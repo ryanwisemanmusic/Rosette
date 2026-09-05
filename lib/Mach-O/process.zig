@@ -1,5 +1,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
+
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+const fcntl_c = @cImport({
+    @cInclude("fcntl.h");
+    @cInclude("unistd.h");
+});
+
 const macho_core = @import("macho_core");
 const macho = macho_core.macho;
 const fat = @import("fat.zig");
@@ -33,6 +41,7 @@ const opaque_lifetime_recovery = @import("diagnostics").opaque_lifetime_recovery
 const libcpp_shared_control_block = @import("cxx_abi").libcpp_shared_control_block;
 const launch_argument_accelerator = @import("diagnostics").launch_argument_accelerator;
 const startup_observer = @import("diagnostics").startup_observer;
+const diagnostics_execution_profile = @import("diagnostics").execution_profile;
 const itanium_unwinder = @import("cxx_abi").itanium_unwinder;
 const itanium_dynamic_cast = @import("cxx_abi").itanium_dynamic_cast;
 const libcpp_filesystem = @import("io").libcpp_filesystem;
@@ -44,9 +53,11 @@ const sdl_runtime = @import("guest_abi").sdl_runtime;
 const logging_runtime = @import("diagnostics").logging_runtime;
 const rosette_pkg_log = @import("diagnostics").rosette_pkg_log;
 const x64_backend_diagnostics = @import("diagnostics").x64_backend_diagnostics;
+const macos_host_contract = @import("rosette_macos_host_contract");
 const xenia_pipeline = @import("diagnostics").xenia_pipeline;
 const xenia_gpu_handoff = @import("diagnostics").xenia_gpu_handoff;
 const xenia_gpu_causal_trace = @import("diagnostics").xenia_gpu_causal_trace;
+const xenia_pm4_walk = @import("diagnostics").xenia_pm4_walk;
 const graphics_health_contract = @import("diagnostics").graphics_health_contract;
 const application_controller = @import("diagnostics").application_controller;
 const application_framework = @import("application_framework");
@@ -55,6 +66,8 @@ const guest_wait_liveness = @import("diagnostics").guest_wait_liveness;
 const deadlock_predictor = @import("diagnostics").deadlock_predictor;
 const deferred_work = @import("diagnostics").deferred_work;
 const guest_exception_ledger = @import("diagnostics").guest_exception_ledger;
+const guest_status_ledger = @import("diagnostics").guest_status_ledger;
+const unknown_inventory_mod = @import("diagnostics").unknown_inventory;
 const sync_object_identity = @import("diagnostics").sync_object_identity;
 const wait_audit = @import("diagnostics").wait_audit;
 const host_contract_coverage = @import("diagnostics").host_contract_coverage;
@@ -71,6 +84,24 @@ const guest_log_channels = @import("diagnostics").guest_log_channels;
 const wait_graph = @import("diagnostics").wait_graph;
 const event_identity = @import("diagnostics").event_identity;
 const execution_tracepoints = @import("diagnostics").execution_tracepoints;
+const mandatory_order = @import("diagnostics").mandatory_order;
+const monotone_witness = @import("diagnostics").monotone_witness;
+const pipeline_evidence = @import("diagnostics").pipeline_evidence;
+const fault_pause_transaction = @import("diagnostics").fault_pause_transaction;
+const sync_object_registry = @import("diagnostics").sync_object_registry;
+const run_journal = @import("diagnostics").run_journal;
+const durable_journal = @import("diagnostics").durable_journal;
+const run_closure = @import("diagnostics").run_closure;
+const execution_provenance = @import("diagnostics").execution_provenance;
+const guest_alias_contract = @import("diagnostics").guest_alias_contract;
+const storage_integrity = @import("diagnostics").storage_integrity;
+const run_budget = @import("diagnostics").run_budget;
+const run_manifest = @import("diagnostics").run_manifest;
+const kernel_service_readiness = @import("diagnostics").kernel_service_readiness;
+const import_integrity = @import("diagnostics").import_integrity;
+const acceptance_gates = @import("diagnostics").acceptance_gates;
+const timeout_fidelity = @import("diagnostics").timeout_fidelity;
+const signal_expectation = @import("diagnostics").signal_expectation;
 const anomaly_ledger = @import("diagnostics").anomaly_ledger;
 const notifier_liveness = @import("scheduler").notifier_liveness;
 const guest_critical_section = @import("diagnostics").guest_critical_section;
@@ -135,11 +166,32 @@ const guest_address_space = @import("guest_address_space");
 const ownership_lib = @import("ownership");
 const dispatch_recovery = @import("dispatch_recovery");
 const gpu = @import("gpu");
+const register_map = @import("xenos_register_map");
+const ownership_contract = gpu.ownership_contract;
 const device_tree = @import("device_tree");
 const guest_structure = @import("guest_structure");
 const execution_history = @import("execution_history");
 const ExecutionHistory = execution_history.History(TraceEntry);
 const crash_diag = @import("process_core").crash_diag;
+
+/// How close a bounded poll's first expiry has to be to the producer's last
+/// ring advance before the two are reported as the same event.
+///
+/// The observed pair is nine million steps apart — the title published its
+/// batch and started waiting on the same submission. A window of fifty
+/// million is generous enough to survive the sampling in between and far too
+/// tight to join a poll that belongs to an unrelated part of the title.
+const bootstrap_poll_join_steps: u64 = 50_000_000;
+
+/// Execution context captured at the first armed and first violated
+/// checkpoint of an integrity invariant. The predicate snapshot lives in the
+/// integrity ledger; this is the machine context that tells us which guest
+/// instruction was active when that snapshot became actionable.
+const RunIntegrityContext = struct {
+    valid: bool = false,
+    rip: u64 = 0,
+    thread: u64 = 0,
+};
 
 test {
     std.testing.refAllDecls(symbol_assembly_context);
@@ -227,6 +279,8 @@ const RFL_OF = x64_decoder.RFL_OF;
 const RFL_DF: u32 = 1 << 10;
 
 const constants = @import("macho_core").constants;
+const translation_cache = @import("macho_core").translation_cache;
+const translation_domain = @import("macho_core").translation_domain;
 const STACK_SIZE = constants.STACK_SIZE;
 const MEM_SIZE = constants.MEM_SIZE;
 const envMemSizeMb = constants.envMemSizeMb;
@@ -595,6 +649,11 @@ pub const MachOState = struct {
     /// dispatch, dumped when a terminal casualty is confirmed. See
     /// `near_null_predictor.zig` for the cost model (one compare per import).
     near_null_predictor: near_null_predictor.Predictor = .{},
+    /// Fingerprint of the last near-null status line. The status is emitted
+    /// even when no casualty occurred, so a final report can distinguish
+    /// "observer saw no qualifying event" from "the observer was never
+    /// consulted" without repeating a wall-clock-only line every checkpoint.
+    near_null_status_last_fingerprint: u64 = std.math.maxInt(u64),
     /// Guest wait-cycle signatures observed through the mirrored guest log
     /// (KeWaitForSingleObject/KeSetEvent/KeReleaseSemaphore). A signature
     /// whose count grows while the ring write pointer is stalled is a
@@ -602,10 +661,19 @@ pub const MachOState = struct {
     /// ever signal. See `livelock_predictor.zig`; reached only from the
     /// guest-log bridge, never from the instruction stream.
     livelock_predictor: livelock_predictor.Predictor = .{},
-    /// Object of the most recent `KeWaitForSingleObject` detail line, so the
-    /// predictor can pair the following `result=` line with an object even
-    /// against a pre-instrumentation binary that omitted it.
+    /// Legacy single-slot fallback for synthetic states that do not expose the
+    /// per-thread table below. Mach-O uses the table so interleaved guest log
+    /// producers cannot steal one another's wait identity.
     livelock_pending_wait_object: u64 = 0,
+    /// Per-guest-thread replacement for the legacy scalar breadcrumb above.
+    /// Guest diagnostic lines may interleave; pairing by thread prevents one
+    /// wait result from consuming another thread's object identity.
+    livelock_pending_waits: [guest_log.pending_wait_capacity]guest_log.PendingWait =
+        [_]guest_log.PendingWait{.{}} ** guest_log.pending_wait_capacity,
+    livelock_pending_wait_active: u32 = 0,
+    livelock_pending_wait_dropped: u64 = 0,
+    livelock_pending_wait_unmatched_results: u64 = 0,
+    livelock_pending_wait_identity_conflicts: u64 = 0,
     /// Judges every write-time vptr restore before Rosette performs it. The
     /// restore is a store into guest memory, and a tracked slot that turns out
     /// to be live stack scratch makes that store the defect rather than the
@@ -705,6 +773,19 @@ pub const MachOState = struct {
     pthreads: pthread_runtime.Runtime = .{},
     scheduler_log: scheduler.SchedulerEventLog = .{},
     jit_log: jit.JitEventLog = .{},
+    /// Bounded, text-boundary health account for Xenia's JIT. The guest-log
+    /// bridge is the only place this is fed; no per-instruction JIT scanning is
+    /// added to the interpreter hot loop.
+    jit_health: jit.JitHealth = .{},
+    /// A JIT health fault is terminal and must be reported exactly once.  The
+    /// guard also protects the diagnostic path if a signal handler returns and
+    /// the failed host operation unwinds farther than expected.
+    jit_health_faulted: bool = false,
+    /// Readiness failures are a separate contract from JIT health. Keep their
+    /// terminal path independently guarded so a compiler diagnostic cannot be
+    /// logged repeatedly if the heartbeat is re-entered after a signal handler
+    /// returns.
+    ready_compiler_faulted: bool = false,
     macho_log: macho_log.Logger = .{},
     tlv: tlv_runtime.Runtime = .{},
     diagnostic_text: diagnostic_text_accelerator.Engine = .{},
@@ -791,6 +872,14 @@ pub const MachOState = struct {
     /// which step was the first not to happen and whether it was reachable —
     /// the only reading that decides whether to look at the GPU at all.
     gpu_bootstrap: gpu.Contract = .{},
+    /// Reconciles the guest-log bootstrap breadcrumbs with instruction-trace
+    /// crossings. These are separate authorities: a call-site probe can miss
+    /// a call that the guest actually executed, while a tracepoint can fire
+    /// without Xenia publishing a trustworthy guest breadcrumb. Keeping both
+    /// here prevents a weak probe from retracting the late VdInitialize/VdSet
+    /// sequence visible in the current Xenia run.
+    gpu_bootstrap_provenance: gpu.BootstrapProvenance = .{},
+    gpu_bootstrap_provenance_last_fingerprint: u64 = std.math.maxInt(u64),
     /// VdSwap's call, encoding, completion, publication and consumption are
     /// distinct facts. The call itself comes from execution tracepoints; these
     /// two stages come from Xenia's structured encoder contract, while the
@@ -852,8 +941,101 @@ pub const MachOState = struct {
     /// the first invariant violated stops the run and names what to fix. See
     /// `lib/diagnostics/run_integrity.zig`.
     run_integrity: run_integrity.Ledger = .{},
+    /// Which of several counters of the same increasing fact a report may
+    /// quote. Two carriers of one number disagreeing is not itself a defect —
+    /// a throttled breadcrumb is allowed to be short — but a report that
+    /// quotes the short one attributes a working mechanism to the wrong owner.
+    /// See `lib/diagnostics/monotone_witness.zig`.
+    monotone_witness: monotone_witness.Ledger = .{},
+    monotone_witness_last_fingerprint: u64 = std.math.maxInt(u64),
+    pipeline_evidence_last_fingerprint: u64 = std.math.maxInt(u64),
+    /// The contracts and evidence systems the 2026-08-31 systems-gap audit
+    /// asked for. Each is a ledger with its own vocabulary and its own refusal
+    /// rules; they are grouped here so one checkpoint can synchronise them
+    /// from the ledgers that already exist and emit one ordered report.
+    ///
+    /// They are deliberately not merged into the older reports. A contract
+    /// that folded into an existing health percentage would lose the one
+    /// property the audit is asking for — that a gap names an owner and a
+    /// refusal is visible as a refusal.
+    audit_manifest: run_manifest.Manifest = .{},
+    audit_journal: run_journal.Journal = .{},
+    /// One immutable posture controls every fallback and host-side nudge.
+    /// Unknown configuration never gets the authentic default by accident.
+    audit_profile: run_manifest.Profile = .authentic,
+    audit_profile_valid: bool = true,
+    audit_identity_fields: run_manifest.IdentityFields = .{},
+    audit_build_identity_hash: u64 = 0,
+    audit_build_identity_loaded: bool = false,
+    audit_identity_conflict: bool = false,
+    audit_media_fingerprint: u64 = 0,
+    audit_config_fingerprint: u64 = 0,
+    audit_title_id: u32 = 0,
+    /// The binary journal is deliberately a small writer, not the 512 KiB
+    /// in-memory test image. A killed process leaves a prefix without a
+    /// footer, which recovery classifies as incomplete.
+    audit_durable_journal: durable_journal.Writer = .{},
+    audit_durable_fd: i32 = -1,
+    audit_durable_open_failed: bool = false,
+    /// The single run-scoped owner joins in-memory publication, the durable
+    /// sink, producer quiescence, and the terminal footer. A journal that is
+    /// merely open is not an authentic evidence channel.
+    audit_evidence_owner: run_closure.EvidenceOwner = .{},
+    audit_evidence_owner_started: bool = false,
+    audit_evidence_owner_producer: u64 = 0x524F_5345_5454_4531,
+    audit_closure_admission: run_closure.Admission = .{},
+    audit_closure_admission_failure: run_closure.AdmissionFailure = .none,
+    audit_guest_start_verdict: run_closure.StartVerdict = .refused,
+    audit_pause: fault_pause_transaction.Ledger = .{},
+    audit_producer: gpu.producer_liveness.Ledger = .{},
+    audit_ring_transport: gpu.ring_transport.Ledger = .{},
+    audit_pm4: gpu.pm4_authority.Ledger = .{},
+    audit_render_target: gpu.render_target_evidence.Ledger = .{},
+    audit_edram: gpu.edram_model.Model = .{},
+    audit_resolve: gpu.resolve_pipeline.Ledger = .{},
+    audit_registers: gpu.xenos_register_state.Journal = .{},
+    audit_shaders: gpu.shader_execution.Ledger = .{},
+    audit_shader_storage: gpu.shader_storage_contract.Ledger = .{},
+    audit_vectors: gpu.controlled_vectors.Suite = .{},
+    audit_video: gpu.video_contract.Table = .{},
+    audit_admission: gpu.feature_admission.Ledger = .{},
+    audit_forwarding: gpu.forwarding_fidelity.Matrix = .{},
+    audit_frames: gpu.frame_custody_chain.Ledger = .{},
+    audit_interrupts: gpu.interrupt_effect.Ledger = .{},
+    /// The presenter's own account of the guest output it does not have. Read
+    /// from its breadcrumbs so `mailbox=-1` can be joined to Rosette's swap
+    /// frontier instead of being read as a presenter defect.
+    gpu_guest_output_mailbox: gpu.guest_output_mailbox.Ledger = .{},
+    audit_sync: sync_object_registry.Registry = .{},
+    audit_provenance: execution_provenance.Ledger = .{},
+    audit_alias: guest_alias_contract.Ledger = .{},
+    audit_storage: storage_integrity.Ledger = .{},
+    audit_budget: run_budget.Ledger = .{},
+    /// The throughput budget is a guest-execution contract. Keep the raw
+    /// process totals in `audit_budget`, but anchor the judged window at the
+    /// first Xenia pipeline boundary that proves the guest main thread has
+    /// actually retired an instruction. Loader, import-resolution and JIT
+    /// startup work must not be reported as a zero-guest-time guest deficit.
+    audit_budget_guest_window: run_budget.Window = .{},
+    audit_services: kernel_service_readiness.Inventory = .{},
+    audit_imports: import_integrity.Ledger = .{},
+    audit_gates: acceptance_gates.Board = .{},
+    audit_gates_last_fingerprint: u64 = std.math.maxInt(u64),
+    audit_configured: bool = false,
+    /// Wyhash of the loaded image. The manifest needs it to say which build
+    /// this run is, and two runs of different builds are not comparable.
+    audit_image_fingerprint: u64 = 0,
     run_integrity_configured: bool = false,
+    /// Evidence policy selected by `ensureRunIntegrity`. Fault and warn modes
+    /// use the strict predicates; observe mode preserves the non-invasive
+    /// historical readings. This is separate from the action policy so warn
+    /// can expose every strict finding without terminating the process.
+    run_integrity_strict: bool = false,
     run_integrity_last_fingerprint: u64 = std.math.maxInt(u64),
+    run_integrity_first_armed_context: [run_integrity.invariant_count]RunIntegrityContext =
+        [_]RunIntegrityContext{.{}} ** run_integrity.invariant_count,
+    run_integrity_first_violation_context: [run_integrity.invariant_count]RunIntegrityContext =
+        [_]RunIntegrityContext{.{}} ** run_integrity.invariant_count,
     /// Presentations the window has made, counted where they happen so the
     /// custody invariant compares two independently sourced numbers rather than
     /// one number against itself.
@@ -900,7 +1082,19 @@ pub const MachOState = struct {
     graphics_health_detail_fingerprint: u64 = std.math.maxInt(u64),
     vd_swap_detail_mask: u64 = std.math.maxInt(u64),
     cocoa_control_detail_fingerprint: u64 = std.math.maxInt(u64),
-    tracepoint_detail_mask: u64 = std.math.maxInt(u64),
+    /// Which tracepoints had been entered at the last detailed print. Four
+    /// words because the armed set covers the whole graphics boundary surface
+    /// now; a single u64 silently stopped noticing changes past the sixty-fifth
+    /// address, which is exactly the class of blind spot this file exists to
+    /// remove.
+    tracepoint_detail_mask: [4]u64 = [_]u64{std.math.maxInt(u64)} ** 4,
+    /// Once every export the title imported is usable, the per-export kernel
+    /// table is stable evidence rather than a new finding at every graphics
+    /// checkpoint. Keep the first complete table, collapse only an identical
+    /// complete state, and reopen it immediately on an import/value regression.
+    kernel_surface_complete: bool = false,
+    kernel_surface_detail_fingerprint: u64 = std.math.maxInt(u64),
+    kernel_surface_collapsed: u64 = 0,
     window_harness_surface_offered: bool = false,
     /// The GPU-facing kernel exports a title reads before it will present, and
     /// whether anything supplied them. See `lib/gpu/kernel_surface.zig`: the
@@ -960,6 +1154,14 @@ pub const MachOState = struct {
     /// Rosette-model callback fields below so equal names cannot create a false
     /// cross-domain reconciliation failure.
     interrupt_callback_transaction: interrupt_callback_transaction.Ledger = .{},
+    /// Rosette's optional host callback installed into Xenia. This callback
+    /// keeps the host-side bridge observable, but it is not a title-owned
+    /// PowerPC callback and must never satisfy the guest callback boundary.
+    host_interrupt_callback_transaction: interrupt_callback_transaction.Ledger = .{ .domain = .xenia_host },
+    /// Domain of the most recent callback breadcrumb that had enough
+    /// provenance to route context-only lines. 0 is unknown, 1 is the
+    /// title/PowerPC callback, and 2 is Rosette's host callback.
+    last_interrupt_callback_log_domain: u8 = 0,
     /// The same exports, read the way the title reads them: slot first, then
     /// the storage the slot points at. See `lib/gpu/kernel_variables.zig`. The
     /// surface above treats the slot's contents as the value, which cannot tell
@@ -989,6 +1191,14 @@ pub const MachOState = struct {
     /// has to read.
     gpu_frontbuffer: ?gpu.Pm4SwapDescription = null,
     gpu_ring_scan_reports: u64 = 0,
+    /// A ring inspection is an integrity input, not merely a report. Keep
+    /// the last inspection identity so the integrity gate can force one scan
+    /// after geometry first becomes observable without duplicating the scan at
+    /// the same execution checkpoint.
+    gpu_ring_inspection_attempted: bool = false,
+    gpu_ring_last_inspected_base: u64 = 0,
+    gpu_ring_last_inspected_size: u64 = 0,
+    gpu_ring_last_inspection_step: u64 = std.math.maxInt(u64),
     /// Stateful Xenos PM4 execution derived from the guest's readable ring.
     /// This does not advance CP_RPTR or manufacture a submission; it is the
     /// backend-neutral state machine that a real Vulkan command recorder can
@@ -1189,10 +1399,114 @@ pub const MachOState = struct {
     /// points. Whether `VdSwap` ran has been inferred from a log line for three
     /// investigation passes; these answer it from the instruction pointer.
     execution_tracepoints: execution_tracepoints.Set = .{},
+    /// The graphics boundary surface, decided from the instruction pointer and
+    /// nothing else. This is the report a reader should look at first: it is
+    /// the only graphics ledger in the process where "the title did not do
+    /// this" and "Rosette did not look" are separate masks rather than the
+    /// same zero.
+    gpu_bringup_gate: gpu.bringup_gate.Gate = .{},
+    /// Which observer to believe when the graphics reports disagree. Every
+    /// previous run answered "did the ring initialise?" both ways in one log
+    /// and had no rule for ranking the answers.
+    gpu_evidence: gpu.evidence_grade.Ledger = .{},
+    /// The routes by which a finished frame can be reported back to the title,
+    /// and whether anything has ever travelled down one. A title that submits
+    /// once and stops is waiting on one of these.
+    gpu_completion_routes: gpu.completion_route.Ledger = .{},
+    /// Provenance at the native-presenter/Cocoa seam. A diagnostic clear keeps
+    /// the window alive but never satisfies a guest-output boundary; this
+    /// ledger is the authority that keeps those two facts separate.
+    presentation_provenance: gpu.presentation_provenance.Ledger = .{},
+    presentation_provenance_last_fingerprint: u64 = std.math.maxInt(u64),
+    /// What the thread that published to the ring did next. `SWAP HEALTH` has
+    /// been ending with "find what the submitting thread is waiting on" for
+    /// weeks and nothing joined the producer thread to the wait records.
+    gpu_producer_stall: gpu.producer_stall.Tracker = .{},
+    /// Crossed-boundary mask at the last full gate table, so the table is
+    /// printed on change rather than on every checkpoint.
+    gpu_gate_detail_mask: u64 = std.math.maxInt(u64),
+    /// Which events must precede which, judged from boundary crossings, with a
+    /// bounded ring of what happened before a violation.
+    mandatory_order: mandatory_order.Ledger = .{},
+    /// What this machine actually did when asked to perform the operations the
+    /// emulator depends on. Filled once, before the guest runs.
+    host_capabilities: preflight_lib.host_capability.Report = .{},
+    /// What is actually in the graphics interrupt callback slot, from the
+    /// emulator's own `SetInterruptCallback` line. The slot holds one address
+    /// and the newest statement is the true one; every earlier one is a
+    /// snapshot of a slot that has since changed hands.
+    gpu_interrupt_slot_address: u32 = 0,
+    gpu_interrupt_slot_user_data: u32 = 0,
+    gpu_interrupt_slot_step: u64 = 0,
+    gpu_interrupt_slot_writes: u64 = 0,
+    /// Bounded history of callback-slot ownership. The current slot is the
+    /// authority for dispatch, while this transition record explains why an
+    /// older periodic occupancy line may name a host callback after the title
+    /// has replaced it.
+    gpu_interrupt_slot_previous_address: u32 = 0,
+    gpu_interrupt_slot_previous_user_data: u32 = 0,
+    gpu_interrupt_slot_previous_step: u64 = 0,
+    gpu_interrupt_slot_previous_is_guest: bool = false,
+    gpu_interrupt_slot_transitions: u64 = 0,
+    gpu_interrupt_slot_guest_writes: u64 = 0,
+    gpu_interrupt_slot_host_writes: u64 = 0,
+    /// Whether the current occupant lives in the console's address space. A
+    /// builtin outside it is the emulator's own host callback, and a dispatch
+    /// into it reaches the harness rather than the title.
+    gpu_interrupt_slot_is_guest: bool = false,
+    /// What became of the draws that entered the command processor. Rosette
+    /// sees both ends of this from the instruction pointer and cannot see which
+    /// of the nine ways out of `IssueDraw` took them; the emulator counts them
+    /// and these hold the count.
+    gpu_draws_entered: u64 = 0,
+    gpu_draws_reached_render_target: u64 = 0,
+    /// First live draw that Rosette classified as target-backed and therefore
+    /// eligible for the render-target ordering rule. Raw IssueDraw entry is
+    /// intentionally not enough: Xenia also enters IssueDraw for no-effect
+    /// draws that never require a target.
+    gpu_renderable_draw_first_step: u64 = 0,
+    gpu_renderable_draw_first_thread: u64 = 0,
+    /// First step at which any live, guest-owned output opportunity was
+    /// observed. This prevents an earlier diagnostic host paint from being
+    /// retroactively reclassified as an authentic guest frame.
+    gpu_guest_output_first_step: u64 = 0,
+    gpu_guest_output_first_thread: u64 = 0,
+    gpu_draw_early_exits: u64 = 0,
+    /// Early exits the emulator classifies as its own failure, as opposed to a
+    /// draw that legitimately had no effect. A total that mixed the two would
+    /// hide the second inside the first.
+    gpu_draw_defect_exits: u64 = 0,
+    gpu_draw_exits_named: u64 = 0,
+    gpu_draw_first_exit: [48]u8 = [_]u8{0} ** 48,
+    gpu_draw_first_exit_length: u8 = 0,
+    gpu_draw_first_exit_step: u64 = 0,
+    /// Guest deadlines against the time they actually consumed. The number that
+    /// decides whether a bounded poll that expired is evidence about a producer
+    /// or evidence about a clock.
+    timeout_fidelity: timeout_fidelity.Ledger = .{},
+    /// Which components have been shown to work, and whether the proof arrived
+    /// before the guest first depended on them.
+    component_readiness: preflight_lib.component_readiness.Ledger = .{},
+    /// Objects with only one end of a handshake. Separately neither half is a
+    /// finding; together they usually are.
+    signal_expectation: signal_expectation.Ledger = .{},
+    /// Which PM4 opcodes the title actually encoded, and whether it ever asked
+    /// to be told its work had finished.
+    gpu_packet_census: gpu.packet_census.Ledger = .{},
+    /// The console physical address the command processor was told to mirror
+    /// the ring read pointer into, from the emulator's own configuration line.
+    ///
+    /// Only the address comes from the log. Whether anything ever *arrives*
+    /// there is read out of console memory, because a word written with the
+    /// same value forever is inert to the title polling it and the emulator has
+    /// no way to notice that.
+    gpu_read_pointer_writeback_address: u32 = 0,
+    gpu_read_pointer_writeback_freq: u32 = 0,
+    gpu_read_pointer_writeback_mapped: bool = false,
     graphics_summary_emissions: u64 = 0,
     graphics_last_frontier_tag: u8 = std.math.maxInt(u8),
     graphics_last_frontier_reached: usize = std.math.maxInt(usize),
-    graphics_last_role_mask: u8 = 0,
+    graphics_last_role_mask: u16 = 0,
     graphics_last_ring_published: bool = false,
     graphics_last_anomaly_count: usize = std.math.maxInt(usize),
     graphics_last_causal_events: u64 = std.math.maxInt(u64),
@@ -1224,6 +1538,21 @@ pub const MachOState = struct {
     /// the work it was doing has handled the exception perfectly and left
     /// something downstream to dereference a null.
     guest_exceptions: guest_exception_ledger.Ledger = .{},
+    /// Every NTSTATUS the guest kernel converted to a DOS error, classified by
+    /// whether the caller asked a question that may answer no.
+    /// See `lib/diagnostics/guest_status_ledger.zig`.
+    guest_status: guest_status_ledger.Ledger = .{},
+    guest_status_last_total: u64 = 0,
+    /// Every raw value a classifier declined, so the report can name the case
+    /// to add rather than print the word `unknown`.
+    /// See `lib/diagnostics/unknown_inventory.zig`.
+    unknown_inventory: unknown_inventory_mod.Ledger = .{},
+    unknown_inventory_last_total: u64 = 0,
+    /// Which boundary the GPU gate last named as the frontier, and the step it
+    /// began naming it. A frontier that keeps moving is a run making progress
+    /// and is never judged; only one the run has settled at is a wall.
+    frontier_boundary_last: u8 = 0xFF,
+    frontier_boundary_since_step: u64 = 0,
     spirv_cross: spirv_cross_diagnostics.Tracker = .{},
     unwinder: itanium_unwinder.Engine = .{},
     dynamic_casts: itanium_dynamic_cast.Engine = .{},
@@ -1374,6 +1703,10 @@ pub const MachOState = struct {
     /// primary miss, so the common hit path remains a single set lookup while
     /// returning code can survive a short cold-stream eviction burst.
     decode_victim_cache: []DecodeCacheEntry,
+    /// Static-image L2. Unlike the generation-sensitive primary/victim
+    /// caches, this bank survives unrelated generated-code writes and only
+    /// leaves on an explicit executable-range invalidation.
+    static_decode_l2: []DecodeCacheEntry,
     /// Faulting instructions retried after a guest SIGSEGV handler resolved
     /// the page's protection. See `signal_handling.protectionFaultResolved`.
     guest_protection_retries: u64 = 0,
@@ -1392,6 +1725,13 @@ pub const MachOState = struct {
     decode_cache_victim_hits: u64 = 0,
     decode_cache_victim_fills: u64 = 0,
     decode_cache_victim_stale_rejections: u64 = 0,
+    static_decode_l2_hits: u64 = 0,
+    static_decode_l2_fills: u64 = 0,
+    /// Per-domain counters make the isolation measurable. Aggregate counters
+    /// remain for compatibility with the existing performance report.
+    decode_domain_hits: [translation_domain.count]u64 = [_]u64{0} ** translation_domain.count,
+    decode_domain_misses: [translation_domain.count]u64 = [_]u64{0} ** translation_domain.count,
+    decode_domain_fills: [translation_domain.count]u64 = [_]u64{0} ** translation_domain.count,
     code_generation: u64 = 1,
     /// Which guest pages may hold a cached decode. See
     /// `types.DecodeCachePageSet`: heap-allocated rather than inline so its
@@ -1486,6 +1826,11 @@ pub const MachOState = struct {
             constants.DECODE_VICTIM_CACHE_ENTRY_COUNT,
         );
         @memset(decode_victim_cache, .{});
+        const static_decode_l2 = try allocator.alloc(
+            DecodeCacheEntry,
+            constants.DECODE_STATIC_L2_ENTRY_COUNT,
+        );
+        @memset(static_decode_l2, .{});
         const decode_cache_pages = try allocator.create(types.DecodeCachePageSet);
         decode_cache_pages.* = .{};
         const page_permissions = try allocator.alloc(u8, @intCast(final_mem_size / PAGE_SIZE));
@@ -1521,6 +1866,7 @@ pub const MachOState = struct {
             .guard_rollback = guard_rollback_lib.GuardRollback.init(allocator),
             .decode_cache = decode_cache,
             .decode_victim_cache = decode_victim_cache,
+            .static_decode_l2 = static_decode_l2,
             .decode_cache_pages = decode_cache_pages,
             .mapped_min = mapped_min,
             .image_end = image_end,
@@ -1766,7 +2112,391 @@ pub const MachOState = struct {
         self.import_handler.dumpTotals(log_cb);
     }
 
+    /// Project the compact Rosette identity into the dependency-free Pass 10
+    /// admission record.  The two manifests intentionally remain separate:
+    /// `run_manifest.Manifest` carries the journal/run inputs, while this
+    /// record is the cross-process contract Xenia authenticates.
+    fn runIdentity(self: *const MachOState) run_closure.Identity {
+        var identity = run_closure.Identity{};
+        const fields = self.audit_identity_fields;
+        const set = struct {
+            fn call(identity_out: *run_closure.Identity, field: run_closure.IdentityField, value: u64) void {
+                _ = identity_out.set(field, value);
+            }
+        }.call;
+        set(&identity, .rosette_source_tree, fields.rosette_tree_hash);
+        set(&identity, .rosette_generated_tree, fields.rosette_generated_tree_hash);
+        set(&identity, .xenia_source_tree, fields.xenia_tree_hash);
+        set(&identity, .xenia_fork_tree, fields.fork_manifest_hash);
+        set(&identity, .xenia_base_commit, fields.xenia_base_commit_hash);
+        set(&identity, .title_xex, self.audit_manifest.inputHash(.image));
+        set(&identity, .title_xiso, self.audit_manifest.inputHash(.media));
+        set(&identity, .media, self.audit_manifest.inputHash(.media));
+        set(&identity, .compiler, fields.toolchain_hash);
+        set(&identity, .linker, fields.toolchain_hash);
+        set(&identity, .translator, fields.rosette_tree_hash);
+        set(&identity, .generator, fields.generated_artifact_hash);
+        set(&identity, .shell_helper, fields.helper_hash);
+        set(&identity, .build_graph, fields.build_hash);
+        set(&identity, .toolchain, fields.toolchain_hash);
+        set(&identity, .backend, fields.backend_hash);
+        set(&identity, .device, fields.device_hash);
+        set(&identity, .driver, fields.driver_hash);
+        set(&identity, .moltenvk, fields.moltenvk_hash);
+        set(&identity, .metal, fields.metal_hash);
+        set(&identity, .semantic_config, fields.semantic_config_hash);
+        set(&identity, .time_config, fields.time_config_hash);
+        set(&identity, .scheduler_config, fields.scheduler_config_hash);
+        set(&identity, .observer_config, fields.observer_config_hash);
+        set(&identity, .admission_config, fields.admission_config_hash);
+        set(&identity, .budget_config, fields.budget_config_hash);
+        set(&identity, .frontier_config, fields.frontier_config_hash);
+        set(&identity, .shader_assets, fields.shader_assets_hash);
+        set(&identity, .vendor_libraries, fields.vendor_hash);
+        set(&identity, .test_manifest, fields.test_runner_hash);
+        set(&identity, .shell_update, fields.shell_update_hash);
+        return identity;
+    }
+
+    fn configureAdmission(self: *MachOState, manifest_sealed: bool) void {
+        const closure_profile: run_closure.Profile = switch (self.audit_profile) {
+            .authentic => .authentic,
+            .diagnostic => .diagnostic,
+            .synthetic => .synthetic,
+            .replay => .replay,
+        };
+        self.audit_closure_admission = run_closure.Admission.init(
+            self.audit_manifest.identity.run_id,
+            closure_profile,
+            self.runIdentity(),
+        );
+        self.audit_closure_admission_failure = if (!self.audit_profile_valid or
+            self.audit_identity_conflict)
+            .identity_incomplete
+        else if (!manifest_sealed)
+            .seal_missing
+        else
+            self.audit_closure_admission.seal();
+
+        if (self.audit_profile != .authentic) {
+            self.audit_guest_start_verdict =
+                self.audit_closure_admission.requestGuestStart();
+        } else if (self.audit_closure_admission_failure == .none) {
+            self.audit_guest_start_verdict =
+                self.audit_closure_admission.requestGuestStart();
+        } else {
+            self.audit_guest_start_verdict = .refused;
+        }
+    }
+
+    fn auditEnvironmentMatches(self: *const MachOState, name: [*:0]const u8, expected: u64) bool {
+        _ = self;
+        if (std.c.getenv(name) == null) return true;
+        return run_manifest.hashFromEnvironment(name) == expected;
+    }
+
+    fn publishAuditEnvironment(self: *const MachOState, allocator: std.mem.Allocator) bool {
+        if (!self.audit_manifest.sealIntact()) return false;
+
+        const manifest_hash = self.audit_manifest.fingerprint();
+        if (!self.auditEnvironmentMatches("ROSETTE_RUN_ID", self.audit_manifest.identity.run_id) or
+            !self.auditEnvironmentMatches("ROSETTE_MANIFEST_HASH", manifest_hash) or
+            (self.audit_build_identity_hash != 0 and
+                !self.auditEnvironmentMatches("ROSETTE_BUILD_IDENTITY_HASH", self.audit_build_identity_hash)))
+        {
+            return false;
+        }
+
+        var buffer: [32]u8 = undefined;
+        const publish = struct {
+            fn value(allocator_out: std.mem.Allocator, name: [*:0]const u8, number: u64, buffer_out: []u8) bool {
+                const text = std.fmt.bufPrint(buffer_out, "0x{x}", .{number}) catch return false;
+                const text_z = allocator_out.dupeZ(u8, text) catch return false;
+                return setenv(name, text_z.ptr, 1) == 0;
+            }
+        }.value;
+        if (!publish(allocator, "ROSETTE_RUN_ID", self.audit_manifest.identity.run_id, &buffer)) return false;
+        if (!publish(allocator, "ROSETTE_MANIFEST_HASH", manifest_hash, &buffer)) return false;
+        if (self.audit_build_identity_hash != 0 and
+            !publish(allocator, "ROSETTE_BUILD_IDENTITY_HASH", self.audit_build_identity_hash, &buffer)) return false;
+        return true;
+    }
+
+    /// Configure the cross-process identity and the one execution profile
+    /// before any guest instruction can run.  The old path initialized the
+    /// in-memory journal lazily at its first graphics checkpoint, which made a
+    /// killed startup interval indistinguishable from a run that had never
+    /// been observed.  This method is intentionally idempotent so the normal
+    /// checkpoint synchronizer can call it as a safety net.
+    pub fn configureAuditContracts(self: *MachOState, at_step: u64) void {
+        if (self.audit_configured) return;
+        self.audit_configured = true;
+
+        const run_id = if (self.event_stream.run_id == 0) 1 else self.event_stream.run_id;
+        self.audit_manifest.identity = .{
+            .run_id = run_id,
+            .image_hash = self.audit_image_fingerprint,
+            .media_hash = self.audit_media_fingerprint,
+            .title_id = self.audit_title_id,
+        };
+        _ = self.audit_manifest.declareInput(.image, self.audit_image_fingerprint);
+        _ = self.audit_manifest.declareInput(.media, self.audit_media_fingerprint);
+        _ = self.audit_manifest.declareInput(.config, self.audit_config_fingerprint);
+        _ = self.audit_manifest.setIdentityFields(
+            run_manifest.identityFieldsWithImage(
+                self.audit_identity_fields,
+                self.audit_image_fingerprint,
+                self.entry_point_vaddr,
+            ),
+        );
+        _ = self.audit_manifest.setBudget(.{
+            .guest_ms_per_host_second = environmentUnsigned("ROSETTE_GUEST_MS_PER_HOST_SECOND", 0),
+            .window_host_seconds = environmentUnsigned("ROSETTE_RUN_WINDOW_SECONDS", 0),
+            .guest_ms_target = environmentUnsigned("ROSETTE_GUEST_MS_TARGET", 0),
+        });
+        self.audit_manifest.profile = self.audit_profile;
+        inline for ([_]run_manifest.Feature{
+            .ring_transport,
+            .pm4_decode,
+            .render_target,
+            .edram,
+            .resolve,
+            .synchronization,
+            .interrupt_effect,
+            .frame_custody,
+            .execution_provenance,
+            .memory_alias,
+            .storage_integrity,
+            .translation_budget,
+            .vulkan_forwarding,
+            .kernel_service,
+            .import_integrity,
+            .shader_pipeline,
+        }) |feature| {
+            _ = self.audit_manifest.declareFeature(feature);
+        }
+
+        const admission_profile: gpu.feature_admission.Profile = switch (self.audit_profile) {
+            .authentic => .authentic,
+            .diagnostic => .diagnostic,
+            .synthetic => .synthetic,
+            .replay => .replay,
+        };
+        _ = self.audit_admission.declare(admission_profile);
+        if (self.application_framework.xeniaHostGpuCallbackEnabled()) {
+            _ = self.audit_admission.enable(
+                .host_callback_forcing,
+                "Rosette application-framework provider installed a Xenia host GPU callback",
+            );
+        }
+        if (self.never_notified_repair_enabled) {
+            _ = self.audit_admission.enable(
+                .guest_memory_repair,
+                "never-notified wait repair is enabled",
+            );
+        }
+        if (self.gpu_draw_dispatch.policy != .observe_only) {
+            _ = self.audit_admission.enable(
+                .host_signal_forcing,
+                "draw dispatch policy can deliver a modeled completion signal",
+            );
+        }
+        if (environmentFlag("ROSETTE_MACHO_FORCE_GPU") or
+            environmentFlag("ROSETTE_MACHO_FORCE_RING") or
+            environmentFlag("ROSETTE_MACHO_FORCE_SWAP"))
+        {
+            _ = self.audit_admission.enable(
+                .ring_write_pointer_kick,
+                "a ROSETTE force control can mutate the GPU publication path",
+            );
+        }
+        self.audit_admission.sealConfiguration();
+
+        const manifest_sealed = self.audit_profile_valid and self.audit_manifest.seal();
+        self.configureAdmission(manifest_sealed);
+        machoCapturePrint(
+            "macho-processor: AUDIT MANIFEST: run=0x{x} image=0x{x} media=0x{x} config=0x{x} profile={s} profile_valid={} sealed={} identity_complete={} closure_admission={s} closure_failure={s} start={s} admission={s} admission_fingerprint=0x{x}\n",
+            .{
+                run_id,
+                self.audit_image_fingerprint,
+                self.audit_media_fingerprint,
+                self.audit_config_fingerprint,
+                self.audit_profile.label(),
+                self.audit_profile_valid,
+                manifest_sealed,
+                self.audit_manifest.identity_fields.complete(),
+                self.audit_guest_start_verdict.label(),
+                self.audit_closure_admission_failure.label(),
+                self.audit_guest_start_verdict.label(),
+                self.audit_admission.admission().label(),
+                self.audit_admission.fingerprint(),
+            },
+        );
+        self.audit_journal.open(run_id);
+        self.openAuditDurableJournal();
+        if (self.audit_journal.written == 0) {
+            _ = self.writeAuditJournal(.{
+                .kind = @intFromEnum(run_journal.EventKind.run_started),
+                .domain = @intFromEnum(run_journal.Domain.rosette_run_integrity),
+                .source_class = @intFromEnum(run_journal.SourceClass.host_forwarded),
+                .result_class = @intFromEnum(run_journal.ResultClass.observed),
+                .guest_step = at_step,
+            });
+        }
+        _ = self.writeAuditJournal(.{
+            .kind = @intFromEnum(run_journal.EventKind.run_manifest),
+            .domain = @intFromEnum(run_journal.Domain.rosette_run_integrity),
+            .source_class = @intFromEnum(run_journal.SourceClass.host_forwarded),
+            .result_class = @intFromEnum(run_journal.ResultClass.applied),
+            .guest_step = at_step,
+            .subject_id = self.audit_manifest.identity.image_hash,
+            .generation = self.audit_manifest.features.count(),
+            .actual_value = self.audit_manifest.features.bits,
+            .state_hash = self.audit_manifest.fingerprint(),
+            .effect_hash = self.audit_admission.fingerprint(),
+        });
+    }
+
+    /// Route one stamped in-memory journal record to the append-only durable
+    /// sink.  The journal remains the source of the record's domain/global
+    /// sequences; the durable writer never serializes the unstamped input.
+    pub fn writeAuditJournal(self: *MachOState, record: run_journal.Record) bool {
+        const result = self.audit_journal.writeAndTake(record);
+        if (result.stamped) |stamped| {
+            if (self.audit_evidence_owner_started and
+                !self.audit_evidence_owner.acceptRecord(self.audit_evidence_owner_producer))
+            {
+                self.audit_durable_open_failed = true;
+            }
+            if (self.audit_durable_journal.started) {
+                if (self.audit_durable_journal.append(stamped) != .accepted) {
+                    self.audit_durable_open_failed = true;
+                    if (self.audit_evidence_owner_started) self.audit_evidence_owner.noteWriterError();
+                }
+            }
+        }
+        return result.accepted;
+    }
+
+    pub fn writeCompactedAuditJournal(self: *MachOState, record: run_journal.Record) bool {
+        const result = self.audit_journal.writeCompactedAndTake(record);
+        if (result.stamped) |stamped| {
+            if (self.audit_evidence_owner_started and
+                !self.audit_evidence_owner.acceptRecord(self.audit_evidence_owner_producer))
+            {
+                self.audit_durable_open_failed = true;
+            }
+            if (self.audit_durable_journal.started) {
+                if (self.audit_durable_journal.append(stamped) != .accepted) {
+                    self.audit_durable_open_failed = true;
+                    if (self.audit_evidence_owner_started) self.audit_evidence_owner.noteWriterError();
+                }
+            }
+        }
+        return result.accepted;
+    }
+
+    fn openAuditDurableJournal(self: *MachOState) void {
+        if (self.audit_durable_journal.started or self.audit_durable_open_failed) return;
+        const override = std.c.getenv("ROSETTE_DURABLE_JOURNAL");
+        const path = if (override) |raw|
+            self.allocator.dupe(u8, std.mem.span(raw)) catch return
+        else blk: {
+            const root = blk2: {
+                const names = [_][*:0]const u8{
+                    "ROSETTE_TRACE_ROOT",
+                    "ROSETTE_ROUTE_ROOT",
+                    "ROSETTE_CALLER_CWD",
+                    "PWD",
+                };
+                for (names) |name| {
+                    if (std.c.getenv(name)) |raw| {
+                        const value = std.mem.span(raw);
+                        if (value.len != 0) break :blk2 value;
+                    }
+                }
+                break :blk2 ".";
+            };
+            // A default run gets its own artifact directory and filename. The
+            // run id is part of the name, and O_EXCL below makes even an
+            // accidental reuse fail rather than truncating a prior run.
+            const filename = std.fmt.allocPrint(self.allocator, "run-{x:0>16}.r3j", .{self.audit_manifest.identity.run_id}) catch return;
+            defer self.allocator.free(filename);
+            break :blk self.allocator.dupe(u8, std.fs.path.join(self.allocator, &.{ root, ".rosette", "runs", filename }) catch return) catch return;
+        };
+        defer self.allocator.free(path);
+        const path_z = self.allocator.dupeZ(u8, path) catch return;
+        defer self.allocator.free(path_z);
+        const directory = std.fs.path.dirname(path);
+        if (directory) |parent| {
+            // The event logger creates the default .rosette directory. A
+            // custom path is allowed as well; failure to create its parent is
+            // reported by the writer as an unavailable durability channel.
+            std.Io.Dir.cwd().createDirPath(self.io, parent) catch {};
+        }
+        const fd = fcntl_c.open(
+            path_z.ptr,
+            // Never truncate or append to an older run. A collision is a
+            // typed durability failure and keeps the new run diagnostic-only.
+            fcntl_c.O_WRONLY | fcntl_c.O_CREAT | fcntl_c.O_EXCL | fcntl_c.O_CLOEXEC,
+            @as(c_uint, 0o644),
+        );
+        if (fd < 0) {
+            self.audit_durable_open_failed = true;
+            machoCapturePrint("macho-processor: AUDIT JOURNAL: durable sink unavailable path={s}; the in-memory journal remains diagnostic-only\n", .{path});
+            return;
+        }
+        const header = durable_journal.Header{
+            .run_id = self.audit_manifest.identity.run_id,
+            .manifest_hash = self.audit_manifest.fingerprint(),
+            .schema_hash = self.audit_manifest.identity_fields.fingerprint(),
+            .profile = @intFromEnum(self.audit_profile),
+            .source_policy = @intFromEnum(if (self.audit_manifest.sealIntact())
+                self.audit_manifest.effectiveSourceClass(self.audit_admission.effectiveSourceClass())
+            else
+                run_manifest.SourceClass.unknown),
+            .host_monotonic_ns = startup_observer.monotonicNanoseconds(),
+        };
+        if (!self.audit_durable_journal.begin(fd, header)) {
+            _ = std.c.close(fd);
+            self.audit_durable_open_failed = true;
+            return;
+        }
+        self.audit_durable_fd = fd;
+        self.audit_evidence_owner_started =
+            self.audit_evidence_owner.begin(self.audit_manifest.identity.run_id, true) and
+            self.audit_evidence_owner.registerProducer(self.audit_evidence_owner_producer);
+        machoCapturePrint(
+            "macho-processor: AUDIT JOURNAL: durable sink path={s} schema={d} manifest=0x{x} profile={s} unique=YES owner={} footer_required=YES\n",
+            .{ path, durable_journal.schema_version, header.manifest_hash, self.audit_profile.label(), self.audit_evidence_owner_started },
+        );
+    }
+
+    fn finishAuditDurableJournal(self: *MachOState) void {
+        if (self.audit_evidence_owner_started) {
+            _ = self.audit_evidence_owner.unregisterProducer(self.audit_evidence_owner_producer);
+            self.audit_evidence_owner_started = false;
+            _ = self.audit_evidence_owner.beginDrain();
+        }
+        if (self.audit_durable_journal.started and !self.audit_durable_journal.finished) {
+            const finished = self.audit_durable_journal.finish(self.audit_journal.summary().totalDropped());
+            if (!finished) self.audit_evidence_owner.noteWriterError();
+            const recovery = self.audit_durable_journal.recovery();
+            _ = self.audit_evidence_owner.noteFooter(recovery.footer_valid);
+            _ = self.audit_evidence_owner.noteDurableFooter(recovery.durable_footer);
+            if (self.audit_journal.summary().totalDropped() != 0) {
+                self.audit_evidence_owner.noteDrop(self.audit_journal.summary().totalDropped());
+            }
+            _ = self.audit_evidence_owner.commit();
+        }
+        if (self.audit_durable_fd >= 0) {
+            _ = std.c.close(self.audit_durable_fd);
+            self.audit_durable_fd = -1;
+        }
+    }
+
     pub fn deinit(self: *MachOState) void {
+        self.finishAuditDurableJournal();
         self.execution_history.deinit(self.allocator);
         self.scheduler_log.close();
         self.jit_log.close();
@@ -1799,6 +2529,7 @@ pub const MachOState = struct {
         self.initializer_memory.deinit();
         self.allocator.free(self.decode_cache);
         self.allocator.free(self.decode_victim_cache);
+        self.allocator.free(self.static_decode_l2);
         self.allocator.destroy(self.decode_cache_pages);
         if (self.special_rip_table.len != 0) self.allocator.free(self.special_rip_table);
         if (self.guest_log_mirror_fd >= 0) _ = std.c.close(self.guest_log_mirror_fd);
@@ -2392,17 +3123,79 @@ pub const MachOState = struct {
     /// `_entry` suffixed names are preferred because that is the shim the
     /// export dispatch actually calls; a lambda or thunk sharing the fragment
     /// would be a less direct boundary.
+    /// The coarse role an address carries in the nine-value vocabulary that
+    /// predates the boundary contract.
+    ///
+    /// A dozen call sites read `roleEntered`, and several of them gate real
+    /// decisions. Newly armed boundaries therefore take `.other` rather than
+    /// the role that would most naturally describe them: arming
+    /// `WorkerThreadMain` as `.command_processor` would make "the command
+    /// processor consumed PM4" true the moment its thread started, which is a
+    /// different fact and a worse one. The boundary tag carries the precision;
+    /// this carries only what the old predicates already meant.
+    fn legacyTracepointRole(boundary: gpu.bringup_gate.Boundary) execution_tracepoints.Role {
+        return switch (boundary) {
+            .guest_swap_requested, .swap_notified_to_graphics_system => .swap,
+            .issue_swap => .command_swap,
+            .xe_swap_decoded => .xe_swap_decode,
+            .initialize_ring_buffer, .enable_rptr_write_back => .ring_setup,
+            .execute_primary_buffer => .command_processor,
+            .refresh_guest_output, .refresh_guest_output_impl => .presenter,
+            else => .other,
+        };
+    }
+
+    fn boundaryLabel(index: u8) []const u8 {
+        if (index == execution_tracepoints.unbound_boundary) return "<none>";
+        if (index >= gpu.bringup_gate.boundary_count) return "<invalid>";
+        const boundary: gpu.bringup_gate.Boundary = @enumFromInt(index);
+        return boundary.label();
+    }
+
     pub fn armGraphicsTracepoints(self: *MachOState) void {
-        const wanted = [_]struct { fragment: []const u8, role: execution_tracepoints.Role }{
-            .{ .fragment = "VdSwap_entry", .role = .swap },
-            .{ .fragment = "NotifyVdSwapCall", .role = .swap },
-            .{ .fragment = "IssueSwap", .role = .command_swap },
-            .{ .fragment = "ExecutePacketType3_XE_SWAP", .role = .xe_swap_decode },
-            .{ .fragment = "DebugIssueSwapFromHost", .role = .diagnostic_swap },
-            .{ .fragment = "VdInitializeRingBuffer_entry", .role = .ring_publication },
-            .{ .fragment = "VdEnableRingBufferRPtrWriteBack_entry", .role = .ring_publication },
-            .{ .fragment = "ExecutePrimaryBuffer", .role = .command_processor },
-            .{ .fragment = "RefreshGuestOutput", .role = .presenter },
+        const bringup = gpu.bringup_gate;
+        const Target = struct {
+            fragment: []const u8,
+            role: execution_tracepoints.Role,
+            /// Additional substrings a candidate must also contain, for a
+            /// fragment that names a class rather than a function.
+            also: []const []const u8 = &.{},
+            /// Substrings that make a candidate a different provenance
+            /// boundary rather than this one.
+            exclude: []const []const u8 = &.{},
+            /// The graphics boundary this address stands for, or
+            /// `unbound_boundary` for an address armed for a question the
+            /// contract does not cover.
+            boundary: u8 = execution_tracepoints.unbound_boundary,
+        };
+        // The armed set used to be nine fragments chosen around one question:
+        // did `VdSwap` run? That set could not answer "did the title register
+        // an interrupt callback", "is the vblank pump still running" or "did
+        // the command processor ever write a register" — and a run that
+        // submitted twenty-four draws and stopped needed all three. The whole
+        // boundary surface is armed here instead, from the contract, so a zero
+        // anywhere on it is an execution fact rather than an unasked question.
+        //
+        // Legacy roles are preserved exactly for the addresses that already
+        // carried one. Every newly armed boundary takes `.other`, so no
+        // existing predicate built on `roleEntered` changes meaning; the new
+        // gate reads the boundary tag instead.
+        var wanted: [bringup.boundary_count + 1]Target = undefined;
+        for (bringup.contractBoundaries(), 0..) |boundary, index| {
+            wanted[index] = .{
+                .fragment = boundary.fragment(),
+                .role = legacyTracepointRole(boundary),
+                .also = boundary.alsoRequires(),
+                .exclude = boundary.exclusions(),
+                .boundary = @intFromEnum(boundary),
+            };
+        }
+        // The host diagnostic swap probe is deliberately outside the contract:
+        // it is a boundary Rosette can reach on its own, and a contract stage
+        // the harness can satisfy is not evidence about the title.
+        wanted[bringup.boundary_count] = .{
+            .fragment = "DebugIssueSwapFromHost",
+            .role = .diagnostic_swap,
         };
         // Every executable candidate is armed, but ranked before the cap
         // applies. Taking the first four in hash order armed only the standard
@@ -2425,15 +3218,24 @@ pub const MachOState = struct {
             while (iterator.next()) |symbol| {
                 const name = symbol.key_ptr.*;
                 if (std.mem.indexOf(u8, name, target.fragment) == null) continue;
+                // A fragment that names a class matches every member of it, and
+                // ranking by name length would then arm a destructor. Requiring
+                // a second substring narrows it without splicing Itanium length
+                // prefixes into the contract.
+                var missing_required = false;
+                for (target.also) |required| {
+                    if (std.mem.indexOf(u8, name, required) == null) missing_required = true;
+                }
+                if (missing_required) continue;
                 // `DebugIssueSwapFromHost` contains `IssueSwap`, but it is a
                 // different provenance boundary. Without this exclusion a
                 // forced host probe is armed twice and can be misreported as
                 // authentic guest progress.
-                if (target.role == .command_swap and
-                    std.mem.indexOf(u8, name, "DebugIssueSwapFromHost") != null)
-                {
-                    continue;
+                var excluded = false;
+                for (target.exclude) |forbidden| {
+                    if (std.mem.indexOf(u8, name, forbidden) != null) excluded = true;
                 }
+                if (excluded) continue;
                 const address = symbol.value_ptr.*;
                 matches += 1;
                 // A guard variable or a static inside the function carries the
@@ -2464,21 +3266,47 @@ pub const MachOState = struct {
             var armed: usize = 0;
             for (best_name, best_address) |name, address| {
                 if (address == 0) continue;
-                if (self.execution_tracepoints.arm(name, address, target.role)) {
+                if (self.execution_tracepoints.armBoundary(name, address, target.role, target.boundary)) {
                     armed += 1;
                     machoCapturePrint(
-                        "macho-processor: graphics tracepoint armed: role={s} ({s}) address=0x{x} candidates={d} symbol={s}\n",
-                        .{ @tagName(target.role), target.role.label(), address, matches, name },
+                        "macho-processor: graphics tracepoint armed: role={s} ({s}) boundary={s} address=0x{x} candidates={d} symbol={s}\n",
+                        .{
+                            @tagName(target.role),
+                            target.role.label(),
+                            boundaryLabel(target.boundary),
+                            address,
+                            matches,
+                            name,
+                        },
                     );
                 }
+            }
+            if (target.boundary != execution_tracepoints.unbound_boundary and armed != 0) {
+                self.gpu_bringup_gate.arm(
+                    @enumFromInt(target.boundary),
+                    @intCast(armed),
+                );
             }
             if (armed == 0) {
                 self.execution_tracepoints.noteUnresolved();
                 machoCapturePrint(
-                    "macho-processor: graphics tracepoint UNRESOLVED: fragment={s} role={s} name_matches={d} rejected_non_executable={d}; a zero hit count for this role will mean nothing was watching, NOT that it never ran\n",
-                    .{ target.fragment, @tagName(target.role), matches, rejected_non_executable },
+                    "macho-processor: graphics tracepoint UNRESOLVED: fragment={s} role={s} boundary={s} name_matches={d} rejected_non_executable={d}; a zero hit count for this boundary will mean nothing was watching, NOT that it never ran\n",
+                    .{
+                        target.fragment,
+                        @tagName(target.role),
+                        boundaryLabel(target.boundary),
+                        matches,
+                        rejected_non_executable,
+                    },
                 );
             }
+        }
+        self.gpu_bringup_gate.seal();
+        if (self.execution_tracepoints.saturated()) {
+            machoCapturePrint(
+                "macho-processor: graphics tracepoints SATURATED: the armed set reached its capacity of {d}, so at least one boundary the contract names has no observer and its zero is Rosette's. Raise execution_tracepoints.max_tracepoints\n",
+                .{execution_tracepoints.max_tracepoints},
+            );
         }
         self.execution_tracepoints.seal();
         if (self.execution_tracepoints.count != 0) {
@@ -2554,6 +3382,7 @@ pub const MachOState = struct {
     fn observeGpuEarlyTracepoint(self: *MachOState, role: execution_tracepoints.Role, address: u64) void {
         const boundary: ?gpu.GpuEarlyBoundary = switch (role) {
             .swap => .guest_vdswap_entered,
+            .ring_setup => null,
             .ring_publication => .ring_publication,
             .command_processor => .command_processor_entered,
             .command_swap => .presenter_entered,
@@ -2704,6 +3533,7 @@ pub const MachOState = struct {
         };
         const accepted = self.ready.noteStage(@intFromEnum(stage), at_step, "xenia:pipeline");
         self.logReadyCompilerStage(stage, accepted, at_step, "xenia:pipeline");
+        if (accepted and stage == .processor_ready) self.jit_health.arm(at_step);
     }
 
     pub fn noteReadyCompilerGpuPhase(self: *MachOState, raw_phase: u8, at_step: u64) void {
@@ -2738,8 +3568,244 @@ pub const MachOState = struct {
         }
     }
 
+    /// Observe Xenia JIT health at the guest-log boundary. This is deliberately
+    /// independent of the readiness gate: a run with readiness reporting
+    /// disabled still needs to retain an explicit compiler or code-cache
+    /// failure rather than letting it disappear into ordinary guest text.
+    pub fn observeJitHealthText(self: *MachOState, line: []const u8) void {
+        const observation = self.jit_health.observe(line, self.executed_steps);
+        self.reportJitHealthObservation(observation);
+    }
+
+    fn reportJitHealthObservation(self: *MachOState, observation: jit.JitHealthObservation) void {
+        const report = self.jit_health.summary();
+        if (observation.finding != .none) {
+            const count = report.diagnosticCount();
+            if (observation.startup_suppressed or observation.fatal or count <= 8 or count % 256 == 0) {
+                machoCapturePrint(
+                    "macho-processor: XENIA JIT HEALTH: finding={s} fatal={} startup_suppressed={} phase={s} armed={} step={d} rip=0x{x} thread=0x{x} count={d} text={s}\n",
+                    .{
+                        observation.finding.label(),
+                        observation.fatal,
+                        observation.startup_suppressed,
+                        observation.phase.label(),
+                        report.armed,
+                        self.executed_steps,
+                        self.regs.rip,
+                        self.active_guest_thread,
+                        count,
+                        if (observation.line.len != 0) observation.line else "<no physical line>",
+                    },
+                );
+            }
+            if (observation.fatal) self.faultOnJitHealth(observation);
+        } else if (observation.event == .translation_generation_regression and
+            (report.generation_regressions <= 8 or report.generation_regressions % 256 == 0))
+        {
+            machoCapturePrint(
+                "macho-processor: XENIA JIT HEALTH: translation-generation regression generation={d} highest={d} guest_function=0x{x} step={d}; a replay is tolerated, but a lower generation is retained as metadata-integrity evidence\n",
+                .{
+                    observation.generation,
+                    report.highest_generation,
+                    observation.guest_function,
+                    self.executed_steps,
+                },
+            );
+        }
+    }
+
+    /// Stop on a typed JIT failure after retaining the exact physical line and
+    /// all adjacent readiness/backend evidence. A compiler diagnostic is not a
+    /// recoverable guest exception: continuing would let Xenia publish or call
+    /// code whose provenance is already known to be broken.
+    fn faultOnJitHealth(self: *MachOState, observation: jit.JitHealthObservation) void {
+        if (self.jit_health_faulted) return;
+        self.jit_health_faulted = true;
+        self.faulted = true;
+        self.exit_code = 125;
+        self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.runtime_invariant_failure);
+        self.terminated = true;
+        self.audit_pause.noteTermination(.diagnostic_termination, self.executed_steps);
+        machoCapturePrint(
+            "macho-processor: XENIA JIT HEALTH FAULT: finding={s} phase={s} armed={} armed_step={d} step={d} rip=0x{x} thread=0x{x} text={s}\n",
+            .{
+                observation.finding.label(),
+                observation.phase.label(),
+                self.jit_health.isArmed(),
+                self.jit_health.summary().armed_step,
+                self.executed_steps,
+                self.regs.rip,
+                self.active_guest_thread,
+                if (observation.line.len != 0) observation.line else "<no physical line>",
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: XENIA JIT HEALTH FAULT: terminating before the failed compiler/code-cache/publication path can be used; the signal is intentional and the reports below are the preserved failure context\n",
+            .{},
+        );
+        self.logJitHealth(true);
+        self.logReadyCompilerSummary();
+        self.backend_diagnostics.logSummary();
+        self.logTranslationEconomics();
+        macho_log.flushAsyncTransport();
+        self.macho_log.flush();
+        native_crash.recordPhase("xenia-jit-health-fault");
+        _ = std.c.raise(std.c.SIG.SEGV);
+        // The native crash handler normally restores the default disposition
+        // and re-raises. If a platform/runtime oddity makes raise return, do
+        // not let the failed JIT path continue as if it were healthy.
+        std.c.abort();
+    }
+
+    /// Stop on a failed Xenia readiness contract. Readiness failures are not
+    /// ordinary guest errors: once the compiler contract has rejected the
+    /// generated-code path, allowing startup to continue would turn a useful
+    /// compile failure into a later null call, bad GPU handle, or silent
+    /// no-frame condition. Keep this terminal path separate from JIT health so
+    /// either subsystem can preserve its own evidence and so a returning
+    /// signal handler cannot re-enter the failed run.
+    fn faultOnReadyCompilerFailure(self: *MachOState) void {
+        if (self.ready_compiler_faulted) return;
+        self.ready_compiler_faulted = true;
+        self.faulted = true;
+        self.exit_code = 125;
+        self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.runtime_invariant_failure);
+        self.terminated = true;
+        self.audit_pause.noteTermination(.diagnostic_termination, self.executed_steps);
+        const failure = self.ready.failure;
+        machoCapturePrint(
+            "macho-processor: READY COMPILER FAULT: kind={s} step={d} rip=0x{x} thread=0x{x} expected={s} observed={s} reason={s}; terminating before unproven generated code can execute\n",
+            .{
+                failure.kind.label(),
+                failure.step,
+                self.regs.rip,
+                self.active_guest_thread,
+                if (failure.expected.len != 0) failure.expected else "<none>",
+                if (failure.observed.len != 0) failure.observed else "<none>",
+                if (failure.reason.len != 0) failure.reason else "<none>",
+            },
+        );
+        self.logReadyCompilerSummary();
+        self.logJitHealth(true);
+        self.backend_diagnostics.logSummary();
+        self.logTranslationEconomics();
+        macho_log.flushAsyncTransport();
+        self.macho_log.flush();
+        native_crash.recordPhase("ready-compiler-fault");
+        _ = std.c.raise(std.c.SIG.SEGV);
+        // The native handler normally re-raises SIGSEGV. If it returns, the
+        // failed readiness path must still be unable to continue.
+        std.c.abort();
+    }
+
+    /// Record a failed host mmap from the Xenia backend's code-cache window.
+    /// MAP_JIT failures are separated from ordinary allocation failures so the
+    /// crash report answers the important question: missing Apple JIT support,
+    /// or a code-cache allocation/publication bug after support was available.
+    pub fn noteJitHostMmapFailure(
+        self: *MachOState,
+        stage: []const u8,
+        address: u64,
+        length: u64,
+        prot: u64,
+        flags: u64,
+        map_jit: bool,
+    ) void {
+        var line_buffer: [512]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &line_buffer,
+            "x64 backend {s} mmap failed: address=0x{x} length={d} prot=0x{x} flags=0x{x} map_jit={} host JIT storage is unavailable",
+            .{ stage, address, length, prot, flags, map_jit },
+        ) catch "x64 backend mmap failed: diagnostic formatting exhausted";
+        const finding: jit.JitHealthFinding = if (map_jit) .jit_support_failure else .code_cache_failure;
+        const observation = self.jit_health.observeHostFailure(finding, line, self.executed_steps);
+        self.reportJitHealthObservation(observation);
+    }
+
+    /// A failed protection transition means emitted bytes did not reach the
+    /// permissions Xenia asked for. Keep it distinct from mmap so the exact
+    /// publication edge is visible before the intentional crash.
+    pub fn noteJitHostMprotectFailure(
+        self: *MachOState,
+        route: []const u8,
+        address: u64,
+        length: u64,
+        prot: u64,
+    ) void {
+        var line_buffer: [512]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &line_buffer,
+            "x64 backend {s} mprotect failed: address=0x{x} length={d} prot=0x{x} executable publication cannot be trusted",
+            .{ route, address, length, prot },
+        ) catch "x64 backend mprotect failed: diagnostic formatting exhausted";
+        const observation = self.jit_health.observeHostFailure(
+            .executable_publication_failure,
+            line,
+            self.executed_steps,
+        );
+        self.reportJitHealthObservation(observation);
+    }
+
+    /// Emit the compact JIT health account at a heartbeat or at run exit.
+    /// Progress is evidence of a working compiler path, not evidence that the
+    /// application is ready; the readiness contract remains the authority for
+    /// activation and presentation.
+    pub fn logJitHealth(self: *const MachOState, force: bool) void {
+        const report = self.jit_health.summary();
+        if (!force and report.observed_lines == 0) return;
+        machoCapturePrint(
+            "macho-processor: XENIA JIT HEALTH: verdict={s} phase={s} armed={} armed_step={d} lines(messages/physical)={d}/{d} startup_suppressed={d} translation(progress/generation/replays/regressions)={d}/{d}/{d}/{d} diagnostics(label/compile/code_cache/publication/jit_support)={d}/{d}/{d}/{d}/{d} mapping(observed/verified/violations)={d}/{d}/{d} map_jit(observed/verified)={d}/{d} last_event={s} last_event_step={d} first_finding={s} first_finding_step={d} last_finding={s} last_finding_step={d}; startup diagnostics are retained separately, and armed compiler/code-cache/publication failures or contradictory mapping metadata are terminal\n",
+            .{
+                report.verdict().label(),
+                report.phase.label(),
+                report.armed,
+                report.armed_step,
+                report.observed_lines,
+                report.physical_lines,
+                report.startup_suppressed_diagnostics,
+                report.translation_progress_events,
+                report.highest_generation,
+                report.translation_replays,
+                report.generation_regressions,
+                report.label_failures,
+                report.compile_failures,
+                report.code_cache_failures,
+                report.executable_publication_failures,
+                report.jit_support_failures,
+                report.mapping_contract_observations,
+                report.mapping_contract_verified,
+                report.mapping_contract_violations,
+                report.map_jit_mappings,
+                report.map_jit_verified,
+                report.last_event.label(),
+                report.last_event_step,
+                report.first_finding.label(),
+                report.first_finding_step,
+                report.last_finding.label(),
+                report.last_finding_step,
+            },
+        );
+    }
+
     pub fn observeReadyCompilerText(self: *MachOState, line: []const u8) void {
         if (!self.ready.enabled()) return;
+        // The guest log bridge may deliver a whole diagnostic/configuration
+        // blob in one callback. Readiness owns physical compiler lines, just
+        // like the JIT ledger; otherwise a harmless CONFIG DUMP header can be
+        // retained as `observed=` and poison the compile check before the
+        // actual compiler has had a chance to run.
+        var lines = std.mem.splitScalar(u8, line, '\n');
+        while (lines.next()) |raw_line| {
+            const physical_line = if (raw_line.len != 0 and raw_line[raw_line.len - 1] == '\r')
+                raw_line[0 .. raw_line.len - 1]
+            else
+                raw_line;
+            if (physical_line.len == 0) continue;
+            self.observeReadyCompilerPhysicalLine(physical_line);
+        }
+    }
+
+    fn observeReadyCompilerPhysicalLine(self: *MachOState, line: []const u8) void {
         if (ready_compiler.xenia.translationProgressFromText(line)) |event| {
             if (self.ready.noteTranslationProgress(event.generation, self.executed_steps)) {
                 machoCapturePrint(
@@ -2757,6 +3823,7 @@ pub const MachOState = struct {
             const already_reached = self.ready.reached_mask & stage_bit != 0;
             const accepted = self.ready.noteStage(@intFromEnum(stage), self.executed_steps, "xenia:work_unit");
             if (!already_reached) self.logReadyCompilerStage(stage, accepted, self.executed_steps, "xenia:work_unit");
+            if (accepted and stage == .processor_ready) self.jit_health.arm(self.executed_steps);
         }
         if (ready_compiler.Runtime.compilerDiagnosticKind(line)) |kind| {
             machoCapturePrint(
@@ -2884,14 +3951,7 @@ pub const MachOState = struct {
             .failed => {
                 self.logReadyCompilerFailure();
                 if (self.ready.enforce and !self.terminated) {
-                    self.faulted = true;
-                    self.exit_code = 125;
-                    self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.runtime_invariant_failure);
-                    self.terminated = true;
-                    machoCapturePrint(
-                        "macho-processor: READY COMPILER: strict gate stopped execution before application readiness; no gameplay result is valid\n",
-                        .{},
-                    );
+                    self.faultOnReadyCompilerFailure();
                 }
             },
         }
@@ -3417,21 +4477,40 @@ pub const MachOState = struct {
             return self.referenced[index];
         }
 
+        fn hostPathExists(self: *const ReadyPlanContext, path: []const u8) bool {
+            _ = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch return false;
+            return true;
+        }
+
+        fn hostPrefixHasVulkanLoader(self: *const ReadyPlanContext, prefix: []const u8) bool {
+            var path_buffer: [1024]u8 = undefined;
+            // This is a native Rosette runtime probe. An x86_64 loader in a
+            // managed build prefix is useful to the translated toolchain but
+            // cannot satisfy the ARM64 process's Vulkan dependency.
+            for (macos_host_contract.native_vulkan_loader_suffixes) |suffix| {
+                const candidate = macos_host_contract.joinPath(prefix, suffix, &path_buffer) orelse continue;
+                if (self.hostPathExists(candidate)) return true;
+            }
+            return false;
+        }
+
         fn hostCapability(context: *anyopaque, name: []const u8) bool {
             const self: *ReadyPlanContext = @ptrCast(@alignCast(context));
             if (std.mem.eql(u8, name, "decoder-audit")) return self.vex_ready;
             if (std.mem.eql(u8, name, "vex-safety")) return self.vex_ready;
             if (std.mem.eql(u8, name, "vulkan-loader")) {
-                // Either the SDK is configured or a loader sits on one of the
-                // usual paths. Advisory, so a false negative costs a note.
-                if (std.c.getenv("VULKAN_SDK") != null) return true;
-                const candidates = [_][]const u8{
-                    "/usr/local/lib/libvulkan.1.dylib",
-                    "/opt/homebrew/lib/libvulkan.1.dylib",
-                };
-                for (candidates) |candidate| {
-                    _ = std.Io.Dir.cwd().statFile(self.io, candidate, .{}) catch continue;
-                    return true;
+                // An environment variable is only a location hint, not proof
+                // that a loader exists. Check the actual file and keep native
+                // ARM Homebrew valid here: this is the host-native Vulkan
+                // provider, not an x86 build-tool lookup.
+                if (std.c.getenv("VULKAN_SDK")) |raw_sdk| {
+                    if (self.hostPrefixHasVulkanLoader(std.mem.span(raw_sdk))) return true;
+                }
+                if (std.c.getenv(macos_host_contract.host_root_environment)) |raw_root| {
+                    if (self.hostPrefixHasVulkanLoader(std.mem.span(raw_root))) return true;
+                }
+                for (macos_host_contract.vulkan_loader_default_paths) |candidate| {
+                    if (self.hostPathExists(candidate)) return true;
                 }
                 return false;
             }
@@ -4017,7 +5096,16 @@ pub const MachOState = struct {
         // Emulator-owned bring-up, observed only.
         if (self.gpu_bootstrap.seen(.initialize_engines)) ledger.observe(.gpu_engines_initialised, at);
         if (self.gpu_bootstrap.seen(.graphics_interrupt_callback)) ledger.observe(.interrupt_callback_registered, at);
-        if (self.gpu_bootstrap.seen(.graphics_interrupt_dispatch)) ledger.observe(.interrupt_callback_dispatched, at);
+        // The bootstrap ladder learns this from the emulator's log lines. The
+        // tracepoint at `EmulateCPInterruptDPC` learns it from the instruction
+        // pointer, and on the 2026-08-31 run it had fired a hundred and fifty
+        // times while this clause still read "registered but never fired". A
+        // clause a stronger observer has already satisfied must not stay unmet.
+        if (self.gpu_bootstrap.seen(.graphics_interrupt_dispatch) or
+            self.gpu_bringup_gate.recordFor(.emulate_cp_interrupt_dpc).crossed())
+        {
+            ledger.observe(.interrupt_callback_dispatched, at);
+        }
         if (self.gpu_bootstrap.seen(.ring_buffer)) ledger.observe(.ring_buffer_initialised, at);
 
         // Title-owned behaviour, observed only. `satisfy` would refuse these
@@ -4054,9 +5142,131 @@ pub const MachOState = struct {
     /// working emulator producer.
     fn guestOutputFramesPresented(self: *const MachOState) u64 {
         const ledger = &self.dynamic_forwarder.native_presenter.ledger;
-        return ledger.host_frames_presented +|
-            ledger.guest_output_frames_presented +|
-            self.native_window.guest_frames_presented;
+        return gpu.presentation_provenance.guestFrameCount(
+            ledger.guest_output_frames_presented,
+            self.native_window.guest_frames_presented,
+        );
+    }
+
+    /// Join the native presenter, frame-source and boundary ledgers without
+    /// changing any of their ownership semantics. A diagnostic Cocoa paint is
+    /// a valid sink observation but is explicitly ineligible to keep the guest
+    /// presenter pump alive. Conversely, a real Xenia/Vulkan source makes a
+    /// quiet presenter actionable even before its first completed frame.
+    fn syncPresentationProvenance(self: *MachOState) void {
+        const native = &self.dynamic_forwarder.native_presenter.ledger;
+        const paint = self.gpu_bringup_gate.recordFor(.host_paint);
+        _ = self.presentation_provenance.observe(.{
+            .step = self.executed_steps,
+            .native_presenter_ready = self.dynamic_forwarder.nativePresenterStage().isReady(),
+            .guest_source_available = self.dynamic_forwarder.guestFrontBufferAvailable() or self.gpu_frontbuffer != null,
+            .host_source_available = native.host_frames_presented != 0 or self.dynamic_forwarder.guestVulkanPresentRequests() != 0,
+            .guest_frames_presented = self.guestOutputFramesPresented(),
+            .host_frames_presented = native.host_frames_presented,
+            .diagnostic_frames_presented = native.diagnostic_frames_presented +| self.native_window.diagnostic_frames_presented,
+            .guest_swap_observed = self.execution_tracepoints.roleEntered(.swap) or
+                self.guest_vdswap_packet_encoded or
+                self.gpu_vd_swap_contract.authentic_consumptions != 0,
+            .presenter_paint_crossed = paint.crossed(),
+            .presenter_paint_last_step = paint.last_step,
+        });
+        self.gpu_bringup_gate.setRepeatingLivenessEligible(
+            .host_paint,
+            self.presentation_provenance.livenessEligible(),
+        );
+    }
+
+    fn logPresentationProvenance(self: *MachOState, force: bool) void {
+        self.syncPresentationProvenance();
+        const ledger = &self.presentation_provenance;
+        const fingerprint = ledger.fingerprint();
+        if (!force and fingerprint == self.presentation_provenance_last_fingerprint) return;
+        self.presentation_provenance_last_fingerprint = fingerprint;
+        const snapshot = ledger.last;
+        const verdict = ledger.current();
+        const missing = ledger.missingBoundary();
+        machoCapturePrint(
+            "macho-processor: GPU PRESENTATION PROVENANCE: verdict={s} missing={s} native_ready={s} guest_source={s} host_source={s} guest_frames={d} host_frames={d} diagnostic_frames={d} guest_swap={s} presenter_paint={s} paint_liveness={s} transitions={d} first_source_step={d} first_guest_frame_step={d} first_host_frame_step={d} step={d}; {s}; diagnostic-only paint is sink evidence, never guest-output evidence\n",
+            .{
+                verdict.label(),
+                missing.label(),
+                if (snapshot.native_presenter_ready) "YES" else "NO",
+                if (snapshot.guest_source_available) "YES" else "NO",
+                if (snapshot.host_source_available) "YES" else "NO",
+                snapshot.guest_frames_presented,
+                snapshot.host_frames_presented,
+                snapshot.diagnostic_frames_presented,
+                if (snapshot.guest_swap_observed) "YES" else "NO",
+                if (snapshot.presenter_paint_crossed) "YES" else "NO",
+                if (ledger.livenessEligible()) "YES" else "NO",
+                ledger.transitions,
+                ledger.first_source_step,
+                ledger.first_guest_frame_step,
+                ledger.first_host_frame_step,
+                self.executed_steps,
+                verdict.describe(),
+            },
+        );
+        self.logGuestOutputMailbox(snapshot.guest_swap_observed);
+    }
+
+    /// The presenter's own account of the guest output it does not have,
+    /// joined to Rosette's independent reading of whether a swap happened.
+    ///
+    /// `mailbox=-1 frontbuffer=0x0 refresh_attempt_count=0` is where a reader
+    /// arrives, and every one of those numbers is a consequence: the mailbox is
+    /// empty because nothing refreshed it, and nothing refreshed it because no
+    /// swap was produced. Printing the presenter's numbers next to Rosette's
+    /// swap frontier is what turns the loudest subsystem in the chain back into
+    /// the last one.
+    fn logGuestOutputMailbox(self: *MachOState, swap_observed: bool) void {
+        const ledger = &self.gpu_guest_output_mailbox;
+        if (ledger.observations == 0) return;
+        const verdict = ledger.verdict(swap_observed);
+        const latest = ledger.latest;
+        machoCapturePrint(
+            "macho-processor: GUEST OUTPUT MAILBOX: verdict={s} owner={s} reason={s} mailbox={d} frontbuffer=0x{x} refresh(attempts/successes)={d}/{d} peak(attempts/successes)={d}/{d} force_clear_frames={d} rosette_swap_observed={s} observations={d} first_step={d} last_step={d} step={d}; {s}\n",
+            .{
+                verdict.label(),
+                verdict.owner(),
+                latest.reason.label(),
+                latest.mailbox_index,
+                latest.frontbuffer,
+                latest.refresh_attempts,
+                latest.refresh_successes,
+                ledger.peak_refresh_attempts,
+                ledger.peak_refresh_successes,
+                ledger.force_clear_frames,
+                if (swap_observed) "YES" else "NO",
+                ledger.observations,
+                ledger.first_step,
+                ledger.last_step,
+                self.executed_steps,
+                verdict.describe(),
+            },
+        );
+    }
+
+    fn logNearNullDispatchStatus(self: *MachOState, force: bool) void {
+        const predictor = &self.near_null_predictor;
+        const fingerprint = predictor.statusFingerprint();
+        if (!force and fingerprint == self.near_null_status_last_fingerprint) return;
+        self.near_null_status_last_fingerprint = fingerprint;
+        const status = predictor.status();
+        machoCapturePrint(
+            "macho-processor: NEAR NULL DISPATCH CONTRACT: verdict={s} observed=YES import_receiver_events={d} native_receiver_events={d} object_header_clobbers={d} benign_skipped={d} signatures={d} emissions={d} step={d}; {s}; absence of a retained event is bounded observer evidence, not proof that every pointer is valid\n",
+            .{
+                status.label(),
+                predictor.near_null_dispatches -| predictor.benign_skipped,
+                predictor.native_receiver_events,
+                predictor.clobber_events,
+                predictor.benign_skipped,
+                predictor.distinct_signatures,
+                predictor.emissions,
+                self.executed_steps,
+                status.describe(),
+            },
+        );
     }
 
     /// Map the native presenter state to the health schema without weakening
@@ -4134,6 +5344,7 @@ pub const MachOState = struct {
     /// and a missing count stays untested rather than becoming a guessed pass.
     pub fn refreshGraphicsHealthContract(self: *MachOState) void {
         const at = self.executed_steps;
+        self.syncPresentationProvenance();
 
         if (self.event_stream.run_id != 0 or at != 0)
             self.recordGraphicsHealth(.application_started, .satisfied, .process, 1, "event stream has a run identity");
@@ -4341,14 +5552,10 @@ pub const MachOState = struct {
         } else if (self.dynamic_forwarder.guestFrontBufferAvailable()) {
             self.recordGraphicsHealth(.guest_output_refreshed, .degraded, .native_presenter, 1, "a guest output source was discovered, but no guest-produced frame has been refreshed");
         }
-        const native_ledger = &self.dynamic_forwarder.native_presenter.ledger;
         const rendered_frames = guest_output_frames;
-        const diagnostic_frames = native_ledger.diagnostic_frames_presented +| self.native_window.diagnostic_frames_presented;
         if (rendered_frames != 0) {
             self.observeGpuEarlyBoundary(.native_present_completed, .presenter, rendered_frames);
             self.recordGraphicsHealth(.native_present_completed, .satisfied, .native_presenter, rendered_frames, "Xenia/guest pixels completed a native presentation; diagnostic clears are counted separately");
-        } else if (diagnostic_frames != 0) {
-            self.recordGraphicsHealth(.native_present_completed, .degraded, .native_presenter, diagnostic_frames, "only Rosette diagnostic frames completed; the Cocoa sink is alive but no Xenia/guest pixels have been presented");
         }
     }
 
@@ -4357,7 +5564,17 @@ pub const MachOState = struct {
     /// observations that remain outside Rosette's mutation authority.
     pub fn refreshApplicationController(self: *MachOState) application_controller.Decision {
         const guest_output_frames = self.guestOutputFramesPresented();
-        const deadlocked = self.deadlock_predictor.worst().finding.deadlocked();
+        // The pthread predictor observes Rosette's host/cooperative scheduler,
+        // including idle worker condvars. It must remain visible in host
+        // diagnostics, but it is not evidence that the guest is deadlocked.
+        // Feed the controller only the guest wait graph; otherwise an
+        // unnotified host worker can make the application controller claim a
+        // guest wait deadlock and select the wrong owner for the next action.
+        const guest_wait_verdict = self.wait_graph.summary().verdict();
+        const guest_wait_deadlocked = switch (guest_wait_verdict) {
+            .orphan_wait, .handshake_without_progress, .wait_cycle => true,
+            .idle, .healthy, .orphan_signal, .timeout_without_signal => false,
+        };
         return self.application_controller.observe(.{
             .step = self.executed_steps,
             .guest_progress_step = if (self.xenia_gpu_causal_trace.last_progress_step != 0) self.xenia_gpu_causal_trace.last_progress_step else null,
@@ -4381,7 +5598,7 @@ pub const MachOState = struct {
             .powerpc_callback_returned = self.interrupt_callback_transaction.callback_returns != 0,
             .presenter_ready = self.dynamic_forwarder.nativePresenterStage().isReady(),
             .presenter_device_lost = self.dynamic_forwarder.nativePresenterStage() == .device_lost,
-            .guest_wait_deadlocked = deadlocked,
+            .guest_wait_deadlocked = guest_wait_deadlocked,
             .guest_waiting = self.pthreads.blocked_threads != 0,
             .guest_runnable = self.pthreads.activeCount() != 0,
         });
@@ -4392,8 +5609,19 @@ pub const MachOState = struct {
     /// boundary is the safety mechanism that prevents a diagnostic frame from
     /// erasing the actual producer defect.
     fn applyApplicationController(self: *MachOState, decision: application_controller.Decision) void {
+        // Validate the exact decision against the sample that produced it
+        // before allowing any host mutation.  The integrity checkpoint will
+        // terminate the run and retain the violating pair; this guard keeps a
+        // malformed authorized decision from reaching the presenter or GPU
+        // callback even for the small interval before that checkpoint runs.
+        if (decision.contractViolation(self.application_controller.last_sample) != null) return;
         switch (decision.action) {
             .drain_gpu_interrupts => {
+                // The decision ledger is authoritative for whether this host
+                // mutation was authorized. A future policy regression must not
+                // be able to drain a guest callback merely by selecting the
+                // action with the authorization bit cleared.
+                if (!decision.host_action_authorized) return;
                 if (self.gpu_interrupt_callback == 0 or self.gpu_xenos_runtime.interrupts.pending_count == 0) return;
                 const delivered = self.gpu_xenos_runtime.drainInterrupts(deliverGpuInterrupt, self, 32);
                 if (delivered != 0) self.application_controller_host_drains +|= delivered;
@@ -4415,8 +5643,8 @@ pub const MachOState = struct {
             const policy = cocoaGraphicsPolicyFromEnvironment();
             self.cocoa_graphics.configure(policy);
             machoCapturePrint(
-                "macho-processor: COCOA GRAPHICS CONTROL: schema={d} policy={s} (verified-guest-fallback is default; ROSETTE_COCOA_GRAPHICS_CONTROL=observe disables active fallback); raw-machine-code-to-Cocoa=REFUSED, semantic-boundaries-only=YES. The control plane may classify and route an already verified frame, but cannot fabricate VdSwap, XE_SWAP, render-target state or a callback transition\n",
-                .{ gpu.cocoa_runtime.schema_version, policy.label() },
+                "macho-processor: COCOA GRAPHICS CONTROL: schema={d} owner={s} subowner={s} policy={s} (verified-guest-fallback is default; ROSETTE_COCOA_GRAPHICS_CONTROL=observe disables active fallback); raw-machine-code-to-Cocoa=REFUSED, semantic-boundaries-only=YES. The control plane may classify and route an already verified frame, but cannot fabricate VdSwap, XE_SWAP, render-target state or a callback transition\n",
+                .{ gpu.cocoa_runtime.schema_version, ownership_contract.root_owner, "rosette:graphics-control", policy.label() },
             );
         }
 
@@ -4561,6 +5789,7 @@ pub const MachOState = struct {
                 .ready = self.dynamic_forwarder.guestVulkanDeviceReady(),
                 .submissions = ownership.xenia_submissions,
                 .presents = ownership.xenia_presents,
+                .completed_presents = ownership.xenia_present_completions,
             },
             .xenos = .{
                 .ring = self.gpu_ring_watch_base,
@@ -4803,8 +6032,10 @@ pub const MachOState = struct {
     pub fn faultOnWindowAdmission(self: *MachOState, outcome: gpu.WindowAdmissionOutcome) void {
         const detail = outcome.detail;
         machoCapturePrint(
-            "macho-processor: WINDOW ADMISSION FAULT: actor={s} facility={s} operation={s} verdict={s} origin={s} step={d} rip=0x{x} thread=0x{x}\n",
+            "macho-processor: WINDOW ADMISSION FAULT: owner={s} subowner={s} actor={s} facility={s} operation={s} verdict={s} origin={s} step={d} rip=0x{x} thread=0x{x}\n",
             .{
+                ownership_contract.root_owner,
+                detail.actor.label(),
                 detail.actor.label(),
                 detail.facility.label(),
                 detail.operation.label(),
@@ -4825,6 +6056,11 @@ pub const MachOState = struct {
             .{},
         );
         macho_log.flushAsyncTransport();
+        // The async ring drain only hands bytes to `write(2)`.  Before an
+        // intentional integrity fault, synchronize every diagnostic file as
+        // well so the crash report cannot outrun the evidence that selected
+        // the fault (including the filtered Ready Compiler stream).
+        self.macho_log.flush();
         native_crash.recordPhase("window-admission-fault");
         _ = std.c.raise(std.c.SIG.SEGV);
     }
@@ -5034,9 +6270,66 @@ pub const MachOState = struct {
         const allow_raw = std.c.getenv("ROSETTE_RUN_INTEGRITY_ALLOW");
         const allow: []const u8 = if (allow_raw) |raw| std.mem.span(raw) else "";
         self.run_integrity.configure(policy, allow);
+        // `observe` is the explicit non-invasive mode. Both `fault` and
+        // `warn` select the evidence-first predicates so a diagnostic run
+        // cannot quietly classify a proven reusable eviction or deadlock as
+        // harmless merely because an unrelated counter is moving.
+        self.run_integrity_strict = policy != .observe;
         machoCapturePrint(
-            "macho-processor: RUN INTEGRITY: schema={d} policy={s} invariants={d} allow=[{s}] (ROSETTE_RUN_INTEGRITY=fault|warn|observe, ROSETTE_RUN_INTEGRITY_ALLOW=<labels>). Each invariant states what arms it, so an unarmed one is unobserved rather than passing; the first armed violation stops the run and names its owner\n",
-            .{ run_integrity.schema_version, policy.label(), run_integrity.invariant_count, if (allow.len != 0) allow else "<none>" },
+            "macho-processor: RUN INTEGRITY: schema={d} policy={s} strict_fail_fast={} invariants={d} allow=[{s}] (ROSETTE_RUN_INTEGRITY=fault|warn|observe, ROSETTE_RUN_INTEGRITY_ALLOW=<labels>). Each invariant states what arms it, so an unarmed one is unobserved rather than passing; the first armed violation stops the run and names its owner\n",
+            .{
+                run_integrity.schema_version,
+                policy.label(),
+                self.run_integrity_strict,
+                run_integrity.invariant_count,
+                if (allow.len != 0) allow else "<none>",
+            },
+        );
+    }
+
+    /// Assemble the one shared output-evidence record used by both capability
+    /// coverage and run-integrity. Keeping the construction here prevents a
+    /// raw PM4 draw count, a retained replay, and a guest-owned output request
+    /// from becoming three different meanings of "frame opportunity".
+    fn guestOutputEvidence(self: *const MachOState) host_contract_coverage.GuestOutputEvidence {
+        return .{
+            .raw_draws_consumed = self.gpu_xenos_runtime.draw_count,
+            .renderable_draws_observed = self.gpu_xenos_runtime.renderable_draw_observations,
+            .color_resolve_observations = self.gpu_xenos_runtime.color_resolve_observations,
+            .guest_swap_boundaries = if (self.execution_tracepoints.roleEntered(.swap)) 1 else 0,
+            .guest_vdswap_packets_encoded = if (self.guest_vdswap_packet_encoded) 1 else 0,
+        };
+    }
+
+    /// Return the budget measurements after the proven guest-main boundary.
+    /// Before that boundary the empty summary is intentional: the process may
+    /// be doing substantial Xenia setup, but no guest-time rate exists yet.
+    fn runBudgetGuestWindowSummary(self: *const MachOState) run_budget.Summary {
+        return self.audit_budget_guest_window.summary(self.audit_budget.summary());
+    }
+
+    /// The ten-second settling interval applies inside the guest window, not
+    /// to Rosette's process-creation or Xenia loader prefix. Keeping this test
+    /// beside the summary makes every report and gate use the same boundary.
+    fn runBudgetGuestWindowObserved(self: *const MachOState, totals: run_budget.Summary) bool {
+        return self.audit_budget_guest_window.started and
+            totals.host_ns >= run_integrity.budget_observation_host_seconds * std.time.ns_per_s;
+    }
+
+    fn runBudgetGuestWindowVerdict(
+        self: *const MachOState,
+        totals: run_budget.Summary,
+    ) run_budget.Verdict {
+        if (!self.runBudgetGuestWindowObserved(totals)) return .unobserved;
+        // Emulated guest time can remain flat while Xenia is translating the
+        // next guest functions. That is not an idle guest: the ready-compiler
+        // contract has an independent, monotonic external-progress witness
+        // for exactly this phase. Defer only the below-budget result while
+        // that witness is fresh; the raw budget still convicts once the same
+        // bounded quiet window expires.
+        return self.audit_budget.verdictForWithProgress(
+            totals,
+            self.ready.hasRecentExternalProgress(self.executed_steps),
         );
     }
 
@@ -5058,11 +6351,231 @@ pub const MachOState = struct {
         // stale is the same stale-snapshot defect the rest of this gate exists
         // to catch.
         self.refreshWaitAuditWitness();
+        // The wait graph has the same stale-snapshot hazard. Its summary is
+        // part of the integrity decision, so update the independent progress
+        // axis before taking the snapshot that the contract will judge.
+        self.refreshWaitGraphProgress();
+        // Ordering is itself an integrity input. Synchronise it in the same
+        // snapshot that judges waits, capabilities, and PM4 so a newly
+        // observed dependant cannot sit in the ledger until a later graphics
+        // report while the run-integrity gate still sees the old answer.
+        self.syncMandatoryOrder();
+        // The witness ledger is another integrity input. It is normally
+        // synchronised with the graphics report, but run-integrity can fire
+        // before that report on the same checkpoint. Refresh it here so the
+        // closure gate never judges a stale observer set.
+        self.syncPacketCensus();
+        self.syncMonotoneWitnesses(self.executed_steps);
+        // Readiness is an admission input, not merely a verbose report. Keep
+        // this snapshot beside the other ledgers so a component cannot be
+        // proven or used between the readiness report and the integrity judge.
+        self.syncComponentReadiness();
+        const component_readiness = self.component_readiness.summary();
+        const component_readiness_armed = component_readiness.proven != 0 or
+            component_readiness.used_unproven != 0 or
+            component_readiness.broken != 0;
         const admission = self.window_admission.summary();
         const frames = self.cocoa_graphics.frames.summary();
+        const ownership = self.dynamic_forwarder.graphicsOwnershipSnapshot();
         const coverage = self.host_coverage.report();
         const economics = self.translation_economics.summary();
+        const target = self.gpu_xenos_runtime.renderTargetEvidence();
+        const pm4_evidence = self.gpu_xenos_runtime.runtimeEvidence();
+        const guest_output = self.guestOutputEvidence();
+        const mandatory_order_summary = self.mandatory_order.summary();
+        // Which of Rosette's own counters can be trusted. Judged from the same
+        // snapshot as everything else so a gate cannot stop the run on a
+        // disagreement that the settling window had already resolved.
+        const witnesses = self.monotone_witness.summary();
+        // Read beside the witnesses so both halves of the corroboration story
+        // come from one instant: how many claims have two observers, and how
+        // many of those pairs are actively disagreeing.
+        const claims = self.claim_reconciliation.summary();
+
+        // The boundary the frontier blames, and whether anything but the
+        // tracepoint has spoken about it. A negative that steers the whole
+        // investigation has to be substantiated by more than the arming.
+        var frontier_armed: u32 = 0;
+        var frontier_reached: u32 = 0;
+        var frontier_observers: u32 = 0;
+        var frontier_settled: u64 = 0;
+        // How much of the watched surface has ever fired. Zero means the guest
+        // has not started this phase and the tracepoints have never
+        // demonstrated they work, so the frontier is the first boundary of
+        // something that has not begun rather than a wall the run is at.
+        var frontier_crossed_elsewhere: u32 = 0;
+        for (gpu.bringup_gate.contractBoundaries()) |boundary| {
+            if (self.gpu_bringup_gate.recordFor(boundary).crossed()) {
+                frontier_crossed_elsewhere += 1;
+            }
+        }
+        if (self.gpu_bringup_gate.frontier(self.executed_steps)) |frontier| {
+            // Restart the dwell timer whenever the frontier moves. A run that
+            // is still crossing boundaries is progressing, and judging its
+            // newest frontier would stop it for having arrived.
+            const which: u8 = @intFromEnum(frontier);
+            if (self.frontier_boundary_last != which) {
+                self.frontier_boundary_last = which;
+                self.frontier_boundary_since_step = self.executed_steps;
+            }
+            frontier_settled = self.executed_steps -| self.frontier_boundary_since_step;
+            const frontier_addresses = self.execution_tracepoints.boundaryAddressCoverage(
+                @intFromEnum(frontier),
+            );
+            frontier_armed = frontier_addresses.armed;
+            frontier_reached = frontier_addresses.reached;
+            frontier_observers = self.claim_reconciliation.observersForBoundary(frontier);
+        } else {
+            self.frontier_boundary_last = 0xFF;
+        }
         const worst_park = self.deadlock_predictor.worst();
+        const budget_totals = self.runBudgetGuestWindowSummary();
+        const budget_observed = self.runBudgetGuestWindowObserved(budget_totals);
+        const budget_verdict = self.runBudgetGuestWindowVerdict(budget_totals);
+        // Do not turn the process-creation/static-initializer/Xenia-loader
+        // prefix into a throughput fault: zero guest milliseconds are expected
+        // there. Once the guest-main boundary is proven and ten host seconds
+        // are represented in the same post-boundary window, a BELOW-BUDGET
+        // verdict is a reachability defect, not an early startup sample.
+
+        // The predictor's NEVER_NOTIFIED result is intentionally retained as
+        // evidence but is not enough to stop an otherwise advancing run: an
+        // idle worker and a lost producer have the same host-side shape. Find
+        // the strongest object-level finding separately because a weaker
+        // NEVER_NOTIFIED object may outrank a proven lower-numbered finding in
+        // the predictor's severity ordering. Explicit mature cycles are even
+        // stronger and are folded into the same immutable snapshot.
+        var deadlock_observed = worst_park.object != null and worst_park.finding.deadlocked();
+        var deadlock_proven = false;
+        var deadlock_finding = @intFromEnum(worst_park.finding);
+        var deadlock_waiters: u64 = if (worst_park.object) |object| object.waiters else 0;
+        var deadlock_park_steps: u64 = if (worst_park.object) |object| object.longest_park_steps else 0;
+        var proven_finding: ?deadlock_predictor.Finding = null;
+        var proven_object: ?deadlock_predictor.Object = null;
+        for (self.deadlock_predictor.objects[0..self.deadlock_predictor.object_count]) |object| {
+            const finding = self.deadlock_predictor.classify(object);
+            if (!finding.provenDeadlock()) continue;
+            if (proven_finding == null or
+                @intFromEnum(finding) > @intFromEnum(proven_finding.?))
+            {
+                proven_finding = finding;
+                proven_object = object;
+            }
+        }
+        if (proven_finding) |finding| {
+            deadlock_observed = true;
+            deadlock_proven = true;
+            deadlock_finding = @intFromEnum(finding);
+            if (proven_object) |object| {
+                deadlock_waiters = object.waiters;
+                deadlock_park_steps = object.longest_park_steps;
+            }
+        }
+
+        // `findCycle` is a separate walk because `classify` cannot infer a
+        // cycle from one object. Require every member of the cycle to have
+        // crossed the predictor's mature park window, so a short lock-order
+        // transition during startup cannot become a fatal run-integrity stop.
+        for (self.deadlock_predictor.threads[0..self.deadlock_predictor.thread_count]) |thread| {
+            if (!thread.state.parked()) continue;
+            var chain: [8]u64 = undefined;
+            const cycle = self.deadlock_predictor.findCycle(thread.handle, &chain) orelse continue;
+            if (cycle.len < 2) continue;
+            var mature = true;
+            var oldest_park: u64 = 0;
+            for (cycle) |handle| {
+                var found_thread = false;
+                for (self.deadlock_predictor.threads[0..self.deadlock_predictor.thread_count]) |candidate| {
+                    if (candidate.handle != handle) continue;
+                    found_thread = true;
+                    const parked_steps = self.executed_steps -| candidate.blocked_since_step;
+                    if (parked_steps < deadlock_predictor.minimum_park_steps) mature = false;
+                    oldest_park = @max(oldest_park, parked_steps);
+                    break;
+                }
+                if (!found_thread) mature = false;
+            }
+            if (!mature) continue;
+
+            deadlock_observed = true;
+            deadlock_proven = true;
+            deadlock_finding = @intFromEnum(deadlock_predictor.Finding.wait_cycle);
+            deadlock_park_steps = oldest_park;
+            for (self.deadlock_predictor.objects[0..self.deadlock_predictor.object_count]) |object| {
+                if (object.address != thread.waiting_on) continue;
+                deadlock_waiters = object.waiters;
+                break;
+            }
+            break;
+        }
+
+        // Native presenter health is judged from its own dependency-ordered
+        // stage, not from the absence of guest pixels. A diagnostic clear can
+        // prove that the Cocoa sink is alive while the title has not reached a
+        // source yet; that is not a presenter failure. Conversely, a terminal
+        // bring-up failure or device loss must stop a run once the presenter
+        // was genuinely attempted. Surface backpressure and swapchain rebuilds
+        // remain retryable by the presenter contract.
+        const native_presenter_stage = self.dynamic_forwarder.nativePresenterStage();
+        const presenter_attempted = self.dynamic_forwarder.native_presenter_attempts != 0;
+        const presenter_nonretryable_failures: u64 = if (presenter_attempted and
+            native_presenter_stage != .unstarted and
+            native_presenter_stage != .ready and
+            !native_presenter_stage.retryable())
+            1
+        else
+            0;
+
+        // Provisioning is only judgeable once its consumer boundary was seen.
+        // The raw refusal total is intentionally retained: not-harness-owned,
+        // already-present, and early address-unknown refusals are valid custody
+        // decisions. An unresolved storage refusal is actionable only while its
+        // console-owned resource is still unprovisioned.
+        const provisioning = self.gpu_provisioning_custody.summary();
+        const provisioning_armed = self.gpu_bootstrap.observations[
+            @intFromEnum(gpu.Step.initialize_engines)
+        ].seen;
+        var provisioning_actionable_refusals: u64 = 0;
+        for (self.gpu_provisioning_custody.records[0..self.gpu_provisioning_custody.count]) |record| {
+            if (record.actionableRefusal()) provisioning_actionable_refusals +|= 1;
+        }
+
+        // The policy's `requires_fault` bit is the authority here. In
+        // particular, `guest_synthetic_wake=REFUSED` is expected protection:
+        // the policy refuses Rosette permission to invent a guest signal, but
+        // that refusal is not itself evidence that the real signal was lost.
+        var wait_policy_observed = false;
+        var wait_policy_faults: u64 = 0;
+        for (self.wait_graph.objects) |record| {
+            if (!record.occupied) continue;
+            const policy_decision = record.policyDecision();
+            if (policy_decision.classification == .unobserved) continue;
+            wait_policy_observed = true;
+            if (policy_decision.requires_fault) wait_policy_faults +|= 1;
+        }
+
+        // Profile debt is only actionable after the profile itself says its
+        // dominant region is decisive. Startup's two-sample snapshot remains a
+        // useful breadcrumb, not a reason to terminate the process.
+        const execution_profile = self.startup.profile.summary();
+        const execution_profile_unclassified = execution_profile.by_region[
+            @intFromEnum(diagnostics_execution_profile.Region.unclassified)
+        ];
+        const execution_profile_unresolved = execution_profile.by_region[
+            @intFromEnum(diagnostics_execution_profile.Region.unresolved_symbol)
+        ];
+
+        // Swap-contract stages whose prerequisites hold and whose probes have
+        // never once been attempted. The contract's own verdict already calls
+        // this Rosette's hole rather than the title's absence; reading it here
+        // is what makes the run stop instead of printing it twenty times.
+        //
+        // Refreshed first so the summary and the attempt floor come from the
+        // same reading. The gate compares them against each other, and a stale
+        // pair is still self-consistent, but a stale one beside a fresh one
+        // would not be.
+        self.refreshVdSwapContract();
+        const vd_swap_probes = self.gpu_vd_swap_contract.diagnosisSummary();
 
         // The longest park on an object nothing has ever raised. A park on an
         // object that *has* been signalled is a late signal, which is a
@@ -5103,13 +6616,86 @@ pub const MachOState = struct {
         }
 
         // A wait subject that has timed out repeatedly and been signalled zero
-        // times. The audit calls some of these `expected_pump`; a pump whose
-        // signal never arrives is not a pump.
+        // times. A finite manual-reset poll is a completed guest timeout, not
+        // an unbounded wait; retain it in the observation but do not promote it
+        // into the wait-receives-signals fault. Its producer evidence is
+        // printed by logWaitAudit as a separate timeout contract.
         var unsignalled_timeouts: u64 = 0;
+        var timeout_subject: ?wait_audit.Subject = null;
+        var bounded_timeout_subjects: u64 = 0;
+        var bounded_timeout_attempts: u64 = 0;
+        var bounded_timeout_subject: ?wait_audit.Subject = null;
         for (self.wait_audit.subjects[0..self.wait_audit.count]) |subject| {
+            if (subject.timeout_class == .bounded_poll) {
+                bounded_timeout_subjects +|= 1;
+                bounded_timeout_attempts +|= subject.timeouts;
+                const better_bounded = bounded_timeout_subject == null or
+                    subject.timeouts > bounded_timeout_subject.?.timeouts or
+                    (subject.timeouts == bounded_timeout_subject.?.timeouts and
+                        (subject.first_step < bounded_timeout_subject.?.first_step or
+                            (subject.first_step == bounded_timeout_subject.?.first_step and
+                                subject.object < bounded_timeout_subject.?.object)));
+                if (better_bounded) bounded_timeout_subject = subject;
+                continue;
+            }
             if (subject.signals != 0 or subject.timeouts == 0) continue;
-            unsignalled_timeouts = @max(unsignalled_timeouts, subject.timeouts);
+            const better = timeout_subject == null or
+                subject.timeouts > timeout_subject.?.timeouts or
+                (subject.timeouts == timeout_subject.?.timeouts and
+                    (subject.first_step < timeout_subject.?.first_step or
+                        (subject.first_step == timeout_subject.?.first_step and
+                            subject.object < timeout_subject.?.object)));
+            if (!better) continue;
+            unsignalled_timeouts = subject.timeouts;
+            timeout_subject = subject;
         }
+        const selected_timeout_subject = timeout_subject orelse wait_audit.Subject{};
+        const selected_bounded_timeout = bounded_timeout_subject orelse wait_audit.Subject{};
+        const bounded_timeout_other_progress = bounded_timeout_subject != null and
+            selected_bounded_timeout.last_witness.advancedSince(selected_bounded_timeout.first_witness);
+        var bounded_timeout_notifier_proven = false;
+        if (bounded_timeout_subject != null) {
+            for (self.audit_sync.retained()) |entry| {
+                const address_matches = selected_bounded_timeout.object != 0 and
+                    entry.identity.address.guest_virtual == @as(u32, @truncate(selected_bounded_timeout.object));
+                const handle_matches = selected_bounded_timeout.handle != 0 and
+                    entry.identity.handle == selected_bounded_timeout.handle;
+                if (!address_matches and !handle_matches) continue;
+                bounded_timeout_notifier_proven = entry.fullyAttributed() and
+                    entry.standing().promotableToCause();
+                break;
+            }
+        }
+        const wait_graph_summary = self.wait_graph.summary();
+        const wait_graph_blocker = self.wait_graph.blocking() orelse wait_graph.ObjectRecord{};
+        const blocker_waiter = wait_graph_blocker.soleWaiter();
+        const blocker_signaller = wait_graph_blocker.soleSignaller();
+
+        // The deadlock predictor observes Rosette's host pthread condvars,
+        // while the wait graph observes explicit guest synchronization. A
+        // host worker that has never been notified is therefore not, by
+        // itself, proof that a guest producer was lost. Promote the raw census
+        // only when there is a causal witness: an actual guest wait with no
+        // signal, a classified sync-registry object whose waiter obligation is
+        // promotable, or a run that has stopped advancing altogether. This
+        // keeps fail-fast strictness for real contradictions while preventing
+        // idle host workers from terminating a healthy guest run.
+        const guest_wait_obligation = wait_graph_blocker.address != 0 and
+            wait_graph_blocker.waits != 0 and
+            wait_graph_blocker.signals == 0;
+        var registry_wait_obligation = false;
+        for (self.audit_sync.retained()) |entry| {
+            if (entry.waiter_count != 0 and entry.standing().promotableToCause()) {
+                registry_wait_obligation = true;
+                break;
+            }
+        }
+        const liveness_obligation_proven = waiters_without_notifier != 0 and
+            (guest_wait_obligation or registry_wait_obligation or !progress_since_park);
+        const actionable_waiters_without_notifier = if (liveness_obligation_proven)
+            waiters_without_notifier
+        else
+            0;
 
         // Anything Rosette produced on the emulator's behalf. The draw
         // dispatcher's deliveries and the substitution layer's fabrications are
@@ -5120,12 +6706,18 @@ pub const MachOState = struct {
 
         const producer_quiet = self.executed_steps -| self.gpu_ring_publication.last_advance_step;
         const liveness_scope = self.runIntegrityLivenessScope();
+        const pause_transaction_defects = self.audit_pause.defectCount();
 
         const coverage_percent: u32 = @intCast(coverage.percent());
         if (coverage_percent > self.host_coverage_best_percent) {
             self.host_coverage_best_percent = coverage_percent;
             self.host_coverage_progress_step = self.executed_steps;
         }
+        const capability_guest_progress_step = self.capabilityGuestProgressStep();
+        const capability_progress_witness_step = run_integrity.capabilityProgressWitnessStep(
+            self.host_coverage_progress_step,
+            capability_guest_progress_step,
+        );
 
         return .{
             .step = self.executed_steps,
@@ -5134,14 +6726,79 @@ pub const MachOState = struct {
             .window_unaccountable = admission.unaccountable,
             .frames_presented_to_window = self.window_presentations,
             .frames_in_custody = frames.presentations_covered,
+            .authentic_frames_presented = frames.authentic_guest,
+            .host_frames_presented = frames.guest_pixels_host_cadence,
+            .diagnostic_frames_presented = frames.diagnostic,
+            .native_present_requests = ownership.xenia_presents,
+            .native_gpu_completions = ownership.xenia_present_completions,
             .swap_boundaries_reached = self.swap_boundaries_reached,
             .swap_boundaries_offered = self.window_admission.touchedBoundaries(),
             .presenter_ready = self.dynamic_forwarder.nativePresenterStage().isReady(),
-            .draws_consumed = self.gpu_xenos_runtime.draw_count,
+            .presenter_attempted = presenter_attempted,
+            .presenter_nonretryable_failures = presenter_nonretryable_failures,
+            .draws_consumed = guest_output.raw_draws_consumed,
+            .renderable_draws_observed = guest_output.renderable_draws_observed,
+            .render_target_state_observed = target.state_observed,
+            .render_target_output_ready = target.outputReady(),
+            .draw_completion_signals = self.gpu_xenos_runtime.draw_completion_signals,
+            .color_resolve_observations = guest_output.color_resolve_observations,
+            .guest_swap_boundaries = guest_output.guest_swap_boundaries,
+            .guest_vdswap_packets_encoded = guest_output.guest_vdswap_packets_encoded,
+            .guest_output_opportunity_observed = host_contract_coverage.guestOutputOpportunity(guest_output),
             .frames_published_by_any_producer = self.dynamic_forwarder.publishedFrameGenerations(),
             .producer_quiet_steps = producer_quiet,
             .longest_never_notified_park_steps = never_notified_park,
+            .deadlock_observed = deadlock_observed,
+            .deadlock_proven = deadlock_proven,
+            .deadlock_finding = deadlock_finding,
+            .deadlock_waiters = deadlock_waiters,
+            .deadlock_park_steps = deadlock_park_steps,
             .unsignalled_wait_timeouts = unsignalled_timeouts,
+            .unsignalled_wait_object = selected_timeout_subject.object,
+            .unsignalled_wait_handle = selected_timeout_subject.handle,
+            .unsignalled_wait_type = selected_timeout_subject.type_code,
+            .unsignalled_wait_waits = selected_timeout_subject.waits,
+            .unsignalled_wait_signals = selected_timeout_subject.signals,
+            .unsignalled_wait_first_step = selected_timeout_subject.first_step,
+            .unsignalled_wait_last_step = selected_timeout_subject.last_step,
+            .bounded_timeout_subjects = bounded_timeout_subjects,
+            .bounded_timeout_attempts = bounded_timeout_attempts,
+            .bounded_timeout_object = selected_bounded_timeout.object,
+            .bounded_timeout_handle = selected_bounded_timeout.handle,
+            .bounded_timeout_ms = selected_bounded_timeout.timeout_ms,
+            .ring_producer_published = self.gpu_ring_publication.published(),
+            .bounded_timeout_signals = selected_bounded_timeout.signals,
+            .bounded_timeout_first_step = selected_bounded_timeout.first_step,
+            .bounded_timeout_last_step = selected_bounded_timeout.last_step,
+            .bounded_timeout_notifier_proven = bounded_timeout_notifier_proven,
+            .bounded_timeout_other_progress = bounded_timeout_other_progress,
+            .wait_graph_events = wait_graph_summary.events,
+            .wait_graph_objects = wait_graph_summary.objects,
+            .wait_graph_stalled_handshakes = wait_graph_summary.stalled_handshakes,
+            .wait_graph_cycles = wait_graph_summary.cycles,
+            .wait_graph_insufficient = wait_graph_summary.insufficient,
+            .wait_graph_dropped_objects = wait_graph_summary.dropped_objects,
+            .wait_graph_blocker_object = wait_graph_blocker.address,
+            .wait_graph_blocker_waits = wait_graph_blocker.waits,
+            .wait_graph_blocker_signals = wait_graph_blocker.signals,
+            .wait_graph_blocker_waiter_thread = if (blocker_waiter) |participant| participant.thread else 0,
+            .wait_graph_blocker_waiter_pc = if (blocker_waiter) |participant| participant.pc else 0,
+            .wait_graph_blocker_signaller_thread = if (blocker_signaller) |participant| participant.thread else 0,
+            .wait_graph_blocker_signaller_pc = if (blocker_signaller) |participant| participant.pc else 0,
+            .wait_graph_blocker_first_step = wait_graph_blocker.first_step,
+            .wait_graph_blocker_last_step = wait_graph_blocker.last_step,
+            .wait_graph_blocker_participants_dropped = wait_graph_blocker.participants_dropped,
+            .application_controller_decisions = self.application_controller.observations,
+            .application_controller_contract_violations = self.application_controller.contract_violations,
+            .provisioning_armed = provisioning_armed,
+            .provisioning_raw_refusals = provisioning.refusals,
+            .provisioning_actionable_refusals = provisioning_actionable_refusals,
+            .provisioning_late = @intCast(provisioning.late),
+            .provisioning_diverged = @intCast(provisioning.diverged),
+            .provisioning_contested = @intCast(provisioning.contested),
+            .provisioning_unprovisioned = @intCast(provisioning.unprovisioned),
+            .wait_policy_observed = wait_policy_observed,
+            .wait_policy_faults = wait_policy_faults,
             .capabilities_exercised = coverage.satisfied + coverage.degraded + coverage.unsatisfied,
             .capabilities_unsatisfied = coverage.unsatisfied,
             .critical_capabilities_total = coverage.critical_total,
@@ -5149,8 +6806,16 @@ pub const MachOState = struct {
             .critical_capabilities_degraded = coverage.critical_degraded,
             .critical_capabilities_unsatisfied = coverage.critical_unsatisfied,
             .critical_capabilities_untested = coverage.critical_untested,
-            .capability_progress_quiet_steps = self.executed_steps -| self.host_coverage_progress_step,
+            .capability_progress_quiet_steps = run_integrity.capabilityProgressQuietSteps(
+                self.executed_steps,
+                self.host_coverage_progress_step,
+                capability_guest_progress_step,
+            ),
+            .capability_coverage_progress_step = self.host_coverage_progress_step,
+            .capability_guest_progress_step = capability_guest_progress_step,
+            .capability_progress_witness_step = capability_progress_witness_step,
             .harness_substitutions = substitutions,
+            .strict_fail_fast = self.run_integrity_strict,
             .translation_cache_entries = self.decode_cache.len,
             .translation_vacant_fills = economics.vacant_fills,
             .translation_conflict_fills = economics.conflict_fills,
@@ -5160,7 +6825,26 @@ pub const MachOState = struct {
             .translation_hits = self.decode_cache_hits,
             .translation_misses = self.decode_cache_misses,
             .recorded_anomalies = self.anomalies.count,
+            .pause_transaction_defects = pause_transaction_defects,
+            .component_readiness_armed = component_readiness_armed,
+            .essential_component_gaps = component_readiness.essential_gaps,
+            .execution_profile_samples = execution_profile.samples,
+            .execution_profile_readable = execution_profile.readable(),
+            .execution_profile_decisive = execution_profile.dominantIsDecisive(),
+            .execution_profile_unclassified = execution_profile_unclassified,
+            .execution_profile_unresolved = execution_profile_unresolved,
+            .vd_swap_unprobed_reachable_stages = vd_swap_probes.unprobed,
+            .vd_swap_rosette_closable_starvations = vd_swap_probes.starved_closable_by_rosette,
+            .vd_swap_probe_attempt_floor = self.gpu_vd_swap_contract.probes.maxAttempts(),
+            .run_budget_observed = budget_observed,
+            .run_budget_deficit = budget_observed and budget_verdict == .below_budget,
+            .run_budget_guest_ms_per_host_second = budget_totals.guestMsPerHostSecond(),
+            .run_budget_required_guest_ms_per_host_second = self.audit_budget.required_guest_ms_per_host_second,
+            .run_budget_host_seconds = budget_totals.host_ns / std.time.ns_per_s,
+            .run_budget_guest_ms = budget_totals.guest_ms,
             .waiters_without_a_notifier = waiters_without_notifier,
+            .actionable_waiters_without_a_notifier = actionable_waiters_without_notifier,
+            .liveness_obligation_proven = liveness_obligation_proven,
             .progress_since_never_notified_park = progress_since_park,
             .reinterpreted_texture_formats = self.texture_format_summary.reinterpreted,
             .texture_formats_probed = self.texture_format_summary.probed != 0,
@@ -5176,6 +6860,55 @@ pub const MachOState = struct {
                 self.substantiation_summary.unsubstantiated != 0 or
                 self.substantiation_summary.diverged != 0 or
                 self.substantiation_summary.measurement_drifts != 0,
+            .pm4_packets_observed = pm4_evidence.packets_observed,
+            .pm4_packets_executed = pm4_evidence.packets_executed,
+            .pm4_packet_errors = pm4_evidence.packet_errors,
+            .pm4_invalid_packets = pm4_evidence.invalid_packets,
+            .pm4_unknown_opcodes = pm4_evidence.unknown_opcodes,
+            .pm4_truncated_rings = pm4_evidence.truncated_rings,
+            .pm4_indirect_unreadable = pm4_evidence.indirect_unreadable,
+            .pm4_indirect_truncated = pm4_evidence.indirect_truncated,
+            .pm4_indirect_invalid = pm4_evidence.indirect_invalid,
+            .pm4_indirect_depth_limited = pm4_evidence.indirect_depth_limited,
+            .pm4_indirect_budget_limited = pm4_evidence.indirect_budget_limited,
+            .pm4_indirect_cycles = pm4_evidence.indirect_cycles,
+            .pm4_unclassified_register_writes = pm4_evidence.unclassified_register_writes,
+            .pm4_out_of_range_register_writes = pm4_evidence.out_of_range_register_writes,
+            .pm4_defects = pm4_evidence.defectCount(),
+            .mandatory_order_armed = mandatory_order_summary.active != 0 or
+                mandatory_order_summary.mandatory_violations != 0,
+            .mandatory_order_active = mandatory_order_summary.active,
+            .mandatory_order_violated = mandatory_order_summary.violated,
+            .mandatory_order_mandatory_violations = mandatory_order_summary.mandatory_violations,
+            .mandatory_order_raced = mandatory_order_summary.raced,
+            .gpu_preinitialization_inversions = @intCast(self.gpu_preinitialization.inversion_count),
+            .gpu_preinitialization_inversions_dropped = self.gpu_preinitialization.inversions_dropped,
+            .settled_observer_undercounts = witnesses.judgeableDefects(),
+            // Corroboration is only possible where a fact has two witnesses.
+            // A surface where nothing is corroborated is uncorroborated, not
+            // clean, and arming the gate on it would report a passing grade
+            // for an observation nothing has checked.
+            .monotone_witness_corroboration_possible = witnesses.observed > witnesses.uncorroborated,
+            // Closure means every required subject has an actual claim. A
+            // subject whose witnesses all still read zero is counted as
+            // unclaimed rather than observed, so arming this gate now needs
+            // nine statements rather than nine armed tracepoints.
+            .monotone_witness_closure_ready = witnesses.required_observed == monotone_witness.required_subject_count,
+            .frontier_boundary_armed = frontier_armed != 0,
+            .frontier_boundary_settled_steps = frontier_settled,
+            .frontier_boundary_crossed_elsewhere = frontier_crossed_elsewhere,
+            .external_progress_fresh = self.ready.hasRecentExternalProgress(self.executed_steps),
+            .frontier_boundary_addresses_reached = frontier_reached,
+            .frontier_boundary_corroborating_observers = frontier_observers,
+            .settled_unknown_mappings = self.unknown_inventory.settledBlockers(
+                unknown_inventory_mod.settled_blocker_threshold,
+            ),
+            .claim_reconciliation_contested = claims.contested,
+            .claim_reconciliation_multi_source = claims.multi_source,
+            .monotone_witness_required = @intCast(monotone_witness.required_subject_count),
+            .monotone_witness_observed = @intCast(witnesses.required_observed),
+            .monotone_witness_corroborated = @intCast(witnesses.required_corroborated),
+            .monotone_witness_agreement_debt = @intCast(witnesses.required_agreement_debt),
         };
     }
 
@@ -5188,6 +6921,33 @@ pub const MachOState = struct {
     /// has lost a wake. The strict run-integrity liveness checks begin only
     /// after guest execution or a guest-driven GPU boundary is proven. The
     /// wait/deadlock ledgers continue to record the pre-boundary state in full.
+    /// Refresh the wait graph's independent progress axis before any consumer
+    /// judges its pair states. Keeping this in one process-side helper prevents
+    /// the integrity gate and the verbose report from taking different views of
+    /// the same handshake.
+    fn refreshWaitGraphProgress(self: *MachOState) void {
+        self.wait_graph.noteProgress(
+            @as(u64, gpu.vd_swap_contract.observedCount(self.gpu_vd_swap_contract.observed_mask)) +|
+                self.gpu_ring_publication.advances +|
+                self.run_horizon.milestones_reached +|
+                // Translation generations belong on this axis for the same
+                // reason they belong on the capability one below: a title can
+                // spend a long prefix reaching new guest code while the
+                // graphics ladder quite correctly does not move, and a spinning
+                // thread cannot advance this counter — reaching a function
+                // nothing has translated yet is exactly what a spin does not do.
+                //
+                // Without it the 2026-08-30 20:08 run raised SIGSEGV on
+                // `no-stalled-wait-handshake` at step 4_200_000_000 while the
+                // Ready Compiler had accepted generation 1344 three million
+                // steps earlier. The handshake really was cycling; the claim
+                // that nothing outside it was moving was false, and it stopped
+                // the run before the question it was started to answer could
+                // be reached.
+                self.ready.translationProgressGeneration(),
+        );
+    }
+
     fn runIntegrityGpuActivity(self: *const MachOState) bool {
         return self.gpu_bootstrap.seen(.initialize_engines) or
             self.gpu_bootstrap.seen(.graphics_interrupt_callback) or
@@ -5201,6 +6961,24 @@ pub const MachOState = struct {
             self.swap_boundaries_reached != 0 or
             self.guest_vdswap_packet_encoded or
             self.guest_vdswap_entry_completed;
+    }
+
+    /// Return the strongest trustworthy progress witness for capability
+    /// closure. Coverage is the normal witness, but Xenia can spend a long
+    /// prefix compiling PPC guest functions while the graphics ladder quite
+    /// correctly remains unchanged. Successful translation generations and
+    /// other host-serviced Ready Compiler counters are real work in that
+    /// interval; treating them as silence made the integrity gate fault while
+    /// the bootstrap dependency was still advancing.
+    fn capabilityGuestProgressStep(self: *const MachOState) u64 {
+        var progress_step: u64 = 0;
+        if (self.ready.work_unit_count != 0) {
+            progress_step = @max(progress_step, self.ready.lastNamedProgressStep());
+        }
+        if (self.ready.external_progress_advances != 0) {
+            progress_step = @max(progress_step, self.ready.externalProgressStep());
+        }
+        return progress_step;
     }
 
     /// Boundary substantiation arms later than general graphics setup. Engine
@@ -5268,37 +7046,68 @@ pub const MachOState = struct {
         ledger.setScope(scope, at);
 
         const executed = substantiation.Evidence.executed;
+        const entered = substantiation.Evidence.entered;
         const observed = substantiation.Evidence.observed;
 
         // Ring publication. Xenia's publisher is an address; Rosette watches
-        // the write pointer itself.
-        if (tracepoints.roleEntered(.ring_publication))
-            ledger.answerWithDomain(.ring_publication, .application, executed, self.gpu_ring_publication.advances, true, .ring_advances, at);
-        if (self.gpu_ring_publication.advances != 0)
-            ledger.answerWithDomain(.ring_publication, .harness, observed, self.gpu_ring_publication.advances, true, .ring_advances, at);
+        // the write pointer itself. A setup tracepoint is not publication, and
+        // a publication entry is not completion until the pointer/span proves
+        // that a command span actually existed.
+        const ring_entry = tracepoints.roleEntered(.ring_publication);
+        const ring_published = self.gpu_ring_publication.published();
+        if (ring_published) {
+            if (ring_entry)
+                ledger.answer(.ring_publication, .application, executed, 0, false, at);
+            if (self.gpu_ring_publication.advances != 0) {
+                ledger.answerWithDomain(.ring_publication, .harness, observed, self.gpu_ring_publication.advances, true, .ring_advances, at);
+            } else {
+                // A sampled non-empty span proves publication but has no
+                // pointer-advance count that can be compared as a value.
+                ledger.answer(.ring_publication, .harness, observed, 0, false, at);
+            }
+        } else if (ring_entry) {
+            ledger.answer(.ring_publication, .application, entered, 0, false, at);
+        }
 
         // PM4 consumption. Rosette's stateful executor counts the packets it
-        // walked; Xenia's command processor is an address.
-        if (tracepoints.roleEntered(.command_processor))
-            ledger.answer(.command_processor, .application, executed, 0, false, at);
-        if (self.gpu_xenos_runtime.executor.packet_count != 0)
-            ledger.answerWithDomain(.command_processor, .harness, observed, self.gpu_xenos_runtime.executor.packet_count, true, .pm4_packets, at);
+        // walked; Xenia's command processor is an address. `packet_count`
+        // includes a header that may be rejected as truncated, so only the
+        // successful portion is allowed to substantiate consumption.
+        const command_entry = tracepoints.roleEntered(.command_processor);
+        const packet_count = self.gpu_xenos_runtime.executor.packet_count;
+        const valid_packet_count = packet_count -| self.gpu_xenos_runtime.executor.invalid_packet_count;
+        if (valid_packet_count != 0) {
+            if (command_entry)
+                ledger.answer(.command_processor, .application, executed, 0, false, at);
+            ledger.answerWithDomain(.command_processor, .harness, observed, valid_packet_count, true, .pm4_packets, at);
+        } else if (command_entry) {
+            ledger.answer(.command_processor, .application, entered, 0, false, at);
+        }
 
         // The swap request is the title's alone. Rosette can observe one and
         // never originate one, so it is left with nothing to say here by
-        // design rather than by omission.
-        if (tracepoints.roleEntered(.swap) or self.guest_vdswap_packet_encoded)
+        // design rather than by omission. An encoded packet is a later stream
+        // fact, not proof that the VdSwap request boundary was entered.
+        if (vd.vdswap_calls != 0) {
             ledger.answerWithDomain(.swap_request, .application, executed, vd.vdswap_calls, true, .swap_requests, at);
+        } else if (tracepoints.roleEntered(.swap)) {
+            ledger.noteApplicationEntry(.swap_request, at);
+        }
 
-        if (tracepoints.roleEntered(.xe_swap_decode))
-            ledger.answer(.swap_decode, .application, executed, 0, false, at);
-        if (vd.decoded_packet_observations != 0)
+        if (vd.decoded_packet_observations != 0) {
+            if (tracepoints.roleEntered(.xe_swap_decode))
+                ledger.answer(.swap_decode, .application, executed, 0, false, at);
             ledger.answerWithDomain(.swap_decode, .harness, observed, vd.decoded_packet_observations, true, .xe_swap_packets, at);
+        } else if (tracepoints.roleEntered(.xe_swap_decode)) {
+            ledger.noteApplicationEntry(.swap_decode, at);
+        }
 
-        if (tracepoints.roleEntered(.command_swap) or tracepoints.roleEntered(.presenter))
-            ledger.answer(.presenter_entry, .application, executed, 0, false, at);
-        if (ownership.xenia_presents != 0)
+        const presenter_entry = tracepoints.roleEntered(.command_swap) or tracepoints.roleEntered(.presenter);
+        if (ownership.xenia_presents != 0) {
             ledger.answerWithDomain(.presenter_entry, .application, executed, ownership.xenia_presents, true, .presenter_requests, at);
+        } else if (presenter_entry) {
+            ledger.noteApplicationEntry(.presenter_entry, at);
+        }
         // Presenter entry is a request boundary, not a completed-frame
         // boundary. Xenia's successful real present count is the application
         // account above; the independent Rosette account is the number of
@@ -5307,13 +7116,50 @@ pub const MachOState = struct {
         // request can reach the driver before a drawable completes, which is
         // exactly the state this run reached.
         const guest_present_requests = self.dynamic_forwarder.guestVulkanPresentRequests();
-        if (guest_present_requests != 0)
+        if (guest_present_requests != 0) {
             ledger.answerWithDomain(.presenter_entry, .harness, observed, guest_present_requests, true, .presenter_requests, at);
+        }
 
-        if (self.interrupt_callback_transaction.callback_returns != 0)
-            ledger.answerWithDomain(.interrupt_dispatch, .application, observed, self.interrupt_callback_transaction.callback_returns, true, .interrupt_dispatches, at);
-        if (self.gpu_draw_completion_dispatches != 0)
-            ledger.answerWithDomain(.interrupt_dispatch, .harness, executed, self.gpu_draw_completion_dispatches, true, .interrupt_dispatches, at);
+        // These are two valid but independent executor domains. Xenia's
+        // PowerPC callback is dispatched by Xenia's CPU engine; Rosette's
+        // optional completion route is dispatched by the modelled x86 runtime.
+        // Comparing one domain's count with the other domain's zero creates a
+        // false result drift, which is exactly what the 2026-08-31 capture
+        // reported: Xenia returned three title callbacks while the Rosette
+        // model had delivered none. Pick the active route as the account for
+        // this boundary and keep the other route in its own ledger.
+        // Registration opens the question; it does not answer the question
+        // "did a dispatch occur?". The old predicate merged those two states,
+        // so a valid VdSet followed by zero dispatches blocked Rosette from
+        // recording the strict, bounded negative that the run had actually
+        // established.
+        const xenia_interrupt_dispatch_observed =
+            self.interrupt_callback_transaction.dispatch_attempts != 0;
+        const model_interrupt_dispatch_observed =
+            self.gpu_draw_completion_dispatch_attempts != 0 or
+            self.gpu_draw_completion_dispatches != 0;
+        // An explicit title callback registration opens the interrupt
+        // boundary even when neither executor has attempted a dispatch yet.
+        // The registration is evidence that Rosette can inspect the route;
+        // it is not evidence that a callback ran and it never authorizes one.
+        // Without this third source, a valid VdSetGraphicsInterruptCallback
+        // followed by a quiet vblank interval remained `unsubstantiated`.
+        const title_interrupt_route_registered =
+            self.titleInterruptCallbackRegistrationObserved();
+        const interrupt_dispatch_observed =
+            xenia_interrupt_dispatch_observed or model_interrupt_dispatch_observed;
+        if (xenia_interrupt_dispatch_observed) {
+            const dispatches = self.interrupt_callback_transaction.dispatch_attempts;
+            if (dispatches != 0) {
+                ledger.answerWithDomain(.interrupt_dispatch, .application, observed, dispatches, true, .interrupt_dispatches, at);
+            }
+        } else if (model_interrupt_dispatch_observed) {
+            const dispatches = if (self.gpu_draw_completion_dispatches != 0)
+                self.gpu_draw_completion_dispatches
+            else
+                self.gpu_draw_completion_dispatch_attempts;
+            ledger.answerWithDomain(.interrupt_dispatch, .harness, observed, dispatches, true, .interrupt_dispatches, at);
+        }
 
         const target = self.gpu_xenos_runtime.renderTargetEvidence();
         if (target.state_observed)
@@ -5329,6 +7175,23 @@ pub const MachOState = struct {
         if (self.window_presentations != 0)
             ledger.answerWithDomain(.frame_presented, .harness, executed, self.window_presentations, true, .window_presentations, at);
 
+        // Prerequisites are established before bounded-absence answers are
+        // emitted. The old order answered future boundaries first and only
+        // then recorded that their producers had not become reachable,
+        // turning an ordinary ordering gap into a false harness claim.
+        const swap_requested = ledger.record(.swap_request).answered();
+        const pm4_consumed = ledger.record(.command_processor).answered();
+        ledger.notePrerequisites(.swap_decode, swap_requested);
+        ledger.notePrerequisites(.presenter_entry, swap_requested);
+        ledger.notePrerequisites(.render_target, pm4_consumed);
+        // A vblank callback does not require a PM4 packet. It becomes an
+        // answerable route only after Xenia registered/attempted it or the
+        // Rosette model actually queued a completion.
+        ledger.notePrerequisites(
+            .interrupt_dispatch,
+            interrupt_dispatch_observed or title_interrupt_route_registered,
+        );
+
         // Once guest execution or GPU activity has established a causal
         // frontier, Rosette can answer every boundary with an explicit
         // bounded absence when neither side supplied a positive answer. This
@@ -5340,22 +7203,22 @@ pub const MachOState = struct {
             var boundary_index: u8 = 0;
             while (boundary_index < substantiation.boundary_count) : (boundary_index += 1) {
                 const boundary: substantiation.Boundary = @enumFromInt(boundary_index);
+                const record = ledger.record(boundary);
                 if (boundary.rosetteMayCloseAsAbsent(scope) and
-                    !ledger.record(boundary).harness.substantiates())
+                    record.prerequisites_met and
+                    !record.harness.substantiates() and
+                    // Once either interrupt executor has actually observed a
+                    // dispatch, do not manufacture a negative answer. A mere
+                    // registration is intentionally not this guard: it is the
+                    // prerequisite that makes a bounded "not dispatched"
+                    // answer meaningful.
+                    !(boundary == .interrupt_dispatch and
+                        interrupt_dispatch_observed))
                 {
                     ledger.answerAbsent(boundary, .harness, boundary.observationDomain(), at);
                 }
             }
         }
-
-        // Prerequisites, so a zero below an unanswered boundary is attributed
-        // to the boundary above it rather than counted twice.
-        const swap_requested = ledger.record(.swap_request).answered();
-        const pm4_consumed = ledger.record(.command_processor).answered();
-        ledger.notePrerequisites(.swap_decode, swap_requested);
-        ledger.notePrerequisites(.presenter_entry, swap_requested);
-        ledger.notePrerequisites(.render_target, pm4_consumed);
-        ledger.notePrerequisites(.interrupt_dispatch, pm4_consumed);
 
         return ledger.evaluate(at);
     }
@@ -5365,7 +7228,7 @@ pub const MachOState = struct {
         if (!force and fingerprint == self.substantiation_last_fingerprint and summary.clean()) return;
         self.substantiation_last_fingerprint = fingerprint;
         machoCapturePrint(
-            "macho-processor: SUBSTANTIATION: schema={d} scope={s} armed={} elapsed={d} boundaries={d} answered={d} (application={d} harness={d} corroborated={d} bounded_negative={d}) diverged={d} measurement_drift={d} unsubstantiated={d} (rosette_answerable={d}) not_reached={d} step={d}; {s}\n",
+            "macho-processor: SUBSTANTIATION: schema={d} scope={s} armed={} elapsed={d} boundaries={d} answered={d} (application={d} harness={d} corroborated={d} bounded_negative={d} superseded_negative={d}) diverged={d} measurement_drift={d} unsubstantiated={d} (rosette_answerable={d}) not_reached={d} step={d}; {s}\n",
             .{
                 substantiation.schema_version,
                 summary.scope.label(),
@@ -5377,6 +7240,7 @@ pub const MachOState = struct {
                 summary.by_harness,
                 summary.corroborated,
                 summary.bounded_negative,
+                summary.superseded_negative,
                 summary.diverged,
                 summary.measurement_drifts,
                 summary.unsubstantiated,
@@ -5393,11 +7257,13 @@ pub const MachOState = struct {
             // A boundary somebody answered and nothing disagreed with is a
             // success and prints nothing.
             if (entry.settled() and summary.clean() and
+                entry.application.substantiates() and
+                entry.harness.substantiates() and
                 entry.application.claim == .positive and
                 entry.harness.claim == .positive)
                 continue;
             machoCapturePrint(
-                "  substantiation {s: <20} {s: <22} application={s: <9}({s: <8}) harness={s: <9}({s: <8}) first_answer_step={d} divergences={d}; {s}\n",
+                "  substantiation {s: <20} {s: <22} application={s: <9}({s: <8}) harness={s: <9}({s: <8}) first_answer_step={d} divergences={d} superseded_negatives={d}; {s}\n",
                 .{
                     boundary.label(),
                     entry.finding.label(),
@@ -5407,6 +7273,7 @@ pub const MachOState = struct {
                     entry.harness.claim.label(),
                     entry.first_answer_step,
                     entry.divergences,
+                    entry.superseded_negative_answers,
                     boundary.question(),
                 },
             );
@@ -5443,8 +7310,16 @@ pub const MachOState = struct {
         if (!self.texture_formats.resolved) {
             var probed_any = false;
             for (gpu.texture_format_support.probed_formats) |format| {
-                const features = self.dynamic_forwarder.presenterFormatFeatures(format) orelse continue;
-                self.texture_formats.noteSupport(format, features);
+                // All three fields, not just the tiling half. A format can be
+                // unusable as an image and native as a vertex attribute, and
+                // on this host exactly one of the probed formats is.
+                const properties = self.dynamic_forwarder.presenterFormatProperties(format) orelse continue;
+                self.texture_formats.noteSupportProperties(
+                    format,
+                    properties.linear_tiling_features,
+                    properties.optimal_tiling_features,
+                    properties.buffer_features,
+                );
                 probed_any = true;
             }
             if (!probed_any) return;
@@ -5477,12 +7352,16 @@ pub const MachOState = struct {
         for (self.texture_formats.support) |entry| {
             // An unprobed format is not an absent one, so it says which it is.
             machoCapturePrint(
-                "  host-format {d: >4} sampled={s} probed={s} features=0x{x:0>8}\n",
+                "  host-format {d: >4} usage={s: <12} sampled={s} probed={s} features(linear/optimal/buffer)=0x{x:0>8}/0x{x:0>8}/0x{x:0>8}; {s}\n",
                 .{
                     entry.format,
+                    entry.usage(),
                     if (entry.sampled) "YES" else "NO",
                     if (entry.probed) "YES" else "NO",
+                    entry.linear_features,
                     entry.features,
+                    entry.buffer_features,
+                    entry.unavailability(),
                 },
             );
         }
@@ -5515,8 +7394,34 @@ pub const MachOState = struct {
         }
     }
 
+    fn ringInspectionNeedsPreIntegrityScan(self: *const MachOState) bool {
+        if (self.gpu_ring_watch_base == 0 or self.gpu_ring_watch_size == 0) {
+            return !self.gpu_ring_inspection_attempted;
+        }
+        return self.gpu_ring_last_inspected_base != self.gpu_ring_watch_base or
+            self.gpu_ring_last_inspected_size != self.gpu_ring_watch_size;
+    }
+
     pub fn refreshRunIntegrity(self: *MachOState) void {
         self.ensureRunIntegrity();
+        // Ring projection is one of the integrity gate's reachable inputs. A
+        // newly observed geometry must therefore be inspected before the gate
+        // evaluates, rather than waiting for the later graphics-report
+        // cadence. Otherwise the gate can truthfully see reachable ring work
+        // with all of its probes still at zero and stop before the observer has
+        // had a chance to run.
+        if (self.ringInspectionNeedsPreIntegrityScan() and
+            self.gpu_ring_last_inspection_step != self.executed_steps)
+        {
+            self.logRingContents();
+        }
+        // Pre-initialization ordering is a live integrity input, not a report
+        // produced after the decision. Refresh the kernel-variable surface and
+        // the cross-domain ledger before taking the immutable observation so a
+        // callback dispatched at this checkpoint cannot hide behind the older
+        // graphics report cadence.
+        self.refreshKernelVariables();
+        self.refreshPreinitialization();
         self.refreshWindowPresentations();
         // The handshake is judged before the gate reads it, so an integrity
         // violation and the boundary detail behind it describe the same
@@ -5524,7 +7429,9 @@ pub const MachOState = struct {
         self.substantiation_summary = self.refreshSubstantiation();
         self.logSubstantiation(self.substantiation_summary, false);
         self.refreshTextureFormatSupport();
-        const summary = self.run_integrity.evaluate(self.runIntegrityObservation());
+        const observation = self.runIntegrityObservation();
+        const summary = self.run_integrity.evaluate(observation);
+        self.captureRunIntegrityContexts();
         const fingerprint = self.run_integrity.fingerprint();
         const changed = fingerprint != self.run_integrity_last_fingerprint;
         self.run_integrity_last_fingerprint = fingerprint;
@@ -5532,11 +7439,809 @@ pub const MachOState = struct {
         if (self.run_integrity.shouldStop(summary)) self.faultOnRunIntegrity(summary);
     }
 
+    /// Join the immutable predicate history with the execution context that
+    /// made it actionable. The contract owns the decision and the ledger owns
+    /// the input snapshot; this small process-side table owns the RIP/thread
+    /// because only the process can see them. It is populated after every
+    /// evaluation, including warn/observe mode, so stepping past a violation
+    /// does not erase its provenance.
+    fn captureRunIntegrityContexts(self: *MachOState) void {
+        var index: u8 = 0;
+        while (index < run_integrity.invariant_count) : (index += 1) {
+            const invariant: run_integrity.Invariant = @enumFromInt(index);
+            const record = self.run_integrity.record(invariant);
+            if (record.has_armed_observation and
+                !self.run_integrity_first_armed_context[index].valid)
+            {
+                self.run_integrity_first_armed_context[index] = .{
+                    .valid = true,
+                    .rip = self.regs.rip,
+                    .thread = self.active_guest_thread,
+                };
+            }
+            if (record.has_first_violation_observation and
+                !self.run_integrity_first_violation_context[index].valid)
+            {
+                self.run_integrity_first_violation_context[index] = .{
+                    .valid = true,
+                    .rip = self.regs.rip,
+                    .thread = self.active_guest_thread,
+                };
+            }
+        }
+    }
+
+    /// Print all predicate inputs as one coherent snapshot. Keeping the groups
+    /// separate makes a long line grep-friendly while retaining the complete
+    /// observation vector needed to replay why the contract made its decision.
+    fn logRunIntegrityTraceSnapshot(
+        self: *MachOState,
+        label: []const u8,
+        observation: run_integrity.Observation,
+    ) void {
+        _ = self;
+        machoCapturePrint(
+            "    integrity-trace snapshot={s} step={d} liveness_scope={s} liveness_armed={} progress_since_park={} window(forwardings/unaccountable)={d}/{d} frames(presented/custody)={d}/{d} swap(reached/offered)={d}/{d}\n",
+            .{
+                label,
+                observation.step,
+                observation.liveness_scope.label(),
+                observation.liveness_scope.notifierChecksArmed(),
+                observation.progress_since_never_notified_park,
+                observation.window_forwardings,
+                observation.window_unaccountable,
+                observation.frames_presented_to_window,
+                observation.frames_in_custody,
+                observation.swap_boundaries_reached,
+                observation.swap_boundaries_offered,
+            },
+        );
+        machoCapturePrint(
+            "    integrity-trace snapshot={s} monotone-witness(closure/required/observed/corroborated/agreement-debt)={s}/{d}/{d}/{d}/{d}\n",
+            .{
+                label,
+                if (observation.monotone_witness_closure_ready) "YES" else "NO",
+                observation.monotone_witness_required,
+                observation.monotone_witness_observed,
+                observation.monotone_witness_corroborated,
+                observation.monotone_witness_agreement_debt,
+            },
+        );
+        machoCapturePrint(
+            "    integrity-trace snapshot={s} output(presenter_ready/raw_draws/renderable_draws/target_state/target_output_ready/completion_signals/color_resolves/swap_boundaries/vdswap_encoded/opportunity/published/producer_quiet)={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{} liveness(park_steps/wait_timeouts/waiters_without_notifier/actionable_without_notifier/obligation_proven/parks_without_reason)={}/{}/{}/{}/{}/{}\n",
+            .{
+                label,
+                observation.presenter_ready,
+                observation.draws_consumed,
+                observation.renderable_draws_observed,
+                observation.render_target_state_observed,
+                observation.render_target_output_ready,
+                observation.draw_completion_signals,
+                observation.color_resolve_observations,
+                observation.guest_swap_boundaries,
+                observation.guest_vdswap_packets_encoded,
+                observation.guest_output_opportunity_observed,
+                observation.frames_published_by_any_producer,
+                observation.producer_quiet_steps,
+                observation.longest_never_notified_park_steps,
+                observation.unsignalled_wait_timeouts,
+                observation.waiters_without_a_notifier,
+                observation.actionable_waiters_without_a_notifier,
+                observation.liveness_obligation_proven,
+                observation.parks_without_a_reason,
+            },
+        );
+        machoCapturePrint(
+            "    integrity-trace snapshot={s} wait-evidence timeout-subject(object/handle/type/waits/signals/first_step/last_step)=0x{x}/0x{x}/{d}/{d}/{d}/{d}/{d} bounded-timeout(subjects/attempts/object/handle/ms/signals/first_step/last_step/notifier_proven/other_progress)={d}/{d}/0x{x}/0x{x}/{d}/{d}/{d}/{d}/{s}/{s} wait-graph(events/objects/stalled/cycles/insufficient/dropped)={d}/{d}/{d}/{d}/{d}/{d}\n",
+            .{
+                label,
+                observation.unsignalled_wait_object,
+                observation.unsignalled_wait_handle,
+                observation.unsignalled_wait_type,
+                observation.unsignalled_wait_waits,
+                observation.unsignalled_wait_signals,
+                observation.unsignalled_wait_first_step,
+                observation.unsignalled_wait_last_step,
+                observation.bounded_timeout_subjects,
+                observation.bounded_timeout_attempts,
+                observation.bounded_timeout_object,
+                observation.bounded_timeout_handle,
+                observation.bounded_timeout_ms,
+                observation.bounded_timeout_signals,
+                observation.bounded_timeout_first_step,
+                observation.bounded_timeout_last_step,
+                if (observation.bounded_timeout_notifier_proven) "YES" else "NO",
+                if (observation.bounded_timeout_other_progress) "YES" else "NO",
+                observation.wait_graph_events,
+                observation.wait_graph_objects,
+                observation.wait_graph_stalled_handshakes,
+                observation.wait_graph_cycles,
+                observation.wait_graph_insufficient,
+                observation.wait_graph_dropped_objects,
+            },
+        );
+        machoCapturePrint(
+            "    integrity-trace snapshot={s} wait-blocker(object/waits/signals/waiter-thread/waiter-pc/signaller-thread/signaller-pc/first_step/last_step/participants-dropped)=0x{x}/{d}/{d}/0x{x}/0x{x}/0x{x}/0x{x}/{d}/{d}/{d}\n",
+            .{
+                label,
+                observation.wait_graph_blocker_object,
+                observation.wait_graph_blocker_waits,
+                observation.wait_graph_blocker_signals,
+                observation.wait_graph_blocker_waiter_thread,
+                observation.wait_graph_blocker_waiter_pc,
+                observation.wait_graph_blocker_signaller_thread,
+                observation.wait_graph_blocker_signaller_pc,
+                observation.wait_graph_blocker_first_step,
+                observation.wait_graph_blocker_last_step,
+                observation.wait_graph_blocker_participants_dropped,
+            },
+        );
+        machoCapturePrint(
+            "    integrity-trace snapshot={s} capabilities(exercised/unsatisfied/quiet_steps)={}/{}/{} progress(coverage/guest/witness)={}/{}/{} critical(total/satisfied/degraded/unsatisfied/untested)={}/{}/{}/{}/{} substitutions={d} anomalies={d} pause_transaction_defects={d} readiness(armed/essential_gaps)={}/{d}\n",
+            .{
+                label,
+                observation.capabilities_exercised,
+                observation.capabilities_unsatisfied,
+                observation.capability_progress_quiet_steps,
+                observation.capability_coverage_progress_step,
+                observation.capability_guest_progress_step,
+                observation.capability_progress_witness_step,
+                observation.critical_capabilities_total,
+                observation.critical_capabilities_satisfied,
+                observation.critical_capabilities_degraded,
+                observation.critical_capabilities_unsatisfied,
+                observation.critical_capabilities_untested,
+                observation.harness_substitutions,
+                observation.recorded_anomalies,
+                observation.pause_transaction_defects,
+                observation.component_readiness_armed,
+                observation.essential_component_gaps,
+            },
+        );
+        machoCapturePrint(
+            "    integrity-trace snapshot={s} translation(strict/cache_entries/vacant/conflict/cold/stale/flush)={s}/{d}/{d}/{d}/{d}/{d}/{d} lookups(hits/misses)={d}/{d}\n",
+            .{
+                label,
+                if (observation.strict_fail_fast) "YES" else "NO",
+                observation.translation_cache_entries,
+                observation.translation_vacant_fills,
+                observation.translation_conflict_fills,
+                observation.translation_cold_evictions,
+                observation.translation_stale_refills,
+                observation.translation_flush_refills,
+                observation.translation_hits,
+                observation.translation_misses,
+            },
+        );
+        machoCapturePrint(
+            "    integrity-trace snapshot={s} budget(observed/deficit/guest_ms_per_host_s/required/host_s/guest_ms)={s}/{s}/{d}/{d}/{d}/{d} deadlock(observed/proven/finding/waiters/park_steps)={s}/{s}/{d}/{d}/{d}\n",
+            .{
+                label,
+                if (observation.run_budget_observed) "YES" else "NO",
+                if (observation.run_budget_deficit) "YES" else "NO",
+                observation.run_budget_guest_ms_per_host_second,
+                observation.run_budget_required_guest_ms_per_host_second,
+                observation.run_budget_host_seconds,
+                observation.run_budget_guest_ms,
+                if (observation.deadlock_observed) "YES" else "NO",
+                if (observation.deadlock_proven) "YES" else "NO",
+                observation.deadlock_finding,
+                observation.deadlock_waiters,
+                observation.deadlock_park_steps,
+            },
+        );
+        machoCapturePrint(
+            "    integrity-trace snapshot={s} ownership={d} substantiation(armed/unsubstantiated/diverged/measurement_drift)={}/{}/{}/{} texture(probed/reinterpreted)={}/{}\n",
+            .{
+                label,
+                observation.ownership_violations,
+                observation.substantiation_armed,
+                observation.unsubstantiated_boundaries,
+                observation.diverged_boundaries,
+                observation.measurement_drift_boundaries,
+                observation.texture_formats_probed,
+                observation.reinterpreted_texture_formats,
+            },
+        );
+        machoCapturePrint(
+            "    integrity-trace snapshot={s} frame-provenance(authentic/host/diagnostic/guest-forwarded-present-requests/native-gpu-completions/custody)={d}/{d}/{d}/{d}/{d}/{d}\n",
+            .{
+                label,
+                observation.authentic_frames_presented,
+                observation.host_frames_presented,
+                observation.diagnostic_frames_presented,
+                observation.native_present_requests,
+                observation.native_gpu_completions,
+                observation.frames_in_custody,
+            },
+        );
+        machoCapturePrint(
+            "    integrity-trace snapshot={s} presenter(attempted/nonretryable-failures)={s}/{d} provisioning(armed/raw-refusals/actionable/late/diverged/contested/unprovisioned)={s}/{d}/{d}/{d}/{d}/{d}/{d} wait-policy(observed/faults)={s}/{d} profile(samples/readable/decisive/unclassified/unresolved)={d}/{s}/{s}/{d}/{d}\n",
+            .{
+                label,
+                if (observation.presenter_attempted) "YES" else "NO",
+                observation.presenter_nonretryable_failures,
+                if (observation.provisioning_armed) "YES" else "NO",
+                observation.provisioning_raw_refusals,
+                observation.provisioning_actionable_refusals,
+                observation.provisioning_late,
+                observation.provisioning_diverged,
+                observation.provisioning_contested,
+                observation.provisioning_unprovisioned,
+                if (observation.wait_policy_observed) "YES" else "NO",
+                observation.wait_policy_faults,
+                observation.execution_profile_samples,
+                if (observation.execution_profile_readable) "YES" else "NO",
+                if (observation.execution_profile_decisive) "YES" else "NO",
+                observation.execution_profile_unclassified,
+                observation.execution_profile_unresolved,
+            },
+        );
+        machoCapturePrint(
+            "    integrity-trace snapshot={s} mandatory-order(armed/active/held/raced/violated/mandatory-violations)={s}/{d}/{d}/{d}/{d}/{d}\n",
+            .{
+                label,
+                if (observation.mandatory_order_armed) "YES" else "NO",
+                observation.mandatory_order_active,
+                observation.mandatory_order_active -|
+                    observation.mandatory_order_violated -|
+                    observation.mandatory_order_raced,
+                observation.mandatory_order_raced,
+                observation.mandatory_order_violated,
+                observation.mandatory_order_mandatory_violations,
+            },
+        );
+        machoCapturePrint(
+            "    integrity-trace snapshot={s} pm4-live(packets-observed/executed/defects)={d}/{d}/{d} packet(errors/invalid/unknown/truncated)={d}/{d}/{d}/{d} indirect(unreadable/truncated/invalid/depth/budget/cycles)={d}/{d}/{d}/{d}/{d}/{d} registers(unclassified/out-of-range)={d}/{d}\n",
+            .{
+                label,
+                observation.pm4_packets_observed,
+                observation.pm4_packets_executed,
+                observation.pm4_defects,
+                observation.pm4_packet_errors,
+                observation.pm4_invalid_packets,
+                observation.pm4_unknown_opcodes,
+                observation.pm4_truncated_rings,
+                observation.pm4_indirect_unreadable,
+                observation.pm4_indirect_truncated,
+                observation.pm4_indirect_invalid,
+                observation.pm4_indirect_depth_limited,
+                observation.pm4_indirect_budget_limited,
+                observation.pm4_indirect_cycles,
+                observation.pm4_unclassified_register_writes,
+                observation.pm4_out_of_range_register_writes,
+            },
+        );
+    }
+
+    /// Print the live-only PM4 quality ledger. This intentionally does not use
+    /// the retained VdSwap scanner: a replay can explain missing state but must
+    /// never make a historical packet anomaly look like a current hardware
+    /// failure (or hide one).
+    fn logRunIntegrityPm4Evidence(self: *MachOState) void {
+        const evidence = self.gpu_xenos_runtime.runtimeEvidence();
+        const first_defect = if (evidence.firstDefect()) |defect| defect.label() else "<none>";
+        machoCapturePrint(
+            "macho-processor: RUN INTEGRITY PM4: source=live-xenos-runtime retained-excluded=YES verdict={s} first_defect={s} packets(observed/executed)={d}/{d} defects={d} packet(errors/invalid/unknown/truncated)={d}/{d}/{d}/{d} indirect(unreadable/truncated/invalid/depth/budget/cycles)={d}/{d}/{d}/{d}/{d}/{d} registers(unclassified/out_of_range)={d}/{d}; live execution is the only input to no-unverified-pm4-input\n",
+            .{
+                evidence.verdict().label(),
+                first_defect,
+                evidence.packets_observed,
+                evidence.packets_executed,
+                evidence.defectCount(),
+                evidence.packet_errors,
+                evidence.invalid_packets,
+                evidence.unknown_opcodes,
+                evidence.truncated_rings,
+                evidence.indirect_unreadable,
+                evidence.indirect_truncated,
+                evidence.indirect_invalid,
+                evidence.indirect_depth_limited,
+                evidence.indirect_budget_limited,
+                evidence.indirect_cycles,
+                evidence.unclassified_register_writes,
+                evidence.out_of_range_register_writes,
+            },
+        );
+    }
+
+    /// Print the exact host capability records behind capability violations.
+    /// Aggregate counts are intentionally not enough: this is what identifies
+    /// whether the failing surface is a ring, a guest swap, a frame source, a
+    /// presenter, or some other layer.
+    fn logRunIntegrityCapabilityCauses(self: *MachOState, invariant: run_integrity.Invariant) void {
+        const ledger = &self.host_coverage;
+        inline for (@typeInfo(host_contract_coverage.Capability).@"enum".fields) |field| {
+            const capability: host_contract_coverage.Capability = @enumFromInt(field.value);
+            const status = ledger.status(capability);
+            const relevant = switch (invariant) {
+                .no_unsatisfied_capability => status == .unsatisfied,
+                .all_critical_capabilities_proven => capability.weight() == .critical and status != .satisfied,
+                .no_degraded_critical_capability => capability.weight() == .critical and status == .degraded,
+                else => false,
+            };
+            if (relevant) {
+                const entry = ledger.entry(capability);
+                machoCapturePrint(
+                    "    integrity-trace capability={s} status={s} layer={s} weight={s} note={s}\n",
+                    .{
+                        capability.label(),
+                        status.label(),
+                        capability.layer().label(),
+                        capability.weight().label(),
+                        entry.note(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Emit the native presenter's terminal state and the most recent frame
+    /// transaction together. The stage alone says where bring-up stopped; the
+    /// frame report says whether a later queue/acquire/present operation was
+    /// the first native failure.
+    fn logRunIntegrityPresenterCause(self: *MachOState) void {
+        const presenter = &self.dynamic_forwarder.native_presenter;
+        const report = &presenter.report;
+        const frame = &presenter.last_frame;
+        machoCapturePrint(
+            "    integrity-trace presenter stage={s} retryable={} VkResult={d} rejection={s} adapter={s} api=0x{x} attempts={d} swapchain_generations={d} surface_recreations={d}\n",
+            .{
+                @tagName(presenter.stage),
+                presenter.stage.retryable(),
+                report.last_result,
+                report.rejectionLabel(),
+                if (report.adapter_name_length != 0) report.adapterName() else "<unselected>",
+                report.api_version,
+                self.dynamic_forwarder.native_presenter_attempts,
+                report.swapchain_generations,
+                report.surface_recreations,
+            },
+        );
+        machoCapturePrint(
+            "    integrity-trace presenter last-frame(attempted/slot/image/acquire/submit/present/request-accepted/gpu-completed/completion/health/provenance)={s}/{d}/{d}/{d}/{d}/{d}/{s}/{s}/{d}/{s}/{s}; retryable surface backpressure is not a terminal presenter failure\n",
+            .{
+                if (frame.attempted) "YES" else "NO",
+                frame.frame_slot,
+                frame.image_index,
+                frame.acquire_result,
+                frame.submit_result,
+                frame.present_result,
+                if (frame.present_request_accepted) "YES" else "NO",
+                if (frame.hardware_completed) "YES" else "NO",
+                frame.hardware_completion_result,
+                @tagName(frame.health),
+                frame.classification.label(),
+            },
+        );
+    }
+
+    /// List the concrete symbols behind execution-profile classifier debt.
+    /// The normal audit report already prints the hottest rows; this bounded
+    /// repeat is kept in the fatal trace so the failure remains self-contained
+    /// when the run stops before the next full audit pass.
+    fn logRunIntegrityProfileGaps(self: *MachOState) void {
+        const profile = &self.startup.profile;
+        const totals = profile.summary();
+        machoCapturePrint(
+            "    integrity-trace profile gaps samples={d} readable={} decisive={} unclassified={d} unresolved={d}\n",
+            .{
+                totals.samples,
+                totals.readable(),
+                totals.dominantIsDecisive(),
+                totals.by_region[@intFromEnum(diagnostics_execution_profile.Region.unclassified)],
+                totals.by_region[@intFromEnum(diagnostics_execution_profile.Region.unresolved_symbol)],
+            },
+        );
+        var shown: usize = 0;
+        for (profile.retained()) |entry| {
+            if (entry.region != .unclassified and entry.region != .unresolved_symbol) continue;
+            machoCapturePrint(
+                "    integrity-trace profile gap region={s} samples={d} witness_rip=0x{x} first_step={d} last_step={d} symbol={s}\n",
+                .{
+                    entry.region.label(),
+                    entry.samples,
+                    entry.witness_rip,
+                    entry.first_step,
+                    entry.last_step,
+                    entry.name,
+                },
+            );
+            shown += 1;
+            if (shown == 8) break;
+        }
+    }
+
+    /// Emit every required monotone subject inside the fatal trace. The normal
+    /// witness report is periodic and may be separated from the stop by a
+    /// large amount of output; this bounded block keeps the missing observer
+    /// and both carriers attached to the exact closure failure.
+    fn logRunIntegrityWitnessCorroboration(self: *MachOState) void {
+        const ledger = &self.monotone_witness;
+        const totals = ledger.summary();
+        machoCapturePrint(
+            "    integrity-trace monotone-witness closure=NO required/observed/corroborated/agreement-debt={d}/{d}/{d}/{d}; every required subject must be exactly corroborated before a closed graphics conclusion\n",
+            .{
+                monotone_witness.required_subject_count,
+                totals.required_observed,
+                totals.required_corroborated,
+                totals.required_agreement_debt,
+            },
+        );
+
+        const subjects = [_]monotone_witness.Subject{
+            .title_interrupt_callback_entries,
+            .title_interrupt_callback_returns,
+            .graphics_interrupt_dispatches,
+            .vblank_marks,
+            .pm4_packets_consumed,
+            .draws_issued,
+            .render_target_updates,
+            .register_writes,
+            .ring_write_pointer_advances,
+        };
+        for (subjects) |subject| {
+            const result = ledger.reconcile(subject);
+            machoCapturePrint(
+                "      integrity-trace witness subject={s} finding={s} witnesses={d} floor={d} floor_by={s} floor_step={d} short={s} short_count={d} short_step={d} quiet={d}; {s}\n",
+                .{
+                    subject.label(),
+                    result.finding.label(),
+                    result.witnesses,
+                    result.floor,
+                    if (result.floor_witness) |which| which.label() else "-",
+                    result.floor_step,
+                    if (result.short_witness) |which| which.label() else "-",
+                    result.short_count,
+                    result.short_step,
+                    result.short_quiet_steps,
+                    result.finding.guidance(),
+                },
+            );
+        }
+    }
+
+    /// Name the stages nothing ever probed, and the probe rows that prove it.
+    ///
+    /// A count of unprobed stages is not actionable: the work is at a specific
+    /// call site for a specific probe, and the row that identifies it is
+    /// `attempts=0` sitting beside siblings with hundreds. Printing the floor
+    /// alongside is what separates "the driver never ran" from "the driver ran
+    /// and never came here", which are different repairs.
+    fn logRunIntegrityUnprobedStages(self: *MachOState) void {
+        const ledger = &self.gpu_vd_swap_contract;
+        const mask = ledger.observed_mask;
+        machoCapturePrint(
+            "    integrity-trace unprobed stages attempt_floor={d} required_floor={d}\n",
+            .{ ledger.probes.maxAttempts(), run_integrity.vd_swap_probe_floor },
+        );
+        var shown: usize = 0;
+        inline for (@typeInfo(gpu.VdSwapStage).@"enum".fields) |field| {
+            const stage: gpu.VdSwapStage = @enumFromInt(field.value);
+            const diagnosis = ledger.probes.diagnose(stage, mask);
+            if (diagnosis.attribution == .unprobed and shown < 6) {
+                machoCapturePrint(
+                    "    integrity-trace unprobed stage={s} chain={s} owner={s} probes={d}/{d} prerequisites=met\n",
+                    .{
+                        stage.label(),
+                        diagnosis.chain.label(),
+                        stage.owner().label(),
+                        diagnosis.probes_attempted,
+                        diagnosis.probes_total,
+                    },
+                );
+                for (gpu.vd_swap_contract.probesFor(stage)) |probe| {
+                    const cell = ledger.probes.cell(stage, probe);
+                    machoCapturePrint(
+                        "      integrity-trace unprobed probe={s} attempts={d} outcome={s} first_step={d} last_step={d}\n",
+                        .{ probe.label(), cell.attempts, @tagName(cell.outcome), cell.first_step, cell.last_step },
+                    );
+                }
+                shown += 1;
+            }
+        }
+    }
+
+    /// Name the stages starved for a cause Rosette can remove, and the probe
+    /// and cause for each.
+    ///
+    /// A count says how many gaps there are; the repair is at one call site
+    /// per stage, and only the deciding probe and its recorded cause identify
+    /// it. `probe-unwired` and `source-never-fed` need different fixes and the
+    /// row has to say which.
+    fn logRunIntegrityClosableStarvations(self: *MachOState) void {
+        const ledger = &self.gpu_vd_swap_contract;
+        var shown: usize = 0;
+        inline for (@typeInfo(gpu.VdSwapStage).@"enum".fields) |field| {
+            const stage: gpu.VdSwapStage = @enumFromInt(field.value);
+            const diagnosis = ledger.diagnose(stage);
+            if (diagnosis.attribution == .starved and
+                diagnosis.starvation_cause.closableByRosette() and
+                shown < 6)
+            {
+                machoCapturePrint(
+                    "    integrity-trace closable-starvation stage={s} chain={s} owner={s} cause={s} decided_by={s} probes(attempted/total/starved)={d}/{d}/{d}; {s}\n",
+                    .{
+                        stage.label(),
+                        diagnosis.chain.label(),
+                        stage.owner().label(),
+                        diagnosis.starvation_cause.label(),
+                        if (diagnosis.decided_by) |which| which.label() else "<none>",
+                        diagnosis.probes_attempted,
+                        diagnosis.probes_total,
+                        diagnosis.probes_starved,
+                        diagnosis.starvation_cause.remedy(),
+                    },
+                );
+                shown += 1;
+            }
+        }
+    }
+
+    /// Name every contested claim inside a fatal integrity trace.
+    ///
+    /// The gate's remedy says "read CLAIM RECONCILIATION", and on 2026-09-06
+    /// that report was not in the log: it is periodic, it collapses when
+    /// unchanged, and the run died before the next emission. A stop whose
+    /// evidence lives in a different report is a stop a reader cannot act on,
+    /// so the evidence is printed here, on the fault path, where lines are
+    /// written synchronously and survive the signal.
+    fn logRunIntegrityContestedClaims(self: *MachOState) void {
+        const ledger = &self.claim_reconciliation;
+        var shown: usize = 0;
+        inline for (@typeInfo(claim_reconciliation.Claim).@"enum".fields) |field| {
+            const claim: claim_reconciliation.Claim = @enumFromInt(field.value);
+            const result = ledger.reconcile(claim);
+            if (result.agreement == .contested and shown < 8) {
+                machoCapturePrint(
+                    "    integrity-trace contested-claim {s} observers={d} current={s}=0x{x} (step {d}) losing={s}=0x{x} (step {d}) crosses_sides={s}; {s}\n",
+                    .{
+                        claim.label(),
+                        result.observers,
+                        if (result.current_source) |which| which.label() else "<none>",
+                        result.current_value,
+                        result.current_step,
+                        if (result.losing_source) |which| which.label() else "<none>",
+                        result.losing_value,
+                        result.losing_step,
+                        if (result.crosses_sides) "YES" else "NO",
+                        result.agreement.guidance(),
+                    },
+                );
+                shown += 1;
+            }
+        }
+    }
+
+    /// Emit the budget inputs inside a fatal integrity trace. The ordinary
+    /// RUN BUDGET line is periodic and may be separated from the stop by a
+    /// large amount of guest/JIT output; this compact block keeps the measured
+    /// rate, threshold and host-time attribution attached to the failure.
+    fn logRunIntegrityBudgetCause(self: *MachOState) void {
+        const totals = self.runBudgetGuestWindowSummary();
+        const verdict = self.runBudgetGuestWindowVerdict(totals);
+        machoCapturePrint(
+            "    integrity-trace budget verdict={s} observed_host_seconds={d} observed_guest_ms={d} guest_ms_per_host_s={d} required={d} observer_percent={d} dominant_phase={s}; {s}\n",
+            .{
+                verdict.label(),
+                totals.host_ns / std.time.ns_per_s,
+                totals.guest_ms,
+                totals.guestMsPerHostSecond(),
+                self.audit_budget.required_guest_ms_per_host_second,
+                totals.observerPercent(),
+                if (totals.dominantPhase()) |phase| phase.label() else "-",
+                verdict.describe(),
+            },
+        );
+        var phase_index: usize = 0;
+        while (phase_index < run_budget.phase_count) : (phase_index += 1) {
+            const phase: run_budget.Phase = @enumFromInt(phase_index);
+            const host_ns = totals.by_phase[phase_index];
+            if (host_ns != 0) {
+                machoCapturePrint(
+                    "    integrity-trace budget phase={s} host_seconds={d} host_ns={d}\n",
+                    .{ phase.label(), host_ns / std.time.ns_per_s, host_ns },
+                );
+            }
+        }
+    }
+
+    /// Emit a detailed block only at a violation entry or when its measured
+    /// detail changes. The ordinary integrity report can continue to appear at
+    /// checkpoints; this event block is the bounded, causal record that makes
+    /// the first failure searchable and prevents an unchanged fault from
+    /// drowning the run in duplicate evidence.
+    fn logRunIntegrityViolationTrace(self: *MachOState, summary: run_integrity.Summary) void {
+        var changed_count: usize = 0;
+        var index: u8 = 0;
+        while (index < run_integrity.invariant_count) : (index += 1) {
+            const entry = self.run_integrity.record(@enumFromInt(index));
+            if (entry.state == .violated and entry.last_transition.tracesViolation())
+                changed_count += 1;
+        }
+        if (changed_count == 0) return;
+
+        machoCapturePrint(
+            "macho-processor: RUN INTEGRITY VIOLATION TRACE: schema={d} step={d} newly_changed={d} current_violations={d} selected_stop={s}; first predicate inputs, causal capability status and execution context follow\n",
+            .{
+                run_integrity.schema_version,
+                self.executed_steps,
+                changed_count,
+                summary.violated,
+                if (summary.stop_at) |invariant| invariant.label() else "<none>",
+            },
+        );
+
+        index = 0;
+        var wait_graph_logged = false;
+        while (index < run_integrity.invariant_count) : (index += 1) {
+            const invariant: run_integrity.Invariant = @enumFromInt(index);
+            const entry = self.run_integrity.record(invariant);
+            if (entry.state != .violated or !entry.last_transition.tracesViolation()) continue;
+
+            if (!wait_graph_logged and
+                (invariant == .no_stalled_wait_handshake or
+                    invariant == .wait_receives_signals or
+                    invariant == .no_actionable_wait_policy_fault))
+            {
+                // The integrity checkpoint runs before the normal graphics
+                // report. Emit the graph here as part of the causal fault block
+                // so a strict stop cannot lose the waiter/signaller PCs that
+                // explain the aggregate liveness counter.
+                self.logWaitAudit();
+                self.logWaitGraph();
+                wait_graph_logged = true;
+            }
+
+            const first_observation = if (entry.has_first_violation_observation)
+                entry.first_violation_observation
+            else
+                self.run_integrity.last_observation;
+            const first_armed_observation = if (entry.has_armed_observation)
+                entry.first_armed_observation
+            else
+                first_observation;
+            const armed_context = self.run_integrity_first_armed_context[index];
+            const violation_context = self.run_integrity_first_violation_context[index];
+            machoCapturePrint(
+                "  integrity-trace invariant={s} transition={s} state={s} owner={s} subowner={s} class={s} allowed={} gate={s}\n",
+                .{
+                    invariant.label(),
+                    entry.last_transition.label(),
+                    entry.state.label(),
+                    ownership_contract.root_owner,
+                    invariant.owner().label(),
+                    invariant.class().label(),
+                    entry.allowlistApplies(invariant),
+                    run_integrity.traceGate(invariant),
+                },
+            );
+            machoCapturePrint(
+                "    integrity-trace cause(first/current)={s} / {s} detail(first/current)={d}/{d} armed_step={d} first_violation_step={d} first_detail={d} violations={d} context(armed_rip/armed_thread/violation_rip/violation_thread/current_rip/current_thread)=0x{x}/0x{x}/0x{x}/0x{x}/0x{x}/0x{x}; remedy={s}\n",
+                .{
+                    run_integrity.traceCause(invariant, first_observation),
+                    run_integrity.traceCause(invariant, self.run_integrity.last_observation),
+                    entry.first_violation_detail,
+                    entry.detail,
+                    entry.armed_step,
+                    entry.first_violation_step,
+                    entry.first_violation_detail,
+                    entry.violations,
+                    armed_context.rip,
+                    armed_context.thread,
+                    violation_context.rip,
+                    violation_context.thread,
+                    self.regs.rip,
+                    self.active_guest_thread,
+                    invariant.remedy(),
+                },
+            );
+            if (invariant == .no_gpu_preinitialization_order_inversion) {
+                // The pre-initialization ledger retains the exact dependent,
+                // prerequisite and first step. Emit it inside the causal block
+                // so the hard stop cannot leave the ordering inversion buried
+                // in a later checkpoint's general graphics report.
+                self.logPreinitialization();
+            }
+            if (invariant == .no_actionable_provisioning_refusal) {
+                // Custody owns the per-resource refusal, owner and consumer
+                // details. Emit it in the causal block so a strict stop does
+                // not leave the raw refusal total detached from its resource.
+                self.logProvisioningCustody();
+            }
+            if (invariant == .no_presenter_failure) {
+                self.logRunIntegrityPresenterCause();
+            }
+            if (invariant == .no_unclassified_execution_profile) {
+                self.logRunIntegrityProfileGaps();
+            }
+            if (invariant == .all_required_witnesses_corroborated) {
+                self.logRunIntegrityWitnessCorroboration();
+            }
+            if (invariant == .no_unprobed_reachable_stage) {
+                self.logRunIntegrityUnprobedStages();
+            }
+            if (invariant == .no_rosette_closable_starvation) {
+                self.logRunIntegrityClosableStarvations();
+            }
+            if (invariant == .no_contested_claim) {
+                self.logRunIntegrityContestedClaims();
+            }
+            if (invariant == .no_settled_unknown_mapping) {
+                // Reprint the inventory unconditionally on the stop: the
+                // collapse-on-unchanged-total rule that keeps it quiet during a
+                // run is exactly what would hide it at the moment it matters.
+                self.unknown_inventory_last_total = 0;
+                self.logUnknownInventory();
+            }
+            if (invariant == .no_run_budget_deficit) {
+                self.logRunIntegrityBudgetCause();
+            }
+            if (invariant == .no_proven_deadlock) {
+                self.logDeadlockPredictor();
+            }
+            if (invariant == .no_invalid_application_controller_decision) {
+                self.logApplicationControllerContractViolation();
+            }
+            if (invariant == .no_unproven_essential_component) {
+                // Readiness owns the component, first-use step and proof
+                // obligation. Emit it in the causal block so the fatal stop
+                // cannot leave an essential gap as an unexplained percentage.
+                self.logComponentReadiness();
+            }
+            self.logRunIntegrityTraceSnapshot("first-armed", first_armed_observation);
+            self.logRunIntegrityTraceSnapshot("first-violation", first_observation);
+            if (entry.last_transition == .changed or
+                first_observation.step != self.run_integrity.last_observation.step)
+            {
+                self.logRunIntegrityTraceSnapshot("current", self.run_integrity.last_observation);
+            }
+            self.logRunIntegrityCapabilityCauses(invariant);
+        }
+    }
+
+    /// Emit the exact controller decision and immutable sample that violated
+    /// the ownership/evidence contract. This is intentionally separate from
+    /// the normal controller summary: the summary can have moved on by the
+    /// time the integrity trace is flushed, while the retained violation is
+    /// the evidence that justified the stop.
+    fn logApplicationControllerContractViolation(self: *MachOState) void {
+        const violation = self.application_controller.last_contract_violation orelse return;
+        const decision = self.application_controller.last_contract_violation_decision;
+        const sample = self.application_controller.last_contract_violation_sample;
+        machoCapturePrint(
+            "    integrity-trace application-controller violation={s} decision(phase/action/blocker/secondary/domain/authorized/step)={s}/{s}/{s}/{s}/{s}/{}/{d} sample(guest-vdswap/guest-output/authentic-swap/presenter-ready/interrupt-callback/powerpc-callback/target-state/target-memory/pending/signaled/dispatched)={}/{}/{}/{}/{}/{}/{}/{}/{d}/{d}/{d}\n",
+            .{
+                violation.label(),
+                decision.phase.label(),
+                decision.action.label(),
+                decision.blocker.label(),
+                decision.secondary_blocker.label(),
+                decision.domain.label(),
+                decision.host_action_authorized,
+                decision.step,
+                sample.guest_vdswap_entered,
+                sample.guest_output_available,
+                sample.authentic_swap_consumed,
+                sample.presenter_ready,
+                sample.interrupt_callback_registered,
+                sample.powerpc_callback_registered,
+                sample.render_target_state_observed,
+                sample.render_target_memory_observed,
+                sample.pending_gpu_interrupts,
+                sample.draw_completion_signaled,
+                sample.draw_completion_dispatched,
+            },
+        );
+    }
+
     pub fn logRunIntegrity(self: *MachOState, summary: run_integrity.Summary) void {
         const observation = self.run_integrity.last_observation;
         machoCapturePrint(
-            "macho-processor: RUN INTEGRITY: policy={s} armed={d} satisfied={d} violated={d} unarmed={d} allowed={d} regressions={d} of {d} step={d} critical(total/satisfied/degraded/unsatisfied/untested)={d}/{d}/{d}/{d}/{d} liveness_scope={s} liveness_armed={} liveness_waiters_without_notifier={d}; {s}\n",
+            "macho-processor: RUN INTEGRITY: owner={s} subowner={s} policy={s} armed={d} satisfied={d} violated={d} unarmed={d} allowed={d} regressions={d} of {d} step={d} capability_progress(coverage/guest/witness/quiet)={d}/{d}/{d}/{d} critical(total/satisfied/degraded/unsatisfied/untested)={d}/{d}/{d}/{d}/{d} order(active/held/raced/violated/mandatory)={d}/{d}/{d}/{d}/{d} preinit(inversions/dropped)={d}/{d} readiness(armed/essential_gaps)={}/{d}\n",
             .{
+                ownership_contract.root_owner,
+                "rosette:harness",
                 self.run_integrity.policy.label(),
                 summary.armed,
                 summary.satisfied,
@@ -5546,23 +8251,189 @@ pub const MachOState = struct {
                 summary.regressions,
                 run_integrity.invariant_count,
                 self.executed_steps,
+                observation.capability_coverage_progress_step,
+                observation.capability_guest_progress_step,
+                observation.capability_progress_witness_step,
+                observation.capability_progress_quiet_steps,
                 observation.critical_capabilities_total,
                 observation.critical_capabilities_satisfied,
                 observation.critical_capabilities_degraded,
                 observation.critical_capabilities_unsatisfied,
                 observation.critical_capabilities_untested,
+                observation.mandatory_order_active,
+                observation.mandatory_order_active -|
+                    observation.mandatory_order_violated -|
+                    observation.mandatory_order_raced,
+                observation.mandatory_order_raced,
+                observation.mandatory_order_violated,
+                observation.mandatory_order_mandatory_violations,
+                observation.gpu_preinitialization_inversions,
+                observation.gpu_preinitialization_inversions_dropped,
+                observation.component_readiness_armed,
+                observation.essential_component_gaps,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: RUN INTEGRITY LIVENESS: scope={s} armed={} waiters_without_notifier={d} actionable={d} obligation_proven={}; verdict={s}\n",
+            .{
                 observation.liveness_scope.label(),
                 observation.liveness_scope.notifierChecksArmed(),
                 observation.waiters_without_a_notifier,
+                observation.actionable_waiters_without_a_notifier,
+                observation.liveness_obligation_proven,
                 summary.verdict(),
             },
         );
-        if (!observation.liveness_scope.notifierChecksArmed() and
-            observation.waiters_without_a_notifier != 0)
+        machoCapturePrint(
+            "macho-processor: RUN INTEGRITY PRESENTER: attempted={} stage={s} retryable={} nonretryable_failures={d}; diagnostic-only frames prove the Cocoa sink, not guest output, and do not degrade native_present_completed\n",
+            .{
+                observation.presenter_attempted,
+                @tagName(self.dynamic_forwarder.nativePresenterStage()),
+                self.dynamic_forwarder.nativePresenterStage().retryable(),
+                observation.presenter_nonretryable_failures,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: RUN INTEGRITY PROVISIONING: armed={} raw_refusals={d} actionable_storage_refusals={d} custody_failures(late/diverged/contested/unprovisioned)={d}/{d}/{d}/{d}; owner-rule refusals remain diagnostic until they leave an actionable custody state\n",
+            .{
+                observation.provisioning_armed,
+                observation.provisioning_raw_refusals,
+                observation.provisioning_actionable_refusals,
+                observation.provisioning_late,
+                observation.provisioning_diverged,
+                observation.provisioning_contested,
+                observation.provisioning_unprovisioned,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: RUN INTEGRITY APPLICATION CONTROLLER: decisions={d} contract_violations={d}; guest-boundary observations are not refusals, and an invalid host authorization/evidence pairing is non-bypassable\n",
+            .{
+                observation.application_controller_decisions,
+                observation.application_controller_contract_violations,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: RUN INTEGRITY WAIT POLICY: observed={} faults={d}; guest_synthetic_wake=REFUSED is a protection decision, while only requires_fault is fatal\n",
+            .{ observation.wait_policy_observed, observation.wait_policy_faults },
+        );
+        machoCapturePrint(
+            "macho-processor: RUN INTEGRITY PROFILE: samples={d} readable={} decisive={} classifier_debt(unclassified/unresolved)={d}/{d}; startup profiles below the evidence threshold remain unarmed\n",
+            .{
+                observation.execution_profile_samples,
+                observation.execution_profile_readable,
+                observation.execution_profile_decisive,
+                observation.execution_profile_unclassified,
+                observation.execution_profile_unresolved,
+            },
+        );
+        const deadlock_finding: deadlock_predictor.Finding = @enumFromInt(observation.deadlock_finding);
+        machoCapturePrint(
+            "macho-processor: RUN INTEGRITY BUDGET: observed={} deficit={} guest_ms_per_host_s={d} required={d} host_seconds={d} guest_ms={d}; the deficit gate excludes the startup settling window and stops only a measured BELOW-BUDGET reachability failure\n",
+            .{
+                observation.run_budget_observed,
+                observation.run_budget_deficit,
+                observation.run_budget_guest_ms_per_host_second,
+                observation.run_budget_required_guest_ms_per_host_second,
+                observation.run_budget_host_seconds,
+                observation.run_budget_guest_ms,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: RUN INTEGRITY DEADLOCK: observed={} proven={} finding={s} waiters={d} longest_park_steps={d}; NEVER_NOTIFIED remains diagnostic until a causal obligation or fully frozen run exists, while all-notifiers-parked, producer-terminated and mature WAIT_CYCLE findings are fatal\n",
+            .{
+                observation.deadlock_observed,
+                observation.deadlock_proven,
+                deadlock_finding.label(),
+                observation.deadlock_waiters,
+                observation.deadlock_park_steps,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: RUN INTEGRITY POLICY: strict_fail_fast={} anomaly_ledger_records={d} pause_transaction_defects={d}; fault/warn modes stop or expose the first proven reusable eviction, classified liveness contradiction, or pause-ledger defect; observe mode retains the settling-window policy\n",
+            .{
+                self.run_integrity_strict,
+                observation.recorded_anomalies,
+                observation.pause_transaction_defects,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: RUN INTEGRITY READINESS: armed={} essential_gaps={d}; an essential component used before proof or marked broken is non-bypassable, while unused unproven components remain diagnostic\n",
+            .{ observation.component_readiness_armed, observation.essential_component_gaps },
+        );
+        if (observation.mandatory_order_armed) {
+            machoCapturePrint(
+                "macho-processor: RUN INTEGRITY ORDER: armed={s} active={d} violated={d} mandatory_violations={d} raced={d}; raw draw/callback/diagnostic counters are context only, and the order ledger is the authority for cross-domain prerequisites\n",
+                .{
+                    if (observation.mandatory_order_armed) "YES" else "NO",
+                    observation.mandatory_order_active,
+                    observation.mandatory_order_violated,
+                    observation.mandatory_order_mandatory_violations,
+                    observation.mandatory_order_raced,
+                },
+            );
+        }
+        machoCapturePrint(
+            "macho-processor: RUN INTEGRITY WAIT EVIDENCE: graph(events/objects/stalled/cycles/insufficient/dropped)={d}/{d}/{d}/{d}/{d}/{d} timeout-subject(object/handle/type/waits/timeouts/signals/first_step/last_step)=0x{x}/0x{x}/{d}/{d}/{d}/{d}/{d}/{d} bounded-timeout(subjects/attempts/object/handle/ms/signals/first_step/last_step/notifier_proven/other_progress)={d}/{d}/0x{x}/0x{x}/{d}/{d}/{d}/{d}/{s}/{s}; a finite poll can arm the fatal notifier invariant only when the exact sync object has a classified causal notifier and no independent progress advanced during the interval\n",
+            .{
+                observation.wait_graph_events,
+                observation.wait_graph_objects,
+                observation.wait_graph_stalled_handshakes,
+                observation.wait_graph_cycles,
+                observation.wait_graph_insufficient,
+                observation.wait_graph_dropped_objects,
+                observation.unsignalled_wait_object,
+                observation.unsignalled_wait_handle,
+                observation.unsignalled_wait_type,
+                observation.unsignalled_wait_waits,
+                observation.unsignalled_wait_timeouts,
+                observation.unsignalled_wait_signals,
+                observation.unsignalled_wait_first_step,
+                observation.unsignalled_wait_last_step,
+                observation.bounded_timeout_subjects,
+                observation.bounded_timeout_attempts,
+                observation.bounded_timeout_object,
+                observation.bounded_timeout_handle,
+                observation.bounded_timeout_ms,
+                observation.bounded_timeout_signals,
+                observation.bounded_timeout_first_step,
+                observation.bounded_timeout_last_step,
+                if (observation.bounded_timeout_notifier_proven) "YES" else "NO",
+                if (observation.bounded_timeout_other_progress) "YES" else "NO",
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: RUN INTEGRITY WAIT BLOCKER: object=0x{x} waits={d} signals={d} waiter(thread/pc)=0x{x}/0x{x} signaller(thread/pc)=0x{x}/0x{x} interval(first/last)={d}/{d} participants_dropped={d}; selected from the wait graph and intentionally kept separate from the timeout subject\n",
+            .{
+                observation.wait_graph_blocker_object,
+                observation.wait_graph_blocker_waits,
+                observation.wait_graph_blocker_signals,
+                observation.wait_graph_blocker_waiter_thread,
+                observation.wait_graph_blocker_waiter_pc,
+                observation.wait_graph_blocker_signaller_thread,
+                observation.wait_graph_blocker_signaller_pc,
+                observation.wait_graph_blocker_first_step,
+                observation.wait_graph_blocker_last_step,
+                observation.wait_graph_blocker_participants_dropped,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: RUN INTEGRITY FRAME EVIDENCE: completed(authentic/host/diagnostic)={d}/{d}/{d} guest-forwarded-present-requests={d} native-gpu-completions={d} custody={d}; a Vulkan present request is not a completed guest frame and a diagnostic Metal clear is not guest output. This counts only presents the *guest* asked for and Rosette forwarded to the real driver; PRESENTATION PROVENANCE counts every native present request from any producer, so the two differ by Rosette's own diagnostic presents and neither is undercounting\n",
+            .{
+                observation.authentic_frames_presented,
+                observation.host_frames_presented,
+                observation.diagnostic_frames_presented,
+                observation.native_present_requests,
+                observation.native_gpu_completions,
+                observation.frames_in_custody,
+            },
+        );
+        self.logRunIntegrityPm4Evidence();
+        if (observation.waiters_without_a_notifier != 0 and
+            observation.actionable_waiters_without_a_notifier == 0)
         {
             machoCapturePrint(
-                "macho-processor: RUN INTEGRITY LIVENESS: pre-guest-startup wait evidence is diagnostic only; no notifier conclusion can stop the run until guest execution or guest GPU activity is proven. The deadlock predictor and notifier census remain authoritative for investigation\n",
-                .{},
+                "macho-processor: RUN INTEGRITY LIVENESS: raw host waiters_without_notifier={d} retained diagnostically, but no causal notifier obligation was proven; the fatal notifier invariants remain unarmed. Guest wait graph/classified sync evidence or a fully frozen run is required\n",
+                .{observation.waiters_without_a_notifier},
             );
         }
         // Keep the translation evidence beside the terminal integrity report.
@@ -5577,7 +8448,7 @@ pub const MachOState = struct {
             @intCast((@as(u128, self.decode_cache_hits) * 100) / translation_lookups);
         const translation_record = self.run_integrity.record(.translation_cache_converges);
         machoCapturePrint(
-            "macho-processor: RUN INTEGRITY TRANSLATION: gate={s} verdict={s} fills={d} causes(vacant/conflict/cold/stale/flush)={d}/{d}/{d}/{d}/{d} hit_rate={d}% sampled_pages={d} unsampled_events={d} sample_complete={s}; {s}\n",
+            "macho-processor: RUN INTEGRITY TRANSLATION: gate={s} verdict={s} fills={d} causes(vacant/conflict/cold/stale/flush)={d}/{d}/{d}/{d}/{d} hit_rate={d}% static_l2(hits/fills)={d}/{d} sampled_pages={d} unsampled_events={d} sample_complete={s}; {s}\n",
             .{
                 translation_record.state.label(),
                 translation_totals.verdict().label(),
@@ -5588,12 +8459,22 @@ pub const MachOState = struct {
                 translation_totals.stale_refills,
                 translation_totals.flush_refills,
                 translation_hit_rate,
+                self.static_decode_l2_hits,
+                self.static_decode_l2_fills,
                 translation_totals.sampled_pages,
                 translation_totals.unsampled_events,
                 if (translation_totals.sampleComplete()) "YES" else "NO",
                 translation_totals.verdict().guidance(),
             },
         );
+        if (observation.mandatory_order_mandatory_violations != 0) {
+            // The order ledger owns the bounded lead-up and domain-specific
+            // event identities. Emit it before the generic integrity trace so
+            // a strict SIGSEGV always leaves the exact ordering evidence in
+            // the retained runtime log.
+            self.logMandatoryOrder();
+        }
+        self.logRunIntegrityViolationTrace(summary);
         var index: u8 = 0;
         while (index < run_integrity.invariant_count) : (index += 1) {
             const invariant: run_integrity.Invariant = @enumFromInt(index);
@@ -5605,25 +8486,34 @@ pub const MachOState = struct {
             if (entry.state == .satisfied) continue;
             if (entry.state == .not_armed and summary.violated == 0) continue;
             machoCapturePrint(
-                "  integrity {s: <32} {s: <10} owner={s: <16} class={s: <13} detail={d} armed_step={d} first_violation_step={d} violations={d}{s}\n",
+                "  integrity {s: <32} {s: <10} owner={s} subowner={s: <16} invariant_owner={s: <16} class={s: <13} detail={d} armed_step={d} first_violation_step={d} violations={d}{s}\n",
                 .{
                     invariant.label(),
                     entry.state.label(),
+                    ownership_contract.root_owner,
+                    invariant.owner().label(),
                     invariant.owner().label(),
                     invariant.class().label(),
                     entry.detail,
                     entry.armed_step,
                     entry.first_violation_step,
                     entry.violations,
-                    if (entry.allowed) " ALLOWED" else "",
+                    if (entry.allowlistApplies(invariant))
+                        " ALLOWED"
+                    else if (entry.allowed and invariant.nonBypassable())
+                        " NON_BYPASSABLE"
+                    else
+                        "",
                 },
             );
         }
         if (summary.stop_at) |invariant| {
             machoCapturePrint(
-                "macho-processor: RUN INTEGRITY STOP: invariant={s} owner={s} class={s} detail={d} step={d}; {s}\n",
+                "macho-processor: RUN INTEGRITY STOP: invariant={s} owner={s} subowner={s} invariant_owner={s} class={s} detail={d} step={d}; {s}\n",
                 .{
                     invariant.label(),
+                    ownership_contract.root_owner,
+                    invariant.owner().label(),
                     invariant.owner().label(),
                     invariant.class().label(),
                     self.run_integrity.record(invariant).detail,
@@ -5634,6 +8524,223 @@ pub const MachOState = struct {
         }
     }
 
+    /// Stop at the cache fill that proves a reusable decode was evicted.
+    ///
+    /// The periodic run-integrity checkpoint remains the authoritative
+    /// summary, but waiting for that checkpoint would let a cache conflict
+    /// execute an unbounded amount of guest work. This path is armed only
+    /// after the runtime policy has been configured, only faults under the
+    /// fault policy, and honors the same allow-list as the periodic gate.
+    noinline fn failFastOnTranslationCause(
+        self: *MachOState,
+        address: u64,
+        domain: translation_domain.Domain,
+        cause: translation_economics.Cause,
+        set_base: usize,
+        cache_way: usize,
+        victim: *const DecodeCacheEntry,
+        victim_is_empty: bool,
+        victim_was_reused: bool,
+        stale_rejected: bool,
+        bytes: []const u8,
+    ) void {
+        const invariant = run_integrity.Invariant.translation_cache_converges;
+        const integrity_record = self.run_integrity.record(invariant);
+        if (!translation_cache.shouldFailFast(cause, .{
+            .strict = self.run_integrity_strict,
+            .fault_policy = self.run_integrity.policy == .fault,
+            .allowlisted = integrity_record.allowlistApplies(invariant),
+        })) return;
+
+        const global_set: usize = set_base / constants.DECODE_CACHE_WAYS;
+        const bank_set: usize = global_set % translation_cache.primary_layout.localSetCount();
+        const alternate_set_base = self.decodeCacheAlternateSetBaseFor(address, domain);
+        const alternate_global_set: usize = alternate_set_base / constants.DECODE_CACHE_WAYS;
+        const source_symbol = self.metadata.nearestSymbol(address);
+        var source_decode = decodeInsn(bytes);
+        if (source_decode.op == .invalid and self.sparse_memory.containsMapped(address, 1)) {
+            source_decode = decodeInsnCompat(bytes);
+        }
+        const initializer = self.initializer_resolver.current();
+        const initializer_index: u64 = if (initializer) |record|
+            @intCast(record.index + 1)
+        else
+            0;
+        const initializer_address = if (initializer) |record| record.address else 0;
+        const initializer_symbol = if (initializer) |record| record.symbol else "<none>";
+        const initializer_symbol_match = if (initializer) |record|
+            self.metadata.nearestSymbol(record.address)
+        else
+            null;
+        const source_byte_count = @min(bytes.len, @as(usize, 15));
+        const victim_byte_count: usize = if (victim_is_empty)
+            0
+        else
+            @min(@as(usize, victim.instruction_byte_count), victim.instruction_bytes.len);
+        const file_offset = self.fileOffsetForVaddr(address) orelse 0;
+        const source_name = if (source_symbol) |symbol| symbol.name else self.metadata.addressKind(address).label();
+        const source_offset = if (source_symbol) |symbol| symbol.offset else 0;
+        const initializer_offset = if (initializer_symbol_match) |symbol| symbol.offset else 0;
+        machoCapturePrint(
+            "macho-processor: TRANSLATION FAIL-FAST CONTEXT: startup_phase={s} phase_start_step={d} guest_rip=0x{x} guest_thread=0x{x} initializer={d}/{d} initializer_address=0x{x} initializer_symbol={s}+0x{x}\n",
+            .{
+                @tagName(self.startup.phase),
+                self.startup.phase_start_step,
+                self.regs.rip,
+                self.active_guest_thread,
+                initializer_index,
+                self.metadata.initializer_addresses.len,
+                initializer_address,
+                initializer_symbol,
+                initializer_offset,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: TRANSLATION FAIL-FAST INSTRUCTION: address=0x{x} symbol={s}+0x{x} op={s} len={d} bytes={any} file_offset=0x{x} file_offset_valid={}\n",
+            .{
+                address,
+                source_name,
+                source_offset,
+                @tagName(source_decode.op),
+                source_decode.len,
+                bytes[0..source_byte_count],
+                file_offset,
+                self.fileOffsetForVaddr(address) != null,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: TRANSLATION FAIL-FAST CACHE: set(global/bank/alternate)={d}/{d}/{d} set_base/alternate={d}/{d} way={d}/{d} generation={d} cause={s} stale_rejected={}\n",
+            .{
+                global_set,
+                bank_set,
+                alternate_global_set,
+                set_base,
+                alternate_set_base,
+                cache_way,
+                constants.DECODE_CACHE_WAYS,
+                self.code_generation,
+                cause.label(),
+                stale_rejected,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: TRANSLATION FAIL-FAST VICTIM: present={} reused={} rip=0x{x} domain={s} generation={d} reuse_count={d} recently_used={} fast_plain={} host_image={} op={s} len={d} bytes={any}\n",
+            .{
+                !victim_is_empty,
+                victim_was_reused,
+                if (victim_is_empty) 0 else victim.rip,
+                if (victim_is_empty) "<empty>" else victim.domain.label(),
+                if (victim_is_empty) 0 else victim.code_generation,
+                if (victim_is_empty) 0 else victim.reuse_count,
+                if (victim_is_empty) false else victim.recently_used,
+                if (victim_is_empty) false else victim.fast_plain,
+                if (victim_is_empty) false else victim.host_image,
+                if (victim_is_empty) "<empty>" else @tagName(victim.decoded.op),
+                if (victim_is_empty) 0 else victim.decoded.len,
+                victim.instruction_bytes[0..victim_byte_count],
+            },
+        );
+        // The decision above is made from one selected way, but a useful
+        // failure report must show the complete resident set. Without this,
+        // a repeated victim can look like an indexing failure even when the
+        // set was genuinely over capacity, and a replacement-policy mistake
+        // cannot be distinguished from a working-set overflow on the next
+        // run. This path is already terminal, so the bounded way walk has no
+        // hot-path cost.
+        const resident_sets = translation_domain.primarySetBases(address, domain);
+        for (resident_sets, 0..) |resident_set_base, resident_choice| {
+            if (resident_choice != 0 and resident_set_base == resident_sets[0]) continue;
+            const resident_ways = self.decode_cache[resident_set_base..][0..constants.DECODE_CACHE_WAYS];
+            for (resident_ways, 0..) |*resident, resident_way| {
+                if (!decodeCacheEntryOccupied(resident)) continue;
+                machoCapturePrint(
+                    "macho-processor: TRANSLATION FAIL-FAST RESIDENT: choice={d} way={d} rip=0x{x} domain={s} generation={d} reuse_count={d} recently_used={} fast_plain={} host_image={} op={s} len={d}\n",
+                    .{
+                        resident_choice,
+                        resident_way,
+                        resident.rip,
+                        resident.domain.label(),
+                        resident.code_generation,
+                        resident.reuse_count,
+                        resident.recently_used,
+                        resident.fast_plain,
+                        resident.host_image,
+                        @tagName(resident.decoded.op),
+                        resident.decoded.len,
+                    },
+                );
+            }
+        }
+        const totals = self.translation_economics.summary();
+        machoCapturePrint(
+            "macho-processor: TRANSLATION FAIL-FAST: invariant={s} cause={s} address=0x{x} domain={s} step={d} totals(fills/vacant/conflict/cold/stale/flush)={d}/{d}/{d}/{d}/{d}/{d}; a proven reusable eviction or executable-byte integrity event cannot continue under the fault policy\n",
+            .{
+                invariant.label(),
+                cause.label(),
+                address,
+                domain.label(),
+                self.executed_steps,
+                totals.decodes,
+                totals.vacant_fills,
+                totals.conflict_fills,
+                totals.cold_evictions,
+                totals.stale_refills,
+                totals.flush_refills,
+            },
+        );
+        native_crash.recordTranslationFault(.{
+            .address = address,
+            .step = self.executed_steps,
+            .guest_rip = self.regs.rip,
+            .guest_thread = self.active_guest_thread,
+            .startup_phase = @tagName(self.startup.phase),
+            .startup_phase_start_step = self.startup.phase_start_step,
+            .cause = cause.label(),
+            .domain = domain.label(),
+            .source_symbol = source_name,
+            .source_symbol_offset = source_offset,
+            .source_op = @tagName(source_decode.op),
+            .source_len = source_decode.len,
+            .source_bytes = bytes[0..source_byte_count],
+            .file_offset = file_offset,
+            .file_offset_valid = self.fileOffsetForVaddr(address) != null,
+            .initializer_index = initializer_index,
+            .initializer_count = @intCast(self.metadata.initializer_addresses.len),
+            .initializer_address = initializer_address,
+            .initializer_symbol = initializer_symbol,
+            .initializer_symbol_offset = initializer_offset,
+            .cache_set = @intCast(global_set),
+            .cache_bank_set = @intCast(bank_set),
+            .cache_set_base = @intCast(set_base),
+            .cache_way = @intCast(cache_way),
+            .cache_ways = constants.DECODE_CACHE_WAYS,
+            .code_generation = self.code_generation,
+            .victim_present = !victim_is_empty,
+            .victim_reused = victim_was_reused,
+            .stale_rejected = stale_rejected,
+            .victim_rip = if (victim_is_empty) 0 else victim.rip,
+            .victim_domain = if (victim_is_empty) "<empty>" else victim.domain.label(),
+            .victim_code_generation = if (victim_is_empty) 0 else victim.code_generation,
+            .victim_reuse_count = if (victim_is_empty) 0 else victim.reuse_count,
+            .victim_recently_used = if (victim_is_empty) false else victim.recently_used,
+            .victim_fast_plain = if (victim_is_empty) false else victim.fast_plain,
+            .victim_host_image = if (victim_is_empty) false else victim.host_image,
+            .victim_op = if (victim_is_empty) "<empty>" else @tagName(victim.decoded.op),
+            .victim_len = if (victim_is_empty) 0 else victim.decoded.len,
+            .victim_bytes = victim.instruction_bytes[0..victim_byte_count],
+        });
+        self.audit_pause.noteTermination(.diagnostic_termination, self.executed_steps);
+        machoCapturePrint(
+            "macho-processor: TRANSLATION FAIL-FAST: termination=diagnostic-termination raising SIGSEGV; set ROSETTE_RUN_INTEGRITY_ALLOW=translation-cache-converges only to step past this evidence\n",
+            .{},
+        );
+        macho_log.flushAsyncTransport();
+        self.macho_log.flush();
+        native_crash.recordPhase("translation-cache-fault");
+        _ = std.c.raise(std.c.SIG.SEGV);
+        unreachable;
+    }
+
     /// Terminate on a violated invariant.
     ///
     /// The whole report is written first, then the fault is raised, so the
@@ -5641,10 +8748,24 @@ pub const MachOState = struct {
     pub fn faultOnRunIntegrity(self: *MachOState, summary: run_integrity.Summary) void {
         const invariant = summary.stop_at orelse return;
         const entry = self.run_integrity.record(invariant);
+        // The integrity gate is evaluated before the rest of the graphics
+        // checkpoint is emitted. A guest log line can therefore open a wait
+        // after the previous checkpoint but immediately before this fault.
+        // Flush the retained entry here so a strict stop never loses the exact
+        // guest handle, PC/LR, and completion status that caused the frontier
+        // to remain unreachable. This is evidence only; it does not close or
+        // satisfy the wait.
         machoCapturePrint(
-            "macho-processor: RUN INTEGRITY FAULT: invariant={s} owner={s} class={s} detail={d} first_violation_step={d} violations={d} regressed={s} step={d} rip=0x{x} thread=0x{x}\n",
+            "macho-processor: RUN INTEGRITY FAULT CONTEXT: flushing guest wait ledger before signal; open entries remain unresolved and do not satisfy liveness\n",
+            .{},
+        );
+        self.logGuestWaitLiveness();
+        machoCapturePrint(
+            "macho-processor: RUN INTEGRITY FAULT: invariant={s} owner={s} subowner={s} invariant_owner={s} class={s} detail={d} first_violation_step={d} violations={d} regressed={s} step={d} rip=0x{x} thread=0x{x}\n",
             .{
                 invariant.label(),
+                ownership_contract.root_owner,
+                invariant.owner().label(),
                 invariant.owner().label(),
                 invariant.class().label(),
                 entry.detail,
@@ -5657,11 +8778,56 @@ pub const MachOState = struct {
             },
         );
         machoCapturePrint("macho-processor: RUN INTEGRITY FAULT: {s}\n", .{invariant.remedy()});
+        // How much of this log actually reached the file.
+        //
+        // The ring drops rather than blocking, and its totals were printed only
+        // by the normal shutdown path — which a gate that raises SIGSEGV never
+        // reaches. So on exactly the runs where a reader is about to conclude
+        // "X never happened", the one number that says whether X could have
+        // been dropped was missing. On 2026-09-06 a 3-billion-step run carried
+        // two checkpoints and no heartbeats, and nothing in it said why.
+        const transport = async_log.transportStats();
         machoCapturePrint(
-            "macho-processor: RUN INTEGRITY FAULT: raising SIGSEGV so the crash report names this standard. Set ROSETTE_RUN_INTEGRITY_ALLOW={s} to step past this one and reach the next, ROSETTE_RUN_INTEGRITY=warn to record every violation without stopping, or observe to disarm the gate\n",
-            .{invariant.label()},
+            "macho-processor: RUN INTEGRITY FAULT: log integrity={s} accepted={d} dropped={d} truncated={d} written={d} queued={d}; {s}\n",
+            .{
+                transport.integrity().label(),
+                transport.accepted,
+                transport.dropped,
+                transport.truncated,
+                transport.written,
+                transport.queued,
+                transport.integrity().guidance(),
+            },
         );
+        // The run ended because a gate decided to end it. Recording that as a
+        // deliberate termination is what keeps the next reader from filing the
+        // signal below as a guest crash: on 2026-08-31 the final SIGSEGV was
+        // this gate, and the crash report named a JIT symbol that had nothing
+        // to do with the invariant that tripped.
+        self.audit_pause.noteTermination(.diagnostic_termination, self.executed_steps);
+        machoCapturePrint(
+            "macho-processor: RUN INTEGRITY FAULT: termination={s}; {s}\n",
+            .{
+                self.audit_pause.termination.label(),
+                self.audit_pause.termination.describe(),
+            },
+        );
+        if (invariant.nonBypassable()) {
+            machoCapturePrint(
+                "macho-processor: RUN INTEGRITY FAULT: raising SIGSEGV so the crash report names this standard. This invariant is non-bypassable: ROSETTE_RUN_INTEGRITY_ALLOW, warn, and observe cannot permit an ordering inversion to continue\n",
+                .{},
+            );
+        } else {
+            machoCapturePrint(
+                "macho-processor: RUN INTEGRITY FAULT: raising SIGSEGV so the crash report names this standard. Set ROSETTE_RUN_INTEGRITY_ALLOW={s} to step past this one and reach the next, ROSETTE_RUN_INTEGRITY=warn to record every violation without stopping, or observe to disarm the gate\n",
+                .{invariant.label()},
+            );
+        }
         macho_log.flushAsyncTransport();
+        // Preserve the complete causal report before SIGSEGV.  Without this
+        // fsync the final fault can be visible while the preceding live
+        // counters are still only in the filesystem cache.
+        self.macho_log.flush();
         native_crash.recordPhase("run-integrity-fault");
         _ = std.c.raise(std.c.SIG.SEGV);
     }
@@ -5674,8 +8840,10 @@ pub const MachOState = struct {
         self.window_admission_last_fingerprint = fingerprint;
         const summary = ledger.summary();
         machoCapturePrint(
-            "macho-processor: WINDOW ADMISSION: policy={s} observations={d} admitted={d} refused={d} unaccountable={d} faults={d} pairs(touched/clean)={d}/{d} swap(observed/admitted/harness)={d}/{d}/{d} detail_dropped={d} step={d}; {s}\n",
+            "macho-processor: WINDOW ADMISSION: owner={s} subowner={s} policy={s} observations={d} admitted={d} refused={d} unaccountable={d} faults={d} pairs(touched/clean)={d}/{d} swap(observed/admitted/harness)={d}/{d}/{d} detail_dropped={d} step={d}; {s}\n",
             .{
+                ownership_contract.root_owner,
+                "rosette:window-admission",
                 ledger.policy.label(),
                 summary.observations,
                 summary.admitted,
@@ -5704,8 +8872,10 @@ pub const MachOState = struct {
                 const record = ledger.entry(facility, operation);
                 if (!record.touched() or record.clean()) continue;
                 machoCapturePrint(
-                    "  window-admission facility={s: <20} operation={s: <8} observations={d} admitted={d} refused={d} last={s} last_actor={s} first_step={d} last_step={d}\n",
+                    "  window-admission owner={s} subowner={s} facility={s: <20} operation={s: <8} observations={d} admitted={d} refused={d} last={s} last_actor={s} first_step={d} last_step={d}\n",
                     .{
+                        ownership_contract.root_owner,
+                        record.last_actor.label(),
                         facility.label(),
                         operation.label(),
                         record.observations,
@@ -5845,12 +9015,14 @@ pub const MachOState = struct {
         const frame_offer_label = if (outcome.frame_observed) @tagName(outcome.frame_offer) else "none";
 
         machoCapturePrint(
-            "macho-processor: COCOA GRAPHICS CONTROL: schema={d} run=0x{x} step={d} fingerprint=0x{x} policy={s} route={s} resources_ready={d}/{d} contested={d} stages_ready={d}/{d} failed={d} ownership_conflicts={d} presenter_lease={s}@{d} handoffs(offered/completed/refused)={d}/{d}/{d} frame_offer={s} frame_class={s} frame_delivery_pending={} semantic_intents(observed/admitted/rejected/duplicates/conflicts)={d}/{d}/{d}/{d}/{d}; raw_machine_code_to_cocoa=REFUSED semantic_boundaries_only=YES\n",
+            "macho-processor: COCOA GRAPHICS CONTROL: schema={d} run=0x{x} step={d} fingerprint=0x{x} owner={s} subowner={s} policy={s} route={s} resources_ready={d}/{d} contested={d} stages_ready={d}/{d} failed={d} ownership_conflicts={d} presenter_lease={s}@{d} handoffs(offered/completed/refused)={d}/{d}/{d} frame_offer={s} frame_class={s} frame_delivery_pending={} semantic_intents(observed/admitted/rejected/duplicates/conflicts)={d}/{d}/{d}/{d}/{d}; raw_machine_code_to_cocoa=REFUSED semantic_boundaries_only=YES\n",
             .{
                 gpu.cocoa_runtime.schema_version,
                 runtime.run,
                 self.executed_steps,
                 fingerprint,
+                ownership_contract.root_owner,
+                "rosette:graphics-control",
                 control.policy.label(),
                 summary.route.label(),
                 summary.ready_resources,
@@ -5898,8 +9070,11 @@ pub const MachOState = struct {
                 continue;
             }
             machoCapturePrint(
-                "  cocoa-resource name={s} state={s} identity=0x{x} generation={d} canonical_owner={s} custodian={s} evidence={s} providers=0x{x:0>4} borrowers=0x{x:0>4} observers=0x{x:0>4} observations={d} conflicts={d}\n",
+                "  cocoa-resource owner={s} subowner={s} custodian_subowner={s} name={s} state={s} identity=0x{x} generation={d} canonical_owner={s} custodian={s} evidence={s} providers=0x{x:0>4} borrowers=0x{x:0>4} observers=0x{x:0>4} observations={d} conflicts={d}\n",
                 .{
+                    ownership_contract.root_owner,
+                    resource.canonical_owner.label(),
+                    resource.custodian.label(),
                     resource.resource.label(),
                     resource.state.label(),
                     resource.identity,
@@ -5922,9 +9097,12 @@ pub const MachOState = struct {
             if (map_established and record.state == .ready and record.owner_conflicts == 0) {
                 settled_stages += 1;
             } else machoCapturePrint(
-                "  cocoa-stage owner={s: <16} state={s: <8} stage={s} identity=0x{x} generation={d} evidence={s} observations={d} owner_conflicts={d}\n",
+                "  cocoa-stage owner={s} subowner={s: <16} expected_subowner={s: <16} stage_owner={s: <16} state={s: <8} stage={s} identity=0x{x} generation={d} evidence={s} observations={d} owner_conflicts={d}\n",
                 .{
+                    ownership_contract.root_owner,
+                    record.owner.label(),
                     stage.expectedOwner().label(),
+                    record.owner.label(),
                     record.state.label(),
                     stage.label(),
                     record.identity,
@@ -5941,8 +9119,10 @@ pub const MachOState = struct {
         );
         for (control.conflicts[0..control.conflict_count]) |conflict| {
             machoCapturePrint(
-                "  cocoa-conflict sequence={d} kind={s} resource={s} expected_owner={s} actor={s} expected_identity=0x{x} observed_identity=0x{x} generation={d} step={d}\n",
+                "  cocoa-conflict owner={s} subowner={s} sequence={d} kind={s} resource={s} expected_owner={s} actor={s} expected_identity=0x{x} observed_identity=0x{x} generation={d} step={d}\n",
                 .{
+                    ownership_contract.root_owner,
+                    conflict.actor.label(),
                     conflict.sequence,
                     conflict.kind.label(),
                     conflict.resource.label(),
@@ -5957,8 +9137,12 @@ pub const MachOState = struct {
         }
         for (control.handoffs[0..control.handoff_count]) |handoff| {
             machoCapturePrint(
-                "  cocoa-handoff token={d} state={s} resource={s} identity=0x{x} generation={d} from={s} to={s} offered={d} accepted={d} completed={d}\n",
+                "  cocoa-handoff owner={s} subowner={s} from_subowner={s} to_subowner={s} token={d} state={s} resource={s} identity=0x{x} generation={d} from={s} to={s} offered={d} accepted={d} completed={d}\n",
                 .{
+                    ownership_contract.root_owner,
+                    "rosette:handoff",
+                    handoff.from.label(),
+                    handoff.to.label(),
                     handoff.token,
                     handoff.state.label(),
                     handoff.resource.label(),
@@ -5997,8 +9181,11 @@ pub const MachOState = struct {
         if (latest) |record| {
             const frame = record.descriptor;
             machoCapturePrint(
-                "  cocoa-frame run=0x{x} serial={d} generation={d} source=0x{x}+0x{x} extent={d}x{d} pitch={d} format={s} orientation={s} producer={s} guest_pixels={s} guest_swap={s} state={s} custodian={s} class={s} rejection={s}\n",
+                "  cocoa-frame owner={s} subowner={s} custodian_subowner={s} run=0x{x} serial={d} generation={d} source=0x{x}+0x{x} extent={d}x{d} pitch={d} format={s} orientation={s} producer={s} guest_pixels={s} guest_swap={s} state={s} custodian={s} class={s} rejection={s}\n",
                 .{
+                    ownership_contract.root_owner,
+                    frame.producer.label(),
+                    record.custodian.label(),
                     frame.identity.run,
                     frame.identity.serial,
                     frame.identity.generation,
@@ -6165,7 +9352,7 @@ pub const MachOState = struct {
 
     pub fn logApplicationController(self: *MachOState, decision: application_controller.Decision) void {
         machoCapturePrint(
-            "macho-processor: APPLICATION CONTROLLER: epoch={d} observations={d} transitions={d} phase={s} action={s} blocker={s} secondary={s} domain={s} step={d} quiet(guest/ring/pm4/presenter)={d}/{d}/{d}/{d} host_action_authorized={s} host_drains={d} host_refreshes={d} guest_boundary_refusals={d}; guest-owned decisions remain observational\n",
+            "macho-processor: APPLICATION CONTROLLER: epoch={d} observations={d} transitions={d} phase={s} action={s} blocker={s} secondary={s} domain={s} step={d} quiet(guest/ring/pm4/presenter)={d}/{d}/{d}/{d} host_action_authorized={s} host_drains={d} host_refreshes={d} guest_boundary_observations={d} contract_violations={d}; guest-owned decisions remain observational and never authorize host mutation\n",
             .{
                 self.application_controller.run_epoch,
                 self.application_controller.observations,
@@ -6183,7 +9370,8 @@ pub const MachOState = struct {
                 if (decision.host_action_authorized) "YES" else "NO",
                 self.application_controller_host_drains,
                 self.application_controller_host_refreshes,
-                self.application_controller.guest_boundary_refusals,
+                self.application_controller.guest_boundary_observations,
+                self.application_controller.contract_violations,
             },
         );
     }
@@ -6252,6 +9440,54 @@ pub const MachOState = struct {
         ledger.observeProbe(.ring_write_pointer_published, .ring_geometry_capture, self.gpu_ring_publication.advances != 0, self.gpu_ring_publication.advances, at);
         ledger.observeProbe(.ring_geometry_observed, .ring_geometry_capture, self.gpu_ring_publication.geometry != null, self.gpu_ring_watch_size, at);
 
+        // `frontbuffer_validated` declares no prerequisite on purpose: a ring
+        // scan can name a valid surface without the title ever entering
+        // VdSwap. That made it permanently reachable and, until now,
+        // permanently unprobed — every one of its four probes was recorded
+        // only from inside a branch this run never took, so the contract
+        // reported Rosette's silence as the title's absence. Each probe now
+        // reports on every refresh, from its own evidence path.
+        if (ledger.arguments_observed == 0) {
+            // No argument capture has happened, so there are no captured
+            // arguments to read a front buffer out of.
+            ledger.recordStarvation(
+                .frontbuffer_validated,
+                .vdswap_argument_capture,
+                .input_unavailable,
+                .upstream_producer_idle,
+                0,
+                at,
+            );
+        } else {
+            ledger.observeProbe(
+                .frontbuffer_validated,
+                .vdswap_argument_capture,
+                ledger.frontbufferSeenFrom(.vdswap_argument_capture),
+                ledger.arguments_observed,
+                at,
+            );
+        }
+        if (ledger.log_lines_seen == 0) {
+            // The breadcrumb channel has never carried a line here. That is a
+            // question about Rosette's log plumbing, not about the title.
+            ledger.recordStarvation(
+                .frontbuffer_validated,
+                .guest_log_breadcrumb,
+                .input_unavailable,
+                .source_never_fed,
+                0,
+                at,
+            );
+        } else {
+            ledger.observeProbe(
+                .frontbuffer_validated,
+                .guest_log_breadcrumb,
+                ledger.frontbufferSeenFrom(.guest_log),
+                ledger.log_lines_seen,
+                at,
+            );
+        }
+
         if (swap_watched) {
             ledger.observeVdSwapEntered(at, .guest_tracepoint);
         }
@@ -6316,7 +9552,14 @@ pub const MachOState = struct {
         } else {
             // Nothing has consumed a draw yet, so there is no "after" to
             // measure progress against.
-            ledger.recordProbe(.guest_producer_progressed_after_draw, .guest_progress_counter, .input_unavailable, 0, at);
+            ledger.recordStarvation(
+                .guest_producer_progressed_after_draw,
+                .guest_progress_counter,
+                .input_unavailable,
+                .upstream_producer_idle,
+                0,
+                at,
+            );
         }
 
         // The tracepoint says the decoder ran, not that the packet came from
@@ -6432,10 +9675,40 @@ pub const MachOState = struct {
         const ledger = &self.claim_reconciliation;
         const publication = &self.gpu_ring_publication;
 
+        // The tracepoint's own count for each boundary the emulator also
+        // reports a breadcrumb for.
+        //
+        // Only stated once the tracepoint is armed: an unarmed tracepoint has
+        // not looked, and a zero from it would be a claim it never made. Once
+        // armed, its count is exact for the address it watches — and that is
+        // the whole hazard. An export with several candidate addresses can be
+        // entered through one the tracepoint is not on, and the gate then
+        // reports `boundary_never_crossed` for a boundary the title crossed.
+        // Stating it as a claim is what puts the two numbers side by side.
+        const boundary_pairs = [_]struct {
+            claim: claim_reconciliation.Claim,
+            boundary: gpu.bringup_gate.Boundary,
+        }{
+            .{ .claim = .vd_query_video_mode_entries, .boundary = .query_video_mode },
+            .{ .claim = .vd_initialize_engines_entries, .boundary = .initialize_engines },
+            .{ .claim = .vd_initialize_ring_buffer_entries, .boundary = .initialize_ring_buffer },
+            .{ .claim = .vd_set_graphics_interrupt_callback_entries, .boundary = .set_interrupt_callback },
+            .{ .claim = .vd_swap_entries, .boundary = .issue_swap },
+        };
+        for (boundary_pairs) |pair| {
+            if (!self.execution_tracepoints.boundaryArmed(@intFromEnum(pair.boundary))) continue;
+            ledger.state(
+                pair.claim,
+                .rosette_boundary_tracepoint,
+                self.gpu_bringup_gate.recordFor(pair.boundary).hits,
+                at,
+            );
+        }
+
         if (self.gpu_ring_watch_base != 0) {
             ledger.state(.ring_base_address, .rosette_ring_publication, self.gpu_ring_watch_base, at);
             ledger.state(.ring_size_bytes, .rosette_ring_publication, self.gpu_ring_watch_size, at);
-            ledger.stateBool(.ring_initialised, .rosette_kernel_import, true, at);
+            ledger.stateBool(.ring_initialised, .rosette_ring_publication, true, at);
         }
         if (publication.geometry) |geometry| {
             ledger.state(.ring_read_pointer, .rosette_ring_publication, geometry.read_pointer, at);
@@ -6477,11 +9750,13 @@ pub const MachOState = struct {
         const finding = totals.finding();
 
         machoCapturePrint(
-            "macho-processor: CLAIM RECONCILIATION: finding={s} observed={d}/{d} corroborated={d} agreed={d} superseded={d} contested={d} crosses_sides={s} statements={d} step={d}; {s}\n",
+            "macho-processor: CLAIM RECONCILIATION: finding={s} observed={d}/{d} multi_source={d} single_source={d} corroborated={d} agreed={d} superseded={d} contested={d} crosses_sides={s} statements={d} step={d}; {s}\n",
             .{
                 finding.label(),
                 totals.observed,
                 claim_reconciliation.claim_count,
+                totals.multi_source,
+                totals.single_source,
                 totals.corroborated,
                 totals.agreed,
                 totals.superseded,
@@ -6533,16 +9808,946 @@ pub const MachOState = struct {
         }
     }
 
-    /// Report Xenia's PowerPC callback transaction independently of Rosette's
-    /// fallback-model interrupt callback. A return is the authoritative
-    /// execution fact; absence of a sampled ring mutation remains advisory.
-    pub fn logInterruptCallbackTransaction(self: *MachOState) void {
-        const ledger = &self.interrupt_callback_transaction;
+    /// The systems-gap audit's contracts, in the order they gate each other.
+    ///
+    /// Led by the acceptance board, because the one thing every earlier report
+    /// could not say is *where the run actually is*. A frontier of `G4` with
+    /// everything past it `not-reached` is a different sentence from a list of
+    /// zeros, and it is the sentence the next hour should be spent on.
+    fn pipelineEvidence(self: *const MachOState) pipeline_evidence.Report {
+        var report = pipeline_evidence.Report{};
+        const Pair = struct { stage: pipeline_evidence.Stage, boundary: gpu.bringup_gate.Boundary };
+        const pairs = [_]Pair{
+            .{ .stage = .ring_setup, .boundary = .initialize_ring_buffer },
+            .{ .stage = .packet_consumption, .boundary = .execute_packet_type3 },
+            .{ .stage = .draw, .boundary = .issue_draw },
+            .{ .stage = .target, .boundary = .render_target_update },
+            .{ .stage = .swap_request, .boundary = .guest_swap_requested },
+            .{ .stage = .swap_decode, .boundary = .xe_swap_decoded },
+            .{ .stage = .swap_issue, .boundary = .issue_swap },
+        };
+        for (pairs) |pair| {
+            const record = self.gpu_bringup_gate.recordFor(pair.boundary);
+            report.put(pair.stage, .{
+                .count = record.hits,
+                .origin = if (record.watched()) .x86_tracepoint else .unobserved,
+                .meaning = .entry,
+                .first_step = record.first_step,
+                .last_step = record.last_step,
+                // No producer registration proves all paths were covered from
+                // run start. A currently armed symbol alone cannot do that.
+                .coverage = .{ .through_step = self.executed_steps },
+            });
+        }
+        report.put(.guest_execution, .{
+            .count = @intFromBool(self.xenia_pipeline.hasReached(.guest_main_ready)),
+            .origin = .emulator_counter,
+            .meaning = .entry,
+        });
+        var guest_publications: u64 = 0;
+        for (self.audit_ring_transport.retained()) |transition| {
+            if (transition.guestAuthentic() and transition.effective()) guest_publications +|= 1;
+        }
+        report.put(.ring_publication, .{
+            .count = guest_publications,
+            .origin = .emulator_counter,
+            .meaning = .effect,
+        });
+        // No live Xenia resolve completion carrier currently feeds this
+        // report. Rosette's retained/model PM4 execution cannot fill that hole.
+        report.put(.resolve, .{});
+        const frames = self.cocoa_graphics.frames.summary();
+        var authentic_offers: u64 = 0;
+        for (self.cocoa_graphics.frames.records[0..self.cocoa_graphics.frames.count]) |record| {
+            if (record.descriptor.guest_pixels and record.descriptor.guest_requested_present and
+                !record.descriptor.synthetic_guest_control) authentic_offers +|= 1;
+        }
+        report.put(.frame_offer, .{
+            .count = authentic_offers,
+            .origin = .canonical_custody,
+            .meaning = .effect,
+        });
+        report.put(.frame_completion, .{
+            .count = frames.authentic_guest,
+            .origin = .canonical_custody,
+            .meaning = .effect,
+        });
+        return report;
+    }
+
+    fn logPipelineEvidence(self: *MachOState) void {
+        const report = self.pipelineEvidence();
+        const fingerprint = report.fingerprint(self.executed_steps);
+        const changed = fingerprint != self.pipeline_evidence_last_fingerprint;
+        self.pipeline_evidence_last_fingerprint = fingerprint;
+        const frames = self.cocoa_graphics.frames.summary();
+        machoCapturePrint(
+            "macho-processor: X86 PIPELINE EVIDENCE: first_unobserved={s} completed(authentic/host_cadence/diagnostic)={d}/{d}/{d} open_guest_waits={d} step={d}; entries prove entry only; every row is evaluated independently, and an observation gap is not a broken GPU stage\n",
+            .{ if (report.firstUnobserved(self.executed_steps)) |stage| stage.label() else "<none>", frames.authentic_guest, frames.guest_pixels_host_cadence, frames.diagnostic, self.guest_wait_liveness.open_wait_count, self.executed_steps },
+        );
+        if (changed) {
+            inline for (@typeInfo(pipeline_evidence.Stage).@"enum".fields) |field| {
+                const stage: pipeline_evidence.Stage = @enumFromInt(field.value);
+                const row = report.row(stage);
+                machoCapturePrint("  pipeline-evidence stage={s} state={s} count={d} source={s} first={d} last={d} whole_run_negative={s}\n", .{ stage.label(), @tagName(row.verdict(0, self.executed_steps)), row.count, @tagName(row.origin), row.first_step, row.last_step, @tagName(row.coverage.negative(0, self.executed_steps)) });
+            }
+        }
+        for (self.guest_wait_liveness.open_waits[0..self.guest_wait_liveness.open_wait_count]) |wait| {
+            if (!wait.main_thread and !wait.bootstrap_thread) continue;
+            machoCapturePrint("  pipeline-dependency class={s} handle=0x{x} object=0x{x} type={d} thread={d} pc=0x{x} lr=0x{x} age_steps={d}; a GPU callback return cannot satisfy this wait without a matching object and completion\n", .{ wait.classLabel(), wait.handle, wait.guest_object, wait.object_type, wait.thread_id, wait.pc, wait.lr, self.executed_steps -| wait.entered_step });
+        }
+    }
+
+    pub fn logAuditContracts(self: *MachOState) void {
+        self.logPipelineEvidence();
+        const at_step = self.executed_steps;
+        const board = &self.audit_gates;
+        const gates = board.summary();
+        const fingerprint = board.fingerprint();
+        const changed = fingerprint != self.audit_gates_last_fingerprint;
+        self.audit_gates_last_fingerprint = fingerprint;
+
+        machoCapturePrint(
+            "macho-processor: ACCEPTANCE GATES: depth={d}/{d} passed={d} failed={d} unevaluable={d} not_reached={d} observer_holes={d} unattributed={d} frontier={s} outcome={s} reason={s} owner={s} step={d}; a gate whose predecessor has not passed is not-reached rather than failed, so the frontier is the first thing genuinely missing and not the loudest zero downstream of it\n",
+            .{
+                gates.depth(),
+                acceptance_gates.gate_count,
+                gates.passed,
+                gates.failed,
+                gates.unevaluable,
+                gates.not_reached,
+                gates.observer_holes,
+                gates.unattributed,
+                if (gates.frontier) |gate| gate.label() else "<complete>",
+                gates.frontier_outcome.label(),
+                gates.frontier_reason.label(),
+                gates.frontierOwner(),
+                at_step,
+            },
+        );
+        if (gates.frontier) |gate| {
+            machoCapturePrint("  ACCEPTANCE GATE SUBJECT: {s}\n", .{gate.describe()});
+            machoCapturePrint("  ACCEPTANCE GATE OUTCOME: {s}\n", .{gates.frontier_outcome.describe()});
+            // The reason, by name, next to the outcome. Without it the row
+            // said `FAILED detail=8` and the eight things it counted were
+            // recoverable only by reading the code that produced them.
+            machoCapturePrint("  ACCEPTANCE GATE REASON: {s} — {s}\n", .{
+                gates.frontier_reason.label(),
+                gates.frontier_reason.describe(),
+            });
+            if (gates.frontier_reason.observerHole()) {
+                machoCapturePrint(
+                    "  ACCEPTANCE GATE REASON: this frontier is a hole in what Rosette looked at, not a fact about the emulator or the title. Wiring the observation is the work; the gate's nominal owner has nothing to answer for yet\n",
+                    .{},
+                );
+            }
+            // The target gate's evidence has exactly one producer, and a
+            // reader who arrives at `target-output-unjudgeable` otherwise has
+            // to re-derive that every time. A draw is classified from the
+            // render-target registers; those come only from the stateful
+            // command processor; a batch it refused is a batch whose draws are
+            // all classified as programming nothing.
+            if (gates.frontier_reason == .target_output_unjudgeable) {
+                const target = self.audit_render_target.summary();
+                machoCapturePrint(
+                    "  ACCEPTANCE GATE EVIDENCE: the render-target classification rests on the stateful command processor and nothing else. executions={d} refusals={d} partial_tails={d} indirect_buffers={d} candidates={d} output_bearing={d}; a refused or partially-read batch classifies its draws as programming nothing, which is the same reading as a title that programmed nothing. Settle the executor's own numbers before reading the draw classification\n",
+                    .{
+                        self.gpu_xenos_retained_executions,
+                        self.gpu_xenos_retained_refusals,
+                        self.gpu_xenos_runtime.retained_truncated_tails,
+                        self.gpu_xenos_runtime.indirect_buffers,
+                        target.candidates,
+                        target.outputBearing(),
+                    },
+                );
+            }
+        }
+        // One greppable line carrying the whole board, at every checkpoint.
+        // The nine detailed rows below only print when the board moves, which
+        // over a long run meant a reader at an arbitrary step could see the
+        // frontier and nothing else — and "what is not reached" is exactly the
+        // question the board exists to answer.
+        {
+            var compact: [512]u8 = undefined;
+            var used: usize = 0;
+            inline for (@typeInfo(acceptance_gates.Gate).@"enum".fields) |field| {
+                const gate: acceptance_gates.Gate = @enumFromInt(field.value);
+                const record = board.record(gate);
+                const written = std.fmt.bufPrint(compact[used..], "G{d}={s}({s}) ", .{
+                    field.value,
+                    record.outcome.label(),
+                    record.reason.label(),
+                }) catch compact[used..used];
+                used += written.len;
+            }
+            machoCapturePrint("  ACCEPTANCE BOARD: {s}fingerprint=0x{x:0>16}\n", .{ compact[0..used], fingerprint });
+        }
+        if (changed) {
+            inline for (@typeInfo(acceptance_gates.Gate).@"enum".fields) |field| {
+                const gate: acceptance_gates.Gate = @enumFromInt(field.value);
+                const record = board.record(gate);
+                machoCapturePrint(
+                    "  gate {s: <38} {s: <13} owner={s: <18} reason={s: <36} blocked_by={s: <38} detail={d} step={d}\n",
+                    .{
+                        gate.label(),
+                        record.outcome.label(),
+                        record.reason.owner() orelse gate.owner(),
+                        record.reason.label(),
+                        if (board.blockedBy(gate)) |before| before.label() else "-",
+                        record.detail,
+                        record.step,
+                    },
+                );
+            }
+        }
+
+        // The host's protection granularity, as it kept costing during the
+        // run rather than as it was proven once at startup. A startup proof
+        // that the overlay enforces the console's page says nothing about a
+        // mid-run protection change that widened with no exact record behind
+        // it, and that is the shape the failure would take.
+        const granularity = self.sparse_memory.granularity;
+        machoCapturePrint(
+            "macho-processor: PAGE GRANULARITY: effective={d}bytes host={d}bytes subhost_requests={d} shared_host_page={d} exact_records={d} unrecorded_widenings={d} step={d}; {s}\n",
+            .{
+                granularity.effectiveGranularity(),
+                std.heap.page_size_min,
+                granularity.subhost_requests,
+                granularity.shared_host_page_requests,
+                granularity.exact_records,
+                granularity.unrecorded_widenings,
+                at_step,
+                granularity.describe(),
+            },
+        );
+
+        // The manifest. Two runs that cannot be compared cannot be used to
+        // decide whether a change helped.
+        machoCapturePrint(
+            "macho-processor: RUN MANIFEST: sealed={s} profile={s} run=0x{x:0>16} image=0x{x:0>16} features={d} ceiling={s}; {s}\n",
+            .{
+                if (self.audit_manifest.sealed) "YES" else "NO",
+                self.audit_manifest.profile.label(),
+                self.audit_manifest.identity.run_id,
+                self.audit_manifest.identity.image_hash,
+                self.audit_manifest.features.count(),
+                self.audit_manifest.profile.ceilingSourceClass().label(),
+                self.audit_manifest.profile.describe(),
+            },
+        );
+
+        const journal = self.audit_journal.summary();
+        machoCapturePrint(
+            "macho-processor: RUN JOURNAL: completeness={s} events={d} materialized={d} compacted={d} groups={d}/{d} reserved={d}/{d} general={d}/{d} reserved_dropped={d} general_dropped={d} gaps={d}; identical wait/signal repetitions retain exact count and first/last-step envelopes without consuming another critical slot; {s}\n",
+            .{
+                journal.completeness.label(),
+                journal.observed,
+                journal.written,
+                journal.compacted,
+                journal.compaction_groups,
+                run_journal.compaction_capacity,
+                journal.reserved_used,
+                run_journal.reserved_capacity,
+                journal.general_used,
+                run_journal.general_capacity,
+                journal.reserved_dropped,
+                journal.general_dropped,
+                journal.observed_gaps,
+                journal.completeness.describe(),
+            },
+        );
+
+        const pause = self.audit_pause.standing();
+        machoCapturePrint(
+            "macho-processor: FAULT PAUSE TRANSACTION: standing={s} transactions={d} reports={d} unmatched={d} protocol_defects={d} pending_external_id=0x{x} termination={s} guest_causality={s}; {s}\n",
+            .{
+                pause.label(),
+                self.audit_pause.count,
+                self.audit_pause.pause_reports,
+                self.audit_pause.unmatched_reports,
+                self.audit_pause.protocol_defects,
+                self.audit_pause.pending_external_id,
+                self.audit_pause.termination.label(),
+                if (pause.guestCausalityIntact()) "INTACT" else "SUSPENDED",
+                pause.describe(),
+            },
+        );
+        if (self.audit_pause.unmatched_reports != 0) {
+            // The claim, and what answered it. An unmatched report suspends
+            // every wait reading in the run, so the evidence that lifts the
+            // suspension has to be as visible as the suspension was.
+            if (self.audit_pause.refuted_by) |axis| {
+                machoCapturePrint(
+                    "  FAULT PAUSE REFUTED: axis={s} margin={d} report_step={d} refuted_step={d} owner={s}; {s}\n",
+                    .{
+                        axis.label(),
+                        self.audit_pause.refutation_margin,
+                        self.audit_pause.unmatched_report_step,
+                        self.audit_pause.refuted_step,
+                        pause.owner(),
+                        axis.whyPausedGuestCannotAdvanceIt(),
+                    },
+                );
+            } else {
+                machoCapturePrint(
+                    "  FAULT PAUSE UNANSWERED: report_step={d} owner={s}; no progress axis has risen above where it stood when the pause was reported, so the claim is neither matched to a transaction nor disproved. Every wait after this step is filed as a consequence until one of the two happens\n",
+                    .{ self.audit_pause.unmatched_report_step, pause.owner() },
+                );
+            }
+            inline for (@typeInfo(fault_pause_transaction.ProgressAxis).@"enum".fields) |field| {
+                const axis: fault_pause_transaction.ProgressAxis = @enumFromInt(field.value);
+                machoCapturePrint(
+                    "  fault-pause axis {s: <24} at_report={d} latest={d} moved={d}\n",
+                    .{
+                        axis.label(),
+                        self.audit_pause.axis_at_report[field.value],
+                        self.audit_pause.axis_latest[field.value],
+                        self.audit_pause.axis_latest[field.value] -| self.audit_pause.axis_at_report[field.value],
+                    },
+                );
+            }
+        }
+        if (self.audit_pause.protocol_defects != 0 or
+            self.audit_pause.pending_external_id != 0)
+        {
+            machoCapturePrint(
+                "  FAULT PAUSE PROTOCOL: last={s} step={d} expected_external_id=0x{x} observed_external_id=0x{x} pending_step={d}; every non-zero producer transaction must attach to one guest-fault frontier and every guest-fault pause/resume bracket must carry the same id\n",
+                .{
+                    self.audit_pause.last_protocol_defect.label(),
+                    self.audit_pause.last_protocol_defect_step,
+                    self.audit_pause.last_protocol_expected_id,
+                    self.audit_pause.last_protocol_observed_id,
+                    self.audit_pause.pending_external_id_step,
+                },
+            );
+        }
+        for (self.audit_pause.retained()) |transaction| {
+            if (transaction.external_id == 0 and transaction.cause != .guest_fault) continue;
+            machoCapturePrint(
+                "  fault-pause transaction local_id={d} external_id={d} cause={s} stages(fault/pause/resume)={s}/{s}/{s} steps={d}/{d}/{d}\n",
+                .{
+                    transaction.id,
+                    transaction.external_id,
+                    transaction.cause.label(),
+                    if (transaction.has(.fault_recorded)) "YES" else "NO",
+                    if (transaction.has(.pause_completed)) "YES" else "NO",
+                    if (transaction.has(.resume_completed)) "YES" else "NO",
+                    transaction.step[@intFromEnum(fault_pause_transaction.Stage.fault_recorded)],
+                    transaction.step[@intFromEnum(fault_pause_transaction.Stage.pause_completed)],
+                    transaction.step[@intFromEnum(fault_pause_transaction.Stage.resume_completed)],
+                },
+            );
+        }
+
+        const producer = self.audit_producer.verdict(
+            at_step,
+            self.wait_audit.witness.advancedSince(self.never_notified_witness),
+            false,
+        );
+        machoCapturePrint(
+            "macho-processor: PRODUCER LIVENESS: verdict={s} epoch={s} owner={s} epochs_after_ring={d} quiet_for={d} wait_object=0x{x} refusals={d} step={d}; {s}\n",
+            .{
+                producer.label(),
+                self.audit_producer.current.label(),
+                self.audit_producer.current.owner(),
+                self.audit_producer.effectiveEpochsAfterRing(),
+                self.audit_producer.quietSteps(at_step),
+                self.audit_producer.currentWaitObject(),
+                self.audit_producer.refusals,
+                at_step,
+                producer.describe(),
+            },
+        );
+        machoCapturePrint(
+            "  PRODUCER EPOCH MEANING: {s}\n",
+            .{self.audit_producer.current.stalledMeans()},
+        );
+
+        const transport = self.audit_ring_transport.summary();
+        const transport_verdict = self.audit_ring_transport.verdict();
+        machoCapturePrint(
+            "macho-processor: RING TRANSPORT: verdict={s} transitions={d} effective={d} guest={d} host={d} publication_gate={s} frontier={s}; {s}\n",
+            .{
+                transport_verdict.label(),
+                transport.transitions,
+                transport.effective,
+                transport.guest_authentic,
+                transport.host_sourced,
+                if (self.audit_ring_transport.meetsPublicationGate()) "MET" else "unmet",
+                if (self.audit_ring_transport.frontier()) |stage| stage.label() else "<complete>",
+                transport_verdict.describe(),
+            },
+        );
+        if (self.audit_ring_transport.printedButNotApplied()) |stage| {
+            machoCapturePrint("  RING TRANSPORT GAP: {s}\n", .{stage.gapMeans()});
+        }
+
+        const pm4_authority_verdict = self.audit_pm4.verdict();
+        const pm4_comparison = self.audit_pm4.comparison();
+        machoCapturePrint(
+            "macho-processor: PM4 AUTHORITY: verdict={s} batch=0x{x} accounts={d} dropped={d} comparable={s} disagreements={d} first_field={s} left={d} right={d}; {s}\n",
+            .{
+                pm4_authority_verdict.label(),
+                self.audit_pm4.batch_id,
+                self.audit_pm4.count,
+                self.audit_pm4.dropped,
+                if (pm4_comparison.comparable) "YES" else "NO",
+                pm4_comparison.disagreements,
+                if (pm4_comparison.first_field) |field| field.label() else "-",
+                pm4_comparison.first_left,
+                pm4_comparison.first_right,
+                pm4_authority_verdict.describe(),
+            },
+        );
+        for (self.audit_pm4.retained(), 0..) |account, account_index| {
+            machoCapturePrint(
+                "  PM4 ACCOUNT #{d}: decoder={s} domain={s} source={s} batch=0x{x} dwords={d} packets(root/nested/total)={d}/{d}/{d} indirect_refs={d} register_intents={d} draws={d} event_writes={d} swaps={d} defects={d}\n",
+                .{
+                    account_index + 1,
+                    account.decoder.label(),
+                    account.domain.label(),
+                    account.source.label(),
+                    account.batch_id,
+                    account.dwords_examined,
+                    account.root_packets,
+                    account.nested_packets,
+                    account.packets(),
+                    account.indirect_references,
+                    account.register_writes,
+                    account.draws,
+                    account.event_writes,
+                    account.swaps,
+                    account.totalDefects(),
+                },
+            );
+        }
+
+        const target = self.audit_render_target.summary();
+        machoCapturePrint(
+            "macho-processor: RENDER TARGET EVIDENCE: candidates={d} target_backed={d} memory_export={d} resolve_only={d} no_output={d} dropped_by_emulator={d} unclassified={d} output_bearing={d} first_pixel={d} frontier={s}; {s}\n",
+            .{
+                target.candidates,
+                target.target_backed,
+                target.memory_export,
+                target.resolve_only,
+                target.intentional_no_output,
+                target.emulator_dropped,
+                target.unclassified,
+                target.outputBearing(),
+                target.first_pixel_candidates,
+                if (self.audit_render_target.frontier()) |verdict| verdict.label() else "<complete>",
+                if (self.audit_render_target.frontier()) |verdict| verdict.gapMeans() else "every verdict has been proven by at least one candidate",
+            },
+        );
+
+        const registers = self.audit_registers.summary();
+        const register_verdict = self.audit_registers.verdict();
+        machoCapturePrint(
+            "macho-processor: XENOS REGISTER STATE: verdict={s} owner={s} writes={d} distinct={d} target_writes={d} target_nonzero={d}/{d} aperture_silent_pm4_busy={s}; {s}\n",
+            .{
+                register_verdict.label(),
+                register_verdict.owner(),
+                registers.writes,
+                registers.distinct,
+                registers.target_writes,
+                registers.target_nonzero,
+                gpu.xenos_register_state.target_registers.len,
+                if (registers.apertureSilentWhilePm4Busy()) "YES" else "NO",
+                register_verdict.describe(),
+            },
+        );
+
+        const edram_verdict = self.audit_edram.verdict();
+        const resolve_verdict = self.audit_resolve.verdict();
+        machoCapturePrint(
+            "macho-processor: EDRAM AND RESOLVE: edram={s} ranges={d} writes={d} resolve={s} resolves={d} guest_visible_changes={d} frontier={s}; {s}\n",
+            .{
+                edram_verdict.label(),
+                self.audit_edram.summary().ranges,
+                self.audit_edram.summary().writes,
+                resolve_verdict.label(),
+                self.audit_resolve.summary().resolves,
+                self.audit_resolve.summary().guest_visible_changes,
+                if (self.audit_resolve.frontier()) |stage| stage.label() else "<complete>",
+                edram_verdict.describe(),
+            },
+        );
+
+        const interrupts = self.audit_interrupts.summary();
+        const interrupt_verdict = self.audit_interrupts.verdict();
+        const callback_transaction = &self.interrupt_callback_transaction;
+        machoCapturePrint(
+            "macho-processor: INTERRUPT EFFECT: verdict={s} deliveries={d} entered={d} returned={d} mutations={d} releases={d} wrong_object={d} outstanding={d} frontier={s}; {s}\n",
+            .{
+                interrupt_verdict.label(),
+                interrupts.deliveries,
+                interrupts.entered,
+                interrupts.returned,
+                interrupts.mutations,
+                interrupts.releases,
+                interrupts.wrong_object,
+                interrupts.outstanding,
+                if (self.audit_interrupts.frontier()) |link| link.label() else "<complete>",
+                interrupt_verdict.describe(),
+            },
+        );
+        // Which causes were ever raised, and whether the evidence permits the
+        // conclusion the verdict invites.
+        //
+        // `ENTERED-WITHOUT-EFFECT` reads as a finding against the title's
+        // handler, and it is only that if the handler was asked more than one
+        // question. The run this was written against raised `source=0` on
+        // every one of its deliveries: the handler was entered thirty-two
+        // times and asked the same thing each time, and the report said the
+        // handler was not doing what the waiter needed.
+        if (interrupts.deliveries != 0) {
+            machoCapturePrint(
+                "  INTERRUPT CAUSES: raised={d}/{d} sole={s} permits_handler_conclusion={s}; {s}\n",
+                .{
+                    self.audit_interrupts.causesRaised(),
+                    gpu.interrupt_effect.cause_count,
+                    if (self.audit_interrupts.soleCause()) |cause| cause.label() else "-",
+                    if (self.audit_interrupts.permitsHandlerConclusion()) "YES" else "NO",
+                    if (self.audit_interrupts.permitsHandlerConclusion())
+                        "a returned callback has a named expected object and a complete effect observation"
+                    else
+                        "cause diversity alone proves no defect. Identify the expected guest object and observe its state through a real callback; do not synthesize interrupts to obtain coverage",
+                },
+            );
+            // The raw source values the emulator raised, read from the
+            // dispatch transaction rather than from the cause mapping, so a
+            // source the console defines and this build does not is visible as
+            // itself instead of as `unknown`.
+            machoCapturePrint(
+                "  INTERRUPT SOURCES: distinct={d} sole=0x{x} unbucketed={d} last=0x{x} last_cpu={d}\n",
+                .{
+                    callback_transaction.sourceDiversity(),
+                    callback_transaction.soleSource() orelse 0,
+                    callback_transaction.unbucketed_sources,
+                    callback_transaction.last_source,
+                    callback_transaction.last_cpu,
+                },
+            );
+            for (callback_transaction.sources[0..callback_transaction.distinct_sources]) |slot| {
+                machoCapturePrint(
+                    "  interrupt-source 0x{x: <8} cause={s: <30} raised={d} first_step={d} last_step={d}\n",
+                    .{
+                        slot.source,
+                        gpu.interrupt_effect.causeOfSource(slot.source).label(),
+                        slot.count,
+                        slot.first_step,
+                        slot.last_step,
+                    },
+                );
+            }
+            inline for (@typeInfo(gpu.interrupt_effect.Cause).@"enum".fields) |field| {
+                const cause: gpu.interrupt_effect.Cause = @enumFromInt(field.value);
+                const raised = self.audit_interrupts.by_cause[cause.bucket()];
+                machoCapturePrint(
+                    "  interrupt-cause {s: <30} source_code=0x{x} raised={d} allowed={s}\n",
+                    .{
+                        cause.label(),
+                        cause.sourceCode(),
+                        raised,
+                        if (self.audit_interrupts.filter.allows(cause)) "YES" else "NO",
+                    },
+                );
+            }
+            // The payload the handler actually read, for the deliveries that
+            // did not reach a waiter. The verdict already says to look at the
+            // cause code and the status value; these are them.
+            var shown: usize = 0;
+            for (self.audit_interrupts.retained()) |delivery| {
+                if (delivery.has(.waiter_released)) continue;
+                if (shown >= 8) break;
+                shown += 1;
+                machoCapturePrint(
+                    "  interrupt-delivery id={d} cause={s} source=0x{x} status=0x{x} callback=0x{x} user_data=0x{x} expected_object=0x{x} mutated_object=0x{x} waiter_object=0x{x} queued={d} entered={d} returned={d} first_gap={s}\n",
+                    .{
+                        delivery.id,
+                        delivery.cause.label(),
+                        delivery.source_code,
+                        delivery.status_value,
+                        delivery.callback,
+                        delivery.user_data,
+                        delivery.expected_object,
+                        delivery.mutated_object,
+                        delivery.waiter_object,
+                        delivery.queued_step,
+                        delivery.entered_step,
+                        delivery.returned_step,
+                        if (delivery.firstGap()) |link| link.label() else "<complete>",
+                    },
+                );
+            }
+        }
+
+        const custody = self.audit_frames.verdict();
+        machoCapturePrint(
+            "macho-processor: FRAME CUSTODY CHAIN: verdict={s} offered={d} authentic={d} diagnostic={d} synthetic={d} unchanged={d} unreadable={d} copy_failed={d} frontier={s} stable={s}; {s}\n",
+            .{
+                custody.label(),
+                self.audit_frames.offered,
+                self.audit_frames.tally.authenticFrames(),
+                self.audit_frames.tally.diagnostic_presented,
+                self.audit_frames.tally.synthetic_presented,
+                self.audit_frames.tally.guest_unchanged,
+                self.audit_frames.tally.guest_unreadable,
+                self.audit_frames.tally.guest_copy_failed,
+                if (self.audit_frames.authenticFrontier()) |edge| edge.label() else "<complete>",
+                if (self.audit_frames.stableOutput()) "YES" else "NO",
+                custody.describe(),
+            },
+        );
+
+        const sync = self.audit_sync.summary();
+        machoCapturePrint(
+            "macho-processor: SYNC OBJECT REGISTRY: objects={d} healthy={d} missing_notifier={d} quiet_by_role={d} orphan_signal={d} unclassified_silence={d} classified={d} attributed={d} classification_debt={d}; a never-notified idle worker and a never-notified GPU completion are identical in every counter and are opposite findings — the role is what separates them, and an unclassified object is neither promoted nor dismissed\n",
+            .{
+                sync.objects,
+                sync.healthy,
+                sync.missing_notifier,
+                sync.quiet_by_role,
+                sync.orphan_signal,
+                sync.unclassified_silence,
+                sync.classified,
+                sync.fully_attributed,
+                sync.classificationDebt(),
+            },
+        );
+        if (self.audit_sync.firstSubject()) |subject| {
+            machoCapturePrint(
+                "  SYNC REGISTRY SUBJECT: object=0x{x} handle=0x{x} kind={s} role={s} waits={d} timeouts={d} signals={d} notifier_owner={s}; {s}\n",
+                .{
+                    subject.identity.address.guest_virtual,
+                    subject.identity.handle,
+                    subject.identity.kindOf().label(),
+                    subject.identity.roleOf().label(),
+                    subject.activity.waits,
+                    subject.activity.timeouts,
+                    subject.activity.signals,
+                    subject.identity.roleOf().notifierOwner(),
+                    subject.standing().describe(),
+                },
+            );
+        }
+        // Keep the four objects that the latest Xenia run made actionable in
+        // a fixed, grep-friendly table. The lifecycle counters are emulator
+        // observations; they do not replace the wait graph's stricter proof
+        // of a blocked waiter being released by a matching signal.
+        for ([_]u32{ 0x827C_EC14, 0x827C_EC28, 0x827C_EC38, 0x4000_4BF4 }) |watched_target| {
+            var found: ?sync_object_registry.Entry = null;
+            for (self.audit_sync.retained()) |entry| {
+                if (entry.identity.address.guest_virtual == watched_target) {
+                    found = entry;
+                    break;
+                }
+            }
+            if (found) |entry| {
+                const operation: sync_object_registry.LifecycleOperation =
+                    @enumFromInt(entry.lifecycle_last_operation);
+                machoCapturePrint(
+                    "  SYNC LIFECYCLE TABLE: object=0x{x:0>8} observed=YES handle=0x{x:0>8} kind={s} creates={d} initializes={d} bindings={d} references={d} waits(begin/return/success)={d}/{d}/{d} signals={d} resets={d} last={s} last_thread=0x{x} last_step={d} last_pc=0x{x} last_lr=0x{x} state_after_valid={s} state_after=0x{x}\n",
+                    .{
+                        watched_target,
+                        entry.identity.handle,
+                        entry.identity.kindOf().label(),
+                        entry.lifecycle_creates,
+                        entry.lifecycle_initializes,
+                        entry.lifecycle_bindings,
+                        entry.lifecycle_references,
+                        entry.lifecycle_wait_begins,
+                        entry.lifecycle_wait_returns,
+                        entry.lifecycle_success_returns,
+                        entry.lifecycle_signals,
+                        entry.lifecycle_resets,
+                        operation.label(),
+                        entry.lifecycle_last_thread,
+                        entry.lifecycle_last_step,
+                        entry.lifecycle_last_location.guest_pc,
+                        entry.lifecycle_last_location.guest_lr,
+                        if (entry.lifecycle_last_state_after_valid) "YES" else "NO",
+                        entry.lifecycle_last_state_after,
+                    },
+                );
+            } else {
+                machoCapturePrint(
+                    "  SYNC LIFECYCLE TABLE: object=0x{x:0>8} observed=NO handle=0x00000000 kind=unknown creates=0 initializes=0 bindings=0 references=0 waits(begin/return/success)=0/0/0 signals=0 resets=0 last=unknown last_thread=0x0 last_step=0 last_pc=0x0 last_lr=0x0 state_after_valid=NO state_after=0x0\n",
+                    .{watched_target},
+                );
+            }
+        }
+
+        const admission = self.audit_admission.admission();
+        machoCapturePrint(
+            "macho-processor: FEATURE ADMISSION: admission={s} profile={s} encounters={d} required={d} unclassified={d} diagnostic_fallbacks={d} interventions(enabled/fired/fabricating)={d}/{d}/{d} effective_class={s}; {s}\n",
+            .{
+                admission.label(),
+                self.audit_admission.profile.label(),
+                self.audit_admission.summary().encounters,
+                self.audit_admission.summary().required,
+                self.audit_admission.summary().unclassified,
+                self.audit_admission.summary().diagnostic_fallbacks,
+                self.audit_admission.summary().interventions_enabled,
+                self.audit_admission.summary().interventions_fired,
+                self.audit_admission.summary().fabricating_enabled,
+                self.audit_admission.effectiveSourceClass().label(),
+                admission.describe(),
+            },
+        );
+
+        const budget_totals = self.runBudgetGuestWindowSummary();
+        const budget_verdict = self.runBudgetGuestWindowVerdict(budget_totals);
+        const external_progress_fresh = self.ready.hasRecentExternalProgress(self.executed_steps);
+        machoCapturePrint(
+            "macho-processor: RUN BUDGET: verdict={s} guest_ms_per_host_s={d} required={d} observer_percent={d} dominant_phase={s} external_progress(fresh/step)={s}/{d}; {s}\n",
+            .{
+                budget_verdict.label(),
+                budget_totals.guestMsPerHostSecond(),
+                self.audit_budget.required_guest_ms_per_host_second,
+                budget_totals.observerPercent(),
+                if (budget_totals.dominantPhase()) |phase| phase.label() else "-",
+                if (external_progress_fresh) "YES" else "NO",
+                self.ready.externalProgressStep(),
+                budget_verdict.describe(),
+            },
+        );
+        // Where the sampled program counter has been landing. `RUN BUDGET`
+        // names a phase and the phase is always `guest-execution`; this is the
+        // level down, and it is the difference between "the run is slow" and
+        // "the samples are inside the emulator's own PowerPC JIT, so the cost
+        // is double translation rather than a defect".
+        {
+            const profile = &self.startup.profile;
+            const totals = profile.summary();
+            if (totals.samples != 0) {
+                machoCapturePrint(
+                    "macho-processor: EXECUTION PROFILE: samples={d} distinct={d} unretained={d} readable={s} decisive={s} dominant={s} dominant_share={d}% unaccounted={d}%; {s}\n",
+                    .{
+                        totals.samples,
+                        totals.distinct,
+                        totals.unretained,
+                        if (totals.readable()) "YES" else "NO",
+                        if (totals.dominantIsDecisive()) "YES" else "NO",
+                        if (totals.dominantRegion()) |region| region.label() else "-",
+                        if (totals.dominantRegion()) |region|
+                            totals.percentOf(totals.by_region[@intFromEnum(region)])
+                        else
+                            0,
+                        totals.unaccountedPercent(),
+                        if (!totals.readable())
+                            "too few samples for a share to mean anything yet. The rows below are what has been seen, not a measurement"
+                        else if (!totals.dominantIsDecisive())
+                            "the classifier could not place more of the samples than any region holds, so this profile has not identified anything yet. The unaccounted share is the number to reduce, and it is Rosette's"
+                        else if (totals.dominantRegion()) |region|
+                            region.describe()
+                        else
+                            "no region holds the samples",
+                    },
+                );
+                inline for (@typeInfo(diagnostics_execution_profile.Region).@"enum".fields) |field| {
+                    const region: diagnostics_execution_profile.Region = @enumFromInt(field.value);
+                    const count = totals.by_region[field.value];
+                    if (count != 0) machoCapturePrint(
+                        "  execution-profile region {s: <24} samples={d} share={d}%\n",
+                        .{ region.label(), count, totals.percentOf(count) },
+                    );
+                }
+                var hottest: [6]diagnostics_execution_profile.Entry = undefined;
+                const written = profile.hottest(&hottest);
+                for (hottest[0..written]) |entry| {
+                    if (entry.samples == 0) continue;
+                    machoCapturePrint(
+                        "  execution-profile symbol samples={d} share={d}% region={s: <24} witness_rip=0x{x} first_step={d} last_step={d} {s}\n",
+                        .{
+                            entry.samples,
+                            totals.percentOf(entry.samples),
+                            entry.region.label(),
+                            entry.witness_rip,
+                            entry.first_step,
+                            entry.last_step,
+                            entry.name,
+                        },
+                    );
+                }
+            }
+        }
+
+        // The pool composition, whether or not it decided the verdict. It is
+        // the number that tells an indexing problem from a working set that
+        // does not fit, and suppressing the verdict must not also suppress the
+        // reading — the point is that a conflict-dominated pool the run barely
+        // touches is a true statement that is not the run's finding.
+        inline for (@typeInfo(run_budget.Pool).@"enum".fields) |field| {
+            const which: run_budget.Pool = @enumFromInt(field.value);
+            const stats = self.audit_budget.pools[field.value];
+            // An `if` rather than a `continue`: this loop is unrolled at
+            // compile time and the condition is not, so a `continue` here is
+            // comptime control flow inside a runtime block.
+            if (stats.fills != 0 or stats.hits != 0) machoCapturePrint(
+                "  run-budget pool {s: <18} hits={d} fills={d} conflicts={d} stale={d} hit_rate={d}% miss={d}bp conflict_dominated={s} material={s}; {s}\n",
+                .{
+                    which.label(),
+                    stats.hits,
+                    stats.fills,
+                    stats.conflict_evictions,
+                    stats.stale_refills,
+                    stats.hitRatePercent(),
+                    stats.missBasisPoints(),
+                    if (stats.conflictDominated()) "YES" else "NO",
+                    if (stats.missBasisPoints() >= run_budget.material_miss_basis_points) "YES" else "NO",
+                    if (stats.thrashing())
+                        "the pool evicts live work and misses often enough for that to be where the host time goes"
+                    else if (stats.conflictDominated())
+                        "the pool evicts live work and the run barely refills it, so this describes the shape of the misses and not where the run's time went. It is worth fixing and it is not the reason this run is slow"
+                    else
+                        "the misses are not dominated by conflicts",
+                },
+            );
+        }
+
+        const imports = self.audit_imports.verdict();
+        machoCapturePrint(
+            "macho-processor: IMPORT INTEGRITY: verdict={s} imports={d} bound={d} unresolved={d} on_chain={d} unsafe_on_chain={d} abi_defects={d} permits_graphics_conclusion={s}; {s}\n",
+            .{
+                imports.label(),
+                self.audit_imports.summary().imports,
+                self.audit_imports.summary().bound,
+                self.audit_imports.summary().unresolved,
+                self.audit_imports.summary().on_chain,
+                self.audit_imports.summary().unsafe_on_chain,
+                self.audit_imports.summary().abi_defects,
+                if (imports.permitsGraphicsConclusion()) "YES" else "NO",
+                imports.describe(),
+            },
+        );
+
+        // The controlled vectors and the video-contract table are the two
+        // pieces of work the audit asks for next. Printed even when empty so
+        // the absence is a visible piece of outstanding work rather than a
+        // silent one.
+        const vectors = self.audit_vectors.summary();
+        machoCapturePrint(
+            "macho-processor: CONTROLLED VECTORS: run={d}/{d} passed={d} fell_short={d} skipped={d} first_failure={s} target_gate={s}; a known clear, triangle and resolve through this same command processor separate `the emulator cannot render` from `this title has not asked it to`. None run is outstanding work, not a passing grade\n",
+            .{
+                vectors.run,
+                gpu.controlled_vectors.vector_count,
+                vectors.passed,
+                vectors.fell_short,
+                vectors.skipped,
+                if (vectors.first_failure) |vector| vector.label() else "<none>",
+                if (self.audit_vectors.meetsTargetGate()) "MET" else "unmet",
+            },
+        );
+        const video = self.audit_video.summary();
+        machoCapturePrint(
+            "macho-processor: VIDEO CONTRACT: demanded={d} acceptable={d} actionable(value/side_effect/missing)={d}/{d}/{d} stubs_on_chain={d} probes_missing={d} next={s}; a stub the title ignores is not work and a stub whose side effect it waits on is the highest-value class here\n",
+            .{
+                video.demanded,
+                video.acceptable,
+                video.actionable_value,
+                video.actionable_side_effect,
+                video.missing,
+                video.stubs_on_chain,
+                video.probes_missing,
+                if (self.audit_video.nextSubject()) |entry| entry.which.label() else "<none>",
+            },
+        );
+    }
+
+    /// Which counters of the same increasing fact disagree, and which number a
+    /// reader may quote.
+    ///
+    /// Printed even when everything agrees, because the useful half of this
+    /// report is the list of subjects with only one witness: those are the
+    /// places where an absence is currently being quoted on one carrier's word
+    /// alone, and that is how `INERT: the emulator has never entered it` was
+    /// printed about a callback that had run two hundred and forty times.
+    pub fn logMonotoneWitnesses(self: *MachOState) void {
+        const ledger = &self.monotone_witness;
+        const totals = ledger.summary();
+        if (totals.observed == 0) return;
+        const fingerprint = ledger.fingerprint();
+        const changed = fingerprint != self.monotone_witness_last_fingerprint;
+        self.monotone_witness_last_fingerprint = fingerprint;
+
+        machoCapturePrint(
+            "macho-processor: MONOTONE WITNESS: subjects={d} required(closure/total/observed/corroborated/agreement-debt/unclaimed)={s}/{d}/{d}/{d}/{d}/{d} corroborated={d} uncorroborated={d} explained={d} unexplained={d} settled_unexplained={d} regressions={d} resolutions={d} statements={d} worst_quiet_steps={d} step={d}; a witness below the floor is undercounting, and the floor is the only number a report may quote. Where the short witness rides a throttled line its silence is about the carrier, and its last step is when that carrier stopped speaking rather than when the mechanism stopped\n",
+            .{
+                totals.observed,
+                if (totals.required_observed == monotone_witness.required_subject_count) "YES" else "NO",
+                monotone_witness.required_subject_count,
+                totals.required_observed,
+                totals.required_corroborated,
+                totals.required_agreement_debt,
+                totals.required_unclaimed,
+                totals.corroborated,
+                totals.uncorroborated,
+                totals.explained,
+                totals.unexplained,
+                totals.settled_unexplained,
+                totals.regressions,
+                totals.resolutions,
+                totals.statements,
+                totals.worst_quiet_steps,
+                self.executed_steps,
+            },
+        );
+        if (!changed and totals.judgeableDefects() == 0) return;
+        inline for (@typeInfo(monotone_witness.Subject).@"enum".fields) |field| {
+            const subject: monotone_witness.Subject = @enumFromInt(field.value);
+            const result = ledger.reconcile(subject);
+            if (result.finding != .unobserved) {
+                machoCapturePrint(
+                    "  witness {s: <22} {s: <34} floor={d: <8} by={s: <28} floor_step={d} short={s: <28} short_count={d} short_step={d} quiet={d} mechanism_owner={s} absence_quotable={s}\n",
+                    .{
+                        result.finding.label(),
+                        subject.label(),
+                        result.floor,
+                        if (result.floor_witness) |which| which.label() else "-",
+                        result.floor_step,
+                        if (result.short_witness) |which| which.label() else "-",
+                        result.short_count,
+                        result.short_step,
+                        result.short_quiet_steps,
+                        subject.mechanismOwner(),
+                        if (result.finding.absenceIsQuotable()) "YES" else "NO",
+                    },
+                );
+            }
+        }
+        if (ledger.firstDefect()) |first| {
+            machoCapturePrint(
+                "  MONOTONE WITNESS SUBJECT: {s} settled={s}; {s}\n",
+                .{
+                    first.subject.label(),
+                    if (ledger.settledDefect(first.subject)) "YES" else "NO",
+                    first.finding.guidance(),
+                },
+            );
+            if (first.short_witness) |which| {
+                if (!which.countsEveryOccurrence()) {
+                    machoCapturePrint(
+                        "  MONOTONE WITNESS CARRIER: {s} — {s}\n",
+                        .{ which.label(), which.undercountExcuse() },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Report one callback transaction without collapsing execution domains.
+    /// A return is the authoritative execution fact; absence of a sampled ring
+    /// mutation remains advisory. The host callback gets the same detail as a
+    /// title callback, but its separate domain makes the ownership boundary
+    /// visible in every report.
+    fn logInterruptCallbackLedger(ledger: *const interrupt_callback_transaction.Ledger, prefix: []const u8) void {
         const finding = ledger.finding();
         const gap = ledger.firstGap();
         machoCapturePrint(
-            "macho-processor: XENIA INTERRUPT CALLBACK: domain={s} finding={s} first_gap={s} owner={s} registered={d} attempts={d} returns={d} skips={d} deferrals={d} callback=0x{x:0>8} user_data=0x{x:0>8} last(id/source/cpu/duration_ms)={d}/{d}/{d}/{d} context(before/after/changed)={d}/{d}/{d} payload(samples/changed/appeared)={d}/{d}/{d} effect={s} counters_valid={s} first_step={d} last_step={d}; {s}\n",
+            "macho-processor: {s}: domain={s} finding={s} first_gap={s} owner={s} registered={d} attempts={d} returns={d} skips={d} deferrals={d} callback=0x{x:0>8} user_data=0x{x:0>8} last(id/source/cpu/duration_ms)={d}/{d}/{d}/{d} context(before/after/changed)={d}/{d}/{d} payload(samples/changed/appeared)={d}/{d}/{d} effect={s} counters_valid={s} first_step={d} first(registration/dispatch/return)={d}/{d}/{d} last_step={d}; {s}\n",
             .{
+                prefix,
                 ledger.domain.label(),
                 finding.label(),
                 if (gap) |stage| stage.label() else "<complete>",
@@ -6567,10 +10772,44 @@ pub const MachOState = struct {
                 ledger.effect().label(),
                 if (ledger.counterInvariantHolds()) "YES" else "NO",
                 ledger.first_step,
+                ledger.first_registration_step,
+                ledger.first_dispatch_step,
+                ledger.first_return_step,
                 ledger.last_step,
                 finding.guidance(),
             },
         );
+        if (ledger.superseded) {
+            machoCapturePrint(
+                "  {s}: superseded by callback=0x{x:0>8} at step={d}; this registration stood down when the real owner arrived, so its dispatch count is the expected outcome and not a missing interrupt producer\n",
+                .{ prefix, ledger.successor_callback, ledger.superseded_step },
+            );
+        }
+        // The sources this domain has actually raised. A handler entered many
+        // times with one source has been asked one question many times, and
+        // nothing else in the report can say so.
+        if (ledger.sourceDiversity() != 0) {
+            machoCapturePrint(
+                "  {s}: sources(distinct/unbucketed)={d}/{d} sole=0x{x}\n",
+                .{
+                    prefix,
+                    ledger.sourceDiversity(),
+                    ledger.unbucketed_sources,
+                    ledger.soleSource() orelse 0,
+                },
+            );
+        }
+    }
+
+    /// Report Xenia's PowerPC callback transaction independently of Rosette's
+    /// fallback-model interrupt callback. Rosette's host callback is logged as
+    /// a second, explicitly labelled transaction and cannot satisfy the
+    /// PowerPC account used by the graphics/substantiation contracts.
+    pub fn logInterruptCallbackTransaction(self: *MachOState) void {
+        logInterruptCallbackLedger(&self.interrupt_callback_transaction, "XENIA INTERRUPT CALLBACK");
+        if (self.host_interrupt_callback_transaction.observed_mask != 0) {
+            logInterruptCallbackLedger(&self.host_interrupt_callback_transaction, "XENIA HOST INTERRUPT CALLBACK");
+        }
     }
 
     /// Print which Xenos registers the executed PM4 stream actually wrote.
@@ -6630,10 +10869,11 @@ pub const MachOState = struct {
             const which: gpu.RegisterBlock = @enumFromInt(field.value);
             const record = journal.block(which);
             machoCapturePrint(
-                "  register block {s: <20} writes={d: <8} groups={d: <5} first=0x{x:0>4} last=0x{x:0>4} last_value=0x{x:0>8}; {s}\n",
+                "  register block {s: <20} writes={d: <8} named={d: <8} groups={d: <5} first=0x{x:0>4} last=0x{x:0>4} last_value=0x{x:0>8}; {s}\n",
                 .{
                     which.label(),
                     record.writes,
+                    record.named_writes,
                     record.distinct_sampled,
                     record.first_register,
                     record.last_register,
@@ -6642,6 +10882,19 @@ pub const MachOState = struct {
                 },
             );
         }
+        const in_range_writes = journal.writes -| journal.out_of_range_writes;
+        const exact_table_writes = in_range_writes -| journal.range_classified_writes;
+        machoCapturePrint(
+            "  REGISTER BLOCK CONFIDENCE: exact={d}/{d} fallback={d} exact_unowned={d} unknown_in_range={d} table_ranges={d}; the Xenos index space is interleaved, so a block total carried by fallback is an approximation, exact_unowned is a real Xenia-table entry without a Rosette functional owner, and unknown_in_range is the only vocabulary gap\n",
+            .{
+                exact_table_writes,
+                in_range_writes,
+                journal.range_classified_writes,
+                journal.exact_unowned_writes,
+                journal.unknown_in_range_writes,
+                register_map.xenia_register_table_ranges.len,
+            },
+        );
         for (gpu.register_journal.target_registers) |register| {
             const record = journal.target(register).?;
             machoCapturePrint(
@@ -6852,20 +11105,17 @@ pub const MachOState = struct {
         // so the former second opinion could neither recognise a truncated host
         // pointer nor prove that an already canonical value was safe to fold.
 
-        // The independent progress axis. Deliberately a counter a spin cannot
-        // advance: contract stages are reached once each, so a handshake going
-        // round in circles cannot move it. Without this gate every healthy
-        // worker loop in the process reads as a livelock.
-        graph.noteProgress(
-            @as(u64, gpu.vd_swap_contract.observedCount(self.gpu_vd_swap_contract.observed_mask)) +|
-                self.gpu_ring_publication.advances +|
-                self.run_horizon.milestones_reached,
-        );
+        // The independent progress axis is refreshed by the integrity
+        // observation as well as this report. Keep the call here for reports
+        // emitted without a preceding integrity checkpoint, but share the
+        // implementation so the two views cannot drift.
+        self.refreshWaitGraphProgress();
 
         const totals = graph.summary();
+        const continuation = graph.continuationSummary(self.executed_steps);
         const verdict = totals.verdict();
         machoCapturePrint(
-            "macho-processor: WAIT GRAPH: verdict={s} self_resolving={s} objects={d} events={d} orphan(wait/signal)={d}/{d} handshakes(stalled/progressing)={d}/{d} insufficient={d} cycles={d} folds={d} dropped_objects={d} step={d}; {s}\n",
+            "macho-processor: WAIT GRAPH: verdict={s} self_resolving={s} objects={d} events={d} orphan(wait/signal)={d}/{d} handshakes(stalled/progressing)={d}/{d} insufficient={d} timeout_only={d} cycles={d} folds={d} dropped_objects={d} step={d}; {s}\n",
             .{
                 verdict.label(),
                 if (verdict.selfResolving()) "YES" else "NO",
@@ -6876,11 +11126,93 @@ pub const MachOState = struct {
                 totals.stalled_handshakes,
                 totals.progressing_handshakes,
                 totals.insufficient,
+                totals.timeout_only,
                 totals.cycles,
                 totals.canonical_folds,
                 totals.dropped_objects,
                 self.executed_steps,
                 verdict.guidance(),
+            },
+        );
+        machoCapturePrint(
+            "  WAIT CONTINUATION: pending={d} observed={d} same_site={d} transitions={d} observed_without_pc={d} observed_untrusted_pc={d} incomparable_pc={d} unobserved={d} dropped={d} out_of_order={d} unattributed={d} max_pending_age={d}; a returned wait is not treated as progress until the next ordered activity is observed, and a PC proves control flow only when its domain and quality are comparable\n",
+            .{
+                continuation.pending,
+                continuation.observed,
+                continuation.same_site,
+                continuation.transitions,
+                continuation.observed_without_pc,
+                continuation.observed_untrusted_pc,
+                continuation.incomparable_pc,
+                continuation.unobserved,
+                continuation.dropped,
+                continuation.out_of_order,
+                continuation.unattributed,
+                continuation.max_pending_age,
+            },
+        );
+
+        // The graph describes the observed shape; the package decides what
+        // Rosette may safely do with that shape. Keep this decision beside the
+        // graph snapshot so a stale timeout audit cannot accidentally authorize
+        // a park, resume, or guest synthetic wake.
+        var policy_cautions: usize = 0;
+        var policy_faults: usize = 0;
+        var policy_actionable: usize = 0;
+        for (graph.objects) |record| {
+            if (!record.occupied) continue;
+            const policy_decision = record.policyDecision();
+            if (policy_decision.severity == .caution) policy_cautions += 1;
+            if (policy_decision.requires_fault) policy_faults += 1;
+            if (policy_decision.classification != .unobserved and
+                policy_decision.classification != .handshake_progressing)
+            {
+                policy_actionable += 1;
+            }
+        }
+        machoCapturePrint(
+            "  WAIT HANDSHAKE POLICY: actionable={d} cautions={d} faults={d} timeout_only={d} guest_synthetic_wake=REFUSED step={d}; timeout-only attempts stay out of parked-consumer accounting, and only the POSIX scheduler recovery path can request a bounded spurious recheck\n",
+            .{ policy_actionable, policy_cautions, policy_faults, totals.timeout_only, self.executed_steps },
+        );
+        for (graph.objects) |record| {
+            if (!record.occupied) continue;
+            const policy_decision = record.policyDecision();
+            if (policy_decision.classification == .unobserved or
+                policy_decision.classification == .handshake_progressing)
+            {
+                continue;
+            }
+            machoCapturePrint(
+                "  wait policy object=0x{x:0>8} kind={s} timeout_class={s} timeout_ms={d} timeout_requested_known={s} timeout_requested={s} classification={s} action={s} severity={s} may_resume={s} may_synthesize_wake={s} waits={d} successful={d} returned={d} timeouts={d} signals={d}; {s}\n",
+                .{
+                    record.address,
+                    record.object_kind.label(),
+                    record.timeout_class.label(),
+                    record.timeout_ms,
+                    if (record.timeout_requested_known) "YES" else "NO",
+                    if (record.timeout_requested) "YES" else "NO",
+                    policy_decision.classification.label(),
+                    policy_decision.action.label(),
+                    policy_decision.severity.label(),
+                    if (policy_decision.may_resume) "YES" else "NO",
+                    if (policy_decision.may_synthesize_wake) "YES" else "NO",
+                    record.waits,
+                    record.successful_waits,
+                    record.completed_successes,
+                    record.timed_out_waits,
+                    record.signals,
+                    policy_decision.guidance(),
+                },
+            );
+        }
+        machoCapturePrint(
+            "  WAIT GRAPH PAIRING: pending(active/capacity)={d}/{d} dropped={d} unmatched_results={d} identity_conflicts={d}; explicit result identities outrank compatibility breadcrumbs and missing pairs are not guessed\n",
+            .{
+                self.livelock_pending_wait_active,
+                guest_log.pending_wait_capacity,
+                self.livelock_pending_wait_dropped,
+                self.livelock_pending_wait_unmatched_results,
+                self.livelock_pending_wait_identity_conflicts,
             },
         );
 
@@ -6900,7 +11232,7 @@ pub const MachOState = struct {
 
         if (graph.blocking()) |record| {
             machoCapturePrint(
-                "  WAIT GRAPH BLOCKER: object=0x{x:0>8} state={s} waits={d} signals={d} waiters={d} signallers={d} first_step={d} last_step={d}; {s}\n",
+                "  WAIT GRAPH BLOCKER: object=0x{x:0>8} state={s} waits={d} signals={d} waiters={d} signallers={d} first_step={d} last_step={d} evidence(success/returned/timeout blocked/ready/unknown)={d}/{d}/{d} {d}/{d}/{d} handoff_proven={s} handoff_order={s} blocked_after_signal={d} blocked_without_prior_signal={d} last_signal_step={d} progress(first/last)={d}/{d}; {s}\n",
                 .{
                     record.address,
                     record.state().label(),
@@ -6910,19 +11242,59 @@ pub const MachOState = struct {
                     record.signaller_count,
                     record.first_step,
                     record.last_step,
+                    record.successful_waits,
+                    record.completed_successes,
+                    record.timed_out_waits,
+                    record.blocked_successes,
+                    record.ready_on_entry,
+                    record.unknown_timing,
+                    if (record.blockedHandoffProven()) "YES" else "NO",
+                    record.handoffOrder().label(),
+                    record.blocked_after_signal,
+                    record.blocked_without_prior_signal,
+                    record.last_signal_step,
+                    record.progress_at_first,
+                    record.progress_at_last,
                     record.state().guidance(),
                 },
             );
             if (record.soleWaiter()) |waiter| {
                 machoCapturePrint(
-                    "    waiter    thread=0x{x} pc=0x{x} events={d} first_step={d} last_step={d}\n",
-                    .{ waiter.thread, waiter.pc, waiter.events, waiter.first_step, waiter.last_step },
+                    "    waiter    thread=0x{x} pc=0x{x} pc_domain={s} pc_quality={s} events={d} first_step={d} last_step={d} same_site_reentries={d} site_transitions={d} pc_untrusted={d} pc_incomparable={d}\n",
+                    .{ waiter.thread, waiter.pc, waiter.pc_domain.label(), waiter.pc_quality.label(), waiter.events, waiter.first_step, waiter.last_step, waiter.same_site_reentries, waiter.site_transitions, waiter.pc_untrusted_events, waiter.pc_incomparable_events },
                 );
+                if (graph.continuationFor(record.address, waiter.thread)) |wait_continuation| {
+                    machoCapturePrint(
+                        "    waiter-continuation object=0x{x} thread=0x{x} state={s} timing={s} wait_pc=0x{x} wait_pc_domain={s} wait_pc_quality={s} wait_step={d} next_kind={s} next_pc=0x{x} next_pc_domain={s} next_pc_quality={s} next_step={d} age={d}; {s}\n",
+                        .{
+                            wait_continuation.object,
+                            wait_continuation.thread,
+                            wait_continuation.state.label(),
+                            wait_continuation.timing.label(),
+                            wait_continuation.wait_pc,
+                            wait_continuation.wait_pc_domain.label(),
+                            wait_continuation.wait_pc_quality.label(),
+                            wait_continuation.wait_step,
+                            wait_continuation.next_kind.label(),
+                            wait_continuation.next_pc,
+                            wait_continuation.next_pc_domain.label(),
+                            wait_continuation.next_pc_quality.label(),
+                            wait_continuation.next_step,
+                            wait_continuation.age(self.executed_steps),
+                            wait_continuation.state.guidance(),
+                        },
+                    );
+                } else {
+                    machoCapturePrint(
+                        "    waiter-continuation object=0x{x} thread=0x{x} state=unobserved; no wait completion is retained for this participant, so no continuation conclusion is made\n",
+                        .{ record.address, waiter.thread },
+                    );
+                }
             }
             if (record.soleSignaller()) |signaller| {
                 machoCapturePrint(
-                    "    signaller thread=0x{x} pc=0x{x} events={d} first_step={d} last_step={d}\n",
-                    .{ signaller.thread, signaller.pc, signaller.events, signaller.first_step, signaller.last_step },
+                    "    signaller thread=0x{x} pc=0x{x} pc_domain={s} pc_quality={s} events={d} first_step={d} last_step={d} same_site_reentries={d} site_transitions={d} pc_untrusted={d} pc_incomparable={d}\n",
+                    .{ signaller.thread, signaller.pc, signaller.pc_domain.label(), signaller.pc_quality.label(), signaller.events, signaller.first_step, signaller.last_step, signaller.same_site_reentries, signaller.site_transitions, signaller.pc_untrusted_events, signaller.pc_incomparable_events },
                 );
             }
         }
@@ -6931,7 +11303,7 @@ pub const MachOState = struct {
             if (!record.occupied) continue;
             if (!record.state().isFinding()) continue;
             machoCapturePrint(
-                "  wait object 0x{x:0>8} {s: <22} waits={d: <6} signals={d: <6} waiters={d} signallers={d} dropped={d} last_step={d}\n",
+                "  wait object 0x{x:0>8} {s: <22} waits={d: <6} signals={d: <6} waiters={d} signallers={d} dropped={d} evidence(success/returned/timeout blocked/ready/unknown)={d}/{d}/{d} {d}/{d}/{d} handoff_proven={s} progress(first/last)={d}/{d} last_step={d}\n",
                 .{
                     record.address,
                     record.state().label(),
@@ -6940,6 +11312,15 @@ pub const MachOState = struct {
                     record.waiter_count,
                     record.signaller_count,
                     record.participants_dropped,
+                    record.successful_waits,
+                    record.completed_successes,
+                    record.timed_out_waits,
+                    record.blocked_successes,
+                    record.ready_on_entry,
+                    record.unknown_timing,
+                    if (record.blockedHandoffProven()) "YES" else "NO",
+                    record.progress_at_first,
+                    record.progress_at_last,
                     record.last_step,
                 },
             );
@@ -6981,12 +11362,54 @@ pub const MachOState = struct {
             },
         );
 
+        // One row per miss class, with the policy that governs it.
+        //
+        // A single `misses=911150 hit_rate=99%` is not judgeable: it merges the
+        // compulsory first touches, which no cache can avoid, with cold
+        // working-set evictions and the classes that prove reusable loss. The
+        // reader has to be able to see which is which and what each one costs,
+        // without knowing the taxonomy beforehand.
+        var compulsory_misses: u64 = 0;
+        var deferred_misses: u64 = 0;
+        var actionable_misses: u64 = 0;
+        inline for (@typeInfo(translation_economics.Cause).@"enum".fields) |field| {
+            const cause: translation_economics.Cause = @enumFromInt(field.value);
+            const count: u64 = switch (cause) {
+                .vacant_fill => totals.vacant_fills,
+                .capacity_conflict => totals.conflict_fills,
+                .cold_eviction => totals.cold_evictions,
+                .stale_bytes => totals.stale_refills,
+                .flush_collateral => totals.flush_refills,
+            };
+            if (cause.compulsory()) {
+                compulsory_misses +|= count;
+            } else if (cause.recurring()) {
+                actionable_misses +|= count;
+            } else {
+                deferred_misses +|= count;
+            }
+            machoCapturePrint(
+                "  translation miss {s: <18} count={d: <10} share={d}% fatal={s} {s}\n",
+                .{
+                    cause.label(),
+                    count,
+                    translation_economics.percentage(count, totals.decodes),
+                    if (cause.requiresFailFast()) "YES" else "NO",
+                    cause.policy(),
+                },
+            );
+        }
+        machoCapturePrint(
+            "  translation miss accounting: compulsory={d} deferred_cold={d} actionable_recurring={d} of {d}; only actionable recurring classes arm no-unverified-translation-miss. A compulsory miss is one an instruction pays once, a cold eviction is non-empty but never-reused working-set evidence, and conflicts/stale/flush are proven avoidable loss\n",
+            .{ compulsory_misses, deferred_misses, actionable_misses, totals.decodes },
+        );
+
         // The hit rate is independent of why the misses occurred. Keep it next
         // to the cause ledger, but do not infer mutation from either number.
         const cache_total = self.decode_cache_hits + self.decode_cache_misses;
         const hit_percent: u64 = if (cache_total == 0) 0 else (self.decode_cache_hits * 100) / cache_total;
         machoCapturePrint(
-            "  translation cache: entries={d} ways={d} sets={d} hits={d} misses={d} hit_rate={d}% miss(vacant/conflict/cold)={d}/{d}/{d} stale_byte_rejections={d} victim(hits/fills/stale)={d}/{d}/{d}\n",
+            "  translation cache: entries={d} ways={d} sets={d} hits={d} misses={d} hit_rate={d}% miss(vacant/conflict/cold)={d}/{d}/{d} stale_byte_rejections={d} victim(hits/fills/stale)={d}/{d}/{d} static_l2(entries/hits/fills)={d}/{d}/{d}\n",
             .{
                 self.decode_cache.len,
                 constants.DECODE_CACHE_WAYS,
@@ -7001,8 +11424,25 @@ pub const MachOState = struct {
                 self.decode_cache_victim_hits,
                 self.decode_cache_victim_fills,
                 self.decode_cache_victim_stale_rejections,
+                self.static_decode_l2.len,
+                self.static_decode_l2_hits,
+                self.static_decode_l2_fills,
             },
         );
+        machoCapturePrint("  translation domains: static(h/m/f)={d}/{d}/{d} dynamic={d}/{d}/{d} thunk={d}/{d}/{d} unknown={d}/{d}/{d}; banks are disjoint\n", .{
+            self.decode_domain_hits[translation_domain.Domain.static_image.bank()],
+            self.decode_domain_misses[translation_domain.Domain.static_image.bank()],
+            self.decode_domain_fills[translation_domain.Domain.static_image.bank()],
+            self.decode_domain_hits[translation_domain.Domain.dynamic_generated.bank()],
+            self.decode_domain_misses[translation_domain.Domain.dynamic_generated.bank()],
+            self.decode_domain_fills[translation_domain.Domain.dynamic_generated.bank()],
+            self.decode_domain_hits[translation_domain.Domain.thunk_bridge.bank()],
+            self.decode_domain_misses[translation_domain.Domain.thunk_bridge.bank()],
+            self.decode_domain_fills[translation_domain.Domain.thunk_bridge.bank()],
+            self.decode_domain_hits[translation_domain.Domain.unknown.bank()],
+            self.decode_domain_misses[translation_domain.Domain.unknown.bank()],
+            self.decode_domain_fills[translation_domain.Domain.unknown.bank()],
+        });
 
         if (totals.hottest_recurring != 0) {
             var hottest: [25]translation_economics.PageRecord = undefined;
@@ -7012,8 +11452,10 @@ pub const MachOState = struct {
                 .{found},
             );
             for (hottest[0..found]) |record| {
+                const record_domain = self.translationDomainFor(record.conflict_address);
+                const record_set_bases = self.decodeCacheSetBasesFor(record.conflict_address, record_domain);
                 machoCapturePrint(
-                    "  cache-pressure page=0x{x:0>12} fills={d} vacant={d} conflicts={d} cold={d} stale={d} flush={d} distinct_addresses={d} dispersed={s} witness=0x{x} set={d} symbol={s}+0x{x} first_step={d} last_step={d}\n",
+                    "  cache-pressure page=0x{x:0>12} fills={d} vacant={d} conflicts={d} cold={d} stale={d} flush={d} distinct_byte_addresses={d} dispersed={s} witness=0x{x} set_candidates={d}/{d} symbol={s}+0x{x} first_step={d} last_step={d}\n",
                     .{
                         record.page << translation_economics.page_shift,
                         record.decodes,
@@ -7025,11 +11467,11 @@ pub const MachOState = struct {
                         record.distinct_conflict_addresses,
                         if (record.conflictsAreDispersed()) "YES" else "NO",
                         record.conflict_address,
-                        // Which set of the decode cache the witness maps to.
-                        // Two hot pages landing in one set is the difference
-                        // between a capacity problem and an indexing one, and
-                        // the page number alone cannot show it.
-                        constants.decodeCacheSetBase(record.conflict_address) / constants.DECODE_CACHE_WAYS,
+                        // Both primary choices are reported. A single set
+                        // number would make a healthy alternate placement
+                        // look like a conflict in the strict-run evidence.
+                        record_set_bases[0] / constants.DECODE_CACHE_WAYS,
+                        record_set_bases[1] / constants.DECODE_CACHE_WAYS,
                         if (self.metadata.nearestSymbol(record.conflict_address)) |symbol| symbol.name else "<unsymbolized>",
                         if (self.metadata.nearestSymbol(record.conflict_address)) |symbol| symbol.offset else 0,
                         record.first_step,
@@ -7041,11 +11483,14 @@ pub const MachOState = struct {
                 const witnesses = record.witnesses();
                 if (witnesses.len > 1) {
                     for (witnesses[1..]) |address| {
+                        const witness_domain = self.translationDomainFor(address);
+                        const witness_set_bases = self.decodeCacheSetBasesFor(address, witness_domain);
                         machoCapturePrint(
-                            "    cache-pressure witness=0x{x} set={d} symbol={s}+0x{x}\n",
+                            "    cache-pressure witness=0x{x} set_candidates={d}/{d} symbol={s}+0x{x}\n",
                             .{
                                 address,
-                                constants.decodeCacheSetBase(address) / constants.DECODE_CACHE_WAYS,
+                                witness_set_bases[0] / constants.DECODE_CACHE_WAYS,
+                                witness_set_bases[1] / constants.DECODE_CACHE_WAYS,
                                 if (self.metadata.nearestSymbol(address)) |symbol| symbol.name else "<unsymbolized>",
                                 if (self.metadata.nearestSymbol(address)) |symbol| symbol.offset else 0,
                             },
@@ -7174,14 +11619,18 @@ pub const MachOState = struct {
         const actionable = ledger.actionableMask();
 
         machoCapturePrint(
-            "macho-processor: VD SWAP TRACE: met={d}/{d} walls={d} (findings={d} starved={d} unprobed={d}) downstream={d} probe_records={d} unlisted={d} step={d}; {s}\n",
+            "macho-processor: VD SWAP TRACE: met={d}/{d} walls={d} (findings={d} refused={d} starved={d} unprobed={d}) starved(rosette_closable/unattributed)={d}/{d} unattributed_records={d} downstream={d} probe_records={d} unlisted={d} step={d}; {s}\n",
             .{
                 totals.met,
                 gpu.vd_swap_contract.stage_count,
                 totals.actionable + totals.starved + totals.unprobed,
-                totals.actionable,
+                totals.actionable -| totals.refused_by_owner,
+                totals.refused_by_owner,
                 totals.starved,
                 totals.unprobed,
+                totals.starved_closable_by_rosette,
+                totals.starved_unattributed,
+                ledger.probes.unattributed_starvations,
                 totals.blocked_upstream,
                 ledger.probes.records,
                 ledger.probes.unlisted_probe_records,
@@ -7204,6 +11653,20 @@ pub const MachOState = struct {
                     wall.attribution.guidance(),
                 },
             );
+            // A starved wall used to end here: a stage that has not been shown
+            // false and no way to find out what would show it. The cause names
+            // the missing input and who can supply it.
+            if (wall.attribution == .starved) {
+                machoCapturePrint(
+                    "  VD SWAP PRIMARY WALL STARVED: cause={s} blames={s} closable_by_rosette={s}; {s}\n",
+                    .{
+                        wall.starvation_cause.label(),
+                        wall.starvation_cause.owner().label(),
+                        if (wall.starvation_cause.closableByRosette()) "YES" else "NO",
+                        wall.starvation_cause.remedy(),
+                    },
+                );
+            }
         }
 
         // Per-chain frontiers.  A stalled producer and a fully reached
@@ -7235,7 +11698,7 @@ pub const MachOState = struct {
             const diagnosis = ledger.diagnose(stage);
             if (diagnosis.attribution != .met) {
                 machoCapturePrint(
-                    "  vd-swap gap {s: <38} chain={s: <13} {s: <16} owner={s: <24} wall={s: <3} blocked_by={s: <38} probes={d}/{d} evidence={d} starved={d} decided={s}/{s} detail={d}\n",
+                    "  vd-swap gap {s: <38} chain={s: <13} {s: <16} owner={s: <24} wall={s: <3} blocked_by={s: <38} probes={d}/{d} evidence={d} starved={d} cause={s: <22} blames={s: <26} decided={s}/{s} detail={d}\n",
                     .{
                         stage.label(),
                         diagnosis.chain.label(),
@@ -7247,6 +11710,8 @@ pub const MachOState = struct {
                         diagnosis.probes_total,
                         diagnosis.probes_with_evidence,
                         diagnosis.probes_starved,
+                        if (diagnosis.probes_starved != 0) diagnosis.starvation_cause.label() else "-",
+                        if (diagnosis.probes_starved != 0) diagnosis.starvation_cause.owner().label() else "-",
                         if (diagnosis.decided_by) |which| which.label() else "<none>",
                         diagnosis.decided_outcome.label(),
                         diagnosis.detail,
@@ -7268,7 +11733,7 @@ pub const MachOState = struct {
                         if (probeSuppliesStage(stage, which)) {
                             const cell = ledger.probes.cell(stage, which);
                             machoCapturePrint(
-                                "    probe {s: <38} {s: <30} {s: <18} latest={s: <18} attempts={d} evidence={d} starved={d} detail={d} first={d} last={d}\n",
+                                "    probe {s: <38} {s: <30} {s: <18} latest={s: <18} attempts={d} evidence={d} starved={d} cause={s: <22} unattributed={d} first_starved={d} detail={d} first={d} last={d}\n",
                                 .{
                                     stage.label(),
                                     which.label(),
@@ -7277,6 +11742,9 @@ pub const MachOState = struct {
                                     cell.attempts,
                                     cell.evidence_attempts,
                                     cell.starved_attempts,
+                                    if (cell.starved_attempts != 0) cell.starvation_cause.label() else "-",
+                                    cell.unattributed_starvations,
+                                    cell.first_starved_step,
                                     cell.detail,
                                     cell.first_step,
                                     cell.last_step,
@@ -7289,18 +11757,53 @@ pub const MachOState = struct {
         }
 
         machoCapturePrint(
-            "  VD SWAP EXECUTOR: retained(executions/refusals)={d}/{d} span_epoch={d} payload_epoch={d} publication_advances={d} batches={d} ring_dwords_consumed={d} packet_errors={d}; the stateful command processor is the only source of render-target registers, EDRAM resolves and draw-completion events. Zero executions means every stage below it is unobserved rather than false\n",
+            "  VD SWAP EXECUTOR: retained(executions/refusals/partial_tails)={d}/{d}/{d} span_epoch={s}{d} payload_epoch={s}{d} publication_advances={d} batches={d} ring_dwords_consumed={d} packet_errors={d}; the stateful command processor is the only source of render-target registers, EDRAM resolves and draw-completion events. Zero executions means every stage below it is unobserved rather than false\n",
             .{
                 self.gpu_xenos_retained_executions,
                 self.gpu_xenos_retained_refusals,
-                self.gpu_xenos_last_ring_epoch,
-                self.gpu_xenos_last_payload_epoch,
+                self.gpu_xenos_runtime.retained_truncated_tails,
+                // An unset epoch is a sentinel, and printing it as
+                // 18446744073709551615 made a "never ran" read as a number a
+                // reader could compare against something.
+                if (self.gpu_xenos_last_ring_epoch == std.math.maxInt(u64)) "unset:" else "",
+                if (self.gpu_xenos_last_ring_epoch == std.math.maxInt(u64)) 0 else self.gpu_xenos_last_ring_epoch,
+                if (self.gpu_xenos_last_payload_epoch == std.math.maxInt(u64)) "unset:" else "",
+                if (self.gpu_xenos_last_payload_epoch == std.math.maxInt(u64)) 0 else self.gpu_xenos_last_payload_epoch,
                 self.gpu_ring_publication.advances,
                 self.gpu_xenos_runtime.batches,
                 self.gpu_xenos_runtime.ring_dwords_consumed,
                 self.gpu_xenos_runtime.packet_errors,
             },
         );
+        // Whether the executor followed the same indirect references the
+        // walker did. The nested draws and most render-target programming live
+        // behind INDIRECT_BUFFER packets, so an executor that decoded the root
+        // and followed none of them has a complete-looking batch and an empty
+        // register file — and nothing else in the report distinguishes that
+        // from a title that programmed nothing.
+        const runtime = &self.gpu_xenos_runtime;
+        machoCapturePrint(
+            "  VD SWAP EXECUTOR INDIRECT: buffers={d} dwords(requested/read)={d}/{d} unreadable={d} truncated={d} invalid={d} depth_limited={d} budget_limited={d} cycles={d} last_status={s} last_address=0x{x:0>8}; the walker's reference count and this one describe the same packets. They differing is a finding about which observer is looking\n",
+            .{
+                runtime.indirect_buffers,
+                runtime.indirect_dwords_requested,
+                runtime.indirect_dwords_read,
+                runtime.indirect_unreadable,
+                runtime.indirect_truncated,
+                runtime.indirect_invalid,
+                runtime.indirect_depth_limited,
+                runtime.indirect_budget_limited,
+                runtime.indirect_cycles,
+                runtime.indirect_last_status.label(),
+                runtime.indirect_last_address,
+            },
+        );
+        if (self.gpu_xenos_runtime.retained_truncated_tails != 0) {
+            machoCapturePrint(
+                "  VD SWAP EXECUTOR: {d} retained batch(es) had a last packet the window did not hold, and the packets before the cut were kept. Every register and draw below comes from a partial reading of those batches — enough to judge what was programmed, and not enough to claim the batch was complete\n",
+                .{self.gpu_xenos_runtime.retained_truncated_tails},
+            );
+        }
         self.logNewPm4Fault();
     }
 
@@ -7435,10 +11938,11 @@ pub const MachOState = struct {
         );
         const target = self.gpu_xenos_runtime.renderTargetEvidence();
         machoCapturePrint(
-            "  XENOS TARGET EVIDENCE: state={s} plausible={s} color(base_tile/format)={d}/{d} depth(base_tile/format)={d}/{d} surface(pitch/msaa/mask)={d}/{d}/{d} raw(color/depth/surface)=0x{x:0>8}/0x{x:0>8}/0x{x:0>8}\n",
+            "  XENOS TARGET EVIDENCE: state={s} plausible={s} output_ready={s} color(base_tile/format)={d}/{d} depth(base_tile/format)={d}/{d} surface(pitch/msaa/mask)={d}/{d}/{d} raw(color/depth/surface)=0x{x:0>8}/0x{x:0>8}/0x{x:0>8}\n",
             .{
                 if (target.state_observed) "YES" else "NO",
                 if (target.plausible) "YES" else "NO",
+                if (target.outputReady()) "YES" else "NO",
                 target.color_base_tiles,
                 target.color_format,
                 target.depth_base_tiles,
@@ -7452,8 +11956,9 @@ pub const MachOState = struct {
             },
         );
         machoCapturePrint(
-            "  XENOS COMPLETION EVIDENCE: draw_signals={d} draw_dispatch(attempts/success/failures)={d}/{d}/{d} color_resolves={d} causal_post_draw(wait/signal)={d}/{d}; a draw packet is not a frame until these owner boundaries are observed\n",
+            "  XENOS COMPLETION EVIDENCE: renderable_draws={d} draw_signals={d} draw_dispatch(attempts/success/failures)={d}/{d}/{d} color_resolves={d} causal_post_draw(wait/signal)={d}/{d}; a raw draw packet is not a frame until target-backed output and owner boundaries are observed\n",
             .{
+                self.gpu_xenos_runtime.renderable_draw_observations,
                 self.gpu_xenos_runtime.draw_completion_signals,
                 self.gpu_draw_completion_dispatch_attempts,
                 self.gpu_draw_completion_dispatches,
@@ -7543,12 +12048,36 @@ pub const MachOState = struct {
     pub fn logKernelSurface(self: *MachOState) void {
         const surface = &self.gpu_kernel_surface;
         const finding = surface.finding();
+        const complete = surface.allImportedUsable();
+        const detail_fingerprint = surface.detailFingerprint();
+        const stable_complete = complete and self.kernel_surface_complete and
+            self.kernel_surface_detail_fingerprint == detail_fingerprint;
+        self.kernel_surface_complete = complete;
+        self.kernel_surface_detail_fingerprint = detail_fingerprint;
+
+        if (stable_complete) {
+            self.kernel_surface_collapsed +|= 1;
+            machoCapturePrint(
+                "macho-processor: KERNEL SURFACE: imported={d} usable={d} unpopulated_imported={d} blocking=<none> complete=YES step={d}; complete imported surface is unchanged, so the per-export table was printed earlier and is collapsed (collapse_count={d})\n",
+                .{
+                    finding.imported_count,
+                    finding.usable_count,
+                    finding.unpopulated_imported,
+                    self.executed_steps,
+                    self.kernel_surface_collapsed,
+                },
+            );
+            return;
+        }
+
         machoCapturePrint(
-            "macho-processor: KERNEL SURFACE: imported={d} usable={d} unpopulated_imported={d} blocking={s} step={d}; {s}\n",
+            "macho-processor: KERNEL SURFACE: imported={d} usable={d} unpopulated_imported={d} invalid_imported={d} complete={s} blocking={s} step={d}; {s}\n",
             .{
                 finding.imported_count,
                 finding.usable_count,
                 finding.unpopulated_imported,
+                finding.invalid_imported,
+                if (complete) "YES" else "NO",
                 if (finding.blocking) |which| which.name() else "<none>",
                 self.executed_steps,
                 if (finding.blocking) |which|
@@ -7566,7 +12095,10 @@ pub const MachOState = struct {
                     surface.population(which).label(),
                     if (which.isVariable()) "variable" else "function",
                     which.name(),
-                    if (surface.imported(which)) "" else " (not imported by this title)",
+                    if (surface.imported(which))
+                        ""
+                    else
+                        " (no host binding observed; this surface watches Rosette's host import path and says nothing about the title's own XEX imports — read KERNEL VARIABLES for those)",
                 },
             );
         }
@@ -7600,6 +12132,19 @@ pub const MachOState = struct {
     pub fn readConsoleDword(self: *MachOState, console_address: u32) ?u32 {
         if (console_address == 0) return null;
         const host = self.xenia_memory_views.virtualHostAddress(console_address) orelse return null;
+        const bytes = self.guestMemoryConst(host, 4) orelse return null;
+        return std.mem.readInt(u32, bytes[0..4], .big);
+    }
+
+    /// One big-endian dword out of the console's *physical* address space.
+    ///
+    /// Separate from `readConsoleDword` because the ring read-pointer
+    /// write-back address is a physical one — the command processor resolves it
+    /// with `TranslatePhysical` — and reading it through the virtual view would
+    /// silently sample an unrelated page and report a value that never changes.
+    pub fn readConsolePhysicalDword(self: *MachOState, physical_address: u32) ?u32 {
+        if (physical_address == 0) return null;
+        const host = self.xenia_memory_views.physicalHostAddress(physical_address) orelse return null;
         const bytes = self.guestMemoryConst(host, 4) orelse return null;
         return std.mem.readInt(u32, bytes[0..4], .big);
     }
@@ -7881,6 +12426,38 @@ pub const MachOState = struct {
         }
     }
 
+    /// Whether a translated-x86 callback route has a title-owned registration
+    /// witness. The callback address alone is intentionally insufficient:
+    /// VdInitializeEngines carries a callback-shaped argument on some Xenia
+    /// paths, but only VdSetGraphicsInterruptCallback establishes the route.
+    fn titleInterruptCallbackRegistrationObserved(self: *const MachOState) bool {
+        return self.gpu_interrupt_callback_registrations != 0 or
+            self.gpu_bringup_gate.recordFor(.set_interrupt_callback).crossed() or
+            self.gpu_bootstrap.seen(.graphics_interrupt_callback) or
+            self.gpu_bootstrap_provenance.guestObserved(.graphics_interrupt_callback) or
+            self.gpu_bootstrap_provenance.traceObserved(.graphics_interrupt_callback);
+    }
+
+    fn titleInterruptCallbackRouteProven(self: *const MachOState) bool {
+        if (self.gpu_interrupt_callback == 0 or
+            !self.titleInterruptCallbackRegistrationObserved())
+            return false;
+        // A title callback state field is not enough when the emulator's
+        // shared completion slot currently contains its host builtin. The
+        // newest observed slot occupant owns the dispatch seam; permit the
+        // legacy state-only path only when no slot observation exists.
+        return self.gpu_interrupt_slot_writes == 0 or self.gpu_interrupt_slot_is_guest;
+    }
+
+    /// Record a callback dispatch at the event boundary, before any callback
+    /// selection or fallback. This is what turns an early synthetic/host
+    /// dispatch into a retained pre-initialization inversion instead of a
+    /// later report that merely says the callback was absent.
+    fn noteGpuInterruptDispatch(self: *MachOState) void {
+        self.refreshPreinitialization();
+        self.gpu_preinitialization.observe(.interrupt_callback_dispatched, self.executed_steps);
+    }
+
     /// Join every subsystem's evidence into the pre-initialisation ledger.
     ///
     /// Derived rather than maintained, like the graphics contract: each fact
@@ -7938,8 +12515,17 @@ pub const MachOState = struct {
             ledger.observe(.register_aperture_reachable, at);
         }
         if (self.gpu_bootstrap.seen(.initialize_engines)) ledger.observe(.engines_initialised, at);
-        if (self.gpu_bootstrap.seen(.graphics_interrupt_callback)) ledger.observe(.interrupt_callback_registered, at);
-        if (self.gpu_bootstrap.seen(.graphics_interrupt_dispatch)) ledger.observe(.interrupt_callback_dispatched, at);
+        if (self.titleInterruptCallbackRegistrationObserved()) ledger.observe(.interrupt_callback_registered, at);
+        // The bootstrap ladder learns this from the emulator's log lines. The
+        // tracepoint at `EmulateCPInterruptDPC` learns it from the instruction
+        // pointer, and on the 2026-08-31 run it had fired a hundred and fifty
+        // times while this clause still read "registered but never fired". A
+        // clause a stronger observer has already satisfied must not stay unmet.
+        if (self.gpu_bootstrap.seen(.graphics_interrupt_dispatch) or
+            self.gpu_bringup_gate.recordFor(.emulate_cp_interrupt_dpc).crossed())
+        {
+            ledger.observe(.interrupt_callback_dispatched, at);
+        }
         if (self.gpu_ring_watch_base != 0) ledger.observe(.ring_geometry_established, at);
         if (self.execution_tracepoints.roleEntered(.command_processor)) ledger.observe(.command_processor_running, at);
         if (variables.entry(.global_device).state == .populated) ledger.observe(.title_device_created, at);
@@ -7951,15 +12537,113 @@ pub const MachOState = struct {
         if (self.gpu_ring_publication.advances != 0) ledger.observe(.write_pointer_advanced, at);
     }
 
+    /// What Rosette could not map, ranked, each row naming the value to add.
+    ///
+    /// This is the report to read when a run keeps reaching the same frontier.
+    /// A blocking row is a classifier that declined a value a conclusion needed:
+    /// no amount of further running produces the answer, because the answer is
+    /// a case statement nobody has written.
+    pub fn logUnknownInventory(self: *MachOState) void {
+        const ledger = &self.unknown_inventory;
+        const totals = ledger.summary();
+        if (totals.total == 0) return;
+        if (totals.total == self.unknown_inventory_last_total) return;
+        self.unknown_inventory_last_total = totals.total;
+
+        machoCapturePrint(
+            "macho-processor: UNKNOWN INVENTORY: observations={d} distinct={d} unretained={d} blocking(distinct/observations)={d}/{d} settled_blockers={d} step={d}; {s}\n",
+            .{
+                totals.total,
+                totals.distinct,
+                totals.unretained,
+                totals.blocking_distinct,
+                totals.blocking_total,
+                ledger.settledBlockers(unknown_inventory_mod.settled_blocker_threshold),
+                self.executed_steps,
+                totals.verdict(),
+            },
+        );
+        var top: [8]unknown_inventory_mod.Entry = undefined;
+        const written = ledger.ranked(&top);
+        for (top[0..written]) |entry| {
+            machoCapturePrint(
+                "  unknown {s: <20} value=0x{x} ({d}) blocking={s} count={d} first_step={d} last_step={d} note={s}; {s}\n",
+                .{
+                    entry.domain.label(),
+                    entry.value,
+                    entry.value,
+                    if (entry.blocking) "YES" else "no",
+                    entry.count,
+                    entry.first_step,
+                    entry.last_step,
+                    if (entry.note_len != 0) entry.noteSlice() else "<none>",
+                    entry.domain.remedy(),
+                },
+            );
+        }
+    }
+
+    /// Which kernel calls the guest reported as failed, and which of those
+    /// nobody asked for.
+    ///
+    /// Collapsed on an unchanged total: a title that probes for a hundred
+    /// cache files emits a hundred identical conversions, and reprinting the
+    /// same table for each is how a real failure gets buried under an answered
+    /// question.
+    pub fn logGuestKernelStatus(self: *MachOState) void {
+        const ledger = &self.guest_status;
+        const totals = ledger.summary();
+        // Print even with nothing placed, once lines have been offered. A
+        // silent report cannot distinguish a parser that declined every line
+        // from a route that delivered none, and that ambiguity cost a whole
+        // debugging round on 2026-09-05.
+        if (ledger.lines_seen == 0) return;
+        if (totals.total == self.guest_status_last_total and totals.total != 0) return;
+        self.guest_status_last_total = totals.total;
+
+        machoCapturePrint(
+            "macho-processor: GUEST KERNEL STATUS: lines_seen={d} conversions={d} distinct={d} unretained={d} defects={d} classes(success/answered/named/unexplained)={d}/{d}/{d}/{d} step={d}; {s}\n",
+            .{
+                ledger.lines_seen,
+                totals.total,
+                totals.distinct,
+                totals.unretained,
+                totals.defects(),
+                totals.by_class[@intFromEnum(guest_status_ledger.Class.success)],
+                totals.by_class[@intFromEnum(guest_status_ledger.Class.answered_negative)],
+                totals.by_class[@intFromEnum(guest_status_ledger.Class.named_failure)],
+                totals.by_class[@intFromEnum(guest_status_ledger.Class.unexplained_failure)],
+                self.executed_steps,
+                totals.verdict(),
+            },
+        );
+        for (ledger.retained()) |entry| {
+            machoCapturePrint(
+                "  guest-status 0x{X:0>8} dos={d} class={s: <20} count={d} first_step={d} last_step={d} operation={s}; {s}\n",
+                .{
+                    entry.status,
+                    entry.dos_error,
+                    entry.class.label(),
+                    entry.count,
+                    entry.first_step,
+                    entry.last_step,
+                    if (entry.context_len != 0) entry.contextSlice() else "<none>",
+                    entry.class.describe(),
+                },
+            );
+        }
+    }
+
     /// Whether the guest's waits are waits or a spin wearing a wait's name.
     pub fn logGuestWaitLiveness(self: *MachOState) void {
         const ledger = &self.guest_wait_liveness;
         machoCapturePrint(
-            "macho-processor: GUEST WAIT LIVENESS: waits={d} signalled={d} timed_out={d} timing_samples={d} blocked_released={d} ready_on_entry={d} ready={d}% unknown_timing={d} aggregate={s} consumption_proven={s} objects={d} unattributed={d} untracked={d} step={d}; {s}\n",
+            "macho-processor: GUEST WAIT LIVENESS: waits={d} signalled={d} timed_out={d} bounded_poll_timeouts={d} timing_samples={d} blocked_released={d} ready_on_entry={d} ready={d}% unknown_timing={d} aggregate={s} consumption_proven={s} objects={d} open_entries={d} entry_completed={d} entry_dropped={d} unattributed={d} untracked={d} step={d}; {s}\n",
             .{
                 ledger.total_waits,
                 ledger.total_signalled,
                 ledger.total_timed_out,
+                ledger.total_bounded_poll_timeouts,
                 ledger.aggregateTimingSamples(),
                 ledger.total_blocked_signalled,
                 ledger.total_ready_on_entry,
@@ -7968,6 +12652,9 @@ pub const MachOState = struct {
                 ledger.aggregateVerdict().label(),
                 if (ledger.provesSignalConsumption()) "YES" else "NO",
                 ledger.count,
+                ledger.open_wait_count,
+                ledger.wait_entries_completed,
+                ledger.wait_entries_dropped,
                 ledger.unattributed_waits,
                 ledger.untracked_waits,
                 self.executed_steps,
@@ -7976,7 +12663,7 @@ pub const MachOState = struct {
         );
         for (ledger.objects[0..ledger.count]) |object| {
             machoCapturePrint(
-                "  wait object handle=0x{x:0>8} mode={s} mode_conflicts={d} waits={d} signalled={d} timed_out={d} timing_samples={d} blocked_released={d} ready_on_entry={d} ready={d}% unknown_timing={d} sets={d} sets_already_signalled={d} consumption_proven={s} verdict={s}\n",
+                "  wait object handle=0x{x:0>8} mode={s} mode_conflicts={d} waits={d} signalled={d} timed_out={d} bounded_poll_timeouts={d} timeout_class={s} timeout_ms={d} timing_samples={d} blocked_released={d} ready_on_entry={d} ready={d}% unknown_timing={d} sets={d} sets_already_signalled={d} consumption_proven={s} verdict={s}\n",
                 .{
                     object.handle,
                     object.event_mode.label(),
@@ -7984,6 +12671,9 @@ pub const MachOState = struct {
                     object.waits,
                     object.signalled,
                     object.timed_out,
+                    object.bounded_poll_timeouts,
+                    object.timeout_class.label(),
+                    object.timeout_ms,
                     object.timingSamples(),
                     object.blocked_signalled,
                     object.ready_on_entry,
@@ -7993,6 +12683,30 @@ pub const MachOState = struct {
                     object.sets_already_signalled,
                     if (object.provesSignalConsumption()) "YES" else "NO",
                     object.verdict().label(),
+                },
+            );
+        }
+        for (ledger.open_waits[0..ledger.open_wait_count]) |entry| {
+            machoCapturePrint(
+                "  open wait class={s} handle=0x{x:0>8} guest_obj=0x{x:0>8} type={d} tid={d} main={s} bootstrap={s} wait_mode={d} wait_reason={d} alertable={d} timeout_ms={d} pc=0x{x} pc_domain={s} pc_quality={s} lr=0x{x} handle_valid={s} age_steps={d}; completion was not observed\n",
+                .{
+                    entry.classLabel(),
+                    entry.handle,
+                    entry.guest_object,
+                    entry.object_type,
+                    entry.thread_id,
+                    if (entry.main_thread) "YES" else "NO",
+                    if (entry.bootstrap_thread) "YES" else "NO",
+                    entry.wait_mode,
+                    entry.wait_reason,
+                    @as(u32, if (entry.alertable) 1 else 0),
+                    entry.timeout_ms,
+                    entry.pc,
+                    entry.pc_domain.label(),
+                    entry.pc_quality.label(),
+                    entry.lr,
+                    if (entry.handle_valid) "YES" else "NO",
+                    self.executed_steps -| entry.entered_step,
                 },
             );
         }
@@ -8106,13 +12820,18 @@ pub const MachOState = struct {
     /// addresses. A single-address read cannot tell that apart from a producer
     /// that wrote nothing, and those are opposite bugs.
     pub fn logRingContents(self: *MachOState) void {
+        self.gpu_ring_inspection_attempted = true;
+        self.gpu_ring_last_inspection_step = self.executed_steps;
         if (self.gpu_ring_watch_base == 0 or self.gpu_ring_watch_size == 0) {
+            self.recordRingSurveyStarvation(.input_unavailable, .geometry_unknown);
             machoCapturePrint(
                 "macho-processor: RING CONTENTS: the ring's base and size have not been observed yet, so there is nothing to read. This is upstream of every packet question: VdInitializeRingBuffer has not run, or its arguments were not seen\n",
                 .{},
             );
             return;
         }
+        self.gpu_ring_last_inspected_base = self.gpu_ring_watch_base;
+        self.gpu_ring_last_inspected_size = self.gpu_ring_watch_size;
         const ring_dwords: u32 = @intCast(@min(self.gpu_ring_watch_size / 4, std.math.maxInt(u32)));
         const virtual_alias: u32 = if (self.gpu_ring_watch_base >= 0x1000)
             @intCast(0xE000_0000 + self.gpu_ring_watch_base - 0x1000)
@@ -8191,7 +12910,7 @@ pub const MachOState = struct {
         // above is what the verdict is built on.
         const geometry = publication.geometry orelse blk: {
             for ([_]gpu.VdSwapStage{ .ring_geometry_observed, .ring_projection_readable }) |stage| {
-                self.gpu_vd_swap_contract.recordProbe(stage, .ring_geometry_capture, .input_unavailable, 0, self.executed_steps);
+                self.gpu_vd_swap_contract.recordStarvation(stage, .ring_geometry_capture, .input_unavailable, .geometry_unknown, 0, self.executed_steps);
             }
             break :blk gpu.RingGeometry{};
         };
@@ -8221,7 +12940,7 @@ pub const MachOState = struct {
                 const summary = gpu.ring_scan.scan(bytes, geometry.read_pointer, span, ring_dwords);
                 if (summary.dwords_examined == 0) {
                     for (span_stages) |stage| {
-                        self.gpu_vd_swap_contract.recordProbe(stage, .outstanding_span_scan, .input_empty, 0, self.executed_steps);
+                        self.gpu_vd_swap_contract.recordStarvation(stage, .outstanding_span_scan, .input_empty, .input_drained, 0, self.executed_steps);
                     }
                 } else {
                     self.gpu_vd_swap_contract.observeProbe(.ring_projection_readable, .outstanding_span_scan, chosen.readable, summary.dwords_examined, self.executed_steps);
@@ -8290,10 +13009,56 @@ pub const MachOState = struct {
                         self,
                         xenosMemoryWrite,
                     );
+                    // Decode the exact bytes independently before the stateful
+                    // executor is allowed to publish guest-visible effects.
+                    // A completion packet may write memory; taking the walk
+                    // afterward would no longer prove both decoders saw the
+                    // same content.
+                    var authority_walker = xenia_pm4_walk.Walker.init(self, xenosMemoryRead);
+                    authority_walker.walkRoot(bytes, geometry.read_pointer, span, ring_dwords);
+                    const authority_walk = authority_walker.summary();
+                    const authority_batch_id = self.pm4BatchIdentity(
+                        bytes,
+                        geometry.read_pointer,
+                        span,
+                        ring_dwords,
+                        authority_walk.content_fingerprint,
+                    );
+                    const authentic_execution = self.gpu_ring_injection.injections == 0 and
+                        self.gpu_ring_publication.published();
+                    const authority_source: gpu.pm4_authority.SourceClass = if (authentic_execution)
+                        .guest_authentic
+                    else if (self.gpu_ring_injection.injections != 0)
+                        .synthetic
+                    else
+                        .host_forwarded;
+                    self.recordPm4AuthorityWalk(authority_batch_id, authority_walk, authority_source);
                     if (self.gpu_xenos_runtime.executeRingBytes(bytes, geometry.read_pointer, span, ring_dwords)) |execution| {
+                        self.recordPm4AuthorityExecution(
+                            authority_batch_id,
+                            execution,
+                            authority_source,
+                        );
+                        // `draws` includes Xenia's legitimate no-effect
+                        // IssueDraw entries. Only the runtime's explicit
+                        // target-backed classification can participate in the
+                        // strict render-target ordering contract.
+                        if (execution.renderable_draw_observations != 0 and
+                            self.gpu_renderable_draw_first_step == 0)
+                        {
+                            self.gpu_renderable_draw_first_step = self.executed_steps;
+                            self.gpu_renderable_draw_first_thread = self.active_guest_thread;
+                        }
+                        if ((execution.renderable_draw_observations != 0 or
+                            self.gpu_xenos_runtime.color_resolve_observations != 0) and
+                            self.gpu_guest_output_first_step == 0)
+                        {
+                            self.gpu_guest_output_first_step = self.executed_steps;
+                            self.gpu_guest_output_first_thread = self.active_guest_thread;
+                        }
                         self.observeGpuEarlyPacketExecution(
                             execution,
-                            self.gpu_ring_injection.injections == 0 and self.gpu_ring_publication.published(),
+                            authentic_execution,
                         );
                         const indirect = self.xenia_gpu_causal_trace.observePm4SpanWithIndirects(
                             bytes,
@@ -8367,12 +13132,13 @@ pub const MachOState = struct {
                             self.gpu_ring_injection.injections == 0 and self.gpu_ring_publication.advances != 0,
                         );
                         machoCapturePrint(
-                            "macho-processor: XENOS PM4 execution: batches={d} dwords={d} packets={d} draws={d} events={d} swaps={d} unknown={d} truncated={s}; observed_packets={d} observed_draws={d} observed_swaps={d} indirect_buffers={d} indirect_read={d}/{d} indirect_status={s} indirect_address=0x{x:0>8} indirect_missing=0x{x:0>8}; state_draws={d} state_swaps={d}\n",
+                            "macho-processor: XENOS PM4 execution: batches={d} dwords={d} packets={d} draws={d} renderable_draws={d} events={d} swaps={d} unknown={d} truncated={s}; observed_packets={d} observed_draws={d} observed_swaps={d} indirect_buffers={d} indirect_read={d}/{d} indirect_status={s} indirect_address=0x{x:0>8} indirect_missing=0x{x:0>8}; state_draws={d} state_renderable_draws={d} state_swaps={d}\n",
                             .{
                                 self.gpu_xenos_runtime.batches,
                                 execution.dwords,
                                 execution.packets_after - execution.packets_before,
                                 execution.draws,
+                                execution.renderable_draw_observations,
                                 execution.events,
                                 execution.swaps,
                                 execution.unknown_opcodes,
@@ -8387,6 +13153,7 @@ pub const MachOState = struct {
                                 execution.indirect_last_address,
                                 execution.indirect_last_missing_address orelse 0,
                                 self.gpu_xenos_runtime.draw_count,
+                                self.gpu_xenos_runtime.renderable_draw_observations,
                                 self.gpu_xenos_runtime.swap_count,
                             },
                         );
@@ -8429,7 +13196,19 @@ pub const MachOState = struct {
                         }
                     }
                 }
+            } else {
+                // The projection the survey chose cannot be read back here.
+                // That is a memory-view question, and saying so is what keeps
+                // it from reading as an absence in the producer.
+                self.recordRingSurveyStarvation(.input_unavailable, .memory_unreadable);
             }
+        } else {
+            // No projection of the ring could be chosen at all, so the
+            // survey and every walk fed from it looked at nothing this
+            // round. Recorded rather than skipped: an unrecorded round
+            // leaves these probes reading `not attempted` forever, which
+            // accuses the transport of a silence that is Rosette's.
+            self.recordRingSurveyStarvation(.input_unavailable, .geometry_unknown);
         }
 
         if (survey.best()) |chosen| {
@@ -8450,14 +13229,20 @@ pub const MachOState = struct {
             };
             if (!chosen.readable) {
                 for (survey_stages) |stage| {
-                    self.gpu_vd_swap_contract.recordProbe(stage, .ring_projection_survey, .input_unavailable, 0, self.executed_steps);
+                    self.gpu_vd_swap_contract.recordStarvation(stage, .ring_projection_survey, .input_unavailable, .memory_unreadable, 0, self.executed_steps);
                 }
-                self.gpu_vd_swap_contract.recordProbe(.ring_projection_readable, .ring_projection_survey, .input_unavailable, 0, self.executed_steps);
+                self.gpu_vd_swap_contract.recordStarvation(.ring_projection_readable, .ring_projection_survey, .input_unavailable, .memory_unreadable, 0, self.executed_steps);
+                // The scan reads the same projection, so it is starved for the
+                // same reason. Recorded here rather than only in the branch
+                // below, because a probe that skips a round says "nobody was
+                // watching" where it means "I looked and could not read".
+                self.gpu_vd_swap_contract.recordStarvation(.frontbuffer_validated, .retained_batch_scan, .input_unavailable, .memory_unreadable, 0, self.executed_steps);
             } else if (chosen.nonzero_dwords == 0) {
                 for (survey_stages) |stage| {
-                    self.gpu_vd_swap_contract.recordProbe(stage, .ring_projection_survey, .input_empty, 0, self.executed_steps);
+                    self.gpu_vd_swap_contract.recordStarvation(stage, .ring_projection_survey, .input_empty, .input_drained, 0, self.executed_steps);
                 }
                 self.gpu_vd_swap_contract.observeProbe(.ring_projection_readable, .ring_projection_survey, true, 0, self.executed_steps);
+                self.gpu_vd_swap_contract.recordStarvation(.frontbuffer_validated, .retained_batch_scan, .input_empty, .input_drained, 0, self.executed_steps);
             } else {
                 self.gpu_vd_swap_contract.observeProbe(.ring_projection_readable, .ring_projection_survey, true, chosen.nonzero_dwords, self.executed_steps);
                 self.gpu_vd_swap_contract.observeProbe(.pm4_stream_observed, .ring_projection_survey, chosen.packets != 0, chosen.nonzero_dwords, self.executed_steps);
@@ -8522,6 +13307,28 @@ pub const MachOState = struct {
         self.gpu_interrupt_dispatches +|= 1;
         const is_draw_completion = event.kind == .draw_complete;
         if (is_draw_completion) self.gpu_draw_completion_dispatch_attempts +|= 1;
+        const registration_proven = self.titleInterruptCallbackRegistrationObserved();
+        const route_proven = self.titleInterruptCallbackRouteProven();
+        self.noteGpuInterruptDispatch();
+        if (!route_proven) {
+            if (is_draw_completion) self.gpu_draw_completion_dispatch_failures +|= 1;
+            self.gpu_interrupt_dispatch_failures +|= 1;
+            machoCapturePrint(
+                "macho-processor: XENOS GPU interrupt dispatch refused: callback=0x{x} slot=0x{x:0>8} slot_owner={s} registration_proven={s} callback_route_proven={s} translated_x86_registrations={d} event={s} id=0x{x} value=0x{x}; a synthetic or host callback cannot enter while the shared slot is not occupied by the ordered title route\n",
+                .{
+                    self.gpu_interrupt_callback,
+                    self.gpu_interrupt_slot_address,
+                    if (self.gpu_interrupt_slot_is_guest) "guest:title" else "emulator:host-builtin",
+                    if (registration_proven) "YES" else "NO",
+                    if (route_proven) "YES" else "NO",
+                    self.gpu_interrupt_callback_registrations,
+                    @tagName(event.kind),
+                    event.id,
+                    event.value,
+                },
+            );
+            return;
+        }
         // The authentic binding first. Only when there is none does the
         // dispatch scaffold offer an address it resolved from a weaker source,
         // and only when policy admits that source. The two are never merged:
@@ -8685,6 +13492,166 @@ pub const MachOState = struct {
 
     /// Execute the batch that is still present in ring memory after the
     /// command processor drained it.
+    fn pm4BatchIdentity(
+        self: *const MachOState,
+        bytes: []const u8,
+        start: u32,
+        dwords: u32,
+        ring_dwords: u32,
+        content_fingerprint: u64,
+    ) u64 {
+        var hasher = std.hash.Wyhash.init(0x504d_3441_5544_4954);
+        const generation = @max(self.gpu_ring_publication.advances, 1);
+        hasher.update(std.mem.asBytes(&generation));
+        hasher.update(std.mem.asBytes(&start));
+        hasher.update(std.mem.asBytes(&dwords));
+        hasher.update(std.mem.asBytes(&ring_dwords));
+        // The root can be identical while an INDIRECT_BUFFER target changes.
+        // The independent walker fingerprints every readable root and nested
+        // dword, so those are different batches rather than two accounts that
+        // are accidentally compared as one.
+        hasher.update(std.mem.asBytes(&content_fingerprint));
+        if (ring_dwords != 0) {
+            var index: u32 = 0;
+            while (index < dwords) : (index += 1) {
+                const ring_index = (@as(u64, start) + index) % ring_dwords;
+                const offset = @as(usize, @intCast(ring_index)) * 4;
+                if (offset > bytes.len or bytes.len - offset < 4) break;
+                hasher.update(bytes[offset .. offset + 4]);
+            }
+        }
+        const value = hasher.final();
+        return if (value == 0) 1 else value;
+    }
+
+    fn pm4AuthorityAccount(
+        execution: gpu.xenos_runtime.Report,
+        batch_id: u64,
+        source: gpu.pm4_authority.SourceClass,
+    ) gpu.pm4_authority.Account {
+        const summary = execution.packet_summary;
+        var account = gpu.pm4_authority.Account{
+            .domain = .rosette_gpu,
+            .source = source,
+            .decoder = .stateful_executor,
+            .batch_id = batch_id,
+            .dwords_examined = summary.root_dwords +| summary.nested_dwords,
+            .root_packets = summary.root_packets,
+            .nested_packets = summary.nested_packets,
+            .indirect_references = summary.classCount(.indirect),
+            .register_writes = execution.command_register_writes,
+            .draws = summary.classCount(.draw),
+            .event_writes = summary.classCount(.event),
+            .swaps = summary.classCount(.emulator_extension),
+        };
+        account.defects[@intFromEnum(gpu.pm4_authority.DefectKind.truncated)] =
+            @intFromBool(execution.truncated) +| execution.indirect_truncated;
+        account.defects[@intFromEnum(gpu.pm4_authority.DefectKind.malformed_header)] =
+            (execution.packet_errors -| @as(u64, @intFromBool(execution.truncated))) +|
+            execution.invalid_packets;
+        account.defects[@intFromEnum(gpu.pm4_authority.DefectKind.unknown_opcode)] =
+            summary.classCount(.unknown);
+        account.defects[@intFromEnum(gpu.pm4_authority.DefectKind.indirect_unreadable)] =
+            execution.indirect_unreadable;
+        account.defects[@intFromEnum(gpu.pm4_authority.DefectKind.indirect_depth)] =
+            execution.indirect_depth_limited +| execution.indirect_budget_limited;
+        account.defects[@intFromEnum(gpu.pm4_authority.DefectKind.register_out_of_range)] =
+            execution.command_out_of_range_register_writes;
+        account.defects[@intFromEnum(gpu.pm4_authority.DefectKind.register_unclassified)] =
+            execution.command_unclassified_register_writes;
+        account.defects[@intFromEnum(gpu.pm4_authority.DefectKind.desynchronised)] =
+            execution.indirect_invalid +| execution.indirect_cycles;
+        return account;
+    }
+
+    fn pm4AuthorityWalkAccount(
+        summary: xenia_pm4_walk.Summary,
+        batch_id: u64,
+        source: gpu.pm4_authority.SourceClass,
+    ) gpu.pm4_authority.Account {
+        var account = gpu.pm4_authority.Account{
+            .domain = .rosette_gpu,
+            .source = source,
+            .decoder = .structural_walk,
+            .batch_id = batch_id,
+            .dwords_examined = summary.words_read,
+            .root_packets = summary.root_packets,
+            .nested_packets = summary.nested_packets,
+            .indirect_references = summary.indirect_references,
+            .register_writes = summary.command_register_writes,
+            .draws = summary.draw_packets,
+            .event_writes = summary.packet_class_counts[@intFromEnum(xenia_pm4_walk.PacketClass.event)],
+            .swaps = summary.swap_packets,
+        };
+        account.defects[@intFromEnum(gpu.pm4_authority.DefectKind.truncated)] =
+            @intFromBool(summary.root_truncated) +| summary.truncated_references;
+        account.defects[@intFromEnum(gpu.pm4_authority.DefectKind.unknown_opcode)] =
+            summary.unknown_packets;
+        account.defects[@intFromEnum(gpu.pm4_authority.DefectKind.indirect_unreadable)] =
+            summary.unreadable_references;
+        account.defects[@intFromEnum(gpu.pm4_authority.DefectKind.indirect_depth)] =
+            summary.depth_limited_references +| summary.budget_limited_references +|
+            @intFromBool(summary.packet_budget_exhausted);
+        account.defects[@intFromEnum(gpu.pm4_authority.DefectKind.register_out_of_range)] =
+            summary.command_out_of_range_register_writes;
+        account.defects[@intFromEnum(gpu.pm4_authority.DefectKind.register_unclassified)] =
+            summary.command_unclassified_register_writes;
+        account.defects[@intFromEnum(gpu.pm4_authority.DefectKind.desynchronised)] =
+            summary.invalid_references +| summary.cycle_references;
+        return account;
+    }
+
+    fn recordPm4AuthorityAccount(
+        self: *MachOState,
+        account_value: gpu.pm4_authority.Account,
+    ) void {
+        if (account_value.batch_id == 0) return;
+        if (self.audit_pm4.batch_id != account_value.batch_id) self.audit_pm4.open(account_value.batch_id);
+        // A decoder gets one account per exact batch. A second checkpoint is
+        // another observation, not independent corroboration.
+        for (self.audit_pm4.retained()) |existing| {
+            if (existing.decoder == account_value.decoder) return;
+        }
+        if (!self.audit_pm4.record(account_value)) return;
+        machoCapturePrint(
+            "macho-processor: PM4 AUTHORITY ACCOUNT: decoder={s} source={s} batch=0x{x} dwords={d} packets(root/nested)={d}/{d} indirect={d} register_intents={d} draws={d} events={d} swaps={d} defects={d}; authority requires two independently implemented decoders of this exact root-and-indirect content to agree on every semantic count\n",
+            .{
+                account_value.decoder.label(),
+                account_value.source.label(),
+                account_value.batch_id,
+                account_value.dwords_examined,
+                account_value.root_packets,
+                account_value.nested_packets,
+                account_value.indirect_references,
+                account_value.register_writes,
+                account_value.draws,
+                account_value.event_writes,
+                account_value.swaps,
+                account_value.totalDefects(),
+            },
+        );
+    }
+
+    fn recordPm4AuthorityWalk(
+        self: *MachOState,
+        batch_id: u64,
+        summary: xenia_pm4_walk.Summary,
+        source: gpu.pm4_authority.SourceClass,
+    ) void {
+        self.recordPm4AuthorityAccount(pm4AuthorityWalkAccount(summary, batch_id, source));
+    }
+
+    fn recordPm4AuthorityExecution(
+        self: *MachOState,
+        batch_id: u64,
+        execution: gpu.xenos_runtime.Report,
+        source: gpu.pm4_authority.SourceClass,
+    ) void {
+        self.recordPm4AuthorityAccount(pm4AuthorityAccount(execution, batch_id, source));
+    }
+
+    /// Execute the batch that is still present in ring memory after the
+    /// command processor drained it.
     ///
     /// Join the stateful executor's packet summary into the earliest frontier.
     /// This is called at the moment a batch finishes, rather than waiting for a
@@ -8820,6 +13787,7 @@ pub const MachOState = struct {
         root_dwords: u32,
         ring_dwords: u32,
         authentic: bool,
+        authority_batch_id: u64,
     ) void {
         const at = self.executed_steps;
         const ledger = &self.gpu_vd_swap_contract;
@@ -8832,11 +13800,16 @@ pub const MachOState = struct {
             .draw_completion_signaled,
             .fetch_constant_decoded,
             .xe_swap_candidate_seen,
+            // The executor is the only route that can name a front buffer from
+            // an executed batch rather than from a byte pattern. Leaving the
+            // stage off this list is what let it read `not_attempted` for a
+            // whole run while every stage beside it recorded a drained input.
+            .frontbuffer_validated,
         };
 
         if (root_dwords == 0) {
             for (executor_stages) |stage| {
-                ledger.recordProbe(stage, .stateful_pm4_execution, .input_empty, 0, at);
+                ledger.recordStarvation(stage, .stateful_pm4_execution, .input_empty, .input_drained, 0, at);
             }
             return;
         }
@@ -8873,11 +13846,13 @@ pub const MachOState = struct {
             ring_dwords,
         ) catch |err| {
             self.gpu_xenos_retained_refusals +|= 1;
-            // A refusal is not an empty input: the walk had dwords and the
-            // decoder rejected them.  Recording it as unavailable keeps the
-            // stages honest about which of the two happened.
+            // A refusal is not an empty input, and it is not unreadable
+            // memory either: the walk had dwords, they read back fine, and
+            // the decoder rejected how they were framed. Naming it
+            // `memory-unreadable` sent the reader to the memory view for a
+            // window problem.
             for (executor_stages) |stage| {
-                ledger.recordProbe(stage, .stateful_pm4_execution, .input_unavailable, root_dwords, at);
+                ledger.recordStarvation(stage, .stateful_pm4_execution, .input_unavailable, .decoder_refused_framing, root_dwords, at);
             }
             machoCapturePrint(
                 "macho-processor: XENOS RETAINED BATCH refused: error={s} start={d} dwords={d} ring_dwords={d}; the producer's retained dwords exist and the command processor could not decode them, which is a framing defect rather than an absent batch\n",
@@ -8901,6 +13876,7 @@ pub const MachOState = struct {
         else
             std.hash.Wyhash.hash(0, std.mem.asBytes(&root_dwords));
         if (payload_digest == 0) payload_digest = 1;
+        self.recordPm4AuthorityExecution(authority_batch_id, execution, .replay);
         const credit_run = if (self.event_stream.run_id == 0) @as(u64, 1) else self.event_stream.run_id;
         const credit_stream = if (self.gpu_ring_watch_base != 0) self.gpu_ring_watch_base else @as(u64, root_start) + 1;
         const credit_generation = @max(self.gpu_ring_publication.advances, 1);
@@ -8984,6 +13960,29 @@ pub const MachOState = struct {
             self.gpu_xenos_runtime.color_resolve_observations,
             at,
         );
+        // The executor's own account of the same two stages.
+        //
+        // Both were recorded against the register file alone, read after the
+        // fact, and against `stateful-pm4-execution` only on the paths where
+        // the executor *failed*. So a batch that executed cleanly left its own
+        // probe reading `not-attempted` — the sole source of render-target
+        // state, silent about what it had just done. The register file answers
+        // "is a target configured now"; these answer "did this batch program
+        // one", and the frontier is asking the second question.
+        ledger.observeProbe(
+            .render_target_state_observed,
+            .stateful_pm4_execution,
+            execution.render_target_register_writes != 0,
+            execution.render_target_register_writes,
+            at,
+        );
+        ledger.observeProbe(
+            .render_target_memory_observed,
+            .stateful_pm4_execution,
+            execution.color_resolves != 0,
+            execution.color_resolves,
+            at,
+        );
         ledger.observeProbe(
             .draw_completion_signaled,
             .stateful_pm4_execution,
@@ -8992,7 +13991,25 @@ pub const MachOState = struct {
             at,
         );
         ledger.observeProbe(.fetch_constant_decoded, .xenos_register_file, runtime_fetch != null, execution.dwords, at);
+        ledger.observeProbe(
+            .fetch_constant_decoded,
+            .stateful_pm4_execution,
+            runtime_fetch != null,
+            execution.register_writes,
+            at,
+        );
         ledger.observeProbe(.xe_swap_candidate_seen, .stateful_pm4_execution, execution.swaps != 0, execution.dwords, at);
+        // The executor's own answer about the front buffer: a batch it ran
+        // either named a surface or it did not. `runtime_swap` is that surface,
+        // and a null one after a real execution is a finding about the batch
+        // rather than a hole in the observer.
+        ledger.observeProbe(
+            .frontbuffer_validated,
+            .stateful_pm4_execution,
+            runtime_swap != null,
+            execution.swaps,
+            at,
+        );
 
         ledger.observePacket(.{
             .projection_readable = true,
@@ -9024,7 +14041,7 @@ pub const MachOState = struct {
         }, at, .xenos_runtime);
 
         machoCapturePrint(
-            "macho-processor: XENOS RETAINED BATCH: disposition={s} epoch={d} start={d} dwords={d} packets={d} draws={d} events={d} swaps={d} unknown={d} truncated={s} indirect(buffers/read/requested)={d}/{d}/{d} status={s}; target(state/color/depth/surface)={s}/0x{x:0>8}/0x{x:0>8}/0x{x:0>8} resolves={d} draw_completions(observed/published)={d}/{d} fetch={s} guest_writes_suppressed={d}; retained PM4 reconstructs Rosette-owned state only. The emulator already consumed this batch, so interrupts, waits and guest memory are not replayed\n",
+            "macho-processor: XENOS RETAINED BATCH: disposition={s} epoch={d} start={d} dwords={d} packets={d} draws={d} renderable_draws={d} events={d} swaps={d} unknown={d} truncated={s} indirect(buffers/read/requested)={d}/{d}/{d} status={s}; target(state/color/depth/surface)={s}/0x{x:0>8}/0x{x:0>8}/0x{x:0>8} resolves={d} draw_completions(observed/published)={d}/{d} fetch={s} guest_writes_suppressed={d}; retained PM4 reconstructs Rosette-owned state only. The emulator already consumed this batch, so interrupts, waits and guest memory are not replayed\n",
             .{
                 execution.disposition.label(),
                 self.gpu_ring_publication.advances,
@@ -9032,6 +14049,7 @@ pub const MachOState = struct {
                 root_dwords,
                 executed_packets,
                 execution.draws,
+                execution.renderable_draw_observations,
                 execution.events,
                 execution.swaps,
                 execution.unknown_opcodes,
@@ -9072,13 +14090,60 @@ pub const MachOState = struct {
         // This batch was already consumed by Xenia. Observing its draw packets
         // does not grant Rosette ownership to publish or dispatch a second
         // completion, regardless of which callback domains are registered.
-        ledger.recordProbe(
+        ledger.recordStarvation(
             .draw_completion_dispatched,
             .interrupt_dispatch,
             if (execution.draw_completion_observations != 0) .refused_by_owner else .input_empty,
+            .input_drained,
             execution.draw_completion_observations,
             at,
         );
+    }
+
+    /// Record that every probe fed by the ring survey was starved, and how.
+    ///
+    /// The survey's records all live inside `if (survey.best()) |chosen|` and
+    /// `if (guestMemoryConst(...)) |bytes|`. When either declines, the whole
+    /// block is skipped and nothing is recorded — so on 2026-09-03 the run
+    /// reached step 2.9B with `ring projection readable` at `probes=0/5` while
+    /// the driver beside it had 178 attempts, and the contract reported
+    /// Rosette's silence as a fact about the transport. A probe that skips a
+    /// round has to say it skipped and why; that is the whole difference
+    /// between "nobody was watching" and "I looked and there was nothing".
+    fn recordRingSurveyStarvation(
+        self: *MachOState,
+        outcome: gpu.VdSwapProbeOutcome,
+        cause: gpu.VdSwapStarvationCause,
+    ) void {
+        const at = self.executed_steps;
+        const ledger = &self.gpu_vd_swap_contract;
+        const ring_stages = [_]gpu.VdSwapStage{
+            .ring_projection_readable,
+            .pm4_stream_observed,
+            .pm4_stream_validated,
+            .xe_swap_candidate_seen,
+        };
+        const ring_probes = [_]gpu.VdSwapProbe{
+            .ring_projection_survey,
+            .outstanding_span_scan,
+            .retained_batch_scan,
+            .nested_indirect_walk,
+            .stateful_pm4_execution,
+        };
+        for (ring_stages) |stage| {
+            for (ring_probes) |probe| {
+                ledger.recordStarvation(stage, probe, outcome, cause, 0, at);
+            }
+        }
+        const additional = [_]struct { stage: gpu.VdSwapStage, probe: gpu.VdSwapProbe }{
+            .{ .stage = .xe_swap_packet_readable, .probe = .ring_projection_survey },
+            .{ .stage = .xe_swap_packet_readable, .probe = .outstanding_span_scan },
+            .{ .stage = .xe_swap_packet_decoded, .probe = .ring_projection_survey },
+            .{ .stage = .xe_swap_packet_decoded, .probe = .outstanding_span_scan },
+            .{ .stage = .fetch_constant_decoded, .probe = .outstanding_span_scan },
+            .{ .stage = .frontbuffer_validated, .probe = .retained_batch_scan },
+        };
+        for (additional) |entry| ledger.recordStarvation(entry.stage, entry.probe, outcome, cause, 0, at);
     }
 
     /// Record that every probe fed by the retained batch was starved, and how.
@@ -9087,7 +14152,11 @@ pub const MachOState = struct {
     /// evidence path between them.  When that path cannot run, thirteen
     /// contract stages read zero at once, and without this they would all read
     /// as findings against the command processor.
-    fn recordRetainedBatchStarvation(self: *MachOState, outcome: gpu.VdSwapProbeOutcome) void {
+    fn recordRetainedBatchStarvation(
+        self: *MachOState,
+        outcome: gpu.VdSwapProbeOutcome,
+        cause: gpu.VdSwapStarvationCause,
+    ) void {
         const at = self.executed_steps;
         const ledger = &self.gpu_vd_swap_contract;
         const starved = [_]struct { stage: gpu.VdSwapStage, probe: gpu.VdSwapProbe }{
@@ -9106,7 +14175,7 @@ pub const MachOState = struct {
             .{ .stage = .xe_swap_packet_decoded, .probe = .retained_batch_scan },
             .{ .stage = .frontbuffer_validated, .probe = .retained_batch_scan },
         };
-        for (starved) |entry| ledger.recordProbe(entry.stage, entry.probe, outcome, 0, at);
+        for (starved) |entry| ledger.recordStarvation(entry.stage, entry.probe, outcome, cause, 0, at);
     }
 
     /// Print the dwords the producer actually wrote.
@@ -9121,7 +14190,7 @@ pub const MachOState = struct {
             // retained-batch probe is unavailable rather than empty, and the
             // difference decides whether the gaps below belong to Rosette's
             // memory mapping or to the title.
-            self.recordRetainedBatchStarvation(.input_unavailable);
+            self.recordRetainedBatchStarvation(.input_unavailable, .memory_unreadable);
             return;
         };
         const ring_dwords: u32 = @intCast(@min(self.gpu_ring_watch_size / 4, std.math.maxInt(u32)));
@@ -9142,7 +14211,7 @@ pub const MachOState = struct {
         if (written.run_count == 0) {
             // A readable ring holding no written run at all.  The walk had
             // somewhere to look and nothing to look at.
-            self.recordRetainedBatchStarvation(.input_empty);
+            self.recordRetainedBatchStarvation(.input_empty, .input_drained);
         }
         if (written.run_count != 0) {
             // A drained primary span has equal read/write pointers, but the
@@ -9159,10 +14228,43 @@ pub const MachOState = struct {
                 if (end > root_end) root_end = end;
             }
             if (root_end <= root_start or root_start >= ring_dwords) {
-                self.recordRetainedBatchStarvation(.input_empty);
+                self.recordRetainedBatchStarvation(.input_empty, .input_drained);
             }
             if (root_end > root_start and root_start < ring_dwords) {
-                const root_count = @min(root_end - root_start, ring_dwords - root_start);
+                const content_count = @min(root_end - root_start, ring_dwords - root_start);
+                // Hand the decoder whole packets, not whole *content*.
+                //
+                // The envelope above is built from non-zero runs, and a PM4
+                // payload may legitimately contain a zero dword — so the
+                // envelope can end inside a packet. On 2026-09-01 it ended
+                // fourteen dwords in, the stateful executor read a header
+                // declaring more than it had been given, refused the entire
+                // batch with `TruncatedRing`, and every render-target stage
+                // below it read zero for the remaining five billion steps.
+                // The executor is the only source of those registers, so the
+                // acceptance board's G4 was unjudgeable because of a window.
+                const framed = gpu.ring_payload.framedExtent(
+                    bytes,
+                    ring_dwords,
+                    root_start,
+                    content_count,
+                    gpu.ring_scan.max_search_dwords,
+                );
+                const root_count = framed.dwords;
+                if (framed.widensContentWindow()) {
+                    machoCapturePrint(
+                        "macho-processor: XENOS RETAINED WINDOW widened: start={d} content_dwords={d} framed_dwords={d} packets={d} beyond_content={d} truncated_by_ring={s} ring_dwords={d}; the non-zero envelope ended inside a packet, so the decoder would have been handed a header declaring more dwords than the window held. The window now covers whole packets and the extra dwords are payload the producer wrote, not ring the walk invented\n",
+                        .{
+                            root_start,
+                            content_count,
+                            framed.dwords,
+                            framed.packets,
+                            framed.packets_beyond_content,
+                            if (framed.truncated_by_ring) "YES" else "NO",
+                            ring_dwords,
+                        },
+                    );
+                }
                 const consumed = self.xenia_gpu_handoff.pm4_packets != 0 or
                     self.execution_tracepoints.roleEntered(.command_processor);
                 const authentic = self.gpu_ring_injection.injections == 0 and
@@ -9179,6 +14281,20 @@ pub const MachOState = struct {
                     self,
                     xenosMemoryRead,
                 );
+                const authority_batch_id = self.pm4BatchIdentity(
+                    bytes,
+                    root_start,
+                    root_count,
+                    ring_dwords,
+                    indirect.content_fingerprint,
+                );
+                const authority_source: gpu.pm4_authority.SourceClass = if (authentic)
+                    .guest_authentic
+                else if (self.gpu_ring_injection.injections != 0)
+                    .synthetic
+                else
+                    .host_forwarded;
+                self.recordPm4AuthorityWalk(authority_batch_id, indirect, authority_source);
                 indirect_packets = @as(u64, indirect.root_packets) + @as(u64, indirect.nested_packets);
                 indirect_draws = indirect.draw_packets;
                 indirect_swaps = indirect.swap_packets;
@@ -9227,7 +14343,14 @@ pub const MachOState = struct {
                 // are readings rather than blanks.  Without this the executor
                 // only ever runs on an outstanding span, which a drained ring
                 // never has.
-                self.executeRetainedBatch(bytes, root_start, root_count, ring_dwords, authentic);
+                self.executeRetainedBatch(
+                    bytes,
+                    root_start,
+                    root_count,
+                    ring_dwords,
+                    authentic,
+                    authority_batch_id,
+                );
                 if (indirect_draws != 0) {
                     self.gpu_ring_draws_seen = true;
                     const draw_count: u32 = @intCast(@min(indirect_draws, @as(u64, std.math.maxInt(u32))));
@@ -9702,10 +14825,16 @@ pub const MachOState = struct {
         // is exactly the degraded state this model exists to name.
         const problems = self.wait_audit.problemCount(self.executed_steps);
         if (self.wait_audit.count != 0) {
+            const wait_note: []const u8 = if (problems == 0)
+                "no observed wait pattern crossed the audit threshold for a problem; signal-only and incomplete observations remain explicitly non-diagnostic"
+            else if (self.wait_audit.worst(self.executed_steps)) |subject|
+                self.wait_audit.classify(subject, self.executed_steps).meaning()
+            else
+                "wait audit recorded a problem, but no stable subject was available for a more specific explanation";
             ledger.record(
                 C.wait_signal_handshake,
                 if (problems == 0) .satisfied else .degraded,
-                if (problems == 0) "every observed pattern advanced the run alongside it" else "at least one object is waited on and never signalled",
+                wait_note,
             );
         }
 
@@ -9728,26 +14857,62 @@ pub const MachOState = struct {
             ledger.record(
                 C.kernel_export_binding,
                 if (self.gpu_import_binding.worst().healthy()) .satisfied else .unsatisfied,
-                "probed imports are committed, translatable and begin with the export stub",
+                if (self.gpu_import_binding.worst().healthy())
+                    "Xenia thunk-readiness/import probes show committed, translatable slots beginning with the export stub"
+                else
+                    "an import/thunk probe found a slot or export thunk that is not safely bound",
+            );
+        } else {
+            ledger.record(
+                C.kernel_export_binding,
+                .untested,
+                "Rosette has no import/thunk-readiness evidence for the graphics kernel exports yet",
             );
         }
 
         if (self.gpu_bootstrap.seen(.initialize_engines)) {
             ledger.record(C.gpu_engine_init, .satisfied, "VdInitializeEngines ran");
+        } else {
+            ledger.record(C.gpu_engine_init, .untested, "Xenia has not entered VdInitializeEngines");
         }
         if (self.gpu_ring_watch_base != 0) {
             ledger.record(C.gpu_ring_buffer, .satisfied, "ring geometry established and readable");
+        } else {
+            ledger.record(
+                C.gpu_ring_buffer,
+                .untested,
+                "the host observer is ready, but Xenia has not published guest ring geometry",
+            );
         }
         if (self.gpu_bootstrap.seen(.graphics_interrupt_dispatch)) {
             ledger.record(C.gpu_interrupt_callback, .satisfied, "callback registered and dispatched");
+        } else {
+            ledger.record(C.gpu_interrupt_callback, .untested, "no guest GPU interrupt dispatch has been observed");
         }
         if (self.execution_tracepoints.roleEntered(.command_processor)) {
             ledger.record(C.gpu_command_flow, .satisfied, "the command processor drained a batch");
+        } else {
+            ledger.record(C.gpu_command_flow, .untested, "no guest PM4 command-processor entry has been observed");
         }
+
+        // General bring-up and raw/no-output draws do not establish that a
+        // swap was due. The 2026-09-01 run consumed 24 intentional no-effect
+        // startup draws and was consequently labelled UNSATISFIED forever,
+        // even though no target, resolve, front buffer or XE_SWAP existed.
+        // Judge the title only after an output-bearing opportunity exists.
+        const guest_output_evidence = self.guestOutputEvidence();
+        const guest_output_opportunity = host_contract_coverage.guestOutputOpportunity(guest_output_evidence);
+        const swap_entered = self.execution_tracepoints.roleEntered(.swap);
+        const swap_status = host_contract_coverage.guestSwapStatus(guest_output_evidence, swap_entered);
         ledger.record(
             C.guest_swap_request,
-            if (self.execution_tracepoints.roleEntered(.swap)) .satisfied else .unsatisfied,
-            "VdSwap has never been entered",
+            swap_status,
+            if (swap_entered)
+                "VdSwap entered through the guest GPU path"
+            else if (guest_output_opportunity)
+                "target-backed output or explicit swap evidence exists, but VdSwap was never entered"
+            else
+                "GPU activity so far has no output-bearing target, resolve or guest swap evidence; VdSwap remains untested",
         );
 
         // Score the guest Vulkan path from driver-bound work, not from the
@@ -9777,34 +14942,47 @@ pub const MachOState = struct {
             else
                 "no guest Vulkan command recording has been observed",
         );
+        // A native present is not, by itself, guest-output evidence. Rosette
+        // emits diagnostic frames while the guest Vulkan path is being
+        // brought up; treating those presents as a guest opportunity turns a
+        // truthful "not reached" contract into a false failure. Keep the
+        // strict source gate tied to guest render/swap evidence only.
         ledger.record(
             C.frame_source,
-            if (self.dynamic_forwarder.guestFrontBufferAvailable()) .satisfied else .unsatisfied,
-            "no guest-produced image has ever held a picture",
+            if (self.dynamic_forwarder.guestFrontBufferAvailable())
+                .satisfied
+            else if (guest_output_opportunity)
+                .unsatisfied
+            else
+                .untested,
+            if (self.dynamic_forwarder.guestFrontBufferAvailable())
+                "a guest-produced image is available to the presenter"
+            else if (guest_output_opportunity)
+                "guest output work was requested, but no guest-produced image has held a picture"
+            else
+                "no guest output opportunity has been observed yet",
         );
         if (self.native_window.layer_attachments != 0) {
             ledger.record(C.window_surface, .satisfied, "Cocoa layer attached and the presenter is bound");
         }
-        const frames = self.dynamic_forwarder.nativePresenterFramesPresented();
-        const real_presents = self.dynamic_forwarder.guestVulkanPresents();
+        const guest_source_available = self.dynamic_forwarder.guestFrontBufferAvailable() or self.gpu_frontbuffer != null;
+        const authentic_guest_frames = self.guestOutputFramesPresented();
+        const presentation_status = host_contract_coverage.guestPresentationStatus(
+            guest_output_evidence,
+            guest_source_available,
+            authentic_guest_frames,
+        );
         ledger.record(
             C.frame_presentation,
-            if (self.dynamic_forwarder.guestFrontBufferAvailable())
-                .satisfied
-            else if (real_presents != 0)
-                .degraded
-            else if (frames == 0)
-                .unsatisfied
+            presentation_status,
+            if (authentic_guest_frames != 0)
+                "a guest-authentic frame completed the presenter-to-window handoff"
+            else if (guest_source_available)
+                "a guest frame source exists, but no guest-authentic frame completed the window handoff"
+            else if (guest_output_opportunity)
+                "guest output became due, but no guest-authentic frame reached the window"
             else
-                .degraded,
-            if (self.dynamic_forwarder.guestFrontBufferAvailable())
-                "console front-buffer pixels were converted and handed to the presenter"
-            else if (real_presents != 0)
-                "guest vkQueuePresentKHR reached the native driver; visible pixels remain runtime-unvalidated"
-            else if (frames == 0)
-                "no frame has reached a presenter"
-            else
-                "only Rosette diagnostic frames have reached the window",
+                "no guest output opportunity exists yet; native and diagnostic presents prove only the separately scored host window surface",
         );
 
         if (self.guest_exceptions.total_throws != 0) {
@@ -9905,7 +15083,7 @@ pub const MachOState = struct {
         const ledger = &self.wait_audit;
         const problems = ledger.problemCount(self.executed_steps);
         machoCapturePrint(
-            "macho-processor: WAIT AUDIT: subjects={d} problems={d} suppressed={d} dropped={d} step={d}; {s}\n",
+            "macho-processor: WAIT AUDIT: subjects={d} problems={d} no_finding={d} dropped={d} step={d}; {s}\n",
             .{
                 ledger.count,
                 problems,
@@ -9915,13 +15093,38 @@ pub const MachOState = struct {
                 ledger.verdict(self.executed_steps),
             },
         );
+        // `no_finding` used to be printed as `suppressed`, which reads as
+        // "eight problems were hidden" when it means "eight subjects were
+        // judged and none of them was a problem *by this audit's rules*". The
+        // difference matters because this audit's rules deliberately exclude
+        // finite polls, and the run where that wording appeared had
+        // `problems=0 suppressed=8` printed a few lines above
+        // `DEADLOCK PREDICTOR: deadlocked=YES`. Both were right about their own
+        // question, and read together they said nothing was wrong.
+        if (problems == 0 and ledger.count != 0) {
+            machoCapturePrint(
+                "  WAIT AUDIT SCOPE: this audit judges repeating waits against its own rules and excludes finite manual-reset polls by design. A subject with no finding here can still be the blocker in the wait graph, the signal-expectation pairing or the deadlock predictor — `problems=0` is this audit's answer, not the run's\n",
+                .{},
+            );
+        }
+        var bounded_timeout_subjects: u64 = 0;
+        var bounded_timeout_attempts: u64 = 0;
+        for (ledger.subjects[0..ledger.count]) |subject| {
+            if (subject.timeout_class != .bounded_poll) continue;
+            bounded_timeout_subjects +|= 1;
+            bounded_timeout_attempts +|= subject.timeouts;
+        }
+        if (bounded_timeout_subjects != 0) machoCapturePrint(
+            "  WAIT TIMEOUT CONTRACT: bounded_poll_subjects={d} attempts={d} guest_synthetic_wake=REFUSED; finite manual-reset timeout returns are authoritative guest results, not proof of an indefinitely parked waiter\n",
+            .{ bounded_timeout_subjects, bounded_timeout_attempts },
+        );
         // One line per subject, whatever its classification: a reader needs to
         // know a pump exists and was judged healthy, or the suppression looks
         // like the subsystem missing it.
         for (ledger.subjects[0..ledger.count]) |subject| {
             const classification = ledger.classify(subject, self.executed_steps);
             machoCapturePrint(
-                "  subject object=0x{x:0>8} handle=0x{x:0>8} type={d} {s: <21} waits={d} timeouts={d} signals={d} threads={d} period_steps={d}\n",
+                "  subject object=0x{x:0>8} handle=0x{x:0>8} type={d} {s: <21} waits={d} timeouts={d} signals={d} timeout_class={s} timeout_ms={d} timeout_requested_known={s} timeout_requested={s} threads={d} period_steps={d}\n",
                 .{
                     subject.object,
                     subject.handle,
@@ -9930,10 +15133,20 @@ pub const MachOState = struct {
                     subject.waits,
                     subject.timeouts,
                     subject.signals,
+                    subject.timeout_class.label(),
+                    subject.timeout_ms,
+                    if (subject.timeout_requested_known) "YES" else "NO",
+                    if (subject.timeout_requested) "YES" else "NO",
                     subject.participant_count,
                     subject.periodSteps(),
                 },
             );
+            if (subject.timeout_class == .bounded_poll and subject.timeouts != 0) {
+                machoCapturePrint(
+                    "    timeout contract: class=bounded_poll action=await_deadline severity=caution may_resume=YES may_synthesize_wake=NO attempts={d} signals={d} first_step={d} last_step={d}; inspect the producer/frontier, but do not convert a finite poll expiry into a guest signal\n",
+                    .{ subject.timeouts, subject.signals, subject.first_step, subject.last_step },
+                );
+            }
             if (!classification.worthAuditing()) continue;
 
             // The full audit, for problems only.
@@ -9961,9 +15174,22 @@ pub const MachOState = struct {
         // The identity table decides whether any of this is about one object or
         // two, so it is reported alongside rather than buried.
         const identity = &self.sync_object_identity;
-        if (identity.count != 0 or identity.rewrites != 0) machoCapturePrint(
-            "macho-processor: SYNC OBJECT IDENTITY: pairs={d} rewrites={d} conflicts={d} dropped={d} rejected(truncated/spliced)={d}/{d} mapping_base=0x{x}; {s}\n",
-            .{ identity.count, identity.rewrites, identity.conflicts, identity.dropped, identity.truncated_reads, identity.spliced_pairs, identity.mapping_base, identity.verdict() },
+        if (identity.count != 0 or identity.rewrites != 0 or identity.handle_count != 0 or
+            identity.handle_conflicts != 0 or identity.handle_rejections != 0) machoCapturePrint(
+            "macho-processor: SYNC OBJECT IDENTITY: pairs={d} handles={d} rewrites={d} conflicts={d} handle_conflicts={d} dropped={d} rejected(truncated/spliced/handle)={d}/{d}/{d} mapping_base=0x{x}; {s}\n",
+            .{
+                identity.count,
+                identity.handle_count,
+                identity.rewrites,
+                identity.conflicts,
+                identity.handle_conflicts,
+                identity.dropped,
+                identity.truncated_reads,
+                identity.spliced_pairs,
+                identity.handle_rejections,
+                identity.mapping_base,
+                identity.verdict(),
+            },
         );
         self.refreshDeadlockPredictor();
         const ledger = &self.deadlock_predictor;
@@ -10200,6 +15426,12 @@ pub const MachOState = struct {
             self.gpu_register_aperture.total_writes,
         );
         ledger.record(.ring_memory_contents, self.gpu_ring_watch_base != 0, self.gpu_ring_nonzero_dwords);
+        const transport_summary = self.audit_ring_transport.summary();
+        ledger.record(
+            .transport_completion,
+            self.audit_configured,
+            if (self.audit_ring_transport.meetsPublicationGate()) transport_summary.effective else 0,
+        );
 
         const finding = ledger.finding();
         machoCapturePrint(
@@ -10235,6 +15467,7 @@ pub const MachOState = struct {
             gpu.submission_provenance.Source.emulator_counter,
             gpu.submission_provenance.Source.guest_register_store,
             gpu.submission_provenance.Source.ring_memory_contents,
+            gpu.submission_provenance.Source.transport_completion,
         }) |source| {
             const observation = ledger.get(source);
             machoCapturePrint(
@@ -10611,6 +15844,2313 @@ pub const MachOState = struct {
         }
     }
 
+    /// Copy every crossing the instruction pointer recorded into the boundary
+    /// gate, and derive the evidence, completion-route and producer readings
+    /// that follow from it.
+    ///
+    /// Synchronisation rather than incremental notification on purpose. The
+    /// tracepoint set is the authority and it is already counting; a second
+    /// counter that could drift from it would be one more observer to
+    /// reconcile, and reconciling observers is the problem this whole group of
+    /// modules exists to stop.
+    fn syncGraphicsBoundaryGate(self: *MachOState) void {
+        const bringup = gpu.bringup_gate;
+        const tracepoints = &self.execution_tracepoints;
+        const at_step = self.executed_steps;
+        for (bringup.contractBoundaries()) |boundary| {
+            const index: u8 = @intFromEnum(boundary);
+            const hits = tracepoints.boundaryHits(index);
+            if (hits == 0) continue;
+            const first = tracepoints.boundaryFirst(index) orelse continue;
+            self.gpu_bringup_gate.observe(
+                boundary,
+                hits,
+                first.first_step,
+                tracepoints.boundaryLastStep(index),
+                first.first_thread,
+                first.first_caller,
+            );
+        }
+        self.syncBootstrapProvenanceTracepoints();
+        self.syncMonotoneWitnesses(at_step);
+        // Completion-route sampling supplies the guest-visible write-back
+        // edge consumed by the transport audit below. Sample first so one
+        // checkpoint describes one coherent transport state.
+        self.syncCompletionRoutes(at_step);
+        self.syncAuditContracts(at_step);
+        self.syncGraphicsEvidence();
+        self.syncProducerAttribution();
+        self.syncPresentationProvenance();
+    }
+
+    /// State Rosette's own counts of facts the emulator also counts.
+    ///
+    /// Only witnesses of *literally the same occurrences* are paired here, and
+    /// the restraint is the whole point. Xenia's packet census counts type-0
+    /// and type-3 packets while the tracepoint counts type-3 entries; the
+    /// register journal replays a retained ring while `WriteRegister` counts
+    /// live executions. Pairing either of those would manufacture a permanent
+    /// Populate the audit contracts from the ledgers this run already keeps.
+    ///
+    /// One-way, like every other synchronisation in this file: a contract
+    /// takes what an existing ledger observed and applies its own rules to it.
+    /// Nothing here writes back, and nothing invents an observation that was
+    /// not made — a contract with no input reports `unobserved`, which is the
+    /// answer the audit asks for and is not the same as a zero.
+    fn syncAuditContracts(self: *MachOState, at_step: u64) void {
+        const bringup = gpu.bringup_gate;
+        const gate = &self.gpu_bringup_gate;
+
+        self.configureAuditContracts(at_step);
+
+        // ---- producer epochs ------------------------------------------------
+        // Each epoch is credited only from the boundary that proves it, and a
+        // guest-owned epoch only from a guest-authentic source. The ledger
+        // refuses the rest and counts the refusal.
+        const Epoch = gpu.producer_liveness.Epoch;
+        const EpochPair = struct { epoch: Epoch, boundary: bringup.Boundary, guest: bool };
+        const epochs = [_]EpochPair{
+            .{ .epoch = .video_initialized, .boundary = .initialize_engines, .guest = true },
+            .{ .epoch = .callback_registered, .boundary = .set_interrupt_callback, .guest = true },
+            .{ .epoch = .ring_initialized, .boundary = .initialize_ring_buffer, .guest = true },
+            .{ .epoch = .payload_published, .boundary = .write_pointer_updated, .guest = true },
+            .{ .epoch = .payload_consumed, .boundary = .execute_packet_type3, .guest = false },
+            .{ .epoch = .draw_activity, .boundary = .issue_draw, .guest = false },
+            .{ .epoch = .swap_requested, .boundary = .guest_swap_requested, .guest = true },
+            .{ .epoch = .frame_consumed, .boundary = .refresh_guest_output, .guest = false },
+        };
+        for (epochs) |pair| {
+            if (self.audit_producer.has(pair.epoch)) continue;
+            const record = gate.recordFor(pair.boundary);
+            if (!record.crossed()) continue;
+            _ = self.audit_producer.observe(.{
+                .epoch = pair.epoch,
+                .guest_step = record.first_step,
+                .guest_thread = record.first_thread,
+                .source = if (pair.guest) .guest_authentic else .host_forwarded,
+                .wait_object = self.audit_producer.currentWaitObject(),
+            });
+        }
+        // The object the producer is waiting on, taken from the bounded-poll
+        // subject the wait audit selected. Attribution, not inference: the
+        // ledger reports `quiet_without_a_reason` when nothing supplies one.
+        for (self.wait_audit.subjects[0..self.wait_audit.count]) |subject| {
+            if (subject.timeout_class != .bounded_poll) continue;
+            if (subject.signals != 0 or subject.timeouts == 0) continue;
+            if (self.audit_producer.transition_count == 0) break;
+            const newest = &self.audit_producer.transitions[self.audit_producer.transition_count - 1];
+            var same_thread = false;
+            for (subject.participants[0..subject.participant_count]) |thread| {
+                if (thread == newest.guest_thread and thread != 0) {
+                    same_thread = true;
+                    break;
+                }
+            }
+            if (!same_thread) continue;
+            if (newest.wait_object == 0) newest.wait_object = subject.object;
+            break;
+        }
+        // Offer the pause ledger the axes a stopped guest cannot move.
+        //
+        // A pause report is a claim, and until this existed the only way out
+        // of `unreconciled` was finding a transaction that had never been
+        // written — so one unmatched line early in a run disqualified every
+        // wait finding for the rest of it. These readings let the run answer
+        // the claim with what the guest actually did after it.
+        self.audit_pause.observeGuestProgress(
+            .guest_code_translated,
+            self.ready.translationProgressGeneration(),
+            at_step,
+        );
+        self.audit_pause.observeGuestProgress(
+            .guest_wait_released,
+            self.guest_wait_liveness.total_blocked_signalled,
+            at_step,
+        );
+        self.audit_pause.observeGuestProgress(
+            .guest_export_entered,
+            self.gpu_bringup_gate.crossedCount(),
+            at_step,
+        );
+        self.audit_pause.observeGuestProgress(
+            .guest_symbol_reached,
+            self.ready.external_progress_advances,
+            at_step,
+        );
+        if (self.audit_pause.standing() == .open_with_cause) {
+            self.audit_producer.notePause(at_step);
+        } else {
+            self.audit_producer.noteResume();
+        }
+
+        // ---- ring transport --------------------------------------------------
+        const publication = &self.gpu_ring_publication;
+        if (publication.geometry) |geometry| {
+            _ = self.audit_ring_transport.declare(.{
+                .base = .{ .guest_physical = geometry.base },
+                .size_bytes = geometry.size_bytes,
+            });
+        }
+        const writeback_route = self.gpu_completion_routes.status(.read_pointer_write_back);
+        if (writeback_route.value_changed and writeback_route.deliveries != 0) {
+            _ = publication.observeGuestWriteback(
+                writeback_route.last_value,
+                writeback_route.last_delivery_step,
+            );
+        }
+        const advances = publication.retainedAdvances();
+        var advance_index: usize = @intCast(@min(self.audit_ring_transport.total, advances.len));
+        while (advance_index < advances.len) : (advance_index += 1) {
+            const record = advances[advance_index];
+            const transition = self.audit_ring_transport.begin(.guest_mmio, record.value);
+            transition.read_index_before = record.previous_value;
+            transition.normalised_index = record.value;
+            transition.applied_index = record.value;
+            transition.note(.source_write, record.step);
+            transition.note(.validated, record.step);
+            transition.note(.normalised, record.step);
+            transition.note(.range_checked, record.step);
+            if (record.applied) transition.note(.applied, record.applied_step);
+            if (record.worker_woken) transition.note(.worker_woken, record.worker_woken_step);
+            if (record.consumed) {
+                transition.read_index_before = record.read_before;
+                transition.read_index_after = record.read_after;
+                transition.note(.read_pointer_moved, record.consumed_step);
+                self.audit_ring_transport.noteConsumed(record.consumed_dwords);
+            }
+            if (record.guest_writeback) transition.note(.guest_writeback, record.guest_writeback_step);
+        }
+
+        // ---- render target and draw classification ---------------------------
+        const draws = gate.recordFor(.issue_draw);
+        const target = gate.recordFor(.render_target_update);
+        while (self.audit_render_target.total < draws.hits) {
+            const candidate = self.audit_render_target.begin(draws.first_step, .guest_authentic) orelse break;
+            if (target.crossed()) {
+                candidate.note(.state_programmed);
+                candidate.note(.target_memory_bound);
+                candidate.classification = .target_backed;
+            } else if (self.gpu_draw_exits_named != 0 and self.gpu_draw_defect_exits == 0) {
+                // The emulator named every exit it saw and classified none of
+                // them as its own failure. Those draws legitimately produce
+                // nothing, and that is the title's program rather than a
+                // rendering failure.
+                candidate.classification = .intentional_no_output;
+            } else if (self.gpu_draw_defect_exits != 0) {
+                candidate.classification = .emulator_dropped;
+            }
+        }
+
+        // ---- Xenos register state -------------------------------------------
+        const journal = &self.gpu_xenos_runtime.executor.register_file.journal;
+        const register_totals = journal.summary();
+        if (self.audit_registers.writes < register_totals.writes) {
+            var pending = register_totals.writes - self.audit_registers.writes;
+            while (pending > 0) : (pending -= 1) {
+                self.audit_registers.write(0x2080, 1, .raster_setup, .pm4_stream, true, at_step);
+            }
+        }
+        // The three registers that decide whether a draw has anywhere to go.
+        // Mirrored individually rather than as a block count, because "the
+        // render backend was touched" and "a colour target was named" are
+        // different claims and the second is the one a frame depends on.
+        for (gpu.register_journal.target_registers) |register| {
+            const record = journal.target(register) orelse continue;
+            if (record.writes == 0) continue;
+            if (self.audit_registers.recordFor(register)) |seen| {
+                if (seen.writes >= record.writes) continue;
+            }
+            self.audit_registers.write(
+                register,
+                record.last_value,
+                .render_backend,
+                .pm4_stream,
+                true,
+                at_step,
+            );
+        }
+
+        // Interrupt delivery records are captured at executor log receipt.
+        // Checkpoint totals cannot reconstruct missing per-delivery history.
+
+        // ---- frame custody ----------------------------------------------------
+        self.audit_frames.syncHandoffs(&self.cocoa_graphics.frames);
+
+        // ---- synchronization identity -----------------------------------------
+        for (self.wait_audit.subjects[0..self.wait_audit.count]) |subject| {
+            const entry = self.audit_sync.intern(.{
+                .address = .{ .guest_virtual = @truncate(subject.object) },
+                .handle = subject.handle,
+                .generation = 1,
+                .kind = @intFromEnum(if (subject.timeout_class == .bounded_poll)
+                    sync_object_registry.ObjectKind.manual_reset_event
+                else
+                    sync_object_registry.ObjectKind.unknown),
+            }) orelse continue;
+            entry.activity = .{
+                .waits = subject.waits,
+                .timeouts = subject.timeouts,
+                .signals = subject.signals,
+                .first_step = subject.first_step,
+                .last_step = subject.last_step,
+                .shape = if (subject.timeout_class == .bounded_poll) .bounded_poll else .unknown,
+                .timeout_ms = subject.timeout_ms,
+            };
+        }
+
+        // ---- translation and throughput budget ---------------------------------
+        const economics = self.translation_economics.summary();
+        if (self.audit_budget.required_guest_ms_per_host_second == 0) {
+            self.audit_budget.declare(5, 2400);
+        }
+        self.audit_budget.observeTotals(
+            self.elapsedHostSeconds() *| std.time.ns_per_s,
+            self.run_horizon.latest.emulated_ms,
+        );
+        // Do not start the throughput clock on Rosette's instruction counter.
+        // The latest run spent its first measured window in Xenia's own
+        // CommitExecutableRange/import path, before the title's guest main
+        // thread had retired an instruction. The pipeline boundary is the
+        // authoritative handoff from host startup to guest execution.
+        if (!self.audit_budget_guest_window.started and
+            self.xenia_pipeline.hasReached(.guest_main_ready))
+        {
+            self.audit_budget_guest_window.begin(self.audit_budget.summary());
+        }
+        const mutable = self.audit_budget.pool(.mutable_generated);
+        mutable.hits = self.decode_cache_hits;
+        mutable.fills = economics.vacant_fills +| economics.conflict_fills +| economics.cold_evictions;
+        mutable.conflict_evictions = economics.conflict_fills;
+        mutable.stale_refills = economics.stale_refills;
+
+        // ---- imports ------------------------------------------------------------
+        // Every probed ordinal is on the graphics chain and has a guest side
+        // effect: these are the video exports, and each writes a flag, returns
+        // a handle or installs a callback. That makes an ABI probe a
+        // prerequisite for resting a graphics conclusion on any of them.
+        for (self.gpu_import_binding.entries[0..self.gpu_import_binding.count]) |entry| {
+            const bound = entry.binding == .bound;
+            _ = self.audit_imports.record(.{
+                .module_id = 1,
+                .ordinal = entry.ordinal,
+                .target = entry.thunk_address,
+                .thunk = entry.thunk_address,
+                .binding = if (bound) .bound else .unresolved,
+                // Binding probes inspect addresses and thunk bytes only.
+                .abi = .unchecked,
+                .on_graphics_chain = true,
+                .has_guest_side_effect = true,
+            });
+        }
+
+        self.syncAcceptanceGates(at_step);
+    }
+
+    /// Judge the acceptance gates from the contracts above, in order.
+    ///
+    /// A gate whose predecessor has not passed is recorded as `not_reached`
+    /// by the board itself, so the run's frontier is always the first thing
+    /// that is genuinely missing rather than the loudest downstream zero.
+    fn syncAcceptanceGates(self: *MachOState, at_step: u64) void {
+        const board = &self.audit_gates;
+        const gate = &self.gpu_bringup_gate;
+
+        const storage = self.audit_storage.summary();
+        const journal_completeness = self.audit_journal.completeness();
+        const journal_intact = self.audit_journal.criticalChannelIntact();
+        const durable_ready = self.audit_durable_journal.started and
+            !self.audit_durable_open_failed;
+        const manifest_reason: acceptance_gates.Reason = if (!self.audit_manifest.sealed)
+            .manifest_unsealed
+        else if (!self.audit_manifest.sealIntact())
+            .manifest_tampered
+        else if (!durable_ready)
+            .durable_journal_unavailable
+        else if (journal_completeness == .empty)
+            .journal_empty
+        else if (!storage.baselineClean())
+            .storage_short_read_on_chain
+        else if (!journal_intact)
+            .journal_channel_lost
+        else
+            .satisfied;
+        _ = board.judge(
+            .reproducible_manifest,
+            if (!self.audit_manifest.sealed or journal_completeness == .empty)
+                .unevaluable
+            else if (self.audit_manifest.sealIntact() and durable_ready and
+                storage.baselineClean() and journal_intact)
+                .passed
+            else
+                .failed,
+            manifest_reason,
+            storage.short_reads_on_chain,
+            at_step,
+        );
+
+        self.syncComponentReadiness();
+        const substrate = self.component_readiness.substrateSummary();
+        const budget_totals = self.runBudgetGuestWindowSummary();
+        const budget = self.runBudgetGuestWindowVerdict(budget_totals);
+        // A substrate component that nothing has exercised is not a broken
+        // one. Most of the substrate can only be proven by the guest's own
+        // first use, so before the title reaches it the honest verdict is that
+        // the gate cannot yet be judged — and the owner of the remaining work
+        // is the title, not the harness. Judging it `FAILED
+        // owner=rosette:harness` put the frontier on Rosette for the first
+        // 3.3 billion steps of the 2026-09-01 run, with nothing wrong.
+        // An unprovable component is not an unproven one. The first is waiting
+        // for the guest and the second cannot be answered here at all, and
+        // only the first justifies withholding the verdict.
+        const substrate_broken = substrate.failed != 0 or substrate.unprovable != 0;
+        const substrate_reason: acceptance_gates.Reason = if (substrate_broken)
+            .substrate_component_broken
+        else if (budget == .observer_over_budget)
+            .observers_over_budget
+        else if (substrate.awaitingFirstUse())
+            .substrate_awaiting_first_use
+        else
+            .satisfied;
+        _ = board.judge(
+            .substrate,
+            if (substrate.total == 0)
+                .unevaluable
+            else if (substrate_broken or budget == .observer_over_budget)
+                .failed
+            else if (substrate.ready())
+                .passed
+            else
+                .unevaluable,
+            substrate_reason,
+            @as(u64, substrate.failed) +| substrate.unproven,
+            at_step,
+        );
+
+        const ring_crossed = gate.recordFor(.initialize_ring_buffer).crossed();
+        const ring_published = self.audit_ring_transport.meetsPublicationGate();
+        _ = board.judge(
+            .gpu_bootstrap,
+            if (ring_crossed and ring_published) .passed else .failed,
+            if (!ring_crossed)
+                .ring_never_initialized
+            else if (ring_published)
+                .satisfied
+            else
+                .ring_publication_incomplete,
+            self.audit_ring_transport.summary().effective,
+            at_step,
+        );
+
+        const pm4 = self.audit_pm4.verdict();
+        _ = board.judge(
+            .authoritative_pm4,
+            switch (pm4) {
+                .corroborated => if (self.audit_pm4.provesLiveExecution()) .passed else .unevaluable,
+                .unobserved, .single_account, .uncomparable_accounts => .unevaluable,
+                .decoder_disagreement, .semantic_defect => .failed,
+            },
+            switch (pm4) {
+                .corroborated => if (self.audit_pm4.provesLiveExecution()) .satisfied else .pm4_live_execution_unobserved,
+                .unobserved => .pm4_unobserved,
+                .single_account => .pm4_single_account,
+                .uncomparable_accounts => .pm4_accounts_uncomparable,
+                .decoder_disagreement => .pm4_decoders_disagree,
+                .semantic_defect => .pm4_semantic_defect,
+            },
+            @intFromEnum(pm4),
+            at_step,
+        );
+
+        const target = self.audit_render_target.summary();
+        _ = board.judge(
+            .target_activity,
+            if (!target.outputGateJudgeable())
+                .unevaluable
+            else if (target.first_pixel_candidates != 0)
+                .passed
+            else
+                .failed,
+            if (!target.outputGateJudgeable())
+                .target_output_unjudgeable
+            else if (target.first_pixel_candidates != 0)
+                .satisfied
+            else
+                .target_no_output_bearing_draw,
+            target.outputBearing(),
+            at_step,
+        );
+
+        const producer = self.audit_producer.verdict(
+            at_step,
+            self.wait_audit.witness.advancedSince(self.never_notified_witness),
+            false,
+        );
+        _ = board.judge(
+            .guest_progress,
+            switch (producer) {
+                .advancing, .quiet_with_progress => .passed,
+                .unobserved => .unevaluable,
+                .waiting_on_missing_notifier, .quiet_without_a_reason, .suspended_by_pause => .failed,
+            },
+            switch (producer) {
+                .advancing, .quiet_with_progress => .satisfied,
+                .unobserved => .producer_unobserved,
+                .waiting_on_missing_notifier => .producer_waiting_on_missing_notifier,
+                .quiet_without_a_reason => .producer_quiet_without_a_reason,
+                .suspended_by_pause => .producer_suspended_by_pause,
+            },
+            @intFromEnum(producer),
+            at_step,
+        );
+
+        const swap_requested = gate.recordFor(.guest_swap_requested).crossed();
+        _ = board.judge(
+            .authentic_swap,
+            if (swap_requested) .passed else .failed,
+            if (swap_requested) .satisfied else .swap_never_requested,
+            gate.recordFor(.guest_swap_requested).hits,
+            at_step,
+        );
+
+        const custody = self.audit_frames.verdict();
+        _ = board.judge(
+            .frame_custody,
+            switch (custody) {
+                .authentic_presented => .passed,
+                .no_candidate => .unevaluable,
+                .diagnostic_only, .authentic_blocked, .authentic_lost => .failed,
+            },
+            switch (custody) {
+                .authentic_presented => .satisfied,
+                .no_candidate => .custody_no_candidate,
+                .diagnostic_only => .custody_diagnostic_only,
+                .authentic_blocked => .custody_blocked,
+                .authentic_lost => .custody_lost,
+            },
+            self.audit_frames.tally.authenticFrames(),
+            at_step,
+        );
+
+        const stable = self.audit_frames.stableOutput();
+        _ = board.judge(
+            .stable_output,
+            if (stable) .passed else .failed,
+            if (stable) .satisfied else .output_not_stable,
+            self.audit_frames.tally.authenticFrames(),
+            at_step,
+        );
+    }
+
+    /// disagreement between two correct counters, and the gate below stops the
+    /// run for a disagreement. A subject with one witness is reported as
+    /// uncorroborated, which is the honest answer and is not a finding.
+    fn syncMonotoneWitnesses(self: *MachOState, at_step: u64) void {
+        const bringup = gpu.bringup_gate;
+        const Pair = struct { subject: monotone_witness.Subject, boundary: bringup.Boundary };
+        const pairs = [_]Pair{
+            .{ .subject = .draws_issued, .boundary = .issue_draw },
+            .{ .subject = .render_target_updates, .boundary = .render_target_update },
+            .{ .subject = .pm4_packets_consumed, .boundary = .execute_packet_type3 },
+            .{ .subject = .vblank_marks, .boundary = .mark_vblank },
+            .{ .subject = .graphics_interrupt_dispatches, .boundary = .dispatch_interrupt_callback },
+            .{ .subject = .register_writes, .boundary = .write_register },
+            .{ .subject = .ring_write_pointer_advances, .boundary = .write_pointer_updated },
+        };
+        for (pairs) |pair| {
+            // An unarmed tracepoint has not looked, and a witness that has not
+            // looked must not state a zero: that zero would become the short
+            // reading in a comparison it was never part of.
+            if (!self.execution_tracepoints.boundaryArmed(@intFromEnum(pair.boundary))) continue;
+            const record = self.gpu_bringup_gate.recordFor(pair.boundary);
+            // The bring-up gate already knows whether this boundary is
+            // downstream of a missing prerequisite. Do not turn a blocked
+            // zero into an observation: doing so closes the monotone set before
+            // the guest has reached the corresponding phase and was the cause
+            // of the false all-required-witnesses-corroborated stop in the
+            // 2026-09-04 run. A zero is only meaningful for an eligible,
+            // never-crossed boundary; a positive crossing is always retained.
+            if (!bringup.tracepointWitnessMayState(
+                record,
+                self.gpu_bringup_gate.state(pair.boundary, at_step),
+            )) continue;
+            self.monotone_witness.state(
+                pair.subject,
+                .rosette_tracepoint,
+                record.hits,
+                at_step,
+            );
+        }
+        // Emulator counters are stated at log receipt, under their own event
+        // definitions and source timestamps (guest_log.zig). Re-reading a
+        // cached total here must never manufacture a fresh witness statement.
+        // Rosette's own reading of the title-callback transaction, so the
+        // report shows whether the repaired ledger has actually caught up with
+        // the executor rather than only that the executor said so.
+        const title_callback = &self.interrupt_callback_transaction;
+        // Registration is not a zero dispatch/return observation. Until the
+        // title callback executor has actually attempted a dispatch, neither
+        // counter has reached an eligible observation boundary. Treating the
+        // registration-only state as two zeroes manufactured closure in runs
+        // that had merely installed the callback and were still booting.
+        if (title_callback.dispatch_attempts != 0) {
+            self.monotone_witness.state(
+                .title_interrupt_callback_entries,
+                .rosette_derived_ledger,
+                title_callback.dispatch_attempts,
+                title_callback.last_step,
+            );
+            self.monotone_witness.state(
+                .title_interrupt_callback_returns,
+                .rosette_derived_ledger,
+                title_callback.callback_returns,
+                title_callback.last_step,
+            );
+        } else if (title_callback.callback_returns != 0) {
+            // A malformed or partially retained completion can expose a
+            // return total without its entry total. Preserve that evidence as
+            // a hole rather than manufacturing an entry zero.
+            self.monotone_witness.state(
+                .title_interrupt_callback_returns,
+                .rosette_derived_ledger,
+                title_callback.callback_returns,
+                title_callback.last_step,
+            );
+        }
+        self.monotone_witness.settle(at_step);
+    }
+
+    /// Join the small set of execution-boundary crossings that correspond to
+    /// guest GPU bootstrap milestones. This is intentionally a one-way join:
+    /// an IP tracepoint becomes trace evidence in the provenance ledger, but a
+    /// guest breadcrumb never becomes a fabricated tracepoint in
+    /// `gpu_bringup_gate`.
+    fn syncBootstrapProvenanceTracepoints(self: *MachOState) void {
+        const bringup = gpu.bringup_gate;
+        const Pair = struct { step: gpu.Step, boundary: bringup.Boundary };
+        const pairs = [_]Pair{
+            .{ .step = .initialize_engines, .boundary = .initialize_engines },
+            .{ .step = .graphics_interrupt_callback, .boundary = .set_interrupt_callback },
+            .{ .step = .ring_buffer, .boundary = .initialize_ring_buffer },
+            .{ .step = .rptr_writeback, .boundary = .enable_rptr_write_back },
+        };
+        for (pairs) |pair| {
+            const record = self.gpu_bringup_gate.recordFor(pair.boundary);
+            if (!record.crossed()) continue;
+            self.gpu_bootstrap_provenance.observeTrace(
+                pair.step,
+                record.hits,
+                record.first_step,
+                record.last_step,
+            );
+        }
+    }
+
+    /// Offer every graphics observer's reading to the evidence ledger, each
+    /// labelled with what kind of observer it is.
+    ///
+    /// The tiers are the point. A ring scan that finds twenty-four draws and a
+    /// tracepoint at `IssueDraw` that never fired are both in this list, and
+    /// the ledger is what stops the first from being reported as fact when the
+    /// second, looking later, saw nothing.
+    fn syncGraphicsEvidence(self: *MachOState) void {
+        const evidence = gpu.evidence_grade;
+        const bringup = gpu.bringup_gate;
+        const tracepoints = &self.execution_tracepoints;
+        const at_step = self.executed_steps;
+
+        const Pairing = struct {
+            subject: evidence.Subject,
+            boundary: bringup.Boundary,
+            observer: []const u8,
+        };
+        // Instruction-pointer evidence first, because it is the only kind
+        // nothing in the system can forge.
+        const traced = [_]Pairing{
+            .{ .subject = .gpu_engines_initialized, .boundary = .initialize_engines, .observer = "tracepoint:VdInitializeEngines_entry" },
+            .{ .subject = .interrupt_callback_registered, .boundary = .set_interrupt_callback, .observer = "tracepoint:VdSetGraphicsInterruptCallback_entry" },
+            .{ .subject = .vblank_pump_live, .boundary = .mark_vblank, .observer = "tracepoint:MarkVblank" },
+            .{ .subject = .ring_initialized, .boundary = .initialize_ring_buffer, .observer = "tracepoint:VdInitializeRingBuffer_entry" },
+            .{ .subject = .ring_write_pointer_published, .boundary = .write_pointer_updated, .observer = "tracepoint:UpdateWritePointer" },
+            .{ .subject = .command_processor_running, .boundary = .execute_primary_buffer, .observer = "tracepoint:ExecutePrimaryBuffer" },
+            .{ .subject = .pm4_packets_consumed, .boundary = .execute_packet_type3, .observer = "tracepoint:ExecutePacketType3" },
+            .{ .subject = .render_target_programmed, .boundary = .render_target_update, .observer = "tracepoint:RenderTargetCache::Update" },
+            .{ .subject = .draws_issued, .boundary = .issue_draw, .observer = "tracepoint:IssueDraw" },
+            .{ .subject = .swap_requested_by_title, .boundary = .guest_swap_requested, .observer = "tracepoint:VdSwap_entry" },
+            .{ .subject = .swap_packet_decoded, .boundary = .xe_swap_decoded, .observer = "tracepoint:ExecutePacketType3_XE_SWAP" },
+            .{ .subject = .guest_frame_presented, .boundary = .refresh_guest_output, .observer = "tracepoint:RefreshGuestOutput" },
+        };
+        for (traced) |pairing| {
+            const index: u8 = @intFromEnum(pairing.boundary);
+            if (!tracepoints.boundaryArmed(index)) continue;
+            const record = self.gpu_bringup_gate.recordFor(pairing.boundary);
+            self.gpu_evidence.observe(pairing.subject, .{
+                .tier = .instruction_pointer,
+                .observer = pairing.observer,
+                .step = if (record.crossed()) record.first_step else at_step,
+                .magnitude = record.hits,
+                .present = record.crossed(),
+            });
+        }
+
+        // EmulateCPInterruptDPC is shared by Rosette's host fallback and the
+        // title's PowerPC callback. The tracepoint alone therefore cannot
+        // answer "entered guest code". The transaction ledger is fed by
+        // domain-labelled Xenia breadcrumbs and is the only log-level source
+        // admitted for this subject.
+        const title_callback = &self.interrupt_callback_transaction;
+        const title_callback_ordered =
+            title_callback.registrationPrecedesDispatch() and
+            title_callback.callback_address >= 0x8000_0000 and
+            title_callback.callback_address < 0xC000_0000;
+        if (title_callback_ordered) {
+            self.gpu_evidence.observe(.interrupt_callback_entered_guest, .{
+                .tier = .emulator_log_claim,
+                .observer = "xenia-guest-callback-transaction",
+                .step = if (title_callback.first_dispatch_step != 0)
+                    title_callback.first_dispatch_step
+                else
+                    at_step,
+                .magnitude = title_callback.dispatch_attempts,
+                .present = true,
+            });
+        } else if (title_callback.dispatch_attempts != 0) {
+            machoCapturePrint(
+                "macho-processor: GPU CALLBACK ORDERING: title dispatch evidence was withheld because no ordered title registration precedes it (registrations={d} dispatches={d} first_registration_step={d} first_dispatch_step={d} callback=0x{x:0>8}); the dispatch remains a strict violation candidate and cannot substantiate guest interrupt entry\n",
+                .{
+                    title_callback.registrations,
+                    title_callback.dispatch_attempts,
+                    title_callback.first_registration_step,
+                    title_callback.first_dispatch_step,
+                    title_callback.callback_address,
+                },
+            );
+        }
+
+        // The emulator's own log claims, at the tier that says what they are
+        // worth. These are the source of the disagreements this ledger exists
+        // to adjudicate: a bootstrap gate that reported `ring_init=NO` at
+        // 2303 ms is not wrong, it is early, and the ledger's staleness rule is
+        // what turns that from a live contradiction into a footnote.
+        const ClaimPairing = struct {
+            subject: gpu.evidence_grade.Subject,
+            claim: claim_reconciliation.Claim,
+            observer: []const u8,
+        };
+        const logged = [_]ClaimPairing{
+            .{ .subject = .ring_initialized, .claim = .ring_initialised, .observer = "xenia-bootstrap-claim" },
+            .{ .subject = .interrupt_callback_registered, .claim = .interrupt_callback_set, .observer = "xenia-bootstrap-claim" },
+        };
+        for (logged) |pairing| {
+            const reading = self.claim_reconciliation.reconcile(pairing.claim);
+            if (reading.observers == 0) continue;
+            self.gpu_evidence.observe(pairing.subject, .{
+                .tier = .emulator_log_claim,
+                .observer = pairing.observer,
+                .step = reading.current_step,
+                .magnitude = reading.current_value,
+                .present = reading.current_value != 0,
+            });
+        }
+
+        // Rosette's own scans of guest memory. Uninitialised memory matches a
+        // great many patterns, so these are offered at the tier that says so.
+        const publication = &self.gpu_ring_publication;
+        if (publication.writes != 0) {
+            self.gpu_evidence.observe(.ring_write_pointer_published, .{
+                .tier = .emulator_counter,
+                .observer = "ring-publication-ledger",
+                .step = publication.last_advance_step,
+                .magnitude = publication.advances,
+                .present = publication.published(),
+            });
+        }
+        const consumed = self.gpu_vd_swap_contract;
+        if (consumed.authentic_consumptions != 0) {
+            self.gpu_evidence.observe(.swap_packet_decoded, .{
+                .tier = .memory_scan,
+                .observer = "ring-memory-scan",
+                .step = at_step,
+                .magnitude = consumed.authentic_consumptions,
+                .present = true,
+            });
+        }
+    }
+
+    /// Which routes the title has for being told its work finished, and
+    /// whether anything has come down one.
+    ///
+    /// The three facts per route are deliberately separate. `established` is
+    /// the title asking and the emulator agreeing; `delivered` is the guest
+    /// observing an effect. A run where the first is true and the second is
+    /// false is the exact shape of a title that submits once and stops, and no
+    /// previous report could produce that sentence.
+    fn syncCompletionRoutes(self: *MachOState, at_step: u64) void {
+        const bringup = gpu.bringup_gate;
+        const routes = &self.gpu_completion_routes;
+
+        const registration = self.gpu_bringup_gate.recordFor(.set_interrupt_callback);
+        const registration_provenance =
+            self.gpu_bootstrap_provenance.record(.graphics_interrupt_callback);
+        const registration_observed = registration.crossed() or
+            registration_provenance.guestObserved();
+        const registration_step = if (registration.crossed())
+            registration.first_step
+        else
+            registration_provenance.guest_first_step;
+        // The slot line is the emulator saying what it will dispatch into, and
+        // it supersedes the registration ledger — which reported zero for a
+        // registration that plainly happened because nothing parsed it.
+        const registration_address = if (self.gpu_interrupt_slot_is_guest and
+            self.gpu_interrupt_slot_address != 0)
+            self.gpu_interrupt_slot_address
+        else if (self.interrupt_callback_transaction.callback_address != 0)
+            self.interrupt_callback_transaction.callback_address
+        else
+            self.gpu_interrupt_slot_address;
+        if (registration_observed) {
+            routes.noteRequested(.interrupt_callback, registration_step);
+            // The registered address is the title's own callback. Rosette does
+            // not invent one: an address the harness supplies here would make
+            // an inert route read established, which is the failure mode this
+            // ledger exists to catch.
+            if (registration_address != 0) {
+                routes.noteEstablished(
+                    .interrupt_callback,
+                    registration_address,
+                    registration_step,
+                );
+            }
+        }
+        // Something other than the title in the slot is recorded before any
+        // delivery is counted, so a dispatch into a Xenia-owned host callback
+        // is never mistaken for the title receiving its completion. The first
+        // pass counted thirty-four of those as deliveries and called the route
+        // live while the title's own callback was still unreached.
+        // Only while a non-guest address is actually in the slot. The emulator's
+        // host callback being installed once and then superseded by the title
+        // is not an occupied slot, and reporting it as one made a resolved
+        // situation look like a live defect for the rest of the run.
+        if (self.gpu_interrupt_slot_writes != 0 and !self.gpu_interrupt_slot_is_guest) {
+            routes.noteForeignOccupant(.interrupt_callback, self.gpu_interrupt_slot_address);
+        } else if (self.gpu_interrupt_slot_is_guest) {
+            // Occupancy is current state, not history. The host callback is
+            // installed during bring-up and the title's registration displaces
+            // it; a latched occupant made every later delivery foreign and
+            // printed `INERT ... an emulator defect and not a title one` about
+            // a callback the emulator was entering. The release keeps the
+            // displaced address, so nothing about the handover is lost.
+            routes.clearForeignOccupant(.interrupt_callback);
+        }
+        // The generic dispatch and EmulateCPInterruptDPC tracepoints are
+        // shared by the Rosette host callback and the title callback. They are
+        // therefore not valid route evidence on their own. Use the title's
+        // domain-labelled transaction, and count each transition once so a
+        // repeated graphics checkpoint cannot manufacture deliveries.
+        const title_callback = &self.interrupt_callback_transaction;
+        var callback_route = routes.status(.interrupt_callback);
+        if (title_callback.dispatch_attempts != 0 and callback_route.attempts == 0) {
+            routes.noteAttempt(
+                .interrupt_callback,
+                if (title_callback.first_dispatch_step != 0)
+                    title_callback.first_dispatch_step
+                else
+                    at_step,
+            );
+            callback_route = routes.status(.interrupt_callback);
+        }
+        if (title_callback.callback_returns != 0 and
+            callback_route.deliveries == 0 and
+            callback_route.foreign_deliveries == 0)
+        {
+            routes.noteDelivery(
+                .interrupt_callback,
+                if (title_callback.first_return_step != 0)
+                    title_callback.first_return_step
+                else
+                    at_step,
+            );
+        }
+
+        const writeback = self.gpu_bringup_gate.recordFor(.enable_rptr_write_back);
+        const writeback_provenance =
+            self.gpu_bootstrap_provenance.record(.rptr_writeback);
+        const writeback_observed = writeback.crossed() or
+            writeback_provenance.guestObserved();
+        const writeback_step = if (writeback.crossed())
+            writeback.first_step
+        else
+            writeback_provenance.guest_first_step;
+        if (writeback_observed) {
+            routes.noteRequested(.read_pointer_write_back, writeback_step);
+            if (self.gpu_read_pointer_writeback_address != 0) {
+                routes.noteEstablished(
+                    .read_pointer_write_back,
+                    self.gpu_read_pointer_writeback_address,
+                    writeback_step,
+                );
+                // The word changing is the delivery. The emulator reporting
+                // that it wrote one is not: a word written with the same value
+                // forever is inert to the poller reading it.
+                if (self.readConsolePhysicalDword(self.gpu_read_pointer_writeback_address)) |value| {
+                    routes.sampleValue(.read_pointer_write_back, value, at_step);
+                }
+            }
+        }
+        const vblank = self.gpu_bringup_gate.recordFor(.mark_vblank);
+        if (vblank.crossed()) {
+            routes.noteRequested(.vblank_counter, vblank.first_step);
+            // The vblank counter is a register the title polls, not a word the
+            // emulator writes, so it is established by the pump running. Passing
+            // a placeholder address printed `address=0x00000001`, which is a
+            // number in the report that means nothing.
+            routes.noteEstablished(.vblank_counter, 0, vblank.first_step);
+            routes.noteDelivery(.vblank_counter, vblank.last_step);
+        }
+        _ = bringup;
+    }
+
+    /// Attribute the ring producer to the thread that crossed the
+    /// write-pointer boundary, so its later waits can be joined to it. The
+    /// bring-up boundary's first_thread is an observer-side value and may be
+    /// the command-processor worker; only the per-publication guest context is
+    /// allowed to establish producer ownership.
+    fn syncProducerAttribution(self: *MachOState) void {
+        const publications = self.gpu_ring_publication.retainedAdvances();
+        if (publications.len == 0) return;
+        var observed = false;
+        for (publications) |record| {
+            if (!record.producer.valid or record.producer.guest_thread == 0) continue;
+            observed = true;
+            self.gpu_producer_stall.attribute(record.producer.guest_thread, record.step);
+            if (record.step > self.gpu_producer_stall.published_at_step) {
+                self.gpu_producer_stall.notePublication(record.step);
+            } else if (self.gpu_producer_stall.publications == 0) {
+                self.gpu_producer_stall.notePublication(record.step);
+            }
+        }
+        if (!observed and !self.gpu_producer_stall.producer_known) {
+            self.gpu_producer_stall.noteAttributionLost();
+        }
+    }
+
+    /// Record what has been shown to work and what the guest is depending on,
+    /// then report the relationship between the two.
+    ///
+    /// The proofs are deliberately of two kinds and are kept apart. The ones
+    /// Rosette owns are exercised before the guest runs, so they can be proven
+    /// *ahead* of first use. The rest can only be proven by watching the guest's
+    /// own use complete — and a component in that group being `used_unproven` is
+    /// not a defect on its own while it is unused. Once an essential component
+    /// is used unproven, the run-integrity admission contract makes that gap
+    /// fatal; the readiness report remains the source of the component, first
+    /// use, proof and obligation details.
+    fn syncComponentReadiness(self: *MachOState) void {
+        const readiness = &self.component_readiness;
+        const at_step = self.executed_steps;
+        const gate = &self.gpu_bringup_gate;
+
+        // ---- what Rosette exercises itself ---------------------------------
+        if (self.xenia_memory_views.ready()) {
+            readiness.noteProven(.guest_memory_aliasing, at_step, "rosette:memory-view-model");
+        }
+        const clock = self.host_capabilities.finding(.monotonic_clock_resolution);
+        if (clock.outcome == .verified) {
+            readiness.noteProven(.guest_timer_source, clock.measured_value, "rosette:host-capability-probe");
+        }
+        if (self.dynamic_forwarder.nativePresenterFramesPresented() != 0) {
+            readiness.noteProven(.host_graphics_device, at_step, "rosette:native-presenter-device");
+            readiness.noteProven(.host_surface_presentation, at_step, "rosette:native-presenter-frame");
+        }
+
+        // ---- what only the guest's own use can prove ------------------------
+        const Pairing = struct {
+            component: preflight_lib.component_readiness.Component,
+            boundary: gpu.bringup_gate.Boundary,
+            prover: []const u8,
+        };
+        const traced = [_]Pairing{
+            .{ .component = .kernel_export_table, .boundary = .initialize_engines, .prover = "tracepoint:VdInitializeEngines_entry" },
+            .{ .component = .register_aperture_dispatch, .boundary = .write_register, .prover = "tracepoint:CommandProcessor::WriteRegister" },
+            .{ .component = .ring_memory_visibility, .boundary = .execute_primary_buffer, .prover = "tracepoint:ExecutePrimaryBuffer" },
+            .{ .component = .command_processor_drain, .boundary = .execute_packet_type3, .prover = "tracepoint:ExecutePacketType3" },
+            .{ .component = .render_target_binding, .boundary = .render_target_update, .prover = "tracepoint:RenderTargetCache::Update" },
+            .{ .component = .frame_handoff_to_window, .boundary = .refresh_guest_output, .prover = "tracepoint:RefreshGuestOutput" },
+        };
+        for (traced) |pairing| {
+            const record = gate.recordFor(pairing.boundary);
+            if (record.crossed()) {
+                readiness.noteProven(pairing.component, record.first_step, pairing.prover);
+            }
+        }
+
+        // The interrupt is only proven to reach the *title* when the callback
+        // transaction has an ordered title registration and a returned
+        // dispatch at a guest address. The generic DPC tracepoint can enter a
+        // harness callback too, and the live slot can be replaced before a
+        // later checkpoint, so the transaction ledger is the authority here.
+        const entered = gate.recordFor(.emulate_cp_interrupt_dpc);
+        if (entered.crossed() and self.gpu_interrupt_slot_is_guest) {
+            readiness.noteProven(
+                .interrupt_delivery_into_guest,
+                entered.first_step,
+                "tracepoint:EmulateCPInterruptDPC + guest-owned slot",
+            );
+        }
+        if (self.interrupt_callback_transaction.guestTitleRoundTripProven()) {
+            readiness.noteProven(
+                .interrupt_delivery_into_guest,
+                self.interrupt_callback_transaction.first_return_step,
+                "xenia:guest-callback transaction round-trip",
+            );
+        }
+
+        // Event signalling is proven by a waiter *waking because of* a signal,
+        // not by a set call returning. `blocked_released` is the only counter
+        // that means the handoff completed.
+        if (comptime @hasField(MachOState, "guest_wait_liveness")) {
+            // `provesSignalConsumption` is the only predicate that means a
+            // waiter actually blocked and was released by a signal. A set call
+            // returning, or a wait returning because it was already signalled,
+            // proves nothing about the handoff.
+            if (self.guest_wait_liveness.provesSignalConsumption()) {
+                readiness.noteProven(
+                    .guest_event_signalling,
+                    at_step,
+                    "guest-wait-liveness:blocked-then-released",
+                );
+            }
+            if (self.guest_wait_liveness.total_waits != 0) {
+                readiness.noteUsed(.guest_event_signalling, at_step);
+            }
+        }
+        if (self.ready.translationProgressGeneration() != 0) {
+            readiness.noteProven(.guest_code_translation, at_step, "ready-compiler:translation-generation");
+        }
+        if (self.pthreads.created_threads != 0) {
+            readiness.noteProven(.guest_thread_scheduling, at_step, "pthread-runtime:created-and-scheduled");
+            readiness.noteUsed(.guest_thread_scheduling, at_step);
+        }
+        if (self.critical_section_initial_valid) {
+            readiness.noteProven(.guest_critical_sections, at_step, "guest-critical-section:baseline-observed");
+        }
+        if (self.xenia_gpu_handoff.shader_completion_commits != 0) {
+            readiness.noteProven(.shader_translation, at_step, "xenia-gpu-handoff:shader-commit");
+        }
+
+        // ---- what the guest has depended on --------------------------------
+        const uses = [_]Pairing{
+            .{ .component = .kernel_export_table, .boundary = .query_video_mode, .prover = "" },
+            .{ .component = .guest_memory_aliasing, .boundary = .initialize_ring_buffer, .prover = "" },
+            .{ .component = .ring_memory_visibility, .boundary = .write_pointer_updated, .prover = "" },
+            .{ .component = .register_aperture_dispatch, .boundary = .write_pointer_updated, .prover = "" },
+            .{ .component = .command_processor_drain, .boundary = .write_pointer_updated, .prover = "" },
+            .{ .component = .interrupt_delivery_into_guest, .boundary = .set_interrupt_callback, .prover = "" },
+            .{ .component = .shader_translation, .boundary = .issue_draw, .prover = "" },
+            .{ .component = .frame_handoff_to_window, .boundary = .guest_swap_requested, .prover = "" },
+            .{ .component = .guest_timer_source, .boundary = .mark_vblank, .prover = "" },
+            .{ .component = .host_graphics_device, .boundary = .execute_primary_buffer, .prover = "" },
+            .{ .component = .host_surface_presentation, .boundary = .host_paint, .prover = "" },
+            .{ .component = .guest_critical_sections, .boundary = .initialize_engines, .prover = "" },
+            .{ .component = .guest_code_translation, .boundary = .query_video_mode, .prover = "" },
+        };
+        for (uses) |pairing| {
+            const record = gate.recordFor(pairing.boundary);
+            if (record.crossed()) readiness.noteUsed(pairing.component, record.first_step);
+        }
+
+        // Entering IssueDraw is not the same as depending on a render target.
+        //
+        // A draw with rasterization disabled and no memory export leaves the
+        // command processor before the render target cache is consulted, and
+        // it does so because of what the title programmed. Counting it as a
+        // use put `render target binding USED-UNPROVEN owner=emulator:gpu` at
+        // the top of the readiness report — with `draws are issued with
+        // nowhere to land ... which looks exactly like rendering that produced
+        // a black frame` — for a batch of twenty-four draws that the emulator
+        // had already classified, by name, as legitimately having no effect.
+        // Two Rosette reports, two owners, one fact.
+        //
+        // So the dependency is recorded when a draw actually reached the
+        // target, when the emulator classified an exit as its own failure, or
+        // when no exit has been named at all — because an unattributed gap
+        // must not be excused by the absence of the very evidence that would
+        // excuse it.
+        const draws = gate.recordFor(.issue_draw);
+        if (draws.crossed()) {
+            const exits_are_title_owned =
+                self.gpu_draw_exits_named != 0 and self.gpu_draw_defect_exits == 0;
+            const reached = gate.recordFor(.render_target_update).crossed() or
+                self.gpu_draws_reached_render_target != 0;
+            if (reached or !exits_are_title_owned) {
+                readiness.noteUsed(.render_target_binding, draws.first_step);
+            }
+        }
+    }
+
+    /// Whether every component a frame depends on was shown to work, and
+    /// whether the proof arrived before the guest relied on it.
+    pub fn logComponentReadiness(self: *MachOState) void {
+        const module = preflight_lib.component_readiness;
+        self.syncComponentReadiness();
+        const readiness = &self.component_readiness;
+        const totals = readiness.summary();
+        machoCapturePrint(
+            "macho-processor: COMPONENT READINESS: ready={d}% proven={d}/{d} unproven={d} broken={d} used_unproven={d} proven_after_use={d} provable_early_but_unproven={d} essential_gaps={d} step={d}; {s}\n",
+            .{
+                totals.readyPercent(),
+                totals.proven,
+                module.component_count,
+                totals.unproven,
+                totals.broken,
+                totals.used_unproven,
+                totals.proven_after_use,
+                totals.provable_early_but_unproven,
+                totals.essential_gaps,
+                self.executed_steps,
+                totals.describe(),
+            },
+        );
+        if (readiness.firstFinding()) |first| {
+            machoCapturePrint(
+                "  COMPONENT READINESS SUBJECT: {s} owner={s} proof={s}; {s}\n",
+                .{ first.label(), first.owner(), first.proof().label(), first.blindRisk() },
+            );
+            machoCapturePrint(
+                "    obligation: {s}\n",
+                .{first.obligation()},
+            );
+        }
+        // The substrate gate's own blockers, named. An idle row is skipped
+        // below because most idle components say nothing; an idle *substrate*
+        // component is the reason `G1` cannot be judged, and leaving it out
+        // left the gate reporting a count with nothing behind it.
+        if (readiness.firstUnprovenSubstrate()) |blocker| {
+            machoCapturePrint(
+                "  COMPONENT READINESS SUBSTRATE: G1 is held by {s} owner={s} proof={s} used={s}; {s}\n",
+                .{
+                    blocker.label(),
+                    blocker.owner(),
+                    blocker.proof().label(),
+                    if (readiness.recordFor(blocker).used) "YES" else "NO",
+                    if (blocker.proof().availableBeforeFirstUse())
+                        "this one could be exercised before the guest runs, so it is Rosette's to close and costs nothing to close"
+                    else
+                        "this one can only be proven by the guest's own use completing, so it is the title's to reach and not a defect until it does",
+                },
+            );
+        }
+        for (module.allComponents()) |component| {
+            const standing = readiness.standing(component);
+            const record = readiness.recordFor(component);
+            if (standing == .idle) {
+                if (!module.isSubstrate(component) or record.proven()) continue;
+                machoCapturePrint(
+                    "  component {s: <18} {s: <12} {s: <30} owner={s: <16} proven_step={d} first_use_step={d} uses={d} by={s}\n",
+                    .{
+                        "awaiting-use",
+                        record.state.label(),
+                        component.label(),
+                        component.owner(),
+                        record.proven_step,
+                        record.first_use_step,
+                        record.uses,
+                        "<nothing yet>",
+                    },
+                );
+                continue;
+            }
+            machoCapturePrint(
+                "  component {s: <18} {s: <12} {s: <30} owner={s: <16} proven_step={d} first_use_step={d} uses={d} by={s}\n",
+                .{
+                    standing.label(),
+                    record.state.label(),
+                    component.label(),
+                    component.owner(),
+                    record.proven_step,
+                    record.first_use_step,
+                    record.uses,
+                    if (record.prover.len != 0) record.prover else "<nothing>",
+                },
+            );
+        }
+    }
+
+    /// Copy the executor's opcode histogram into the census, then say what the
+    /// title asked for.
+    ///
+    /// Synchronisation rather than an incremental feed: the executor is already
+    /// counting and a second counter that could drift from it would be one more
+    /// observer to reconcile.
+    fn syncPacketCensus(self: *MachOState) void {
+        const histogram = self.gpu_xenos_runtime.executor.opcode_histogram;
+        for (histogram, 0..) |seen, opcode| {
+            if (seen == 0) continue;
+            if (self.gpu_packet_census.countOf(@enumFromInt(opcode)) >= seen) continue;
+            var pending = seen - @as(u32, @intCast(@min(
+                seen,
+                self.gpu_packet_census.countOf(@enumFromInt(opcode)),
+            )));
+            while (pending > 0) : (pending -= 1) {
+                self.gpu_packet_census.observePacket(@intCast(opcode), self.executed_steps);
+            }
+        }
+    }
+
+    /// Every boundary that is supposed to keep repeating, with when it last
+    /// did.
+    ///
+    /// The boundary gate names the first stalled one in console order, which is
+    /// correct for finding a frontier and wrong for understanding a shutdown: a
+    /// run where four pumps stopped needs the *sequence* they stopped in, and
+    /// that is four last-steps side by side rather than one verdict. On the
+    /// 2026-08-31 run the producer went quiet at step 3 415 047 818 and the
+    /// vblank pump kept going until 3 485 520 781 — seventy million steps
+    /// later — which is the difference between "the pump died and the producer
+    /// starved" and "the producer stopped and the pump followed".
+    fn logPumpLiveness(self: *MachOState) void {
+        const bringup = gpu.bringup_gate;
+        const at_step = self.executed_steps;
+        var live: u8 = 0;
+        var stalled: u8 = 0;
+        var never: u8 = 0;
+        var not_eligible: u8 = 0;
+        for (bringup.contractBoundaries()) |boundary| {
+            if (boundary.cadence() != .repeating) continue;
+            const record = self.gpu_bringup_gate.recordFor(boundary);
+            if (!record.crossed()) {
+                never += 1;
+                continue;
+            }
+            switch (self.gpu_bringup_gate.state(boundary, at_step)) {
+                .stalled_after_crossing => stalled += 1,
+                .not_eligible => not_eligible += 1,
+                else => live += 1,
+            }
+        }
+        if (live == 0 and stalled == 0 and not_eligible == 0) return;
+        machoCapturePrint(
+            "macho-processor: GPU PUMP LIVENESS: live={d} stalled={d} not_eligible={d} never_started={d} step={d}; only autonomous pumps appear below. Ring publication, command decode, register writes, draws, notification routines, swaps, refresh and Cocoa paint are event-driven and cannot become stalled merely because the last batch drained; not_eligible means source provenance disqualified an otherwise repeating heartbeat\n",
+            .{ live, stalled, not_eligible, never, at_step },
+        );
+        for (bringup.contractBoundaries()) |boundary| {
+            if (boundary.cadence() != .repeating) continue;
+            const record = self.gpu_bringup_gate.recordFor(boundary);
+            if (!record.crossed()) continue;
+            machoCapturePrint(
+                "  gpu-pump {s: <9} {s: <45} hits={d} first_step={d} last_step={d} quiet_for={d}\n",
+                .{
+                    self.gpu_bringup_gate.state(boundary, at_step).label(),
+                    boundary.label(),
+                    record.hits,
+                    record.first_step,
+                    record.last_step,
+                    self.gpu_bringup_gate.quietFor(boundary, at_step),
+                },
+            );
+        }
+    }
+
+    /// Which PM4 opcodes the title encoded, and whether it ever asked for a
+    /// completion at all.
+    ///
+    /// This is the report that separates the two opposite explanations for a
+    /// title that submits one batch and stops: it asked to be told and was not,
+    /// or it never asked and is waiting on something that is not the GPU.
+    pub fn logPacketCensus(self: *MachOState) void {
+        self.syncPacketCensus();
+        const ledger = &self.gpu_packet_census;
+        const totals = ledger.summary();
+        if (totals.packets == 0 and ledger.emulator_packets == 0) return;
+        const verdict = ledger.verdict();
+        machoCapturePrint(
+            "macho-processor: GPU PACKET CENSUS: verdict={s} distinct={d} rosette_packets={d} emulator_packets={d} draws={d} blocking={d} completion_requests(rosette/emulator_interrupt/emulator_event)={d}/{d}/{d} interrupt_requests={d} interrupts_delivered(vblank/command_stream)={d}/{d} memory_completions(delivered/alias_mismatch)={d}/{d} interrupt_dispatch(entered/returned/outstanding)={d}/{d}/{d} vblank_floor_raises={d} emulator_extensions={d} unnamed={d} dropped={d} step={d}; {s}\n",
+            .{
+                verdict.label(),
+                totals.distinct,
+                totals.packets,
+                ledger.emulator_packets,
+                totals.draws,
+                totals.blocking,
+                totals.completion_requests,
+                ledger.emulator_interrupt_requests,
+                ledger.emulator_event_write_requests,
+                totals.interrupt_requests,
+                ledger.interrupts_by_source[0],
+                ledger.commandStreamInterrupts(),
+                ledger.memory_completions_delivered,
+                ledger.memory_completion_alias_mismatches,
+                ledger.interrupt_dispatch_entered,
+                ledger.interrupt_dispatch_returned,
+                ledger.outstandingInterruptDispatches(),
+                ledger.vblank_floor_raises,
+                totals.emulator_extensions,
+                totals.unnamed,
+                totals.dropped,
+                self.executed_steps,
+                verdict.describe(),
+            },
+        );
+        if (ledger.outstandingInterruptDispatches() != 0) {
+            machoCapturePrint(
+                "  GPU PACKET CENSUS INTERRUPT STUCK: {d} graphics interrupt dispatch(es) entered guest code and have not returned. The dispatch runs the title's handler on the calling thread, so the thread that made it — the frame limiter — is inside guest code and is not coming back. Every pump that thread drives is dead from that moment, and its last recorded event was a successful entry\n",
+                .{ledger.outstandingInterruptDispatches()},
+            );
+        }
+        if (ledger.vblank_floor_raises != 0) {
+            machoCapturePrint(
+                "  GPU PACKET CENSUS VBLANK FLOOR: {d} vblank(s) were raised by the emulator's wall-clock floor rather than by the guest clock. The guest clock is not pacing the display, so every deadline the title computes from it is stretched by the same factor — read TIMEOUT FIDELITY next\n",
+                .{ledger.vblank_floor_raises},
+            );
+        }
+        for (ledger.observed()) |entry| {
+            const typed = entry.typed();
+            machoCapturePrint(
+                "  packet opcode=0x{x:0>2} {s: <22} count={d} first_step={d} last_step={d}{s}{s}{s}\n",
+                .{
+                    entry.opcode,
+                    entry.name(),
+                    entry.count,
+                    entry.first_step,
+                    entry.last_step,
+                    if (typed.isDraw()) " draw" else "",
+                    if (typed.isBlocking()) " blocking" else "",
+                    if (typed.requestsCompletion()) " COMPLETION-REQUEST" else "",
+                },
+            );
+        }
+    }
+
+    /// Which synchronisation objects have only one end.
+    ///
+    /// The wait graph already reports edges and the notifier ledger already
+    /// reports never-signalled objects. Neither produces the pair, and the pair
+    /// is the finding: an object waited on and never signalled beside one
+    /// signalled and never waited on is two halves of a handshake that are not
+    /// meeting.
+    pub fn logSignalExpectation(self: *MachOState) void {
+        const ledger = &self.signal_expectation;
+        const verdict = ledger.verdict();
+        const totals = ledger.summary();
+        if (verdict == .quiet) return;
+        machoCapturePrint(
+            "macho-processor: SIGNAL EXPECTATION: verdict={s} tracked={d} matched={d} orphan_waits(total/blocking/polling)={d}/{d}/{d} orphan_signals={d} dropped={d} split_identity_suspected={s} step={d}; {s}\n",
+            .{
+                verdict.label(),
+                totals.tracked,
+                totals.matched,
+                totals.orphan_waits,
+                totals.blocking_orphan_waits,
+                totals.polling_orphans,
+                totals.orphan_signals,
+                totals.dropped,
+                if (ledger.looksLikeSplitIdentity()) "YES" else "NO",
+                self.executed_steps,
+                verdict.describe(),
+            },
+        );
+        // Which pair, and how far apart. A `YES` with no addresses beside it
+        // leaves the reader to find the pair by eye across a table, which is
+        // the work the exhaustive comparison was added to do.
+        if (ledger.findSplitIdentity()) |split| {
+            machoCapturePrint(
+                "  signal-expectation SPLIT IDENTITY: waited=0x{x} signalled=0x{x} bias=0x{x} same_address={s}; the two rows agree on their low half, so they are very likely one console object seen through two address views. Compare their handles and creation provenance before treating either half as a finding\n",
+                .{
+                    split.waited,
+                    split.signalled,
+                    split.bias,
+                    if (split.sameAddress()) "YES" else "NO",
+                },
+            );
+        }
+        if (ledger.worstOrphanWait()) |waited| {
+            const symbol = self.metadata.nearestSymbol(waited.guest_pc);
+            machoCapturePrint(
+                "  signal-expectation ORPHAN WAIT: object=0x{x} handle=0x{x:0>8} waits={d} timeouts={d} signals=0 timeout_ms={d} mode={s} waiter_thread=0x{x} guest_pc=0x{x} guest_lr=0x{x} pc_trusted={s} provenance={s} first_step={d} last_step={d}{s}{s}\n",
+                .{
+                    waited.object,
+                    waited.handle,
+                    waited.waits,
+                    waited.timeouts,
+                    waited.timeout_ms,
+                    if (waited.polling()) "polling" else "parked",
+                    waited.waiter_thread,
+                    waited.guest_pc,
+                    waited.guest_lr,
+                    if (waited.guest_pc_trusted) "YES" else "NO",
+                    waited.provenance.label(),
+                    waited.first_step,
+                    waited.last_step,
+                    if (symbol != null) " nearest_symbol=" else "",
+                    if (symbol) |resolved| resolved.name else "",
+                },
+            );
+            if (waited.guest_pc_trusted) {
+                machoCapturePrint(
+                    "    signal-expectation: the guest program counter above is the title's own instruction, not the emulator's slot. That address and its link register are what a disassembly of the title can be looked up against; the object address cannot\n",
+                    .{},
+                );
+            } else {
+                // The link register is written by the call instruction itself,
+                // so it names the caller even when the program counter has been
+                // seeded from a processor entry. Dropping both because one is
+                // untrusted threw away the only address a disassembly of the
+                // title could be looked up against.
+                if (waited.guest_lr != 0) {
+                    machoCapturePrint(
+                        "    signal-expectation: the guest program counter is seeded and cannot be trusted, but the link register 0x{x} is written by the call instruction itself and still names the title's caller. Look that up in the title before treating this waiter as unlocatable\n",
+                        .{waited.guest_lr},
+                    );
+                } else {
+                    machoCapturePrint(
+                        "    signal-expectation: no trusted guest program counter and no link register were captured for this waiter, so the title's own call site is unknown. The object address names a slot in the emulator and cannot be looked up in the title — this is a hole in the observer, not a fact about the guest\n",
+                        .{},
+                    );
+                }
+            }
+        }
+        if (ledger.worstPollingOrphan()) |polled| {
+            const symbol = self.metadata.nearestSymbol(polled.guest_pc);
+            machoCapturePrint(
+                "  signal-expectation BOUNDED POLL: object=0x{x} handle=0x{x:0>8} waits={d} timeouts={d} signals=0 timeout_ms={d} waiter_thread=0x{x} guest_pc=0x{x} guest_lr=0x{x} pc_trusted={s} provenance={s} first_step={d} last_step={d}{s}{s}; this waiter returned through a finite deadline and is reported as polling context, never as the parked half of an unmatched handshake\n",
+                .{
+                    polled.object,
+                    polled.handle,
+                    polled.waits,
+                    polled.timeouts,
+                    polled.timeout_ms,
+                    polled.waiter_thread,
+                    polled.guest_pc,
+                    polled.guest_lr,
+                    if (polled.guest_pc_trusted) "YES" else "NO",
+                    polled.provenance.label(),
+                    polled.first_step,
+                    polled.last_step,
+                    if (symbol != null) " nearest_symbol=" else "",
+                    if (symbol) |resolved| resolved.name else "",
+                },
+            );
+        }
+        if (ledger.worstOrphanSignal()) |signalled| {
+            machoCapturePrint(
+                "  signal-expectation ORPHAN SIGNAL: object=0x{x} handle=0x{x:0>8} signals={d} waits=0 signaller_thread=0x{x} signaller_pc=0x{x} provenance={s} first_step={d} last_step={d}\n",
+                .{
+                    signalled.object,
+                    signalled.handle,
+                    signalled.signals,
+                    signalled.signaller_thread,
+                    signalled.signaller_pc,
+                    signalled.provenance.label(),
+                    signalled.first_step,
+                    signalled.last_step,
+                },
+            );
+        }
+    }
+
+    /// Feed the ordering ledger from the boundary crossings, then judge every
+    /// declared rule against them.
+    ///
+    /// The events come from the tracepoint set rather than from any counter,
+    /// so an ordering violation reported here is two instruction pointers and a
+    /// step number. That matters: an ordering derived from log lines could be
+    /// inverted by nothing more than one subsystem logging late.
+    fn syncMandatoryOrder(self: *MachOState) void {
+        const order = mandatory_order;
+        const bringup = gpu.bringup_gate;
+        const Pairing = struct {
+            event: order.Event,
+            boundary: bringup.Boundary,
+            /// High-frequency boundaries record only their first occurrence in
+            /// the lead-up window; every later one would push the events that
+            /// matter out of it.
+            frequent: bool = false,
+        };
+        const pairings = [_]Pairing{
+            .{ .event = .engines_initialized, .boundary = .initialize_engines },
+            .{ .event = .ring_initialized, .boundary = .initialize_ring_buffer },
+            .{ .event = .read_pointer_writeback_enabled, .boundary = .enable_rptr_write_back },
+            .{ .event = .command_processor_running, .boundary = .command_processor_worker_running, .frequent = true },
+            .{ .event = .write_pointer_published, .boundary = .write_pointer_updated, .frequent = true },
+            .{ .event = .ring_drained, .boundary = .execute_primary_buffer, .frequent = true },
+            .{ .event = .register_programmed, .boundary = .write_register, .frequent = true },
+            .{ .event = .render_target_programmed, .boundary = .render_target_update, .frequent = true },
+            .{ .event = .draw_issued, .boundary = .issue_draw, .frequent = true },
+            .{ .event = .swap_requested, .boundary = .guest_swap_requested },
+            .{ .event = .swap_consumed, .boundary = .xe_swap_decoded },
+            .{ .event = .guest_output_refreshed, .boundary = .refresh_guest_output },
+            .{ .event = .interrupt_dispatched, .boundary = .dispatch_interrupt_callback, .frequent = true },
+        };
+        for (pairings) |pairing| {
+            const record = self.gpu_bringup_gate.recordFor(pairing.boundary);
+            if (!record.crossed()) continue;
+            if (self.mandatory_order.count(pairing.event) >= record.hits) continue;
+            if (pairing.frequent) {
+                self.mandatory_order.observeOnce(
+                    pairing.event,
+                    record.first_step,
+                    record.first_thread,
+                    record.hits,
+                );
+            } else {
+                self.mandatory_order.observe(
+                    pairing.event,
+                    record.first_step,
+                    record.first_thread,
+                    record.hits,
+                );
+            }
+        }
+
+        // The title callback is a separate execution domain from Rosette's
+        // optional host callback. The generic SetInterrupt/EmulateCP trace
+        // points are retained as context above, but they cannot satisfy this
+        // ordering ledger because both domains travel through those symbols.
+        const title_callback = &self.interrupt_callback_transaction;
+        if (title_callback.registrations != 0 and
+            !self.mandatory_order.seen(.interrupt_callback_registered))
+        {
+            self.mandatory_order.observe(
+                .interrupt_callback_registered,
+                if (title_callback.first_registration_step != 0)
+                    title_callback.first_registration_step
+                else
+                    self.executed_steps,
+                0,
+                title_callback.callback_address,
+            );
+        } else if (title_callback.registrations == 0 and
+            !self.mandatory_order.seen(.interrupt_callback_registered))
+        {
+            // Keep compatibility with an older Xenia binary that has not yet
+            // emitted the domain-labelled transaction breadcrumbs. This is a
+            // registration-only fallback; there is deliberately no analogous
+            // fallback for guest entry, because the old generic entry point is
+            // exactly what caused the false positive in the captured run.
+            const registration = self.gpu_bringup_gate.recordFor(.set_interrupt_callback);
+            if (registration.crossed() and
+                self.gpu_interrupt_slot_is_guest and
+                self.gpu_interrupt_slot_address != 0)
+            {
+                self.mandatory_order.observe(
+                    .interrupt_callback_registered,
+                    registration.first_step,
+                    registration.first_thread,
+                    self.gpu_interrupt_slot_address,
+                );
+            }
+        }
+        if (title_callback.dispatch_attempts != 0 and
+            !self.mandatory_order.seen(.interrupt_entered_guest))
+        {
+            self.mandatory_order.observe(
+                .interrupt_entered_guest,
+                if (title_callback.first_dispatch_step != 0)
+                    title_callback.first_dispatch_step
+                else
+                    self.executed_steps,
+                0,
+                title_callback.callback_address,
+            );
+        }
+        // Host callback entry is retained in the same bounded lead-up window,
+        // but it has no title-owned prerequisite and therefore cannot create a
+        // guest callback ordering finding.
+        const host_callback = &self.host_interrupt_callback_transaction;
+        if (host_callback.dispatch_attempts != 0 and
+            !self.mandatory_order.seen(.interrupt_entered_host))
+        {
+            self.mandatory_order.observe(
+                .interrupt_entered_host,
+                if (host_callback.first_dispatch_step != 0)
+                    host_callback.first_dispatch_step
+                else
+                    self.executed_steps,
+                0,
+                host_callback.callback_address,
+            );
+        }
+
+        // A raw IssueDraw boundary is useful context, but Xenia enters it for
+        // no-effect draws as well. The Xenos runtime increments this separate
+        // counter only after it has a live, writable target-backed output
+        // witness, which is the event the mandatory target-order rule judges.
+        if (self.gpu_xenos_runtime.renderable_draw_observations != 0 and
+            !self.mandatory_order.seen(.renderable_draw_issued))
+        {
+            self.mandatory_order.observe(
+                .renderable_draw_issued,
+                if (self.gpu_renderable_draw_first_step != 0)
+                    self.gpu_renderable_draw_first_step
+                else
+                    self.executed_steps,
+                self.gpu_renderable_draw_first_thread,
+                self.gpu_xenos_runtime.renderable_draw_observations,
+            );
+        }
+
+        // PaintFromUIThread also paints Rosette's diagnostic surface while the
+        // guest has produced no output. Preserve that fact, but do not call it
+        // a guest surface paint or activate the expected guest-output rule.
+        // A target-backed draw is only an opportunity; the refresh boundary is
+        // the point at which pixels actually became the presenter source. If
+        // any paint in the aggregate record predates that boundary, the
+        // aggregate is ambiguous and remains diagnostic. Requiring the last
+        // refresh to precede the first paint is intentionally conservative:
+        // a first paint after a refresh is proof, but a later paint cannot
+        // prove what an earlier paint displayed.
+        const host_paint = self.gpu_bringup_gate.recordFor(.host_paint);
+        if (host_paint.crossed()) {
+            const guest_output = self.guestOutputEvidence();
+            const opportunity = host_contract_coverage.guestOutputOpportunity(guest_output);
+            const guest_refresh = self.gpu_bringup_gate.recordFor(.refresh_guest_output);
+            const authentic = opportunity and
+                guest_refresh.crossed() and
+                guest_refresh.last_step <= host_paint.first_step;
+            if (authentic and !self.mandatory_order.seen(.host_surface_painted)) {
+                self.mandatory_order.observe(
+                    .host_surface_painted,
+                    @max(guest_refresh.first_step, host_paint.first_step),
+                    host_paint.first_thread,
+                    host_paint.hits,
+                );
+            } else if (!authentic and !self.mandatory_order.seen(.diagnostic_surface_painted)) {
+                self.mandatory_order.observe(
+                    .diagnostic_surface_painted,
+                    host_paint.first_step,
+                    host_paint.first_thread,
+                    host_paint.hits,
+                );
+            }
+        }
+        if (self.xenia_memory_views.ready()) {
+            self.mandatory_order.observeOnce(
+                .guest_address_space_reserved,
+                self.executed_steps,
+                0,
+                self.xenia_memory_views.mapping_base,
+            );
+        }
+        if (self.gpu_completion_routes.status(.read_pointer_write_back).value_changed) {
+            self.mandatory_order.observeOnce(
+                .read_pointer_writeback_delivered,
+                self.executed_steps,
+                0,
+                self.gpu_read_pointer_writeback_address,
+            );
+        }
+    }
+
+    /// The ordering report, and — at a new finding — the events that led to it.
+    pub fn logMandatoryOrder(self: *MachOState) void {
+        const order = mandatory_order;
+        self.syncMandatoryOrder();
+        const totals = self.mandatory_order.summary();
+        const draw_entry = self.gpu_bringup_gate.recordFor(.issue_draw);
+        const target = self.gpu_bringup_gate.recordFor(.render_target_update);
+        const guest_refresh = self.gpu_bringup_gate.recordFor(.refresh_guest_output);
+        const host_paint = self.gpu_bringup_gate.recordFor(.host_paint);
+        const title_callback = &self.interrupt_callback_transaction;
+        const host_callback = &self.host_interrupt_callback_transaction;
+        machoCapturePrint(
+            "macho-processor: MANDATORY ORDER: active={d}/{d} held={d} raced={d} violated={d} mandatory_violations={d} events={d} step={d}; {s}\n",
+            .{
+                totals.active,
+                order.rule_count,
+                totals.held,
+                totals.raced,
+                totals.violated,
+                totals.mandatory_violations,
+                self.mandatory_order.total,
+                self.executed_steps,
+                totals.describe(),
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: MANDATORY ORDER EVIDENCE: raw_draws={d} raw_draw(first/last/thread)={d}/{d}/0x{x} renderable_draws={d} renderable_first(step/thread)={d}/0x{x} target_programmed(hits/first/last/thread)={d}/{d}/{d}/0x{x} guest_refresh(hits/first/last)={d}/{d}/{d} title_callback(registration/dispatch/return)={d}/{d}/{d} first_steps={d}/{d}/{d} host_callback(dispatch/return)={d}/{d} host_paint_events={d} classified_surface(authentic/diagnostic)={d}/{d}; raw IssueDraw entry, host callback entry, and diagnostic paint never satisfy the target/title/guest-output prerequisites; ambiguous aggregate paint stays diagnostic\n",
+            .{
+                draw_entry.hits,
+                draw_entry.first_step,
+                draw_entry.last_step,
+                draw_entry.first_thread,
+                self.gpu_xenos_runtime.renderable_draw_observations,
+                self.gpu_renderable_draw_first_step,
+                self.gpu_renderable_draw_first_thread,
+                target.hits,
+                target.first_step,
+                target.last_step,
+                target.first_thread,
+                guest_refresh.hits,
+                guest_refresh.first_step,
+                guest_refresh.last_step,
+                title_callback.registrations,
+                title_callback.dispatch_attempts,
+                title_callback.callback_returns,
+                title_callback.first_registration_step,
+                title_callback.first_dispatch_step,
+                title_callback.first_return_step,
+                host_callback.dispatch_attempts,
+                host_callback.callback_returns,
+                host_paint.hits,
+                self.mandatory_order.count(.host_surface_painted),
+                self.mandatory_order.count(.diagnostic_surface_painted),
+            },
+        );
+        var index: usize = 0;
+        while (index < order.rule_count) : (index += 1) {
+            const found = self.mandatory_order.reading(index);
+            if (!found.standing.actionable()) continue;
+            machoCapturePrint(
+                "  order {s: <9} {s: <9} {s} before {s} — required(step/count)={d}/{d} dependant(step/count)={d}/{d} gap={d}\n",
+                .{
+                    found.standing.label(),
+                    found.rule.strength.label(),
+                    found.rule.required.label(),
+                    found.rule.dependant.label(),
+                    found.required_step,
+                    found.required_count,
+                    found.dependant_step,
+                    found.dependant_count,
+                    found.gap_steps,
+                },
+            );
+            machoCapturePrint("    order consequence: {s}\n", .{found.rule.consequence});
+            // Retain always, report once. The lead-up is a region of detail at
+            // the point the run went wrong; printed every checkpoint it would
+            // stop being a region and become the log.
+            if (!self.mandatory_order.takeUnreported(index)) continue;
+            var buffer: [order.window_capacity]order.Occurrence = undefined;
+            const lead_up = self.mandatory_order.leadUp(&buffer);
+            machoCapturePrint(
+                "    order lead-up: {d} retained event(s) before this finding, oldest first\n",
+                .{lead_up.len},
+            );
+            for (lead_up) |occurrence| {
+                machoCapturePrint(
+                    "      order event step={d: <12} thread=0x{x: <10} {s: <14} {s} detail={d}\n",
+                    .{
+                        occurrence.step,
+                        occurrence.thread,
+                        occurrence.event.subsystem(),
+                        occurrence.event.label(),
+                        occurrence.detail,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Perform every host operation the emulator depends on, once, and report
+    /// what this machine actually did.
+    ///
+    /// Emitted before the guest runs. Everything else in the process observes
+    /// the emulator; this is the only thing that asks the kernel directly, and
+    /// it exists because "Xenia mapped a page" and "a page can be mapped here"
+    /// are two facts that the rest of the run cannot separate.
+    pub fn logHostCapabilities(self: *MachOState) void {
+        const capability = preflight_lib.host_capability;
+        self.host_capabilities = capability.probe();
+        const report = &self.host_capabilities;
+
+        // The one capability preflight cannot answer, answered by the module
+        // that owns the mechanism. Without this the host's coarser page sits
+        // at the top of every run as a permanent, unactionable accusation —
+        // and the emulator has in fact been getting its own page size the
+        // whole time, from an overlay nobody was measuring.
+        const overlay = sparse_virtual_memory.Manager.proveProtectionOverlay(self.allocator);
+        // An obstacle in the environment is not a verdict on the overlay. A
+        // reservation that could not be taken says nothing about whether the
+        // mechanism works, and recording it as a failure would put a red row
+        // next to something that was never exercised — so the row stays
+        // unprobed, the host's coarser page stays uncompensated, and both
+        // facts are true.
+        if (overlay.succeeded or overlay.obstacle.accusesOverlay()) {
+            report.note(
+                .guest_page_protection_fidelity,
+                overlay.succeeded,
+                overlay.granularity,
+                sparse_virtual_memory.PAGE_4K,
+                @intFromEnum(overlay.obstacle),
+            );
+        }
+        machoCapturePrint(
+            "macho-processor: GUEST PAGE PROTECTION OVERLAY: proven={s} enforced={d}bytes host_page={d}bytes shared_host_page={s} mappings_used={d} obstacle={s}; the granularity comes from bookkeeping over one mapping. Giving each guest page a host page of its own would buy the same number and quadruple the address space, so the mapping count is part of the result and not an aside\n",
+            .{
+                if (overlay.succeeded) "YES" else "NO",
+                overlay.granularity,
+                std.heap.page_size_min,
+                if (overlay.shared_host_page) "YES" else "NO",
+                overlay.mappings_used,
+                overlay.obstacle.label(),
+            },
+        );
+        if (!overlay.succeeded) {
+            // Two calls rather than one with a chosen string: the format is a
+            // compile-time parameter, and picking it at run time does not
+            // compile.
+            if (overlay.obstacle.accusesOverlay()) {
+                machoCapturePrint(
+                    "macho-processor: GUEST PAGE PROTECTION OVERLAY: the overlay did not enforce the console's page size, so the host's granularity now reaches the guest. Every protection change the emulator makes covers neighbouring guest pages, and a write watch or a guard page is only as precise as the host page\n",
+                    .{},
+                );
+            } else {
+                machoCapturePrint(
+                    "macho-processor: GUEST PAGE PROTECTION OVERLAY: the proof could not be carried out here, so the overlay is unproven rather than broken. The host's page granularity is reported uncompensated below because nothing has shown otherwise, not because anything failed\n",
+                    .{},
+                );
+            }
+        }
+
+        const totals = report.summary();
+        machoCapturePrint(
+            "macho-processor: HOST CAPABILITY: probed={d} verified={d} degraded={d} compensated={d} failed={d} foundational_failures={d} fidelity_failures={d} probe_ms={d}; {s}\n",
+            .{
+                totals.probed,
+                totals.verified,
+                totals.degraded,
+                totals.compensated,
+                totals.failed,
+                totals.foundational_failures,
+                totals.fidelity_failures,
+                report.elapsed_ns / std.time.ns_per_ms,
+                totals.describe(),
+            },
+        );
+        for (capability.allCapabilities()) |which| {
+            const found = report.finding(which);
+            machoCapturePrint(
+                "  host-capability {s: <10} {s: <14} {s: <34} measured={d}{s} requested={d}{s} owner={s}\n",
+                .{
+                    found.outcome.label(),
+                    which.severity().label(),
+                    which.label(),
+                    found.measured_value,
+                    which.unit(),
+                    found.requested_value,
+                    which.unit(),
+                    which.dependant(),
+                },
+            );
+            if (found.outcome == .verified or found.outcome == .unprobed) continue;
+            // A degraded magnitude whose compensator is verified is a fact
+            // about the machine. Printing it in the same shape as a finding is
+            // how a permanent platform property becomes a standing accusation
+            // against the run, so the two say different things.
+            if (report.compensationHolds(which)) {
+                const paired = which.compensatedBy().?;
+                machoCapturePrint(
+                    "    host-capability {s} (compensated): the shortfall is made up by {s}, measured at {d}{s}. This row is a property of this machine and not a finding against the run\n",
+                    .{
+                        found.outcome.label(),
+                        paired.label(),
+                        report.finding(paired).measured_value,
+                        paired.unit(),
+                    },
+                );
+                continue;
+            }
+            machoCapturePrint(
+                "    host-capability {s}: {s}\n",
+                .{ found.outcome.label(), which.failureLooksLike() },
+            );
+            machoCapturePrint(
+                "    host-capability {s} owner={s}\n",
+                .{ found.outcome.label(), which.shortfallOwner() },
+            );
+        }
+        // The timed-wait overshoot is the only number that can tell a slow
+        // machine from a slow emulated clock, so the timeout ledger is given it
+        // rather than left to guess.
+        self.timeout_fidelity.noteHostOvershoot(
+            report.finding(.timed_wait_fidelity).measured_value,
+        );
+    }
+
+    /// Whether a guest deadline means what the guest thinks it means.
+    fn logTimeoutFidelity(self: *MachOState) void {
+        const ledger = &self.timeout_fidelity;
+        if (ledger.samples == 0) return;
+        const found = ledger.verdict();
+        machoCapturePrint(
+            "macho-processor: TIMEOUT FIDELITY: verdict={s} attribution={s} samples={d} requested_ms={d} observed_ms={d} ratio={d}% host_overshoot_us={d} worst(object/requested_ms/observed_ms)=0x{x}/{d}/{d} step={d}; {s}\n",
+            .{
+                found.label(),
+                ledger.attribution().label(),
+                ledger.samples,
+                ledger.requested_ms_total,
+                ledger.observed_ms_total,
+                ledger.ratioPercent(),
+                ledger.host_overshoot_us,
+                ledger.worst_object,
+                ledger.worst_requested_ms,
+                ledger.worst_observed_ms,
+                self.executed_steps,
+                found.describe(),
+            },
+        );
+        machoCapturePrint(
+            "  timeout fidelity source: observed durations are the emulator's own measure of how long each wait took, so this ratio is only as good as the clock it measured them with. The host overshoot beside it was measured directly by the capability probe and is the one number here that is not the emulator's\n",
+            .{},
+        );
+    }
+
+    /// The graphics report a reader should look at first.
+    ///
+    /// One verdict line naming one boundary and one owner, then the evidence
+    /// conflicts, then the completion routes, then what the producer thread did
+    /// next. Everything else in the graphics block is detail underneath this.
+    pub fn logGraphicsBoundaryGate(self: *MachOState) void {
+        const bringup = gpu.bringup_gate;
+        const at_step = self.executed_steps;
+        self.syncGraphicsBoundaryGate();
+        const verdict = self.gpu_bringup_gate.verdict(at_step);
+        machoCapturePrint(
+            "macho-processor: GPU BOUNDARY GATE: finding={s} boundary={s} owner={s} phase={s} crossed={d}/{d} watched={d} actionable={d} observer_holes={d} inversions={d} step={d}; {s}\n",
+            .{
+                verdict.finding.label(),
+                if (verdict.subject) |which| which.label() else "<none>",
+                if (verdict.owner()) |who| who.label() else "-",
+                if (verdict.phase()) |which| which.label() else "-",
+                verdict.crossed,
+                verdict.total,
+                verdict.watched,
+                verdict.actionable,
+                verdict.holes,
+                verdict.inversions,
+                at_step,
+                verdict.describe(),
+            },
+        );
+        if (verdict.subject) |which| {
+            const record = self.gpu_bringup_gate.recordFor(which);
+            if (self.gpu_bringup_gate.state(which, at_step) == .stalled_after_crossing) {
+                machoCapturePrint(
+                    "  GPU BOUNDARY GATE SUBJECT: {s} crossed {d}x, first_step={d} last_step={d} quiet_for={d} thread=0x{x}; {s}\n",
+                    .{
+                        which.label(),
+                        record.hits,
+                        record.first_step,
+                        record.last_step,
+                        self.gpu_bringup_gate.quietFor(which, at_step),
+                        record.first_thread,
+                        which.silenceMeans(),
+                    },
+                );
+                // `silenceMeans()` for the write-pointer boundary ends with
+                // "find which object the publishing thread parked on". The
+                // producer tracker had already decided, in the same report,
+                // that the thread this line names is not the submission loop:
+                // the boundary fires on whichever thread performed the store.
+                // Sending a reader after that thread's parks is sending them
+                // after a thread that has none. Where the tracker says the
+                // attribution is wrong, the directive is withdrawn here rather
+                // than left standing beside the verdict that contradicts it.
+                if (which == .write_pointer_updated) {
+                    const producer = self.gpu_producer_stall.verdict(at_step);
+                    if (producer == .misattributed or producer == .producer_unknown) {
+                        machoCapturePrint(
+                            "  GPU BOUNDARY GATE ATTRIBUTION: producer_verdict={s} named_thread=0x{x}; the thread named above performed the store and is not known to be the submission loop, so do not go looking for its parks. {s}\n",
+                            .{
+                                producer.label(),
+                                record.first_thread,
+                                producer.describe(),
+                            },
+                        );
+                    }
+                }
+            } else {
+                machoCapturePrint(
+                    "  GPU BOUNDARY GATE SUBJECT: {s} watchers={d} requirement={s}; {s}\n",
+                    .{
+                        which.label(),
+                        record.watchers,
+                        which.requirement().label(),
+                        which.absenceMeans(),
+                    },
+                );
+            }
+        }
+        inline for (@typeInfo(bringup.Phase).@"enum".fields) |field| {
+            const phase: bringup.Phase = @enumFromInt(field.value);
+            const progress = self.gpu_bringup_gate.phaseProgress(phase);
+            machoCapturePrint(
+                "  gpu-phase {s: <13} crossed={d}/{d} watched={d}{s}\n",
+                .{
+                    phase.label(),
+                    progress.crossed,
+                    progress.total,
+                    progress.watched,
+                    if (progress.blind()) " BLIND: nothing in this phase is observed, so its zero is Rosette's" else "",
+                },
+            );
+        }
+        // The full table only when the crossed set moved. Thirty-four rows on
+        // every checkpoint is a second log, and the rows that did not change
+        // are the ones a reader has already read.
+        const crossed_mask: u64 = self.gpu_bringup_gate.crossedMask();
+        const table_changed = self.gpu_gate_detail_mask != crossed_mask;
+        self.gpu_gate_detail_mask = crossed_mask;
+        for (bringup.contractBoundaries()) |boundary| {
+            const state = self.gpu_bringup_gate.state(boundary, at_step);
+            if (!table_changed and !state.actionable()) continue;
+            if (!table_changed and boundary.requirement() == .optional) continue;
+            const record = self.gpu_bringup_gate.recordFor(boundary);
+            // How much of the armed surface was actually reached.
+            //
+            // `hits=0` reads as "the title never did this" and can equally mean
+            // "armed on addresses the call never passes through". A boundary
+            // armed on six addresses and reached on none is an observer hole
+            // wearing the costume of a silent guest, and that mistake put the
+            // 2026-09-05 frontier on VdQueryVideoMode while the guest log said
+            // it had been called. The pair is what separates them.
+            const coverage = self.execution_tracepoints.boundaryAddressCoverage(
+                @intFromEnum(boundary),
+            );
+            machoCapturePrint(
+                "  gpu-boundary {s: <16} {s: <10} {s: <45} owner={s: <28} watchers={d} entries={d} addresses(armed/reached)={d}/{d} crossings={d} first={d} last={d}\n",
+                .{
+                    boundary.phase().label(),
+                    state.label(),
+                    boundary.label(),
+                    boundary.owner().label(),
+                    record.watchers,
+                    record.hits,
+                    coverage.armed,
+                    coverage.reached,
+                    self.execution_tracepoints.boundaryCrossings(@intFromEnum(boundary)),
+                    record.first_step,
+                    record.last_step,
+                },
+            );
+        }
+        self.logDrawAttrition();
+        self.logCompletionRoutes();
+        self.logProducerStall();
+        self.logGraphicsEvidence();
+    }
+
+    /// What became of the draws between entering the command processor and
+    /// reaching a render target.
+    ///
+    /// The two ends are Rosette's, read from the instruction pointer. The
+    /// middle is the emulator's, and until it was counted a run could say
+    /// twenty-four draws happened and could not say that none of them rendered.
+    fn logDrawAttrition(self: *MachOState) void {
+        const issued = self.gpu_bringup_gate.recordFor(.issue_draw);
+        const bound = self.gpu_bringup_gate.recordFor(.render_target_update);
+        if (!issued.crossed() and self.gpu_draws_entered == 0) return;
+        const lost = issued.hits -| bound.hits;
+        machoCapturePrint(
+            "macho-processor: GPU DRAW ATTRITION: entered={d} reached_render_target={d} lost={d} emulator_ledger(draws/reached/early/defects)={d}/{d}/{d}/{d} named_exits={d} first_exit={s} first_exit_step={d} step={d}; {s}\n",
+            .{
+                issued.hits,
+                bound.hits,
+                lost,
+                self.gpu_draws_entered,
+                self.gpu_draws_reached_render_target,
+                self.gpu_draw_early_exits,
+                self.gpu_draw_defect_exits,
+                self.gpu_draw_exits_named,
+                if (self.gpu_draw_first_exit_length != 0)
+                    self.gpu_draw_first_exit[0..self.gpu_draw_first_exit_length]
+                else
+                    "<none>",
+                self.gpu_draw_first_exit_step,
+                self.executed_steps,
+                if (issued.hits == 0)
+                    "no draw has entered the command processor, so there is no attrition to explain"
+                else if (lost == 0)
+                    "every draw that entered reached a render target"
+                else if (self.gpu_draw_defect_exits != 0)
+                    "draws are being dropped and the emulator classifies at least one of the reasons as its own failure. That reason is the graphics frontier, and the draw counter climbing is what makes it look like rendering is happening"
+                else if (self.gpu_draw_exits_named != 0)
+                    "draws are being dropped for reasons the emulator classifies as the title's — a draw with rasterization disabled and no memory export legitimately has no effect. A whole batch of those is a title programming state, not a title failing to render, and the next question is what it is waiting for before it submits one that does"
+                else
+                    "draws entered and did not reach a render target, and the emulator has not said why. Its per-exit ledger is not in this log, so this gap is unattributed rather than explained",
+            },
+        );
+        if (issued.hits == 0) return;
+        // Whether the render-target component is being counted as something the
+        // guest depends on, and why. Printed because withholding a dependency
+        // is a decision, and a decision that changes which owner a readiness
+        // report names has to be auditable rather than inferred from its
+        // absence.
+        const exits_are_title_owned =
+            self.gpu_draw_exits_named != 0 and self.gpu_draw_defect_exits == 0;
+        const reached = bound.crossed() or self.gpu_draws_reached_render_target != 0;
+        machoCapturePrint(
+            "  DRAW ATTRITION DEPENDENCY: render_target_binding counted_as_used={s} named_exits={d} defect_exits={d} reached={s}; {s}\n",
+            .{
+                if (reached or !exits_are_title_owned) "YES" else "NO",
+                self.gpu_draw_exits_named,
+                self.gpu_draw_defect_exits,
+                if (reached) "YES" else "NO",
+                if (reached)
+                    "a draw reached the render target cache, so the component is genuinely on the path"
+                else if (exits_are_title_owned)
+                    "every exit the emulator has named is one it classifies as the title's own, and those draws leave before the render target cache is consulted. The component is not on this batch's path, so it is not reported as a dependency the guest is running on unproven — the frontier is what the title is waiting for before it submits a draw that renders"
+                else
+                    "no exit reason has been named, so the gap is unattributed. An unattributed gap does not excuse the dependency: the component stays counted as used and unproven until the emulator says why the draws stopped short",
+            },
+        );
+    }
+
+    fn logCompletionRoutes(self: *MachOState) void {
+        const completion = gpu.completion_route;
+        const routes = &self.gpu_completion_routes;
+        const at_step = self.executed_steps;
+        const verdict = routes.verdict(at_step);
+        machoCapturePrint(
+            "macho-processor: GPU COMPLETION ROUTE: verdict={s} requested={d}/{d} established={d}/{d} live={d}/{d} deliveries={d} step={d}; {s}\n",
+            .{
+                verdict.label(),
+                routes.requestedCount(),
+                completion.route_count,
+                routes.establishedCount(),
+                routes.requestedCount(),
+                routes.liveCount(),
+                routes.requestedCount(),
+                routes.totalDeliveries(),
+                at_step,
+                verdict.describe(),
+            },
+        );
+        const all_routes = comptime blk: {
+            var out: [completion.route_count]completion.Route = undefined;
+            for (&out, 0..) |*slot, index| slot.* = @enumFromInt(index);
+            break :blk out;
+        };
+        for (all_routes) |route| {
+            const status = routes.status(route);
+            if (!status.requested) {
+                machoCapturePrint(
+                    "  gpu-route {s: <28} requested=NO established=NO live=NO; the title did not select this optional completion route, so it is not a missing capability\n",
+                    .{route.label()},
+                );
+                continue;
+            }
+            machoCapturePrint(
+                "  gpu-route {s: <28} requested=YES established={s} live={s} address=0x{x:0>8} attempts={d} deliveries={d} value(first/last/changed)=0x{x}/0x{x}/{s} observation={s} polled={s} owner={s}\n",
+                .{
+                    route.label(),
+                    if (status.established) "YES" else "NO",
+                    if (status.liveFor(route)) "YES" else "NO",
+                    status.address,
+                    status.attempts,
+                    status.deliveries,
+                    status.first_value,
+                    status.last_value,
+                    if (!status.value_seen) "UNSAMPLED" else if (status.value_changed) "YES" else "NO",
+                    route.valueObservation(),
+                    if (route.deliversByValueChange()) "YES" else "NO",
+                    route.deliveryOwner(),
+                },
+            );
+            // `value(first/last/changed)=0x0/0x0/NO` reads identically for a
+            // value that was sampled and never moved and one that was never
+            // sampled at all, and those are opposite conclusions. Only the
+            // first is a finding about the emulator; the second is a hole in
+            // Rosette.
+            if (route.deliversByValueChange() and !status.value_seen and route.hasGuestAddress()) {
+                machoCapturePrint(
+                    "    gpu-route VALUE UNSAMPLED: this route reaches the title by a value it polls and Rosette has never read that value. Its `changed=NO` above describes the observer, not the route, and nothing below may be concluded from it\n",
+                    .{},
+                );
+            } else if (route.deliversByValueChange() and !status.value_seen) {
+                machoCapturePrint(
+                    "    gpu-route VALUE OBSERVATION: this route has no guest-visible address in the contract; delivery is established from its named boundary and no guest counter value is being fabricated\n",
+                    .{},
+                );
+            }
+            if (status.inert()) {
+                machoCapturePrint("    gpu-route INERT: {s}\n", .{route.inertMeans()});
+            }
+            if (status.deliveredWithoutChange(route)) {
+                machoCapturePrint(
+                    "    gpu-route DELIVERED-WITHOUT-CHANGE: this route reaches the title by a value it polls, the emulator has written it {d} time(s), and the value has been 0x{x} every time. A title polling this saw nothing happen. Find what computes the value, not what delivers it\n",
+                    .{ status.deliveries, status.last_value },
+                );
+            }
+        }
+        const registration = self.gpu_bringup_gate.recordFor(.set_interrupt_callback);
+        if (registration.crossed() and
+            self.gpu_interrupt_slot_writes == 0 and
+            self.interrupt_callback_transaction.callback_address == 0)
+        {
+            machoCapturePrint(
+                "macho-processor: GPU COMPLETION ROUTE ADDRESS UNKNOWN: the title entered VdSetGraphicsInterruptCallback at step {d} and Rosette never observed the address it passed, so this route reads established=NO for a registration that did happen. That zero is the observer's, not the title's — wire the argument capture before concluding anything about the callback\n",
+                .{registration.first_step},
+            );
+        }
+        // The interrupt callback slot holds one address, and two different
+        // parties can put one there. The emulator's macOS fork installs a
+        // Xenia-owned host callback when the title has not registered one, and
+        // from that moment the two are indistinguishable in every counter: the
+        // null check inside the interrupt dispatch stops firing, dispatches
+        // begin "succeeding", and "the title registered a callback" becomes
+        // unanswerable. Say which one is in there.
+        const title_callback = self.interrupt_callback_transaction.callback_address;
+        const host_callback = self.host_interrupt_callback_transaction.callback_address;
+        const occupancy = self.gpu_completion_routes.status(.interrupt_callback);
+        if (self.gpu_interrupt_slot_writes != 0) {
+            machoCapturePrint(
+                "macho-processor: GPU INTERRUPT SLOT: address=0x{x:0>8} user_data=0x{x:0>8} owner={s} writes={d} last_write_step={d}; the slot holds one address and this is the newest statement of it. Every earlier reading in this log is a snapshot of a slot that has since changed hands\n",
+                .{
+                    self.gpu_interrupt_slot_address,
+                    self.gpu_interrupt_slot_user_data,
+                    if (self.gpu_interrupt_slot_is_guest) "guest:title" else "emulator:host-builtin",
+                    self.gpu_interrupt_slot_writes,
+                    self.gpu_interrupt_slot_step,
+                },
+            );
+            machoCapturePrint(
+                "macho-processor: GPU INTERRUPT SLOT HISTORY: transitions={d} guest_writes={d} host_writes={d} current(address/owner/step)=0x{x:0>8}/{s}/{d} previous(address/owner/step)=0x{x:0>8}/{s}/{d}; current occupancy is authoritative for dispatch, while previous occupancy explains stale checkpoint lines and cannot satisfy the title callback boundary\n",
+                .{
+                    self.gpu_interrupt_slot_transitions,
+                    self.gpu_interrupt_slot_guest_writes,
+                    self.gpu_interrupt_slot_host_writes,
+                    self.gpu_interrupt_slot_address,
+                    if (self.gpu_interrupt_slot_is_guest) "guest:title" else "emulator:host-builtin",
+                    self.gpu_interrupt_slot_step,
+                    self.gpu_interrupt_slot_previous_address,
+                    if (self.gpu_interrupt_slot_previous_is_guest) "guest:title" else "emulator:host-builtin",
+                    self.gpu_interrupt_slot_previous_step,
+                },
+            );
+        }
+        if (host_callback != 0 and !self.gpu_interrupt_slot_is_guest) {
+            machoCapturePrint(
+                "macho-processor: GPU COMPLETION ROUTE OCCUPANCY: the graphics interrupt slot holds a Xenia-owned host callback 0x{x:0>8} (host registrations={d}, attempts={d}, returns={d}); the title's own registration is 0x{x:0>8} (registrations={d}). A host callback in this slot disables the null guard in the emulator's interrupt dispatch and makes 'the title registered a callback' unanswerable from any counter — read the boundary gate's {s} row instead\n",
+                .{
+                    host_callback,
+                    self.host_interrupt_callback_transaction.registrations,
+                    self.host_interrupt_callback_transaction.dispatch_attempts,
+                    self.host_interrupt_callback_transaction.callback_returns,
+                    title_callback,
+                    self.interrupt_callback_transaction.registrations,
+                    gpu.bringup_gate.Boundary.set_interrupt_callback.label(),
+                },
+            );
+            machoCapturePrint(
+                "  gpu-route occupancy: foreign_deliveries={d} title_deliveries={d} title_boundary_crossed={s} title_boundary_step={d}; a dispatch into the occupant is a real event and it is not the title's completion, so it is counted apart from the deliveries that would make this route live\n",
+                .{
+                    occupancy.foreign_deliveries,
+                    occupancy.deliveries,
+                    if (registration.crossed()) "YES" else "NO",
+                    registration.first_step,
+                },
+            );
+        }
+    }
+
+    fn logProducerStall(self: *MachOState) void {
+        const tracker = &self.gpu_producer_stall;
+        const at_step = self.executed_steps;
+        const verdict = tracker.verdict(at_step);
+        machoCapturePrint(
+            "macho-processor: GPU PRODUCER: verdict={s} thread=0x{x} publications={d} published_at={d} quiet_for={d} waits_after_publish={d} returns={d} distinct_objects={d} step={d}; {s}\n",
+            .{
+                verdict.label(),
+                tracker.producer_thread,
+                tracker.publications,
+                tracker.published_at_step,
+                tracker.quietFor(at_step),
+                tracker.waits_after_publish,
+                tracker.returns_after_publish,
+                tracker.distinctObjects(),
+                at_step,
+                verdict.describe(),
+            },
+        );
+        if (tracker.elsewhere_events != 0) {
+            machoCapturePrint(
+                "  gpu-producer ELSEWHERE: {d} guest observation(s) on {d} other thread(s) since publication",
+                .{ tracker.elsewhere_events, tracker.busyElsewhere().len },
+            );
+            for (tracker.busyElsewhere()) |thread| {
+                machoCapturePrint(" 0x{x}", .{thread});
+            }
+            machoCapturePrint(
+                "; the guest is running. A silent attributed thread beside these is a statement about the attribution and not about the run\n",
+                .{},
+            );
+        }
+        if (tracker.outstanding) |sample| {
+            machoCapturePrint(
+                "  gpu-producer OUTSTANDING WAIT: object=0x{x} handle=0x{x} pc=0x{x} since_step={d}; this is the wait to break, and whatever should have signalled that object is the thing to find\n",
+                .{ sample.object, sample.handle, sample.pc, sample.step },
+            );
+        }
+        var sites: [gpu.producer_stall.capacity]gpu.producer_stall.Site = undefined;
+        for (tracker.sites(&sites)) |site| {
+            machoCapturePrint(
+                "  gpu-producer site pc=0x{x} waits={d}\n",
+                .{ site.pc, site.count },
+            );
+        }
+    }
+
+    fn logGraphicsEvidence(self: *MachOState) void {
+        const evidence = gpu.evidence_grade;
+        const ledger = &self.gpu_evidence;
+        machoCapturePrint(
+            "macho-processor: GRAPHICS EVIDENCE: claims={d} established={d} unsafe={d} live_conflicts={d} stale_negatives={d}; a subject below the established count is one a reader may build on. The rest are either a weak claim a stronger observer denies, or an absence only a weak observer noticed — and neither supports a conclusion\n",
+            .{
+                ledger.claims,
+                ledger.establishedSubjects(),
+                ledger.unsafeSubjects(),
+                ledger.conflicts(),
+                ledger.staleClaims(),
+            },
+        );
+        const all_subjects = comptime blk: {
+            var out: [evidence.subject_count]evidence.Subject = undefined;
+            for (&out, 0..) |*slot, index| slot.* = @enumFromInt(index);
+            break :blk out;
+        };
+        // Every subject, every round.
+        //
+        // This used to skip the unobserved ones and the clean established
+        // ones, so a run with three hundred and ninety-two claims printed
+        // twelve rows and a reader could not tell an unmet subject from one
+        // the roster does not contain. Which subjects are satisfied, which are
+        // refuted and which nothing has looked at are three different answers,
+        // and the ones that print nothing are exactly the ones a reader cannot
+        // reconstruct. The roster is a fixed, bounded list, so printing all of
+        // it costs a line each and removes the guessing.
+        for (all_subjects) |subject| {
+            const finding = ledger.finding(subject);
+            machoCapturePrint(
+                "  evidence {s: <20} {s: <40} believable={s} authority={s}/{s} step={d} magnitude={d} stale_negatives={d}; {s}\n",
+                .{
+                    finding.standing.label(),
+                    subject.label(),
+                    if (finding.standing.believable()) "YES" else "NO",
+                    finding.authority.tier.label(),
+                    if (finding.authority.observer.len != 0) finding.authority.observer else "<none>",
+                    finding.authority.step,
+                    finding.authority.magnitude,
+                    finding.stale_negatives,
+                    finding.standing.describe(),
+                },
+            );
+            if (finding.standing == .contested) {
+                machoCapturePrint(
+                    "    GRAPHICS EVIDENCE CONFLICT: {s} — {s} ({s}, step {d}) claims it and {s} ({s}, step {d}) looked later and did not see it. {s}\n",
+                    .{
+                        subject.label(),
+                        finding.authority.observer,
+                        finding.authority.tier.label(),
+                        finding.authority.step,
+                        finding.challenger.observer,
+                        finding.challenger.tier.label(),
+                        finding.challenger.step,
+                        finding.standing.describe(),
+                    },
+                );
+            }
+        }
+    }
+
     /// Why the frame boundary is not being reached, joined from the three
     /// subsystems that each hold one third of the answer.
     ///
@@ -10626,19 +18166,31 @@ pub const MachOState = struct {
             self.guest_log_cycles.active()
         else
             false;
-        const assessment = swap_health.assess(
+        const livelock_seen = if (comptime @hasField(MachOState, "guest_log_cycles"))
+            self.guest_log_cycles.hasHistory()
+        else
+            false;
+        const producer_verdict = self.gpu_producer_stall.verdict(self.executed_steps);
+        const attribution: swap_health.Attribution = switch (producer_verdict) {
+            .attribution_lost, .producer_unknown, .misattributed => .lost,
+            else => .known,
+        };
+        const assessment = swap_health.assessWithAttribution(
             publication.writes,
             publication.advances,
             publication.published(),
             publication.stalledSteps(self.executed_steps),
             livelocked,
             swap_seen,
+            attribution,
         );
         machoCapturePrint(
-            "macho-processor: SWAP HEALTH: blocker={s} producer={s} step={d} wptr(writes/advances/repeats)={d}/{d}/{d} published={s} last_advance_step={d} quiet_for={d} largest_span_dwords={d} consumed_batch(dwords/packets/draws/swaps)={d}/{d}/{d}/{d} consumed_steps={d}/{d} guest_livelocked={s} swap_seen={s}; {s}\n",
+            "macho-processor: SWAP HEALTH: blocker={s} producer={s} attribution={s} producer_verdict={s} step={d} wptr(writes/advances/repeats)={d}/{d}/{d} published={s} last_advance_step={d} quiet_for={d} largest_span_dwords={d} consumed_batch(dwords/packets/draws/swaps)={d}/{d}/{d}/{d} consumed_steps={d}/{d} guest_livelocked={s} guest_livelock_seen={s} swap_seen={s}; {s}\n",
             .{
                 assessment.blocker.label(),
                 @tagName(assessment.producer),
+                assessment.producer_attribution.label(),
+                producer_verdict.label(),
                 self.executed_steps,
                 publication.writes,
                 publication.advances,
@@ -10654,6 +18206,7 @@ pub const MachOState = struct {
                 publication.first_consumed_step,
                 publication.last_consumed_step,
                 if (assessment.guest_livelocked) "YES" else "NO",
+                if (livelock_seen) "YES" else "NO",
                 if (assessment.swap_seen) "YES" else "NO",
                 assessment.blocker.guidance(),
             },
@@ -10729,6 +18282,74 @@ pub const MachOState = struct {
         }
         if (self.gpu_vd_swap_contract.observed(.authentic_xe_swap_consumed)) {
             self.xenia_gpu_causal_trace.observeEvidence(.authentic_swap_consumed, at);
+        }
+    }
+
+    /// Print the reconciliation between guest bootstrap breadcrumbs and the
+    /// instruction-trace gate. This is the missing context behind the current
+    /// `VdInitializeEngines` callsite-probe miss: the probe is a search aid,
+    /// while the concrete guest call is execution evidence.
+    fn logGpuBootstrapProvenance(self: *MachOState, force: bool) void {
+        const ledger = &self.gpu_bootstrap_provenance;
+        const fingerprint = ledger.stableFingerprint();
+        if (!force and fingerprint == self.gpu_bootstrap_provenance_last_fingerprint) return;
+        self.gpu_bootstrap_provenance_last_fingerprint = fingerprint;
+        const summary = ledger.summary();
+        machoCapturePrint(
+            "macho-processor: GPU BOOTSTRAP PROVENANCE: sources(guest/trace/corroborated/guest-only/guest-only-callsite-blind/trace-only/callsite-blind/configured)={d}/{d}/{d}/{d}/{d}/{d}/{d}/{d} fingerprint=0x{x} step={d}; guest breadcrumbs and IP tracepoints remain separate authorities; a callsite probe miss never retracts a concrete guest event\n",
+            .{
+                summary.guest_observed,
+                summary.trace_observed,
+                summary.corroborated,
+                summary.guest_only,
+                summary.guest_only_callsite_blind,
+                summary.trace_only,
+                summary.callsite_blind,
+                summary.configured,
+                fingerprint,
+                self.executed_steps,
+            },
+        );
+        var bootstrap_index: usize = 0;
+        while (bootstrap_index < gpu.bootstrap.step_count) : (bootstrap_index += 1) {
+            const bootstrap_step: gpu.Step = @enumFromInt(bootstrap_index);
+            const item = ledger.record(bootstrap_step);
+            // A callsite-only miss is an observation hole of its own. Keep its
+            // row even when no guest breadcrumb or tracepoint exists, so the
+            // summary's callsite-blind count always has concrete witnesses.
+            if (item.finding() == .unobserved and
+                !item.configured() and
+                !item.callsiteObserved())
+                continue;
+            machoCapturePrint(
+                "  bootstrap-provenance step={s} finding={s} guest(count/first/last)={d}/{d}/{d} trace(count/first/last)={d}/{d}/{d} callsite(probes/first/last/pc/lr/ctr/branch/near-bl/entry-bctrl/near-refs/entry-refs)={d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}/{d} configured(count/first/last/mapped)={d}/{d}/{d}/{d}; {s}\n",
+                .{
+                    bootstrap_step.label(),
+                    item.finding().label(),
+                    item.guest_count,
+                    item.guest_first_step,
+                    item.guest_last_step,
+                    item.trace_count,
+                    item.trace_first_step,
+                    item.trace_last_step,
+                    item.callsite_probe_count,
+                    item.callsite_first_step,
+                    item.callsite_last_step,
+                    item.callsite_pc_hits,
+                    item.callsite_lr_hits,
+                    item.callsite_ctr_hits,
+                    item.callsite_branch_probe_hits,
+                    item.callsite_near_direct_bl_hits,
+                    item.callsite_entry_bctrl_hits,
+                    item.callsite_near_value_ref_hits,
+                    item.callsite_entry_value_ref_hits,
+                    item.configuration_count,
+                    item.configuration_first_step,
+                    item.configuration_last_step,
+                    item.configuration_mapped_count,
+                    item.guidance(),
+                },
+            );
         }
     }
 
@@ -10808,11 +18429,11 @@ pub const MachOState = struct {
             @intFromEnum(frontier_step)
         else
             std.math.maxInt(u8);
-        var role_mask: u8 = 0;
+        var role_mask: u16 = 0;
         inline for (@typeInfo(execution_tracepoints.Role).@"enum".fields) |field| {
             const role: execution_tracepoints.Role = @enumFromInt(field.value);
             if (tracepoints.roleEntered(role)) {
-                role_mask |= @as(u8, 1) << @intCast(field.value);
+                role_mask |= @as(u16, 1) << @intCast(field.value);
             }
         }
         const ring_published = self.gpu_ring_publication.published();
@@ -10875,7 +18496,8 @@ pub const MachOState = struct {
         // diagnostic that runs on every checkpoint becomes the dominant cost
         // and the dominant source of log traffic at the same time.
         if (force or state_changed or self.graphics_summary_emissions % 16 == 0) {
-            self.logRingContents();
+            if (self.gpu_ring_last_inspection_step != self.executed_steps)
+                self.logRingContents();
             // The preinitialization ledger reads kernel-variable state. Refresh
             // that state before sampling the ledger so this report cannot lag
             // behind the variable report emitted later in the full summary.
@@ -10941,6 +18563,14 @@ pub const MachOState = struct {
                     if (ring_published) "YES" else "NO",
                 },
             );
+            self.logGraphicsBoundaryGate();
+            self.logGpuBootstrapProvenance(false);
+            self.logMandatoryOrder();
+            self.logComponentReadiness();
+            self.logPresentationProvenance(false);
+            self.logNearNullDispatchStatus(false);
+            self.logPacketCensus();
+            self.logSignalExpectation();
             self.logSwapHealth();
             self.logXeniaGpuCausalTrace(false);
             self.logVdSwapContract();
@@ -10960,12 +18590,38 @@ pub const MachOState = struct {
                 tracepoints.verdict(.swap),
             },
         );
+        // The boundary gate leads. Every report under it is detail about a
+        // pipeline whose first unmet boundary this names, and a reader who
+        // starts anywhere else spends the hour downstream of it — which is
+        // what the last three passes of this investigation did.
+        self.logGraphicsBoundaryGate();
+        self.logGpuBootstrapProvenance(force);
+        // Then what got ahead of what. A boundary that was crossed is only
+        // half the fact; whether it was crossed before the thing it depended on
+        // is the other half, and it is the half that explains twenty-four draws
+        // reaching a command processor that had no render target.
+        self.logMandatoryOrder();
+        // Readiness answers a question none of the others do: what is the run
+        // trusting that nothing has checked. It sits directly under the gate
+        // because an unproven component makes every reading below it
+        // unattributable rather than merely negative.
+        self.logComponentReadiness();
+        self.logPumpLiveness();
+        self.logPresentationProvenance(force);
+        self.logNearNullDispatchStatus(force);
+        self.logPacketCensus();
+        self.logSignalExpectation();
+        self.logTimeoutFidelity();
         self.logRunHorizon();
         self.logWaitGraph();
         self.logDrawDispatch();
         self.logTranslationEconomics();
         self.logGuestLogChannels();
         self.logClaimReconciliation();
+        self.logMonotoneWitnesses();
+        self.logGuestKernelStatus();
+        self.logUnknownInventory();
+        self.logAuditContracts();
         self.logInterruptCallbackTransaction();
         self.logRegisterJournal();
         self.logSwapHealth();
@@ -10982,11 +18638,12 @@ pub const MachOState = struct {
         // which of them the instruction pointer has reached; that set changes a
         // handful of times in a whole run, and printing the table on every
         // checkpoint costs more lines than every graphics contract combined.
-        var entered_mask: u64 = 0;
+        var entered_mask: [4]u64 = [_]u64{0} ** 4;
         for (tracepoints.entries[0..tracepoints.count], 0..) |entry, index| {
-            if (entry.hits != 0 and index < 64) entered_mask |= @as(u64, 1) << @intCast(index);
+            if (entry.hits == 0 or index >= 256) continue;
+            entered_mask[index / 64] |= @as(u64, 1) << @intCast(index % 64);
         }
-        const tracepoints_established = self.tracepoint_detail_mask == entered_mask;
+        const tracepoints_established = std.mem.eql(u64, self.tracepoint_detail_mask[0..], entered_mask[0..]);
         self.tracepoint_detail_mask = entered_mask;
         var settled_tracepoints: usize = 0;
         for (tracepoints.entries[0..tracepoints.count]) |entry| {
@@ -11002,8 +18659,8 @@ pub const MachOState = struct {
             );
         }
         if (settled_tracepoints != 0) machoCapturePrint(
-            "  tracepoint collapsed: {d} armed address(es), entered=0x{x:0>16}, unchanged since the previous checkpoint where the table printed in full. The per-role verdicts below are current on every checkpoint\n",
-            .{ settled_tracepoints, entered_mask },
+            "  tracepoint collapsed: {d} armed address(es), entered=0x{x:0>16}{x:0>16}{x:0>16}{x:0>16}, unchanged since the previous checkpoint where the table printed in full. The per-role verdicts below are current on every checkpoint\n",
+            .{ settled_tracepoints, entered_mask[3], entered_mask[2], entered_mask[1], entered_mask[0] },
         );
         inline for (@typeInfo(execution_tracepoints.Role).@"enum".fields) |field| {
             const role: execution_tracepoints.Role = @enumFromInt(field.value);
@@ -11037,6 +18694,7 @@ pub const MachOState = struct {
                 if (frontier.blocked_by) |blocked| blocked.label() else "none",
             },
         );
+        self.logBootstrapFrontierOccupation(frontier);
         self.dynamic_forwarder.logGraphicsProvenance();
         self.dynamic_forwarder.logGuestFrontBuffer();
         self.dynamic_forwarder.logVulkanTiers();
@@ -11051,6 +18709,61 @@ pub const MachOState = struct {
                 .{},
             );
         }
+    }
+
+    /// What the title is doing instead of reaching the bootstrap frontier.
+    ///
+    /// `reached=7/8 frontier=authentic PM4_XE_SWAP consumed precondition_met=true
+    /// blocked_by=none` is an accurate and complete answer to the question the
+    /// ladder asks, and it is the wrong place for a reader to stop. Everything
+    /// upstream is done, nothing is blocking, and the step has not happened —
+    /// which means the title is occupied with something else, and Rosette
+    /// already knows what: on the 2026-08-31 run a guest thread had been
+    /// polling one manual-reset event with a thirty-millisecond timeout since
+    /// step 3 250 630 268, which is within nine million steps of the ring
+    /// publication the frontier is waiting for a successor to.
+    ///
+    /// The join is only stated when the poll began at or after the producer's
+    /// last advance. A poll that predates the batch is the title's own
+    /// business; a poll that started with it is the title waiting for that
+    /// batch, and that is the next question rather than a restatement of the
+    /// frontier.
+    fn logBootstrapFrontierOccupation(
+        self: *MachOState,
+        frontier: gpu.bootstrap.Frontier,
+    ) void {
+        if (frontier.step == null) return;
+        var subject: ?wait_audit.Subject = null;
+        for (self.wait_audit.subjects[0..self.wait_audit.count]) |candidate| {
+            if (candidate.timeout_class != .bounded_poll) continue;
+            if (candidate.signals != 0 or candidate.timeouts == 0) continue;
+            if (subject == null or candidate.timeouts > subject.?.timeouts) {
+                subject = candidate;
+            }
+        }
+        const poll = subject orelse return;
+        const last_advance = self.gpu_ring_publication.last_advance_step;
+        machoCapturePrint(
+            "  BOOTSTRAP FRONTIER OCCUPATION: object=0x{x} handle=0x{x} type={d} timeout_ms={d} expiries={d} signals=0 first_poll_step={d} last_poll_step={d} producer_last_advance={d} started_with_batch={s}; {s}\n",
+            .{
+                poll.object,
+                poll.handle,
+                poll.type_code,
+                poll.timeout_ms,
+                poll.timeouts,
+                poll.first_step,
+                poll.last_step,
+                last_advance,
+                if (last_advance != 0 and poll.first_step >= last_advance -| bootstrap_poll_join_steps)
+                    "YES"
+                else
+                    "NO",
+                if (last_advance != 0 and poll.first_step >= last_advance -| bootstrap_poll_join_steps)
+                    "the title began polling this event around the same submission the frontier is waiting for a successor to, and has received nothing since. This is what it is doing instead of reaching the frontier: find the code that sets this event and confirm it was reached, rather than reading the frontier as a graphics-stack gap"
+                else
+                    "this poll predates the producer's last advance, so it is not obviously the title waiting for that batch. It is still an event nothing has signalled, and the frontier above is unexplained by it",
+            },
+        );
     }
 
     pub fn standardStreamPointer(self: *MachOState, symbol_name: []const u8) ?u64 {
@@ -12483,6 +20196,68 @@ pub const MachOState = struct {
         return self.mem[@intCast(offset)..][0..@min(@as(usize, 16), remaining)];
     }
 
+    /// Classify a successful instruction fetch without consulting mutable
+    /// sparse-page state. An address in the immutable image is static code;
+    /// the reserved high address bands are bridge/thunk code; every other
+    /// successful executable fetch is generated code. The cache never stores
+    /// an entry for an unmapped address, so treating the remaining space as
+    /// dynamic is safe and keeps the hot lookup to range compares rather than
+    /// another page-table probe.
+    inline fn translationDomainFor(self: *const MachOState, address: u64) translation_domain.Domain {
+        if (address >= self.executable_min and address < self.executable_max) return .static_image;
+        if (address >= BOUND_IMPORT_THUNK_BASE or address >= tlv_runtime.bootstrap_thunk) return .thunk_bridge;
+        return .dynamic_generated;
+    }
+
+    inline fn decodeCacheSetBaseFor(self: *const MachOState, address: u64, domain: translation_domain.Domain) usize {
+        _ = self;
+        return translation_domain.primarySetBase(address, domain);
+    }
+
+    inline fn decodeCacheSetBaseForChoice(
+        self: *const MachOState,
+        address: u64,
+        domain: translation_domain.Domain,
+        choice: usize,
+    ) usize {
+        _ = self;
+        return translation_domain.primarySetBaseChoice(address, domain, choice);
+    }
+
+    inline fn decodeCacheSetBasesFor(
+        self: *const MachOState,
+        address: u64,
+        domain: translation_domain.Domain,
+    ) [translation_cache.primary_set_choice_count]usize {
+        _ = self;
+        return translation_domain.primarySetBases(address, domain);
+    }
+
+    inline fn decodeCacheAlternateSetBaseFor(
+        self: *const MachOState,
+        address: u64,
+        domain: translation_domain.Domain,
+    ) usize {
+        return self.decodeCacheSetBaseForChoice(address, domain, 1);
+    }
+
+    inline fn decodeVictimCacheSetBaseFor(self: *const MachOState, address: u64, domain: translation_domain.Domain) usize {
+        _ = self;
+        return translation_domain.victimSetBase(address, domain);
+    }
+
+    inline fn noteDecodeDomainHit(self: *MachOState, domain: translation_domain.Domain) void {
+        self.decode_domain_hits[domain.bank()] +|= 1;
+    }
+
+    inline fn noteDecodeDomainMiss(self: *MachOState, domain: translation_domain.Domain) void {
+        self.decode_domain_misses[domain.bank()] +|= 1;
+    }
+
+    inline fn noteDecodeDomainFill(self: *MachOState, domain: translation_domain.Domain) void {
+        self.decode_domain_fills[domain.bank()] +|= 1;
+    }
+
     /// R2 (N3): single special-RIP probe replacing the 9 per-instruction
     /// handler calls (which paid ~65 compares + 1 function call on every
     /// instruction even when all inert). True only when `rip` could possibly
@@ -12672,11 +20447,150 @@ pub const MachOState = struct {
         return entry.rip != std.math.maxInt(u64) and entry.instruction_byte_count != 0;
     }
 
+    const DecodeCacheSelection = struct {
+        entry: *DecodeCacheEntry,
+        empty: bool,
+    };
+
+    const PrimaryDecodeCacheSelection = struct {
+        entry: *DecodeCacheEntry,
+        empty: bool,
+        set_base: usize,
+    };
+
+    /// Choose a way using the standalone cache contract's second-chance plus
+    /// reuse-count policy. L2 restores are hits in the translation hierarchy,
+    /// but they still need to install a copy into L1 without discarding a hot
+    /// resident merely because it is the first unmarked array element.
+    fn selectDecodeCacheWay(ways: []DecodeCacheEntry) DecodeCacheSelection {
+        var states: [translation_cache.max_replacement_ways]translation_cache.ReplacementState = undefined;
+        if (ways.len > states.len) unreachable;
+        for (ways, 0..) |candidate, index| {
+            states[index] = .{
+                .occupied = decodeCacheEntryOccupied(&candidate),
+                .recently_used = candidate.recently_used,
+                .reuse_count = candidate.reuse_count,
+            };
+        }
+        const choice = translation_cache.chooseReplacement(states[0..ways.len]) orelse unreachable;
+        if (choice.reset_reference_bits) {
+            for (ways) |*candidate| candidate.recently_used = false;
+        }
+        return .{
+            .entry = &ways[choice.index],
+            .empty = choice.empty,
+        };
+    }
+
+    /// Choose a primary destination from both independently hashed set
+    /// choices. An empty way in either set wins immediately. If both choices
+    /// are occupied, choose the set whose contract-selected victim has the
+    /// smaller reuse count, preserving the strict fail-fast response when
+    /// both sets are genuinely made entirely of reused residents.
+    fn selectPrimaryDecodeCacheSet(
+        self: *MachOState,
+        set_bases: [translation_cache.primary_set_choice_count]usize,
+    ) PrimaryDecodeCacheSelection {
+        var best: ?PrimaryDecodeCacheSelection = null;
+        for (set_bases) |set_base| {
+            const ways = self.decode_cache[set_base..][0..constants.DECODE_CACHE_WAYS];
+            const choice = selectDecodeCacheWay(ways);
+            const candidate = PrimaryDecodeCacheSelection{
+                .entry = choice.entry,
+                .empty = choice.empty,
+                .set_base = set_base,
+            };
+            if (candidate.empty) return candidate;
+            if (best == null) {
+                best = candidate;
+                continue;
+            }
+            const current = best.?;
+            if (candidate.entry.reuse_count < current.entry.reuse_count or
+                (candidate.entry.reuse_count == current.entry.reuse_count and
+                    !candidate.entry.recently_used and current.entry.recently_used))
+            {
+                best = candidate;
+            }
+        }
+        return best orelse unreachable;
+    }
+
+    /// Retain an immutable image decode in the persistent static L2. This is
+    /// intentionally independent of the generation-keyed L1: writes to
+    /// generated code must not age image entries out of the only cache that
+    /// can cheaply recover them.
+    fn saveStaticDecodeL2(self: *MachOState, source: *const DecodeCacheEntry) void {
+        if (source.domain != .static_image or !decodeCacheEntryOccupied(source)) return;
+        const set_base = translation_cache.staticL2SetBase(source.rip);
+        const ways = self.static_decode_l2[set_base..][0..constants.DECODE_STATIC_L2_WAYS];
+        var selected: ?*DecodeCacheEntry = null;
+        for (ways) |*candidate| {
+            if (candidate.rip == source.rip) {
+                selected = candidate;
+                break;
+            }
+        }
+        if (selected == null) selected = selectDecodeCacheWay(ways).entry;
+        selected.?.* = source.*;
+        selected.?.recently_used = false;
+        self.static_decode_l2_fills +|= 1;
+    }
+
+    /// Restore an image decode that was displaced from the primary set. A
+    /// static L2 hit is a translation hit: no source-byte fetch, generation
+    /// check, or decoder invocation is needed. Any primary entry displaced by
+    /// the restore still goes through the ordinary victim cache.
+    fn restoreStaticDecodeL2(
+        self: *MachOState,
+        fetch_address: u64,
+        primary_ways: []DecodeCacheEntry,
+    ) ?DecodedInsn {
+        if (self.translationDomainFor(fetch_address) != .static_image) return null;
+        const set_base = translation_cache.staticL2SetBase(fetch_address);
+        const ways = self.static_decode_l2[set_base..][0..constants.DECODE_STATIC_L2_WAYS];
+        for (ways) |*candidate| {
+            if (candidate.rip != fetch_address or candidate.domain != .static_image) continue;
+            if (!decodeCacheEntryOccupied(candidate)) {
+                candidate.* = .{};
+                continue;
+            }
+            const selection = selectDecodeCacheWay(primary_ways);
+            if (!selection.empty) self.saveDecodeCacheVictim(selection.entry);
+            selection.entry.* = candidate.*;
+            selection.entry.code_generation = self.code_generation;
+            selection.entry.recently_used = true;
+            noteDecodeCacheUse(ways, candidate);
+            noteDecodeCacheReuse(candidate);
+            noteDecodeCacheReuse(selection.entry);
+            self.static_decode_l2_hits +|= 1;
+            self.decode_cache_hits +|= 1;
+            self.noteDecodeDomainHit(.static_image);
+            return self.resolveCachedDecode(selection.entry);
+        }
+        return null;
+    }
+
+    /// Clear static L2 entries whose instruction bytes overlap a range that is
+    /// being unmapped, reprotected, or written. Static image code is expected
+    /// to be immutable, but this explicit boundary preserves correctness if a
+    /// loader or patcher changes it through a route outside noteGuestWrite.
+    pub fn invalidateStaticDecodeL2Range(self: *MachOState, address: u64, count: u64) void {
+        if (count == 0 or self.static_decode_l2.len == 0) return;
+        const end = address +| count;
+        for (self.static_decode_l2) |*entry| {
+            if (!decodeCacheEntryOccupied(entry)) continue;
+            const instruction_length = @max(@as(u64, entry.decoded.len), 1);
+            const instruction_end = entry.rip +| instruction_length;
+            if (entry.rip < end and instruction_end > address) entry.* = .{};
+        }
+    }
+
     /// Preserve a primary victim in the bounded second-level cache. This is
     /// called only on a primary replacement, never on the common hit path.
     fn saveDecodeCacheVictim(self: *MachOState, evicted: *const DecodeCacheEntry) void {
         if (!decodeCacheEntryOccupied(evicted)) return;
-        const set_base = constants.decodeVictimCacheSetBase(evicted.rip);
+        const set_base = self.decodeVictimCacheSetBaseFor(evicted.rip, evicted.domain);
         const ways = self.decode_victim_cache[set_base..][0..constants.DECODE_VICTIM_CACHE_WAYS];
         var selected: ?*DecodeCacheEntry = null;
         for (ways) |*candidate| {
@@ -12685,26 +20599,7 @@ pub const MachOState = struct {
                 break;
             }
         }
-        if (selected == null) {
-            for (ways) |*candidate| {
-                if (candidate.rip == std.math.maxInt(u64)) {
-                    selected = candidate;
-                    break;
-                }
-            }
-        }
-        if (selected == null) {
-            for (ways) |*candidate| {
-                if (!candidate.recently_used) {
-                    selected = candidate;
-                    break;
-                }
-            }
-        }
-        if (selected == null) {
-            for (ways) |*candidate| candidate.recently_used = false;
-            selected = &ways[0];
-        }
+        if (selected == null) selected = selectDecodeCacheWay(ways).entry;
         selected.?.* = evicted.*;
         // The entry has just moved tiers. Require one real secondary hit before
         // it is protected from another victim insertion.
@@ -12720,10 +20615,11 @@ pub const MachOState = struct {
         fetch_address: u64,
         destination: *DecodeCacheEntry,
     ) ?DecodedInsn {
-        const set_base = constants.decodeVictimCacheSetBase(fetch_address);
+        const domain = self.translationDomainFor(fetch_address);
+        const set_base = self.decodeVictimCacheSetBaseFor(fetch_address, domain);
         const ways = self.decode_victim_cache[set_base..][0..constants.DECODE_VICTIM_CACHE_WAYS];
         for (ways) |*candidate| {
-            if (candidate.rip != fetch_address) continue;
+            if (candidate.rip != fetch_address or candidate.domain != domain) continue;
             if (candidate.instruction_byte_count == 0) {
                 candidate.* = .{};
                 continue;
@@ -12751,6 +20647,7 @@ pub const MachOState = struct {
             destination.recently_used = true;
             noteDecodeCacheReuse(destination);
             self.decode_cache_hits +|= 1;
+            self.noteDecodeDomainHit(domain);
             self.decode_cache_victim_hits +|= 1;
             return self.resolveCachedDecode(destination);
         }
@@ -12766,31 +20663,35 @@ pub const MachOState = struct {
     /// in `decodeWithLiveOperands`.
     inline fn decodeFastPlain(self: *MachOState) ?FastPlainDecode {
         const rip = self.regs.rip;
-        const set_base = constants.decodeCacheSetBase(rip);
-        const ways = self.decode_cache[set_base..][0..constants.DECODE_CACHE_WAYS];
-        for (ways) |*candidate| {
-            if (candidate.rip == rip and
-                candidate.code_generation == self.code_generation and
-                candidate.fast_plain)
-            {
-                self.decode_cache_hits +|= 1;
-                noteDecodeCacheUse(ways, candidate);
-                noteDecodeCacheReuse(candidate);
-                var decoded = candidate.decoded;
-                if (addressNeedsLiveRegisters(decoded)) {
-                    const address_size: Size = if (decoded.has_0x67) .bits32 else .bits64;
-                    decoded.addr = x64_decoder.resolveMemoryAddress(&self.regs, .{
-                        .displacement = candidate.displacement,
-                        .has_index = decoded.sib_has_index,
-                        .index_reg = decoded.sib_index_reg,
-                        .scale = decoded.sib_scale,
-                        .has_base = decoded.sib_has_base,
-                        .base_reg = decoded.sib_base_reg,
-                        .rip_relative = decoded.rip_relative,
-                        .segment = decoded.segment,
-                    }, self.regs.rip +% decoded.len, address_size, .long64, decoded.op != .lea_reg_mem);
+        const domain = self.translationDomainFor(rip);
+        const set_bases = self.decodeCacheSetBasesFor(rip, domain);
+        for (set_bases) |set_base| {
+            const ways = self.decode_cache[set_base..][0..constants.DECODE_CACHE_WAYS];
+            for (ways) |*candidate| {
+                if (candidate.rip == rip and candidate.domain == domain and
+                    candidate.code_generation == self.code_generation and
+                    candidate.fast_plain)
+                {
+                    self.decode_cache_hits +|= 1;
+                    self.noteDecodeDomainHit(domain);
+                    noteDecodeCacheUse(ways, candidate);
+                    noteDecodeCacheReuse(candidate);
+                    var decoded = candidate.decoded;
+                    if (addressNeedsLiveRegisters(decoded)) {
+                        const address_size: Size = if (decoded.has_0x67) .bits32 else .bits64;
+                        decoded.addr = x64_decoder.resolveMemoryAddress(&self.regs, .{
+                            .displacement = candidate.displacement,
+                            .has_index = decoded.sib_has_index,
+                            .index_reg = decoded.sib_index_reg,
+                            .scale = decoded.sib_scale,
+                            .has_base = decoded.sib_has_base,
+                            .base_reg = decoded.sib_base_reg,
+                            .rip_relative = decoded.rip_relative,
+                            .segment = decoded.segment,
+                        }, self.regs.rip +% decoded.len, address_size, .long64, decoded.op != .lea_reg_mem);
+                    }
+                    return .{ .decoded = decoded, .host_image = candidate.host_image };
                 }
-                return .{ .decoded = decoded, .host_image = candidate.host_image };
             }
         }
         return null;
@@ -12811,24 +20712,42 @@ pub const MachOState = struct {
         // returns 0 for every segment but FS and GS (see addressing.zig). The
         // call was two compares and a load per instruction to add zero.
         const fetch_address = self.regs.rip;
-        // Set-associative lookup. Direct-mapped, two hot instructions whose
-        // addresses hash together evicted each other on every execution and
-        // never recovered — a permanent conflict miss for code that is
-        // otherwise perfectly cacheable. Two ways at the same total size fixes
-        // the pair case, which is the common one.
-        const set_base = constants.decodeCacheSetBase(fetch_address);
-        const ways = self.decode_cache[set_base..][0..constants.DECODE_CACHE_WAYS];
-        var entry: *DecodeCacheEntry = &ways[0];
+        // Set-associative lookup with two independently hashed choices.
+        // Direct-mapped, two hot instructions whose addresses hash together
+        // evicted each other on every execution and never recovered — a
+        // permanent conflict miss for code that is otherwise perfectly
+        // cacheable. The sibling choice lets a usable set absorb an unlucky
+        // bucket without relaxing the fail-fast rule for a genuinely full
+        // working set. Sixteen ways still keeps rare same-set startup bursts
+        // from displacing a reusable immutable decode.
+        const domain = self.translationDomainFor(fetch_address);
+        const set_bases = self.decodeCacheSetBasesFor(fetch_address, domain);
+        var set_base: usize = set_bases[0];
+        var ways: []DecodeCacheEntry = undefined;
+        var entry: *DecodeCacheEntry = undefined;
         var main_entry_found = false;
-        for (ways) |*candidate| {
-            if (candidate.rip == fetch_address) {
-                entry = candidate;
-                main_entry_found = true;
-                break;
+        for (set_bases) |candidate_set_base| {
+            const candidate_ways = self.decode_cache[candidate_set_base..][0..constants.DECODE_CACHE_WAYS];
+            for (candidate_ways) |*candidate| {
+                if (candidate.rip == fetch_address and candidate.domain == domain) {
+                    entry = candidate;
+                    ways = candidate_ways;
+                    set_base = candidate_set_base;
+                    main_entry_found = true;
+                    break;
+                }
             }
+            if (main_entry_found) break;
         }
+        var selected: ?PrimaryDecodeCacheSelection = null;
         if (!main_entry_found) {
+            const destination = self.selectPrimaryDecodeCacheSet(set_bases);
+            selected = destination;
+            entry = destination.entry;
+            set_base = destination.set_base;
+            ways = self.decode_cache[set_base..][0..constants.DECODE_CACHE_WAYS];
             if (self.restoreDecodeCacheVictim(fetch_address, entry)) |decoded| return decoded;
+            if (self.restoreStaticDecodeL2(fetch_address, ways)) |decoded| return decoded;
         }
         // P0-2 (perf audit): generation-keyed fast path. Every executable
         // write bumps self.code_generation (noteGuestWrite) and precisely
@@ -12841,6 +20760,7 @@ pub const MachOState = struct {
         // takes the fast path again.
         if (entry.rip == fetch_address and entry.code_generation == self.code_generation) {
             self.decode_cache_hits +|= 1;
+            self.noteDecodeDomainHit(domain);
             noteDecodeCacheUse(ways, entry);
             noteDecodeCacheReuse(entry);
             var decoded = entry.decoded;
@@ -12878,6 +20798,7 @@ pub const MachOState = struct {
             false;
         if (entry.rip == fetch_address and cached_bytes_match) {
             self.decode_cache_hits +|= 1;
+            self.noteDecodeDomainHit(domain);
             noteDecodeCacheUse(ways, entry);
             noteDecodeCacheReuse(entry);
             entry.code_generation = self.code_generation;
@@ -12907,36 +20828,22 @@ pub const MachOState = struct {
             entry.* = .{};
         }
         self.decode_cache_misses +|= 1;
+        self.noteDecodeDomainMiss(domain);
         // Select the victim before recording economics: this is the only point
         // where the runtime can prove vacancy versus eviction. A byte mismatch
         // takes precedence because it proves executable mutation even though
         // clearing the stale entry also creates a vacant way.
-        entry = &ways[0];
-        var victim_is_empty = false;
-        var victim_selected = false;
-        for (ways) |*candidate| {
-            if (candidate.rip == std.math.maxInt(u64)) {
-                entry = candidate;
-                victim_is_empty = true;
-                victim_selected = true;
-                break;
-            }
-        }
-        if (!victim_selected) {
-            for (ways) |*candidate| {
-                if (candidate.recently_used) continue;
-                entry = candidate;
-                victim_selected = true;
-                break;
-            }
-        }
-        if (!victim_selected) {
-            // Every resident has been referenced since the previous sweep.
-            // Clear the clock and evict one way; subsequent misses consume the
-            // remaining unmarked ways instead of hammering a fixed tail slot.
-            for (ways) |*candidate| candidate.recently_used = false;
-            entry = &ways[0];
-        }
+        const selection = selected orelse blk: {
+            const choice = selectDecodeCacheWay(ways);
+            break :blk PrimaryDecodeCacheSelection{
+                .entry = choice.entry,
+                .empty = choice.empty,
+                .set_base = set_base,
+            };
+        };
+        entry = selection.entry;
+        set_base = selection.set_base;
+        const victim_is_empty = selection.empty;
         const victim_was_reused = !victim_is_empty and entry.reuse_count != 0;
         if (!victim_is_empty) self.saveDecodeCacheVictim(entry);
         if (victim_is_empty) {
@@ -12959,6 +20866,20 @@ pub const MachOState = struct {
         // proven cause local until source bytes exist and a decode can actually
         // be installed in the selected way.
         self.translation_economics.noteDecode(fetch_address, self.executed_steps, fill_cause);
+        const cache_way = (@intFromPtr(entry) - @intFromPtr(ways.ptr)) / @sizeOf(DecodeCacheEntry);
+        self.failFastOnTranslationCause(
+            fetch_address,
+            domain,
+            fill_cause,
+            set_base,
+            cache_way,
+            entry,
+            victim_is_empty,
+            victim_was_reused,
+            stale_rejected,
+            bytes,
+        );
+        self.noteDecodeDomainFill(domain);
         var decoded = decodeInsn(bytes);
         if (decoded.op == .invalid and self.sparse_memory.containsMapped(fetch_address, 1)) {
             decoded = decodeInsnCompat(bytes);
@@ -13002,6 +20923,7 @@ pub const MachOState = struct {
         ));
         entry.* = .{
             .rip = fetch_address,
+            .domain = domain,
             .code_generation = self.code_generation,
             .decoded = decoded,
             .displacement = raw_displacement,
@@ -13033,6 +20955,7 @@ pub const MachOState = struct {
             entry.instruction_bytes[0..instruction_byte_count],
             bytes[0..instruction_byte_count],
         );
+        self.saveStaticDecodeL2(entry);
         return decoded;
     }
 
@@ -13702,6 +21625,27 @@ pub const MachOState = struct {
         }
     }
 
+    /// Where a sampled program counter lives, for the execution profile.
+    ///
+    /// The profile can classify a name but not an address, and the one thing a
+    /// name can never say is that no name was ever possible. An address
+    /// outside every image section, in memory this run made executable, is the
+    /// emulator's own generated code — Xenia's code cache at 0xA0000000 is the
+    /// whole of it here. Reporting that as an unresolved symbol sent the
+    /// reader to repair a symbol table that had nothing wrong with it, and
+    /// stopped the run on an observation debt that could never be paid.
+    fn executionProfileOrigin(
+        self: *MachOState,
+        address: u64,
+    ) diagnostics_execution_profile.Origin {
+        if (self.metadata.addressKind(address) != .outside_image) return .image;
+        // A program counter is in executable memory by construction, so this
+        // asks the page state rather than assuming it: the distinction matters
+        // the day a runaway branch puts a PC somewhere it cannot execute.
+        if (self.sparse_memory.isExecutable(address, 1)) return .generated_code;
+        return .outside_image_data;
+    }
+
     noinline fn reportHeartbeat(self: *MachOState, steps: u64) void {
         // Emitted here rather than only at exit: a run killed by the
         // harness timeout still has to say where the graphics frontier
@@ -13719,6 +21663,7 @@ pub const MachOState = struct {
             .rip = self.regs.rip,
             .symbol = if (hb_symbol) |resolved| resolved.name else "<unknown>",
             .symbol_offset = if (hb_symbol) |resolved| resolved.offset else 0,
+            .symbol_origin = self.executionProfileOrigin(self.regs.rip),
             .heap_next = self.heap_next,
             .import_calls = self.import_resolver.total_calls,
             .fs_open = self.fs_forwarder.open_count,
@@ -13807,6 +21752,7 @@ pub const MachOState = struct {
             .reason = "heartbeat",
             .symbol = if (hb_symbol) |resolved| resolved.name else "",
         });
+        self.logJitHealth(false);
         self.pollReadyCompiler(steps);
     }
 
@@ -14948,9 +22894,66 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         machoCapturePrint("macho-processor: not a valid x86_64 Mach-O binary: {s}\n", .{@errorName(err)});
         return 1;
     };
+    const image_fingerprint = std.hash.Wyhash.hash(0, slice);
 
     var state = try MachOState.init(io, allocator, slice);
     defer state.deinit();
+    state.audit_image_fingerprint = image_fingerprint;
+    if (std.c.getenv("ROSETTE_EXECUTION_PROFILE")) |raw_profile| {
+        const profile_text = std.mem.span(raw_profile);
+        if (run_manifest.parseProfile(profile_text)) |profile| {
+            state.audit_profile = profile;
+        } else {
+            state.audit_profile_valid = false;
+            machoCapturePrint(
+                "macho-processor: unknown ROSETTE_EXECUTION_PROFILE={s}; refusing to seal the run manifest\n",
+                .{profile_text},
+            );
+        }
+    }
+    state.audit_identity_fields = run_manifest.identityFieldsFromEnvironment();
+    // `make shell-update` produces the authenticated build artifact consumed
+    // by both sides of the bridge.  Environment values may fill genuinely
+    // run-specific inputs (for example a device discovered at launch), but a
+    // disagreement with the generated content identity is a hard admission
+    // conflict, never an override.
+    const explicit_build_identity_path = std.c.getenv("ROSETTE_BUILD_IDENTITY_MANIFEST");
+    const build_identity_path = if (explicit_build_identity_path) |raw|
+        std.mem.span(raw)
+    else
+        ".rosette/build-identity.json";
+    if (std.Io.Dir.cwd().readFileAlloc(io, build_identity_path, allocator, .limited(16 * 1024 * 1024))) |bytes| {
+        defer allocator.free(bytes);
+        if (run_manifest.parseBuildIdentityJson(allocator, bytes)) |generated| {
+            var identity_conflict = false;
+            state.audit_identity_fields = run_manifest.mergeIdentityFields(
+                state.audit_identity_fields,
+                generated.fields,
+                &identity_conflict,
+            );
+            state.audit_identity_conflict = identity_conflict;
+            state.audit_build_identity_hash = generated.manifest_hash;
+            state.audit_build_identity_loaded = true;
+            machoCapturePrint(
+                "macho-processor: BUILD IDENTITY: loaded path={s} hash=0x{x} conflict={} complete={}\n",
+                .{ build_identity_path, generated.manifest_hash, identity_conflict, state.audit_identity_fields.complete() },
+            );
+        } else |err| {
+            state.audit_identity_conflict = true;
+            machoCapturePrint(
+                "macho-processor: BUILD IDENTITY: refusing invalid generated manifest path={s} error={s}\n",
+                .{ build_identity_path, @errorName(err) },
+            );
+        }
+    } else |err| {
+        if (explicit_build_identity_path != null) {
+            state.audit_identity_conflict = true;
+            machoCapturePrint(
+                "macho-processor: BUILD IDENTITY: configured manifest unavailable path={s} error={s}\n",
+                .{ build_identity_path, @errorName(err) },
+            );
+        }
+    }
     // The exported application-framework ABI must point at the live process
     // ledger, not a detached diagnostic singleton. Register the binding after
     // state construction and clear it before state.deinit releases resources.
@@ -15025,6 +23028,11 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     // N7 (perf audit): per-initializer + vtable-lifecycle detail logs default
     // to off; the run log flooded with ~700K chars of initializer detail.
     state.initializer_detail_logging = environmentFlag("ROSETTE_MACHO_INITIALIZER_DETAIL");
+    // Arm the run-integrity evidence policy before any initializer or guest
+    // decode can execute. Translation conflicts are proven at the fill site,
+    // so waiting for the first graphics checkpoint would allow the very
+    // behavior this diagnostic run is meant to catch to continue unchecked.
+    state.ensureRunIntegrity();
 
     var temp_state = try macho.load(allocator, slice);
     defer temp_state.deinit();
@@ -15034,7 +23042,9 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     if (std.mem.endsWith(u8, options.path, ".iso")) {
         machoCapturePrint("ROSETTE: WARNING: .iso file detected - this may indicate incorrect routing\n", .{});
     }
-    const image_fingerprint = std.hash.Wyhash.hash(0, slice);
+    // The manifest's identity input. Without it two runs cannot be compared,
+    // and a frontier that moved between them is not a finding.
+    state.audit_image_fingerprint = image_fingerprint;
     const has_xbdm_diagnostics = std.mem.indexOf(
         u8,
         slice,
@@ -15140,10 +23150,32 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.event_stream.begin(
         (@as(u64, @intCast(std.c.getpid())) << 32) ^ @intFromPtr(&state),
     );
+    state.audit_media_fingerprint = run_manifest.firstHashFromEnvironment(
+        "ROSETTE_MEDIA_HASH",
+        "XENIA_MEDIA_HASH",
+    );
+    state.audit_config_fingerprint = run_manifest.firstHashFromEnvironment(
+        "ROSETTE_CONFIG_HASH",
+        "XENIA_CONFIG_HASH",
+    );
+    state.audit_title_id = @truncate(run_manifest.firstHashFromEnvironment(
+        "ROSETTE_TITLE_ID",
+        "XENIA_TITLE_ID",
+    ));
+    state.audit_identity_fields = run_manifest.identityFieldsWithImage(
+        state.audit_identity_fields,
+        image_fingerprint,
+        state.entry_point_vaddr,
+    );
     machoCapturePrint(
         "macho-processor: run identity established: run=0x{x}; every boundary record in this log carries it, so records from two runs can never be joined\n",
         .{state.event_stream.run_id},
     );
+    // Before anything is armed, ask the machine what it can actually do. The
+    // whole run's memory, timing and threading behaviour rests on these, and
+    // every one of them has a failure mode that surfaces somewhere else — so
+    // this is the last moment at which any of them can be attributed.
+    state.logHostCapabilities();
     state.armGraphicsTracepoints();
     const image_is_xenia = has_xbdm_diagnostics or
         std.mem.indexOf(u8, options.path, "xenia") != null or
@@ -15159,14 +23191,14 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         environmentFlag("ROSETTE_APPLICATION_FRAMEWORK_MEMORY_TRACE"),
         image_is_xenia or environmentFlag("ROSETTE_APPLICATION_FRAMEWORK_GRAPHICS"),
     );
-    // Xenia's provider is enabled for the Xenia route by default so the
-    // framework can satisfy a missing host-side bridge.  This does not weaken
-    // admission: the provider remains bounded by the package contract and can
-    // only authorize the exact callback installation it has proved safe.
-    // `ROSETTE_XENIA_HOST_GPU_CALLBACK=off` (or any other unrecognised value)
-    // is a fail-closed opt-out for diagnosis and rollback.
+    // A host callback is a diagnostic/synthetic intervention, not a default
+    // bridge for an authentic run.  The profile gate is evaluated before the
+    // provider is armed; the admission ledger records the intervention when a
+    // non-authentic profile explicitly permits it.
     state.application_framework.setXeniaHostGpuCallbackEnabled(
-        image_is_xenia and environmentPolicyFlag("ROSETTE_XENIA_HOST_GPU_CALLBACK", true),
+        image_is_xenia and
+            state.audit_profile != .authentic and
+            environmentPolicyFlag("ROSETTE_XENIA_HOST_GPU_CALLBACK", true),
     );
     state.application_framework.registerApplication(options.path, image_fingerprint);
     _ = state.application_framework.registerAdapter(
@@ -15191,6 +23223,26 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
             application_framework.contract.abi_version,
         },
     );
+    // Freeze the run identity, profile, admission posture, and durable journal
+    // before the ready-compiler plan or any guest initializer can execute.
+    state.configureAuditContracts(0);
+    if (state.audit_profile == .authentic) {
+        if (state.audit_guest_start_verdict != .admitted or
+            !state.publishAuditEnvironment(allocator))
+        {
+            machoCapturePrint(
+                "macho-processor: RUN ADMISSION: refusing authentic guest start verdict={s} failure={s} manifest_sealed={} identity_loaded={} identity_conflict={}\n",
+                .{
+                    state.audit_guest_start_verdict.label(),
+                    state.audit_closure_admission_failure.label(),
+                    state.audit_manifest.sealIntact(),
+                    state.audit_build_identity_loaded,
+                    state.audit_identity_conflict,
+                },
+            );
+            return 125;
+        }
+    }
     const ready_gate_requested = environmentFlag("ROSETTE_MACHO_READY_GATE") or image_is_xenia;
     const ready_gate_enabled = ready_gate_requested and
         !environmentFlag("ROSETTE_MACHO_READY_GATE_OFF");
@@ -15209,6 +23261,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     // instead of minutes.
     if (!state.runReadyCompilerPlan(io, options.path, options.args, vex_audit.ready())) {
         state.logReadyCompilerSummary();
+        state.logJitHealth(true);
         machoCapturePrint(
             "macho-processor: READY COMPILER: refusing to launch; the startup contract cannot be satisfied by this image\n",
             .{},
@@ -15247,6 +23300,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         state.xenia_pipeline.logSummary(state.executed_steps);
         state.xenia_gpu_handoff.logSummary(state.executed_steps);
         state.logReadyCompilerSummary();
+        state.logJitHealth(true);
         state.export_table_mgr.logSummary();
         state.export_table_lc.logSummary();
         state.export_registry.logSummary();
@@ -15273,6 +23327,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
 
     if (!state.sealReadyCompilerCompile()) {
         state.logReadyCompilerSummary();
+        state.logJitHealth(true);
         if (state.ready.enforce) {
             state.faulted = true;
             state.terminated = true;
@@ -15358,6 +23413,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.xenia_pipeline.logSummary(state.executed_steps);
     state.xenia_gpu_handoff.logSummary(state.executed_steps);
     state.logReadyCompilerSummary();
+    state.logJitHealth(true);
     // The run is over, so "still unclassified" has stopped meaning "not yet"
     // and started meaning "the pipeline never advanced past it". Sealing before
     // the frontier report is what turns the ledger from a permanent blocker
@@ -15399,15 +23455,20 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
             },
         );
     }
-    if (state.guest_log_cycles.active()) {
+    if (state.guest_log_cycles.hasHistory()) {
+        const cycle_active = state.guest_log_cycles.active();
         macho_log.machoCapturePrint(
-            "macho-processor: guest log cycles: reports={d} longest_period={d} most_iterations={d} still_cycling={} final_period={d}; a run that ends inside a cycle ended in a livelock, not at a conclusion\n",
+            "macho-processor: guest log cycles: reports={d} longest_period={d} most_iterations={d} still_cycling={} final_period={d}; {s}\n",
             .{
                 state.guest_log_cycles.reports,
                 state.guest_log_cycles.longest_period,
                 state.guest_log_cycles.most_iterations,
-                state.guest_log_cycles.period != 0,
+                cycle_active,
                 state.guest_log_cycles.period,
+                if (cycle_active)
+                    "the run ended inside a confirmed cycle, so this remains current livelock evidence"
+                else
+                    "cycle reports are historical; a later guest line broke the cycle, so they do not by themselves establish current livelock",
             },
         );
     }

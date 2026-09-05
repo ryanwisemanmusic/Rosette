@@ -315,6 +315,15 @@ uint64_t rosette_macho_native_window_present_diagnostic_frame(
       [encoder endEncoding];
       [command_buffer presentDrawable:drawable];
       [command_buffer commit];
+      // `commit` only proves that Metal accepted a command buffer. It does not
+      // prove that the drawable was executed or that its presentation reached
+      // the device. Diagnostic custody is deliberately stricter than the
+      // guest-copy path: wait for a completed command buffer before publishing
+      // a counter that the Zig ledgers will use as hardware evidence.
+      [command_buffer waitUntilCompleted];
+      if ([command_buffer status] != MTLCommandBufferStatusCompleted) {
+        return;
+      }
       presented = ++g_diagnostic_frames_presented;
     });
   }

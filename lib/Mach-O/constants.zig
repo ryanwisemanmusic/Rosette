@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const translation_cache = @import("rosette_translation_cache_contract");
 
 pub const STACK_SIZE: u64 = 8 * 1024 * 1024;
 pub const MEM_SIZE: u64 = 2 * 1024 * 1024 * 1024;
@@ -64,58 +65,57 @@ pub const GUEST_LOG_BUFFER_SIZE: u64 = 64 * 1024;
 /// starts.  With the old 64K / two-way table, a steady-state Halo 3 interval
 /// reported 1,506,110 live-entry evictions for only 30 vacant fills: the cache
 /// was decoding immutable Mach-O text again because unrelated instructions
-/// competed for two slots.  Four times the capacity is about 23 MiB at the
-/// current entry size, small beside the translated process heap and large
-/// enough to retain the host-side compiler passes that dominate the trace.
-pub const DECODE_CACHE_ENTRY_COUNT: usize = 1 << 18;
-/// Eight-way set associativity keeps the same 32,768 sets as the previous 64K
-/// two-way layout while giving each colliding working set four times the room.
-/// Replacement uses second-chance reference bits in `process.zig`; unlike the
-/// old two-way-only MRU bit, every way is eligible and no fixed final way
-/// absorbs all evictions.
-pub const DECODE_CACHE_WAYS: usize = 8;
-pub const DECODE_CACHE_SET_COUNT: usize = DECODE_CACHE_ENTRY_COUNT / DECODE_CACHE_WAYS;
-pub const DECODE_CACHE_HASH_SHIFT: u6 = 46;
-/// 64 - log2(DECODE_CACHE_SET_COUNT).
-pub const DECODE_CACHE_SET_SHIFT: u6 = 49;
-pub const DECODE_CACHE_HASH_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
+/// competed for two slots. Each of the four ownership banks now has 65,536
+/// local sets with sixteen ways, for 4,194,304 total entries. This is about
+/// 368 MiB at the current entry size, small beside the translated process
+/// heap and sized to keep the later graphics-setup working set from turning a
+/// dispersed address stream into a 17th-resident conflict.
+pub const DECODE_CACHE_ENTRY_COUNT: usize = translation_cache.primary_layout.entryCount();
+/// Sixteen-way set associativity plus the expanded local-set budget gives each
+/// ownership bank both lower dispersed occupancy and substantial same-set
+/// room. Replacement uses the contract-owned reference/reuse policy in
+/// `process.zig`; no fixed final way absorbs all evictions.
+pub const DECODE_CACHE_WAYS: usize = translation_cache.primary_layout.ways;
+pub const DECODE_CACHE_SET_COUNT: usize = translation_cache.primary_layout.total_set_count;
 
 /// Small second-level victim cache for entries displaced from the primary
 /// decode set.  A primary conflict is only harmful when the displaced code is
 /// used again; retaining recent victims lets a returning instruction recover
 /// its already-validated decode without paying another full translation.
 /// Four-way sets keep the miss-side probe bounded while adding only a small
-/// amount of storage beside the 262K-entry primary table.
-pub const DECODE_VICTIM_CACHE_WAYS: usize = 4;
-pub const DECODE_VICTIM_CACHE_SET_COUNT: usize = 1 << 10;
-pub const DECODE_VICTIM_CACHE_ENTRY_COUNT: usize =
-    DECODE_VICTIM_CACHE_WAYS * DECODE_VICTIM_CACHE_SET_COUNT;
-pub const DECODE_VICTIM_CACHE_SET_SHIFT: u6 = 54;
-pub const DECODE_VICTIM_CACHE_HASH_MULTIPLIER: u64 = 0xD6E8_FEB8_6659_FD93;
+/// amount of storage beside the 4,194K-entry primary table.
+pub const DECODE_VICTIM_CACHE_WAYS: usize = translation_cache.victim_layout.ways;
+pub const DECODE_VICTIM_CACHE_SET_COUNT: usize = translation_cache.victim_layout.total_set_count;
+pub const DECODE_VICTIM_CACHE_ENTRY_COUNT: usize = translation_cache.victim_layout.entryCount();
 
-/// Hash an exact instruction address into the direct-mapped decode cache.
-///
-/// The old `(address >> 4) & mask` mapping gave every instruction in the same
-/// 16-byte block one cache slot. A normal basic block therefore evicted itself
-/// continuously (the Xenia trace showed a 3% hit rate). Multiplicative hashing
-/// keeps neighboring instruction starts in independent slots while still
-/// mixing high JIT addresses such as 0xA0000000 into the index.
+/// Persistent second-level cache for immutable Mach-O image decodes. The
+/// primary cache is intentionally shared by domains through disjoint banks,
+/// but a compiler burst can still churn the static bank's L1 ways. Keeping a
+/// small static-only L2 lets an image instruction refill an L1 way without
+/// fetching bytes or invoking the decoder again.
+pub const DECODE_STATIC_L2_WAYS: usize = translation_cache.static_l2_layout.ways;
+pub const DECODE_STATIC_L2_SET_COUNT: usize = translation_cache.static_l2_layout.total_set_count;
+pub const DECODE_STATIC_L2_ENTRY_COUNT: usize = translation_cache.static_l2_layout.entryCount();
+
+/// Compatibility helper retained for constants-only consumers. It returns the
+/// primary static-image set base; the standalone translation-cache package is
+/// the authority for the actual mapping and all runtime callers select a
+/// domain explicitly.
 pub inline fn decodeCacheIndex(address: u64) usize {
-    return @intCast((address *% DECODE_CACHE_HASH_MULTIPLIER) >> DECODE_CACHE_HASH_SHIFT);
+    return translation_cache.primarySetBase(address, .static_image);
 }
 
 /// Index of the first way of the set an address maps to.
 pub inline fn decodeCacheSetBase(address: u64) usize {
-    const set: usize = @intCast((address *% DECODE_CACHE_HASH_MULTIPLIER) >> DECODE_CACHE_SET_SHIFT);
-    return set * DECODE_CACHE_WAYS;
+    return translation_cache.primarySetBase(address, .static_image);
 }
 
 pub inline fn decodeVictimCacheSetBase(address: u64) usize {
-    // Fold the high half before multiplying so generated-code addresses and
-    // image addresses do not share the primary table's exact index function.
-    const mixed = (address ^ (address >> 32)) *% DECODE_VICTIM_CACHE_HASH_MULTIPLIER;
-    const set: usize = @intCast(mixed >> DECODE_VICTIM_CACHE_SET_SHIFT);
-    return set * DECODE_VICTIM_CACHE_WAYS;
+    return translation_cache.victimSetBase(address, .dynamic_generated);
+}
+
+pub inline fn decodeStaticL2SetBase(address: u64) usize {
+    return translation_cache.staticL2SetBase(address);
 }
 
 test "invalidation and lookup enumerate the same slots" {
@@ -147,8 +147,8 @@ test "every set base is in range and both ways are addressable" {
 }
 
 test "a set holds two independent addresses that previously evicted each other" {
-    // Find a colliding pair under the direct-mapped index, then prove the
-    // set-associative mapping still gives them distinct ways to live in.
+    // Find a pair that shares a set under the package mapper, then prove the
+    // set-associative mapping exposes a complete way range for both.
     var probe: u64 = 0x1000;
     const target = decodeCacheIndex(0x1000);
     const collider = while (probe < 0x40_0000) : (probe += 1) {
@@ -159,7 +159,7 @@ test "a set holds two independent addresses that previously evicted each other" 
     }
 }
 
-test "decode cache hashes neighboring instruction starts independently" {
+test "decode cache mapper differentiates neighboring instruction starts" {
     var seen = [_]bool{false} ** DECODE_CACHE_ENTRY_COUNT;
     for (0..16) |offset| {
         const index = decodeCacheIndex(0xA000_5AF8 + offset);
@@ -177,6 +177,18 @@ test "victim cache set bases partition the secondary cache" {
     try std.testing.expectEqual(
         DECODE_VICTIM_CACHE_ENTRY_COUNT,
         DECODE_VICTIM_CACHE_SET_COUNT * DECODE_VICTIM_CACHE_WAYS,
+    );
+}
+
+test "static L2 set bases partition the persistent image cache" {
+    for ([_]u64{ 0, 1, 0xA000_5AF8, 0x34D8_6000, std.math.maxInt(u64) }) |address| {
+        const base = decodeStaticL2SetBase(address);
+        try std.testing.expect(base + DECODE_STATIC_L2_WAYS <= DECODE_STATIC_L2_ENTRY_COUNT);
+        try std.testing.expectEqual(@as(usize, 0), base % DECODE_STATIC_L2_WAYS);
+    }
+    try std.testing.expectEqual(
+        DECODE_STATIC_L2_ENTRY_COUNT,
+        DECODE_STATIC_L2_SET_COUNT * DECODE_STATIC_L2_WAYS,
     );
 }
 pub const IMPORT_ROUTE_CACHE_SIZE: usize = 1024;

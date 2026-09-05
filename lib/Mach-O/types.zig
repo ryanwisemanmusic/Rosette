@@ -5,6 +5,7 @@ const memory_provenance = @import("dyld").memory_provenance;
 const pointer_firewall = @import("dyld").pointer_firewall;
 const macho = @import("macho.zig");
 const constants = @import("constants.zig");
+const translation_domain = @import("rosette_translation_cache_contract");
 
 const compat_runtime = @import("macho_compat_runtime");
 const guest_assertion_recovery = @import("guest_abi").guest_assertion_recovery;
@@ -258,6 +259,10 @@ pub const ControlTransferContext = struct {
 
 pub const DecodeCacheEntry = struct {
     rip: u64 = std.math.maxInt(u64),
+    /// The cache bank is part of the entry's identity. Static image code,
+    /// generated JIT code and bridge thunks may hash to the same local set,
+    /// but they must never evict one another.
+    domain: translation_domain.Domain = .unknown,
     code_generation: u64 = 0,
     decoded: DecodedInsn = .{},
     /// Exact bytes used to produce `decoded`. Executable-write notifications
