@@ -5,6 +5,7 @@ pub const monitor = @import("monitor.zig");
 pub const profiler = @import("profiler.zig");
 pub const xenia = @import("xenia.zig");
 pub const event_log = @import("event_log.zig");
+pub const health = @import("health.zig");
 
 pub const GuestAddress = types.GuestAddress;
 pub const HostAddress = types.HostAddress;
@@ -25,6 +26,11 @@ pub const SystemVAbi = xenia.SystemVAbi;
 pub const JitEventLog = event_log.Logger;
 pub const JitEventLogKind = event_log.Kind;
 pub const JitLogEvent = event_log.Event;
+pub const JitHealth = health.Ledger;
+pub const JitHealthSummary = health.Summary;
+pub const JitHealthObservation = health.Observation;
+pub const JitHealthFinding = health.Finding;
+pub const JitHealthEventKind = health.EventKind;
 
 test "JIT types tests" {
     _ = @import("types.zig");
@@ -44,4 +50,8 @@ test "JIT xenia tests" {
 
 test "JIT event_log tests" {
     _ = @import("event_log.zig");
+}
+
+test "JIT health tests" {
+    _ = @import("health.zig");
 }
