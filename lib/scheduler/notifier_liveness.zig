@@ -48,8 +48,9 @@ pub const Progress = enum(u8) {
     idle,
     /// A notification arrived recently. Waiting here is normal.
     progressing,
-    /// Waiters exist and nothing has ever notified this object. Either the
-    /// producer has not started or it signals something else.
+    /// Waiters exist and nothing has ever notified this object. This is an
+    /// attribution gap until a producer obligation is known: an idle worker
+    /// and a missing producer have exactly the same history.
     never_notified,
     /// Notifications have stopped, but at least one thread that used to send
     /// them is still able to run. Recoverable, and worth watching.
@@ -72,7 +73,7 @@ pub const Progress = enum(u8) {
         return switch (self) {
             .idle => "idle (no waiters)",
             .progressing => "progressing (a notification arrived recently)",
-            .never_notified => "NEVER NOTIFIED (waiters exist and nothing has ever signalled this object)",
+            .never_notified => "NO NOTIFIER OBSERVED (idle worker and missing producer remain indistinguishable)",
             .starved => "STARVED (notifications stopped; a past notifier is still runnable)",
             .untracked_notifier_stale => "UNTRACKED NOTIFIER STALE (notifications stopped; at least one notifier was a synthetic or external execution context)",
             .observed_notifiers_parked => "OBSERVED NOTIFIERS PARKED (all previously seen notifiers currently wait here; external producers remain possible)",
@@ -83,7 +84,7 @@ pub const Progress = enum(u8) {
         return switch (self) {
             .idle => "nothing to investigate here",
             .progressing => "this wait is being served; look elsewhere for the stall",
-            .never_notified => "find the code that should signal this object and confirm it ran. Waiters chose this object, so something intended to signal it",
+            .never_notified => "identify the queue owner and prove a wake was owed before treating this as starvation. No notifier history alone cannot distinguish an intentionally idle worker from a missing producer",
             .starved => "the last notifier is still able to run and has not signalled since. Follow that thread's path from its last notification forward — the notification it did not send is on it",
             .untracked_notifier_stale => "follow the retained notifier thread and PC through the callback, UI, timer, or host-bridge producer. Its notification is proven, but a scheduler-slot liveness verdict would be fabricated",
             .observed_notifiers_parked => "follow the last observed notifier, but do not synthesize a wake or call this a closed cycle until every external queue, UI, timer and producer path has also been ruled out",
@@ -285,12 +286,12 @@ test "a recent notification means the wait is being served" {
     try std.testing.expectEqual(Progress.progressing, classify(object, 1000, default_stall_steps));
 }
 
-// Waiters chose this object, so something intended to signal it.
 test "waiters with no notification history are a different finding from a stall" {
     const object = Object{ .address = 0x1000, .active = true, .waiter_mask = maskOf(3) };
     const progress = classify(object, 10_000_000_000, default_stall_steps);
     try std.testing.expectEqual(Progress.never_notified, progress);
-    try std.testing.expect(std.mem.indexOf(u8, progress.guidance(), "confirm it ran") != null);
+    try std.testing.expect(std.mem.indexOf(u8, progress.guidance(), "prove a wake was owed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, progress.label(), "NO NOTIFIER OBSERVED") != null);
 }
 
 // The distinction the whole file exists for.

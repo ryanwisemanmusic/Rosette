@@ -1,4 +1,5 @@
 const std = @import("std");
+const canonical_guest_time = @import("canonical_guest_time.zig");
 
 pub const TimerEntry = struct {
     deadline_ns: u64,
@@ -34,6 +35,12 @@ pub const Service = struct {
     execution_step_watermark: ?u64 = null,
     execution_advances: u64 = 0,
     execution_advanced_ns: u64 = 0,
+    /// The canonical Xbox clock is the owner of guest-visible time. The
+    /// legacy nanosecond fields remain as the scheduler's deadline unit, but
+    /// every time mutation below is now committed through this 50 MHz clock.
+    canonical_clock: canonical_guest_time.Clock = .{},
+    canonical_baseline_valid: bool = false,
+    canonical_remainder_ns: u8 = 0,
     deadlines: std.ArrayList(TimerEntry) = .empty,
 
     pub fn deinit(self: *Service, allocator: std.mem.Allocator) void {
@@ -51,13 +58,78 @@ pub const Service = struct {
     }
 
     pub fn advanceBy(self: *Service, delta_ns: u64) u64 {
-        self.monotonic_ns +|= delta_ns;
-        return self.monotonic_ns;
+        return self.advanceBySource(delta_ns, .guest_execution);
+    }
+
+    /// Restore a transactional checkpoint without retaining canonical ticks
+    /// from work that was rolled back. Source counters for the abandoned
+    /// transaction must not leak into later timing evidence.
+    pub fn restoreMonotonic(self: *Service, timestamp_ns: u64) void {
+        self.monotonic_ns = timestamp_ns;
+        self.canonical_clock = .{};
+        self.canonical_baseline_valid = false;
+        self.canonical_remainder_ns = 0;
     }
 
     pub fn advanceTo(self: *Service, deadline_ns: u64) u64 {
-        self.monotonic_ns = @max(self.monotonic_ns, deadline_ns);
+        if (deadline_ns <= self.monotonic_ns) return self.monotonic_ns;
+        return self.advanceBySource(deadline_ns - self.monotonic_ns, .guest_timer);
+    }
+
+    /// Advance the scheduler clock while recording which subsystem owns the
+    /// guest-time mutation. Diagnostic probes are deliberately rejected by the
+    /// canonical clock and therefore cannot make a timeout or vblank appear.
+    pub fn advanceBySource(
+        self: *Service,
+        delta_ns: u64,
+        source: canonical_guest_time.AdvancementSource,
+    ) u64 {
+        self.ensureCanonicalBaseline();
+        if (delta_ns == 0) return self.monotonic_ns;
+        if (!source.mayAdvanceGuest()) {
+            _ = self.canonical_clock.advance(0, source);
+            return self.monotonic_ns;
+        }
+
+        const total_ns = @as(u64, self.canonical_remainder_ns) +| delta_ns;
+        const delta_ticks = total_ns / 20;
+        const remainder: u8 = @intCast(total_ns % 20);
+        if (delta_ticks == 0) {
+            // The canonical clock has 20 ns resolution, so retain sub-tick
+            // scheduler precision until the next mutation without claiming
+            // an advancement event in the guest clock.
+            self.canonical_remainder_ns = remainder;
+            self.monotonic_ns +|= delta_ns;
+            return self.monotonic_ns;
+        }
+        if (!self.canonical_clock.advance(delta_ticks, source)) {
+            return self.monotonic_ns;
+        }
+        self.canonical_remainder_ns = remainder;
+        const canonical_ns = @as(u128, self.canonical_clock.ticks) * 20 + remainder;
+        self.monotonic_ns = if (canonical_ns > std.math.maxInt(u64))
+            std.math.maxInt(u64)
+        else
+            @intCast(canonical_ns);
         return self.monotonic_ns;
+    }
+
+    pub fn canonicalNowTicks(self: *const Service) u64 {
+        if (self.canonical_baseline_valid) return self.canonical_clock.nowTicks();
+        return self.monotonic_ns / 20;
+    }
+
+    pub fn canonicalNowFileTime(self: *const Service) u64 {
+        if (self.canonical_baseline_valid) return self.canonical_clock.nowFileTime();
+        return self.wallNow() / 100;
+    }
+
+    fn ensureCanonicalBaseline(self: *Service) void {
+        if (self.canonical_baseline_valid) return;
+        self.canonical_clock.filetime_epoch = self.wall_epoch_ns / 100;
+        self.canonical_clock.ticks = self.monotonic_ns / 20;
+        self.canonical_remainder_ns = @intCast(self.monotonic_ns % 20);
+        self.canonical_baseline_valid = true;
     }
 
     /// Advance time only when the cooperative scheduler has proven that no
@@ -68,13 +140,16 @@ pub const Service = struct {
     /// time or jumping to an unbounded sentinel deadline.
     pub fn advanceForQuiescence(self: *Service) u64 {
         if (self.time_mode == .wall_clock) {
-            self.monotonic_ns = self.wallClockNow();
+            const target = self.wallClockNow();
+            if (target > self.monotonic_ns) {
+                _ = self.advanceBySource(target - self.monotonic_ns, .host_wait_service);
+            }
             return self.monotonic_ns;
         }
         const scheduler_tick_ns: u64 = 1_000_000;
         self.quiescence_advances +|= 1;
         self.quiescence_advanced_ns +|= scheduler_tick_ns;
-        return self.advanceBy(scheduler_tick_ns);
+        return self.advanceBySource(scheduler_tick_ns, .host_wait_service);
     }
 
     /// Capture the current host monotonic time as the wall-clock baseline.
@@ -104,7 +179,10 @@ pub const Service = struct {
     /// contexts. The watermark makes repeated scheduler scans idempotent.
     pub fn advanceForExecution(self: *Service, current_step: u64) u64 {
         if (self.time_mode == .wall_clock) {
-            self.monotonic_ns = self.wallClockNow();
+            const target = self.wallClockNow();
+            if (target > self.monotonic_ns) {
+                _ = self.advanceBySource(target - self.monotonic_ns, .guest_execution);
+            }
             return self.monotonic_ns;
         }
         const previous_step = self.execution_step_watermark orelse {
@@ -117,7 +195,7 @@ pub const Service = struct {
         self.execution_step_watermark = current_step;
         self.execution_advances +|= 1;
         self.execution_advanced_ns +|= delta_ns;
-        return self.advanceBy(delta_ns);
+        return self.advanceBySource(delta_ns, .guest_execution);
     }
 
     pub fn schedule(
@@ -232,6 +310,21 @@ test "monotonic clock never moves backward" {
     var service = Service{};
     try std.testing.expectEqual(@as(u64, 1_000_000_000), service.advanceTo(5));
     try std.testing.expectEqual(@as(u64, 1_000_000_007), service.advanceBy(7));
+}
+
+test "scheduler commits time through the canonical Xbox clock" {
+    var service = Service{ .monotonic_ns = 0 };
+    try std.testing.expectEqual(@as(u64, 20), service.advanceBy(20));
+    try std.testing.expectEqual(@as(u64, 1), service.canonicalNowTicks());
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        service.canonical_clock.by_source[@intFromEnum(canonical_guest_time.AdvancementSource.guest_execution)],
+    );
+    const before = service.now();
+    _ = service.advanceBySource(1_000, .diagnostic_probe);
+    try std.testing.expectEqual(before, service.now());
+    try std.testing.expectEqual(@as(u64, 1), service.canonicalNowTicks());
+    try std.testing.expectEqual(@as(u64, 1), service.canonical_clock.rejected_advances);
 }
 
 test "quiescence advances time by bounded scheduler ticks" {
