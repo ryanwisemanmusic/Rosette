@@ -1,0 +1,11 @@
+name = "common-xenia-launch-assist-contract"
+version = "0.1.0-local"
+kind = "xenia-rosette-launch-assist-abi-contract"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
+# Fixed-width request/response records and the pure admission policy live here.
+# Runtime state, event retention and the Xenia adapter remain outside the
+# package so the contract cannot silently become a second emulator.
