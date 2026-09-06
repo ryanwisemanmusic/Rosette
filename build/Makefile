@@ -124,6 +124,17 @@ ROSETTE_PPC_ANCHOR_OBJ := $(ROOT_DIR)/$(BP)rosette_ppc_exports_anchor.o
 DYLD_DYLIB := $(ZIG_OUT_DIR)/lib/rosette-exec.dylib
 SHELL_HELPER_SRC := $(ROOT_DIR)/src/shell/global_config/rosette_shell.zig
 SHELL_HELPER_BIN := $(ZIG_OUT_DIR)/bin/rosette-shell
+TEST_CENSUS_SCRIPT := $(ROOT_DIR)/tools/test_census.py
+TEST_CENSUS_OUT := $(ROOT_DIR)/.rosette/test-census.json
+SHELL_UPDATE_RECORD_SCRIPT := $(ROOT_DIR)/tools/record_shell_update.py
+SHELL_UPDATE_RECORD_OUT := $(ROOT_DIR)/.rosette/shell-update.json
+BUILD_IDENTITY_SCRIPT := $(ROOT_DIR)/tools/build_identity_manifest.py
+BUILD_IDENTITY_OUT := $(ROOT_DIR)/.rosette/build-identity.json
+XENIA_FORK_MANIFEST_SCRIPT := $(ROOT_DIR)/tools/build_xenia_fork_manifest.py
+XENIA_FORK_MANIFEST_OUT := $(ROOT_DIR)/.rosette/xenia-fork-manifest.json
+XENIA_ROOT ?= /Volumes/2023 Drive/xenia/xenia
+EVIDENCE_REPLAY_SCRIPT := $(ROOT_DIR)/tools/replay_evidence.py
+EVIDENCE_REPLAY_JOURNAL ?= $(ROOT_DIR)/.rosette/rosette-evidence.r3j
 COMPAT_ROUTER_SRC := $(ROOT_DIR)/src/compat/rosetta2/main.zig
 COMPAT_ROUTER_BIN := $(ZIG_OUT_DIR)/bin/rosette-router
 LINK_AUDIT_SRC := src/tooling/link-audit/main.zig
@@ -231,8 +242,9 @@ OBJC_FRAMEWORKS := -framework Cocoa -framework Foundation
 
 ISO_BIN := $(ZIG_OUT_DIR)/bin/rosette-iso
 ISO_SRC := $(ROOT_DIR)/src/tooling/iso/main.zig
+XBOX360_MEDIA_TOOL := $(ROOT_DIR)/tools/xbox360_media.py
 
-.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build link-audit-build pkg-boundary-audit vendor-library-audit vendor-audit shell-helper-build shell shell-update shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse iso-build iso-run app-wrapper installer uninstaller app-all release notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
+.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build link-audit-build pkg-boundary-audit vendor-library-audit vendor-audit shell-helper-build test-census xenia-fork-manifest build-identity replay-evidence shell shell-update shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse iso-build iso-run app-wrapper installer uninstaller app-all release notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
 
 all: headers-check zig-build test-run
 
@@ -255,7 +267,11 @@ help:
 		'  make window-lib  Build native Cocoa console-emulation window library (librosette_window.a)' \
 		'  make snake-window Build snake game with native Cocoa window' \
 		'  make shell       Install transparent Rosette make-time shell checks' \
-		'  make shell-update Refresh the Rosette shell helper/snippet/wrappers' \
+		'  make shell-update Refresh the Rosette shell helper/snippet/wrappers and record its identity' \
+		'  make test-census  Execute zig build check and write the source/artifact test census' \
+		'  make xenia-fork-manifest  Record the pinned Xenia base and classify every fork path' \
+		'  make build-identity  Hash Rosette/Xenia/build/test/shell inputs into an admission manifest' \
+		'  make replay-evidence Replay a durable .r3j journal without the original runtime' \
 		'  make vendor-audit Audit vendored library sources, target records, and host providers' \
 		'  make shell-uninstall Remove Rosette shell integration' \
 		'  make shell-clean-state Kill stale Rosette shell/ELF helper processes' \
@@ -264,6 +280,7 @@ help:
 		'  make iso-build       Build the ISO 9660 file inspector tool\n' \
 		'  make iso-run ISO=... Parse and inspect an ISO 9660 image\n' \
 		'  make run-iso          Prompt for ISO path and inspect it\n' \
+		'  make xbox360-media-self-test  Test GOD/XISO media validation and recovery\n' \
 		'  make clean        Remove build artifacts'
 
 # Include per-folder make fragments when present
@@ -389,6 +406,28 @@ shell-helper-build: pkg-boundary-audit vendor-library-audit c-fix-build assemble
 	@mkdir -p "$(ZIG_CACHE_DIR)/global"
 	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build-exe -lc --dep entrypoint_alignment --dep entrypoint_kernel_process_guard --dep compat_source_include_compat --dep compat_third_party_include_compat -Mroot="$(SHELL_HELPER_SRC)" -Mentrypoint_alignment=src/entrypoint/alignment/root.zig -Mentrypoint_kernel_process_guard=src/entrypoint/kernel/process_guard.zig -Mcompat_source_include_compat=src/compat/source/include_compat.zig -Mcompat_third_party_include_compat=src/compat/third_party/include_compat.zig -femit-bin="$(SHELL_HELPER_BIN)"
 
+# Keep source-level test declarations separate from the executed `check`
+# artifacts. The census script is intentionally the only place that parses
+# the verbose test summary; a successful process exit remains authoritative
+# because several negative-path tests print "failed command" deliberately.
+test-census:
+	@cd "$(ROOT_DIR)" && python3 "$(TEST_CENSUS_SCRIPT)" --root "$(ROOT_DIR)" --output "$(TEST_CENSUS_OUT)" --run-check --strict
+
+# The fork manifest is source-only and never invokes Xenia.  It is kept as a
+# separate artifact so an identity can bind the classification and pinned
+# base without pretending that a source census is a behavior proof.
+xenia-fork-manifest:
+	@cd "$(ROOT_DIR)" && python3 "$(XENIA_FORK_MANIFEST_SCRIPT)" --root "$(XENIA_ROOT)" --output "$(XENIA_FORK_MANIFEST_OUT)"
+
+# The manifest is deliberately generated after the check artifacts exist. It
+# hashes their bytes and the shell-update record, while keeping filesystem
+# paths as metadata only. It never invokes Xenia.
+build-identity: shell-helper-build test-census xenia-fork-manifest
+	@cd "$(ROOT_DIR)" && python3 "$(BUILD_IDENTITY_SCRIPT)" --root "$(ROOT_DIR)" --xenia-root "$(XENIA_ROOT)" --helper "$(SHELL_HELPER_BIN)" --census "$(TEST_CENSUS_OUT)" --shell-update "$(SHELL_UPDATE_RECORD_OUT)" --fork-manifest "$(XENIA_FORK_MANIFEST_OUT)" --output "$(BUILD_IDENTITY_OUT)"
+
+replay-evidence:
+	@cd "$(ROOT_DIR)" && python3 "$(EVIDENCE_REPLAY_SCRIPT)" "$(EVIDENCE_REPLAY_JOURNAL)"
+
 shell shell-update: override ROSETTE_RUNTIME_OPTIMIZE := ReleaseFast
 
 shell: shell-helper-build
@@ -399,8 +438,10 @@ shell: shell-helper-build
 # I use most, this is one of the biggest go-to.
 # It enables you to update your global shell if you are trying to debug
 # something
-shell-update: shell-helper-build
+shell-update: shell-helper-build test-census xenia-fork-manifest
 	@"$(SHELL_HELPER_BIN)" update "$(ROOT_DIR)"
+	@cd "$(ROOT_DIR)" && python3 "$(SHELL_UPDATE_RECORD_SCRIPT)" --root "$(ROOT_DIR)" --helper "$(SHELL_HELPER_BIN)" --source "$(SHELL_HELPER_SRC)" --census "$(TEST_CENSUS_OUT)" --output "$(SHELL_UPDATE_RECORD_OUT)"
+	@cd "$(ROOT_DIR)" && python3 "$(BUILD_IDENTITY_SCRIPT)" --root "$(ROOT_DIR)" --xenia-root "$(XENIA_ROOT)" --helper "$(SHELL_HELPER_BIN)" --census "$(TEST_CENSUS_OUT)" --shell-update "$(SHELL_UPDATE_RECORD_OUT)" --fork-manifest "$(XENIA_FORK_MANIFEST_OUT)" --output "$(BUILD_IDENTITY_OUT)"
 
 shell-uninstall: shell-helper-build
 	@"$(SHELL_HELPER_BIN)" uninstall
@@ -805,7 +846,10 @@ iso-run: iso-build
 
 run-iso: iso-run
 
-.PHONY: iso-build iso-run run-iso
+xbox360-media-self-test:
+	@python3 "$(XBOX360_MEDIA_TOOL)" self-test
+
+.PHONY: iso-build iso-run run-iso xbox360-media-self-test
 
 
 
