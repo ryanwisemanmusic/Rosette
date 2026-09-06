@@ -1050,9 +1050,8 @@ pub fn executeXeniaVdInitializeEngines(state: anytype) bool {
     const arg = state.regs.rdx;
     state.regs.rax = 1;
     observeXeniaVd(state, .vd_initialize_engines, .initialize_engines);
-    observeXeniaVdCallback(state, callback, arg);
     machoCapturePrint(
-        "macho-processor: VdInitializeEngines import handled: callback=0x{x} arg=0x{x} result=1\n",
+        "macho-processor: VdInitializeEngines import handled: callback=0x{x} arg=0x{x} result=1; initialization callback argument retained as diagnostic context only, not registered for interrupt dispatch\n",
         .{ callback, arg },
     );
     return true;
