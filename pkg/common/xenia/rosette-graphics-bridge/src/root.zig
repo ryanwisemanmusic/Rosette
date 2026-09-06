@@ -28,6 +28,9 @@ pub const CodeLocation = contract.CodeLocation;
 pub const RunIdentity = contract.RunIdentity;
 pub const Feature = contract.Feature;
 pub const FeatureSet = contract.FeatureSet;
+pub const Provenance = contract.Provenance;
+pub const Effect = contract.Effect;
+pub const ContractEdge = contract.ContractEdge;
 
 test {
     // Rooted here so these run rather than merely compile. A `pub const` that
@@ -45,4 +48,15 @@ test "one schema version governs every file in the package" {
     try std.testing.expectEqual(contract.schema_version, schema_version);
     try std.testing.expectEqual(contract.schema_version, (event.Record{}).schema);
     try std.testing.expectEqual(contract.schema_version, (contract.RunIdentity{}).schema);
+}
+
+test "causal vocabulary is total and explicitly versioned" {
+    inline for (@typeInfo(Provenance).@"enum".fields) |field| {
+        try std.testing.expect(@as(Provenance, @enumFromInt(field.value)).label().len != 0);
+    }
+    inline for (@typeInfo(ContractEdge).@"enum".fields) |field| {
+        const edge: ContractEdge = @enumFromInt(field.value);
+        try std.testing.expect(edge.label().len != 0);
+    }
+    try std.testing.expectEqual(@as(u16, 3), contract.schema_version);
 }
