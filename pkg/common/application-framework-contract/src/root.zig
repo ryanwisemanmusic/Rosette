@@ -59,6 +59,14 @@ pub fn capabilityBit(capability: Capability) u64 {
     return @as(u64, 1) << @as(u6, @intCast(@intFromEnum(capability)));
 }
 
+/// Who an event belongs to.
+///
+/// The distinction that matters is *master* versus *substantiating*. Rosette
+/// owns the process and is the only master owner an event can have; a hosted
+/// application substantiates its own truth inside that process and is recorded
+/// as the subowner. Two master owners in one process is how two accounts of the
+/// same fact drift apart without either one looking wrong, which is the failure
+/// this split exists to make impossible rather than merely unlikely.
 pub const Owner = enum(u8) {
     unknown,
     rosette,
@@ -81,7 +89,45 @@ pub const Owner = enum(u8) {
             .external_adapter => "external:adapter",
         };
     }
+
+    /// Whether this owner may hold the master truth of the process. Only
+    /// Rosette does: it is the framework the process runs inside.
+    pub fn isMaster(self: Owner) bool {
+        return self == .rosette or self == .host_framework;
+    }
+
+    /// Whether this owner may substantiate a truth of its own beneath the
+    /// master. Everything hosted may; `unknown` may not, because an event whose
+    /// substantiator is unknown is one nobody can be asked about.
+    pub fn mayBeSubowner(self: Owner) bool {
+        return self != .unknown and !self.isMaster();
+    }
 };
+
+/// The master/subowner pair an event should carry.
+pub const Attribution = struct {
+    owner: Owner = .rosette,
+    subowner: Owner = .unknown,
+};
+
+/// Split a single requested owner into the pair the event records.
+///
+/// A caller naming `xenia_gpu` is saying "the GPU subsystem substantiated
+/// this", not "the GPU subsystem owns the process". Rosette is the master owner
+/// either way, and the requested owner becomes the subowner. A caller that
+/// already named a master owner has no subowner: the framework spoke for
+/// itself.
+pub fn attribute(requested: Owner) Attribution {
+    if (requested.isMaster()) return .{ .owner = requested, .subowner = .unknown };
+    return .{ .owner = .rosette, .subowner = requested };
+}
+
+/// Whether an event's ownership pair is one this contract permits.
+pub fn ownershipIsWellFormed(owner: Owner, subowner: Owner) bool {
+    if (!owner.isMaster()) return false;
+    if (subowner == .unknown) return true;
+    return subowner.mayBeSubowner();
+}
 
 pub const Domain = enum(u8) {
     unknown,
@@ -359,7 +405,10 @@ pub const Event = extern struct {
     domain: u8 = @intFromEnum(Domain.unknown),
     value_kind: u8 = @intFromEnum(ValueKind.none),
     equivalence: u8 = @intFromEnum(Equivalence.not_checked),
-    reserved0: u16 = 0,
+    /// The hosted subsystem that substantiated this event, beneath the master
+    /// owner. Carved out of the former padding, so the layout is unchanged.
+    subowner: u8 = @intFromEnum(Owner.unknown),
+    reserved0: u8 = 0,
     sequence: u64 = 0,
     guest_step: u64 = 0,
     thread_id: u64 = 0,
@@ -433,4 +482,49 @@ test "C ABI records remain pointer-free and fixed size" {
     try std.testing.expectEqual(@as(usize, 248), @sizeOf(Event));
     try std.testing.expectEqual(@as(usize, 120), @sizeOf(Snapshot));
     try std.testing.expect(@offsetOf(Event, "name") < @offsetOf(Event, "detail"));
+}
+
+test "Rosette is the only master owner" {
+    try std.testing.expect(Owner.rosette.isMaster());
+    try std.testing.expect(Owner.host_framework.isMaster());
+    for ([_]Owner{ .guest, .xenia_kernel, .xenia_gpu, .xenia_presenter, .external_adapter }) |owner| {
+        try std.testing.expect(!owner.isMaster());
+        try std.testing.expect(owner.mayBeSubowner());
+    }
+    try std.testing.expect(!Owner.unknown.isMaster());
+    try std.testing.expect(!Owner.unknown.mayBeSubowner());
+}
+
+test "a hosted subsystem substantiates beneath Rosette rather than beside it" {
+    const gpu = attribute(.xenia_gpu);
+    try std.testing.expectEqual(Owner.rosette, gpu.owner);
+    try std.testing.expectEqual(Owner.xenia_gpu, gpu.subowner);
+    try std.testing.expect(ownershipIsWellFormed(gpu.owner, gpu.subowner));
+
+    // The framework speaking for itself has no subowner.
+    const self_owned = attribute(.rosette);
+    try std.testing.expectEqual(Owner.rosette, self_owned.owner);
+    try std.testing.expectEqual(Owner.unknown, self_owned.subowner);
+    try std.testing.expect(ownershipIsWellFormed(self_owned.owner, self_owned.subowner));
+}
+
+test "two master owners is never well formed" {
+    try std.testing.expect(!ownershipIsWellFormed(.rosette, .host_framework));
+    try std.testing.expect(!ownershipIsWellFormed(.xenia_gpu, .guest));
+    try std.testing.expect(!ownershipIsWellFormed(.unknown, .guest));
+}
+
+test "attribution of every owner is well formed" {
+    inline for (@typeInfo(Owner).@"enum".fields) |field| {
+        const owner: Owner = @enumFromInt(field.value);
+        if (owner == .unknown) continue;
+        const pair = attribute(owner);
+        try std.testing.expect(ownershipIsWellFormed(pair.owner, pair.subowner));
+    }
+}
+
+test "the subowner byte did not change the event layout" {
+    try std.testing.expectEqual(@as(usize, 248), @sizeOf(Event));
+    const event = Event{};
+    try std.testing.expectEqual(@intFromEnum(Owner.unknown), event.subowner);
 }
