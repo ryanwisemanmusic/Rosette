@@ -26,7 +26,7 @@ pub const RuntimeModeConfig = struct {
     apply_workarounds: bool = false,
 
     /// Repair counter per repair type
-    repair_counts: std.AutoHashMap([]const u8, u64),
+    repair_counts: std.StringHashMap(u64),
 
     /// Allocator
     allocator: std.mem.Allocator,
@@ -34,7 +34,7 @@ pub const RuntimeModeConfig = struct {
     /// Initialize runtime mode configuration
     pub fn init(allocator: std.mem.Allocator) RuntimeModeConfig {
         return .{
-            .repair_counts = std.AutoHashMap([]const u8, u64).init(allocator),
+            .repair_counts = std.StringHashMap(u64).init(allocator),
             .allocator = allocator,
         };
     }

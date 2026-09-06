@@ -1,6 +1,7 @@
 const std = @import("std");
 const scheduler = @import("scheduler");
 const machoCapturePrint = @import("event_log").machoCapturePrint;
+const wait_policy = @import("xenia_wait_handshake_policy");
 
 const CURRENT_THREAD_HANDLE: u64 = 0x7FFF_1000;
 const SYNTHETIC_THREAD_BASE: u64 = 0x7FFF_2000;
@@ -8,6 +9,7 @@ const MAX_ATTRIBUTES = 32;
 const MAX_THREADS = 64;
 const MAX_MUTEXES = 128;
 const MAX_CONDVARS = 64;
+const MAX_TLS_KEYS = 64;
 const ETIMEDOUT: u64 = 60;
 
 pub const Outcome = union(enum) {
@@ -132,6 +134,12 @@ const Thread = struct {
     last_spurious_generation: u64 = 0,
     priority: i32 = 0,
     numeric_id: u64 = 0,
+    /// Real pthread-specific storage for the cooperative guest thread. The
+    /// previous implementation counted sets and returned zero, which made a
+    /// host library's thread-local Xenia/Rosette binding disappear at the
+    /// next callback boundary.
+    tls_values: [MAX_TLS_KEYS]u64 = [_]u64{0} ** MAX_TLS_KEYS,
+    tls_present: u64 = 0,
 };
 
 const system_clock_epoch_nanoseconds: u64 = 1_719_000_000 * 1_000_000_000;
@@ -186,7 +194,16 @@ pub const Runtime = struct {
     indefinite_sleeps_started: u64 = 0,
     cpp_indefinite_waits_started: u64 = 0,
     quiescence_spurious_wakes: u64 = 0,
+    spurious_wake_policy_refusals: u64 = 0,
     tls_sets: u64 = 0,
+    tls_gets: u64 = 0,
+    tls_key_creates: u64 = 0,
+    tls_key_deletes: u64 = 0,
+    tls_keys: u64 = 0,
+    tls_destructors: [MAX_TLS_KEYS]u64 = [_]u64{0} ** MAX_TLS_KEYS,
+    next_tls_key: u64 = 0,
+    main_tls_values: [MAX_TLS_KEYS]u64 = [_]u64{0} ** MAX_TLS_KEYS,
+    main_tls_present: u64 = 0,
     scheduled_threads: u64 = 0,
     completed_threads: u64 = 0,
     blocked_threads: u64 = 0,
@@ -221,10 +238,11 @@ pub const Runtime = struct {
         }
         if (std.mem.eql(u8, name, "_pthread_getname_np")) return .{ .handled = self.getName(state) };
         if (std.mem.eql(u8, name, "_pthread_getschedparam")) return .{ .handled = self.getSchedule(state) };
-        if (std.mem.eql(u8, name, "_pthread_getspecific")) return .{ .handled = 0 };
+        if (std.mem.eql(u8, name, "_pthread_key_create")) return .{ .handled = self.tlsKeyCreate(state) };
+        if (std.mem.eql(u8, name, "_pthread_key_delete")) return .{ .handled = self.tlsKeyDelete(state.regs.rdi) };
+        if (std.mem.eql(u8, name, "_pthread_getspecific")) return .{ .handled = self.tlsGet(self.currentThreadHandle(state), state.regs.rdi) };
         if (std.mem.eql(u8, name, "_pthread_setspecific")) {
-            self.tls_sets +|= 1;
-            return .{ .handled = 0 };
+            return .{ .handled = self.tlsSet(self.currentThreadHandle(state), state.regs.rdi, state.regs.rsi) };
         }
         if (std.mem.eql(u8, name, "_pthread_mutex_init")) return .{ .handled = self.mutexInit(state) };
         if (std.mem.eql(u8, name, "_pthread_mutex_destroy")) return .{ .handled = self.mutexDestroy(state.regs.rdi) };
@@ -431,7 +449,7 @@ pub const Runtime = struct {
     pub fn logSummary(self: *const Runtime) void {
         if (self.created_threads == 0 and self.mutex_locks == 0 and self.collapsed_waits == 0 and self.tls_sets == 0) return;
         machoCapturePrint(
-            "macho-processor: pthread runtime: created={d} deferred={d} scheduled={d} completed={d} joined={d} unhonoured_joins={d} cancelled={d} blocked={d} mutex(lock/unlock/contention)={d}/{d}/{d} cond(notify/broadcast/waits/quiescence_wakes)={d}/{d}/{d}/{d} timed_waits(started/signaled/expired)={d}/{d}/{d} indefinite_wait_sentinels={d} sleeps(timed_started/timed_completed/indefinite)={d}/{d}/{d} yield_hints={d} tls_sets={d} thread_id_queries={d}\n",
+            "macho-processor: pthread runtime: created={d} deferred={d} scheduled={d} completed={d} joined={d} unhonoured_joins={d} cancelled={d} blocked={d} mutex(lock/unlock/contention)={d}/{d}/{d} cond(notify/broadcast/waits/quiescence_wakes/policy_refusals)={d}/{d}/{d}/{d}/{d} timed_waits(started/signaled/expired)={d}/{d}/{d} indefinite_wait_sentinels={d} sleeps(timed_started/timed_completed/indefinite)={d}/{d}/{d} yield_hints={d} tls_sets={d} thread_id_queries={d}\n",
             .{
                 self.created_threads,
                 self.deferred_threads,
@@ -448,6 +466,7 @@ pub const Runtime = struct {
                 self.condition_broadcasts,
                 self.collapsed_waits,
                 self.quiescence_spurious_wakes,
+                self.spurious_wake_policy_refusals,
                 self.timed_waits_started,
                 self.timed_waits_signaled,
                 self.timed_waits_expired,
@@ -611,6 +630,20 @@ pub const Runtime = struct {
         const thread = self.threadForHandle(handle) orelse return;
         if (thread.state == .terminated) return;
         thread.state = .terminated;
+        // Thread termination is the join signal. Publish the target's
+        // terminal state before releasing any caller parked on it, and keep
+        // the caller at its original import frame so it can re-enter the
+        // join and consume the result exactly once.
+        for (&self.threads) |*joiner| {
+            if (!joiner.active or joiner.state != .waiting_join or joiner.waiting_join_target != handle) continue;
+            joiner.state = .runnable;
+            joiner.waiting_join_target = 0;
+            joiner.blocked_reason = "";
+            joiner.blocked_rip = 0;
+            joiner.wait_result = .signaled;
+            self.blocked_threads -|= 1;
+            self.emit(.{ .kind = .thread_resumed, .thread = joiner.handle, .object = handle, .reason = "pthread_join_target_terminated" });
+        }
         self.bumpStateVersion();
         self.completed_threads +|= 1;
         self.emit(.{ .kind = .thread_terminated, .thread = handle, .reason = "guest_thread_returned" });
@@ -641,6 +674,111 @@ pub const Runtime = struct {
             if (state.active_guest_thread != 0) return state.active_guest_thread;
         }
         return self.main_thread_handle;
+    }
+
+    pub const JoinDecision = enum {
+        ready,
+        pending,
+        unavailable,
+        invalid,
+    };
+
+    /// Enter a real cooperative join. The caller remains at the import frame
+    /// while the target runs; once `markCompleted` makes the caller runnable,
+    /// the import is re-entered and returns success. An unavailable
+    /// cooperative context is never reported as a completed join.
+    pub fn beginJoin(self: *Runtime, state: anytype) JoinDecision {
+        const target_handle = state.regs.rdi;
+        const caller_handle = self.currentThreadHandle(state);
+        if (target_handle == 0 or target_handle == caller_handle) return .invalid;
+        const target = self.threadForHandle(target_handle) orelse return .unavailable;
+        if (target.state == .terminated or target.state == .cancelled) return .ready;
+        const caller = self.threadForHandle(caller_handle) orelse return .unavailable;
+        if (caller.state == .waiting_join) {
+            return if (caller.waiting_join_target == target_handle) .pending else .invalid;
+        }
+        caller.state = .waiting_join;
+        caller.blocked_since_step = schedulerStep(state);
+        caller.blocked_rip = state.regs.rip;
+        caller.blocked_reason = "pthread_join";
+        caller.waiting_join_target = target_handle;
+        caller.wait_result = .pending;
+        self.blocked_threads +|= 1;
+        self.bumpStateVersion();
+        self.emit(.{ .kind = .thread_blocked, .step = schedulerStep(state), .thread = caller_handle, .object = target_handle, .reason = "pthread_join" });
+        return .pending;
+    }
+
+    /// Roll back a join entry when no alternate cooperative context exists.
+    /// The caller then receives the real modeled failure from `join` rather
+    /// than a false success.
+    pub fn cancelJoinWait(self: *Runtime, state: anytype) void {
+        const caller = self.threadForHandle(self.currentThreadHandle(state)) orelse return;
+        if (caller.state != .waiting_join) return;
+        caller.state = .runnable;
+        caller.waiting_join_target = 0;
+        caller.blocked_reason = "";
+        caller.blocked_rip = 0;
+        caller.wait_result = .cancelled;
+        self.blocked_threads -|= 1;
+        self.bumpStateVersion();
+    }
+
+    fn tlsKeyCreate(self: *Runtime, state: anytype) u64 {
+        if (state.regs.rdi == 0 or state.guestMemory(state.regs.rdi, 8) == null) return 14;
+        if (self.next_tls_key >= MAX_TLS_KEYS) return 11;
+        const key = self.next_tls_key;
+        self.next_tls_key += 1;
+        self.tls_keys |= @as(u64, 1) << @intCast(key);
+        self.tls_destructors[@intCast(key)] = state.regs.rsi;
+        state.write64(state.regs.rdi, key);
+        self.tls_key_creates +|= 1;
+        return 0;
+    }
+
+    fn tlsKeyDelete(self: *Runtime, key: u64) u64 {
+        if (key >= MAX_TLS_KEYS or (self.tls_keys & (@as(u64, 1) << @intCast(key))) == 0) return 22;
+        const mask = @as(u64, 1) << @intCast(key);
+        self.tls_keys &= ~mask;
+        self.tls_destructors[@intCast(key)] = 0;
+        self.main_tls_values[@intCast(key)] = 0;
+        self.main_tls_present &= ~mask;
+        for (&self.threads) |*thread| {
+            if (!thread.active) continue;
+            thread.tls_values[@intCast(key)] = 0;
+            thread.tls_present &= ~mask;
+        }
+        self.tls_key_deletes +|= 1;
+        return 0;
+    }
+
+    fn validTlsKey(self: *const Runtime, key: u64) bool {
+        return key < MAX_TLS_KEYS and (self.tls_keys & (@as(u64, 1) << @intCast(key))) != 0;
+    }
+
+    pub fn tlsGet(self: *Runtime, thread_handle: u64, key: u64) u64 {
+        self.tls_gets +|= 1;
+        if (!self.validTlsKey(key)) return 0;
+        const bit = @as(u64, 1) << @intCast(key);
+        if (thread_handle == self.main_thread_handle) return if (self.main_tls_present & bit != 0) self.main_tls_values[@intCast(key)] else 0;
+        const thread = self.threadForHandle(thread_handle) orelse return 0;
+        return if (thread.tls_present & bit != 0) thread.tls_values[@intCast(key)] else 0;
+    }
+
+    pub fn tlsSet(self: *Runtime, thread_handle: u64, key: u64, value: u64) u64 {
+        self.tls_sets +|= 1;
+        if (!self.validTlsKey(key)) return 22;
+        const index: usize = @intCast(key);
+        const bit = @as(u64, 1) << @intCast(key);
+        if (thread_handle == self.main_thread_handle) {
+            self.main_tls_values[index] = value;
+            if (value == 0) self.main_tls_present &= ~bit else self.main_tls_present |= bit;
+            return 0;
+        }
+        const thread = self.threadForHandle(thread_handle) orelse return 3;
+        thread.tls_values[index] = value;
+        if (value == 0) thread.tls_present &= ~bit else thread.tls_present |= bit;
+        return 0;
     }
 
     pub fn mutexWouldBlock(self: *Runtime, address: u64, owner: u64) bool {
@@ -926,6 +1064,36 @@ pub const Runtime = struct {
         waited_steps: u64,
     };
 
+    /// The automatic recovery paths below are deliberately POSIX-only. Keep
+    /// the final permission check next to the mutation so a future caller
+    /// cannot add another spurious-wake path without satisfying the shared
+    /// policy. Guest semaphores/events never enter this helper.
+    fn permitPosixSpuriousWake(self: *Runtime, thread: *const Thread) bool {
+        const result = wait_policy.spuriousWakeDecision(.{
+            .object_kind = .posix_condvar,
+            // Reaching this internal scheduler operation is the explicit
+            // Rosette scheduler opt-in. It is not inferred from an unknown
+            // guest object or from a returned wait result.
+            .explicit_opt_in = true,
+            .predicate_recheck_safe = true,
+            .mutex_available = thread.waiting_mutex == 0 or
+                !self.mutexWouldBlock(thread.waiting_mutex, thread.handle),
+            .waiter_parked = thread.state == .waiting_condvar,
+            .generation_already_repaired = thread.waiting_condvar == thread.last_spurious_condvar and
+                thread.wait_generation == thread.last_spurious_generation,
+        });
+        if (!result.allowed) {
+            self.spurious_wake_policy_refusals +|= 1;
+            if (self.spurious_wake_policy_refusals <= 4) {
+                machoCapturePrint(
+                    "macho-processor: POSIX SPURIOUS WAKE POLICY: refused thread=0x{x} object=0x{x} reason={s}; no synthetic wake was granted\n",
+                    .{ thread.handle, thread.waiting_condvar, result.reason },
+                );
+            }
+        }
+        return result.allowed;
+    }
+
     pub fn wakeNeverNotifiedWaiter(self: *Runtime, current_step: u64) ?NeverNotifiedRepair {
         // The report's worst object and the repair's target are different
         // questions: an `observed_notifiers_parked` object outranks a
@@ -940,6 +1108,7 @@ pub const Runtime = struct {
             if (thread.waiting_condvar == thread.last_spurious_condvar and
                 thread.wait_generation == thread.last_spurious_generation) continue;
             if (thread.waiting_mutex != 0 and self.mutexWouldBlock(thread.waiting_mutex, thread.handle)) continue;
+            if (!self.permitPosixSpuriousWake(thread)) continue;
             if (selected == null or thread.blocked_since_step < selected.?.blocked_since_step) selected = thread;
         }
         const thread = selected orelse return null;
@@ -980,6 +1149,7 @@ pub const Runtime = struct {
             if (thread.waiting_condvar == thread.last_spurious_condvar and
                 thread.wait_generation == thread.last_spurious_generation) continue;
             if (thread.waiting_mutex != 0 and self.mutexWouldBlock(thread.waiting_mutex, thread.handle)) continue;
+            if (!self.permitPosixSpuriousWake(thread)) continue;
             if (thread.handle == preferred_handle) {
                 selected = thread;
                 break;
@@ -1076,58 +1246,19 @@ pub const Runtime = struct {
         return 11;
     }
 
-    /// `pthread_join`, and the one thing it cannot currently honour.
-    ///
-    /// A correct join blocks the **caller** until the target terminates. This
-    /// one returns success immediately, because the import dispatch has no
-    /// outcome that means "re-execute me later" — every handler completes. The
-    /// consequence is not theoretical: `std::thread::join()` believes the
-    /// thread finished, the caller destroys whatever the thread was still
-    /// using, and the thread dispatches through a freed object some thousands
-    /// of steps later. That is a use-after-free with the crash arriving in a
-    /// different thread, in a different subsystem, long after the cause.
-    ///
-    /// Two things are fixed here and one is only reported:
-    ///
-    ///  * The *target* was being marked `waiting_join`, which is nonsense — it
-    ///    is running, and the state corrupted belonged to a thread doing real
-    ///    work. No thread's state is changed now: marking the caller instead
-    ///    would be wrong the other way, because the import returns and the
-    ///    caller resumes immediately, so a scheduler that believed it blocked
-    ///    would refuse to run it.
-    ///  * The early return is now recorded against the target, so the eventual
-    ///    crash can be attributed to it instead of to whatever memory happened
-    ///    to be reused.
-    ///
-    /// The early return itself stays until the dispatch grows a retry outcome;
-    /// inventing one here would change the contract every import is written
-    /// against.
+    /// Complete a join only after the target has reached a terminal state.
+    /// Cooperative callers enter through `beginJoin`; the import handler keeps
+    /// their call frame intact while the target runs and retries this method
+    /// after `markCompleted` wakes the caller. Direct callers that cannot park
+    /// receive EBUSY rather than a fabricated success.
     fn join(self: *Runtime, state: anytype) u64 {
         const target = self.threadForHandle(state.regs.rdi) orelse return 3;
         const caller_handle = self.currentThreadHandle(state);
         const terminated = target.state == .terminated or target.state == .cancelled;
 
-        if (!terminated) {
-            // The relationship is recorded and **no state is changed**.
-            //
-            // Marking the target `waiting_join` — what this used to do —
-            // corrupted a thread that was running. Marking the *caller* would
-            // be equally wrong in the other direction: the import returns
-            // success, so the caller resumes executing immediately, and a
-            // scheduler that believed it was blocked would refuse to run it.
-            // Until the dispatch can express "re-execute me later", the honest
-            // state for both threads is the one they already had.
-            if (self.threadForHandle(caller_handle)) |caller| {
-                caller.waiting_join_target = target.handle;
-            }
-            self.unhonoured_joins +|= 1;
-            if (self.unhonoured_joins <= 8 or self.unhonoured_joins % 64 == 0) {
-                machoCapturePrint(
-                    "macho-processor: pthread join not honoured #{d}: caller=0x{x} target=0x{x} target_state={s} started_step={d}; the join returns success while the target is still running, so anything the caller destroys next is still in use by it. A crash that arrives later in another thread belongs to this line, not to the memory it lands in\n",
-                    .{ self.unhonoured_joins, caller_handle, target.handle, @tagName(target.state), target.blocked_since_step },
-                );
-            }
-        } else if (self.threadForHandle(caller_handle)) |caller| {
+        if (!terminated) return 16; // EBUSY: direct callers must retry after termination.
+
+        if (self.threadForHandle(caller_handle)) |caller| {
             if (caller.waiting_join_target == target.handle) caller.waiting_join_target = 0;
         }
 
@@ -1192,6 +1323,11 @@ pub const Runtime = struct {
         }
         mutex.depth +|= 1;
         mutex.owner_thread = owner;
+        // A condvar waiter may already have been notified but still be
+        // waiting to reacquire this mutex. The runnable-cache key must change
+        // when ownership changes, otherwise the scheduler can keep reusing a
+        // stale "not runnable" result and never retry that waiter.
+        self.bumpStateVersion();
         self.mutex_locks +|= 1;
         return 0;
     }
@@ -1206,6 +1342,10 @@ pub const Runtime = struct {
         if (mutex.depth != 0) {
             mutex.depth -= 1;
             if (mutex.depth == 0) mutex.owner_thread = 0;
+            // Unlocking is the event that makes a notified waiter eligible to
+            // complete its atomic condvar reacquisition. This invalidation is
+            // as important as the notification itself.
+            self.bumpStateVersion();
         }
         self.mutex_unlocks +|= 1;
         return 0;
@@ -1220,6 +1360,7 @@ pub const Runtime = struct {
         if (mutex.depth != 0) {
             if (mutex.recursive and mutex.owner_thread == owner) {
                 mutex.depth +|= 1;
+                self.bumpStateVersion();
                 self.mutex_locks +|= 1;
                 return 0;
             }
@@ -1229,6 +1370,7 @@ pub const Runtime = struct {
         }
         mutex.depth = 1;
         mutex.owner_thread = owner;
+        self.bumpStateVersion();
         self.mutex_locks +|= 1;
         return 0;
     }
@@ -1602,6 +1744,118 @@ test "pthread runtime records deferred guest threads" {
     try std.testing.expectEqual(@as(u64, 1), runtime.completed_threads);
 }
 
+test "pthread TLS keys retain values per cooperative thread" {
+    var runtime = Runtime{};
+    var state = struct {
+        memory: [64]u8 = [_]u8{0} ** 64,
+        active_guest_thread: u64 = CURRENT_THREAD_HANDLE,
+        regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0, rip: u64 = 0 } = .{},
+
+        fn guestMemory(self: *@This(), address: u64, size: u64) ?[]u8 {
+            const start: usize = @intCast(address);
+            const length: usize = @intCast(size);
+            if (start > self.memory.len or length > self.memory.len - start) return null;
+            return self.memory[start .. start + length];
+        }
+
+        fn write64(self: *@This(), address: u64, value: u64) void {
+            std.mem.writeInt(u64, self.memory[@intCast(address)..][0..8], value, .little);
+        }
+
+        fn write32(self: *@This(), address: u64, value: u32) void {
+            std.mem.writeInt(u32, self.memory[@intCast(address)..][0..4], value, .little);
+        }
+    }{};
+
+    state.regs.rdi = 8;
+    state.regs.rsi = 0xDEAD;
+    try std.testing.expectEqual(@as(u64, 0), runtime.dispatch(&state, "_pthread_key_create").?.handled);
+    const key = std.mem.readInt(u64, state.memory[8..16], .little);
+    try std.testing.expectEqual(@as(u64, 0), key);
+
+    try std.testing.expectEqual(@as(u64, 0), runtime.tlsSet(CURRENT_THREAD_HANDLE, key, 0x1111));
+    try std.testing.expectEqual(@as(u64, 0x1111), runtime.tlsGet(CURRENT_THREAD_HANDLE, key));
+
+    const worker = SYNTHETIC_THREAD_BASE;
+    runtime.threads[0] = .{ .active = true, .handle = worker };
+    try std.testing.expectEqual(@as(u64, 0), runtime.tlsSet(worker, key, 0x2222));
+    try std.testing.expectEqual(@as(u64, 0x2222), runtime.tlsGet(worker, key));
+    try std.testing.expectEqual(@as(u64, 0x1111), runtime.tlsGet(CURRENT_THREAD_HANDLE, key));
+
+    state.regs.rdi = key;
+    try std.testing.expectEqual(@as(u64, 0), runtime.dispatch(&state, "_pthread_key_delete").?.handled);
+    try std.testing.expectEqual(@as(u64, 0), runtime.tlsGet(worker, key));
+    try std.testing.expectEqual(@as(u64, 22), runtime.tlsSet(worker, key, 1));
+}
+
+test "pthread join parks the caller and releases it on target termination" {
+    var runtime = Runtime{};
+    const caller: u64 = CURRENT_THREAD_HANDLE;
+    const target: u64 = SYNTHETIC_THREAD_BASE;
+    runtime.threads[0] = .{ .active = true, .handle = caller, .state = .running };
+    runtime.threads[1] = .{ .active = true, .handle = target, .state = .running };
+
+    var state = struct {
+        memory: [32]u8 = [_]u8{0} ** 32,
+        active_guest_thread: u64 = caller,
+        executed_steps: u64 = 42,
+        regs: struct { rdi: u64 = target, rsi: u64 = 8, rdx: u64 = 0, rcx: u64 = 0, rip: u64 = 0x9000 } = .{},
+
+        fn guestMemory(self: *@This(), address: u64, size: u64) ?[]u8 {
+            const start: usize = @intCast(address);
+            const length: usize = @intCast(size);
+            if (start > self.memory.len or length > self.memory.len - start) return null;
+            return self.memory[start .. start + length];
+        }
+
+        fn write64(self: *@This(), address: u64, value: u64) void {
+            std.mem.writeInt(u64, self.memory[@intCast(address)..][0..8], value, .little);
+        }
+
+        fn write32(self: *@This(), address: u64, value: u32) void {
+            std.mem.writeInt(u32, self.memory[@intCast(address)..][0..4], value, .little);
+        }
+    }{};
+
+    try std.testing.expectEqual(Runtime.JoinDecision.pending, runtime.beginJoin(&state));
+    try std.testing.expectEqual(ThreadState.waiting_join, runtime.threads[0].state);
+    try std.testing.expectEqual(target, runtime.threads[0].waiting_join_target);
+
+    runtime.markCompleted(target);
+    try std.testing.expectEqual(ThreadState.terminated, runtime.threads[1].state);
+    try std.testing.expectEqual(ThreadState.runnable, runtime.threads[0].state);
+    try std.testing.expectEqual(@as(u64, 0), runtime.threads[0].waiting_join_target);
+
+    try std.testing.expectEqual(Runtime.JoinDecision.ready, runtime.beginJoin(&state));
+    try std.testing.expectEqual(@as(u64, 0), runtime.dispatch(&state, "_pthread_join").?.handled);
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, state.memory[8..16], .little));
+    try std.testing.expect(runtime.threads[1].joined);
+}
+
+test "pthread join does not report success while a target is running" {
+    var runtime = Runtime{};
+    const target: u64 = SYNTHETIC_THREAD_BASE;
+    runtime.threads[0] = .{ .active = true, .handle = target, .state = .running };
+    var state = struct {
+        regs: struct { rdi: u64 = target, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0, rip: u64 = 0 } = .{},
+
+        fn guestMemory(self: *@This(), _: u64, _: u64) ?[]u8 {
+            _ = self;
+            return null;
+        }
+
+        fn write64(self: *@This(), _: u64, _: u64) void {
+            _ = self;
+        }
+
+        fn write32(self: *@This(), _: u64, _: u32) void {
+            _ = self;
+        }
+    }{};
+    try std.testing.expectEqual(@as(u64, 16), runtime.dispatch(&state, "_pthread_join").?.handled);
+    try std.testing.expect(!runtime.threads[0].joined);
+}
+
 test "pthread mutex contention tracking" {
     var runtime = Runtime{};
     const mutex_addr: u64 = 0x1000;
@@ -1632,6 +1886,29 @@ test "pthread mutex try-lock reports busy and succeeds after unlock" {
     try std.testing.expect(!runtime.cppMutexTryLock(address));
     try std.testing.expectEqual(@as(u64, 0), runtime.mutexUnlock(address));
     try std.testing.expect(runtime.cppMutexTryLock(address));
+}
+
+test "mutex ownership transitions invalidate the suspended-runnable cache" {
+    var runtime = Runtime{};
+    const address: u64 = 0x2800;
+    const first_owner: u64 = SYNTHETIC_THREAD_BASE;
+    const second_owner: u64 = SYNTHETIC_THREAD_BASE + 0x10;
+
+    const initial_version = runtime.state_version;
+    try std.testing.expect(runtime.cppMutexTryLockForThread(address, first_owner));
+    try std.testing.expect(runtime.state_version > initial_version);
+
+    const held_version = runtime.state_version;
+    try std.testing.expect(!runtime.cppMutexTryLockForThread(address, second_owner));
+    // A failed try-lock does not publish a transition: the owner and the
+    // waiter's eligibility have not changed yet.
+    try std.testing.expectEqual(held_version, runtime.state_version);
+
+    try std.testing.expectEqual(@as(u64, 0), runtime.mutexUnlockForThread(address, first_owner));
+    const released_version = runtime.state_version;
+    try std.testing.expect(released_version > held_version);
+    try std.testing.expect(runtime.cppMutexTryLockForThread(address, second_owner));
+    try std.testing.expect(runtime.state_version > released_version);
 }
 
 test "libc++ recursive mutex models reentrancy and ownership" {

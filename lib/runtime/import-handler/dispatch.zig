@@ -2447,6 +2447,40 @@ pub fn handleCooperativeYieldImport(self: anytype, imported: macho_metadata.Impo
 
 pub fn handleCooperativeWaitImport(self: anytype, imported: macho_metadata.ImportedSymbol, return_address: u64) bool {
     if (!isCooperativeWaitImport(imported.name)) return false;
+    const pthread_join = std.mem.eql(u8, imported.name, "_pthread_join");
+    if (pthread_join) {
+        switch (self.pthreads.beginJoin(self)) {
+            .ready => {
+                self.regs.rax = 0;
+                if (return_address != 0 and self.isExecutableAddress(return_address)) {
+                    _ = self.pop();
+                    self.regs.rip = return_address;
+                } else {
+                    self.faulted = true;
+                    self.exit_code = 127;
+                    self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
+                    self.terminated = true;
+                }
+                self.resolving_import_route = .pthread;
+                self.import_provider_override = .pthread_runtime;
+                return true;
+            },
+            .pending => {
+                // Keep the import call frame intact. The target's terminal
+                // transition makes this context runnable and the next
+                // dispatch re-enters the import, at which point `.ready`
+                // consumes the join exactly once.
+                if (self.yieldActiveGuestThreadForWait("pthread join")) {
+                    self.resolving_import_route = .pthread;
+                    self.import_provider_override = .pthread_runtime;
+                    return true;
+                }
+                self.pthreads.cancelJoinWait(self);
+                return false;
+            },
+            .unavailable, .invalid => return false,
+        }
+    }
     const cpp_condvar_wait = std.mem.indexOf(u8, imported.name, "condition_variable15__do_timed_wait") != null or
         std.mem.indexOf(u8, imported.name, "condition_variable4wait") != null or
         std.mem.indexOf(u8, imported.name, "condition_variable10wait_until") != null;
@@ -2508,7 +2542,10 @@ pub fn handleSleepSchedulingBoundary(self: anytype, decision: scheduler.GuestSle
     const sleeping_thread = self.active_guest_thread;
     var parked = false;
     switch (decision.kind) {
-        .yield => _ = self.guest_time.advanceBy(decision.effective_nanoseconds),
+        .yield => _ = self.guest_time.advanceBySource(
+            decision.effective_nanoseconds,
+            .guest_timer,
+        ),
         .invalid => return false,
         .timed => {
             const deadline = self.guest_time.now() +| decision.effective_nanoseconds;
@@ -2521,7 +2558,10 @@ pub fn handleSleepSchedulingBoundary(self: anytype, decision: scheduler.GuestSle
             );
             if (!parked) {
                 _ = self.guest_time.cancel(sequence);
-                _ = self.guest_time.advanceBy(decision.effective_nanoseconds);
+                _ = self.guest_time.advanceBySource(
+                    decision.effective_nanoseconds,
+                    .guest_timer,
+                );
             }
         },
         .indefinite => {

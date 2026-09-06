@@ -133,10 +133,115 @@ const Activation = struct {
     sequence: u64,
 };
 
+/// What the host's protection granularity cost this run, and how much of it
+/// the overlay took back.
+///
+/// The host-capability report answers this once, before the guest runs. It
+/// cannot answer it *during* the run, and the run is where the claim has to
+/// keep being true: a startup proof that the overlay enforces 4 KiB says
+/// nothing about a mid-run protection change that widened to a host page
+/// because no activation covered the neighbouring guest page. So the same
+/// question is counted as it happens.
+///
+/// The fields are deliberately three separate numbers rather than a ratio. A
+/// run with no sub-host-page requests at all is a different fact from one with
+/// thousands that the overlay recorded exactly, and both are different from
+/// one where the exact record was not taken.
+pub const GranularityLedger = struct {
+    /// Protection requests whose exact guest range was narrower than the host
+    /// would change on its own.
+    subhost_requests: u64 = 0,
+    /// Of those, the ones whose widened host span reached a guest page the
+    /// request did not name. These are the requests where the host protection
+    /// alone would have been wrong in one direction or the other.
+    shared_host_page_requests: u64 = 0,
+    /// Requests for which the exact guest-granular interval was recorded, so
+    /// the guest is judged against what it asked for rather than against what
+    /// the host was willing to do.
+    exact_records: u64 = 0,
+    /// Requests that widened and were *not* recorded exactly. Non-zero here is
+    /// the finding: the overlay has a hole and the host page decides.
+    unrecorded_widenings: u64 = 0,
+
+    /// The granularity the guest actually got. 4 KiB while every widened
+    /// request was also recorded exactly; the host page as soon as one was not.
+    pub fn effectiveGranularity(self: GranularityLedger) u64 {
+        return if (self.unrecorded_widenings == 0)
+            PAGE_4K
+        else
+            guest_memory_geometry.host_vm_page_size;
+    }
+
+    pub fn holds(self: GranularityLedger) bool {
+        return self.unrecorded_widenings == 0;
+    }
+
+    pub fn describe(self: GranularityLedger) []const u8 {
+        if (!self.holds()) {
+            return "a guest protection change widened to a host page and no exact guest-granular record was taken, so the host page decides. Neighbouring guest pages now carry a protection nothing asked for";
+        }
+        if (self.subhost_requests == 0) {
+            return "no protection change has been narrower than the host's own granularity, so the host page size has not yet cost this run anything";
+        }
+        if (self.shared_host_page_requests == 0) {
+            return "every protection change narrower than the host page landed on a host page it did not share, so the widening reached nothing the request did not name";
+        }
+        return "protection changes narrower than the host page widened onto guest pages they did not name, and every one of them was also recorded at exact guest granularity — the guest is judged against its own request and not against the host's";
+    }
+};
+
+/// Why an overlay proof could not be completed. Distinct from "the overlay
+/// does not work": a reservation that could not be taken says nothing about
+/// the mechanism, and reporting it as a failure would send a reader to fix
+/// something that was never exercised.
+pub const OverlayObstacle = enum(u8) {
+    none,
+    reservation_failed,
+    protect_rejected,
+    neighbour_lost_access,
+    protection_not_enforced,
+    mapping_split,
+
+    pub fn label(self: OverlayObstacle) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .reservation_failed => "no address range could be reserved for the proof",
+            .protect_rejected => "the overlay refused a guest-granular protection change",
+            .neighbour_lost_access => "a guest page lost access its own request granted",
+            .protection_not_enforced => "a guest page kept access its own request removed",
+            .mapping_split => "the overlay split a mapping to achieve the granularity",
+        };
+    }
+
+    /// Whether this obstacle is a statement about the overlay. The others are
+    /// statements about the environment the proof ran in.
+    pub fn accusesOverlay(self: OverlayObstacle) bool {
+        return switch (self) {
+            .none, .reservation_failed => false,
+            .protect_rejected, .neighbour_lost_access, .protection_not_enforced, .mapping_split => true,
+        };
+    }
+};
+
+/// The result of exercising the guest protection overlay once.
+pub const OverlayProof = struct {
+    succeeded: bool,
+    /// The granularity the overlay enforced, in bytes.
+    granularity: u64,
+    obstacle: OverlayObstacle = .none,
+    /// Whether the two guest pages the proof used actually shared a host page.
+    /// False on a host whose page is already the console's, where the proof
+    /// still holds and proves less.
+    shared_host_page: bool = false,
+    /// Mappings the proof needed. One: the anti-fragmentation property.
+    mappings_used: usize = 0,
+};
+
 pub const Manager = struct {
     allocator: std.mem.Allocator,
     mappings: std.ArrayList(Mapping) = .empty,
     activations: std.ArrayList(Activation) = .empty,
+    granularity: GranularityLedger = .{},
     total_reserved: u64 = 0,
     protection_sequence: u64 = 0,
     /// Set once the guest installs its own fault handler. A refusal at a page
@@ -722,6 +827,17 @@ pub const Manager = struct {
                 // mapping kind.
                 const active_memory = mapping.memory[offset..][0..effective_length_usize];
                 self.appendActivation(guest_base, active_memory, prot_raw) catch return false;
+                // Count what the host's granularity cost this request and
+                // whether the exact record above took it back. The activation
+                // is appended first because that is the thing being counted:
+                // an exact record that failed to append returned above and is
+                // never counted as one.
+                self.noteGranularity(
+                    host_span.offset,
+                    host_span.length,
+                    offset,
+                    effective_length_usize,
+                );
                 if (prot_raw & PROT_EXEC != 0) {
                     machoCapturePrint(
                         "macho-processor: sparse guest execute protection emulated: guest_base=0x{x} requested_length={d} effective_length={d} guest_prot=0x{x} host_prot=0x{x} host_execute=false\n",
@@ -852,6 +968,108 @@ pub const Manager = struct {
     fn bumpPageCache(self: *Manager) void {
         self.page_cache_generation +%= 1;
         if (self.page_cache_generation == 0) self.page_cache_generation = 1;
+    }
+
+    /// Record one protection request against the host's granularity.
+    ///
+    /// `host_*` is the span the kernel was actually given; `exact_*` is the
+    /// guest-granular interval the request named and the overlay recorded.
+    /// The two differing is the whole subject: it is the moment the host page
+    /// reached a guest page nobody asked about, and the exact record is the
+    /// only reason that does not become the guest's problem.
+    fn noteGranularity(
+        self: *Manager,
+        host_offset: usize,
+        host_length: usize,
+        exact_offset: usize,
+        exact_length: usize,
+    ) void {
+        const widened = host_offset != exact_offset or host_length != exact_length;
+        if (!widened) return;
+        self.granularity.subhost_requests +|= 1;
+        // A widening that reaches beyond the named interval touches guest
+        // pages the request did not name. A widening that only rounds the tail
+        // *within* the named interval does not.
+        if (host_offset < exact_offset or
+            host_offset + host_length > exact_offset + exact_length)
+        {
+            self.granularity.shared_host_page_requests +|= 1;
+        }
+        // Reaching here means `appendActivation` succeeded, so the exact
+        // interval is on record and the guest is judged against it.
+        self.granularity.exact_records +|= 1;
+    }
+
+    /// Record that a protection request widened to a host page with no exact
+    /// guest-granular record behind it. Called by the paths that cannot append
+    /// an activation, so the ledger's claim stays falsifiable rather than
+    /// being true by construction.
+    pub fn noteUnrecordedWidening(self: *Manager) void {
+        self.granularity.subhost_requests +|= 1;
+        self.granularity.shared_host_page_requests +|= 1;
+        self.granularity.unrecorded_widenings +|= 1;
+    }
+
+    /// Exercise the overlay and report the granularity it actually enforces.
+    ///
+    /// This is the proof behind the `guest page protection fidelity` row in
+    /// the host-capability report, and it is deliberately run against a real
+    /// `Manager` rather than reasoned about: the claim is that two adjacent
+    /// guest pages inside one host page can carry different protections and
+    /// both be enforced, and the only way to know is to give one of them a
+    /// protection the other does not have and ask.
+    ///
+    /// It creates exactly one mapping and never splits it. That matters as
+    /// much as the result: the obvious way to get 4 KiB protection on a 16 KiB
+    /// host is to give every guest page its own host page, which would
+    /// quadruple the address space and fragment every heap the guest owns.
+    /// The overlay is bookkeeping over one mapping, and the assertion below
+    /// pins that.
+    pub fn proveProtectionOverlay(allocator: std.mem.Allocator) OverlayProof {
+        var manager = Manager.init(allocator);
+        defer manager.deinit();
+
+        const host_page: u64 = guest_memory_geometry.host_vm_page_size;
+        // Two host pages' worth, so the proof has a neighbour to be wrong
+        // about. Widened through a `u64` binding because `@max` narrows its
+        // result type to the values it saw.
+        const covered: u64 = @max(host_page, PAGE_4K * 2);
+        const base = manager.reserveAnywhere(covered * 2) orelse
+            return .{ .succeeded = false, .granularity = host_page, .obstacle = .reservation_failed };
+        const mappings_before = manager.mappings.items.len;
+
+        // Two adjacent guest pages. On a host page larger than the console's
+        // they share one, which is the case this exists to answer.
+        const lower = base;
+        const upper = base + PAGE_4K;
+        const shares_host_page = (lower / host_page) == (upper / host_page);
+
+        if (!manager.protect(lower, PAGE_4K, PROT_READ | PROT_WRITE))
+            return .{ .succeeded = false, .granularity = host_page, .obstacle = .protect_rejected };
+        if (!manager.protect(upper, PAGE_4K, PROT_READ))
+            return .{ .succeeded = false, .granularity = host_page, .obstacle = .protect_rejected };
+
+        // The lower page keeps the write its own request asked for.
+        if (manager.bytes(lower, PAGE_4K, true) == null)
+            return .{ .succeeded = false, .granularity = host_page, .obstacle = .neighbour_lost_access };
+        // The upper page keeps the read, and does not inherit the neighbour's
+        // write from the host page they share.
+        if (manager.bytesConst(upper, PAGE_4K) == null)
+            return .{ .succeeded = false, .granularity = host_page, .obstacle = .neighbour_lost_access };
+        if (manager.bytes(upper, PAGE_4K, true) != null)
+            return .{ .succeeded = false, .granularity = host_page, .obstacle = .protection_not_enforced };
+
+        // No mapping was split to achieve it.
+        if (manager.mappings.items.len != mappings_before)
+            return .{ .succeeded = false, .granularity = PAGE_4K, .obstacle = .mapping_split };
+
+        return .{
+            .succeeded = true,
+            .granularity = PAGE_4K,
+            .obstacle = .none,
+            .shared_host_page = shares_host_page,
+            .mappings_used = mappings_before,
+        };
     }
 
     pub fn bytes(self: *Manager, address: u64, length: u64, write: bool) ?[]u8 {
@@ -1718,4 +1936,71 @@ test "page cache invalidates when a new mapping appears at a none page" {
     try std.testing.expect(manager.mapFixed(base, PAGE_64K, PROT_READ | PROT_WRITE, anonymous_private, -1, 0));
     try std.testing.expect(manager.contains(base, 1));
     try std.testing.expect(manager.bytes(base, 1, false) != null);
+}
+
+// The claim the host-capability report rests on: on a host whose page is four
+// times the console's, two adjacent guest pages inside one host page carry
+// different protections and both are enforced. Reasoned about, this is an
+// assumption; exercised, it is the difference between a permanent red row at
+// the top of every run and a measured fact.
+test "the overlay enforces guest-page protection inside one host page" {
+    const proof = Manager.proveProtectionOverlay(std.testing.allocator);
+    try std.testing.expect(proof.succeeded);
+    try std.testing.expectEqual(OverlayObstacle.none, proof.obstacle);
+    try std.testing.expectEqual(PAGE_4K, proof.granularity);
+    // The anti-fragmentation property, which matters as much as the result:
+    // the granularity comes from bookkeeping over one mapping, never from
+    // giving each guest page a host page of its own.
+    try std.testing.expectEqual(@as(usize, 1), proof.mappings_used);
+    // On this host the two pages really do share one, so the proof is about
+    // the case it was written for rather than a degenerate one.
+    if (guest_memory_geometry.host_vm_page_size > PAGE_4K) {
+        try std.testing.expect(proof.shared_host_page);
+    }
+}
+
+test "an obstacle in the environment is not an accusation against the overlay" {
+    try std.testing.expect(!OverlayObstacle.reservation_failed.accusesOverlay());
+    try std.testing.expect(!OverlayObstacle.none.accusesOverlay());
+    try std.testing.expect(OverlayObstacle.protection_not_enforced.accusesOverlay());
+    try std.testing.expect(OverlayObstacle.mapping_split.accusesOverlay());
+    for (std.enums.values(OverlayObstacle)) |obstacle| {
+        try std.testing.expect(obstacle.label().len != 0);
+    }
+}
+
+// A ledger that could only ever say "fine" would be decoration. The counters
+// have to move when a protection request widens, and the verdict has to turn
+// when an exact record is missing.
+test "the granularity ledger counts what the host page cost and what took it back" {
+    var manager = Manager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const host_page: u64 = guest_memory_geometry.host_vm_page_size;
+    const covered: u64 = @max(host_page, PAGE_4K * 2);
+    const base = manager.reserveAnywhere(covered * 2) orelse
+        return error.TestUnexpectedResult;
+
+    try std.testing.expectEqual(@as(u64, 0), manager.granularity.subhost_requests);
+    try std.testing.expect(manager.granularity.holds());
+    try std.testing.expect(std.mem.indexOf(u8, manager.granularity.describe(), "has not yet cost this run") != null);
+
+    try std.testing.expect(manager.protect(base, PAGE_4K, PROT_READ | PROT_WRITE));
+    if (host_page > PAGE_4K) {
+        // The request named one guest page and the kernel was handed a host
+        // page, so it reached three guest pages nobody asked about.
+        try std.testing.expectEqual(@as(u64, 1), manager.granularity.subhost_requests);
+        try std.testing.expectEqual(@as(u64, 1), manager.granularity.shared_host_page_requests);
+        try std.testing.expectEqual(@as(u64, 1), manager.granularity.exact_records);
+    }
+    // Every widening carried an exact record, so the guest still gets its own
+    // page size.
+    try std.testing.expect(manager.granularity.holds());
+    try std.testing.expectEqual(PAGE_4K, manager.granularity.effectiveGranularity());
+
+    // One widening with no exact record behind it and the host page decides.
+    manager.noteUnrecordedWidening();
+    try std.testing.expect(!manager.granularity.holds());
+    try std.testing.expectEqual(host_page, manager.granularity.effectiveGranularity());
+    try std.testing.expect(std.mem.indexOf(u8, manager.granularity.describe(), "host page decides") != null);
 }
