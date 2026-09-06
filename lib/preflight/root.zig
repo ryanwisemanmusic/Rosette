@@ -29,6 +29,8 @@
 //! and guarantees the next person meets it too.
 
 pub const check = @import("check.zig");
+pub const host_capability = @import("host_capability.zig");
+pub const component_readiness = @import("component_readiness.zig");
 pub const xenia = @import("xenia.zig");
 pub const observation = @import("observation.zig");
 pub const collector = @import("collector.zig");
@@ -50,8 +52,18 @@ pub const ConfigReading = observation.ConfigReading;
 pub const evaluate = observation.evaluate;
 pub const Collector = collector.Collector;
 
+pub const HostCapability = host_capability.Capability;
+pub const HostCapabilityReport = host_capability.Report;
+pub const probeHostCapabilities = host_capability.probe;
+
+pub const Component = component_readiness.Component;
+pub const ComponentReadiness = component_readiness.Ledger;
+pub const ComponentStanding = component_readiness.Standing;
+
 test {
     _ = check;
+    _ = host_capability;
+    _ = component_readiness;
     _ = xenia;
     _ = observation;
     _ = collector;
