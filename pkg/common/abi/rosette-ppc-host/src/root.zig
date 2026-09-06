@@ -7,7 +7,7 @@
 
 const std = @import("std");
 
-pub const abi_version: u32 = 1;
+pub const abi_version: u32 = 2;
 
 pub const Symbol = enum {
     host_available,
@@ -69,5 +69,5 @@ test "the direct PPC ABI catalogue is complete" {
 }
 
 test "ABI version is explicit and stable" {
-    try std.testing.expectEqual(@as(u32, 1), abi_version);
+    try std.testing.expectEqual(@as(u32, 2), abi_version);
 }

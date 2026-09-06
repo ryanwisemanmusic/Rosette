@@ -7,48 +7,11 @@
 //! "this page was seen before".
 
 const std = @import("std");
-
-pub const Cause = enum(u8) {
-    /// The selected set contained a vacant way. This includes cold fills and
-    /// entries made vacant by a precise invalidation; it deliberately does not
-    /// claim the page had never been seen before.
-    vacant_fill,
-    /// A live, byte-valid decode was evicted to make room for this address.
-    /// This is cache conflict/capacity pressure, not executable mutation.
-    capacity_conflict,
-    /// A non-empty entry that had never been reused was displaced. This is a
-    /// cold working-set stream, not evidence that hot code is fighting for a
-    /// set, and must not inflate the conflict verdict.
-    cold_eviction,
-    /// The exact RIP was present but its source bytes no longer matched.
-    stale_bytes,
-    /// A coarse invalidation discarded an entry without proving it overlapped.
-    flush_collateral,
-
-    pub fn label(self: Cause) []const u8 {
-        return switch (self) {
-            .vacant_fill => "vacant-fill",
-            .capacity_conflict => "capacity-conflict",
-            .cold_eviction => "cold-eviction",
-            .stale_bytes => "stale-bytes",
-            .flush_collateral => "flush-collateral",
-        };
-    }
-
-    pub fn recurring(self: Cause) bool {
-        return self == .capacity_conflict or self == .stale_bytes or self == .flush_collateral;
-    }
-
-    pub fn meaning(self: Cause) []const u8 {
-        return switch (self) {
-            .vacant_fill => "the selected set had an unused way; this is a cold or precisely-cleared fill and does not prove executable code was rewritten",
-            .capacity_conflict => "a live decode was evicted by another address; larger capacity, wider associativity or separate immutable and mutable tiers can recover this work",
-            .cold_eviction => "a non-empty but never-reused decode was displaced by a cold working-set stream; this is fill cost, not hot conflict evidence",
-            .stale_bytes => "the cached RIP was reached with different source bytes; executable mutation is proven for this address",
-            .flush_collateral => "a coarse invalidation discarded a decode without proving overlap; the refill is avoidable invalidation collateral",
-        };
-    }
-};
+// The fill-cause vocabulary belongs to the standalone cache boundary. This
+// package retains the public alias so existing economics ledgers keep their
+// API while fail-fast policy, cache mapping, and diagnostics all name the same
+// enum type.
+pub const Cause = @import("rosette_translation_cache_contract").Cause;
 
 pub const Verdict = enum(u8) {
     idle,
