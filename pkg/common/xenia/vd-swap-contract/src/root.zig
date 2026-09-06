@@ -519,6 +519,112 @@ pub const ProbeOutcome = enum(u8) {
     }
 };
 
+/// Whether a starvation is a hole in Rosette or an absence of something to
+/// look at.
+///
+/// Both produce the same `starved=1` and they are opposite pieces of work. A
+/// probe nobody wired is Rosette's to fix today; a probe whose input has not
+/// been produced yet is not broken and fixing it would produce nothing.
+pub const StarvationOwner = enum(u8) {
+    /// The probe itself is the problem: not wired, or wired to a source that
+    /// has never fed it. Rosette can close this without the guest doing
+    /// anything.
+    rosette_observer,
+    /// The probe is fine and there is nothing to read. Closing it means the
+    /// upstream fact has to happen first, and no amount of observer work
+    /// brings it forward.
+    upstream_fact,
+
+    pub fn label(self: StarvationOwner) []const u8 {
+        return switch (self) {
+            .rosette_observer => "rosette:observer",
+            .upstream_fact => "upstream:not-yet-produced",
+        };
+    }
+};
+
+/// What a starved probe was missing.
+///
+/// `starved=1` on its own says the observer produced no information and
+/// nothing about why, which leaves a reader with the least actionable line in
+/// the report: a stage that has not been shown false, with no way to find out
+/// what would show it. Each cause below names the specific thing that was not
+/// there, and `remedy` names what would end it.
+pub const StarvationCause = enum(u8) {
+    /// No cause was recorded. A wiring gap in the probe's call site rather
+    /// than a statement about the run, and counted separately so it cannot
+    /// quietly become the common case.
+    unspecified,
+    /// The address or extent the probe needs has never been established.
+    geometry_unknown,
+    /// The memory the probe needs is not mapped, not readable, or reads back
+    /// as a projection that disagrees with itself.
+    memory_unreadable,
+    /// The input is readable, well-formed and holds nothing: a drained ring, a
+    /// zero-length span, a batch of zero dwords.
+    input_drained,
+    /// The stage that produces this probe's input has not run, so there is
+    /// nothing for the probe to read yet.
+    upstream_producer_idle,
+    /// The probe's counter or ledger exists and its source has never written
+    /// to it. Distinct from a drained input: this one has never had anything.
+    source_never_fed,
+    /// No code path connects this probe to anything on this route.
+    probe_unwired,
+    /// The input was present and readable and the decoder refused its framing.
+    /// Distinct from `memory_unreadable` on purpose: the bytes were there, so
+    /// this is a question about the packet stream or the window it was read
+    /// through, and sending a reader to the memory view would waste the hour.
+    decoder_refused_framing,
+
+    pub fn label(self: StarvationCause) []const u8 {
+        return switch (self) {
+            .unspecified => "unspecified",
+            .geometry_unknown => "geometry-unknown",
+            .memory_unreadable => "memory-unreadable",
+            .input_drained => "input-drained",
+            .upstream_producer_idle => "upstream-producer-idle",
+            .source_never_fed => "source-never-fed",
+            .probe_unwired => "probe-unwired",
+            .decoder_refused_framing => "decoder-refused-framing",
+        };
+    }
+
+    pub fn owner(self: StarvationCause) StarvationOwner {
+        return switch (self) {
+            // A framing refusal is Rosette's: the bytes were readable and
+            // either the window handed to the decoder or the decoder itself
+            // is wrong, and both are Rosette's to fix without the guest doing
+            // anything.
+            .unspecified, .source_never_fed, .probe_unwired, .decoder_refused_framing => .rosette_observer,
+            .geometry_unknown, .memory_unreadable, .input_drained, .upstream_producer_idle => .upstream_fact,
+        };
+    }
+
+    /// What would end this starvation. The half a reader needs and the half a
+    /// bare count cannot carry.
+    pub fn remedy(self: StarvationCause) []const u8 {
+        return switch (self) {
+            .unspecified => "record a cause at the probe's call site; until then the starvation names no work",
+            .geometry_unknown => "the base and extent have to be published before this probe can read anything; find who publishes them and whether that ran",
+            .memory_unreadable => "the range has to be mapped and readable from here; this is a memory-view or projection question, not a question about the title",
+            .input_drained => "the input is well-formed and empty, so the probe is working and there is nothing in it. Look at the producer that would fill it, not at the probe",
+            .upstream_producer_idle => "the stage that fills this probe's input has not run. Its own attribution is the one to read",
+            .source_never_fed => "the counter this probe reads has never been written. Either its source never ran or nothing connects the source to it — check which before reading the zero",
+            .probe_unwired => "nothing connects this probe to a source on this route. Wire it; the zero beside it is Rosette's",
+            .decoder_refused_framing => "the dwords were present and readable and the decoder rejected how they were framed. Check the window the decoder was handed before checking the stream: a window derived from where the content happens to be non-zero can end inside a packet, and the decoder then reads a header declaring more than it was given",
+        };
+    }
+
+    /// Whether Rosette can close this without the guest or the emulator doing
+    /// anything first.
+    pub fn closableByRosette(self: StarvationCause) bool {
+        return self.owner() == .rosette_observer;
+    }
+};
+
+pub const starvation_cause_count: usize = @typeInfo(StarvationCause).@"enum".fields.len;
+
 /// Why one unmet stage is unmet.  Every stage in a report carries one of these
 /// so a reader can separate the stages that are waiting on something else from
 /// the ones nobody looked at from the ones that are real findings.
@@ -1133,4 +1239,72 @@ test "every source that observes the guest maps to a probe" {
     // sitting at `not_attempted`.
     try std.testing.expectEqual(Probe.stateful_pm4_execution, probeForSource(.stateful_pm4_executor).?);
     try std.testing.expectEqual(Probe.xenos_register_file, probeForSource(.xenos_runtime).?);
+}
+
+// `starved=1` with no cause is the least actionable line a report can carry:
+// a stage that has not been shown false, and no way to find out what would
+// show it.
+test "every starvation cause names an owner and what would end it" {
+    var labels: [starvation_cause_count][]const u8 = undefined;
+    inline for (@typeInfo(StarvationCause).@"enum".fields, 0..) |field, index| {
+        const cause: StarvationCause = @enumFromInt(field.value);
+        try std.testing.expect(cause.label().len != 0);
+        try std.testing.expect(cause.remedy().len != 0);
+        try std.testing.expect(cause.owner().label().len != 0);
+        labels[index] = cause.label();
+    }
+    for (labels, 0..) |left, i| {
+        for (labels[i + 1 ..]) |right| {
+            try std.testing.expect(!std.mem.eql(u8, left, right));
+        }
+    }
+}
+
+// The distinction the count cannot make: a probe nobody wired is work for
+// today, and a probe whose input has not been produced is not.
+test "a hole in the observer is separated from an absence of anything to read" {
+    try std.testing.expect(StarvationCause.probe_unwired.closableByRosette());
+    try std.testing.expect(StarvationCause.source_never_fed.closableByRosette());
+    // An unrecorded cause is Rosette's by construction: the omission is at
+    // Rosette's own call site.
+    try std.testing.expect(StarvationCause.unspecified.closableByRosette());
+
+    try std.testing.expect(!StarvationCause.input_drained.closableByRosette());
+    try std.testing.expect(!StarvationCause.geometry_unknown.closableByRosette());
+    try std.testing.expect(!StarvationCause.upstream_producer_idle.closableByRosette());
+    try std.testing.expectEqual(
+        StarvationOwner.upstream_fact,
+        StarvationCause.memory_unreadable.owner(),
+    );
+
+    // A drained input is the case most often misread as a broken probe, so it
+    // says outright which end to look at.
+    try std.testing.expect(std.mem.indexOf(u8, StarvationCause.input_drained.remedy(), "not at the probe") != null);
+}
+
+// The 2026-09-01 mis-attribution: the retained batch's dwords were present and
+// readable, the decoder refused their framing, and the report said
+// `memory-unreadable` — which sends a reader to the memory view for a problem
+// that is entirely in the window the decoder was handed.
+test "a framing refusal is not an unreadable memory finding" {
+    try std.testing.expectEqual(
+        StarvationOwner.rosette_observer,
+        StarvationCause.decoder_refused_framing.owner(),
+    );
+    try std.testing.expect(StarvationCause.decoder_refused_framing.closableByRosette());
+    // Unreadable memory is the opposite attribution and must stay that way.
+    try std.testing.expectEqual(
+        StarvationOwner.upstream_fact,
+        StarvationCause.memory_unreadable.owner(),
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        StarvationCause.decoder_refused_framing.remedy(),
+        "window the decoder was handed",
+    ) != null);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        StarvationCause.decoder_refused_framing.remedy(),
+        StarvationCause.memory_unreadable.remedy(),
+    ));
 }
