@@ -115,6 +115,25 @@ pub fn applyTransition(counts: ReferenceCounts, transition: Transition) Transiti
 /// across the return.
 pub const created: ReferenceCounts = .{ .handle_count = 1, .pointer_count = 1 };
 
+/// The standard package entry point.
+///
+/// The invariant that matters is the `and` in `shouldDestroy`: an object dies
+/// only when *both* counts reach zero. Collapsing it to `or` frees objects a
+/// running thread still holds, which is the use-after-free this package was
+/// written to prevent, so it is checked at startup rather than assumed.
+pub fn contractIsWellFormed() bool {
+    const both_held = ReferenceCounts{ .handle_count = 1, .pointer_count = 1 };
+    if (both_held.shouldDestroy()) return false;
+    const handle_only = ReferenceCounts{ .handle_count = 1 };
+    if (handle_only.shouldDestroy()) return false;
+    const pointer_only = ReferenceCounts{ .pointer_count = 1 };
+    if (pointer_only.shouldDestroy()) return false;
+    const released = ReferenceCounts{};
+    if (!released.shouldDestroy()) return false;
+    if (created.shouldDestroy()) return false;
+    return true;
+}
+
 test "a new object is not destroyable" {
     try std.testing.expect(!created.shouldDestroy());
     try std.testing.expect(created.isNamed());
