@@ -209,7 +209,23 @@ pub const CycleDetector = struct {
         return null;
     }
 
+    /// Whether a *confirmed* cycle is still the current stream suffix.
+    ///
+    /// `reports` is historical evidence: once a cycle has been observed it
+    /// remains useful in the final audit.  It is not a liveness bit.  Using it
+    /// as one made a short-lived allocator/initialisation repetition at 10B
+    /// steps poison every later SWAP HEALTH checkpoint, even after a new line
+    /// broke the cycle.  A current cycle must still have its period and must
+    /// have crossed the reporting threshold.
     pub fn active(self: *const CycleDetector) bool {
+        return self.period != 0 and self.iterations >= first_report;
+    }
+
+    /// Whether this run ever produced a cycle report.  This is intentionally
+    /// separate from `active`: historical reports belong in the final audit,
+    /// while only an active suffix may classify the current producer as
+    /// livelocked.
+    pub fn hasHistory(self: *const CycleDetector) bool {
         return self.reports != 0;
     }
 };
@@ -368,6 +384,8 @@ test "a cycle that stops is not credited with later repetitions" {
 
     _ = detector.observe("something genuinely new");
     try std.testing.expectEqual(@as(usize, 0), detector.period);
+    try std.testing.expect(!detector.active());
+    try std.testing.expect(detector.hasHistory());
     try std.testing.expectEqual(@as(u64, 0), detector.iterations);
     // The high-water mark survives, so the run summary can still report it.
     try std.testing.expectEqual(during, detector.most_iterations);

@@ -40,6 +40,9 @@
 //! coverage and shows a blue screen.
 
 const std = @import("std");
+const observation_contract = @import("xenia_gpu_observation_contract");
+
+pub const GuestOutputEvidence = observation_contract.GuestOutputEvidence;
 
 /// The layer a capability belongs to. Reported separately because "the run is
 /// at sixty percent" says nothing actionable and "threading is complete and
@@ -227,7 +230,7 @@ pub const Capability = enum(u8) {
             .graphics_command_execution => "graphics commands actually execute",
             .frame_source => "a frame source exists",
             .window_surface => "native window surface",
-            .frame_presentation => "frames reach the window",
+            .frame_presentation => "guest frames reach the window",
             .exception_unwinding => "C++ exception unwinding",
             .code_generation => "guest code generation",
             .locale_and_time => "locale and time queries",
@@ -236,6 +239,43 @@ pub const Capability = enum(u8) {
 };
 
 pub const capability_count = @typeInfo(Capability).@"enum".fields.len;
+
+/// Whether the guest has produced an output opportunity that can be judged
+/// against the frame-source contract.
+///
+/// A native Vulkan present is intentionally not an input here. The native
+/// presenter is also used for Rosette's diagnostic clears, and a successful
+/// `vkQueuePresentKHR` only proves that a present request reached a driver. It
+/// does not prove that Xenia's guest renderer produced an image. Requiring a
+/// A target-backed live draw, a successful color resolve, a swap boundary, or
+/// an encoded XE_SWAP keeps the supporting capability honest. Raw PM4 draw
+/// syntax is retained for diagnostics but is not sufficient: a retained
+/// observation can contain draws that never owned guest-visible effects, and a
+/// draw with no target cannot produce a frame.
+pub fn guestOutputOpportunity(evidence: GuestOutputEvidence) bool {
+    return evidence.hasOutputOpportunity();
+}
+
+/// Judge VdSwap only after the guest has produced pixels or an explicit swap
+/// boundary. General GPU bring-up and no-output startup draws are progress,
+/// not proof that a presentation request was due.
+pub fn guestSwapStatus(evidence: GuestOutputEvidence, swap_entered: bool) Status {
+    if (swap_entered) return .satisfied;
+    return if (guestOutputOpportunity(evidence)) .unsatisfied else .untested;
+}
+
+/// Judge the guest-to-window handoff from guest-authentic frames only.
+/// Native/diagnostic presents prove the host sink separately through
+/// `window_surface`; they never degrade this guest-owned capability.
+pub fn guestPresentationStatus(
+    evidence: GuestOutputEvidence,
+    guest_source_available: bool,
+    authentic_guest_frames_presented: u64,
+) Status {
+    if (authentic_guest_frames_presented != 0) return .satisfied;
+    if (guest_source_available or guestOutputOpportunity(evidence)) return .unsatisfied;
+    return .untested;
+}
 
 pub const Entry = struct {
     status: Status = .untested,
@@ -560,4 +600,40 @@ test "every capability names a layer, a weight and itself" {
     inline for (.{ Status.untested, Status.unsatisfied, Status.degraded, Status.satisfied }) |st| {
         try std.testing.expect(st.label().len > 0);
     }
+}
+
+test "a native diagnostic present is not a guest output opportunity" {
+    try std.testing.expect(!guestOutputOpportunity(.{}));
+}
+
+test "raw PM4 draws do not open the frame-source contract" {
+    try std.testing.expect(!guestOutputOpportunity(.{ .raw_draws_consumed = 24 }));
+}
+
+test "guest render evidence opens the frame-source contract" {
+    try std.testing.expect(guestOutputOpportunity(.{ .raw_draws_consumed = 24, .renderable_draws_observed = 1 }));
+    try std.testing.expect(guestOutputOpportunity(.{ .color_resolve_observations = 1 }));
+    try std.testing.expect(guestOutputOpportunity(.{ .guest_swap_boundaries = 1 }));
+    try std.testing.expect(guestOutputOpportunity(.{ .guest_vdswap_packets_encoded = 1 }));
+}
+
+test "startup GPU traffic does not turn an unreached VdSwap into a failure" {
+    const startup = GuestOutputEvidence{ .raw_draws_consumed = 24 };
+    try std.testing.expectEqual(Status.untested, guestSwapStatus(startup, false));
+    try std.testing.expectEqual(Status.satisfied, guestSwapStatus(startup, true));
+    try std.testing.expectEqual(
+        Status.unsatisfied,
+        guestSwapStatus(.{ .renderable_draws_observed = 1 }, false),
+    );
+}
+
+test "diagnostic native presents never degrade the guest frame capability" {
+    const startup = GuestOutputEvidence{ .raw_draws_consumed = 24 };
+    try std.testing.expectEqual(Status.untested, guestPresentationStatus(startup, false, 0));
+    try std.testing.expectEqual(
+        Status.unsatisfied,
+        guestPresentationStatus(.{ .color_resolve_observations = 1 }, false, 0),
+    );
+    try std.testing.expectEqual(Status.unsatisfied, guestPresentationStatus(.{}, true, 0));
+    try std.testing.expectEqual(Status.satisfied, guestPresentationStatus(.{}, true, 1));
 }

@@ -51,6 +51,12 @@ pub const Record = struct {
     divergences: u64 = 0,
     first_answer_step: u64 = 0,
     last_change_step: u64 = 0,
+    /// A bounded negative is an observation through a finite frontier, not a
+    /// claim that the event can never happen.  If the other side later
+    /// supplies a timestamped positive observation, the old negative is
+    /// removed from the *current* comparison, but this count keeps the stale
+    /// answer visible to diagnostics instead of silently erasing history.
+    superseded_negative_answers: u64 = 0,
 
     pub fn answered(self: Record) bool {
         return self.application.substantiates() or self.harness.substantiates();
@@ -72,6 +78,10 @@ pub const Summary = struct {
     by_harness: usize = 0,
     corroborated: usize = 0,
     bounded_negative: usize = 0,
+    /// Bounded negatives that were superseded by a later positive observation
+    /// from the other side.  These are historical audit facts, not current
+    /// answers and therefore do not make a clean summary dirty.
+    superseded_negative: usize = 0,
     diverged: usize = 0,
     unsubstantiated: usize = 0,
     /// Unanswered boundaries Rosette was allowed to observe and did not. A
@@ -135,6 +145,15 @@ pub const Ledger = struct {
         self.answerWithClaim(boundary, side, evidence, .positive, value, has_value, .untyped, step);
     }
 
+    /// Preserve an application's control-flow entry without treating it as a
+    /// completed boundary. This is the safe bridge for tracepoints: a function
+    /// can be entered and then return early, fault, or leave the state it was
+    /// meant to publish untouched. The entry remains visible in reports while
+    /// `Evidence.entered` stays below the substantiation threshold.
+    pub fn noteApplicationEntry(self: *Ledger, boundary: Boundary, step: u64) void {
+        self.answer(boundary, .application, .entered, 0, false, step);
+    }
+
     /// State a positive answer whose numeric unit is explicit. Boolean-only
     /// callers can use `answer`; production counters should use this form so
     /// unrelated values cannot silently become corroboration.
@@ -183,6 +202,24 @@ pub const Ledger = struct {
         if (evidence.rank() < slot.evidence.rank()) {
             // Never weaken a stronger observation with a later checkpoint.
             return;
+        }
+
+        // A negative answer is bounded by the checkpoint at which it was
+        // observed.  It is valid to say "no dispatch through step 2.9B" and
+        // later observe the title dispatch at step 2.95B; those observations
+        // do not disagree.  Keeping the old negative in the live slot would
+        // manufacture a result drift out of two observations with different
+        // temporal horizons.  Same-step (or later) negative answers remain a
+        // real conflict and are intentionally not relaxed.
+        if (claim == .positive and evidence.substantiates()) {
+            const other = switch (side) {
+                .application => &entry.harness,
+                .harness => &entry.application,
+            };
+            if (other.isNegative() and other.step < step) {
+                other.* = .{};
+                entry.superseded_negative_answers +|= 1;
+            }
         }
         slot.evidence = evidence;
         slot.claim = claim;
@@ -242,6 +279,7 @@ pub const Ledger = struct {
             findings[index] = finding;
             if (entry.application.isNegative()) summary.bounded_negative += 1;
             if (entry.harness.isNegative()) summary.bounded_negative += 1;
+            if (entry.superseded_negative_answers != 0) summary.superseded_negative += 1;
             switch (finding) {
                 .not_reached => summary.not_reached += 1,
                 .application_answered => {
@@ -290,6 +328,7 @@ pub const Ledger = struct {
             hash = mix(hash, @intFromEnum(entry.harness.claim));
             hash = mix(hash, @intFromEnum(entry.application.value_domain));
             hash = mix(hash, @intFromEnum(entry.harness.value_domain));
+            hash = mix(hash, entry.superseded_negative_answers);
         }
         return hash;
     }
@@ -395,6 +434,19 @@ test "a stronger answer is never weakened by a later weaker one" {
     try std.testing.expectEqual(@as(u64, 10), ledger.record(.command_processor).application.step);
 }
 
+test "an application entry remains visible without answering the boundary" {
+    var ledger = Ledger{};
+    ledger.setScope(.application_execution, 0);
+    ledger.noteApplicationEntry(.ring_publication, 100);
+    ledger.answerAbsent(.ring_publication, .harness, .ring_advances, 100);
+    const summary = ledger.evaluate(100);
+    const entry = ledger.record(.ring_publication);
+    try std.testing.expectEqual(Evidence.entered, entry.application.evidence);
+    try std.testing.expect(!entry.application.substantiates());
+    try std.testing.expectEqual(Finding.harness_answered, entry.finding);
+    try std.testing.expectEqual(@as(usize, 0), summary.diverged);
+}
+
 test "a bounded negative answer closes a missing event" {
     var ledger = Ledger{};
     ledger.setScope(.application_execution, 0);
@@ -421,6 +473,51 @@ test "a later positive observation replaces a bounded negative answer" {
     try std.testing.expect(!answer.isNegative());
     try std.testing.expectEqual(@as(u64, 3), answer.value);
     try std.testing.expectEqual(@as(u64, 100), ledger.record(.command_processor).first_answer_step);
+}
+
+test "a later application event supersedes an earlier harness absence" {
+    var ledger = Ledger{};
+    ledger.setScope(.gpu_activity, 0);
+
+    // The harness checked the interrupt frontier before the guest's vblank
+    // producer reached the callback.  The negative is true through step 100,
+    // but it must not remain a second live account after the application
+    // dispatches at step 200.
+    ledger.answerAbsent(.interrupt_dispatch, .harness, .interrupt_dispatches, 100);
+    ledger.answerWithDomain(.interrupt_dispatch, .application, .observed, 3, true, .interrupt_dispatches, 200);
+
+    const before_evaluation = ledger.record(.interrupt_dispatch);
+    try std.testing.expectEqual(Evidence.none, before_evaluation.harness.evidence);
+    try std.testing.expectEqual(@as(u64, 1), before_evaluation.superseded_negative_answers);
+    try std.testing.expectEqual(@as(u64, 100), before_evaluation.first_answer_step);
+
+    const summary = ledger.evaluate(200);
+    try std.testing.expectEqual(@as(usize, 1), summary.by_application);
+    try std.testing.expectEqual(@as(usize, 0), summary.diverged);
+    try std.testing.expectEqual(@as(usize, 1), summary.superseded_negative);
+    try std.testing.expectEqual(Finding.application_answered, ledger.record(.interrupt_dispatch).finding);
+}
+
+test "a same-step absence remains a strict divergence" {
+    var ledger = Ledger{};
+    ledger.setScope(.gpu_activity, 0);
+    ledger.answerAbsent(.interrupt_dispatch, .harness, .interrupt_dispatches, 200);
+    ledger.answerWithDomain(.interrupt_dispatch, .application, .observed, 1, true, .interrupt_dispatches, 200);
+
+    const summary = ledger.evaluate(200);
+    try std.testing.expectEqual(@as(usize, 1), summary.diverged);
+    try std.testing.expectEqual(@as(u64, 0), ledger.record(.interrupt_dispatch).superseded_negative_answers);
+}
+
+test "a later harness absence is not excused by an earlier application event" {
+    var ledger = Ledger{};
+    ledger.setScope(.gpu_activity, 0);
+    ledger.answerWithDomain(.interrupt_dispatch, .application, .observed, 1, true, .interrupt_dispatches, 200);
+    ledger.answerAbsent(.interrupt_dispatch, .harness, .interrupt_dispatches, 300);
+
+    const summary = ledger.evaluate(300);
+    try std.testing.expectEqual(@as(usize, 1), summary.diverged);
+    try std.testing.expectEqual(@as(u64, 0), ledger.record(.interrupt_dispatch).superseded_negative_answers);
 }
 
 test "a positive application event and explicit host absence remain a divergence" {

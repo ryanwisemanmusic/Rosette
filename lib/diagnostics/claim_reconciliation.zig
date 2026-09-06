@@ -82,6 +82,13 @@ pub const Reconciliation = struct {
 
 pub const Summary = struct {
     observed: usize = 0,
+    /// Claims with more than one source statement. This is the actual
+    /// cross-check population; `corroborated` is retained as the historical
+    /// field name for consumers that already use it.
+    multi_source: usize = 0,
+    /// Claims with exactly one source. These are not disagreements, but they
+    /// are not independently confirmed either.
+    single_source: usize = 0,
     corroborated: usize = 0,
     agreed: usize = 0,
     superseded: usize = 0,
@@ -108,6 +115,33 @@ pub const Ledger = struct {
     /// Called on every emission, not only on change: the count of statements
     /// made after a contradiction is the rule's only input, and skipping the
     /// repeats would erase it.
+    /// How many observers other than a boundary tracepoint have spoken about
+    /// the claim that corresponds to a GPU bring-up boundary.
+    ///
+    /// Zero means the only thing that ever looked at this boundary is the
+    /// instruction-pointer arming, so a `never crossed` reading below it rests
+    /// on one observer and cannot be substantiated. Returns zero for boundaries
+    /// with no corresponding claim: an unmapped boundary is uncorroborated by
+    /// construction, which is the honest answer.
+    pub fn observersForBoundary(self: *const Ledger, boundary: anytype) u32 {
+        const claim: Claim = switch (boundary) {
+            .query_video_mode => .vd_query_video_mode_entries,
+            .initialize_engines => .vd_initialize_engines_entries,
+            .initialize_ring_buffer => .vd_initialize_ring_buffer_entries,
+            .set_interrupt_callback => .vd_set_graphics_interrupt_callback_entries,
+            .issue_swap => .vd_swap_entries,
+            else => return 0,
+        };
+        var others: u32 = 0;
+        for (self.entries[@intFromEnum(claim)], 0..) |entry, index| {
+            if (!entry.stated) continue;
+            const which: Source = @enumFromInt(index);
+            if (which == .rosette_boundary_tracepoint) continue;
+            others += 1;
+        }
+        return others;
+    }
+
     pub fn state(self: *Ledger, claim: Claim, source: Source, value: u64, step: u64) void {
         self.statements +|= 1;
         const row = &self.entries[@intFromEnum(claim)];
@@ -188,13 +222,21 @@ pub const Ledger = struct {
             const claim: Claim = @enumFromInt(field.value);
             const result = self.reconcile(claim);
             if (result.observers != 0) totals.observed += 1;
-            if (result.observers > 1) totals.corroborated += 1;
+            if (result.observers > 1) {
+                totals.corroborated += 1;
+                totals.multi_source += 1;
+            } else if (result.observers == 1) {
+                totals.single_source += 1;
+            }
+            // A superseded claim can still cross the Rosette/emulator boundary.
+            // The headline must expose that fact even though the row is not a
+            // live contest; otherwise the summary contradicts its own detail.
+            if (result.crosses_sides) totals.crosses_sides = true;
             switch (result.agreement) {
                 .agreed => totals.agreed += 1,
                 .superseded => totals.superseded += 1,
                 .contested => {
                     totals.contested += 1;
-                    if (result.crosses_sides) totals.crosses_sides = true;
                 },
                 .unobserved, .single_source => {},
             }
@@ -310,6 +352,8 @@ test "agreeing observers are corroboration, not noise" {
 
     const totals = ledger.summary();
     try std.testing.expectEqual(@as(usize, 1), totals.corroborated);
+    try std.testing.expectEqual(@as(usize, 1), totals.multi_source);
+    try std.testing.expectEqual(@as(usize, 0), totals.single_source);
     try std.testing.expectEqual(Finding.consistent, totals.finding());
     try std.testing.expect(ledger.blocking() == null);
 }
@@ -322,6 +366,8 @@ test "one observer is never consistency" {
     const totals = ledger.summary();
     try std.testing.expectEqual(@as(usize, 1), totals.observed);
     try std.testing.expectEqual(@as(usize, 0), totals.corroborated);
+    try std.testing.expectEqual(@as(usize, 0), totals.multi_source);
+    try std.testing.expectEqual(@as(usize, 1), totals.single_source);
     try std.testing.expectEqual(Finding.uncorroborated, totals.finding());
 }
 
@@ -348,6 +394,7 @@ test "a live contest is reported ahead of any number of stale readings" {
     const totals = ledger.summary();
     try std.testing.expectEqual(@as(usize, 5), totals.superseded);
     try std.testing.expectEqual(@as(usize, 1), totals.contested);
+    try std.testing.expect(totals.crosses_sides);
     try std.testing.expectEqual(Finding.model_split, totals.finding());
     try std.testing.expectEqual(Claim.ring_read_pointer, ledger.blocking().?.claim);
 }

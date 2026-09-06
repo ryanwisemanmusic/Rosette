@@ -59,6 +59,7 @@ const vfs_device_contract = @import("xenia_vfs_device_contract");
 const ob_contract = @import("xenia_ob_contract");
 const config_schema = @import("xenia_config_schema");
 const vendor_library_contract = @import("vendor_library_contract");
+const wait_handshake_policy = @import("xenia_wait_handshake_policy");
 
 // ── Route-specific contract imports ────────────────────────────────────────
 const graphics_contract = @import("xenia_graphics_contract");
@@ -103,6 +104,7 @@ const all_contracts = [_]ContractCheck{
     .{ .name = "graphics-contract", .checkFn = graphics_contract.contractIsWellFormed },
     .{ .name = "surface-path-contract", .checkFn = surface_path_contract.contractIsWellFormed },
     .{ .name = "vendor-library-contract", .checkFn = vendor_library_contract.contractIsWellFormed },
+    .{ .name = "wait-handshake-policy", .checkFn = wait_handshake_policy.contractIsWellFormed },
 };
 
 // ── Logger ─────────────────────────────────────────────────────────────────

@@ -11,6 +11,7 @@ const contract = @import("abi_translation_economics_contract");
 
 pub const Cause = contract.Cause;
 pub const Verdict = contract.Verdict;
+pub const percentage = contract.percentage;
 
 pub const page_shift: u6 = 12;
 /// Distinct conflicting addresses retained per page. Enough to tell a hot loop
@@ -18,6 +19,11 @@ pub const page_shift: u6 = 12;
 /// a fixed cost.
 pub const conflict_witnesses: usize = 4;
 pub const page_bytes: u64 = @as(u64, 1) << page_shift;
+/// One bit per byte in a sampled 4 KiB page. The old four-entry recent list
+/// was only a witness list, but it was also used as the distinct-address
+/// test; after the fifth address every later miss was counted as new again.
+/// Keep the witnesses bounded while making the cardinality exact.
+pub const conflict_bitmap_words: usize = @intCast(page_bytes / 64);
 pub const sample_pages: usize = 512;
 
 pub fn pageOf(address: u64) u64 {
@@ -46,6 +52,7 @@ pub const PageRecord = struct {
     /// those need opposite fixes.
     distinct_conflict_addresses: u32 = 0,
     recent_conflicts: [conflict_witnesses]u64 = [_]u64{0} ** conflict_witnesses,
+    conflict_seen: [conflict_bitmap_words]u64 = [_]u64{0} ** conflict_bitmap_words,
 
     pub fn recurring(self: PageRecord) u64 {
         return self.conflict_fills +| self.stale_refills +| self.flush_refills;
@@ -66,9 +73,12 @@ pub const PageRecord = struct {
 
     fn noteConflictAddress(self: *PageRecord, address: u64) void {
         if (self.conflict_address == 0) self.conflict_address = address;
-        for (self.recent_conflicts[0..]) |witness| {
-            if (witness == address) return;
-        }
+        const offset = address & (page_bytes - 1);
+        const word: usize = @intCast(offset >> 6);
+        const bit: u6 = @intCast(offset & 63);
+        const mask = @as(u64, 1) << bit;
+        if ((self.conflict_seen[word] & mask) != 0) return;
+        self.conflict_seen[word] |= mask;
         if (self.distinct_conflict_addresses < conflict_witnesses) {
             self.recent_conflicts[self.distinct_conflict_addresses] = address;
         }
@@ -332,6 +342,22 @@ test "many addresses conflicting once each is a dispersed working set" {
     try std.testing.expectEqual(@as(u32, 40), hot[0].distinct_conflict_addresses);
     try std.testing.expect(hot[0].conflictsAreDispersed());
     // The witness list stays bounded however many addresses are seen.
+    try std.testing.expectEqual(conflict_witnesses, hot[0].witnesses().len);
+}
+
+test "repeated addresses beyond the witness list keep exact cardinality" {
+    var ledger = Ledger{};
+    var round: u64 = 0;
+    while (round < 100) : (round += 1) {
+        var offset: u64 = 0;
+        while (offset < 5) : (offset += 1) {
+            ledger.noteDecode(0x26C_000 + offset * 8, round, .capacity_conflict);
+        }
+    }
+    var hot: [1]PageRecord = undefined;
+    _ = ledger.hottestPages(&hot);
+    try std.testing.expectEqual(@as(u32, 5), hot[0].distinct_conflict_addresses);
+    try std.testing.expect(hot[0].conflictsAreDispersed());
     try std.testing.expectEqual(conflict_witnesses, hot[0].witnesses().len);
 }
 

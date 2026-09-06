@@ -91,7 +91,7 @@ pub const Verdict = enum(u8) {
         return switch (self) {
             .not_started => "no milestone was ever reached, so the run says nothing about pacing. Check that the guest started at all before reading any stall verdict",
             .horizon => "the newest milestone landed in the final stretch of the run: the guest was still advancing when the run ended. This is a horizon, not a stall — every downstream 'never happened' below is a statement about run length. Run longer before changing anything",
-            .quiet => "no new milestone for a while, and no independent progress axis has frozen. The run is between milestones; a stall verdict is not supportable yet and neither is a clean bill of health",
+            .quiet => "no new milestone for a while, and the quiet tail is not yet a large enough share of the run for a stall verdict. Read `axis_frozen` on the same line before deciding what this is: a frozen axis under a short tail is a run that may be about to stall, and a moving axis is a run between milestones. Neither is a clean bill of health",
             .stalled => "milestones stopped long ago and an independent progress axis is frozen. A longer run will not help; this is the case where debugging is the right response",
         };
     }

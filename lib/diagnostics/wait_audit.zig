@@ -36,6 +36,9 @@
 //! healthy pump in the process.
 
 const std = @import("std");
+const wait_policy = @import("xenia_wait_handshake_policy");
+
+pub const TimeoutEvidence = wait_policy.TimeoutEvidence;
 
 /// Independent evidence that the run as a whole is getting somewhere. Each axis
 /// is driven by a different subsystem, so a wait can freeze one without
@@ -105,19 +108,29 @@ pub const Classification = enum(u8) {
     expected_pump = 1,
     /// The pattern ran and stopped. Bounded work, now finished.
     expected_bounded = 2,
+    /// Notifications were observed without an observed waiter. This is an
+    /// orphan producer observation, not evidence that a wait is stalled.
+    /// Keeping it explicit prevents signal-only objects from being promoted
+    /// to a false problem merely because their progress witness is flat.
+    signal_only = 3,
     /// The pattern recurs and nothing that proves progress has moved since it
     /// started.
-    problem_stalled = 3,
+    problem_stalled = 4,
     /// Every wait on this object times out. The signal is not merely late.
-    problem_never_ready = 4,
+    problem_never_ready = 5,
+    /// An explicit finite manual-reset polling boundary returned
+    /// STATUS_TIMEOUT. It is evidence about the producer, not a parked wait.
+    bounded_timeout = 6,
 
     pub fn label(self: Classification) []const u8 {
         return switch (self) {
             .insufficient_evidence => "insufficient_evidence",
             .expected_pump => "expected_pump",
             .expected_bounded => "expected_bounded",
+            .signal_only => "signal_only",
             .problem_stalled => "PROBLEM_STALLED",
             .problem_never_ready => "PROBLEM_NEVER_READY",
+            .bounded_timeout => "bounded_timeout",
         };
     }
 
@@ -125,7 +138,10 @@ pub const Classification = enum(u8) {
     /// pump gets one line, and only a problem gets its participants, operation
     /// mix and frozen axes.
     pub fn worthAuditing(self: Classification) bool {
-        return @intFromEnum(self) >= @intFromEnum(Classification.problem_stalled);
+        return switch (self) {
+            .problem_stalled, .problem_never_ready => true,
+            else => false,
+        };
     }
 
     pub fn meaning(self: Classification) []const u8 {
@@ -133,8 +149,10 @@ pub const Classification = enum(u8) {
             .insufficient_evidence => "too few sightings to distinguish a working pump from a stalled one. One wait proves nothing",
             .expected_pump => "the pattern recurs and the run advanced alongside it, so this is a working producer/consumer pump and its detail is not worth printing",
             .expected_bounded => "the pattern ran for a while and stopped. Bounded work that finished, which is what a healthy wait looks like in hindsight",
+            .signal_only => "signals were observed without an observed waiter. This is retained as producer-side evidence, but it does not establish a stalled consumer or justify a wait fault",
             .problem_stalled => "the pattern recurs and nothing that proves progress has moved since it started. The operations are happening and the run is not getting anywhere, so this rotation is consuming the process rather than advancing it — the frozen axes below are what it is holding back",
             .problem_never_ready => "every wait on this object timed out. The waiter blocks correctly and the signal never comes at all, which puts the defect in whatever was supposed to signal rather than in the wait",
+            .bounded_timeout => "the guest returned an explicit finite timeout on a manual-reset polling boundary. Preserve the timeout and inspect the producer, but do not mistake repeated poll expiries for a parked waiter or synthesize a signal",
         };
     }
 };
@@ -176,6 +194,17 @@ pub const Subject = struct {
     waits: u64 = 0,
     timeouts: u64 = 0,
     signals: u64 = 0,
+    /// Timeout shape is captured separately from the count. A timeout result
+    /// without its entry metadata is not allowed to become a bounded poll by
+    /// inference from elapsed host time alone.
+    timeout_class: wait_policy.TimeoutClass = .none,
+    timeout_ms: i64 = 0,
+    timeout_evidence_count: u64 = 0,
+    /// Provenance of the timeout value. A result duration can populate
+    /// `timeout_ms` without proving what the guest requested, so the report
+    /// must keep those two facts separate.
+    timeout_requested_known: bool = false,
+    timeout_requested: bool = false,
     first_step: u64 = 0,
     last_step: u64 = 0,
     /// Threads observed operating on it. The participant list is what turns
@@ -244,6 +273,19 @@ pub const Ledger = struct {
         type_code: u32,
         step: u64,
     ) void {
+        self.observeWithTimeout(object, operation, thread, handle, type_code, step, .{});
+    }
+
+    pub fn observeWithTimeout(
+        self: *Ledger,
+        object: u64,
+        operation: Operation,
+        thread: u64,
+        handle: u32,
+        type_code: u32,
+        step: u64,
+        timeout: TimeoutEvidence,
+    ) void {
         if (object == 0) return;
         const subject = self.slot(object) orelse return;
         if (subject.sightings() == 0) {
@@ -252,7 +294,24 @@ pub const Ledger = struct {
         }
         switch (operation) {
             .wait => subject.waits +|= 1,
-            .wait_timeout => subject.timeouts +|= 1,
+            .wait_timeout => {
+                subject.timeouts +|= 1;
+                const timeout_class = wait_policy.classifyTimeout(timeout);
+                if (subject.timeout_evidence_count == 0) {
+                    subject.timeout_class = timeout_class;
+                    if (timeout.timeout_known) subject.timeout_ms = timeout.timeout_ms;
+                } else if (subject.timeout_class != timeout_class or
+                    (timeout.requested_known and subject.timeout_requested_known and
+                        timeout.requested != subject.timeout_requested))
+                {
+                    subject.timeout_class = .mixed;
+                }
+                if (timeout.requested_known) {
+                    subject.timeout_requested_known = true;
+                    subject.timeout_requested = timeout.requested;
+                }
+                subject.timeout_evidence_count +|= 1;
+            },
             .signal => subject.signals +|= 1,
         }
         subject.last_step = step;
@@ -265,15 +324,27 @@ pub const Ledger = struct {
     pub fn classify(self: *const Ledger, subject: Subject, current_step: u64) Classification {
         _ = self;
         if (subject.sightings() < minimum_sightings) return .insufficient_evidence;
-        // A pattern that stopped is bounded work that finished. Checked before
-        // the progress test so a pump that ran early and went quiet is not
-        // accused of stalling the run it is no longer part of.
+        // A signal-only record cannot be a stalled wait: there is no observed
+        // waiter whose continuation could be blocked. Check this before the
+        // flat-progress branch, because a producer may quite legitimately
+        // publish notifications while the consumer has not started yet.
+        if (subject.waits == 0 and subject.timeouts == 0 and subject.signals != 0)
+            return .signal_only;
+        // Timeouts prove the waiter really blocked, which is a different defect
+        // from a rotation that never blocks at all. This must precede the
+        // independent-progress and quiescence checks: a timeout-only subject is
+        // not a finished bounded operation merely because the rest of the run
+        // advanced after its last expiry.
+        if (subject.waits == 0 and subject.timeouts != 0) {
+            if (subject.timeout_class == .bounded_poll) return .bounded_timeout;
+            return .problem_never_ready;
+        }
+        // A pattern that stopped is bounded work that finished. Checked after
+        // timeout-only evidence so a real missing signal cannot age out of the
+        // audit and be mistaken for completed work.
         if (current_step > subject.last_step and
             current_step - subject.last_step >= quiescent_steps) return .expected_bounded;
         if (subject.last_witness.advancedSince(subject.first_witness)) return .expected_pump;
-        // Timeouts prove the waiter really blocked, which is a different defect
-        // from a rotation that never blocks at all.
-        if (subject.waits == 0 and subject.timeouts != 0) return .problem_never_ready;
         return .problem_stalled;
     }
 
@@ -322,10 +393,20 @@ pub const Ledger = struct {
         return count;
     }
 
+    pub fn boundedTimeoutCount(self: *const Ledger) u32 {
+        var count: u32 = 0;
+        for (self.subjects[0..self.count]) |subject| {
+            if (subject.timeout_class == .bounded_poll and subject.timeouts != 0) count += 1;
+        }
+        return count;
+    }
+
     pub fn verdict(self: *const Ledger, current_step: u64) []const u8 {
         if (self.count == 0)
             return "no wait pattern has been observed, so nothing here can be called a problem or expected";
         if (self.worst(current_step)) |subject| return self.classify(subject, current_step).meaning();
+        if (self.boundedTimeoutCount() != 0)
+            return "finite manual-reset polling timeouts were observed and retained as producer evidence. They did not create a parked waiter or authorize a synthetic signal";
         return "every observed wait pattern either advanced the run alongside it or ran and finished. None of them is holding anything back, so none of their detail is printed";
     }
 };
@@ -412,6 +493,19 @@ test "a pattern that ran and stopped is bounded work rather than a stall" {
     try std.testing.expect(!Classification.expected_bounded.worthAuditing());
 }
 
+test "signal-only evidence is not a stalled wait" {
+    var ledger = Ledger{};
+    var index: u64 = 0;
+    while (index < 20) : (index += 1) {
+        ledger.observe(0x3337EC28, .signal, 0x7fff2160, 0xF8000014, 2, 1000 + index * 100);
+    }
+    const subject = ledger.subjects[0];
+    try std.testing.expectEqual(Classification.signal_only, ledger.classify(subject, 5000));
+    try std.testing.expect(!Classification.signal_only.worthAuditing());
+    try std.testing.expect(ledger.worst(5000) == null);
+    try std.testing.expectEqual(@as(u32, 0), ledger.problemCount(5000));
+}
+
 // A waiter that blocks and times out is a different defect from a rotation that
 // never blocks, and the remedies are in different subsystems.
 test "waits that always time out accuse the signaller rather than the waiter" {
@@ -422,6 +516,70 @@ test "waits that always time out accuse the signaller rather than the waiter" {
     }
     try std.testing.expectEqual(Classification.problem_never_ready, ledger.classify(ledger.subjects[0], 5000));
     try std.testing.expect(std.mem.indexOf(u8, Classification.problem_never_ready.meaning(), "supposed to signal") != null);
+}
+
+test "unrelated progress does not hide a timeout-only subject" {
+    var ledger = Ledger{};
+    var index: u64 = 0;
+    while (index < 20) : (index += 1) {
+        // The rest of the process is advancing, but this object has never
+        // completed a wait and has never received a signal. Those are separate
+        // facts and the timeout-only finding must win.
+        ledger.noteProgress(.module_load, index + 1);
+        ledger.observe(0x40004BF4, .wait_timeout, 0x7fff2000, 0xF8000168, 2, 1000 + index * 100);
+    }
+    const subject = ledger.subjects[0];
+    try std.testing.expectEqual(Classification.problem_never_ready, ledger.classify(subject, 5000));
+    try std.testing.expect(ledger.worst(5000) != null);
+    try std.testing.expectEqual(@as(u32, 1), ledger.problemCount(5000));
+}
+
+test "a proven bounded poll is retained without becoming an audit problem" {
+    var ledger = Ledger{};
+    const timeout: TimeoutEvidence = .{
+        .timeout_ms = 32,
+        .timeout_known = true,
+        .requested = true,
+        .object_kind = .guest_manual_reset_event,
+        .event_mode_known = true,
+        .manual_reset = true,
+    };
+    var index: u64 = 0;
+    while (index < minimum_sightings) : (index += 1) {
+        ledger.observeWithTimeout(
+            0x40004BF4,
+            .wait_timeout,
+            0x7fff2140,
+            0xF8000158,
+            2,
+            1000 + index * 32,
+            timeout,
+        );
+    }
+    const subject = ledger.subjects[0];
+    try std.testing.expectEqual(wait_policy.TimeoutClass.bounded_poll, subject.timeout_class);
+    try std.testing.expectEqual(Classification.bounded_timeout, ledger.classify(subject, 2000));
+    try std.testing.expect(!Classification.bounded_timeout.worthAuditing());
+    try std.testing.expectEqual(@as(u32, 0), ledger.problemCount(2000));
+}
+
+test "timeout-only evidence cannot age out as completed bounded work" {
+    var ledger = Ledger{};
+    var index: u64 = 0;
+    while (index < minimum_sightings) : (index += 1) {
+        ledger.observe(
+            0x40004BF4,
+            .wait_timeout,
+            0x7fff2140,
+            0xF8000158,
+            2,
+            1000 + index * 32,
+        );
+    }
+    try std.testing.expectEqual(
+        Classification.problem_never_ready,
+        ledger.classify(ledger.subjects[0], ledger.subjects[0].last_step + quiescent_steps + 1),
+    );
 }
 
 test "the audit records participants, handle, type and period" {
@@ -452,7 +610,7 @@ test "the worst subject prefers a harder classification then more traffic" {
     }
     // never_ready outranks stalled even with less traffic.
     try std.testing.expectEqual(@as(u64, 0x827206E4), ledger.worst(90000).?.object);
-    try std.testing.expectEqual(@as(u32, 4), ledger.problemCount(90000));
+    try std.testing.expectEqual(@as(u32, 2), ledger.problemCount(90000));
 }
 
 test "subjects past capacity are counted rather than dropped silently" {
@@ -483,8 +641,8 @@ test "an empty ledger calls nothing a problem" {
     }
     inline for (.{
         Classification.insufficient_evidence, Classification.expected_pump,
-        Classification.expected_bounded, Classification.problem_stalled,
-        Classification.problem_never_ready,
+        Classification.expected_bounded,      Classification.signal_only,
+        Classification.problem_stalled,       Classification.problem_never_ready,
     }) |classification| {
         try std.testing.expect(classification.label().len > 0);
         try std.testing.expect(classification.meaning().len > 40);

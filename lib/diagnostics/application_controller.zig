@@ -62,6 +62,52 @@ pub const Sample = struct {
     guest_runnable: bool = true,
 };
 
+/// A controller decision is a safety boundary, not just a log message. These
+/// violations describe decisions that would either mutate a host-owned system
+/// without the evidence that authorizes it or report a state contradictory to
+/// the sample from which the decision was made.
+pub const DecisionViolation = enum(u8) {
+    host_authorization_mismatch,
+    host_action_domain_mismatch,
+    drain_without_callback,
+    drain_without_pending_work,
+    refresh_without_guest_output,
+    refresh_without_presenter,
+    refresh_after_authentic_swap,
+    yield_without_powerpc_callback,
+    yield_without_pending_work,
+    guest_boundary_already_entered,
+    authentic_swap_before_guest_boundary,
+    device_lost_not_observed,
+    render_target_gap_not_observed,
+    action_blocker_mismatch,
+    presenter_wait_while_ready,
+    presented_without_completion,
+    presented_with_mutating_action,
+
+    pub fn label(self: DecisionViolation) []const u8 {
+        return switch (self) {
+            .host_authorization_mismatch => "host-authorization-mismatch",
+            .host_action_domain_mismatch => "host-action-domain-mismatch",
+            .drain_without_callback => "drain-without-callback",
+            .drain_without_pending_work => "drain-without-pending-work",
+            .refresh_without_guest_output => "refresh-without-guest-output",
+            .refresh_without_presenter => "refresh-without-presenter",
+            .refresh_after_authentic_swap => "refresh-after-authentic-swap",
+            .yield_without_powerpc_callback => "yield-without-powerpc-callback",
+            .yield_without_pending_work => "yield-without-pending-work",
+            .guest_boundary_already_entered => "guest-boundary-already-entered",
+            .authentic_swap_before_guest_boundary => "authentic-swap-before-guest-boundary",
+            .device_lost_not_observed => "device-lost-not-observed",
+            .render_target_gap_not_observed => "render-target-gap-not-observed",
+            .action_blocker_mismatch => "action-blocker-mismatch",
+            .presenter_wait_while_ready => "presenter-wait-while-ready",
+            .presented_without_completion => "presented-without-completion",
+            .presented_with_mutating_action => "presented-with-mutating-action",
+        };
+    }
+};
+
 pub const Decision = struct {
     phase: Phase = .boot,
     action: Action = .observe_only,
@@ -83,6 +129,69 @@ pub const Decision = struct {
             (@as(u64, @intFromEnum(self.domain)) << 32) |
             (@as(u64, @intFromBool(self.host_action_authorized)) << 40);
     }
+
+    /// Validate the decision against the immutable sample that produced it.
+    /// This is intentionally independent of `decide`: the second path catches
+    /// regressions where a future policy change adds an action but forgets to
+    /// update one of its evidence or ownership preconditions.
+    pub fn contractViolation(self: Decision, sample: Sample) ?DecisionViolation {
+        if (self.host_action_authorized != self.action.hostMayExecute())
+            return .host_authorization_mismatch;
+
+        const target_missing = sample.pm4_stream_consumed and !sample.render_target_state_observed;
+        const memory_missing = sample.render_target_state_observed and !sample.render_target_memory_observed;
+        const completion_pending = sample.draw_completion_signaled > sample.draw_completion_dispatched;
+        const gpu_work_pending = completion_pending or sample.pending_gpu_interrupts != 0;
+
+        if (self.blocker == .guest_vdswap_not_entered and sample.guest_vdswap_entered)
+            return .guest_boundary_already_entered;
+        if (self.blocker == .authentic_swap_not_consumed and !sample.guest_vdswap_entered)
+            return .authentic_swap_before_guest_boundary;
+        if (self.blocker == .device_lost and !sample.presenter_device_lost)
+            return .device_lost_not_observed;
+        if (self.blocker == .render_target_missing and !(target_missing or memory_missing))
+            return .render_target_gap_not_observed;
+
+        switch (self.action) {
+            .drain_gpu_interrupts => {
+                if (self.domain != .pm4) return .host_action_domain_mismatch;
+                if (!sample.interrupt_callback_registered) return .drain_without_callback;
+                if (!gpu_work_pending) return .drain_without_pending_work;
+            },
+            .refresh_discovered_output => {
+                if (self.domain != .presenter) return .host_action_domain_mismatch;
+                if (!sample.guest_output_available) return .refresh_without_guest_output;
+                if (!sample.presenter_ready) return .refresh_without_presenter;
+                if (sample.authentic_swap_consumed) return .refresh_after_authentic_swap;
+            },
+            .yield_guest_for_gpu => {
+                if (!sample.powerpc_callback_registered) return .yield_without_powerpc_callback;
+                if (!gpu_work_pending) return .yield_without_pending_work;
+            },
+            .await_guest_vdswap => {
+                if (self.blocker != .guest_vdswap_not_entered and
+                    self.blocker != .authentic_swap_not_consumed)
+                    return .action_blocker_mismatch;
+            },
+            .await_render_target => {
+                if (self.blocker != .render_target_missing) return .action_blocker_mismatch;
+            },
+            .await_presenter => {
+                if (self.blocker != .presenter_not_ready) return .action_blocker_mismatch;
+                if (sample.presenter_ready) return .presenter_wait_while_ready;
+            },
+            .report_stall => {
+                if (self.blocker == .none) return .action_blocker_mismatch;
+            },
+            .observe_only, .continue_guest => {},
+        }
+
+        if (self.phase == .presented) {
+            if (!sample.native_present_completed) return .presented_without_completion;
+            if (self.action != .observe_only) return .presented_with_mutating_action;
+        }
+        return null;
+    }
 };
 
 pub const Controller = struct {
@@ -97,7 +206,16 @@ pub const Controller = struct {
     observations: u64 = 0,
     transitions: u64 = 0,
     host_actions_authorized: u64 = 0,
-    guest_boundary_refusals: u64 = 0,
+    /// Number of samples for which the guest-owned VdSwap boundary remained
+    /// open. This is an observation count, not a failed wake or refusal.
+    guest_boundary_observations: u64 = 0,
+    /// A non-zero value means the policy emitted a decision whose ownership or
+    /// evidence preconditions contradict the sample that produced it.
+    last_sample: Sample = .{},
+    contract_violations: u64 = 0,
+    last_contract_violation: ?DecisionViolation = null,
+    last_contract_violation_decision: Decision = .{},
+    last_contract_violation_sample: Sample = .{},
 
     /// Observe one process snapshot and return the controller directive. The
     /// only state this mutates is this ledger; any host action is still applied
@@ -105,6 +223,7 @@ pub const Controller = struct {
     pub fn observe(self: *Controller, sample: Sample) Decision {
         if (sample.step < self.last_step) self.beginNewRun();
         self.last_step = sample.step;
+        self.last_sample = sample;
         self.observeProgress(&self.last_guest_progress_step, sample.guest_progress_step, sample.step);
         self.observeProgress(&self.last_ring_progress_step, sample.ring_progress_step, sample.step);
         self.observeProgress(&self.last_pm4_progress_step, sample.pm4_progress_step, sample.step);
@@ -115,7 +234,13 @@ pub const Controller = struct {
         if (decision.fingerprint() != self.last_decision.fingerprint()) self.transitions +|= 1;
         if (decision.host_action_authorized) self.host_actions_authorized +|= 1;
         if (decision.action == .await_guest_vdswap or decision.blocker == .guest_vdswap_not_entered)
-            self.guest_boundary_refusals +|= 1;
+            self.guest_boundary_observations +|= 1;
+        if (decision.contractViolation(sample)) |violation| {
+            self.contract_violations +|= 1;
+            self.last_contract_violation = violation;
+            self.last_contract_violation_decision = decision;
+            self.last_contract_violation_sample = sample;
+        }
         self.phase = decision.phase;
         self.last_decision = decision;
         return decision;
@@ -379,6 +504,42 @@ test "a decreasing step starts a new run epoch" {
     _ = controller.observe(.{ .step = 10 });
     try std.testing.expectEqual(@as(u64, 1), controller.run_epoch);
     try std.testing.expectEqual(@as(u64, 10), controller.last_step);
+}
+
+test "an open guest boundary is observation, not a controller contract failure" {
+    var controller = Controller{};
+    const decision = controller.observe(.{
+        .step = 100,
+        .presenter_ready = true,
+    });
+    try std.testing.expectEqual(Action.await_guest_vdswap, decision.action);
+    try std.testing.expectEqual(@as(u64, 1), controller.guest_boundary_observations);
+    try std.testing.expectEqual(@as(u64, 0), controller.contract_violations);
+    try std.testing.expect(controller.last_contract_violation == null);
+}
+
+test "controller validation catches unauthorized host work" {
+    const decision = Decision{
+        .action = .await_guest_vdswap,
+        .host_action_authorized = true,
+    };
+    try std.testing.expectEqual(
+        DecisionViolation.host_authorization_mismatch,
+        decision.contractViolation(.{}).?,
+    );
+}
+
+test "controller validation catches a host drain without callback evidence" {
+    const decision = Decision{
+        .phase = .gpu_pending,
+        .action = .drain_gpu_interrupts,
+        .domain = .pm4,
+        .host_action_authorized = true,
+    };
+    try std.testing.expectEqual(
+        DecisionViolation.drain_without_callback,
+        decision.contractViolation(.{ .pending_gpu_interrupts = 1 }).?,
+    );
 }
 
 test "every controller action is non-fabricating by policy" {

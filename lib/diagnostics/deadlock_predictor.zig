@@ -105,6 +105,18 @@ pub const Finding = enum(u8) {
         return @intFromEnum(self) >= @intFromEnum(Finding.all_notifiers_parked);
     }
 
+    /// Whether the finding is strong enough to stop a run without another
+    /// causal witness. `deadlocked()` intentionally includes NEVER_NOTIFIED
+    /// because it is a useful predictor result; a worker that has never been
+    /// signalled is not, by that fact alone, distinguishable from an idle
+    /// worker waiting for future work. The run-integrity gate uses this stricter
+    /// predicate and treats a mature explicit cycle as proven separately.
+    pub fn provenDeadlock(self: Finding) bool {
+        return self == .all_notifiers_parked or
+            self == .notifiers_terminated or
+            self == .wait_cycle;
+    }
+
     pub fn meaning(self: Finding) []const u8 {
         return switch (self) {
             .no_waiters => "nothing is parked on this object",
@@ -766,6 +778,10 @@ test "every finding names a different owner and only some are deadlocks" {
     try std.testing.expect(!Finding.window_too_short.deadlocked());
     try std.testing.expect(Finding.never_notified.deadlocked());
     try std.testing.expect(Finding.wait_cycle.deadlocked());
+    try std.testing.expect(!Finding.never_notified.provenDeadlock());
+    try std.testing.expect(Finding.all_notifiers_parked.provenDeadlock());
+    try std.testing.expect(Finding.notifiers_terminated.provenDeadlock());
+    try std.testing.expect(Finding.wait_cycle.provenDeadlock());
 
     inline for (.{
         ObjectKind.event,   ObjectKind.semaphore,        ObjectKind.mutex,

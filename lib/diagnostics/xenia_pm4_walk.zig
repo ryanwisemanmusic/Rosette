@@ -14,8 +14,10 @@
 
 const std = @import("std");
 const pm4 = @import("xenia_pm4_contract");
+const register_map = @import("xenos_register_map");
 
 pub const MemoryReadCallback = *const fn (context: *anyopaque, address: u32) ?u32;
+pub const PacketClass = pm4.PacketClass;
 
 pub const ReferenceStatus = enum(u8) {
     observed,
@@ -72,6 +74,12 @@ pub const Summary = struct {
     unknown_packets: u32 = 0,
     packets_walked: u32 = 0,
     words_read: u32 = 0,
+    /// Register writes encoded by PM4 itself. Executor bookkeeping registers
+    /// are intentionally absent so this structural account is comparable to
+    /// the stateful decoder's command-intent counters.
+    command_register_writes: u64 = 0,
+    command_unclassified_register_writes: u64 = 0,
+    command_out_of_range_register_writes: u64 = 0,
     /// Ordered fingerprint of every readable root and nested dword, including
     /// packet bodies. Two publications with the same opcode counts but
     /// different register values or draw parameters are not the same work.
@@ -262,9 +270,11 @@ pub const Walker = struct {
             // include the packet body. Validate and fingerprint every dword so
             // a register-value-only change is unique and an unreadable body is
             // reported as truncation rather than a complete packet.
+            var payload_prefix: [6]u32 = [_]u32{0} ** 6;
+            var payload_prefix_count: usize = 0;
             var body = cursor + 1;
             while (body < cursor + advance) : (body += 1) {
-                _ = switch (self.readSource(source, body)) {
+                const value = switch (self.readSource(source, body)) {
                     .value => |value| value,
                     .unavailable => |address| {
                         if (root) self.result.root_truncated = true;
@@ -274,13 +284,18 @@ pub const Walker = struct {
                         };
                     },
                 };
+                if (payload_prefix_count < payload_prefix.len) {
+                    payload_prefix[payload_prefix_count] = value;
+                    payload_prefix_count += 1;
+                }
             }
 
             self.result.packets_walked +|= 1;
             if (root) self.result.root_packets +|= 1 else self.result.nested_packets +|= 1;
+            self.noteRegisterIntent(header, packet, payload_prefix[0..payload_prefix_count]);
             switch (packet.packet_type) {
-                .type0, .type1 => {},
-                .type2 => {},
+                .type0, .type1 => self.result.packet_class_counts[@intFromEnum(pm4.PacketClass.state)] +|= 1,
+                .type2 => self.result.packet_class_counts[@intFromEnum(pm4.PacketClass.filler)] +|= 1,
                 .type3 => {
                     const class = pm4.classifyOpcode(packet.opcode);
                     self.result.packet_class_counts[@intFromEnum(class)] +|= 1;
@@ -296,7 +311,7 @@ pub const Walker = struct {
                         .indirect => {
                             self.result.indirect_packets +|= 1;
                             if (root) self.result.root_indirect_packets +|= 1 else self.result.nested_indirect_packets +|= 1;
-                            self.followIndirect(source, cursor, packet, depth);
+                            self.followIndirect(header, packet, depth, payload_prefix[0..payload_prefix_count]);
                         },
                         .wait => self.result.wait_packets +|= 1,
                         .unknown => self.result.unknown_packets +|= 1,
@@ -309,43 +324,13 @@ pub const Walker = struct {
         return .{ .status = .complete };
     }
 
-    fn followIndirect(self: *Walker, source: Source, packet_offset: u32, packet: pm4.Packet, depth: u8) void {
-        var payload: [2]u32 = undefined;
-        payload[0] = switch (self.readSource(source, packet_offset + 1)) {
-            .value => |value| value,
-            .unavailable => |address| {
-                const reference_index = self.recordReference(.{
-                    .opcode = @enumFromInt(packet.opcode),
-                    .address = 0,
-                    .size_dwords = 0,
-                    .control = 0,
-                }, depth, .unreadable, address);
-                if (reference_index != null) self.result.unreadable_references +|= 1;
-                return;
-            },
-        };
-        payload[1] = switch (self.readSource(source, packet_offset + 2)) {
-            .value => |value| value,
-            .unavailable => |address| {
-                const reference_index = self.recordReference(.{
-                    .opcode = @enumFromInt(packet.opcode),
-                    .address = payload[0],
-                    .size_dwords = 0,
-                    .control = 0,
-                }, depth, .unreadable, address);
-                if (reference_index != null) self.result.unreadable_references +|= 1;
-                return;
-            },
-        };
-        const descriptor = pm4.decodeIndirectBuffer(
-            0xC000_0000 | (@as(u32, packet.body_dwords - 1) << pm4.count_shift) | (@as(u32, packet.opcode) << pm4.opcode_shift),
-            &payload,
-        ) orelse {
+    fn followIndirect(self: *Walker, header: u32, packet: pm4.Packet, depth: u8, payload: []const u32) void {
+        const descriptor = pm4.decodeIndirectBuffer(header, payload) orelse {
             const reference_index = self.recordReference(.{
                 .opcode = @enumFromInt(packet.opcode),
-                .address = payload[0],
-                .size_dwords = payload[1] & pm4.indirect_size_mask,
-                .control = payload[1] & ~pm4.indirect_size_mask,
+                .address = if (payload.len >= 1) payload[0] else 0,
+                .size_dwords = if (payload.len >= 2) payload[1] & pm4.indirect_size_mask else 0,
+                .control = if (payload.len >= 2) payload[1] & ~pm4.indirect_size_mask else 0,
             }, depth, .invalid, null);
             if (reference_index != null) self.result.invalid_references +|= 1;
             return;
@@ -423,6 +408,79 @@ pub const Walker = struct {
         }
     }
 
+    fn noteCommandRegister(self: *Walker, register: u32) void {
+        self.result.command_register_writes +|= 1;
+        const block = register_map.blockForIndex(register) orelse {
+            self.result.command_out_of_range_register_writes +|= 1;
+            return;
+        };
+        if (block == .unclassified) self.result.command_unclassified_register_writes +|= 1;
+    }
+
+    fn noteCommandRegisterRange(self: *Walker, start: u32, count: u32, one_register: bool) void {
+        var offset: u32 = 0;
+        while (offset < count) : (offset += 1) {
+            self.noteCommandRegister(if (one_register) start else start +| offset);
+        }
+    }
+
+    /// Structural register accounting implemented independently of the
+    /// stateful executor. Only immutable register-bank constants are shared.
+    fn noteRegisterIntent(self: *Walker, header: u32, packet: pm4.Packet, payload: []const u32) void {
+        switch (packet.packet_type) {
+            .type0 => self.noteCommandRegisterRange(
+                pm4.type0BaseRegister(header),
+                packet.body_dwords,
+                (header & (1 << 15)) != 0,
+            ),
+            .type1 => {
+                self.noteCommandRegister(header & 0x7FF);
+                self.noteCommandRegister((header >> 11) & 0x7FF);
+            },
+            .type2 => {},
+            .type3 => switch (packet.opcode) {
+                0x21 => {
+                    if (packet.body_dwords >= 3 and payload.len >= 1) {
+                        self.noteCommandRegister(payload[0] & 0x1FFF);
+                    }
+                },
+                0x2D => {
+                    if (packet.body_dwords < 2 or payload.len < 1) return;
+                    const base = constantBankBase((payload[0] >> 16) & 0xFF) orelse return;
+                    self.noteCommandRegisterRange(
+                        base +| (payload[0] & 0x7FF),
+                        packet.body_dwords - 1,
+                        false,
+                    );
+                },
+                0x2F => {
+                    if (packet.body_dwords < 3 or payload.len < 3) return;
+                    const base = constantBankBase((payload[1] >> 16) & 0xFF) orelse return;
+                    self.noteCommandRegisterRange(
+                        base +| (payload[1] & 0x7FF),
+                        payload[2] & 0xFFF,
+                        false,
+                    );
+                },
+                0x45 => {
+                    if (packet.body_dwords >= 6 and payload.len >= 5 and (payload[0] & 0x100) == 0) {
+                        self.noteCommandRegister(payload[4]);
+                    }
+                },
+                0x55, 0x56 => {
+                    if (packet.body_dwords >= 2 and payload.len >= 1) {
+                        self.noteCommandRegisterRange(
+                            payload[0] & 0xFFFF,
+                            packet.body_dwords - 1,
+                            false,
+                        );
+                    }
+                },
+                else => {},
+            },
+        }
+    }
+
     fn recordReference(
         self: *Walker,
         descriptor: pm4.IndirectBuffer,
@@ -492,6 +550,17 @@ pub const Walker = struct {
         return false;
     }
 };
+
+fn constantBankBase(kind: u32) ?u32 {
+    return switch (kind) {
+        0 => register_map.shader_constant_alu_base,
+        1 => register_map.shader_constant_fetch_base,
+        2 => register_map.shader_constant_bool_base,
+        3 => register_map.shader_constant_loop_base,
+        4 => register_map.shader_constant_register_base,
+        else => null,
+    };
+}
 
 fn indirectHeader(opcode: u8, body_dwords: u32) u32 {
     return 0xC000_0000 |
@@ -569,4 +638,32 @@ test "overlapping indirect ranges are stopped as cycles" {
     try std.testing.expectEqual(@as(u32, 2), result.indirect_references);
     try std.testing.expectEqual(@as(u32, 1), result.cycle_references);
     try std.testing.expectEqual(ReferenceStatus.cycle, walker.referenceSlice()[1].status);
+}
+
+test "structural register intent excludes observer side effects" {
+    var root = [_]u8{0} ** (9 * 4);
+    // Two classified Type-0 writes starting at RB_COLOR_INFO.
+    writeBig(
+        &root,
+        0,
+        (@as(u32, 1) << pm4.count_shift) | @as(u32, register_map.RB_COLOR_INFO),
+    );
+    writeBig(&root, 1, 0x1111);
+    writeBig(&root, 2, 0x2222);
+    // One in-range but unclassified REG_RMW target.
+    writeBig(&root, 3, indirectHeader(0x21, 3));
+    writeBig(&root, 4, 0x1000);
+    writeBig(&root, 5, 0xFFFF_FFFF);
+    writeBig(&root, 6, 0);
+    // One Type-0 target immediately outside the retained aperture.
+    writeBig(&root, 7, @intCast(register_map.register_count));
+    writeBig(&root, 8, 0x3333);
+
+    var walker = Walker.init(null, null);
+    walker.walkRoot(&root, 0, 9, 9);
+    const result = walker.summary();
+    try std.testing.expectEqual(@as(u32, 3), result.packets_walked);
+    try std.testing.expectEqual(@as(u64, 4), result.command_register_writes);
+    try std.testing.expectEqual(@as(u64, 1), result.command_unclassified_register_writes);
+    try std.testing.expectEqual(@as(u64, 1), result.command_out_of_range_register_writes);
 }

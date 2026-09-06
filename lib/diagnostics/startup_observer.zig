@@ -1,5 +1,6 @@
 const std = @import("std");
 const machoCapturePrint = @import("event_log").machoCapturePrint;
+const execution_profile = @import("execution_profile.zig");
 
 pub const Phase = enum {
     dyld_bind,
@@ -30,6 +31,9 @@ pub const Snapshot = struct {
     rip: u64,
     symbol: []const u8,
     symbol_offset: u64,
+    /// Where `rip` lives, so the profile can tell generated code from a hole
+    /// in the symbol table. Callers that cannot answer leave it `unstated`.
+    symbol_origin: execution_profile.Origin = .unstated,
     heap_next: u64,
     import_calls: u64,
     fs_open: u64,
@@ -86,6 +90,11 @@ pub const Observer = struct {
     hot_symbol_start_fs_read: u64 = 0,
     last_hot_symbol_diagnostic_wall: u64 = 0,
     stall_policy: StallPolicy = .{},
+    /// Where the sampled program counter has been landing, aggregated. The
+    /// heartbeat prints one symbol per hundred million steps and nothing was
+    /// keeping them, so the answer to "where does this run spend itself" had
+    /// to be assembled by hand from the log.
+    profile: execution_profile.Ledger = .{},
     timing_stack: [32]PhaseTiming = undefined,
     timing_depth: usize = 0,
 
@@ -165,6 +174,16 @@ pub const Observer = struct {
             hot_symbol_steps >= self.stall_policy.min_same_state_steps and
             hot_symbol_ns >= self.stall_policy.min_same_state_ns and
             hot_symbol_cooldown_elapsed;
+
+        // The heartbeat already resolved the symbol. Accumulating it costs a
+        // comparison per retained entry a few dozen times per run and turns
+        // eighty scattered lines into one answer about where the run lives.
+        self.profile.observeAt(
+            snapshot.symbol,
+            snapshot.symbol_origin,
+            snapshot.rip,
+            snapshot.step,
+        );
 
         const phase_str = @tagName(self.phase);
         machoCapturePrint(

@@ -608,7 +608,7 @@ pub const Ledger = struct {
         if (self.total_events == 0 and !force) return;
         const gap = self.firstGap();
         machoCapturePrint(
-            "macho-processor: XENIA GPU CAUSAL TRACE: observed_mask=0x{x:0>4} frontier={s} owner={s} events={d} dropped={d} out_of_order={d} cycles={d} cycle_repetitions={d} last_progress_step={d} quiet_steps={d} post_draw_waits={d} post_draw_signals={d} verdict={s}\n",
+            "macho-processor: XENIA GPU CAUSAL TRACE: observed_mask=0x{x:0>4} frontier={s} owner={s} events={d} tail_evictions={d} out_of_order={d} cycles={d} cycle_repetitions={d} last_progress_step={d} quiet_steps={d} post_draw_waits={d} post_draw_signals={d} verdict={s}; tail_evictions only age records out of this bounded diagnostic view—the live run journal receives new events before eviction\n",
             .{
                 self.observed_mask,
                 if (gap) |stage| stage.label() else "<complete>",
@@ -775,6 +775,16 @@ pub const Ledger = struct {
         return self.events[(self.event_cursor + ordinal) % max_events];
     }
 
+    /// Retrieve a just-recorded event by its durable sequence. The guest-log
+    /// bridge calls this immediately, before the small diagnostic tail can
+    /// overwrite it, and copies the event into the larger run journal.
+    pub fn eventForSequence(self: *const Ledger, sequence: u64) ?Event {
+        if (sequence == 0 or self.event_count == 0) return null;
+        const first_retained = self.total_events - @as(u64, @intCast(self.event_count)) + 1;
+        if (sequence < first_retained or sequence > self.total_events) return null;
+        return self.retainedEvent(@intCast(sequence - first_retained));
+    }
+
     fn noteSignature(self: *Ledger, signature: Signature, step: u64) void {
         if (self.recent_count < recent_signature_capacity) {
             self.recent_signatures[self.recent_count] = signature;
@@ -909,6 +919,16 @@ test "a consumed draw advances the draw boundary but not VdSwap" {
     try std.testing.expect(ledger.observed(.first_draw_consumed));
     try std.testing.expectEqual(vd_ring.CausalStage.guest_vdswap_entered, ledger.firstGap().?);
     try std.testing.expect(!vd_ring.handoffReady(ledger.observed_mask, .title_to_command_processor));
+}
+
+test "a newly recorded causal event is retrievable before tail eviction" {
+    var ledger = Ledger{};
+    ledger.observeWritePointer(0x16, 10);
+    const event = ledger.eventForSequence(1).?;
+    try std.testing.expectEqual(EventKind.ring_write_pointer, event.kind);
+    try std.testing.expectEqual(@as(u64, 0x16), event.value);
+    try std.testing.expect(ledger.eventForSequence(0) == null);
+    try std.testing.expect(ledger.eventForSequence(2) == null);
 }
 
 test "post-draw wait and signal evidence is anchored after draw consumption" {

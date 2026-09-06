@@ -84,7 +84,9 @@ pub const Stats = struct {
 
 pub const Ring = struct {
     slots: []Slot,
-    /// Monotonic claim counter. Producers increment; the low bits index a slot.
+    /// Monotonic reservation counter. It advances only after a producer has
+    /// successfully reserved capacity. A dropped offer therefore does not
+    /// leave a ticket that the consumer has to guess how to skip.
     claimed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Slots the writer has consumed. Read by producers to detect a full ring.
     consumed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -107,19 +109,30 @@ pub const Ring = struct {
     /// Offer a line. Returns false when the ring was full and the line was
     /// dropped.
     ///
-    /// This is the whole producer path: one fetchAdd, one bounds test, one
+    /// This is the whole producer path: a bounded CAS reservation, one
     /// memcpy, one release store. Nothing here can block, allocate, or enter
     /// the kernel, which is what keeps the observed program's timing its own.
     pub fn offer(self: *Ring, text: []const u8) bool {
         const count = self.slots.len;
-        const ticket = self.claimed.fetchAdd(1, .monotonic);
-
-        // Full when the claim would lap a slot the writer has not consumed.
-        // Checked after claiming rather than before: a pre-check would race
-        // with other producers and let two claim the same slot.
-        if (ticket -% self.consumed.load(.acquire) >= count) {
+        if (count == 0) {
             _ = self.dropped.fetchAdd(1, .monotonic);
             return false;
+        }
+
+        // Reserve with a compare-exchange instead of fetchAdd-then-check.
+        // The old order permanently advanced `claimed` for an over-capacity
+        // offer. The writer then stopped at that unpublished ticket forever,
+        // so one busy burst could make every later line disappear. Capacity is
+        // now reserved atomically and a rejected offer consumes no sequence.
+        var ticket = self.claimed.load(.monotonic);
+        while (true) {
+            const consumed = self.consumed.load(.acquire);
+            if (ticket -% consumed >= count) {
+                _ = self.dropped.fetchAdd(1, .monotonic);
+                return false;
+            }
+            if (self.claimed.cmpxchgWeak(ticket, ticket +% 1, .monotonic, .monotonic) == null) break;
+            ticket = self.claimed.load(.monotonic);
         }
 
         const slot = &self.slots[@intCast(ticket % count)];
@@ -233,6 +246,27 @@ pub fn priorityOf(text: []const u8) Priority {
     if (containsAny(text, &.{ "CRASH", "FATAL", "SIGSEGV", "SIGBUS", "SIGILL", "panic", "ABORT" })) {
         return .critical;
     }
+    // Terminal evidence: the lines that end a run, and the lines that say why.
+    //
+    // These were `routine`, so they were the first thing a full ring dropped —
+    // and the ring is fullest exactly when a gate stops the run, because the
+    // guest is still logging while the fault block is written. On 2026-09-04
+    // the whole fault block was lost and the only line that reached the log was
+    // the one containing `SIGSEGV`, which is the line that says how to *bypass*
+    // the gate. The reader got the bypass instructions and no reason.
+    //
+    // The volume is bounded: a run stops once, so writing this block
+    // synchronously costs nothing in steady state and is the difference between
+    // an actionable stop and an unexplained one.
+    if (containsAny(text, &.{
+        "RUN INTEGRITY FAULT",
+        "RUN INTEGRITY STOP",
+        "RUN INTEGRITY VIOLATION TRACE",
+        "integrity-trace",
+        "FAIL-FAST",
+    })) {
+        return .critical;
+    }
     if (containsAny(text, &.{ "CONTRACT:", "FRONTIER", "BLOCKER", "VERDICT", "verdict=", "finding=" })) {
         return .finding;
     }
@@ -259,6 +293,36 @@ const CollectSink = struct {
 
 fn testRing(slots: []Slot) Ring {
     return Ring.init(slots);
+}
+
+// 2026-09-04: the run-integrity fault block was `routine`, so a busy ring
+// dropped every line of it except the one containing `SIGSEGV`. That line is
+// the bypass instruction; the reason for the stop was gone.
+test "terminal evidence bypasses the ring" {
+    const terminal = [_][]const u8{
+        "macho-processor: RUN INTEGRITY STOP: invariant=all-required-witnesses-corroborated owner=rosette",
+        "macho-processor: RUN INTEGRITY FAULT CONTEXT: flushing guest wait ledger before signal",
+        "macho-processor: RUN INTEGRITY FAULT: invariant=all-required-witnesses-corroborated detail=2",
+        "macho-processor: RUN INTEGRITY VIOLATION TRACE: schema=7 step=200000000",
+        "      integrity-trace witness subject=vblank marks finding=uncorroborated",
+        "macho-processor: TRANSLATION FAIL-FAST: invariant=translation-cache-converges",
+    };
+    for (terminal) |line| {
+        try std.testing.expectEqual(Priority.critical, priorityOf(line));
+        try std.testing.expect(priorityOf(line).requiresSynchronousWrite());
+    }
+
+    // The steady-state traffic this protection must not swallow. A run emits
+    // tens of thousands of these and making them synchronous would reintroduce
+    // the stall the ring exists to remove.
+    const routine = [_][]const u8{
+        "macho-processor: heartbeat phase=main_loop step=100000000",
+        "[xenia] i> READY COMPILER: translation-progress schema=1 generation=1136",
+        "  translation miss vacant-fill count=118218 share=100% fatal=NO",
+    };
+    for (routine) |line| {
+        try std.testing.expect(!priorityOf(line).requiresSynchronousWrite());
+    }
 }
 
 test "a line offered is a line drained, in order" {
@@ -407,7 +471,7 @@ test "a crash line is classified critical and bypasses the ring" {
 }
 
 test "concurrent producers neither lose nor duplicate a line" {
-    // The claim is one fetchAdd; if it were a load-then-store, two threads
+    // The reservation is one CAS; if it were a load-then-store, two threads
     // would share a slot and the log would silently lose lines under exactly
     // the load that makes logging interesting.
     var slots: [4096]Slot = undefined;
@@ -428,7 +492,35 @@ test "concurrent producers neither lose nor duplicate a line" {
 
     const totals = ring.stats();
     try std.testing.expectEqual(@as(u64, 2000), totals.accepted + totals.dropped);
-    try std.testing.expectEqual(@as(u64, 2000), ring.claimed.load(.monotonic));
+    try std.testing.expectEqual(totals.accepted, ring.claimed.load(.monotonic));
+}
+
+test "concurrent overflow never leaves a consumer hole" {
+    var slots: [64]Slot = undefined;
+    var ring = testRing(&slots);
+
+    const Worker = struct {
+        fn run(target: *Ring, lines: usize) void {
+            var index: usize = 0;
+            while (index < lines) : (index += 1) _ = target.offer("overflow line");
+        }
+    };
+
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{ &ring, 500 });
+    }
+    for (threads) |thread| thread.join();
+
+    const before = ring.stats();
+    try std.testing.expectEqual(@as(u64, 2000), before.accepted + before.dropped);
+    try std.testing.expectEqual(before.accepted, ring.claimed.load(.monotonic));
+
+    var sink = CollectSink{ .buffer = .empty };
+    defer sink.buffer.deinit(std.testing.allocator);
+    const drained = ring.drain(&sink, CollectSink.write, 4096);
+    try std.testing.expectEqual(@as(usize, @intCast(before.accepted)), drained);
+    try std.testing.expectEqual(@as(u64, 0), ring.pending());
 }
 
 // ---------------------------------------------------------------------------

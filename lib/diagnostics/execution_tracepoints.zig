@@ -27,21 +27,47 @@
 
 const std = @import("std");
 
-pub const max_tracepoints: usize = 64;
+pub const max_tracepoints: usize = 256;
 /// Buckets in the address filter. Sized so that arming every candidate for a
-/// question still leaves the filter sparse: with ~30 tracepoints, 1024 buckets
-/// reject about 97% of in-range addresses before any search happens.
-pub const filter_buckets: usize = 1024;
+/// question still leaves the filter sparse: with ~160 tracepoints, 4096 buckets
+/// reject about 96% of in-range addresses before any search happens.
+///
+/// The capacity above was 64 while the armed set was nine symbol fragments.
+/// The full graphics boundary surface is thirty-three, and four candidates per
+/// fragment is what covers a virtual and its backend overrides — so a set that
+/// silently stopped arming at 64 would have reported NEVER ENTERED for
+/// whatever happened to sort last, which is exactly the failure the whole
+/// module exists to prevent.
+pub const filter_buckets: usize = 4096;
 const filter_words: usize = filter_buckets / 64;
+
+/// A tracepoint armed for a question the graphics boundary contract does not
+/// cover. Kept out of the contract's index space so `boundaryEntered` cannot
+/// accidentally answer for one.
+pub const unbound_boundary: u8 = 0xFF;
+
+/// Boundary ids are contract enum indices, so one slot per possible id.
+pub const boundary_slots: usize = 255;
+
+// Entry de-duplication needs no timing constant. An earlier version used a
+// 256-step window, which is fragile in both directions: an export shim that
+// does real work between two armed addresses exceeds it and splits one call in
+// two, while a tight loop under it merges two calls into one. The epoch rule
+// below is exact for any call duration.
 
 /// What a traced boundary means, so a hit report can say why it was watched.
 /// The categories are the frontier the graphics investigation is walking.
 pub const Role = enum(u8) {
     /// Entry into the authentic guest VdSwap export path. This proves the call
-    /// executed, but deliberately does not claim the guest published an
-    /// XE_SWAP packet. Host diagnostic work must never satisfy this role.
+    /// path was entered, but deliberately does not claim the guest published
+    /// an XE_SWAP packet. Host diagnostic work must never satisfy this role.
     swap,
-    /// Ring publication by the kernel video path.
+    /// Entry into the kernel video ring setup path. This is deliberately
+    /// separate from ring publication: allocating/configuring a ring and
+    /// advancing its write pointer are different state transitions.
+    ring_setup,
+    /// Ring publication by the kernel video path. This role is reserved for a
+    /// true producer/publish entry, not VdInitializeRingBuffer setup.
     ring_publication,
     /// Command-processor packet execution.
     command_processor,
@@ -62,6 +88,7 @@ pub const Role = enum(u8) {
     pub fn label(self: Role) []const u8 {
         return switch (self) {
             .swap => "guest VdSwap call",
+            .ring_setup => "ring setup",
             .ring_publication => "ring publication",
             .command_processor => "command processor",
             .command_swap => "command-processor swap",
@@ -83,8 +110,13 @@ pub const Role = enum(u8) {
     /// wrong end of the pipeline.
     pub fn predecessor(self: Role) ?Role {
         return switch (self) {
-            .ring_publication => null,
-            .command_processor => .ring_publication,
+            .ring_setup => null,
+            .ring_publication => .ring_setup,
+            // There is no universal command-processor entry that proves the
+            // guest advanced its write pointer. Ring setup is therefore the
+            // reachability predecessor; publication itself remains an
+            // independent measured effect in the substantiation contract.
+            .command_processor => .ring_setup,
             .swap => .command_processor,
             .command_swap => .command_processor,
             .xe_swap_decode => .command_processor,
@@ -125,6 +157,13 @@ pub const Tracepoint = struct {
     first_caller: u64 = 0,
     last_step: u64 = 0,
     last_thread: u64 = 0,
+    /// Which entry of this address's boundary last crossed it.
+    ///
+    /// A call enters an export through a chain — trampoline, shim,
+    /// implementation — and crosses each armed address at most once. Seeing an
+    /// address twice in the same entry therefore means a *new* call began, and
+    /// that is an exact signal with no timing constant in it.
+    entry_epoch: u64 = 0,
     /// Records the owning subsystem produced for this boundary — ring writes,
     /// consumed packets, presented frames. Left at zero by subsystems that do
     /// not report one, which is why `records_expected` gates the comparison
@@ -133,6 +172,15 @@ pub const Tracepoint = struct {
     /// Whether the owning subsystem promises to call `record`. Only then does
     /// `hits > 0 and records == 0` mean anything.
     records_expected: bool = false,
+    /// Which boundary of the graphics bring-up contract this address stands
+    /// for, as the contract's own enum index, or `unbound_boundary`.
+    ///
+    /// `role` is a nine-value vocabulary that predates the contract and stays
+    /// as it is because a dozen call sites read it. It is too coarse to answer
+    /// "did the title register an interrupt callback" — that question and "did
+    /// it initialise the ring" are both `ring_setup`. Carrying the contract
+    /// index alongside keeps both readings exact without a flag day.
+    boundary: u8 = unbound_boundary,
 
     pub fn entered(self: *const Tracepoint) bool {
         return self.hits != 0;
@@ -156,6 +204,21 @@ pub const Set = struct {
     /// a tracepoint that was never armed reads exactly like one that was armed
     /// and never hit.
     unresolved: u32 = 0,
+    /// Distinct entries per contract boundary, de-duplicated across the
+    /// several addresses one boundary is armed on.
+    ///
+    /// A boundary is armed on an ordinal trampoline, an export shim and the
+    /// implementation; one guest call crosses however many lie on its path.
+    /// Summing the per-address hits counted the path length, which is how
+    /// `VdInitializeEngines` reported 2 against the emulator's breadcrumb of 1
+    /// and stopped the 2026-09-05 run on a contested claim where both
+    /// observers were correct.
+    boundary_entries: [boundary_slots]u64 = [_]u64{0} ** boundary_slots,
+    /// The identifier of the entry currently in progress for each boundary.
+    /// Compared against each address's `entry_epoch` to tell "another address
+    /// on the same call" from "this address again, so a new call".
+    boundary_epoch: [boundary_slots]u64 = [_]u64{0} ** boundary_slots,
+    boundary_entry_thread: [boundary_slots]u64 = [_]u64{0} ** boundary_slots,
     probes: u64 = 0,
     gate_rejections: u64 = 0,
 
@@ -163,16 +226,39 @@ pub const Set = struct {
     /// commonly resolve to one address after inlining, and counting one entry
     /// twice would overstate how much is being watched.
     pub fn arm(self: *Set, name: []const u8, address: u64, role: Role) bool {
+        return self.armBoundary(name, address, role, unbound_boundary);
+    }
+
+    /// Arm a tracepoint that also stands for one boundary of the graphics
+    /// contract. A duplicate address still collapses, but the surviving entry
+    /// adopts the contract boundary when it had none: inlining routinely maps
+    /// a shim and its trampoline onto one address, and losing the boundary tag
+    /// because the coarse role was armed first would leave the gate reporting
+    /// UNWATCHED for something it was in fact watching.
+    pub fn armBoundary(self: *Set, name: []const u8, address: u64, role: Role, boundary: u8) bool {
         if (self.sealed or address == 0 or self.count >= max_tracepoints) {
             if (address == 0) self.unresolved +|= 1;
             return false;
         }
-        for (self.entries[0..self.count]) |existing| {
-            if (existing.address == address) return false;
+        for (self.entries[0..self.count]) |*existing| {
+            if (existing.address != address) continue;
+            if (existing.boundary == unbound_boundary) existing.boundary = boundary;
+            return false;
         }
-        self.entries[self.count] = .{ .address = address, .role = role, .name = name };
+        self.entries[self.count] = .{
+            .address = address,
+            .role = role,
+            .name = name,
+            .boundary = boundary,
+        };
         self.count += 1;
         return true;
+    }
+
+    /// Whether the set is full. Reported rather than discovered: an arm that
+    /// silently fails produces a zero indistinguishable from never executing.
+    pub fn saturated(self: *const Set) bool {
+        return self.count >= max_tracepoints;
     }
 
     pub fn noteUnresolved(self: *Set) void {
@@ -241,6 +327,7 @@ pub const Set = struct {
         entry.hits +|= 1;
         entry.last_step = step;
         entry.last_thread = thread;
+        self.noteBoundaryEntry(entry, thread);
         if (first) {
             entry.first_step = step;
             entry.first_thread = thread;
@@ -265,6 +352,150 @@ pub const Set = struct {
             if (entry.role == role and entry.entered()) return true;
         }
         return false;
+    }
+
+    /// Whether any address armed for this contract boundary was entered.
+    pub fn boundaryEntered(self: *const Set, boundary: u8) bool {
+        if (boundary == unbound_boundary) return false;
+        for (self.entries[0..self.count]) |entry| {
+            if (entry.boundary == boundary and entry.entered()) return true;
+        }
+        return false;
+    }
+
+    /// Whether anything at all is watching this contract boundary. The
+    /// distinction this module exists for: `false` here makes every downstream
+    /// zero Rosette's rather than the title's.
+    pub fn boundaryArmed(self: *const Set, boundary: u8) bool {
+        if (boundary == unbound_boundary) return false;
+        for (self.entries[0..self.count]) |entry| {
+            if (entry.boundary == boundary) return true;
+        }
+        return false;
+    }
+
+    /// The earliest crossing recorded for a contract boundary, with the thread
+    /// and caller that made it. Several addresses can stand for one boundary —
+    /// a shim, its trampoline, a backend override — and the first of them to
+    /// execute is the crossing.
+    pub fn boundaryFirst(self: *const Set, boundary: u8) ?*const Tracepoint {
+        if (boundary == unbound_boundary) return null;
+        var earliest: ?*const Tracepoint = null;
+        for (self.entries[0..self.count]) |*entry| {
+            if (entry.boundary != boundary or !entry.entered()) continue;
+            if (earliest) |held| {
+                if (entry.first_step >= held.first_step) continue;
+            }
+            earliest = entry;
+        }
+        return earliest;
+    }
+
+    /// Count a crossing as a new entry unless it belongs to a call already
+    /// counted.
+    ///
+    /// A call enters an export through a chain of armed addresses and crosses
+    /// each at most once, so a *repeat* of an address that has already been
+    /// crossed in the current entry is the start of the next call. A different
+    /// thread is always a different call: two threads cannot share a frame.
+    ///
+    /// Exact regardless of how long a call takes or how far apart two calls
+    /// are, which a step window could never be.
+    fn noteBoundaryEntry(self: *Set, entry: *Tracepoint, thread: u64) void {
+        const boundary = entry.boundary;
+        if (boundary == unbound_boundary or boundary >= boundary_slots) return;
+        const index: usize = boundary;
+        const started = self.boundary_entries[index] != 0;
+        const repeat_address = started and entry.entry_epoch == self.boundary_epoch[index];
+        const other_thread = started and self.boundary_entry_thread[index] != thread;
+        if (!started or repeat_address or other_thread) {
+            self.boundary_entries[index] +|= 1;
+            self.boundary_epoch[index] +|= 1;
+            self.boundary_entry_thread[index] = thread;
+        }
+        entry.entry_epoch = self.boundary_epoch[index];
+    }
+
+    /// Entries into a contract boundary, across every address armed for it.
+    ///
+    /// The **maximum** across the boundary's addresses, not the sum. One
+    /// boundary routinely has several armed addresses — an ordinal trampoline,
+    /// an export shim, the implementation — and a single guest call crosses
+    /// however many of them lie on its path. Each address is crossed at most
+    /// once per call, so the largest per-address count is the number of calls
+    /// and the sum is that number multiplied by the path length.
+    ///
+    /// Summing is what made `VdInitializeEngines` read 2 against the emulator's
+    /// own breadcrumb of 1 on 2026-09-05, and stopped the run on a contested
+    /// claim where both observers were behaving correctly. It also inflated
+    /// every pump reading built on this number: `MarkVblank` and
+    /// `DispatchInterruptCallback` each have four armed addresses, so a report
+    /// of 147 vblanks and 113 dispatches was counting path crossings and
+    /// calling them events.
+    ///
+    /// `boundaryCrossings` below keeps the old total for the questions that
+    /// genuinely want it.
+    pub fn boundaryHits(self: *const Set, boundary: u8) u64 {
+        if (boundary == unbound_boundary or boundary >= boundary_slots) return 0;
+        return self.boundary_entries[boundary];
+    }
+
+    /// Total crossings summed over every armed address for a boundary.
+    ///
+    /// Not an entry count. Useful only for questions about the tracepoints
+    /// themselves — how much of the armed surface is live, whether an address
+    /// was armed and never reached — and never for "how many times did this
+    /// happen".
+    pub fn boundaryCrossings(self: *const Set, boundary: u8) u64 {
+        if (boundary == unbound_boundary) return 0;
+        var total: u64 = 0;
+        for (self.entries[0..self.count]) |entry| {
+            if (entry.boundary == boundary) total +|= entry.hits;
+        }
+        return total;
+    }
+
+    /// Armed addresses for a boundary, and how many of them were ever reached.
+    ///
+    /// The pair is what distinguishes "armed on the right address" from "armed
+    /// on six and reached two". A boundary whose reached count is zero while
+    /// its armed count is high is an observer hole wearing the costume of a
+    /// guest that never called.
+    pub fn boundaryAddressCoverage(self: *const Set, boundary: u8) struct { armed: u32, reached: u32 } {
+        if (boundary == unbound_boundary) return .{ .armed = 0, .reached = 0 };
+        var armed: u32 = 0;
+        var reached: u32 = 0;
+        for (self.entries[0..self.count]) |entry| {
+            if (entry.boundary != boundary) continue;
+            armed += 1;
+            if (entry.hits != 0) reached += 1;
+        }
+        return .{ .armed = armed, .reached = reached };
+    }
+
+    /// The most recent step at which any address for this boundary executed.
+    /// A pump that ran and stopped is a different finding from one that never
+    /// ran, and only the last step separates them.
+    pub fn boundaryLastStep(self: *const Set, boundary: u8) u64 {
+        if (boundary == unbound_boundary) return 0;
+        var latest: u64 = 0;
+        for (self.entries[0..self.count]) |entry| {
+            if (entry.boundary != boundary or !entry.entered()) continue;
+            if (entry.last_step > latest) latest = entry.last_step;
+        }
+        return latest;
+    }
+
+    /// How many addresses are armed for this boundary. Reported so a reader can
+    /// tell "one shim watched" from "a shim, a trampoline and two backend
+    /// overrides watched", which changes how much a zero is worth.
+    pub fn boundaryWatchers(self: *const Set, boundary: u8) u32 {
+        if (boundary == unbound_boundary) return 0;
+        var total: u32 = 0;
+        for (self.entries[0..self.count]) |entry| {
+            if (entry.boundary == boundary) total += 1;
+        }
+        return total;
     }
 
     pub fn roleArmed(self: *const Set, role: Role) bool {
@@ -439,20 +670,22 @@ test "an unwatched role is distinguished from one that never executed" {
 // "NEVER ENTERED" four times names four frontiers, and there is only one.
 test "a downstream zero is not a finding while its predecessor is also zero" {
     var set = Set{};
-    _ = set.arm("VdInitializeRingBuffer", 0x1000, .ring_publication);
+    _ = set.arm("VdInitializeRingBuffer", 0x1000, .ring_setup);
     _ = set.arm("ExecutePrimaryBuffer", 0x2000, .command_processor);
     _ = set.arm("VdSwap", 0x3000, .swap);
     set.seal();
 
     // Nothing has run: only the head of the pipeline is a real finding.
-    try std.testing.expectEqual(Verdict.never_entered, set.classify(.ring_publication));
+    try std.testing.expectEqual(Verdict.never_entered, set.classify(.ring_setup));
     try std.testing.expectEqual(Verdict.not_yet_reached, set.classify(.command_processor));
     try std.testing.expectEqual(Verdict.not_yet_reached, set.classify(.swap));
 
-    // Once the ring publishes, the command processor's zero becomes its own
-    // finding, and the frontier moves one stage down.
+    // Once ring setup is entered, the command processor's zero becomes its
+    // own finding, and the frontier moves one stage down. Setup is not
+    // publication, so the publication boundary remains independently
+    // unsubstantiated until a producer effect is observed.
     _ = set.observe(0x1000, 10, 1, 0);
-    try std.testing.expectEqual(Verdict.entered, set.classify(.ring_publication));
+    try std.testing.expectEqual(Verdict.entered, set.classify(.ring_setup));
     try std.testing.expectEqual(Verdict.never_entered, set.classify(.command_processor));
     try std.testing.expectEqual(Verdict.not_yet_reached, set.classify(.swap));
 }
@@ -582,4 +815,154 @@ test "every role explains itself" {
         const role: Role = @enumFromInt(field.value);
         try std.testing.expect(role.label().len > 0);
     }
+}
+
+test "ring setup is distinct from ring publication" {
+    try std.testing.expectEqualStrings("ring setup", Role.ring_setup.label());
+    try std.testing.expectEqual(Role.ring_setup, Role.ring_publication.predecessor().?);
+}
+
+test "a contract boundary is answered from its earliest crossing" {
+    var set = Set{};
+    try std.testing.expect(set.armBoundary("shim", 0x1000, .ring_setup, 7));
+    try std.testing.expect(set.armBoundary("trampoline", 0x2000, .ring_setup, 7));
+    set.seal();
+    try std.testing.expect(set.boundaryArmed(7));
+    try std.testing.expect(!set.boundaryEntered(7));
+
+    _ = set.observe(0x2000, 900, 0xaa, 0);
+    _ = set.observe(0x1000, 400, 0xbb, 0);
+    try std.testing.expect(set.boundaryEntered(7));
+    try std.testing.expectEqual(@as(u64, 400), set.boundaryFirst(7).?.first_step);
+    try std.testing.expectEqual(@as(u64, 2), set.boundaryHits(7));
+    try std.testing.expectEqual(@as(u32, 2), set.boundaryWatchers(7));
+    try std.testing.expectEqual(@as(u64, 900), set.boundaryLastStep(7));
+}
+
+// An unwatched boundary must never answer, or "Rosette did not look" becomes
+// indistinguishable from "the title did not do it" all over again.
+test "an unbound boundary answers nothing" {
+    var set = Set{};
+    _ = set.arm("plain", 0x1000, .swap);
+    set.seal();
+    _ = set.observe(0x1000, 1, 0, 0);
+    try std.testing.expect(!set.boundaryArmed(unbound_boundary));
+    try std.testing.expect(!set.boundaryEntered(unbound_boundary));
+    try std.testing.expect(!set.boundaryArmed(3));
+    try std.testing.expect(set.boundaryFirst(3) == null);
+}
+
+// Inlining maps a shim and its trampoline onto one address often enough that
+// losing the contract tag to whichever was armed first would leave the gate
+// blind to a boundary it was watching.
+test "a collapsed duplicate adopts the contract boundary" {
+    var set = Set{};
+    try std.testing.expect(set.arm("role-only", 0x3000, .ring_setup));
+    try std.testing.expect(!set.armBoundary("with-boundary", 0x3000, .ring_setup, 12));
+    try std.testing.expectEqual(@as(usize, 1), set.count);
+    try std.testing.expect(set.boundaryArmed(12));
+}
+
+// 2026-09-05. `VdInitializeEngines` is armed on three addresses; one guest call
+// crossed two of them and the summed count read 2 against the emulator's own
+// breadcrumb of 1. The run stopped on a contested claim in which both observers
+// were behaving correctly and only the arithmetic was wrong.
+test "one call across several armed addresses is one entry" {
+    var set = Set{};
+    const boundary: u8 = 3;
+    // Three addresses armed for one boundary, as the run arms them.
+    _ = set.armBoundary("a", 0x875090, .other, boundary);
+    _ = set.armBoundary("b", 0x8754a0, .other, boundary);
+    _ = set.armBoundary("c", 0x87f2b0, .other, boundary);
+
+    const coverage_before = set.boundaryAddressCoverage(boundary);
+    try std.testing.expectEqual(@as(u32, 3), coverage_before.armed);
+    try std.testing.expectEqual(@as(u32, 0), coverage_before.reached);
+    try std.testing.expectEqual(@as(u64, 0), set.boundaryHits(boundary));
+
+    set.seal();
+    // One guest call whose path crosses two of the three.
+    _ = set.observe(0x875090, 10, 1, 0);
+    _ = set.observe(0x8754a0, 12, 1, 0);
+    try std.testing.expectEqual(@as(u64, 1), set.boundaryHits(boundary));
+    // The sum is still available, and is still 2 — it just is not an entry count.
+    try std.testing.expectEqual(@as(u64, 2), set.boundaryCrossings(boundary));
+
+    const coverage = set.boundaryAddressCoverage(boundary);
+    try std.testing.expectEqual(@as(u32, 3), coverage.armed);
+    try std.testing.expectEqual(@as(u32, 2), coverage.reached);
+
+    // A second call advances by exactly one, however far away it is.
+    _ = set.observe(0x875090, 100_000, 1, 0);
+    _ = set.observe(0x8754a0, 100_002, 1, 0);
+    try std.testing.expectEqual(@as(u64, 2), set.boundaryHits(boundary));
+    try std.testing.expectEqual(@as(u64, 4), set.boundaryCrossings(boundary));
+}
+
+// A boundary armed on many addresses and reached on none is an observer hole,
+// not a guest that never called. The pair is what separates them.
+test "address coverage separates an observer hole from a silent guest" {
+    var set = Set{};
+    const boundary: u8 = 7;
+    _ = set.armBoundary("x", 0x1000, .other, boundary);
+    _ = set.armBoundary("y", 0x2000, .other, boundary);
+    set.seal();
+    const cold = set.boundaryAddressCoverage(boundary);
+    try std.testing.expectEqual(@as(u32, 2), cold.armed);
+    try std.testing.expectEqual(@as(u32, 0), cold.reached);
+
+    _ = set.observe(0x2000, 5, 1, 0);
+    const warm = set.boundaryAddressCoverage(boundary);
+    try std.testing.expectEqual(@as(u32, 1), warm.reached);
+    try std.testing.expectEqual(@as(u64, 1), set.boundaryHits(boundary));
+}
+
+// The step window this replaced would have split this call in two: a shim that
+// does real work between its armed addresses can span far more than a few
+// hundred guest steps, which is exactly what left `VdInitializeEngines`
+// contested at 2 against the emulator's breadcrumb of 1.
+test "a slow call chain is still one entry" {
+    var set = Set{};
+    const boundary: u8 = 11;
+    _ = set.armBoundary("trampoline", 0x1000, .other, boundary);
+    _ = set.armBoundary("shim", 0x2000, .other, boundary);
+    _ = set.armBoundary("impl", 0x3000, .other, boundary);
+    set.seal();
+
+    // One call, its three addresses millions of steps apart.
+    _ = set.observe(0x1000, 1, 7, 0);
+    _ = set.observe(0x2000, 5_000_000, 7, 0);
+    _ = set.observe(0x3000, 9_000_000, 7, 0);
+    try std.testing.expectEqual(@as(u64, 1), set.boundaryHits(boundary));
+    try std.testing.expectEqual(@as(u64, 3), set.boundaryCrossings(boundary));
+
+    // The next call repeats the first address, which is what makes it next.
+    _ = set.observe(0x1000, 9_000_010, 7, 0);
+    try std.testing.expectEqual(@as(u64, 2), set.boundaryHits(boundary));
+}
+
+// Two calls back to back through a single address are two entries, however
+// close together. A step window merged these.
+test "rapid repeat calls through one address are counted separately" {
+    var set = Set{};
+    const boundary: u8 = 12;
+    _ = set.armBoundary("only", 0x4000, .other, boundary);
+    set.seal();
+    _ = set.observe(0x4000, 100, 7, 0);
+    _ = set.observe(0x4000, 101, 7, 0);
+    _ = set.observe(0x4000, 102, 7, 0);
+    try std.testing.expectEqual(@as(u64, 3), set.boundaryHits(boundary));
+}
+
+// Two threads cannot share a call frame, so interleaved crossings of the same
+// address are separate entries even inside one epoch.
+test "two threads entering one boundary are two entries" {
+    var set = Set{};
+    const boundary: u8 = 13;
+    _ = set.armBoundary("a", 0x5000, .other, boundary);
+    _ = set.armBoundary("b", 0x6000, .other, boundary);
+    set.seal();
+    _ = set.observe(0x5000, 10, 0xaa, 0);
+    _ = set.observe(0x5000, 11, 0xbb, 0);
+    try std.testing.expectEqual(@as(u64, 2), set.boundaryHits(boundary));
 }

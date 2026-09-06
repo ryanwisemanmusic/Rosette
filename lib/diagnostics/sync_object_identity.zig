@@ -45,8 +45,16 @@ const std = @import("std");
 pub const Provenance = enum(u8) {
     /// The address was already canonical, or nothing is known about it.
     unmapped,
+    /// A 32-bit value could be either a console address or the low word of a
+    /// host pointer. It is retained without guessing until the caller tells
+    /// us which address space produced it.
+    ambiguous_address_space,
     /// The emulator printed both names on one line; this is exact.
     observed_pair,
+    /// A kernel handle named the console object on an intact line. Handles
+    /// are stronger than either address spelling because both host and guest
+    /// paths can refer to the same handle.
+    observed_handle,
     /// Derived by subtracting the emulator's mapping base. Correct when the
     /// address really is in the primary view and wrong when it is not, so it
     /// is only used when no pair was observed.
@@ -55,13 +63,15 @@ pub const Provenance = enum(u8) {
     pub fn label(self: Provenance) []const u8 {
         return switch (self) {
             .unmapped => "unmapped",
+            .ambiguous_address_space => "ambiguous_address_space",
             .observed_pair => "observed_pair",
+            .observed_handle => "observed_handle",
             .derived_from_mapping_base => "derived",
         };
     }
 
     pub fn exact(self: Provenance) bool {
-        return self == .observed_pair;
+        return self == .observed_pair or self == .observed_handle;
     }
 };
 
@@ -110,6 +120,9 @@ pub const max_pairs = 32;
 pub const HandleEntry = struct {
     handle: u32 = 0,
     console: u64 = 0,
+    host: u64 = 0,
+    sightings: u64 = 0,
+    ambiguous: bool = false,
 };
 
 pub const Pair = struct {
@@ -145,12 +158,51 @@ pub const Table = struct {
     /// Handle-to-console mappings learned from untruncated header lines.
     handles: [max_pairs]HandleEntry = [_]HandleEntry{.{}} ** max_pairs,
     handle_count: usize = 0,
+    /// A handle was seen naming two different console objects. Once this
+    /// happens the handle is deliberately unusable for canonicalisation.
+    handle_conflicts: u64 = 0,
+    /// Handle/object evidence was rejected because the host and console
+    /// fields disagreed with the independently known mapping base.
+    handle_rejections: u64 = 0,
 
     fn find(self: *Table, host: u64) ?*Pair {
         for (self.pairs[0..self.count]) |*pair| {
             if (pair.host == host) return pair;
         }
         return null;
+    }
+
+    fn findHandle(self: *Table, handle: u32) ?*HandleEntry {
+        for (self.handles[0..self.handle_count]) |*entry| {
+            if (entry.handle == handle) return entry;
+        }
+        return null;
+    }
+
+    fn recordHandle(self: *Table, handle: u32, host: u64, console: u64) void {
+        if (self.findHandle(handle)) |entry| {
+            entry.sightings +|= 1;
+            if (entry.ambiguous) return;
+            if (entry.console != console) {
+                self.handle_conflicts +|= 1;
+                entry.console = 0;
+                entry.ambiguous = true;
+                return;
+            }
+            if (entry.host == 0) entry.host = host;
+            return;
+        }
+        if (self.handle_count == max_pairs) {
+            self.dropped +|= 1;
+            return;
+        }
+        self.handles[self.handle_count] = .{
+            .handle = handle,
+            .console = console,
+            .host = host,
+            .sightings = 1,
+        };
+        self.handle_count += 1;
     }
 
     /// Learn from a line that named the object both ways — if the line is
@@ -209,24 +261,36 @@ pub const Table = struct {
         if (host_full <= self.mapping_base) return;
         const console = host_full - self.mapping_base;
         if (!plausibleConsoleAddress(console)) return;
-        for (self.handles[0..self.handle_count]) |*entry| {
-            if (entry.handle == handle) {
-                entry.console = console;
+        self.recordHandle(handle, host_full, console);
+    }
+
+    /// Learn a handle/object identity from one intact diagnostic record.
+    ///
+    /// A result line such as `obj_ptr=DA7CEC14 guest_obj=827CEC14
+    /// handle=F800015C` supplies an independent host/guest check and a kernel
+    /// identity. The mapping-base check is mandatory whenever the host field is
+    /// present; without it, a spliced line is not allowed to teach the table a
+    /// new handle. A guest-only line is still useful when the handle is the
+    /// only stable identity available.
+    pub fn observeHandleObject(self: *Table, handle: u32, host: u64, console: u64) void {
+        if (handle == 0 or !plausibleConsoleAddress(console)) return;
+        if (host != 0 and host != console and self.mapping_base != 0) {
+            const derived = deriveConsoleAddress(host, self.mapping_base) orelse {
+                self.handle_rejections +|= 1;
+                return;
+            };
+            if (derived != console) {
+                self.handle_rejections +|= 1;
                 return;
             }
         }
-        if (self.handle_count == max_pairs) {
-            self.dropped +|= 1;
-            return;
-        }
-        self.handles[self.handle_count] = .{ .handle = handle, .console = console };
-        self.handle_count += 1;
+        self.recordHandle(handle, host, console);
     }
 
     /// The console object a handle names, when one was learned.
     pub fn consoleForHandle(self: *const Table, handle: u32) ?u64 {
         for (self.handles[0..self.handle_count]) |entry| {
-            if (entry.handle == handle) return entry.console;
+            if (entry.handle == handle) return if (entry.ambiguous) null else entry.console;
         }
         return null;
     }
@@ -252,20 +316,46 @@ pub const Table = struct {
             self.pairs[index] = self.pairs[self.count - 1];
             self.count -= 1;
         }
+        for (self.handles[0..self.handle_count]) |*entry| {
+            if (entry.ambiguous or entry.host == 0) continue;
+            const derived = deriveConsoleAddress(entry.host, base);
+            if (derived != null and derived.? == entry.console) continue;
+            self.handle_rejections +|= 1;
+            entry.console = 0;
+            entry.ambiguous = true;
+        }
     }
 
     /// Resolve an address to the name a reader can act on.
     pub fn resolve(self: *Table, address: u64) Resolution {
         if (address == 0) return .{ .canonical = 0, .provenance = .unmapped, .rewritten = false };
-        // An address already in console space is canonical. Checking this first
-        // means a console address is never "resolved" through a coincidental
-        // host match.
+        // A 32-bit value is ambiguous whenever no observed pair identifies it.
+        // It may already be a console address, or it may be the low word of a
+        // host pointer. Never subtract the mapping base speculatively: doing
+        // so turned guest 0x827CEC14 into the unrelated-looking 0x2A7CEC14
+        // and split one semaphore into two wait-graph records.
         if (address <= 0xFFFF_FFFF) {
             for (self.pairs[0..self.count]) |pair| {
                 if (pair.console == address) {
                     return .{ .canonical = address, .provenance = .observed_pair, .rewritten = false };
                 }
             }
+            if (self.find(address)) |pair| {
+                self.rewrites +|= 1;
+                return .{ .canonical = pair.console, .provenance = .observed_pair, .rewritten = true };
+            }
+            if (self.mapping_base != 0) {
+                if (deriveConsoleAddress(address, self.mapping_base)) |derived| {
+                    if (derived != address) {
+                        return .{
+                            .canonical = address,
+                            .provenance = .ambiguous_address_space,
+                            .rewritten = false,
+                        };
+                    }
+                }
+            }
+            return .{ .canonical = address, .provenance = .unmapped, .rewritten = false };
         }
         if (self.find(address)) |pair| {
             self.rewrites +|= 1;
@@ -284,9 +374,52 @@ pub const Table = struct {
         return .{ .canonical = address, .provenance = .unmapped, .rewritten = false };
     }
 
+    /// Resolve an address explicitly known to have come from the host-pointer
+    /// field. This is the only path allowed to derive a truncated 32-bit host
+    /// pointer from the mapping base; the guest-pointer path above refuses to
+    /// guess, which keeps an Xbox address from becoming a different object.
+    pub fn resolveHost(self: *Table, address: u64) Resolution {
+        if (address == 0) return .{ .canonical = 0, .provenance = .unmapped, .rewritten = false };
+        if (self.find(address)) |pair| {
+            self.rewrites +|= 1;
+            return .{ .canonical = pair.console, .provenance = .observed_pair, .rewritten = true };
+        }
+        if (self.mapping_base != 0) {
+            if (deriveConsoleAddress(address, self.mapping_base)) |derived| {
+                self.rewrites +|= 1;
+                return .{
+                    .canonical = derived,
+                    .provenance = .derived_from_mapping_base,
+                    .rewritten = true,
+                };
+            }
+        }
+        return .{ .canonical = address, .provenance = .unmapped, .rewritten = false };
+    }
+
+    /// Resolve through a kernel handle after the line has supplied its
+    /// handle/object evidence. An unambiguous handle is stronger than an
+    /// address spelling; an ambiguous handle deliberately falls back to the
+    /// address-space-aware resolver and therefore cannot silently merge data.
+    pub fn resolveHandle(self: *Table, address: u64, handle: u32) Resolution {
+        if (handle == 0) return self.resolve(address);
+        if (self.consoleForHandle(handle)) |console| {
+            if (address == console) {
+                return .{ .canonical = console, .provenance = .observed_handle, .rewritten = false };
+            }
+            self.rewrites +|= 1;
+            return .{ .canonical = console, .provenance = .observed_handle, .rewritten = true };
+        }
+        return self.resolve(address);
+    }
+
     pub fn verdict(self: *const Table) []const u8 {
         if (self.conflicts != 0)
             return "a host pointer resolved to two different console addresses during this run. The emulator's mapping moved, so every normalisation taken before the move named the wrong object and any evidence merged across it is unsound";
+        if (self.handle_conflicts != 0)
+            return "a kernel handle was observed naming two different console objects. Its identity is ambiguous, so Rosette refuses to merge either address into the wait graph";
+        if (self.handle_rejections != 0)
+            return "handle/object evidence was refused because the host and console fields disagree with the mapping-base derivation. The wait graph stays conservative instead of accepting a spliced identity";
         // Checked before the "nothing learned yet" case: truncation is a fact
         // about the log itself and stays true whether or not any pair was ever
         // read, so reporting the absence of pairs would bury it.
@@ -294,6 +427,8 @@ pub const Table = struct {
             return "stated object pairs are being refused because their two halves disagree with the mapping-base derivation — the emulator's logging spliced them. Every refusal is a wrong identity that did not enter the table, and a wrong identity is worse than a missing one because it carries exact provenance and outranks the derivation that would have been right";
         if (self.truncated_reads != 0 and self.rewrites == 0)
             return "object-pointer fields are arriving truncated and are being refused rather than turned into phantom objects. The emulator's logging is not line-atomic under this runtime, so its synchronisation lines splice";
+        if (self.count == 0 and self.handle_count != 0)
+            return "no host/console pair was accepted, but handle-qualified object identities are available and will be used only while each handle remains unambiguous";
         if (self.count == 0)
             return "no line has named an object both ways yet, so every address is being taken at face value. Any object the run refers to through two address spaces is currently being counted as two objects";
         if (self.rewrites == 0)
@@ -368,7 +503,7 @@ test "a truncated host pointer is derived in the width it was printed in" {
     try std.testing.expectEqual(@as(?u64, 0x827206E4), deriveConsoleAddress(0xCFF706E4, 0x34D850000));
     try std.testing.expectEqual(@as(?u64, 0x40004BF4), deriveConsoleAddress(0x8D854BF4, 0x34D850000));
 
-    const resolution = table.resolve(0xD001EC38);
+    const resolution = table.resolveHost(0xD001EC38);
     try std.testing.expectEqual(@as(u64, 0x827CEC38), resolution.canonical);
     try std.testing.expect(resolution.rewritten);
     try std.testing.expectEqual(Provenance.derived_from_mapping_base, resolution.provenance);
@@ -388,6 +523,25 @@ test "an observed pair outranks the derived fallback" {
     const resolution = table.resolve(0xCFF706E4);
     try std.testing.expectEqual(@as(u64, 0x827206E4), resolution.canonical);
     try std.testing.expect(resolution.provenance.exact());
+}
+
+test "a guest address is not reinterpreted as a truncated host pointer" {
+    var table = Table{};
+    table.observeMappingBase(0x358000000);
+
+    // The old resolver subtracted the low mapping base from this guest
+    // address and produced 0x2A7CEC14, exactly the split in the captured wait
+    // audit. The guest path must retain the address and expose the ambiguity.
+    const guest = table.resolve(0x827CEC14);
+    try std.testing.expectEqual(@as(u64, 0x827CEC14), guest.canonical);
+    try std.testing.expectEqual(Provenance.ambiguous_address_space, guest.provenance);
+    try std.testing.expect(!guest.rewritten);
+
+    // A caller that knows it read the host field may still use the derived
+    // fallback explicitly.
+    const host = table.resolveHost(0xDA7CEC14);
+    try std.testing.expectEqual(@as(u64, 0x827CEC14), host.canonical);
+    try std.testing.expectEqual(Provenance.derived_from_mapping_base, host.provenance);
 }
 
 // A mapping that moves mid-run invalidates every normalisation taken before it,
@@ -485,6 +639,35 @@ test "a handle header line gives the console object a handle names" {
     try std.testing.expect(bare.consoleForHandle(0xF8000154) == null);
 }
 
+test "an intact wait result binds a handle and folds either address spelling" {
+    var table = Table{};
+    table.observeMappingBase(0x358000000);
+    table.observePair(0xDA7CEC14, 0x827CEC14);
+    table.observeHandleObject(0xF800015C, 0xDA7CEC14, 0x827CEC14);
+
+    try std.testing.expectEqual(@as(?u64, 0x827CEC14), table.consoleForHandle(0xF800015C));
+    try std.testing.expectEqual(
+        @as(u64, 0x827CEC14),
+        table.resolveHandle(0x2A7CEC14, 0xF800015C).canonical,
+    );
+    try std.testing.expectEqual(Provenance.observed_handle, table.resolveHandle(0xDA7CEC14, 0xF800015C).provenance);
+    try std.testing.expectEqual(@as(u64, 1), table.handles[0].sightings);
+}
+
+test "a handle conflict disables handle canonicalisation" {
+    var table = Table{};
+    table.observeHandleObject(0xF800015C, 0, 0x827CEC14);
+    table.observeHandleObject(0xF800015C, 0, 0x827CEC38);
+
+    try std.testing.expect(table.consoleForHandle(0xF800015C) == null);
+    try std.testing.expectEqual(@as(u64, 1), table.handle_conflicts);
+    try std.testing.expectEqual(
+        Provenance.unmapped,
+        table.resolveHandle(0x827CEC14, 0xF800015C).provenance,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, table.verdict(), "ambiguous") != null);
+}
+
 test "a short object-pointer field is counted as a refusal, not an object" {
     var table = Table{};
     table.truncated_reads = 3;
@@ -498,7 +681,7 @@ test "zero resolves to zero rather than becoming an object" {
     try std.testing.expect(!plausibleConsoleAddress(0));
     try std.testing.expect(!plausibleConsoleAddress(0x40));
     try std.testing.expect(plausibleConsoleAddress(0x827206E4));
-    inline for (.{ Provenance.unmapped, Provenance.observed_pair, Provenance.derived_from_mapping_base }) |provenance| {
+    inline for (.{ Provenance.unmapped, Provenance.ambiguous_address_space, Provenance.observed_pair, Provenance.observed_handle, Provenance.derived_from_mapping_base }) |provenance| {
         try std.testing.expect(provenance.label().len > 0);
     }
 }
