@@ -1,0 +1,7 @@
+name = "common-rosette-macos-host-contract"
+version = "0.1.0-local"
+kind = "macos-host-contract"
+role = "hybrid"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
