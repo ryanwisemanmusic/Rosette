@@ -47,6 +47,8 @@ var in_handler: bool = false;
 // ---------------------------------------------------------------------------
 
 const GUEST_SYMBOL_CAP = 96;
+const DIAGNOSTIC_TEXT_CAP = 96;
+const DIAGNOSTIC_BYTES_CAP = 15;
 
 pub const GuestProgress = struct {
     valid: bool = false,
@@ -60,6 +62,167 @@ pub const GuestProgress = struct {
 };
 
 var guest_progress: GuestProgress = .{};
+
+/// A fail-fast diagnostic is raised from host code, so the signal context's
+/// PC is the intentional `raise(SIGSEGV)` rather than the guest boundary that
+/// selected the fault. Keep that boundary in a fixed, signal-readable record
+/// before raising. The input uses borrowed slices only at the normal-context
+/// recording call; `recordTranslationFault` copies every slice into this
+/// process-global snapshot.
+pub const TranslationFaultInput = struct {
+    address: u64,
+    step: u64,
+    guest_rip: u64,
+    guest_thread: u64,
+    startup_phase: []const u8 = "",
+    startup_phase_start_step: u64 = 0,
+    cause: []const u8 = "",
+    domain: []const u8 = "",
+    source_symbol: []const u8 = "",
+    source_symbol_offset: u64 = 0,
+    source_op: []const u8 = "",
+    source_len: u8 = 0,
+    source_bytes: []const u8 = &.{},
+    file_offset: u64 = 0,
+    file_offset_valid: bool = false,
+    initializer_index: u64 = 0,
+    initializer_count: u64 = 0,
+    initializer_address: u64 = 0,
+    initializer_symbol: []const u8 = "",
+    initializer_symbol_offset: u64 = 0,
+    cache_set: u64 = 0,
+    cache_bank_set: u64 = 0,
+    cache_set_base: u64 = 0,
+    cache_way: u64 = 0,
+    cache_ways: u64 = 0,
+    code_generation: u64 = 0,
+    victim_present: bool = false,
+    victim_reused: bool = false,
+    stale_rejected: bool = false,
+    victim_rip: u64 = 0,
+    victim_domain: []const u8 = "",
+    victim_code_generation: u64 = 0,
+    victim_reuse_count: u64 = 0,
+    victim_recently_used: bool = false,
+    victim_fast_plain: bool = false,
+    victim_host_image: bool = false,
+    victim_op: []const u8 = "",
+    victim_len: u8 = 0,
+    victim_bytes: []const u8 = &.{},
+};
+
+const TranslationFault = struct {
+    valid: bool = false,
+    address: u64 = 0,
+    step: u64 = 0,
+    guest_rip: u64 = 0,
+    guest_thread: u64 = 0,
+    startup_phase: [DIAGNOSTIC_TEXT_CAP]u8 = undefined,
+    startup_phase_len: usize = 0,
+    startup_phase_start_step: u64 = 0,
+    cause: [DIAGNOSTIC_TEXT_CAP]u8 = undefined,
+    cause_len: usize = 0,
+    domain: [DIAGNOSTIC_TEXT_CAP]u8 = undefined,
+    domain_len: usize = 0,
+    source_symbol: [DIAGNOSTIC_TEXT_CAP]u8 = undefined,
+    source_symbol_len: usize = 0,
+    source_symbol_offset: u64 = 0,
+    source_op: [DIAGNOSTIC_TEXT_CAP]u8 = undefined,
+    source_op_len: usize = 0,
+    source_len: u8 = 0,
+    source_bytes: [DIAGNOSTIC_BYTES_CAP]u8 = [_]u8{0} ** DIAGNOSTIC_BYTES_CAP,
+    source_byte_count: u8 = 0,
+    file_offset: u64 = 0,
+    file_offset_valid: bool = false,
+    initializer_index: u64 = 0,
+    initializer_count: u64 = 0,
+    initializer_address: u64 = 0,
+    initializer_symbol: [DIAGNOSTIC_TEXT_CAP]u8 = undefined,
+    initializer_symbol_len: usize = 0,
+    initializer_symbol_offset: u64 = 0,
+    cache_set: u64 = 0,
+    cache_bank_set: u64 = 0,
+    cache_set_base: u64 = 0,
+    cache_way: u64 = 0,
+    cache_ways: u64 = 0,
+    code_generation: u64 = 0,
+    victim_present: bool = false,
+    victim_reused: bool = false,
+    stale_rejected: bool = false,
+    victim_rip: u64 = 0,
+    victim_domain: [DIAGNOSTIC_TEXT_CAP]u8 = undefined,
+    victim_domain_len: usize = 0,
+    victim_code_generation: u64 = 0,
+    victim_reuse_count: u64 = 0,
+    victim_recently_used: bool = false,
+    victim_fast_plain: bool = false,
+    victim_host_image: bool = false,
+    victim_op: [DIAGNOSTIC_TEXT_CAP]u8 = undefined,
+    victim_op_len: usize = 0,
+    victim_len: u8 = 0,
+    victim_bytes: [DIAGNOSTIC_BYTES_CAP]u8 = [_]u8{0} ** DIAGNOSTIC_BYTES_CAP,
+    victim_byte_count: u8 = 0,
+};
+
+var translation_fault: TranslationFault = .{};
+
+fn copyDiagnosticText(destination: []u8, length: *usize, source: []const u8) void {
+    const count = @min(destination.len, source.len);
+    if (count != 0) @memcpy(destination[0..count], source[0..count]);
+    length.* = count;
+}
+
+fn copyDiagnosticBytes(destination: []u8, count_out: *u8, source: []const u8) void {
+    const count = @min(destination.len, source.len);
+    if (count != 0) @memcpy(destination[0..count], source[0..count]);
+    count_out.* = @intCast(count);
+}
+
+/// Save the exact translation boundary before an intentional diagnostic
+/// signal. This is deliberately independent of the guest-progress heartbeat:
+/// a step-zero initializer failure has no completed guest checkpoint yet.
+pub fn recordTranslationFault(input: TranslationFaultInput) void {
+    translation_fault.valid = true;
+    translation_fault.address = input.address;
+    translation_fault.step = input.step;
+    translation_fault.guest_rip = input.guest_rip;
+    translation_fault.guest_thread = input.guest_thread;
+    translation_fault.startup_phase_start_step = input.startup_phase_start_step;
+    translation_fault.source_symbol_offset = input.source_symbol_offset;
+    translation_fault.source_len = input.source_len;
+    translation_fault.file_offset = input.file_offset;
+    translation_fault.file_offset_valid = input.file_offset_valid;
+    translation_fault.initializer_index = input.initializer_index;
+    translation_fault.initializer_count = input.initializer_count;
+    translation_fault.initializer_address = input.initializer_address;
+    translation_fault.initializer_symbol_offset = input.initializer_symbol_offset;
+    translation_fault.cache_set = input.cache_set;
+    translation_fault.cache_bank_set = input.cache_bank_set;
+    translation_fault.cache_set_base = input.cache_set_base;
+    translation_fault.cache_way = input.cache_way;
+    translation_fault.cache_ways = input.cache_ways;
+    translation_fault.code_generation = input.code_generation;
+    translation_fault.victim_present = input.victim_present;
+    translation_fault.victim_reused = input.victim_reused;
+    translation_fault.stale_rejected = input.stale_rejected;
+    translation_fault.victim_rip = input.victim_rip;
+    translation_fault.victim_code_generation = input.victim_code_generation;
+    translation_fault.victim_reuse_count = input.victim_reuse_count;
+    translation_fault.victim_recently_used = input.victim_recently_used;
+    translation_fault.victim_fast_plain = input.victim_fast_plain;
+    translation_fault.victim_host_image = input.victim_host_image;
+    translation_fault.victim_len = input.victim_len;
+    copyDiagnosticText(&translation_fault.startup_phase, &translation_fault.startup_phase_len, input.startup_phase);
+    copyDiagnosticText(&translation_fault.cause, &translation_fault.cause_len, input.cause);
+    copyDiagnosticText(&translation_fault.domain, &translation_fault.domain_len, input.domain);
+    copyDiagnosticText(&translation_fault.source_symbol, &translation_fault.source_symbol_len, input.source_symbol);
+    copyDiagnosticText(&translation_fault.source_op, &translation_fault.source_op_len, input.source_op);
+    copyDiagnosticText(&translation_fault.initializer_symbol, &translation_fault.initializer_symbol_len, input.initializer_symbol);
+    copyDiagnosticText(&translation_fault.victim_domain, &translation_fault.victim_domain_len, input.victim_domain);
+    copyDiagnosticText(&translation_fault.victim_op, &translation_fault.victim_op_len, input.victim_op);
+    copyDiagnosticBytes(&translation_fault.source_bytes, &translation_fault.source_byte_count, input.source_bytes);
+    copyDiagnosticBytes(&translation_fault.victim_bytes, &translation_fault.victim_byte_count, input.victim_bytes);
+}
 
 /// Called from the interpreter at every progress checkpoint and heartbeat.
 /// The symbol slice is copied because it points into guest image memory which
@@ -190,7 +353,11 @@ fn faultHandler(sig: c.SIG, info: *const c.siginfo_t, ctx: ?*anyopaque) callconv
     }
     in_handler = true;
 
-    var buffer: [4096]u8 = undefined;
+    // The host-register dump and a bounded frame chain already consume most of
+    // the old 4 KiB report. Strict translation faults now carry the cache
+    // victim and source-byte provenance too; keep the report bounded, but do
+    // not let that context truncate the crash path.
+    var buffer: [8192]u8 = undefined;
     var used: usize = 0;
 
     addLine(&buffer, &used, "macho-processor: NATIVE HOST CRASH: signal={s}({d}) pid={d}\n", .{
@@ -211,7 +378,64 @@ fn faultHandler(sig: c.SIG, info: *const c.siginfo_t, ctx: ?*anyopaque) callconv
     addLine(&buffer, &used, "  backtrace (frame chain):\n", .{});
     const frames = walkBacktrace(regs, &buffer, &used);
 
-    if (guest_progress.valid) {
+    if (translation_fault.valid) {
+        addLine(&buffer, &used, "  diagnostic translation fault: address=0x{x} cause={s} domain={s} step={d} source={s}+0x{x} op={s} len={d} file_offset=0x{x} file_offset_valid={}\n", .{
+            translation_fault.address,
+            translation_fault.cause[0..translation_fault.cause_len],
+            translation_fault.domain[0..translation_fault.domain_len],
+            translation_fault.step,
+            translation_fault.source_symbol[0..translation_fault.source_symbol_len],
+            translation_fault.source_symbol_offset,
+            translation_fault.source_op[0..translation_fault.source_op_len],
+            translation_fault.source_len,
+            translation_fault.file_offset,
+            translation_fault.file_offset_valid,
+        });
+        addLine(&buffer, &used, "    startup: phase={s} phase_start_step={d} guest_rip=0x{x} guest_thread=0x{x} initializer={d}/{d} address=0x{x} symbol={s}+0x{x}\n", .{
+            translation_fault.startup_phase[0..translation_fault.startup_phase_len],
+            translation_fault.startup_phase_start_step,
+            translation_fault.guest_rip,
+            translation_fault.guest_thread,
+            translation_fault.initializer_index,
+            translation_fault.initializer_count,
+            translation_fault.initializer_address,
+            translation_fault.initializer_symbol[0..translation_fault.initializer_symbol_len],
+            translation_fault.initializer_symbol_offset,
+        });
+        addLine(&buffer, &used, "    cache: set(global/bank)={d}/{d} set_base={d} way={d}/{d} generation={d} victim_present={} reused={} stale_rejected={}\n", .{
+            translation_fault.cache_set,
+            translation_fault.cache_bank_set,
+            translation_fault.cache_set_base,
+            translation_fault.cache_way,
+            translation_fault.cache_ways,
+            translation_fault.code_generation,
+            translation_fault.victim_present,
+            translation_fault.victim_reused,
+            translation_fault.stale_rejected,
+        });
+        addLine(&buffer, &used, "    victim: rip=0x{x} domain={s} generation={d} reuse_count={d} recently_used={} fast_plain={} host_image={} op={s} len={d}\n", .{
+            translation_fault.victim_rip,
+            if (translation_fault.victim_domain_len != 0) translation_fault.victim_domain[0..translation_fault.victim_domain_len] else "<empty>",
+            translation_fault.victim_code_generation,
+            translation_fault.victim_reuse_count,
+            translation_fault.victim_recently_used,
+            translation_fault.victim_fast_plain,
+            translation_fault.victim_host_image,
+            if (translation_fault.victim_op_len != 0) translation_fault.victim_op[0..translation_fault.victim_op_len] else "<empty>",
+            translation_fault.victim_len,
+        });
+        addLine(&buffer, &used, "    bytes: source={any} victim={any}\n", .{
+            translation_fault.source_bytes[0..@as(usize, translation_fault.source_byte_count)],
+            translation_fault.victim_bytes[0..@as(usize, translation_fault.victim_byte_count)],
+        });
+        addLine(&buffer, &used, "  guest progress: phase={s} step={d} rip=0x{x} thread=0x{x} symbol={s} (diagnostic boundary; signal raised before a guest-progress checkpoint)\n", .{
+            translation_fault.startup_phase[0..translation_fault.startup_phase_len],
+            translation_fault.step,
+            translation_fault.guest_rip,
+            translation_fault.guest_thread,
+            translation_fault.source_symbol[0..translation_fault.source_symbol_len],
+        });
+    } else if (guest_progress.valid) {
         addLine(&buffer, &used, "  guest progress: phase={s} step={d} rip=0x{x} thread=0x{x} symbol={s}\n", .{
             guest_progress.phase[0..guest_progress.phase_len],
             guest_progress.step,

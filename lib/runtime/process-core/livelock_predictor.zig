@@ -60,6 +60,54 @@ pub const Operation = enum(u8) {
     }
 };
 
+/// How the authoritative wait audit accounted for a retained signature.
+///
+/// Repetition and health are different questions.  A signal-only producer,
+/// a finite polling timeout, and a one-off breadcrumb are all accounted-for
+/// observations, but none is a healthy producer/consumer pump.  Keeping those
+/// outcomes distinct prevents the final predictor from turning a classified
+/// caution into an "unaccounted livelock" while still retaining the evidence.
+pub const Accounting = enum(u8) {
+    /// The signature has not crossed the recurrence threshold. It is retained
+    /// as a breadcrumb, never promoted to a livelock finding.
+    immature,
+    expected_pump,
+    expected_bounded,
+    signal_only,
+    bounded_timeout,
+    insufficient_evidence,
+    problem_stalled,
+    problem_never_ready,
+    /// No authoritative wait-audit subject matched this mature signature.
+    no_audit,
+
+    pub fn label(self: Accounting) []const u8 {
+        return switch (self) {
+            .immature => "immature",
+            .expected_pump => "expected_pump",
+            .expected_bounded => "expected_bounded",
+            .signal_only => "signal_only",
+            .bounded_timeout => "bounded_timeout",
+            .insufficient_evidence => "insufficient_evidence",
+            .problem_stalled => "PROBLEM_STALLED",
+            .problem_never_ready => "PROBLEM_NEVER_READY",
+            .no_audit => "no_audit",
+        };
+    }
+
+    pub fn isHealthy(self: Accounting) bool {
+        return self == .expected_pump or self == .expected_bounded;
+    }
+
+    pub fn isClassified(self: Accounting) bool {
+        return self != .immature and self != .no_audit;
+    }
+
+    pub fn isProblem(self: Accounting) bool {
+        return self == .problem_stalled or self == .problem_never_ready;
+    }
+};
+
 const Signature = struct {
     valid: bool = false,
     op: Operation = .wait,
@@ -95,9 +143,15 @@ const Recent = struct {
 pub const Termination = enum(u8) {
     /// Nothing was retained. The run did not end in a wait pattern at all.
     quiet,
+    /// Retained breadcrumbs exist, but none reached the recurrence threshold.
+    /// A first sighting is evidence to keep, not a livelock conclusion.
+    insufficient_evidence,
     /// Every retained signature is a handshake the audit judged healthy: a
     /// bounded wait that completed, or a pump that kept its consumer fed.
     healthy_pumps_only,
+    /// Every mature signature was classified by the wait audit, but at least
+    /// one was a caution or an explicit problem rather than a healthy pump.
+    classified_findings,
     /// At least one signature recurred while the audit could not account for
     /// it. This is the one worth reading the recent window for.
     unaccounted_cycle,
@@ -105,7 +159,9 @@ pub const Termination = enum(u8) {
     pub fn label(self: Termination) []const u8 {
         return switch (self) {
             .quiet => "quiet",
+            .insufficient_evidence => "insufficient-evidence",
             .healthy_pumps_only => "healthy-pumps-only",
+            .classified_findings => "classified-findings",
             .unaccounted_cycle => "unaccounted-cycle",
         };
     }
@@ -113,7 +169,9 @@ pub const Termination = enum(u8) {
     pub fn meaning(self: Termination) []const u8 {
         return switch (self) {
             .quiet => "no wait signature was retained; the run did not end inside a synchronization pattern and nothing here bears on why it stopped",
+            .insufficient_evidence => "wait breadcrumbs were retained, but none crossed the recurrence threshold. A first sighting is not a livelock, so the predictor keeps it as evidence without assigning a cycle verdict",
             .healthy_pumps_only => "every retained signature is a handshake the wait audit accounted for — a bounded wait that completed, or a pump whose consumer kept up. Repetition here is what a working producer/consumer looks like; the reason the run stopped is somewhere else, and the detail is collapsed so it does not read as a finding",
+            .classified_findings => "every mature signature has an authoritative wait-audit classification. Some are cautions or explicit wait findings, but none is an unclassified cycle; read those classifications together with the wait graph rather than treating them as an unexplained livelock",
             .unaccounted_cycle => "a signature recurred that the wait audit could not account for. This is the pattern to read the recent window against: the question is not who failed to signal, but what the woken thread does next and why it comes straight back",
         };
     }
@@ -185,38 +243,73 @@ pub const Predictor = struct {
     pub fn dump(self: *Predictor, state: anytype, reason: []const u8) Termination {
         var retained: usize = 0;
         var accounted: usize = 0;
+        var healthy: usize = 0;
+        var classified: usize = 0;
+        var immature: usize = 0;
         var unaccounted: usize = 0;
         for (&self.signatures) |*signature| {
             if (!signature.valid) continue;
             retained += 1;
-            if (self.accountedFor(state, signature)) {
-                accounted += 1;
-                continue;
-            }
-            unaccounted += 1;
-            machoCapturePrint(
-                "LIVELOCK PREDICTOR: signature op={s} object=0x{x} thread=0x{x} pc=0x{x} count={d} first_seen_step={d} last_seen_step={d} emissions={d} accounted=NO\n",
-                .{
-                    signature.op.label(),
-                    signature.object,
-                    signature.thread,
-                    signature.pc,
-                    signature.count,
-                    signature.first_seen_step,
-                    signature.last_seen_step,
-                    signature.emissions,
+            const accounting = self.accountingFor(state, signature);
+            switch (accounting) {
+                .immature => {
+                    accounted += 1;
+                    immature += 1;
                 },
-            );
+                .expected_pump, .expected_bounded => {
+                    accounted += 1;
+                    healthy += 1;
+                },
+                .no_audit => {
+                    unaccounted += 1;
+                    machoCapturePrint(
+                        "LIVELOCK PREDICTOR: signature op={s} object=0x{x} thread=0x{x} pc=0x{x} count={d} first_seen_step={d} last_seen_step={d} emissions={d} accounting=no_audit accounted=NO\n",
+                        .{
+                            signature.op.label(),
+                            signature.object,
+                            signature.thread,
+                            signature.pc,
+                            signature.count,
+                            signature.first_seen_step,
+                            signature.last_seen_step,
+                            signature.emissions,
+                        },
+                    );
+                },
+                else => {
+                    accounted += 1;
+                    classified += 1;
+                    machoCapturePrint(
+                        "LIVELOCK PREDICTOR: signature op={s} object=0x{x} thread=0x{x} pc=0x{x} count={d} first_seen_step={d} last_seen_step={d} emissions={d} accounting={s} accounted=YES; the wait audit classified this signature, so it is not an unexplained cycle\n",
+                        .{
+                            signature.op.label(),
+                            signature.object,
+                            signature.thread,
+                            signature.pc,
+                            signature.count,
+                            signature.first_seen_step,
+                            signature.last_seen_step,
+                            signature.emissions,
+                            accounting.label(),
+                        },
+                    );
+                },
+            }
         }
         const termination: Termination = if (retained == 0)
             .quiet
         else if (unaccounted == 0)
-            .healthy_pumps_only
+            if (classified != 0)
+                .classified_findings
+            else if (immature != 0)
+                .insufficient_evidence
+            else
+                .healthy_pumps_only
         else
             .unaccounted_cycle;
         if (accounted != 0) machoCapturePrint(
-            "LIVELOCK PREDICTOR: {d} signature(s) collapsed: the wait audit accounted for each one as a bounded wait or a fed pump. They are counted, not hidden — a signature stops being collapsed the moment the audit stops accounting for it\n",
-            .{accounted},
+            "LIVELOCK PREDICTOR: accounting healthy={d} classified={d} immature={d} accounted={d} unaccounted={d}; mature signatures are either healthy pumps or explicitly classified findings, and immature breadcrumbs are not promoted to cycles\n",
+            .{ healthy, classified, immature, accounted, unaccounted },
         );
         machoCapturePrint(
             "LIVELOCK PREDICTOR: dump reason={s} termination={s} distinct={d} retained={d} accounted={d} unaccounted={d} observations={d} recent_window={d} emissions={d} suppressed_by_audit={d} step={d}; {s}\n",
@@ -238,20 +331,35 @@ pub const Predictor = struct {
         return termination;
     }
 
-    /// Whether the wait audit can account for this signature as healthy.
+    /// Match a retained signature to the authoritative wait audit.
     ///
-    /// The same judgement `emit` applies while the run is going, applied once
-    /// more at the end so the dump and the live emissions cannot disagree.
-    fn accountedFor(self: *Predictor, state: anytype, signature: *const Signature) bool {
+    /// This deliberately returns more than a boolean.  `signal_only`,
+    /// `bounded_timeout`, and `insufficient_evidence` are all meaningful
+    /// classifications, while `problem_*` remains a real finding even though
+    /// it is no longer an unexplained livelock.  A boolean used to collapse all
+    /// of those into the same false "unaccounted" bucket.
+    fn accountingFor(self: *Predictor, state: anytype, signature: *const Signature) Accounting {
         _ = self;
-        if (comptime !@hasField(@TypeOf(state.*), "wait_audit")) return false;
+        if (signature.count < MIN_CYCLE_COUNT) return .immature;
+        if (comptime !@hasField(@TypeOf(state.*), "wait_audit")) return .no_audit;
         const audit = &state.wait_audit;
         for (audit.subjects[0..audit.count]) |subject| {
             if (subject.object != signature.object) continue;
             const classification = audit.classify(subject, state.executed_steps);
-            return classification == .expected_pump or classification == .expected_bounded;
+            return accountingFromClassificationName(@tagName(classification));
         }
-        return false;
+        return .no_audit;
+    }
+
+    fn accountingFromClassificationName(name: []const u8) Accounting {
+        if (std.mem.eql(u8, name, "expected_pump")) return .expected_pump;
+        if (std.mem.eql(u8, name, "expected_bounded")) return .expected_bounded;
+        if (std.mem.eql(u8, name, "signal_only")) return .signal_only;
+        if (std.mem.eql(u8, name, "bounded_timeout")) return .bounded_timeout;
+        if (std.mem.eql(u8, name, "problem_stalled")) return .problem_stalled;
+        if (std.mem.eql(u8, name, "problem_never_ready")) return .problem_never_ready;
+        if (std.mem.eql(u8, name, "insufficient_evidence")) return .insufficient_evidence;
+        return .no_audit;
     }
 
     /// The most recent wait operations, oldest first, for correlation.
@@ -281,16 +389,10 @@ pub const Predictor = struct {
         // them indistinguishable. The audit decides, because it holds the one
         // thing this predictor cannot see — whether anything else in the run
         // advanced alongside the pattern.
-        if (comptime @hasField(@TypeOf(state.*), "wait_audit")) {
-            const audit = &state.wait_audit;
-            for (audit.subjects[0..audit.count]) |subject| {
-                if (subject.object != signature.object) continue;
-                const classification = audit.classify(subject, state.executed_steps);
-                if (classification == .expected_pump or classification == .expected_bounded) {
-                    self.suppressed +|= 1;
-                    return;
-                }
-            }
+        const accounting = self.accountingFor(state, signature);
+        if (accounting.isClassified() and !accounting.isProblem()) {
+            self.suppressed +|= 1;
+            return;
         }
         self.emissions +|= 1;
         const guidance: []const u8 = switch (signature.op) {
@@ -306,7 +408,7 @@ pub const Predictor = struct {
         else
             "recurrence";
         machoCapturePrint(
-            "LIVELOCK PREDICTOR: {s} op={s} object=0x{x} thread=0x{x} pc=0x{x} count={d} first_seen_step={d} last_seen_step={d} ring_stalled=YES step={d}; {s}\n",
+            "LIVELOCK PREDICTOR: {s} op={s} object=0x{x} thread=0x{x} pc=0x{x} count={d} first_seen_step={d} last_seen_step={d} ring_stalled=YES step={d} accounting={s}; {s}\n",
             .{
                 kind,
                 signature.op.label(),
@@ -317,6 +419,7 @@ pub const Predictor = struct {
                 signature.first_seen_step,
                 signature.last_seen_step,
                 state.executed_steps,
+                accounting.label(),
                 guidance,
             },
         );
@@ -578,12 +681,16 @@ test "an empty predictor terminates quiet" {
     try std.testing.expectEqual(Termination.quiet, predictor.dump(&state, "test"));
 }
 
-test "a retained signature with no audit to account for it is unaccounted" {
+test "a mature retained signature with no audit to account for it is unaccounted" {
     const TestState = struct { executed_steps: u64 = 0 };
     var predictor = Predictor{};
     var state = TestState{};
     state.executed_steps = 100;
-    predictor.note(&state, .wait, 0x827CEC14, 0x7fff2110, true);
+    var index: u32 = 0;
+    while (index < MIN_CYCLE_COUNT) : (index += 1) {
+        state.executed_steps = 100 + index;
+        predictor.note(&state, .wait, 0x827CEC14, 0x7fff2110, true);
+    }
     try std.testing.expectEqual(Termination.unaccounted_cycle, predictor.dump(&state, "test"));
 }
 
@@ -608,15 +715,18 @@ test "signatures the wait audit accounts for terminate as healthy pumps" {
     state.wait_audit.subjects[0] = .{ .object = 0x827CEC14 };
     state.wait_audit.subjects[1] = .{ .object = 0x827CEC38 };
     state.wait_audit.count = 2;
-    state.executed_steps = 100;
-    predictor.note(&state, .wait, 0x827CEC14, 0x7fff2110, true);
-    predictor.note(&state, .set_event, 0x827CEC38, 0x7fff2080, true);
+    var index: u32 = 0;
+    while (index < MIN_CYCLE_COUNT) : (index += 1) {
+        state.executed_steps = 100 + index;
+        predictor.note(&state, .wait, 0x827CEC14, 0x7fff2110, true);
+        predictor.note(&state, .set_event, 0x827CEC38, 0x7fff2080, true);
+    }
     try std.testing.expectEqual(Termination.healthy_pumps_only, predictor.dump(&state, "test"));
-    // Suppression at emission time and accounting at dump time are the same
-    // judgement; a healthy pattern is never reported by one and hidden by the
-    // other.
+    // First sightings remain visible as breadcrumbs even when the audit already
+    // knows the object is a healthy pump. Once recurrence is mature, the audit
+    // classification suppresses the repeated detail without hiding its count.
     try std.testing.expect(predictor.suppressed >= 2);
-    try std.testing.expectEqual(@as(u64, 0), predictor.emissions);
+    try std.testing.expectEqual(@as(u64, 2), predictor.emissions);
 }
 
 test "one unaccounted signature among healthy ones still terminates unaccounted" {
@@ -641,7 +751,11 @@ test "one unaccounted signature among healthy ones still terminates unaccounted"
     state.wait_audit.subjects[0] = .{ .object = 0x827CEC14 };
     state.wait_audit.count = 1;
     state.executed_steps = 100;
-    predictor.note(&state, .wait, 0x827CEC14, 0x7fff2110, true);
-    predictor.note(&state, .wait, 0x14D49FD0, 0x7fff2090, true);
+    var index: u32 = 0;
+    while (index < MIN_CYCLE_COUNT) : (index += 1) {
+        state.executed_steps = 100 + index;
+        predictor.note(&state, .wait, 0x827CEC14, 0x7fff2110, true);
+        predictor.note(&state, .wait, 0x14D49FD0, 0x7fff2090, true);
+    }
     try std.testing.expectEqual(Termination.unaccounted_cycle, predictor.dump(&state, "test"));
 }

@@ -69,6 +69,38 @@ pub const NativeReceiverKind = enum {
     derived_member_offset,
 };
 
+/// The bounded answer the predictor can give at a graphics or terminal
+/// checkpoint. not_observed means the observer retained no qualifying
+/// receiver/casualty signature; it does not claim that every possible native
+/// pointer is valid.
+pub const Status = enum(u8) {
+    not_observed,
+    import_receiver_observed,
+    object_header_clobber_observed,
+    native_receiver_observed,
+    multiple_sources_observed,
+
+    pub fn label(self: Status) []const u8 {
+        return switch (self) {
+            .not_observed => "not-observed",
+            .import_receiver_observed => "import-receiver",
+            .object_header_clobber_observed => "object-header-clobber",
+            .native_receiver_observed => "native-receiver",
+            .multiple_sources_observed => "multiple-sources",
+        };
+    }
+
+    pub fn describe(self: Status) []const u8 {
+        return switch (self) {
+            .not_observed => "the predictor retained no qualifying near-null receiver or native casualty; the current run is not attributed to near-null by this observer",
+            .import_receiver_observed => "a receiver-shaped import received a near-null value; correlate its retained caller with the terminal or wait trace",
+            .object_header_clobber_observed => "a tracked native object header was clobbered and one or more zeroed fields predict a later near-null member receiver",
+            .native_receiver_observed => "a native member call reached the causality recorder with a null or derived near-null receiver",
+            .multiple_sources_observed => "both forward import/object evidence and a native casualty were retained; correlate the bounded histories before assigning the fault",
+        };
+    }
+};
+
 const Signature = struct {
     valid: bool = false,
     symbol_hash: u64 = 0,
@@ -134,6 +166,38 @@ pub const Predictor = struct {
     clobber_index: usize = 0,
     clobber_filled: bool = false,
     clobber_events: u64 = 0,
+
+    pub fn status(self: *const Predictor) Status {
+        const import_observed = self.distinct_signatures != 0;
+        const clobber_observed = self.clobber_events != 0;
+        const native_observed = self.native_receiver_events != 0;
+        const forward_observed = import_observed or clobber_observed;
+        if (forward_observed and native_observed) return .multiple_sources_observed;
+        if (native_observed) return .native_receiver_observed;
+        if (clobber_observed) return .object_header_clobber_observed;
+        if (import_observed) return .import_receiver_observed;
+        return .not_observed;
+    }
+
+    pub fn statusFingerprint(self: *const Predictor) u64 {
+        var hash: u64 = 0xcbf2_9ce4_8422_2325;
+        const add = struct {
+            fn value(hash_in: u64, value_in: u64) u64 {
+                var result = hash_in;
+                result ^= value_in;
+                result *%= 0x100_0000_01b3;
+                return result;
+            }
+        }.value;
+        hash = add(hash, @intFromEnum(self.status()));
+        hash = add(hash, self.near_null_dispatches);
+        hash = add(hash, self.benign_skipped);
+        hash = add(hash, self.native_receiver_events);
+        hash = add(hash, self.clobber_events);
+        hash = add(hash, self.distinct_signatures);
+        hash = add(hash, self.emissions);
+        return hash;
+    }
 
     /// Hot path — one compare for the overwhelming majority of dispatches.
     /// Only near-null receivers on receiver-shaped imports resolve the caller

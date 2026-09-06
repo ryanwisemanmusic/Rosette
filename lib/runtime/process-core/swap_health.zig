@@ -54,6 +54,10 @@ pub const Blocker = enum {
     producer_stalled_in_guest_livelock,
     /// The producer published and then stopped, with no livelock evidence.
     producer_stalled_after_publication,
+    /// A publication was observed, but the breadcrumb that would identify the
+    /// submitting guest thread was missing or contradicted by later activity.
+    /// The producer may be stalled; the named thread is not evidence for that.
+    producer_attribution_lost,
     /// The producer is live and a swap still has not been decoded — the
     /// frontier really is downstream of publication.
     consumer_not_reaching_swap,
@@ -66,6 +70,7 @@ pub const Blocker = enum {
             .producer_published_nothing => "producer_published_nothing",
             .producer_stalled_in_guest_livelock => "producer_stalled_in_guest_livelock",
             .producer_stalled_after_publication => "producer_stalled_after_publication",
+            .producer_attribution_lost => "producer_attribution_lost",
             .consumer_not_reaching_swap => "consumer_not_reaching_swap",
             .healthy => "healthy",
         };
@@ -76,17 +81,29 @@ pub const Blocker = enum {
     /// that the raw counters point at.
     pub fn guidance(self: Blocker) []const u8 {
         return switch (self) {
-            .producer_never_started =>
-                "the guest never wrote the ring write pointer, so no frame was ever submitted. Look at what the title is doing instead of reaching its submission path — not at the command processor, the ring geometry or the presenter, none of which have been asked to do anything yet",
-            .producer_published_nothing =>
-                "the guest wrote the ring write pointer without ever changing it. The ring is configured and empty, so this is a producer with no payload rather than a consumer that failed to drain one",
-            .producer_stalled_in_guest_livelock =>
-                "the guest published, then stopped advancing the write pointer while repeating the same log lines. The producer is alive and making no progress: this is a livelock in guest code, and the swap will never arrive until that loop is broken. Ring publication being latched YES is what makes this look like a consumer problem — it is not",
-            .producer_stalled_after_publication =>
-                "the guest published once and has not advanced the write pointer since. `ring_published=YES` is a latch and does not mean the producer is still running — find what the submitting thread is waiting on",
-            .consumer_not_reaching_swap =>
-                "the producer is advancing the write pointer and no swap packet has been decoded. This one really is downstream: look at packet decode and the command processor, in that order",
+            .producer_never_started => "the guest never wrote the ring write pointer, so no frame was ever submitted. Look at what the title is doing instead of reaching its submission path — not at the command processor, the ring geometry or the presenter, none of which have been asked to do anything yet",
+            .producer_published_nothing => "the guest wrote the ring write pointer without ever changing it. The ring is configured and empty, so this is a producer with no payload rather than a consumer that failed to drain one",
+            .producer_stalled_in_guest_livelock => "the guest published, then stopped advancing the write pointer while repeating the same log lines. The producer is alive and making no progress: this is a livelock in guest code, and the swap will never arrive until that loop is broken. Ring publication being latched YES is what makes this look like a consumer problem — it is not",
+            .producer_stalled_after_publication => "the guest published once and has not advanced the write pointer since. `ring_published=YES` is a latch and does not mean the producer is still running — find what the submitting thread is waiting on",
+            .producer_attribution_lost => "the guest published, but the publication did not carry a trustworthy submitting-thread identity or later activity contradicted it. Do not chase the named command-processor or waiter thread as the producer; re-run with the publication's direct guest PPC PC/LR and thread capture enabled",
+            .consumer_not_reaching_swap => "the producer is advancing the write pointer and no swap packet has been decoded. This one really is downstream: look at packet decode and the command processor, in that order",
             .healthy => "a swap was observed; the frame boundary is being reached",
+        };
+    }
+};
+
+/// Whether the ring publication can be joined to a guest submission loop.
+/// This is separate from `Producer`: a pointer can be latched and quiet while
+/// the thread that performed the store is not the owner of the loop that
+/// should publish the next batch.
+pub const Attribution = enum {
+    known,
+    lost,
+
+    pub fn label(self: Attribution) []const u8 {
+        return switch (self) {
+            .known => "known",
+            .lost => "lost",
         };
     }
 };
@@ -94,6 +111,7 @@ pub const Blocker = enum {
 pub const Assessment = struct {
     producer: Producer,
     blocker: Blocker,
+    producer_attribution: Attribution = .known,
     /// Steps since the write pointer last moved, or null when it never did.
     stalled_steps: ?u64 = null,
     advances: u64 = 0,
@@ -158,6 +176,36 @@ pub fn assess(
     };
 }
 
+/// Join the pointer-only liveness decision with the separate producer
+/// attribution ledger. A quiet publication is still a real observation, but
+/// naming an unproven thread turns a useful blocker into a false causal claim.
+pub fn assessWithAttribution(
+    writes: u64,
+    advances: u64,
+    published: bool,
+    stalled_steps: ?u64,
+    guest_livelocked: bool,
+    swap_seen: bool,
+    attribution: Attribution,
+) Assessment {
+    var result = assess(
+        writes,
+        advances,
+        published,
+        stalled_steps,
+        guest_livelocked,
+        swap_seen,
+    );
+    result.producer_attribution = attribution;
+    if (attribution == .lost and
+        (result.blocker == .producer_stalled_after_publication or
+            result.blocker == .producer_stalled_in_guest_livelock))
+    {
+        result.blocker = .producer_attribution_lost;
+    }
+    return result;
+}
+
 test "a producer that never wrote the pointer is not a consumer problem" {
     const result = assess(0, 0, false, null, false, false);
     try std.testing.expectEqual(Producer.never_started, result.producer);
@@ -204,4 +252,22 @@ test "an observed swap ends the analysis whatever the producer looks like" {
     const result = assess(2, 2, true, 10_300_000_000, true, true);
     try std.testing.expectEqual(Blocker.healthy, result.blocker);
     try std.testing.expectEqual(Producer.latched_then_stalled, result.producer);
+}
+
+test "lost publication attribution never names a guest producer" {
+    const result = assessWithAttribution(
+        2,
+        2,
+        true,
+        10_300_000_000,
+        true,
+        false,
+        .lost,
+    );
+    try std.testing.expectEqual(Blocker.producer_attribution_lost, result.blocker);
+    try std.testing.expectEqual(Attribution.lost, result.producer_attribution);
+    try std.testing.expect(std.mem.indexOf(u8, result.blocker.guidance(), "Do not chase") != null);
+
+    const healthy = assessWithAttribution(2, 2, true, 10_300_000_000, true, true, .lost);
+    try std.testing.expectEqual(Blocker.healthy, healthy.blocker);
 }

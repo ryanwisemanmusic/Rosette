@@ -50,7 +50,7 @@ pub fn rollbackInitializerTransaction(self: anytype) bool {
     const complete = self.initializer_memory.rollback(self.mem);
     self.heap_next = checkpoint.heap_next;
     self.compat = checkpoint.compat;
-    self.guest_time.monotonic_ns = checkpoint.monotonic_nanoseconds;
+    self.guest_time.restoreMonotonic(checkpoint.monotonic_nanoseconds);
     self.ios_xalloc_next = checkpoint.ios_xalloc_next;
     self.cxxopts_split_accelerations = checkpoint.cxxopts_split_accelerations;
     self.guest_errno_address = checkpoint.guest_errno_address;

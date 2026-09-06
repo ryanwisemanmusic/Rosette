@@ -9,6 +9,7 @@ const x64_decoder = @import("x64_decoder");
 const macho_core = @import("macho_core");
 const types = macho_core.types;
 const constants = macho_core.constants;
+const translation_domain = macho_core.translation_domain;
 const decodeInsn = macho_core.decoder.decodeInsn;
 const compat_runtime = @import("macho_compat_runtime");
 const exit_diagnostics = @import("exit_diagnostics");
@@ -5754,6 +5755,13 @@ pub fn noteGuestWrite(self: anytype, address: u64, count: u64) void {
 /// reach the same precise invalidation.
 pub fn invalidateDecodeRange(self: anytype, address: u64, count: u64) void {
     if (count == 0) return;
+    // The static-image L2 is intentionally not represented by the primary
+    // decode-page bitmap. Invalidate it before the bitmap's cheap early exit
+    // so an image patch or discard cannot leave a persistent stale decode just
+    // because no primary entry currently occupies that page.
+    if (comptime @hasDecl(@TypeOf(self.*), "invalidateStaticDecodeL2Range")) {
+        self.invalidateStaticDecodeL2Range(address, count);
+    }
     const end = address +| count;
     // Xenia emits and patches translated x64 in a sparse RWX code cache
     // (normally 0xA0000000..0xAFFFFFFF). Invalidate only cached instructions
@@ -5807,9 +5815,10 @@ pub fn invalidateDecodeRange(self: anytype, address: u64, count: u64) void {
     // when an entry is populated, so a set bit means "an entry may exist
     // here", never the reverse.
     // Any x86 instruction overlapping this write must begin between
-    // address-14 and end-1. Probe exact candidate starts with the same hash as
-    // decodeWithLiveOperands; this preserves precise invalidation without reverting to a
-    // global cache flush for each small Xenia JIT patch.
+    // address-14 and end-1. Probe exact candidate starts with the same two
+    // primary choices as decodeWithLiveOperands; this preserves precise
+    // invalidation without reverting to a global cache flush for each small
+    // Xenia JIT patch.
     //
     // F3: this walk is precise — it clears exactly the entries whose bytes the
     // write touched — so the global `code_generation` bump that used to
@@ -5824,26 +5833,38 @@ pub fn invalidateDecodeRange(self: anytype, address: u64, count: u64) void {
         // an invalidation that clears only one way leaves a stale decode
         // reachable in the other. That is the failure this loop exists to
         // prevent, so it has to enumerate exactly what the lookup enumerates.
-        const set_base = constants.decodeCacheSetBase(candidate);
-        for (self.decode_cache[set_base..][0..constants.DECODE_CACHE_WAYS]) |*entry| {
-            if (entry.rip == std.math.maxInt(u64)) continue;
-            const instruction_length = @max(@as(u64, entry.decoded.len), 1);
-            const instruction_end = entry.rip +| instruction_length;
-            if (entry.rip < end and instruction_end > address) {
-                if (comptime @hasField(@TypeOf(self.*), "translation_economics")) {
-                    self.translation_economics.notePreciseInvalidation(entry.rip, end -| address);
+        // The lookup owns one disjoint bank per translation domain. An
+        // executable write must walk every bank: probing only the legacy
+        // address hash would leave a stale static, generated, or bridge entry
+        // reachable in the bank it actually occupies.
+        for (translation_domain.all) |domain| {
+            const primary_bases = translation_domain.primarySetBases(candidate, domain);
+            for (primary_bases, 0..) |set_base, choice| {
+                // The two choices are independently hashed, but a collision
+                // for one address is still possible. Do not walk the same
+                // physical set twice when that happens.
+                if (choice != 0 and set_base == primary_bases[0]) continue;
+                for (self.decode_cache[set_base..][0..constants.DECODE_CACHE_WAYS]) |*entry| {
+                    if (entry.rip == std.math.maxInt(u64)) continue;
+                    const instruction_length = @max(@as(u64, entry.decoded.len), 1);
+                    const instruction_end = entry.rip +| instruction_length;
+                    if (entry.rip < end and instruction_end > address) {
+                        if (comptime @hasField(@TypeOf(self.*), "translation_economics")) {
+                            self.translation_economics.notePreciseInvalidation(entry.rip, end -| address);
+                        }
+                        entry.* = .{};
+                    }
                 }
-                entry.* = .{};
             }
-        }
-        if (comptime @hasField(@TypeOf(self.*), "decode_victim_cache")) {
-            const victim_set_base = constants.decodeVictimCacheSetBase(candidate);
-            for (self.decode_victim_cache[victim_set_base..][0..constants.DECODE_VICTIM_CACHE_WAYS]) |*entry| {
-                if (entry.rip == std.math.maxInt(u64)) continue;
-                const instruction_length = @max(@as(u64, entry.decoded.len), 1);
-                const instruction_end = entry.rip +| instruction_length;
-                if (entry.rip < end and instruction_end > address) {
-                    entry.* = .{};
+            if (comptime @hasField(@TypeOf(self.*), "decode_victim_cache")) {
+                const victim_set_base = translation_domain.victimSetBase(candidate, domain);
+                for (self.decode_victim_cache[victim_set_base..][0..constants.DECODE_VICTIM_CACHE_WAYS]) |*entry| {
+                    if (entry.rip == std.math.maxInt(u64)) continue;
+                    const instruction_length = @max(@as(u64, entry.decoded.len), 1);
+                    const instruction_end = entry.rip +| instruction_length;
+                    if (entry.rip < end and instruction_end > address) {
+                        entry.* = .{};
+                    }
                 }
             }
         }

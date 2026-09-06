@@ -37,4 +37,5 @@ test {
     _ = vtable_clobber_predictor;
     _ = import_binding_predictor;
     _ = swap_health;
+    _ = guest_log;
 }
