@@ -1,0 +1,7 @@
+name = "common-rosette-source-architecture-contract"
+version = "0.1.0-local"
+kind = "source-architecture-contract"
+role = "hybrid"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
