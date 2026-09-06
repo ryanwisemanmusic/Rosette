@@ -209,6 +209,10 @@ pub const Evidence = enum(u8) {
     observed_state,
     intercepted_call,
     completed_call,
+    /// A host synchronization primitive (for example a Metal command-buffer
+    /// status or a Vulkan fence) proved that submitted GPU work completed.
+    /// This is stronger and more specific than an API returning successfully.
+    hardware_completed,
 
     pub fn label(self: Evidence) []const u8 {
         return switch (self) {
@@ -218,6 +222,7 @@ pub const Evidence = enum(u8) {
             .observed_state => "observed-state",
             .intercepted_call => "intercepted-call",
             .completed_call => "completed-call",
+            .hardware_completed => "hardware-completed",
         };
     }
 
@@ -226,7 +231,7 @@ pub const Evidence = enum(u8) {
     }
 
     pub fn provesEffect(self: Evidence) bool {
-        return self == .completed_call;
+        return self == .completed_call or self == .hardware_completed;
     }
 };
 
@@ -300,6 +305,10 @@ pub const Stage = enum(u8) {
     xenia_vulkan_swapchain_ready,
     xenia_vulkan_submission_seen,
     xenia_vulkan_present_seen,
+    /// A present request was followed by an explicit host synchronization edge.
+    /// The request stage above intentionally remains weaker: it can be true
+    /// while the queue still has work in flight.
+    xenia_vulkan_present_completed,
     xenos_ring_ready,
     xenos_render_target_ready,
     powerpc_callback_registered,
@@ -335,6 +344,7 @@ pub const Stage = enum(u8) {
             .xenia_vulkan_swapchain_ready => "Xenia Vulkan swapchain ready",
             .xenia_vulkan_submission_seen => "Xenia Vulkan submission observed",
             .xenia_vulkan_present_seen => "Xenia Vulkan present observed",
+            .xenia_vulkan_present_completed => "Xenia Vulkan present GPU work completed",
             .xenos_ring_ready => "Xenos ring ready",
             .xenos_render_target_ready => "Xenos render target ready",
             .powerpc_callback_registered => "PowerPC interrupt callback registered",
@@ -372,6 +382,7 @@ pub const Stage = enum(u8) {
             .xenia_vulkan_swapchain_ready,
             .xenia_vulkan_submission_seen,
             .xenia_vulkan_present_seen,
+            .xenia_vulkan_present_completed,
             .issue_swap_entered,
             => .xenia_vulkan,
             .xenos_ring_ready, .guest_vdswap_entered, .guest_xe_swap_encoded => .guest_title,
