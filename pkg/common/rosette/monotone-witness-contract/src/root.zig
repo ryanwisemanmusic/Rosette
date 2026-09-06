@@ -57,7 +57,7 @@
 
 const std = @import("std");
 
-pub const schema_version: u32 = 1;
+pub const schema_version: u32 = 2;
 
 /// A quantity that only ever increases over a run.
 ///
@@ -88,6 +88,10 @@ pub const Subject = enum(u8) {
     ring_write_pointer_advances,
     /// Guest frames that reached a host surface.
     guest_frames_presented,
+    /// Executor admissions after registration, load and resolve gates.
+    interrupt_executor_entries,
+    /// All packet types, unlike the type-3 function-entry subject.
+    pm4_packets_all_types,
 
     pub fn label(self: Subject) []const u8 {
         return switch (self) {
@@ -101,6 +105,8 @@ pub const Subject = enum(u8) {
             .register_writes => "register writes",
             .ring_write_pointer_advances => "ring write pointer advances",
             .guest_frames_presented => "guest frames presented",
+            .interrupt_executor_entries => "interrupt executor entries after gates",
+            .pm4_packets_all_types => "PM4 packets all types",
         };
     }
 
@@ -114,6 +120,8 @@ pub const Subject = enum(u8) {
             .title_interrupt_callback_returns,
             => "guest:title",
             .graphics_interrupt_dispatches,
+            .interrupt_executor_entries,
+            .pm4_packets_all_types,
             .vblank_marks,
             .pm4_packets_consumed,
             .draws_issued,
@@ -127,6 +135,20 @@ pub const Subject = enum(u8) {
 };
 
 pub const subject_count: usize = @typeInfo(Subject).@"enum".fields.len;
+
+/// The nine bring-up subjects that must have independent agreeing observers
+/// before Rosette may make a closed graphics observation. Guest frames are
+/// intentionally outside this set until a real guest frame exists: requiring
+/// an observer for a frame that has not been produced would turn a valid
+/// pre-present state into an observation failure.
+pub const required_subject_count: usize = 9;
+
+pub fn isRequiredSubject(subject: Subject) bool {
+    return switch (subject) {
+        .guest_frames_presented, .interrupt_executor_entries, .pm4_packets_all_types => false,
+        else => true,
+    };
+}
 
 /// Who is counting, and — the part that decides — what their number rides on.
 pub const Witness = enum(u8) {
@@ -204,6 +226,8 @@ pub const Finding = enum(u8) {
     single_witness,
     /// Every witness agrees on the floor.
     corroborated,
+    /// Equal values from copied or incomplete evidence are not independent proof.
+    dependent_agreement,
     /// A witness is below the floor and its carrier explains why. The floor
     /// is what a reader should quote; the short witness is not a finding.
     undercount_explained,
@@ -227,6 +251,7 @@ pub const Finding = enum(u8) {
             .unobserved => "unobserved",
             .single_witness => "single-witness",
             .corroborated => "corroborated",
+            .dependent_agreement => "dependent-agreement",
             .undercount_explained => "undercount-explained",
             .undercount_unexplained => "UNDERCOUNT-UNEXPLAINED",
             .weak_witness_exceeds => "weak-witness-exceeds",
@@ -242,7 +267,13 @@ pub const Finding = enum(u8) {
     /// Whether a reader may quote an absence from the short witness.
     pub fn absenceIsQuotable(self: Finding) bool {
         return switch (self) {
-            .corroborated, .single_witness => true,
+            // One witness is useful evidence, but it is not corroboration.
+            // The report's own guidance says that a second carrier is what
+            // makes an absence checkable; returning true here made the
+            // machine-readable flag contradict that guidance and allowed a
+            // single silent observer to be quoted as proof of absence.
+            .corroborated => true,
+            .single_witness, .dependent_agreement => false,
             .unobserved,
             .undercount_explained,
             .undercount_unexplained,
@@ -256,7 +287,8 @@ pub const Finding = enum(u8) {
         return switch (self) {
             .unobserved => "no witness has counted this. That is a hole in the observation and not a zero: nothing here licenses a conclusion in either direction",
             .single_witness => "one witness, uncorroborated. Its number is the best available and nothing has confirmed it; a second witness on a different carrier is what would make an absence here quotable",
-            .corroborated => "every witness agrees. An absence reported here is an absence of the thing, not of the observation",
+            .corroborated => "independent complete witnesses agree for this subject; negative claims still require coverage of the interval being discussed",
+            .dependent_agreement => "the numbers agree but do not supply two independent complete observations. A parsed total and its derived ledger cannot corroborate one another",
             .undercount_explained => "a witness is below the floor because of how its number reaches Rosette, not because the events did not happen. Quote the floor. Do not read the short witness's last step as the moment the mechanism stopped — it is the moment its carrier last spoke",
             .undercount_unexplained => "a witness that sees every occurrence is reporting fewer than another witness that also sees every occurrence. One of them is misobserving — armed on the wrong address, parsing the wrong line, or scoped to the wrong domain — and every absence the lower one has reported has to be re-derived before any of them is quoted",
             .weak_witness_exceeds => "a witness that is allowed to be short is reporting more than every witness that sees each occurrence. Either the weak witness is counting something adjacent to the subject, or the strong ones are missing entries. Both are worth knowing and neither is decidable from the counts, so this is reported and never judged",
@@ -360,13 +392,27 @@ pub fn classify(readings: []const Reading) Finding {
         if (strong_witnesses != 0 and reading.count > judgement_floor) exceeds = true;
     }
     if (exceeds) return .weak_witness_exceeds;
-    return if (explained) .undercount_explained else .corroborated;
+    if (explained) return .undercount_explained;
+    // Both emulator carriers can restate the same underlying counter. The
+    // instruction trace is the independent origin; copying a total into a
+    // Rosette ledger does not create another measurement.
+    var trace = false;
+    var emulator = false;
+    for (readings) |reading| {
+        if (!reading.stated) continue;
+        switch (reading.witness) {
+            .rosette_tracepoint => trace = true,
+            .emulator_sampled_total, .emulator_heartbeat_counter => emulator = true,
+            else => {},
+        }
+    }
+    return if (trace and emulator) .corroborated else .dependent_agreement;
 }
 
 test "agreeing witnesses corroborate" {
     const readings = [_]Reading{
         .{ .witness = .rosette_tracepoint, .count = 24, .stated = true },
-        .{ .witness = .rosette_retained_walk, .count = 24, .stated = true },
+        .{ .witness = .emulator_heartbeat_counter, .count = 24, .stated = true },
     };
     try std.testing.expectEqual(Finding.corroborated, classify(&readings));
     try std.testing.expect(Finding.corroborated.absenceIsQuotable());
@@ -410,6 +456,7 @@ test "a monotone counter that goes backwards is not counting the subject" {
 test "one witness is not corroboration and no witness is not zero" {
     const one = [_]Reading{.{ .witness = .rosette_tracepoint, .count = 5, .stated = true }};
     try std.testing.expectEqual(Finding.single_witness, classify(&one));
+    try std.testing.expect(!Finding.single_witness.absenceIsQuotable());
 
     const none = [_]Reading{.{ .witness = .rosette_tracepoint, .stated = false }};
     try std.testing.expectEqual(Finding.unobserved, classify(&none));
@@ -434,8 +481,14 @@ test "every subject names its mechanism owner" {
         try std.testing.expect(subject.label().len != 0);
         try std.testing.expect(subject.mechanismOwner().len != 0);
     }
-    try std.testing.expectEqual(@as(usize, 10), subject_count);
+    try std.testing.expectEqual(@as(usize, 12), subject_count);
+    try std.testing.expectEqual(@as(usize, 9), required_subject_count);
     try std.testing.expectEqual(@as(usize, 6), witness_count);
+}
+
+test "guest frames are optional for core corroboration closure" {
+    try std.testing.expect(isRequiredSubject(.ring_write_pointer_advances));
+    try std.testing.expect(!isRequiredSubject(.guest_frames_presented));
 }
 
 // The false finding this separation exists to prevent. Xenia's attempt
@@ -478,7 +531,7 @@ test "one strong witness alone is never indicted by weak company" {
         .{ .witness = .emulator_sampled_total, .count = 240, .stated = true },
         .{ .witness = .rosette_derived_ledger, .count = 240, .stated = true },
     };
-    try std.testing.expectEqual(Finding.corroborated, classify(&derived));
+    try std.testing.expectEqual(Finding.dependent_agreement, classify(&derived));
 }
 
 test "weak witnesses alone can neither corroborate nor accuse" {
@@ -489,4 +542,14 @@ test "weak witnesses alone can neither corroborate nor accuse" {
     const finding = classify(&readings);
     try std.testing.expectEqual(Finding.undercount_explained, finding);
     try std.testing.expect(!finding.isDefect());
+}
+
+test "two carriers of one emulator counter do not establish independent absence" {
+    const readings = [_]Reading{
+        .{ .witness = .emulator_sampled_total, .count = 0, .stated = true },
+        .{ .witness = .emulator_heartbeat_counter, .count = 0, .stated = true },
+    };
+    const finding = classify(&readings);
+    try std.testing.expectEqual(Finding.dependent_agreement, finding);
+    try std.testing.expect(!finding.absenceIsQuotable());
 }
