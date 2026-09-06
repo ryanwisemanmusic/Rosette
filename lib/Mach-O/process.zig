@@ -97,6 +97,8 @@ const guest_alias_contract = @import("diagnostics").guest_alias_contract;
 const storage_integrity = @import("diagnostics").storage_integrity;
 const run_budget = @import("diagnostics").run_budget;
 const run_manifest = @import("diagnostics").run_manifest;
+const xiso_preflight = @import("diagnostics").xiso_preflight;
+const xiso_format = @import("xenia_xiso_format");
 const kernel_service_readiness = @import("diagnostics").kernel_service_readiness;
 const import_integrity = @import("diagnostics").import_integrity;
 const acceptance_gates = @import("diagnostics").acceptance_gates;
@@ -22871,6 +22873,434 @@ fn environmentPolicyFlag(name: [*:0]const u8, default_value: bool) bool {
     return false;
 }
 
+const InputFingerprint = struct {
+    hash: u64 = 0,
+    source: []const u8 = "missing",
+};
+
+fn environmentText(name: [*:0]const u8) ?[]const u8 {
+    const raw = std.c.getenv(name) orelse return null;
+    const value = std.mem.trim(u8, std.mem.span(raw), " \t\r\n");
+    return if (value.len == 0) null else value;
+}
+
+fn launchOptionValue(args: []const []const u8, name: []const u8) ?[]const u8 {
+    for (args, 0..) |arg, index| {
+        if (std.mem.eql(u8, arg, name)) {
+            return if (index + 1 < args.len) args[index + 1] else null;
+        }
+        if (arg.len > name.len and std.mem.startsWith(u8, arg, name) and arg[name.len] == '=') {
+            return arg[name.len + 1 ..];
+        }
+    }
+    return null;
+}
+
+fn hasPathSuffixIgnoreCase(path: []const u8, suffix: []const u8) bool {
+    return path.len >= suffix.len and
+        std.ascii.eqlIgnoreCase(path[path.len - suffix.len ..], suffix);
+}
+
+fn launchMediaPath(args: []const []const u8) ?[]const u8 {
+    // Xenia accepts both an XISO and a loose XEX.  Keep this deliberately
+    // suffix-based: --config and --storage_root are also paths, but they are
+    // separate identity inputs and must not be treated as title media.
+    for (args) |arg| {
+        if (arg.len == 0 or arg[0] == '-') continue;
+        if (hasPathSuffixIgnoreCase(arg, ".iso") or
+            hasPathSuffixIgnoreCase(arg, ".xiso") or
+            hasPathSuffixIgnoreCase(arg, ".xex")) return arg;
+    }
+    return null;
+}
+
+fn reportInputHashProgress(bytes_read: u64, total_bytes: ?u64) void {
+    if (total_bytes) |total| {
+        const percent = if (total == 0) 100 else @divTrunc(bytes_read * 100, total);
+        machoCapturePrint(
+            "macho-processor: AUDIT INPUTS: hashing progress bytes={d}/{d} ({d}%)\n",
+            .{ bytes_read, total, percent },
+        );
+    } else {
+        machoCapturePrint(
+            "macho-processor: AUDIT INPUTS: hashing progress bytes={d} (total unavailable)\n",
+            .{bytes_read},
+        );
+    }
+}
+
+fn reportInputHashRetry(
+    offset: u64,
+    recovery_event: u32,
+    chunk_bytes: usize,
+    error_name: []const u8,
+    wait_ns: u64,
+) void {
+    machoCapturePrint(
+        "macho-processor: AUDIT INPUTS: read retry offset={d} recovery_event={d} request_bytes={d} error={s} device_wait_ms={d}; reopening input at the exact digest offset\n",
+        .{ offset, recovery_event, chunk_bytes, error_name, @divTrunc(wait_ns, std.time.ns_per_ms) },
+    );
+}
+
+fn reportInputHashFailure(
+    offset: u64,
+    total_bytes: ?u64,
+    recovery_events: u32,
+    chunk_bytes: usize,
+    error_name: []const u8,
+    wait_ns: u64,
+) void {
+    const wait_ms = @divTrunc(wait_ns, std.time.ns_per_ms);
+    if (total_bytes) |total| {
+        machoCapturePrint(
+            "macho-processor: AUDIT INPUTS: read failure offset={d}/{d} recovery_events={d} request_bytes={d} reason={s} device_wait_ms={d}; complete content identity was not established\n",
+            .{ offset, total, recovery_events, chunk_bytes, error_name, wait_ms },
+        );
+    } else {
+        machoCapturePrint(
+            "macho-processor: AUDIT INPUTS: read failure offset={d} recovery_events={d} request_bytes={d} reason={s} device_wait_ms={d}; complete content identity was not established\n",
+            .{ offset, recovery_events, chunk_bytes, error_name, wait_ms },
+        );
+    }
+}
+
+/// Announce the damage survey before it goes quiet.
+///
+/// The survey makes no output while it runs and every probe that refuses costs
+/// the device's whole retry budget, so a launcher watching this log for
+/// liveness sees a silence it cannot tell from a wedged process. Declaring the
+/// budget lets the watchdog wait exactly as long as the runtime said, rather
+/// than guessing a constant that is too tight to survive one device retry.
+fn reportInputSurveyStart(offset: u64, budget_ns: u64) void {
+    machoCapturePrint(
+        "macho-processor: AUDIT INPUTS: damage survey starting offset={d} budget_ms={d}; probing for the extent of the unreadable region. This log is silent while it runs, by design\n",
+        .{ offset, @divTrunc(budget_ns, std.time.ns_per_ms) },
+    );
+}
+
+/// The failure line says the digest stopped. This says what stopped it.
+///
+/// A launch input that will not hash leaves the operator with two very
+/// different jobs — repackage the image, or stop trusting the volume — and the
+/// error name alone does not choose between them. These lines carry the
+/// evidence that does: how long the device took to refuse, whether the file
+/// holds every byte it claims, and how far the unreadable region runs.
+/// What the image pre-flight established about the media being hashed.
+///
+/// The hash's fault observer is a bare function pointer with nowhere to carry a
+/// context, and without the image's layout a fault is only an offset. This is
+/// how the two meet: written once before the digest starts, read only if it
+/// fails.
+var audited_image_volume: ?xiso_format.VolumeDescriptor = null;
+var audited_image_bytes: u64 = 0;
+
+/// Establish whether the image is *usable* before anything reads it whole.
+///
+/// Being whole costs gigabytes of reads; being usable costs the volume
+/// descriptor and the root directory table, at offsets the container format
+/// fixes in advance. Running the cheap question first means an image that could
+/// never have mounted is refused in milliseconds instead of at the end of a
+/// digest that was never going to finish.
+fn preflightUnsigned(name: [*:0]const u8, fallback: u64, maximum: u64) u64 {
+    const raw = environmentText(name) orelse return fallback;
+    const parsed = std.fmt.parseUnsigned(u64, raw, 10) catch return fallback;
+    return @min(parsed, maximum);
+}
+
+fn reportMediaPreflight(io: std.Io, path: []const u8) void {
+    const finding = xiso_preflight.inspectFile(io, path, .{
+        .content_samples = @intCast(preflightUnsigned("ROSETTE_IMAGE_SAMPLES", 64, 64)),
+        .sample_budget_ns = preflightUnsigned("ROSETTE_IMAGE_SAMPLE_BUDGET_MS", 1_500, 600_000) *
+            std.time.ns_per_ms,
+    });
+    audited_image_volume = finding.volume;
+    audited_image_bytes = finding.image_bytes;
+
+    machoCapturePrint(
+        "macho-processor: AUDIT INPUTS: image preflight outcome={s} bytes={d} probes={d} refusals={d} samples={d}/{d} elapsed_ms={d}\n",
+        .{
+            finding.outcome.text(),
+            finding.image_bytes,
+            finding.probes,
+            finding.refusals,
+            finding.samples_read,
+            finding.samples_planned,
+            @divTrunc(finding.elapsed_ns, std.time.ns_per_ms),
+        },
+    );
+
+    if (finding.volume) |volume| {
+        machoCapturePrint(
+            "macho-processor: AUDIT INPUTS: image layout partition_base=0x{x} descriptor=0x{x} directory_table=0x{x} directory_bytes={d}\n",
+            .{ volume.game_offset, volume.descriptorOffset(), volume.rootOffset(), volume.root_size },
+        );
+    }
+
+    if (finding.refused_offset) |offset| {
+        const kind_text = if (finding.refused_kind) |kind| kind.text() else "unknown";
+        const impact_text = if (finding.impact()) |impact| impact.text() else "unclassified";
+        machoCapturePrint(
+            "macho-processor: AUDIT INPUTS: image refusal offset={d} probe={s} error={s} impact={s}\n",
+            .{ offset, kind_text, finding.refused_error, impact_text },
+        );
+    }
+
+    switch (finding.outcome) {
+        .structure_intact => machoCapturePrint(
+            "macho-processor: AUDIT INPUTS: image PREFLIGHT PASS; the image identifies and its directory table reads. This is not a claim that it is whole — only the content hash establishes that\n",
+            .{},
+        ),
+        .content_suspect => machoCapturePrint(
+            "macho-processor: AUDIT INPUTS: image PREFLIGHT CONTENT SUSPECT; the image mounts and a sampled region does not read. Whatever file occupies that region is gone; the rest of the image is unaffected\n",
+            .{},
+        ),
+        .structure_unreadable => machoCapturePrint(
+            "macho-processor: AUDIT INPUTS: image PREFLIGHT FAIL structure; the image cannot be mounted, so no run of it can proceed. Restore the image from its source rather than retrying\n",
+            .{},
+        ),
+        .not_an_image => machoCapturePrint(
+            "macho-processor: AUDIT INPUTS: image PREFLIGHT FAIL identity; no known partition base carries the disc magic. This file is not a disc image, which is a different problem from a damaged one\n",
+            .{},
+        ),
+        .unavailable => machoCapturePrint(
+            "macho-processor: AUDIT INPUTS: image PREFLIGHT SKIPPED; the path could not be opened or measured, so nothing about the image was established\n",
+            .{},
+        ),
+    }
+}
+
+fn reportInputHashDiagnosis(diagnosis: run_manifest.InputFaultDiagnosis) void {
+    machoCapturePrint(
+        "macho-processor: AUDIT INPUTS: fault owner={s} offset={d} request_bytes={d} error={s} device_wait_ms={d} recovery_events={d}\n",
+        .{
+            diagnosis.owner.text(),
+            diagnosis.offset,
+            diagnosis.request_bytes,
+            diagnosis.error_name,
+            @divTrunc(diagnosis.fault_wait_ns, std.time.ns_per_ms),
+            diagnosis.recovery_events,
+        },
+    );
+
+    if (diagnosis.allocated_bytes) |allocated| {
+        const size = diagnosis.logical_size orelse 0;
+        if (allocated >= size) {
+            machoCapturePrint(
+                "macho-processor: AUDIT INPUTS: allocation logical={d} allocated={d} fully_allocated=YES; every byte the file claims is stored, so the unreadable region was written and later stopped reading back\n",
+                .{ size, allocated },
+            );
+        } else {
+            machoCapturePrint(
+                "macho-processor: AUDIT INPUTS: allocation logical={d} allocated={d} fully_allocated=NO; the file holds fewer bytes than its length claims and was never written whole\n",
+                .{ size, allocated },
+            );
+        }
+    } else {
+        machoCapturePrint(
+            "macho-processor: AUDIT INPUTS: allocation unavailable; block count could not be read, so truncation and media damage are not separated on this volume\n",
+            .{},
+        );
+    }
+
+    if (diagnosis.survey) |survey| {
+        const bounded = if (survey.budget_exhausted) "YES" else "NO";
+        const elapsed_ms = @divTrunc(survey.elapsed_ns, std.time.ns_per_ms);
+        if (survey.first_fault_offset) |first_fault| {
+            if (survey.damagedBytes()) |damaged| {
+                machoCapturePrint(
+                    "macho-processor: AUDIT INPUTS: damage first_unreadable={d} resumes={d} bytes={d} probe_bytes={d} probes={d} refused={d} elapsed_ms={d} bounded={s}\n",
+                    .{
+                        first_fault,
+                        survey.resume_offset orelse first_fault,
+                        damaged,
+                        survey.probe_bytes,
+                        survey.probes_attempted,
+                        survey.probes_failed,
+                        elapsed_ms,
+                        bounded,
+                    },
+                );
+            } else {
+                machoCapturePrint(
+                    "macho-processor: AUDIT INPUTS: damage first_unreadable={d} resumes=UNREACHED probe_bytes={d} probes={d} refused={d} elapsed_ms={d} bounded={s}; readable data was not found inside the probe budget, so this is a floor on the damage and not its size\n",
+                    .{
+                        first_fault,
+                        survey.probe_bytes,
+                        survey.probes_attempted,
+                        survey.probes_failed,
+                        elapsed_ms,
+                        bounded,
+                    },
+                );
+            }
+        } else {
+            machoCapturePrint(
+                "macho-processor: AUDIT INPUTS: damage none_confirmed scan_start={d} probes={d} refused={d} elapsed_ms={d} bounded={s}; the failed window read cleanly when probed on its own, so the refusal was transient rather than a hole\n",
+                .{
+                    survey.scan_start,
+                    survey.probes_attempted,
+                    survey.probes_failed,
+                    elapsed_ms,
+                    bounded,
+                },
+            );
+        }
+        if (survey.tail_readable) |tail_readable| {
+            if (tail_readable) {
+                machoCapturePrint(
+                    "macho-processor: AUDIT INPUTS: tail probe readable=YES; the end of the file still answers, so the damage is a region rather than the volume ending here\n",
+                    .{},
+                );
+            } else {
+                machoCapturePrint(
+                    "macho-processor: AUDIT INPUTS: tail probe readable=NO; the end of the file does not answer either, so the damage is not known to be bounded\n",
+                    .{},
+                );
+            }
+        }
+    }
+
+    // An offset is not a diagnosis. The same hole is fatal over the volume
+    // descriptor and merely unfortunate in the middle of one file's data, and
+    // only the image's layout separates them.
+    if (audited_image_volume) |volume| {
+        if (diagnosis.survey) |survey| {
+            if (survey.first_fault_offset) |first_fault| {
+                const damage_end = survey.resume_offset orelse (first_fault + survey.probe_bytes);
+                const impact = xiso_format.impactOfDamage(
+                    volume,
+                    audited_image_bytes,
+                    first_fault,
+                    damage_end,
+                );
+                if (impact.blocksMount()) {
+                    machoCapturePrint(
+                        "macho-processor: AUDIT INPUTS: image impact={s} blocks_mount=YES; the unreadable region covers structure the image cannot be mounted without\n",
+                        .{impact.text()},
+                    );
+                } else {
+                    machoCapturePrint(
+                        "macho-processor: AUDIT INPUTS: image impact={s} blocks_mount=NO; the unreadable region is file contents, so the image still identifies and mounts and only what occupies that region is lost\n",
+                        .{impact.text()},
+                    );
+                }
+            }
+        }
+    }
+
+    switch (diagnosis.owner) {
+        .host_media => machoCapturePrint(
+            "macho-processor: AUDIT INPUTS: VERDICT host-media; the image is intact as recorded and the volume will not return part of it. Restore the input from its source onto storage that reads back, and treat this volume as suspect. Repackaging the title changes nothing here\n",
+            .{},
+        ),
+        .input_truncated => machoCapturePrint(
+            "macho-processor: AUDIT INPUTS: VERDICT input-truncated; the input is shorter than it claims to be and was never written whole. Repackage or recopy the image; the volume is not accused\n",
+            .{},
+        ),
+        .input_replaced => machoCapturePrint(
+            "macho-processor: AUDIT INPUTS: VERDICT input-replaced; the file changed underneath the digest, so no hash of it would describe the input this run was given\n",
+            .{},
+        ),
+        .undetermined => machoCapturePrint(
+            "macho-processor: AUDIT INPUTS: VERDICT undetermined; the evidence does not separate a damaged input from a failing volume, and the audit will not name an owner it cannot show\n",
+            .{},
+        ),
+    }
+}
+
+fn hashInputPath(io: std.Io, path: []const u8, source: []const u8) InputFingerprint {
+    machoCapturePrint(
+        "macho-processor: AUDIT INPUTS: hashing path={s} source={s}\n",
+        .{ path, source },
+    );
+    const hash_options = run_manifest.defaultFileHashOptions();
+    machoCapturePrint(
+        "macho-processor: AUDIT INPUTS: hash policy max_recovery_ms={d} max_recovery_events={d} recovery_reset_bytes={d} retry_limit={d} retry_chunk_bytes={d} final_retry_chunk_bytes={d}\n",
+        .{
+            @divTrunc(hash_options.max_recovery_time_ns, std.time.ns_per_ms),
+            hash_options.max_recovery_events,
+            hash_options.recovery_reset_bytes,
+            hash_options.retry_limit,
+            hash_options.retry_chunk_bytes,
+            hash_options.final_retry_chunk_bytes,
+        },
+    );
+    const hash = run_manifest.hashFileContentsWithDiagnosis(
+        io,
+        path,
+        reportInputHashProgress,
+        reportInputHashRetry,
+        reportInputHashFailure,
+        reportInputHashDiagnosis,
+        reportInputSurveyStart,
+        hash_options,
+    ) catch |err| {
+        machoCapturePrint(
+            "macho-processor: AUDIT INPUTS: hash failure path={s} source={s} error={s}\n",
+            .{ path, source, @errorName(err) },
+        );
+        // Say what the failure costs, rather than leaving a zero fingerprint
+        // to be read later as an input that was simply never declared.
+        machoCapturePrint(
+            "macho-processor: AUDIT INPUTS: identity unestablished path={s}; the fingerprint is recorded as 0x0, this run cannot be compared to any other run of the same input, and a generated media identity cannot be matched\n",
+            .{path},
+        );
+        return .{ .hash = 0, .source = path };
+    };
+    machoCapturePrint(
+        "macho-processor: AUDIT INPUTS: hash complete path={s} hash=0x{x}\n",
+        .{ path, hash },
+    );
+    return .{ .hash = hash, .source = path };
+}
+
+fn hashInputReference(io: std.Io, env_name: [*:0]const u8, value: []const u8) InputFingerprint {
+    const declared = run_manifest.hashFromEnvironment(env_name);
+    if (declared != 0) {
+        machoCapturePrint(
+            "macho-processor: AUDIT INPUTS: using declared hash source={s} hash=0x{x}\n",
+            .{ std.mem.span(env_name), declared },
+        );
+        return .{ .hash = declared, .source = "environment" };
+    }
+
+    // hashFromEnvironment intentionally rejects path-shaped values.  At this
+    // boundary we do have the authority to open the named input, so hash its
+    // verified bytes rather than ever hashing the pathname itself.
+    return hashInputPath(io, value, std.mem.span(env_name));
+}
+
+fn configuredInputFingerprint(
+    io: std.Io,
+    primary: [*:0]const u8,
+    alias: [*:0]const u8,
+    argument_path: ?[]const u8,
+) InputFingerprint {
+    for ([_][*:0]const u8{ primary, alias }) |name| {
+        if (environmentText(name)) |value| return hashInputReference(io, name, value);
+    }
+    if (argument_path) |path| return hashInputPath(io, path, "launch argument");
+    return .{};
+}
+
+fn hostIdentityDescriptor(buffer: []u8) []const u8 {
+    const cpu_profile = environmentText("ROSETTE_X64_CPU_PROFILE") orelse "xenia";
+    return std.fmt.bufPrint(
+        buffer,
+        "os={s};arch={s};page={d};x64-profile={s}",
+        .{
+            @tagName(builtin.target.os.tag),
+            @tagName(builtin.target.cpu.arch),
+            std.heap.page_size_min,
+            cpu_profile,
+        },
+    ) catch "runtime-host-descriptor-unavailable";
+}
+
+fn runtimeValue(name: [*:0]const u8, default_value: []const u8) []const u8 {
+    return environmentText(name) orelse default_value;
+}
+
 pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOptions) !u64 {
     native_crash.recordPhase("load");
     var output = runtime_output.Controller.init(allocator);
@@ -22887,7 +23317,17 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     const async_started = startAsyncDiagnosticTransport(allocator, &output);
     defer if (async_started) stopAsyncDiagnosticTransport();
 
-    const file_data = try std.Io.Dir.cwd().readFileAlloc(io, options.path, allocator, .unlimited);
+    machoCapturePrint(
+        "macho-processor: STARTUP: reading Mach-O image path={s}\n",
+        .{options.path},
+    );
+    const file_data = std.Io.Dir.cwd().readFileAlloc(io, options.path, allocator, .unlimited) catch |err| {
+        machoCapturePrint(
+            "macho-processor: STARTUP: Mach-O image read failure path={s} error={s}\n",
+            .{ options.path, @errorName(err) },
+        );
+        return err;
+    };
     defer allocator.free(file_data);
 
     const slice = extractX8664Slice(allocator, file_data) catch |err| {
@@ -22895,72 +23335,20 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         return 1;
     };
     const image_fingerprint = std.hash.Wyhash.hash(0, slice);
+    machoCapturePrint(
+        "macho-processor: STARTUP: Mach-O image loaded bytes={d}; constructing runtime state before reading launch inputs\n",
+        .{slice.len},
+    );
 
-    var state = try MachOState.init(io, allocator, slice);
+    var state = MachOState.init(io, allocator, slice) catch |err| {
+        machoCapturePrint(
+            "macho-processor: STARTUP: runtime state initialization failure error={s}\n",
+            .{@errorName(err)},
+        );
+        return err;
+    };
     defer state.deinit();
     state.audit_image_fingerprint = image_fingerprint;
-    if (std.c.getenv("ROSETTE_EXECUTION_PROFILE")) |raw_profile| {
-        const profile_text = std.mem.span(raw_profile);
-        if (run_manifest.parseProfile(profile_text)) |profile| {
-            state.audit_profile = profile;
-        } else {
-            state.audit_profile_valid = false;
-            machoCapturePrint(
-                "macho-processor: unknown ROSETTE_EXECUTION_PROFILE={s}; refusing to seal the run manifest\n",
-                .{profile_text},
-            );
-        }
-    }
-    state.audit_identity_fields = run_manifest.identityFieldsFromEnvironment();
-    // `make shell-update` produces the authenticated build artifact consumed
-    // by both sides of the bridge.  Environment values may fill genuinely
-    // run-specific inputs (for example a device discovered at launch), but a
-    // disagreement with the generated content identity is a hard admission
-    // conflict, never an override.
-    const explicit_build_identity_path = std.c.getenv("ROSETTE_BUILD_IDENTITY_MANIFEST");
-    const build_identity_path = if (explicit_build_identity_path) |raw|
-        std.mem.span(raw)
-    else
-        ".rosette/build-identity.json";
-    if (std.Io.Dir.cwd().readFileAlloc(io, build_identity_path, allocator, .limited(16 * 1024 * 1024))) |bytes| {
-        defer allocator.free(bytes);
-        if (run_manifest.parseBuildIdentityJson(allocator, bytes)) |generated| {
-            var identity_conflict = false;
-            state.audit_identity_fields = run_manifest.mergeIdentityFields(
-                state.audit_identity_fields,
-                generated.fields,
-                &identity_conflict,
-            );
-            state.audit_identity_conflict = identity_conflict;
-            state.audit_build_identity_hash = generated.manifest_hash;
-            state.audit_build_identity_loaded = true;
-            machoCapturePrint(
-                "macho-processor: BUILD IDENTITY: loaded path={s} hash=0x{x} conflict={} complete={}\n",
-                .{ build_identity_path, generated.manifest_hash, identity_conflict, state.audit_identity_fields.complete() },
-            );
-        } else |err| {
-            state.audit_identity_conflict = true;
-            machoCapturePrint(
-                "macho-processor: BUILD IDENTITY: refusing invalid generated manifest path={s} error={s}\n",
-                .{ build_identity_path, @errorName(err) },
-            );
-        }
-    } else |err| {
-        if (explicit_build_identity_path != null) {
-            state.audit_identity_conflict = true;
-            machoCapturePrint(
-                "macho-processor: BUILD IDENTITY: configured manifest unavailable path={s} error={s}\n",
-                .{ build_identity_path, @errorName(err) },
-            );
-        }
-    }
-    // The exported application-framework ABI must point at the live process
-    // ledger, not a detached diagnostic singleton. Register the binding after
-    // state construction and clear it before state.deinit releases resources.
-    application_framework.activateDefault(&state.application_framework);
-    defer application_framework.deactivateDefault(&state.application_framework);
-    var host_termination_scope = host_termination.Scope.install();
-    defer host_termination_scope.deinit();
     state.concise_output = output.concise;
     state.diagnostic_output_fd = output.diagnosticsFd();
     state.summary_output_fd = output.summaryFd();
@@ -22979,6 +23367,258 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         .step = 0,
         .reason = options.path,
     });
+    machoCapturePrint(
+        "macho-processor: STARTUP: runtime diagnostics open; launch-input verification is next\n",
+        .{},
+    );
+
+    const media_path = launchMediaPath(options.args);
+    const config_path = launchOptionValue(options.args, "--config") orelse
+        launchOptionValue(options.args, "--config_path") orelse
+        launchOptionValue(options.args, "--config-path");
+    native_crash.recordPhase("input-hash");
+    output.human("Verifying launch inputs...\n", .{});
+    if (media_path) |image_path| {
+        if (hasPathSuffixIgnoreCase(image_path, ".iso") or hasPathSuffixIgnoreCase(image_path, ".xiso")) {
+            reportMediaPreflight(io, image_path);
+        }
+    }
+    const media_input = configuredInputFingerprint(
+        io,
+        "ROSETTE_MEDIA_HASH",
+        "XENIA_MEDIA_HASH",
+        media_path,
+    );
+    const config_input = configuredInputFingerprint(
+        io,
+        "ROSETTE_CONFIG_HASH",
+        "XENIA_CONFIG_HASH",
+        config_path,
+    );
+    state.audit_media_fingerprint = media_input.hash;
+    state.audit_config_fingerprint = config_input.hash;
+    machoCapturePrint(
+        "macho-processor: AUDIT INPUTS: media=0x{x} source={s} config=0x{x} source={s}; input paths are content-hashed before authentic admission\n",
+        .{
+            media_input.hash,
+            media_input.source,
+            config_input.hash,
+            config_input.source,
+        },
+    );
+    if (std.c.getenv("ROSETTE_EXECUTION_PROFILE")) |raw_profile| {
+        const profile_text = std.mem.span(raw_profile);
+        if (run_manifest.parseProfile(profile_text)) |profile| {
+            state.audit_profile = profile;
+        } else {
+            state.audit_profile_valid = false;
+            machoCapturePrint(
+                "macho-processor: unknown ROSETTE_EXECUTION_PROFILE={s}; refusing to seal the run manifest\n",
+                .{profile_text},
+            );
+        }
+    }
+    state.audit_identity_fields = run_manifest.identityFieldsFromEnvironment();
+    // `make shell-update` produces the authenticated build artifact consumed
+    // by both sides of the bridge.  Environment values may fill genuinely
+    // run-specific inputs (for example a device discovered at launch), but a
+    // disagreement with the generated content identity is a hard admission
+    // conflict, never an override.  The generated artifact is merged before
+    // computed runtime defaults are filled: a default is an absence of a
+    // deployment declaration, not a second declaration that can falsely
+    // conflict with the artifact (notably for host/toolchain identity).
+    const explicit_build_identity_path = std.c.getenv("ROSETTE_BUILD_IDENTITY_MANIFEST");
+    var owned_identity_paths: [2][]const u8 = undefined;
+    var owned_identity_path_count: usize = 0;
+    defer for (owned_identity_paths[0..owned_identity_path_count]) |path| allocator.free(path);
+    var source_root_contents: ?[]u8 = null;
+    defer if (source_root_contents) |contents| allocator.free(contents);
+    var identity_candidates: [4][]const u8 = undefined;
+    var identity_candidate_count: usize = 0;
+    if (explicit_build_identity_path) |raw| {
+        identity_candidates[identity_candidate_count] = std.mem.span(raw);
+        identity_candidate_count += 1;
+    } else {
+        if (environmentText("ROSETTE_SOURCE_ROOT")) |source_root| {
+            if (std.fs.path.join(allocator, &.{ source_root, ".rosette", "build-identity.json" })) |path| {
+                owned_identity_paths[owned_identity_path_count] = path;
+                owned_identity_path_count += 1;
+                identity_candidates[identity_candidate_count] = path;
+                identity_candidate_count += 1;
+            } else |_| {}
+        }
+        if (std.c.getenv("HOME")) |home_raw| {
+            const home = std.mem.span(home_raw);
+            if (std.fs.path.join(allocator, &.{ home, ".rosette", "source-root" })) |source_root_path| {
+                defer allocator.free(source_root_path);
+                source_root_contents = std.Io.Dir.cwd().readFileAlloc(
+                    io,
+                    source_root_path,
+                    allocator,
+                    .limited(4096),
+                ) catch null;
+                if (source_root_contents) |contents| {
+                    const source_root = std.mem.trim(u8, contents, " \t\r\n");
+                    if (source_root.len != 0) {
+                        if (std.fs.path.join(allocator, &.{ source_root, ".rosette", "build-identity.json" })) |path| {
+                            owned_identity_paths[owned_identity_path_count] = path;
+                            owned_identity_path_count += 1;
+                            identity_candidates[identity_candidate_count] = path;
+                            identity_candidate_count += 1;
+                        } else |_| {}
+                    }
+                }
+            } else |_| {}
+        }
+        identity_candidates[identity_candidate_count] = ".rosette/build-identity.json";
+        identity_candidate_count += 1;
+    }
+
+    for (identity_candidates[0..identity_candidate_count]) |build_identity_path| {
+        if (std.Io.Dir.cwd().readFileAlloc(io, build_identity_path, allocator, .limited(16 * 1024 * 1024))) |bytes| {
+            defer allocator.free(bytes);
+            if (run_manifest.parseBuildIdentityJson(allocator, bytes)) |generated| {
+                var identity_conflict = false;
+                const identity_conflict_mask = run_manifest.identityConflictMask(
+                    state.audit_identity_fields,
+                    generated.fields,
+                );
+                if (identity_conflict_mask != 0) {
+                    var remaining_conflicts = identity_conflict_mask;
+                    while (remaining_conflicts != 0) {
+                        const field_index: u8 = @intCast(@ctz(remaining_conflicts));
+                        const field: run_manifest.IdentityField = @enumFromInt(field_index);
+                        machoCapturePrint(
+                            "macho-processor: BUILD IDENTITY: conflict field={s} supplied=0x{x} generated=0x{x}\n",
+                            .{
+                                run_manifest.identityFieldLabel(field),
+                                run_manifest.identityFieldValue(state.audit_identity_fields, field),
+                                run_manifest.identityFieldValue(generated.fields, field),
+                            },
+                        );
+                        remaining_conflicts &= remaining_conflicts - 1;
+                    }
+                }
+                state.audit_identity_fields = run_manifest.mergeIdentityFields(
+                    state.audit_identity_fields,
+                    generated.fields,
+                    &identity_conflict,
+                );
+                if (generated.media_hash != 0 and generated.media_hash != state.audit_media_fingerprint) {
+                    identity_conflict = true;
+                    machoCapturePrint(
+                        "macho-processor: BUILD IDENTITY: selected media differs from generated media identity path={s} generated=0x{x} selected=0x{x}\n",
+                        .{ build_identity_path, generated.media_hash, state.audit_media_fingerprint },
+                    );
+                }
+                state.audit_identity_conflict = identity_conflict;
+                state.audit_build_identity_hash = generated.manifest_hash;
+                state.audit_build_identity_loaded = true;
+                machoCapturePrint(
+                    "macho-processor: BUILD IDENTITY: loaded path={s} hash=0x{x} conflict={} conflict_fields=0x{x} complete={}\n",
+                    .{
+                        build_identity_path,
+                        generated.manifest_hash,
+                        identity_conflict,
+                        identity_conflict_mask,
+                        state.audit_identity_fields.complete(),
+                    },
+                );
+                break;
+            } else |err| {
+                if (explicit_build_identity_path != null) {
+                    state.audit_identity_conflict = true;
+                    machoCapturePrint(
+                        "macho-processor: BUILD IDENTITY: refusing invalid generated manifest path={s} error={s}\n",
+                        .{ build_identity_path, @errorName(err) },
+                    );
+                    break;
+                }
+            }
+        } else |err| {
+            if (explicit_build_identity_path != null) {
+                state.audit_identity_conflict = true;
+                machoCapturePrint(
+                    "macho-processor: BUILD IDENTITY: configured manifest unavailable path={s} error={s}\n",
+                    .{ build_identity_path, @errorName(err) },
+                );
+                break;
+            }
+        }
+    }
+    if (!state.audit_build_identity_loaded) {
+        machoCapturePrint(
+            "macho-processor: BUILD IDENTITY: no generated manifest found; searched the launch context, source-root config, and current directory\n",
+            .{},
+        );
+    }
+
+    var host_identity_buffer: [256]u8 = undefined;
+    const host_identity = hostIdentityDescriptor(&host_identity_buffer);
+    var launch_config_buffer: [256]u8 = undefined;
+    const launch_config = std.fmt.bufPrint(
+        &launch_config_buffer,
+        "image=0x{x};media=0x{x};config=0x{x};profile={s}",
+        .{
+            image_fingerprint,
+            media_input.hash,
+            config_input.hash,
+            state.audit_profile.label(),
+        },
+    ) catch "launch-config-descriptor-unavailable";
+    const selected_backend = launchOptionValue(options.args, "--gpu") orelse
+        runtimeValue("ROSETTE_BACKEND", "vulkan");
+    var device_identity_buffer: [320]u8 = undefined;
+    const device_identity = std.fmt.bufPrint(
+        &device_identity_buffer,
+        "{s};{s}",
+        .{ host_identity, runtimeValue("ROSETTE_DEVICE", "system-default") },
+    ) catch "runtime-device-descriptor-unavailable";
+    var driver_identity_buffer: [320]u8 = undefined;
+    const driver_identity = std.fmt.bufPrint(
+        &driver_identity_buffer,
+        "{s};{s}",
+        .{ host_identity, runtimeValue("ROSETTE_DRIVER", "system-default") },
+    ) catch "runtime-driver-descriptor-unavailable";
+    var moltenvk_identity_buffer: [320]u8 = undefined;
+    const moltenvk_identity = std.fmt.bufPrint(
+        &moltenvk_identity_buffer,
+        "{s};{s}",
+        .{ host_identity, runtimeValue("ROSETTE_MOLTENVK", "system-default") },
+    ) catch "runtime-moltenvk-descriptor-unavailable";
+    var metal_identity_buffer: [320]u8 = undefined;
+    const metal_identity = std.fmt.bufPrint(
+        &metal_identity_buffer,
+        "{s};{s}",
+        .{ host_identity, runtimeValue("ROSETTE_METAL_CAPABILITIES", "system-default") },
+    ) catch "runtime-metal-descriptor-unavailable";
+    const runtime_defaults = run_manifest.RuntimeIdentityValues{
+        .host = host_identity,
+        .driver = driver_identity,
+        .cvar = launch_config,
+        .backend = selected_backend,
+        .device = device_identity,
+        .moltenvk = moltenvk_identity,
+        .metal = metal_identity,
+        .semantic_config = launch_config,
+        .time_config = runtimeValue("ROSETTE_TIME_CONFIG", "defaults-v1"),
+        .scheduler_config = runtimeValue("ROSETTE_SCHEDULER_CONFIG", "defaults-v1"),
+        .observer_config = runtimeValue("ROSETTE_OBSERVER_CONFIG", "defaults-v1"),
+        .admission_config = runtimeValue("ROSETTE_ADMISSION_CONFIG", "defaults-v1"),
+        .budget_config = runtimeValue("ROSETTE_BUDGET_CONFIG", "defaults-v1"),
+        .frontier_config = runtimeValue("ROSETTE_FRONTIER_CONFIG", "defaults-v1"),
+    };
+    state.audit_identity_fields = run_manifest.completeRuntimeIdentity(
+        state.audit_identity_fields,
+        runtime_defaults,
+    );
+    // The exported application-framework ABI must point at the live process
+    // ledger, not a detached diagnostic singleton. Register the binding after
+    // state construction and clear it before state.deinit releases resources.
+    application_framework.activateDefault(&state.application_framework);
+    defer application_framework.deactivateDefault(&state.application_framework);
+    var host_termination_scope = host_termination.Scope.install();
+    defer host_termination_scope.deinit();
     // Package contract verification: checks all Xenia contracts at startup
     // and writes results to .rosette/rosette-pkg.log. Failures are also
     // piped to stderr (rosette-runtime.log) for immediate visibility.
@@ -23149,14 +23789,6 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     // accident.
     state.event_stream.begin(
         (@as(u64, @intCast(std.c.getpid())) << 32) ^ @intFromPtr(&state),
-    );
-    state.audit_media_fingerprint = run_manifest.firstHashFromEnvironment(
-        "ROSETTE_MEDIA_HASH",
-        "XENIA_MEDIA_HASH",
-    );
-    state.audit_config_fingerprint = run_manifest.firstHashFromEnvironment(
-        "ROSETTE_CONFIG_HASH",
-        "XENIA_CONFIG_HASH",
     );
     state.audit_title_id = @truncate(run_manifest.firstHashFromEnvironment(
         "ROSETTE_TITLE_ID",
