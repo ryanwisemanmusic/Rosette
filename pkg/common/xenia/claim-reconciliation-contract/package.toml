@@ -1,0 +1,7 @@
+name = "common-xenia-claim-reconciliation-contract"
+version = "0.1.0-local"
+kind = "emulator-claim-reconciliation-contract"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
