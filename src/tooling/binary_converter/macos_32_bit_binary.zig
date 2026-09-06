@@ -33,7 +33,7 @@ pub fn strip32BitSlice(allocator: std.mem.Allocator, ub: fat.UniversalBinary) ![
 }
 
 test "isConvertible detects 32-bit Mach-O" {
-    var hdr = macho.MachHeader32{
+    const hdr = macho.MachHeader32{
         .magic = macho.MH_MAGIC,
         .cputype = macho.CPU_TYPE_I386,
         .cpusubtype = 3,
@@ -78,7 +78,7 @@ test "extract 32-bit slice from fat binary" {
     buf.appendSlice(std.testing.allocator, std.mem.asBytes(&arch)) catch unreachable;
     buf.appendSlice(std.testing.allocator, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF }) catch unreachable;
 
-    const ub = try fat.parseFatBinary(std.testing.allocator, buf.items);
+    var ub = try fat.parseFatBinary(std.testing.allocator, buf.items);
     defer ub.deinit();
     const slice = try extract32BitSlice(std.testing.allocator, ub);
     defer std.testing.allocator.free(slice);
