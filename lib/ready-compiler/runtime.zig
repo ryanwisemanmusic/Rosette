@@ -383,6 +383,19 @@ pub const Runtime = struct {
         return if (self.external_progress_seen) self.external_progress_step else 0;
     }
 
+    /// A fresh host-serviced counter is structural progress, not merely
+    /// retired instructions. It is safe to keep a throughput gate open for
+    /// this bounded interval because the quiet budget is the same one that
+    /// decides when external progress has stopped being evidence of forward
+    /// motion. Once it expires, the caller gets the strict failure path back.
+    pub fn hasRecentExternalProgress(self: *const Runtime, step: u64) bool {
+        const contract = self.contract orelse return false;
+        if (self.phase != .activation or !self.external_progress_seen) return false;
+        if (contract.quiet_budget_steps == 0) return false;
+        if (step < self.external_progress_step) return false;
+        return step - self.external_progress_step < contract.quiet_budget_steps;
+    }
+
     /// Record an interpreter heartbeat or another trusted execution witness.
     /// This is intentionally separate from a semantic milestone: a loop can
     /// execute billions of instructions without completing startup.
@@ -1031,17 +1044,46 @@ pub const Runtime = struct {
     /// failure wins for control flow, but later evidence must remain visible
     /// in the diagnostic log.
     pub fn compilerDiagnosticKind(line: []const u8) ?types.FailureKind {
-        if (std.mem.indexOf(u8, line, "undefined label") != null or
-            std.mem.indexOf(u8, line, "label is not found") != null)
+        if (std.ascii.indexOfIgnoreCase(line, "undefined label") != null or
+            std.ascii.indexOfIgnoreCase(line, "label is not found") != null)
         {
             return .label_reference_unbound;
         }
-        if (std.mem.indexOf(u8, line, "Xbyak") != null or
-            std.mem.indexOf(u8, line, "codegen failed") != null or
-            std.mem.indexOf(u8, line, "function left undefined") != null)
-        {
-            return .compile_check_failed;
-        }
+        if (std.ascii.indexOfIgnoreCase(line, "function left undefined") != null) return .compile_check_failed;
+        // Xenia's JIT can fail after instruction emission, while publishing
+        // the executable range or growing its code cache. These messages do
+        // not always mention Xbyak, so keep the publication/allocation failure
+        // on the same typed readiness path instead of waiting for a later
+        // null-function or no-progress symptom.
+        const code_cache = std.ascii.indexOfIgnoreCase(line, "code cache") != null or
+            std.ascii.indexOfIgnoreCase(line, "code-cache") != null or
+            std.ascii.indexOfIgnoreCase(line, "codecache") != null or
+            std.ascii.indexOfIgnoreCase(line, "commit executable range") != null;
+        const executable_publication = std.ascii.indexOfIgnoreCase(line, "executable range") != null or
+            std.ascii.indexOfIgnoreCase(line, "executable memory") != null or
+            std.ascii.indexOfIgnoreCase(line, "publish executable") != null or
+            std.ascii.indexOfIgnoreCase(line, "publish code") != null or
+            std.ascii.indexOfIgnoreCase(line, "protect code cache") != null;
+        const failure = std.ascii.indexOfIgnoreCase(line, "failed") != null or
+            std.ascii.indexOfIgnoreCase(line, "failure") != null or
+            std.ascii.indexOfIgnoreCase(line, "fatal") != null or
+            std.ascii.indexOfIgnoreCase(line, "error") != null or
+            std.ascii.indexOfIgnoreCase(line, "assert") != null or
+            std.ascii.indexOfIgnoreCase(line, "out of memory") != null or
+            std.ascii.indexOfIgnoreCase(line, "could not") != null or
+            std.ascii.indexOfIgnoreCase(line, "cannot") != null or
+            std.ascii.indexOfIgnoreCase(line, "unable") != null or
+            std.ascii.indexOfIgnoreCase(line, "unavailable") != null or
+            std.ascii.indexOfIgnoreCase(line, "unsupported") != null or
+            std.ascii.indexOfIgnoreCase(line, "not supported") != null or
+            std.ascii.indexOfIgnoreCase(line, "permission denied") != null or
+            std.ascii.indexOfIgnoreCase(line, "operation not permitted") != null or
+            std.ascii.indexOfIgnoreCase(line, "overflow") != null;
+        const xbyak_or_codegen = std.ascii.indexOfIgnoreCase(line, "xbyak") != null or
+            std.ascii.indexOfIgnoreCase(line, "codegen") != null or
+            std.ascii.indexOfIgnoreCase(line, "compile") != null;
+        if (xbyak_or_codegen and failure) return .compile_check_failed;
+        if ((code_cache or executable_publication) and failure) return .compile_check_failed;
         return null;
     }
 
@@ -1110,6 +1152,27 @@ pub const Runtime = struct {
     /// also where the work-unit axis is fed.
     pub fn observeCompilerText(self: *Runtime, line: []const u8, step: u64, rip: u64, thread: u64) void {
         if (!self.enabled() or self.phase == .ready) return;
+
+        // Guest log boundaries are not guaranteed to be physical compiler
+        // lines. Xenia's configuration dump, in particular, is commonly
+        // emitted as one text blob whose first line contains the word
+        // "CONFIG" and whose later lines contain compiler-looking tokens.
+        // Classifying that blob as one diagnostic both poisons readiness and
+        // loses the actual line that would explain a real failure. Split at
+        // the readiness boundary so every stored reason is an exact physical
+        // line, independent of which caller supplied the text.
+        var lines = std.mem.splitScalar(u8, line, '\n');
+        while (lines.next()) |raw_line| {
+            const physical_line = if (raw_line.len != 0 and raw_line[raw_line.len - 1] == '\r')
+                raw_line[0 .. raw_line.len - 1]
+            else
+                raw_line;
+            if (physical_line.len == 0) continue;
+            self.observeCompilerPhysicalLine(physical_line, step, rip, thread);
+        }
+    }
+
+    fn observeCompilerPhysicalLine(self: *Runtime, line: []const u8, step: u64, rip: u64, thread: u64) void {
         if (workUnitFromText(line)) |name| self.noteWorkUnitAt(name, step, thread, rip);
         const kind = compilerDiagnosticKind(line) orelse return;
         self.compiler_diagnostic_count +|= 1;
@@ -1525,6 +1588,46 @@ test "compiler evidence continues to be counted after the first failure" {
     try std.testing.expectEqual(@as(u64, 2), runtime.compiler_diagnostic_count);
     try std.testing.expectEqual(types.FailureKind.label_reference_unbound, runtime.failure.kind);
     try std.testing.expectEqualStrings("undefined label:11", runtime.failure.reason);
+}
+
+test "JIT code-cache and executable-publication failures are typed diagnostics" {
+    try std.testing.expectEqual(
+        types.FailureKind.compile_check_failed,
+        Runtime.compilerDiagnosticKind("JIT code cache allocation failed"),
+    );
+    try std.testing.expectEqual(
+        types.FailureKind.compile_check_failed,
+        Runtime.compilerDiagnosticKind("failed to publish executable range"),
+    );
+    try std.testing.expect(Runtime.compilerDiagnosticKind("JIT code cache allocation completed") == null);
+}
+
+test "informational Xbyak diagnostics are not compiler failures" {
+    try std.testing.expect(Runtime.compilerDiagnosticKind("Xbyak emitter initialized successfully") == null);
+    try std.testing.expect(Runtime.compilerDiagnosticKind("Xbyak::CodeGenerator using MAP_JIT storage") == null);
+    try std.testing.expectEqual(
+        types.FailureKind.compile_check_failed,
+        Runtime.compilerDiagnosticKind("Xbyak error: codegen failed for guest function"),
+    );
+}
+
+test "multiline compiler text retains only genuine physical failures" {
+    const stages = [_]types.StageSpec{.{ .id = 0, .name = "entry" }};
+    var runtime = Runtime{};
+    runtime.configure(.{ .name = "test", .stages = &stages }, true);
+    runtime.observeCompilerText(
+        "----------- CONFIG DUMP -----------\n[CPU] MAP_JIT storage selected\nXbyak emitter initialized successfully\n",
+        7,
+        0x2000,
+        3,
+    );
+    try std.testing.expectEqual(@as(u64, 0), runtime.compiler_diagnostic_count);
+    try std.testing.expectEqual(types.FailureKind.none, runtime.failure.kind);
+
+    runtime.observeCompilerText("Xbyak error: codegen failed for guest function\r\n", 8, 0x2001, 3);
+    try std.testing.expectEqual(@as(u64, 1), runtime.compiler_diagnostic_count);
+    try std.testing.expectEqual(types.FailureKind.compile_check_failed, runtime.failure.kind);
+    try std.testing.expectEqualStrings("Xbyak error: codegen failed for guest function", runtime.failure.reason);
 }
 
 test "quiet activation timeout identifies an unsignaled wait" {
@@ -2336,6 +2439,9 @@ test "successful guest translation is monotonic external progress" {
     try std.testing.expect(runtime.noteTranslationProgress(16, 110));
     try std.testing.expectEqual(@as(u64, 2), runtime.external_progress_advances);
     try std.testing.expectEqual(types.ProgressClass.external_advancing, runtime.classifyProgress(110));
+    try std.testing.expect(runtime.hasRecentExternalProgress(110));
+    try std.testing.expect(!runtime.hasRecentExternalProgress(100));
+    try std.testing.expect(!runtime.hasRecentExternalProgress(210));
 
     // A later periodic snapshot must not erase the asynchronous generation.
     runtime.noteExternalProgress(.{ .heap_high_water = 100 }, 120);
