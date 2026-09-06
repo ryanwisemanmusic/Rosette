@@ -535,6 +535,7 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
         helper_path,
         if (is_macos and fileExists(allocator, dyld_lib_path)) dyld_lib_path else null,
         if (fileExists(allocator, elf_processor_path)) elf_processor_path else null,
+        if (source_root.len != 0) source_root else null,
     ) catch |err| {
         std.debug.print("[INSTALL] ERROR: Failed to build shell snippet: {s}\n", .{@errorName(err)});
         return err;
@@ -549,7 +550,11 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     std.debug.print("[INSTALL] Wrote shell snippet: {s}\n", .{shell_path});
 
     std.debug.print("[INSTALL] Step 14: Building bash env snippet\n", .{});
-    const bash_env_snippet = buildBashEnvSnippet(allocator, helper_path) catch |err| {
+    const bash_env_snippet = buildBashEnvSnippet(
+        allocator,
+        helper_path,
+        if (source_root.len != 0) source_root else null,
+    ) catch |err| {
         std.debug.print("[INSTALL] ERROR: Failed to build bash env snippet: {s}\n", .{@errorName(err)});
         return err;
     };
@@ -1908,7 +1913,13 @@ fn buildMakeEnv(
     return out.items;
 }
 
-fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld_path: ?[]const u8, elf_processor_path: ?[]const u8) ![]const u8 {
+fn buildShellSnippet(
+    allocator: std.mem.Allocator,
+    helper_path: []const u8,
+    dyld_path: ?[]const u8,
+    elf_processor_path: ?[]const u8,
+    source_root: ?[]const u8,
+) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
@@ -1929,6 +1940,13 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
     try out.appendSlice(allocator, "export ROSETTE_SHELL_HELPER=");
     try appendShellQuoted(&out, allocator, helper_path);
     try out.appendSlice(allocator, "\n");
+
+    if (source_root) |root| {
+        try out.appendSlice(allocator, "export ROSETTE_SOURCE_ROOT=");
+        try appendShellQuoted(&out, allocator, root);
+        try out.appendSlice(allocator, "\n");
+        try out.appendSlice(allocator, "export ROSETTE_BUILD_IDENTITY_MANIFEST=\"$ROSETTE_SOURCE_ROOT/.rosette/build-identity.json\"\n");
+    }
 
     if (dyld_path) |dyld| {
         try out.appendSlice(allocator, "export ROSETTE_DYLD_INTERPOSER=");
@@ -1997,6 +2015,15 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
         \\export ROSETTE_COMPILER_SANITIZER
         \\: "${ROSETTE_X86_INTRINSICS_COMPAT:=$HOME/.rosette/include/x86_intrinsics_compat.h}"
         \\export ROSETTE_X86_INTRINSICS_COMPAT
+        \\# Diagnostic scaffolds, defaulted here so a plain run carries them and an
+        \\# explicit value on the command line still wins. Both are temporary: they
+        \\# exist to tell a missing signal apart from a signal nobody wants, and
+        \\# everything they do is recorded as a substitution that can never close an
+        \\# authentic contract stage. Set either to 0/observe to turn it off.
+        \\: "${ROSETTE_ASYNC_LOG:=1}"
+        \\export ROSETTE_ASYNC_LOG
+        \\: "${ROSETTE_DRAW_DISPATCH:=any}"
+        \\export ROSETTE_DRAW_DISPATCH
         \\if [ -z "${ROSETTE_SHELL_DISABLE:-}" ] && [ "${ROSETTE_COMPILER_SANITIZER_ENABLE:-auto}" != "0" ] && [ -x "$ROSETTE_COMPILER_SANITIZER" ]; then
         \\  : "${CMAKE_C_COMPILER_LAUNCHER:=$ROSETTE_COMPILER_SANITIZER}"
         \\  : "${CMAKE_CXX_COMPILER_LAUNCHER:=$ROSETTE_COMPILER_SANITIZER}"
@@ -2386,7 +2413,11 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
     return out.items;
 }
 
-fn buildBashEnvSnippet(allocator: std.mem.Allocator, helper_path: []const u8) ![]const u8 {
+fn buildBashEnvSnippet(
+    allocator: std.mem.Allocator,
+    helper_path: []const u8,
+    source_root: ?[]const u8,
+) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
@@ -2402,12 +2433,26 @@ fn buildBashEnvSnippet(allocator: std.mem.Allocator, helper_path: []const u8) ![
         \\export ROSETTE_SHELL_HELPER=
     );
     try appendShellQuoted(&out, allocator, helper_path);
+    if (source_root) |root| {
+        try out.appendSlice(allocator, "\nexport ROSETTE_SOURCE_ROOT=");
+        try appendShellQuoted(&out, allocator, root);
+        try out.appendSlice(allocator, "\nexport ROSETTE_BUILD_IDENTITY_MANIFEST=\"$ROSETTE_SOURCE_ROOT/.rosette/build-identity.json\"");
+    }
     try out.appendSlice(allocator,
         \\
         \\: "${ROSETTE_COMPILER_SANITIZER:=$HOME/.rosette/bin/rosette-compiler-sanitize}"
         \\export ROSETTE_COMPILER_SANITIZER
         \\: "${ROSETTE_X86_INTRINSICS_COMPAT:=$HOME/.rosette/include/x86_intrinsics_compat.h}"
         \\export ROSETTE_X86_INTRINSICS_COMPAT
+        \\# Diagnostic scaffolds, defaulted here so a plain run carries them and an
+        \\# explicit value on the command line still wins. Both are temporary: they
+        \\# exist to tell a missing signal apart from a signal nobody wants, and
+        \\# everything they do is recorded as a substitution that can never close an
+        \\# authentic contract stage. Set either to 0/observe to turn it off.
+        \\: "${ROSETTE_ASYNC_LOG:=1}"
+        \\export ROSETTE_ASYNC_LOG
+        \\: "${ROSETTE_DRAW_DISPATCH:=any}"
+        \\export ROSETTE_DRAW_DISPATCH
         \\if [ -z "${ROSETTE_SHELL_DISABLE:-}" ] && [ "${ROSETTE_COMPILER_SANITIZER_ENABLE:-auto}" != "0" ] && [ -x "$ROSETTE_COMPILER_SANITIZER" ]; then
         \\  : "${CMAKE_C_COMPILER_LAUNCHER:=$ROSETTE_COMPILER_SANITIZER}"
         \\  : "${CMAKE_CXX_COMPILER_LAUNCHER:=$ROSETTE_COMPILER_SANITIZER}"
@@ -4950,6 +4995,7 @@ test "shell snippet includes zsh direct ELF launcher" {
         "/tmp/rosette/bin/rosette-shell",
         "/tmp/rosette/lib/rosette-exec.dylib",
         "/tmp/rosette/bin/elf_processor",
+        "/tmp/rosette",
     );
     try std.testing.expect(containsIgnoreCase(snippet, "run-elf"));
     try std.testing.expect(containsIgnoreCase(snippet, "__rosette_refresh_elf_commands"));
@@ -4991,7 +5037,11 @@ test "arch route parser ignores plain and non-x86 requests" {
 test "bash env snippet routes x86 arch only" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const snippet = try buildBashEnvSnippet(arena.allocator(), "/tmp/rosette/bin/rosette-shell");
+    const snippet = try buildBashEnvSnippet(
+        arena.allocator(),
+        "/tmp/rosette/bin/rosette-shell",
+        "/tmp/rosette",
+    );
     try std.testing.expect(containsIgnoreCase(snippet, "rosette-arch"));
     try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_ARCH_BACKEND"));
     try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_CALLER_CWD"));
@@ -5004,7 +5054,11 @@ test "bash env snippet routes x86 arch only" {
 test "bash env snippet enables scoped project include compatibility" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const snippet = try buildBashEnvSnippet(arena.allocator(), "/tmp/rosette/bin/rosette-shell");
+    const snippet = try buildBashEnvSnippet(
+        arena.allocator(),
+        "/tmp/rosette/bin/rosette-shell",
+        null,
+    );
     try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_COMPILER_SANITIZER"));
     try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_X86_INTRINSICS_COMPAT"));
     try std.testing.expect(containsIgnoreCase(snippet, "CMAKE_C_COMPILER_LAUNCHER"));
