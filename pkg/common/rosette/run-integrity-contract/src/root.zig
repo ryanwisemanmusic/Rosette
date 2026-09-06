@@ -39,7 +39,7 @@
 
 const std = @import("std");
 
-pub const schema_version: u16 = 4;
+pub const schema_version: u16 = 8;
 
 /// The runtime phase that makes a missing notifier actionable.
 ///
@@ -242,6 +242,93 @@ pub const Invariant = enum(u8) {
     /// handshake whose producer never ran, and every finite expiry is the same
     /// non-event counted again.
     bounded_poll_receives_signals,
+    /// The native presenter did not merely lack guest pixels: its own native
+    /// bring-up or device lifetime entered a terminal failure. Retryable
+    /// surface backpressure and swapchain rebuilds are deliberately excluded.
+    no_presenter_failure,
+    /// A console-owned platform value was still unresolved, arrived after its
+    /// consumer, diverged from the owner's value, or failed through an
+    /// unresolved storage refusal once the consumer boundary was observed.
+    /// Owner-rule refusals for title-owned or already-populated values are not
+    /// this finding.
+    no_actionable_provisioning_refusal,
+    /// The wait-handshake policy itself classified an observed object as a
+    /// fault. A refused synthetic guest wake is a protection decision and is
+    /// not a fault by itself.
+    no_actionable_wait_policy_fault,
+    /// The application controller emitted a decision whose host authority or
+    /// evidence preconditions contradicted the immutable sample it inspected.
+    /// This is a Rosette safety violation: applying such a decision could make
+    /// the host mutate state on behalf of the guest or hide a missing boundary.
+    no_invalid_application_controller_decision,
+    /// A readable, decisive execution profile still contains samples the
+    /// classifier or symbol resolver could not account for. Continuing would
+    /// make the dominant-region conclusion stronger than its evidence.
+    no_unclassified_execution_profile,
+    /// A swap-contract stage whose causal prerequisites are all met has never
+    /// had a single one of its probes attempted, while other probes on the
+    /// same driver have run many times. That is a wiring gap in Rosette, and
+    /// every zero the contract reports at or below that stage is Rosette's
+    /// silence being read as the title's absence.
+    no_unprobed_reachable_stage,
+    /// A reachable swap-contract stage was probed and the probe read nothing,
+    /// for a reason Rosette can remove without the guest or the emulator doing
+    /// anything: the probe is not wired to a route, or it reads a counter no
+    /// source ever writes. The contract's own verdict already says this is
+    /// "Rosette's to close today"; unlike an unprobed stage, the probe ran and
+    /// reported honestly, and the gap is still Rosette's.
+    no_rosette_closable_starvation,
+    /// The measured guest-time rate has fallen below the rate declared for the
+    /// run after the startup settling window. Continuing only moves the
+    /// watchdog farther away from the stage the run was started to measure.
+    no_run_budget_deficit,
+    /// The host wait-for graph has a deadlock finding with enough causal
+    /// evidence to stop. NEVER_NOTIFIED remains an observation until a guest
+    /// obligation or a fully frozen run makes it causal; this gate is for the
+    /// stronger all-notifiers-parked, producer-terminated and mature-cycle
+    /// findings.
+    no_proven_deadlock,
+    /// An essential component was used while it was still unproven, or was
+    /// exercised and failed. Continuing would make every downstream result
+    /// depend on an unchecked boundary; the readiness ledger is the authority
+    /// for this decision.
+    no_unproven_essential_component,
+    /// Every required core monotone witness has an independent agreeing
+    /// observer. This is deliberately stricter than the undercount gate:
+    /// explained, weak, and single-witness readings are still observation debt
+    /// when Rosette is about to make a closed graphics claim.
+    all_required_witnesses_corroborated,
+    /// Two live observers of one claim disagree about the present, and the
+    /// losing source is still repeating its value after being contradicted.
+    /// A superseded claim is deliberately not this: there the losing sources
+    /// went quiet, so the newest reading is current and the older ones are
+    /// stale snapshots a reader must not quote. A contested one has no current
+    /// reading at all, and every conclusion drawn from either side is unsound.
+    no_contested_claim,
+    /// A classifier declined a raw value that a conclusion downstream needed,
+    /// and went on declining it. Running longer cannot produce the answer: the
+    /// answer is a case statement nobody has written, so the run would reach
+    /// the same frontier for the same reason however long it continued. This
+    /// is the gate that turns "stuck" from a feeling into a stop with the
+    /// missing value printed beside it.
+    no_settled_unknown_mapping,
+    /// The boundary the frontier names as the blocker is armed, was reached on
+    /// none of its addresses, and no independent observer agrees that it never
+    /// happened.
+    ///
+    /// A frontier directs everything downstream of it — which subsystem gets
+    /// investigated, which owner is blamed, which week is spent. It is built on
+    /// instruction-pointer tracepoints, which are exact for the address they
+    /// are armed on and blind everywhere else. A boundary armed on one of six
+    /// candidate addresses reports `never crossed` for a call that happened,
+    /// and the frontier then points at a subsystem that is working. That is not
+    /// hypothetical: on 2026-09-05 `VdQueryVideoMode` read never-crossed at
+    /// step 2.1B while the emulator's own breadcrumb in the same log said
+    /// `called (count=1)`.
+    ///
+    /// A negative this load-bearing needs two observers. Without one the run is
+    /// about to spend its next week on a frontier it cannot substantiate.
+    frontier_boundary_corroborated,
 
     pub fn label(self: Invariant) []const u8 {
         return switch (self) {
@@ -268,6 +355,20 @@ pub const Invariant = enum(u8) {
             .no_gpu_preinitialization_order_inversion => "no-gpu-preinitialization-order-inversion",
             .no_undercounting_observer => "no-undercounting-observer",
             .bounded_poll_receives_signals => "bounded-poll-receives-signals",
+            .no_presenter_failure => "no-presenter-failure",
+            .no_actionable_provisioning_refusal => "no-actionable-provisioning-refusal",
+            .no_actionable_wait_policy_fault => "no-actionable-wait-policy-fault",
+            .no_invalid_application_controller_decision => "no-invalid-application-controller-decision",
+            .no_unclassified_execution_profile => "no-unclassified-execution-profile",
+            .no_unprobed_reachable_stage => "no-unprobed-reachable-stage",
+            .no_rosette_closable_starvation => "no-rosette-closable-starvation",
+            .no_run_budget_deficit => "no-run-budget-deficit",
+            .no_proven_deadlock => "no-proven-deadlock",
+            .no_unproven_essential_component => "no-unproven-essential-component",
+            .all_required_witnesses_corroborated => "all-required-witnesses-corroborated",
+            .no_contested_claim => "no-contested-claim",
+            .no_settled_unknown_mapping => "no-settled-unknown-mapping",
+            .frontier_boundary_corroborated => "frontier-boundary-corroborated",
         };
     }
 
@@ -293,6 +394,20 @@ pub const Invariant = enum(u8) {
             // Rosette's reading, not the emulator's mechanism. The counter the
             // emulator keeps is the one that turned out to be right.
             .no_undercounting_observer,
+            .no_actionable_provisioning_refusal,
+            .no_invalid_application_controller_decision,
+            .no_unclassified_execution_profile,
+            // The probe table and the code that drives it are both Rosette's.
+            // A stage the driver never visits is a hole in Rosette's observer,
+            // whoever owns the stage itself.
+            .no_unprobed_reachable_stage,
+            .no_rosette_closable_starvation,
+            .no_run_budget_deficit,
+            .no_unproven_essential_component,
+            .all_required_witnesses_corroborated,
+            .no_contested_claim,
+            .no_settled_unknown_mapping,
+            .frontier_boundary_corroborated,
             => .rosette_harness,
             .guest_output_handoff_connected,
             .no_never_notified_park,
@@ -314,7 +429,10 @@ pub const Invariant = enum(u8) {
             // Same reasoning as `wait_receives_signals`: Rosette observed the
             // poll correctly; what is missing is the signaller.
             .bounded_poll_receives_signals,
+            .no_actionable_wait_policy_fault,
+            .no_proven_deadlock,
             => .emulator_host,
+            .no_presenter_failure => .host_driver,
         };
     }
 
@@ -343,6 +461,20 @@ pub const Invariant = enum(u8) {
             .no_unsatisfied_capability => .capability,
             .translation_cache_converges => .pressure,
             .no_recorded_anomaly => .anomaly,
+            .no_presenter_failure => .capability,
+            .no_actionable_provisioning_refusal => .ownership,
+            .no_actionable_wait_policy_fault => .liveness,
+            .no_invalid_application_controller_decision => .ownership,
+            .no_unclassified_execution_profile => .ownership,
+            .no_unprobed_reachable_stage => .ownership,
+            .no_rosette_closable_starvation => .ownership,
+            .no_run_budget_deficit => .pressure,
+            .no_proven_deadlock => .liveness,
+            .no_unproven_essential_component => .ownership,
+            .all_required_witnesses_corroborated => .ownership,
+            .no_contested_claim => .ownership,
+            .no_settled_unknown_mapping => .ownership,
+            .frontier_boundary_corroborated => .ownership,
         };
     }
 
@@ -360,8 +492,8 @@ pub const Invariant = enum(u8) {
             .wait_receives_signals => "a wait subject has only ever timed out; it is not a pump, it is a signal that never arrives — find the intended signaller",
             .no_unsatisfied_capability => "a capability was exercised and did not work; the critical-gap list names it and its layer",
             .no_harness_substitution => "the run advanced on Rosette's own output rather than the application's; every conclusion drawn past this point describes Rosette. Disable the substitution or accept that the run is measuring the harness",
-            .translation_cache_converges => "live byte-valid decodes are being evicted faster than vacant ways fill; the cache-pressure page list names the hot pages, and the fix is capacity or separating immutable image code from mutable JIT code",
-            .no_recorded_anomaly => "the anomaly ledger recorded something; it names the kind, and for an emulator assertion the file, line and function it came from",
+            .translation_cache_converges => "the decode cache lost actionable reusable work. Read TRANSLATION ECONOMICS: compulsory first-touch fills are unavoidable, cold evictions are deferred working-set evidence, and the recurring actionable classes are reusable conflicts, stale bytes, or coarse-flush collateral. The cache-pressure page list names the addresses; the fix is capacity, a better mapping, or separating immutable image code from mutable JIT code",
+            .no_recorded_anomaly => "the anomaly ledger or pause-causality ledger recorded a defect; read the exact ledger entry before continuing",
             .every_waiter_has_a_notifier => "a thread is waiting on an object no code has ever raised. Waiters chose that object, so something intended to signal it — find that code and confirm it ran at all, rather than waiting for a signal that is not late but absent",
             .every_park_has_a_reason => "a thread is parked and Rosette cannot say why. That is a hole in Rosette's model of the wait, not a defect in the thread: teach the scheduler to name this wait before drawing any conclusion from it",
             .single_master_owner => "a framework event carries an ownership pair the contract does not permit. Rosette is the only master owner of the process; a hosted subsystem substantiates its own truth beneath it, and two masters is how two accounts of one fact drift apart",
@@ -374,16 +506,33 @@ pub const Invariant = enum(u8) {
             .no_gpu_preinitialization_order_inversion => "GPU pre-initialization established a dependent element before its prerequisite. Read GPU PRE-INITIALIZATION ORDERING INVERSION, fix the producer or observer ordering, and do not dispatch a synthetic or host GPU interrupt before the title callback registration is proven",
             .no_undercounting_observer => "an observer that sees every occurrence is reporting fewer than another observer of the same fact, and has been for longer than the sampling window explains. Read MONOTONE WITNESS: it names the subject, the floor, who set it and who is short. Repair the short observer — a tracepoint armed on the wrong address, a parser reading the wrong line, a ledger scoped to the wrong domain — before quoting any absence it has reported",
             .bounded_poll_receives_signals => "a bounded manual-reset poll has expired repeatedly, received no signal at all, and the ring producer beside it has published nothing for the whole window. Read RUN INTEGRITY WAIT EVIDENCE for the object and handle, find the code that is supposed to set that event, and confirm it was reached — a finite timeout expiring is not the title making progress, it is the same non-event counted again. Do not synthesise the signal",
+            .no_presenter_failure => "the native presenter entered a non-retryable bring-up or device failure. Read the native presenter stage, VkResult, adapter, and last frame report; surface_not_presentable and swapchain_failed remain retryable and are not this finding",
+            .no_actionable_provisioning_refusal => "a console-owned platform value was not established in time, was contested, or remains blocked by an unresolved storage refusal. Read PROVISIONING CUSTODY for the resource and consumer step; raw not-harness-owned, already-present, and address-unknown refusals are diagnostic unless they leave this custody contract broken",
+            .no_actionable_wait_policy_fault => "the wait-handshake policy made a fault decision for an observed synchronization object. Read WAIT HANDSHAKE POLICY and the matching wait-graph object; a refused synthetic guest wake or a caution is protection, not proof of a broken wake path",
+            .no_invalid_application_controller_decision => "the application controller emitted an internally inconsistent or unauthorized action. Read the retained controller decision and sample, then repair the evidence/ownership guard before allowing host work or guest-boundary conclusions to proceed",
+            .no_unclassified_execution_profile => "a readable and decisive execution profile still contains unclassified or unresolved-symbol samples. Read the retained profile witnesses, extend the region/symbol classifier, and do not treat the dominant region as a complete explanation until that observation debt is gone",
+            .no_unprobed_reachable_stage => "a swap-contract stage with every causal prerequisite met has never had one of its probes attempted, while probes on the same driver have run many times. Read VD SWAP TRACE for the stage and its probe rows: every one reads attempts=0. Wire the probe at its call site. Until then the contract is reporting a hole in Rosette as an absence in the title, and no zero at or below that stage means anything",
+            .no_rosette_closable_starvation => "a reachable swap-contract stage was probed and read nothing for a reason Rosette owns: the probe is unwired on this route, or the counter it reads has never been written by any source. Read VD SWAP TRACE for the stage, its deciding probe and the recorded cause. Wire the probe or connect the counter; nothing is needed from the guest or the emulator, and until it is closed the zero below that stage is Rosette's silence rather than the title's absence",
+            .no_run_budget_deficit => "the settled run is below its declared guest-millisecond throughput budget. Read RUN BUDGET and the phase table, fix the dominant host-time consumer, and do not let a watchdog turn a measured reachability failure into an apparent hang",
+            .no_proven_deadlock => "the deadlock predictor has a causal deadlock finding after the guest boundary. Read DEADLOCK PREDICTOR for the exact object, waiter and notifier roster; repair the producer or wait-for edge, and do not inject a synthetic wake to hide it",
+            .no_unproven_essential_component => "an essential component was used before its readiness proof, or its proof failed. Read COMPONENT READINESS for the component, first-use step and proof obligation; repair that boundary before trusting any downstream GPU or scheduler result",
+            .frontier_boundary_corroborated => "the boundary the frontier blames is armed, was reached on none of its armed addresses, and nothing else agrees it never happened. Read the gpu-boundary row for addresses(armed/reached): reached=0 on every armed address means either the title never called it or Rosette armed addresses the call does not pass through, and a tracepoint cannot tell those apart. Add a second observer for this boundary — the emulator's own breadcrumb is usually already in the log — before spending another day downstream of this frontier",
+            .no_settled_unknown_mapping => "a classifier has repeatedly declined a raw value that something downstream needed. Read UNKNOWN INVENTORY: the blocking rows name the exact value and the table it belongs in, and the domain's remedy names the file. This is not a condition further running resolves — the run will reach this same frontier for this same reason every time until the case is added, which is what being stuck is",
+            .no_contested_claim => "two live observers of the same claim disagree about the present, and the losing one is still repeating its value after being contradicted. Read CLAIM RECONCILIATION for the subject, both sources and their last steps. When the two sit on opposite sides of the host/guest boundary this is a model split rather than a race, and neither reading may be quoted until it is resolved. A superseded claim is not this: there the losing source went quiet and the newest reading is current",
+            .all_required_witnesses_corroborated => "the nine required bring-up witness subjects have been observed, but one or more still lacks an independent agreeing observer. Read MONOTONE WITNESS for each subject's finding and carrier; repair or add the missing observer before quoting a closed graphics conclusion",
         };
     }
 
-    /// This invariant cannot be stepped past. An ordering inversion here is not
-    /// merely a bad result that can be documented while the run continues: it
-    /// means a callback or another GPU dependency was allowed to act against a
-    /// state that did not exist. Warn/observe and allow-list controls remain
-    /// useful for ordinary findings, but must not reopen this admission hole.
+    /// These invariants cannot be stepped past. An ordering inversion or an
+    /// invalid controller authorization is not merely a bad result that can be
+    /// documented while the run continues: it means a callback, GPU dependency
+    /// or host action was allowed to act against a state that did not exist.
+    /// Warn/observe and allow-list controls remain useful for ordinary findings,
+    /// but must not reopen either admission hole.
     pub fn nonBypassable(self: Invariant) bool {
-        return self == .no_gpu_preinitialization_order_inversion;
+        return self == .no_gpu_preinitialization_order_inversion or
+            self == .no_invalid_application_controller_decision or
+            self == .no_unproven_essential_component;
     }
 };
 
@@ -440,6 +589,12 @@ pub const Observation = struct {
 
     // Output handoff.
     presenter_ready: bool = false,
+    /// The native presenter was actually attempted. A host with no layer or
+    /// loader attempt has not reached this boundary and stays unarmed.
+    presenter_attempted: bool = false,
+    /// Terminal native presenter failures only. Retryable surface backpressure
+    /// and swapchain rebuild states are intentionally excluded.
+    presenter_nonretryable_failures: u64 = 0,
     draws_consumed: u64 = 0,
     /// A draw observed in a retained PM4 batch is not enough to arm this gate.
     /// This count is restricted to live draws with an explicit, writable
@@ -532,6 +687,38 @@ pub const Observation = struct {
     wait_graph_blocker_last_step: u64 = 0,
     wait_graph_blocker_participants_dropped: u64 = 0,
 
+    // Application controller.
+    /// Number of immutable process samples for which the controller emitted a
+    /// decision. A zero count leaves the decision contract unarmed.
+    application_controller_decisions: u64 = 0,
+    /// Decisions whose host-action or state preconditions contradicted the
+    /// sample that produced them. This is a safety fault, not a guest refusal.
+    application_controller_contract_violations: u64 = 0,
+
+    // Provisioning custody.
+    /// The consumer boundary for tracked console variables was observed.
+    /// Before that point, a missing value is incomplete evidence rather than a
+    /// failed handoff.
+    provisioning_armed: bool = false,
+    /// Total refusal attempts, retained to distinguish valid owner-rule
+    /// refusals from an actionable custody failure.
+    provisioning_raw_refusals: u64 = 0,
+    /// Unresolved storage refusals on console-owned resources. The state-level
+    /// custody counters remain authoritative; this field makes the refusal
+    /// class visible in the trace.
+    provisioning_actionable_refusals: u64 = 0,
+    provisioning_late: u64 = 0,
+    provisioning_diverged: u64 = 0,
+    provisioning_contested: u64 = 0,
+    provisioning_unprovisioned: u64 = 0,
+
+    // Wait-handshake policy.
+    /// At least one observed wait object reached a classified policy decision.
+    wait_policy_observed: bool = false,
+    /// Decisions whose severity was `.fault`; refused synthetic wakes and
+    /// cautions do not increment this count.
+    wait_policy_faults: u64 = 0,
+
     // Capability.
     capabilities_exercised: u64 = 0,
     capabilities_unsatisfied: u64 = 0,
@@ -576,6 +763,15 @@ pub const Observation = struct {
     harness_substitutions: u64 = 0,
 
     // Translation pressure.
+    /// Runtime-selected evidence mode. The ordinary contract keeps cache
+    /// pressure and never-notified parks behind their settling windows so a
+    /// warm-up burst or idle worker does not stop a run. The fault-policy
+    /// runtime may select this stricter mode after the relevant observer is
+    /// armed: proven reusable eviction, executable-byte changes and proven
+    /// liveness contradictions are then faults even when an unrelated counter
+    /// is still advancing. Cold evictions remain separately observable because
+    /// they do not prove reusable work was lost.
+    strict_fail_fast: bool = false,
     translation_cache_entries: u64 = 0,
     translation_vacant_fills: u64 = 0,
     translation_conflict_fills: u64 = 0,
@@ -599,6 +795,69 @@ pub const Observation = struct {
 
     // Anomalies.
     recorded_anomalies: u64 = 0,
+    /// Defects in the pause-causality ledger are separate from emulator
+    /// anomalies. A pause report later disproved by guest progress is an
+    /// observer contradiction, not a guest assertion, but it still prevents a
+    /// clean run from continuing.
+    pause_transaction_defects: u64 = 0,
+
+    // Component readiness.
+    /// True once the readiness ledger has observed a proof or a guest use and
+    /// can therefore distinguish an unvisited component from an essential
+    /// gap.
+    component_readiness_armed: bool = false,
+    /// Essential components currently used unproven or exercised and broken.
+    essential_component_gaps: u64 = 0,
+
+    // Execution profile.
+    execution_profile_samples: u64 = 0,
+    execution_profile_readable: bool = false,
+    execution_profile_decisive: bool = false,
+    execution_profile_unclassified: u64 = 0,
+    execution_profile_unresolved: u64 = 0,
+
+    // Swap-contract probe coverage.
+    /// Stages whose causal prerequisites are all met and for which not one
+    /// declared probe has ever been attempted.
+    vd_swap_unprobed_reachable_stages: u64 = 0,
+    /// The most attempts any single swap probe has recorded. The evidence that
+    /// the driver ran at all: a cold ledger has every reachable stage unprobed
+    /// and that says nothing, while a ledger where one probe has been called a
+    /// hundred times and another never has a probe off the driver's path.
+    vd_swap_probe_attempt_floor: u64 = 0,
+    /// Reachable stages starved for a cause Rosette can remove on its own —
+    /// an unwired probe, or a counter nothing feeds.
+    vd_swap_rosette_closable_starvations: u64 = 0,
+
+    // Throughput reachability.
+    /// True only after the guest-main execution boundary and enough
+    /// post-boundary host time have been observed for the declared rate to be
+    /// useful. A process still in loader/static-initializer/Xenia startup must
+    /// not fail this gate merely because no guest milliseconds have accrued
+    /// yet; the runtime owns the boundary and supplies a scoped measurement.
+    run_budget_observed: bool = false,
+    /// The run-budget ledger's specific below-budget verdict. Observer-share
+    /// and cache-thrashing defects retain their own diagnostics and gates.
+    run_budget_deficit: bool = false,
+    run_budget_guest_ms_per_host_second: u64 = 0,
+    run_budget_required_guest_ms_per_host_second: u64 = 0,
+    run_budget_host_seconds: u64 = 0,
+    run_budget_guest_ms: u64 = 0,
+
+    // Deadlock evidence.
+    /// The predictor saw a deadlocked classification (including the weaker
+    /// NEVER_NOTIFIED finding). This is retained for the trace even when the
+    /// stronger causal gate below is not armed.
+    deadlock_observed: bool = false,
+    /// True only for all-notifiers-parked, notifiers-terminated, or a mature
+    /// wait cycle. A never-notified idle worker is not enough by itself.
+    deadlock_proven: bool = false,
+    /// Numeric value of deadlock_predictor.Finding at the selected witness.
+    /// Keeping the contract independent of that diagnostics module avoids a
+    /// package dependency while preserving the exact finding in reports.
+    deadlock_finding: u8 = 0,
+    deadlock_waiters: u64 = 0,
+    deadlock_park_steps: u64 = 0,
 
     // Liveness, ownership and substantiation.
     /// The application boundary that makes a missing notifier actionable. A
@@ -608,6 +867,15 @@ pub const Observation = struct {
     /// Objects with waiters and no notifier at all, past the liveness
     /// classifier's own stall threshold.
     waiters_without_a_notifier: u64 = 0,
+    /// The subset of the raw host-pthread census for which Rosetta has proved
+    /// a causal obligation to notify. A parked POSIX worker by itself is not
+    /// a guest deadlock: it may simply be an idle worker waiting for future
+    /// work. Keep the raw count for diagnostics, but only this subset can arm
+    /// a fatal liveness invariant.
+    actionable_waiters_without_a_notifier: u64 = 0,
+    /// True only when a guest wait, a classified synchronization object, or a
+    /// genuinely frozen run proves that the raw silence is causally relevant.
+    liveness_obligation_proven: bool = false,
     /// Threads parked with no reason Rosette can name.
     parks_without_a_reason: u64 = 0,
     /// Framework events whose master/subowner pair the contract refuses.
@@ -675,6 +943,54 @@ pub const Observation = struct {
     /// possible at all. A single-witness surface is uncorroborated, not
     /// passing, and must not arm this gate.
     monotone_witness_corroboration_possible: bool = false,
+    /// True once all nine required bring-up subjects have spoken at least once.
+    /// The optional guest-frame subject is not part of this admission boundary.
+    monotone_witness_closure_ready: bool = false,
+    monotone_witness_required: u64 = 0,
+    monotone_witness_observed: u64 = 0,
+    monotone_witness_corroborated: u64 = 0,
+    monotone_witness_agreement_debt: u64 = 0,
+    /// Claims whose observers actively disagree while both remain live.
+    claim_reconciliation_contested: u64 = 0,
+    /// Claims that have been cross-checked at all. Without one, a zero above
+    /// is "nothing was compared", not "everything agreed".
+    claim_reconciliation_multi_source: u64 = 0,
+    /// Unmapped raw values that a conclusion needed and that have been
+    /// consulted often enough to be a certain table gap rather than a
+    /// bring-up transient.
+    settled_unknown_mappings: u64 = 0,
+    /// Whether a frontier boundary exists and is armed at all. Without one
+    /// there is no negative to substantiate.
+    frontier_boundary_armed: bool = false,
+    /// Steps this same boundary has been the frontier.
+    ///
+    /// A frontier that has just appeared is a run in progress, not a wall. At
+    /// step 0 every boundary is armed, reached on none, and spoken about by
+    /// nobody — which is the correct state of a run that has not started and
+    /// which stopped the 2026-09-06 run at its first checkpoint. The gate below
+    /// judges a frontier only once the run has sat at it long enough that "not
+    /// yet" has stopped being the explanation. The timer resets whenever the
+    /// frontier moves, so a run making boundary progress is never judged.
+    frontier_boundary_settled_steps: u64 = 0,
+    /// Boundaries crossed anywhere on the watched surface.
+    ///
+    /// Evidence that the run reached this phase at all and that the tracepoint
+    /// set demonstrably fires. With none crossed, the frontier is simply the
+    /// first boundary of a phase the guest has not started: on 2026-09-06 the
+    /// gate blamed `VdQueryVideoMode` at step 100M while the title was still
+    /// inside `XexModule::LoadContinue`, having not finished mapping its own
+    /// executable. A frontier ahead of the run is not a wall.
+    frontier_boundary_crossed_elsewhere: u32 = 0,
+    /// Whether an independent axis — module loads, translation progress,
+    /// milestones — moved recently. A run still moving toward the frontier has
+    /// not settled at it, however long the frontier has had the same name.
+    external_progress_fresh: bool = false,
+    /// Armed addresses for the frontier boundary that were ever reached.
+    frontier_boundary_addresses_reached: u32 = 0,
+    /// Whether any observer other than the tracepoint has spoken about this
+    /// boundary. A breadcrumb, a claim, a guest log counter — anything that
+    /// did not come from the same instruction-pointer arming.
+    frontier_boundary_corroborating_observers: u32 = 0,
 
     /// Whether any axis that proves progress has advanced since the longest
     /// never-notified park began.
@@ -692,6 +1008,12 @@ pub const Observation = struct {
 /// point where a signal that was coming would have arrived.
 pub const never_notified_park_steps: u64 = 1_000_000_000;
 
+/// The deadlock predictor has already classified a never-notified object as a
+/// stalled wait by the time it reaches its own 100M-step window. Strict mode
+/// uses that evidence boundary instead of waiting another billion steps while
+/// unrelated guest work advances.
+pub const strict_never_notified_park_steps: u64 = 100_000_000;
+
 /// How many timeouts a wait may accumulate with no signal at all before it
 /// stops being a poll and becomes a signal that never arrives.
 pub const unsignalled_timeout_limit: u64 = 32;
@@ -699,6 +1021,32 @@ pub const unsignalled_timeout_limit: u64 = 32;
 /// How long the producer must be quiet before "no frame yet" becomes "no
 /// handoff".
 pub const output_handoff_quiet_steps: u64 = 1_000_000_000;
+
+/// How many times one swap probe must have been attempted before a *different*
+/// stage's total absence of attempts stops being a cold ledger and becomes an
+/// unwired probe.
+///
+/// The refresh that drives every probe runs on the same checkpoint, so a probe
+/// on its path accumulates attempts at the same rate as every other. Eight
+/// rounds is well past any ordering or first-checkpoint effect and far short of
+/// the hundreds a real run accumulates, so the gate arms early enough to be
+/// worth having and late enough that a run cannot trip it on the way up.
+pub const vd_swap_probe_floor: u64 = 8;
+
+/// Steps a boundary must remain the frontier before its negative is judged.
+///
+/// Long enough that a run still crossing boundaries is never stopped — the
+/// timer resets on every frontier move — and short enough that a genuine wall
+/// is named within the first minute rather than after the whole run. Matches
+/// the checkpoint cadence, so the gate arms on evidence a reader has already
+/// seen printed.
+pub const frontier_settle_steps: u64 = 100_000_000;
+
+/// Host seconds that must elapse after the proven guest-main boundary before a
+/// measured below-budget rate becomes a reachability failure. Process
+/// creation, static initializers and Xenia loader work are outside that
+/// boundary, where zero guest milliseconds is expected.
+pub const budget_observation_host_seconds: u64 = 10;
 
 /// How long host-capability coverage must stop improving before its remaining
 /// failures are findings rather than work still in progress.
@@ -793,6 +1141,19 @@ pub fn judge(invariant: Invariant, observation: Observation) Judgement {
         .no_never_notified_park => blk: {
             if (!observation.liveness_scope.notifierChecksArmed()) break :blk .{};
             if (observation.longest_never_notified_park_steps == 0) break :blk .{};
+            // The deadlock predictor observes host condvars, so silence alone
+            // is deliberately not causal evidence. Require the runtime to
+            // prove an obligation before this invariant can arm.
+            if (!observation.liveness_obligation_proven or
+                observation.actionable_waiters_without_a_notifier == 0)
+                break :blk .{};
+            if (observation.strict_fail_fast) break :blk .{
+                .state = if (observation.longest_never_notified_park_steps < strict_never_notified_park_steps)
+                    .satisfied
+                else
+                    .violated,
+                .detail = observation.longest_never_notified_park_steps,
+            };
             // Same gate as `every_waiter_has_a_notifier`: a long park beside a
             // run that keeps advancing is a worker that has nothing to do.
             if (observation.progress_since_never_notified_park) break :blk .{
@@ -905,6 +1266,35 @@ pub fn judge(invariant: Invariant, observation: Observation) Judgement {
                 observation.translation_flush_refills;
             if (fills == 0) break :blk .{};
 
+            // A strict diagnostic run is explicitly trying to catch the
+            // first reusable eviction, not decide whether the aggregate hit
+            // rate made it expensive. `capacity_conflict` is already proved
+            // at the cache fill site: a non-empty entry with a non-zero reuse
+            // count was displaced. Stale-byte and coarse-flush refills are
+            // equally strong integrity evidence. Do not let nominal cache
+            // occupancy or a 99% hit rate turn those facts back into a
+            // “warming” report.
+            //
+            // Cold evictions deliberately do not enter this branch. Their
+            // victim had never been reused, and the active victim/static-L2
+            // tiers may recover it without another decode. A cold stream is
+            // valuable evidence for cache sizing, but this event alone does
+            // not prove that reusable work was lost.
+            if (observation.strict_fail_fast) {
+                if (observation.translation_conflict_fills != 0) break :blk .{
+                    .state = .violated,
+                    .detail = observation.translation_conflict_fills,
+                };
+                if (observation.translation_stale_refills != 0) break :blk .{
+                    .state = .violated,
+                    .detail = observation.translation_stale_refills,
+                };
+                if (observation.translation_flush_refills != 0) break :blk .{
+                    .state = .violated,
+                    .detail = observation.translation_flush_refills,
+                };
+            }
+
             // Do not let the warm-up occupancy gate hide a proven integrity
             // failure. These are the two causes that the economics contract
             // deliberately keeps distinct from ordinary cache pressure.
@@ -941,25 +1331,38 @@ pub fn judge(invariant: Invariant, observation: Observation) Judgement {
             };
         },
         .no_recorded_anomaly => blk: {
+            const defects = observation.recorded_anomalies +| observation.pause_transaction_defects;
             break :blk .{
-                .state = if (observation.recorded_anomalies == 0) .satisfied else .violated,
-                .detail = observation.recorded_anomalies,
+                .state = if (defects == 0) .satisfied else .violated,
+                .detail = defects,
             };
         },
         .every_waiter_has_a_notifier => blk: {
             if (!observation.liveness_scope.notifierChecksArmed()) break :blk .{};
             if (observation.waiters_without_a_notifier == 0) break :blk .{ .state = .satisfied };
+            // Preserve the raw host wait census for the report, but do not
+            // treat an idle/unclassified worker as a required guest producer.
+            if (!observation.liveness_obligation_proven or
+                observation.actionable_waiters_without_a_notifier == 0)
+                break :blk .{};
+            if (observation.strict_fail_fast) break :blk .{
+                .state = if (observation.longest_never_notified_park_steps < strict_never_notified_park_steps)
+                    .satisfied
+                else
+                    .violated,
+                .detail = observation.actionable_waiters_without_a_notifier,
+            };
             // Gated on an independent progress axis, like every other predictor
             // here. Three condvars parked from startup in a run that is
             // otherwise advancing are idle workers; the same three in a run
             // that has stopped moving are the finding.
             if (observation.progress_since_never_notified_park) break :blk .{
                 .state = .satisfied,
-                .detail = observation.waiters_without_a_notifier,
+                .detail = observation.actionable_waiters_without_a_notifier,
             };
             break :blk .{
                 .state = .violated,
-                .detail = observation.waiters_without_a_notifier,
+                .detail = observation.actionable_waiters_without_a_notifier,
             };
         },
         .no_reinterpreting_texture_format => blk: {
@@ -1078,6 +1481,192 @@ pub fn judge(invariant: Invariant, observation: Observation) Judgement {
                 else
                     .violated,
                 .detail = observation.settled_observer_undercounts,
+            };
+        },
+        .no_presenter_failure => blk: {
+            if (!observation.presenter_attempted) break :blk .{};
+            break :blk .{
+                .state = if (observation.presenter_nonretryable_failures == 0)
+                    .satisfied
+                else
+                    .violated,
+                .detail = observation.presenter_nonretryable_failures,
+            };
+        },
+        .no_actionable_provisioning_refusal => blk: {
+            if (!observation.provisioning_armed) break :blk .{};
+            const custody_failures = observation.provisioning_late +|
+                observation.provisioning_diverged +|
+                observation.provisioning_contested +|
+                observation.provisioning_unprovisioned;
+            // An unresolved storage refusal normally leaves the resource
+            // unprovisioned and is therefore already represented above. Keep
+            // the maximum so a hand-built observation can still expose a
+            // refusal without double-counting one resource in the detail.
+            const failures = @max(custody_failures, observation.provisioning_actionable_refusals);
+            break :blk .{
+                .state = if (failures == 0) .satisfied else .violated,
+                .detail = failures,
+            };
+        },
+        .no_actionable_wait_policy_fault => blk: {
+            if (!observation.wait_policy_observed) break :blk .{};
+            break :blk .{
+                .state = if (observation.wait_policy_faults == 0) .satisfied else .violated,
+                .detail = observation.wait_policy_faults,
+            };
+        },
+        .no_invalid_application_controller_decision => blk: {
+            if (observation.application_controller_decisions == 0) break :blk .{};
+            break :blk .{
+                .state = if (observation.application_controller_contract_violations == 0)
+                    .satisfied
+                else
+                    .violated,
+                .detail = observation.application_controller_contract_violations,
+            };
+        },
+        .no_unclassified_execution_profile => blk: {
+            if (!observation.execution_profile_readable or
+                !observation.execution_profile_decisive)
+                break :blk .{};
+            const debt = observation.execution_profile_unclassified +|
+                observation.execution_profile_unresolved;
+            break :blk .{
+                .state = if (debt == 0) .satisfied else .violated,
+                .detail = debt,
+            };
+        },
+        // Unarmed until the probe driver has demonstrably run. Before that,
+        // "never probed" is the whole ledger being cold and stopping on it
+        // would stop every run at its first checkpoint. Once one probe has
+        // been called this many times, a reachable stage with no attempts at
+        // all is not waiting its turn — nothing calls it.
+        .no_unprobed_reachable_stage => blk: {
+            if (observation.vd_swap_probe_attempt_floor < vd_swap_probe_floor)
+                break :blk .{};
+            break :blk .{
+                .state = if (observation.vd_swap_unprobed_reachable_stages == 0)
+                    .satisfied
+                else
+                    .violated,
+                .detail = observation.vd_swap_unprobed_reachable_stages,
+            };
+        },
+        // Armed on the same evidence as the unprobed gate, and for the same
+        // reason: before the driver has run, every stage is starved and that
+        // says nothing about the wiring.
+        .no_rosette_closable_starvation => blk: {
+            if (observation.vd_swap_probe_attempt_floor < vd_swap_probe_floor)
+                break :blk .{};
+            break :blk .{
+                .state = if (observation.vd_swap_rosette_closable_starvations == 0)
+                    .satisfied
+                else
+                    .violated,
+                .detail = observation.vd_swap_rosette_closable_starvations,
+            };
+        },
+        .no_run_budget_deficit => blk: {
+            if (!observation.run_budget_observed) break :blk .{};
+            break :blk .{
+                .state = if (observation.run_budget_deficit) .violated else .satisfied,
+                .detail = if (observation.run_budget_deficit)
+                    observation.run_budget_required_guest_ms_per_host_second -|
+                        observation.run_budget_guest_ms_per_host_second
+                else
+                    observation.run_budget_guest_ms_per_host_second,
+            };
+        },
+        .no_proven_deadlock => blk: {
+            if (!observation.liveness_scope.notifierChecksArmed() or
+                !observation.deadlock_observed or
+                !observation.deadlock_proven)
+                break :blk .{};
+            break :blk .{
+                .state = .violated,
+                .detail = if (observation.deadlock_park_steps != 0)
+                    observation.deadlock_park_steps
+                else
+                    observation.deadlock_waiters,
+            };
+        },
+        .no_unproven_essential_component => blk: {
+            if (!observation.component_readiness_armed) break :blk .{};
+            break :blk .{
+                .state = if (observation.essential_component_gaps == 0)
+                    .satisfied
+                else
+                    .violated,
+                .detail = observation.essential_component_gaps,
+            };
+        },
+        // Armed only once some claim actually has two observers. A run whose
+        // whole surface is single-source has nothing to disagree about, and
+        // reporting that as satisfied would be the same mistake as reporting
+        // it as violated.
+        // Armed by its own evidence: the threshold that makes a gap settled is
+        // applied where the inventory is read, so a first sighting during
+        // bring-up cannot stop a run that was about to map the value anyway.
+        // Armed only once a frontier boundary exists and is watched. Before
+        // that there is no negative being asserted, and a gate that fired on a
+        // run which had not yet armed its tracepoints would say nothing about
+        // the observers.
+        .frontier_boundary_corroborated => blk: {
+            if (!observation.frontier_boundary_armed) break :blk .{};
+            // Nothing on this surface has ever been crossed: the phase has not
+            // begun and the tracepoints have never demonstrated they fire.
+            // There is no negative here to substantiate.
+            if (observation.frontier_boundary_crossed_elsewhere == 0) break :blk .{};
+            if (observation.frontier_boundary_settled_steps < frontier_settle_steps)
+                break :blk .{};
+            // The run is still moving. A frontier the guest has not arrived at
+            // is ahead of the run, not blocking it — the discriminator every
+            // predictor in this codebase is required to consult.
+            if (observation.external_progress_fresh) break :blk .{};
+            // Reached on at least one address: the tracepoint is demonstrably
+            // on the path, so its silence about later calls is evidence.
+            if (observation.frontier_boundary_addresses_reached != 0) break :blk .{
+                .state = .satisfied,
+                .detail = observation.frontier_boundary_addresses_reached,
+            };
+            if (observation.frontier_boundary_corroborating_observers != 0) break :blk .{
+                .state = .satisfied,
+                .detail = observation.frontier_boundary_corroborating_observers,
+            };
+            break :blk .{ .state = .violated, .detail = 0 };
+        },
+        .no_settled_unknown_mapping => blk: {
+            break :blk .{
+                .state = if (observation.settled_unknown_mappings == 0)
+                    .satisfied
+                else
+                    .violated,
+                .detail = observation.settled_unknown_mappings,
+            };
+        },
+        .no_contested_claim => blk: {
+            if (observation.claim_reconciliation_multi_source == 0) break :blk .{};
+            break :blk .{
+                .state = if (observation.claim_reconciliation_contested == 0)
+                    .satisfied
+                else
+                    .violated,
+                .detail = observation.claim_reconciliation_contested,
+            };
+        },
+        .all_required_witnesses_corroborated => blk: {
+            // Do not turn an early, still-cold observer set into a failure.
+            // Once all required subjects have spoken, however, every one of
+            // them must be exactly corroborated; explained and weak findings
+            // remain unsafe for a closed graphics conclusion.
+            if (!observation.monotone_witness_closure_ready) break :blk .{};
+            break :blk .{
+                .state = if (observation.monotone_witness_agreement_debt == 0)
+                    .satisfied
+                else
+                    .violated,
+                .detail = observation.monotone_witness_agreement_debt,
             };
         },
     };
@@ -1279,11 +1868,15 @@ test "a short park is a worker and a long one is a lost wakeup" {
         judge(.no_never_notified_park, .{
             .liveness_scope = scope,
             .longest_never_notified_park_steps = 1000,
+            .actionable_waiters_without_a_notifier = 1,
+            .liveness_obligation_proven = true,
         }).state,
     );
     try std.testing.expect(judge(.no_never_notified_park, .{
         .liveness_scope = scope,
         .longest_never_notified_park_steps = never_notified_park_steps,
+        .actionable_waiters_without_a_notifier = 1,
+        .liveness_obligation_proven = true,
     }).violated());
 }
 
@@ -1409,6 +2002,45 @@ test "conflicts that do cost the run stop it" {
     const judgement = judge(.translation_cache_converges, thrashing);
     try std.testing.expect(judgement.violated());
     try std.testing.expectEqual(@as(u64, 50), judgement.detail);
+}
+
+test "strict translation mode stops on the first proven reusable eviction" {
+    const strict = Observation{
+        .strict_fail_fast = true,
+        // The primary cache is intentionally below its nominal occupancy
+        // gate here. Strict mode must not wait for that gate to reach an
+        // accounting number that the active bank layout may never produce.
+        .translation_cache_entries = 262_144,
+        .translation_vacant_fills = 131_072,
+        .translation_conflict_fills = 1,
+        .translation_hits = 9_999,
+        .translation_misses = 1,
+    };
+    const judgement = judge(.translation_cache_converges, strict);
+    try std.testing.expectEqual(State.violated, judgement.state);
+    try std.testing.expectEqual(@as(u64, 1), judgement.detail);
+}
+
+test "strict liveness mode does not dismiss a classified park with progress" {
+    const strict = Observation{
+        .strict_fail_fast = true,
+        .liveness_scope = .gpu_activity,
+        .waiters_without_a_notifier = 1,
+        .longest_never_notified_park_steps = strict_never_notified_park_steps,
+        .progress_since_never_notified_park = true,
+        .actionable_waiters_without_a_notifier = 1,
+        .liveness_obligation_proven = true,
+    };
+    try std.testing.expect(judge(.no_never_notified_park, strict).violated());
+    try std.testing.expect(judge(.every_waiter_has_a_notifier, strict).violated());
+}
+
+test "pause transaction defects block the anomaly invariant" {
+    const judgement = judge(.no_recorded_anomaly, .{
+        .pause_transaction_defects = 1,
+    });
+    try std.testing.expect(judgement.violated());
+    try std.testing.expectEqual(@as(u64, 1), judgement.detail);
 }
 
 test "a low hit rate from vacant fills alone is not conflict pressure" {
@@ -1612,7 +2244,7 @@ test "the allow list matches exactly and a typo widens nothing" {
 // The 2026-08-27 run, replayed. The raw PM4 draw count is retained as
 // diagnostic context, but this replay has no target-backed draw, resolve, swap
 // boundary, or VdSwap packet, so it must not manufacture an output opportunity.
-test "the observed run violates five invariants and stops at Rosette's" {
+test "the observed run violates four proven invariants and stops at Rosette's" {
     const observed = Observation{
         .step = 6_800_000_000,
         .liveness_scope = .gpu_activity,
@@ -1647,7 +2279,7 @@ test "the observed run violates five invariants and stops at Rosette's" {
         judgements[index] = judge(invariant, observed);
         if (judgements[index].violated()) violations += 1;
     }
-    try std.testing.expectEqual(@as(usize, 5), violations);
+    try std.testing.expectEqual(@as(usize, 4), violations);
     // Exactly one of them is Rosette's — one frame reached the window that
     // custody never recorded — and that is where the run stops. The translation
     // cache is *not* among them: 85% conflicts at a 99% hit rate is a true
@@ -1660,7 +2292,9 @@ test "the observed run violates five invariants and stops at Rosette's" {
     // next stop because raw/retained draws never armed it.
     judgements[@intFromEnum(Invariant.presented_frames_in_custody)] = .{ .state = .satisfied };
     try std.testing.expectEqual(Owner.emulator_host, firstToStopAt(judgements).?.owner());
-    try std.testing.expectEqual(Invariant.no_never_notified_park, firstToStopAt(judgements).?);
+    // Once unproven host-worker silence is removed, the remaining proven
+    // emulator-side finding is the un-signalled wait-timeout contract.
+    try std.testing.expectEqual(Invariant.wait_receives_signals, firstToStopAt(judgements).?);
 }
 
 // The one-frame custody gap in that run was not a lost frame: the presenter
@@ -1709,6 +2343,8 @@ test "a waiter with no notifier is strict after guest execution starts" {
     const judgement = judge(.every_waiter_has_a_notifier, .{
         .liveness_scope = .guest_execution,
         .waiters_without_a_notifier = 1,
+        .actionable_waiters_without_a_notifier = 1,
+        .liveness_obligation_proven = true,
     });
     try std.testing.expect(judgement.violated());
     try std.testing.expectEqual(Owner.emulator_host, Invariant.every_waiter_has_a_notifier.owner());
@@ -1831,6 +2467,8 @@ test "a park beside a run that keeps advancing is an idle worker" {
         .waiters_without_a_notifier = 3,
         .longest_never_notified_park_steps = never_notified_park_steps * 4,
         .progress_since_never_notified_park = true,
+        .actionable_waiters_without_a_notifier = 3,
+        .liveness_obligation_proven = true,
     };
     try std.testing.expectEqual(State.satisfied, judge(.every_waiter_has_a_notifier, advancing).state);
     try std.testing.expectEqual(State.satisfied, judge(.no_never_notified_park, advancing).state);
@@ -1847,8 +2485,22 @@ test "the detail survives the progress gate so the count is still readable" {
         .liveness_scope = .guest_execution,
         .waiters_without_a_notifier = 3,
         .progress_since_never_notified_park = true,
+        .actionable_waiters_without_a_notifier = 3,
+        .liveness_obligation_proven = true,
     };
     try std.testing.expectEqual(@as(u64, 3), judge(.every_waiter_has_a_notifier, advancing).detail);
+}
+
+test "raw host wait silence without a proven obligation stays diagnostic" {
+    const observation = Observation{
+        .strict_fail_fast = true,
+        .liveness_scope = .gpu_activity,
+        .waiters_without_a_notifier = 2,
+        .longest_never_notified_park_steps = strict_never_notified_park_steps * 4,
+        .progress_since_never_notified_park = true,
+    };
+    try std.testing.expectEqual(State.not_armed, judge(.no_never_notified_park, observation).state);
+    try std.testing.expectEqual(State.not_armed, judge(.every_waiter_has_a_notifier, observation).state);
 }
 
 test "a texture format is only judged once a device has been asked" {
@@ -1899,6 +2551,41 @@ test "an undercounting observer arms only once corroboration is possible" {
     try std.testing.expect(
         std.mem.indexOf(u8, Invariant.no_undercounting_observer.remedy(), "MONOTONE WITNESS") != null,
     );
+}
+
+test "required monotone witness closure rejects uncorroborated subjects" {
+    try std.testing.expectEqual(
+        State.not_armed,
+        judge(.all_required_witnesses_corroborated, .{
+            .monotone_witness_closure_ready = false,
+            .monotone_witness_required = 9,
+            .monotone_witness_observed = 8,
+            .monotone_witness_corroborated = 4,
+            .monotone_witness_agreement_debt = 4,
+        }).state,
+    );
+
+    const incomplete = judge(.all_required_witnesses_corroborated, .{
+        .monotone_witness_closure_ready = true,
+        .monotone_witness_required = 9,
+        .monotone_witness_observed = 9,
+        .monotone_witness_corroborated = 4,
+        .monotone_witness_agreement_debt = 5,
+    });
+    try std.testing.expectEqual(State.violated, incomplete.state);
+    try std.testing.expectEqual(@as(u64, 5), incomplete.detail);
+    try std.testing.expectEqual(Owner.rosette_harness, Invariant.all_required_witnesses_corroborated.owner());
+    try std.testing.expectEqual(Class.ownership, Invariant.all_required_witnesses_corroborated.class());
+    try std.testing.expect(!Invariant.all_required_witnesses_corroborated.nonBypassable());
+
+    const complete = judge(.all_required_witnesses_corroborated, .{
+        .monotone_witness_closure_ready = true,
+        .monotone_witness_required = 9,
+        .monotone_witness_observed = 9,
+        .monotone_witness_corroborated = 9,
+        .monotone_witness_agreement_debt = 0,
+    });
+    try std.testing.expectEqual(State.satisfied, complete.state);
 }
 
 // The 2026-08-31 live blocker. A guest thread polled a manual-reset event with
@@ -1967,6 +2654,466 @@ test "an attributed bounded poll that never receives a signal beside a silent pr
     try std.testing.expectEqual(Owner.emulator_host, Invariant.bounded_poll_receives_signals.owner());
     try std.testing.expect(
         std.mem.indexOf(u8, Invariant.bounded_poll_receives_signals.remedy(), "Do not synthesise") != null,
+    );
+}
+
+test "presenter failure is armed only after a native attempt and ignores retryable states" {
+    try std.testing.expectEqual(State.not_armed, judge(.no_presenter_failure, .{}).state);
+    try std.testing.expectEqual(
+        State.satisfied,
+        judge(.no_presenter_failure, .{ .presenter_attempted = true }).state,
+    );
+    try std.testing.expectEqual(
+        State.violated,
+        judge(.no_presenter_failure, .{
+            .presenter_attempted = true,
+            .presenter_nonretryable_failures = 1,
+        }).state,
+    );
+    try std.testing.expectEqual(Class.capability, Invariant.no_presenter_failure.class());
+    try std.testing.expectEqual(Owner.host_driver, Invariant.no_presenter_failure.owner());
+}
+
+test "provisioning owner refusals stay diagnostic until custody is actionable" {
+    try std.testing.expectEqual(
+        State.not_armed,
+        judge(.no_actionable_provisioning_refusal, .{
+            .provisioning_raw_refusals = 99,
+        }).state,
+    );
+    try std.testing.expectEqual(
+        State.satisfied,
+        judge(.no_actionable_provisioning_refusal, .{
+            .provisioning_armed = true,
+            .provisioning_raw_refusals = 99,
+        }).state,
+    );
+    const judgement = judge(.no_actionable_provisioning_refusal, .{
+        .provisioning_armed = true,
+        .provisioning_actionable_refusals = 1,
+    });
+    try std.testing.expectEqual(State.violated, judgement.state);
+    try std.testing.expectEqual(@as(u64, 1), judgement.detail);
+    try std.testing.expectEqual(Class.ownership, Invariant.no_actionable_provisioning_refusal.class());
+    try std.testing.expectEqual(Owner.rosette_harness, Invariant.no_actionable_provisioning_refusal.owner());
+}
+
+test "only a wait policy fault is fatal, not a refused synthetic wake" {
+    try std.testing.expectEqual(
+        State.not_armed,
+        judge(.no_actionable_wait_policy_fault, .{}).state,
+    );
+    try std.testing.expectEqual(
+        State.satisfied,
+        judge(.no_actionable_wait_policy_fault, .{
+            .wait_policy_observed = true,
+        }).state,
+    );
+    const judgement = judge(.no_actionable_wait_policy_fault, .{
+        .wait_policy_observed = true,
+        .wait_policy_faults = 2,
+    });
+    try std.testing.expectEqual(State.violated, judgement.state);
+    try std.testing.expectEqual(@as(u64, 2), judgement.detail);
+    try std.testing.expectEqual(Class.liveness, Invariant.no_actionable_wait_policy_fault.class());
+    try std.testing.expectEqual(Owner.emulator_host, Invariant.no_actionable_wait_policy_fault.owner());
+}
+
+test "an invalid application-controller decision is a non-bypassable safety fault" {
+    try std.testing.expectEqual(
+        State.not_armed,
+        judge(.no_invalid_application_controller_decision, .{}).state,
+    );
+    try std.testing.expectEqual(
+        State.satisfied,
+        judge(.no_invalid_application_controller_decision, .{
+            .application_controller_decisions = 4,
+        }).state,
+    );
+    const judgement = judge(.no_invalid_application_controller_decision, .{
+        .application_controller_decisions = 4,
+        .application_controller_contract_violations = 1,
+    });
+    try std.testing.expectEqual(State.violated, judgement.state);
+    try std.testing.expectEqual(@as(u64, 1), judgement.detail);
+    try std.testing.expect(Invariant.no_invalid_application_controller_decision.nonBypassable());
+    try std.testing.expectEqual(Class.ownership, Invariant.no_invalid_application_controller_decision.class());
+    try std.testing.expectEqual(Owner.rosette_harness, Invariant.no_invalid_application_controller_decision.owner());
+}
+
+// The 2026-09-03 run: `VD SWAP TRACE ... unprobed=1` on every one of twenty
+// checkpoints, with `front buffer validated` at `probes=0/4` while the probes
+// beside it recorded a hundred attempts each. The report already said "the
+// zero is Rosette's, not the title's" and nothing stopped on it, so the whole
+// front-buffer branch of the producer chain read as an absence in the title.
+test "an unprobed reachable stage is fatal only once the probe driver has run" {
+    // A cold ledger has every reachable stage unprobed and means nothing.
+    try std.testing.expectEqual(
+        State.not_armed,
+        judge(.no_unprobed_reachable_stage, .{
+            .vd_swap_unprobed_reachable_stages = 6,
+        }).state,
+    );
+    // Still cold one round short of the floor.
+    try std.testing.expectEqual(
+        State.not_armed,
+        judge(.no_unprobed_reachable_stage, .{
+            .vd_swap_unprobed_reachable_stages = 1,
+            .vd_swap_probe_attempt_floor = vd_swap_probe_floor - 1,
+        }).state,
+    );
+    // A driver that has run, with every reachable stage probed.
+    try std.testing.expectEqual(
+        State.satisfied,
+        judge(.no_unprobed_reachable_stage, .{
+            .vd_swap_probe_attempt_floor = 100,
+        }).state,
+    );
+    // A driver that has run a hundred rounds and a stage it never visits.
+    const judgement = judge(.no_unprobed_reachable_stage, .{
+        .vd_swap_unprobed_reachable_stages = 1,
+        .vd_swap_probe_attempt_floor = 100,
+    });
+    try std.testing.expectEqual(State.violated, judgement.state);
+    try std.testing.expectEqual(@as(u64, 1), judgement.detail);
+    try std.testing.expectEqual(Class.ownership, Invariant.no_unprobed_reachable_stage.class());
+    try std.testing.expectEqual(Owner.rosette_harness, Invariant.no_unprobed_reachable_stage.owner());
+    // It is Rosette's own blind spot, so it can be stepped past like the other
+    // observation debts while the wiring is repaired.
+    try std.testing.expect(!Invariant.no_unprobed_reachable_stage.nonBypassable());
+}
+
+// A 99% hit rate is not a cache diagnosis by itself. The fill-site distinction
+// matters: compulsory fills are unavoidable, cold evictions are non-empty but
+// never-reused working-set evidence, and conflicts/stale/flush are actionable
+// recurring loss. The observed `miss(vacant/conflict/cold)=908548/0/2602`
+// stream therefore remains visible without being mistaken for hot conflict.
+test "reusable translation loss is fatal and compulsory or cold work is not" {
+    // Compulsory fills alone never arm the gate: an instruction must be
+    // decoded once and no cache policy makes a first touch free.
+    try std.testing.expectEqual(
+        State.satisfied,
+        judge(.translation_cache_converges, .{
+            .strict_fail_fast = true,
+            .translation_cache_entries = 262_144,
+            .translation_vacant_fills = 908_548,
+            .translation_hits = 2_807_391_687,
+            .translation_misses = 908_548,
+        }).state,
+    );
+    // Cold evictions stay observable but are not enough to prove reusable loss.
+    const cold = judge(.translation_cache_converges, .{
+        .translation_cache_entries = 262_144,
+        .strict_fail_fast = true,
+        .translation_vacant_fills = 908_548,
+        .translation_cold_evictions = 2_602,
+        .translation_hits = 2_807_391_687,
+        .translation_misses = 911_150,
+    });
+    try std.testing.expectEqual(State.satisfied, cold.state);
+    try std.testing.expectEqual(@as(u64, 99), cold.detail);
+    // The three that were already fatal stay fatal, and each names its own count.
+    try std.testing.expectEqual(
+        State.violated,
+        judge(.translation_cache_converges, .{
+            .strict_fail_fast = true,
+            .translation_vacant_fills = 10,
+            .translation_conflict_fills = 3,
+        }).state,
+    );
+    // Nothing decoded yet is not a pass.
+    try std.testing.expectEqual(
+        State.not_armed,
+        judge(.translation_cache_converges, .{ .strict_fail_fast = true }).state,
+    );
+}
+
+// The contract already called this "Rosette's to close today" on every
+// checkpoint and nothing stopped on it.
+test "a Rosette-closable starvation is fatal once the probe driver has run" {
+    // Cold ledger: every stage is starved and that says nothing.
+    try std.testing.expectEqual(
+        State.not_armed,
+        judge(.no_rosette_closable_starvation, .{
+            .vd_swap_rosette_closable_starvations = 3,
+        }).state,
+    );
+    try std.testing.expectEqual(
+        State.satisfied,
+        judge(.no_rosette_closable_starvation, .{
+            .vd_swap_probe_attempt_floor = 178,
+        }).state,
+    );
+    const judgement = judge(.no_rosette_closable_starvation, .{
+        .vd_swap_probe_attempt_floor = 178,
+        .vd_swap_rosette_closable_starvations = 1,
+    });
+    try std.testing.expectEqual(State.violated, judgement.state);
+    try std.testing.expectEqual(@as(u64, 1), judgement.detail);
+    try std.testing.expectEqual(Owner.rosette_harness, Invariant.no_rosette_closable_starvation.owner());
+    try std.testing.expectEqual(Class.ownership, Invariant.no_rosette_closable_starvation.class());
+}
+
+// 2026-09-04: a run whose tracepoints were merely armed reported all nine
+// required subjects observed, every one of them in agreement debt, and stopped
+// demanding that a second observer corroborate nine statements nobody had made.
+// Closure now means nine *claims*, so this gate can only fire on real ones.
+// The anti-stuck condition. A classifier that keeps declining a value a
+// conclusion needs will produce the same frontier every run, forever, and no
+// amount of further running changes that.
+// The frontier is the single most consequential sentence Rosette emits: it
+// decides which subsystem gets the next week. On 2026-09-05 it named
+// VdQueryVideoMode while the emulator's own breadcrumb said that export had
+// been called. A negative that directs work must be corroborated.
+test "an uncorroborated frontier negative stops the run" {
+    // No frontier armed yet: nothing is being asserted.
+    try std.testing.expectEqual(
+        State.not_armed,
+        judge(.frontier_boundary_corroborated, .{}).state,
+    );
+    // A frontier that has only just appeared is a run in progress. This is the
+    // step-0 state that stopped the 2026-09-06 run at its first checkpoint:
+    // armed, reached on nothing, spoken about by nobody, because nothing had
+    // happened yet.
+    try std.testing.expectEqual(
+        State.not_armed,
+        judge(.frontier_boundary_corroborated, .{
+            .frontier_boundary_armed = true,
+            .frontier_boundary_crossed_elsewhere = 4,
+            .frontier_boundary_settled_steps = 0,
+        }).state,
+    );
+    try std.testing.expectEqual(
+        State.not_armed,
+        judge(.frontier_boundary_corroborated, .{
+            .frontier_boundary_armed = true,
+            .frontier_boundary_crossed_elsewhere = 4,
+            .frontier_boundary_settled_steps = frontier_settle_steps - 1,
+        }).state,
+    );
+    // Nothing crossed anywhere: the guest has not begun this phase. This is the
+    // second false positive — the title was still mapping its own executable
+    // while the gate blamed the first GPU export for never being called.
+    try std.testing.expectEqual(
+        State.not_armed,
+        judge(.frontier_boundary_corroborated, .{
+            .frontier_boundary_armed = true,
+            .frontier_boundary_crossed_elsewhere = 0,
+            .frontier_boundary_settled_steps = frontier_settle_steps * 10,
+        }).state,
+    );
+    // Settled, phase begun, but the run is still moving toward the frontier.
+    try std.testing.expectEqual(
+        State.not_armed,
+        judge(.frontier_boundary_corroborated, .{
+            .frontier_boundary_armed = true,
+            .frontier_boundary_crossed_elsewhere = 4,
+            .frontier_boundary_settled_steps = frontier_settle_steps,
+            .external_progress_fresh = true,
+        }).state,
+    );
+    // The tracepoint is demonstrably on the path, so its reading stands.
+    try std.testing.expectEqual(
+        State.satisfied,
+        judge(.frontier_boundary_corroborated, .{
+            .frontier_boundary_armed = true,
+            .frontier_boundary_crossed_elsewhere = 4,
+            .frontier_boundary_settled_steps = frontier_settle_steps,
+            .frontier_boundary_addresses_reached = 2,
+        }).state,
+    );
+    // Never reached, but a second observer agrees it never happened.
+    try std.testing.expectEqual(
+        State.satisfied,
+        judge(.frontier_boundary_corroborated, .{
+            .frontier_boundary_armed = true,
+            .frontier_boundary_crossed_elsewhere = 4,
+            .frontier_boundary_settled_steps = frontier_settle_steps,
+            .frontier_boundary_corroborating_observers = 1,
+        }).state,
+    );
+    // Armed, never reached, nobody else looked: the frontier is unsubstantiated.
+    const judgement = judge(.frontier_boundary_corroborated, .{
+        .frontier_boundary_armed = true,
+        .frontier_boundary_crossed_elsewhere = 10,
+        .frontier_boundary_settled_steps = frontier_settle_steps,
+    });
+    try std.testing.expectEqual(State.violated, judgement.state);
+    try std.testing.expectEqual(Owner.rosette_harness, Invariant.frontier_boundary_corroborated.owner());
+    // The remedy has to name the armed/reached pair, because that row is the
+    // only place the two explanations are distinguishable.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        Invariant.frontier_boundary_corroborated.remedy(),
+        "addresses(armed/reached)",
+    ) != null);
+}
+
+test "a settled unmapped value stops the run and a fresh one does not" {
+    // Satisfied rather than not-armed: the inventory always has an answer, and
+    // "nothing is blocked" is a real reading rather than an absence.
+    try std.testing.expectEqual(
+        State.satisfied,
+        judge(.no_settled_unknown_mapping, .{}).state,
+    );
+    const judgement = judge(.no_settled_unknown_mapping, .{ .settled_unknown_mappings = 2 });
+    try std.testing.expectEqual(State.violated, judgement.state);
+    try std.testing.expectEqual(@as(u64, 2), judgement.detail);
+    try std.testing.expectEqual(Owner.rosette_harness, Invariant.no_settled_unknown_mapping.owner());
+    // The remedy has to say that running longer is not the fix, because that is
+    // the thing a reader keeps trying.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        Invariant.no_settled_unknown_mapping.remedy(),
+        "not a condition further running resolves",
+    ) != null);
+}
+
+test "a contested claim is fatal and a single-source surface is not judged" {
+    // Nothing has two observers: there is nothing to disagree about, and
+    // reporting that as clean would be the same error as reporting it as bad.
+    try std.testing.expectEqual(
+        State.not_armed,
+        judge(.no_contested_claim, .{ .claim_reconciliation_contested = 2 }).state,
+    );
+    try std.testing.expectEqual(
+        State.satisfied,
+        judge(.no_contested_claim, .{ .claim_reconciliation_multi_source = 6 }).state,
+    );
+    const judgement = judge(.no_contested_claim, .{
+        .claim_reconciliation_multi_source = 6,
+        .claim_reconciliation_contested = 1,
+    });
+    try std.testing.expectEqual(State.violated, judgement.state);
+    try std.testing.expectEqual(@as(u64, 1), judgement.detail);
+    try std.testing.expectEqual(Owner.rosette_harness, Invariant.no_contested_claim.owner());
+    try std.testing.expectEqual(Class.ownership, Invariant.no_contested_claim.class());
+    // It is Rosette's own reading, so it can be stepped past while repaired.
+    try std.testing.expect(!Invariant.no_contested_claim.nonBypassable());
+    // The remedy has to separate contested from superseded, because only one
+    // of them is a defect and the two look identical in a count.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        Invariant.no_contested_claim.remedy(),
+        "superseded",
+    ) != null);
+}
+
+test "execution profile classifier debt is fatal only after a decisive profile" {
+    try std.testing.expectEqual(
+        State.not_armed,
+        judge(.no_unclassified_execution_profile, .{
+            .execution_profile_samples = 2,
+            .execution_profile_unclassified = 2,
+        }).state,
+    );
+    try std.testing.expectEqual(
+        State.not_armed,
+        judge(.no_unclassified_execution_profile, .{
+            .execution_profile_readable = true,
+            .execution_profile_decisive = false,
+            .execution_profile_unclassified = 2,
+        }).state,
+    );
+    const judgement = judge(.no_unclassified_execution_profile, .{
+        .execution_profile_samples = 21,
+        .execution_profile_readable = true,
+        .execution_profile_decisive = true,
+        .execution_profile_unclassified = 2,
+        .execution_profile_unresolved = 1,
+    });
+    try std.testing.expectEqual(State.violated, judgement.state);
+    try std.testing.expectEqual(@as(u64, 3), judgement.detail);
+    try std.testing.expectEqual(Class.ownership, Invariant.no_unclassified_execution_profile.class());
+    try std.testing.expectEqual(Owner.rosette_harness, Invariant.no_unclassified_execution_profile.owner());
+}
+
+test "a settled below-budget run is a reachability failure" {
+    try std.testing.expectEqual(
+        State.not_armed,
+        judge(.no_run_budget_deficit, .{ .run_budget_deficit = true }).state,
+    );
+    try std.testing.expectEqual(
+        State.not_armed,
+        judge(.no_run_budget_deficit, .{
+            .run_budget_observed = false,
+            .run_budget_deficit = true,
+            .run_budget_required_guest_ms_per_host_second = 5,
+        }).state,
+    );
+
+    const deficit = judge(.no_run_budget_deficit, .{
+        .run_budget_observed = true,
+        .run_budget_deficit = true,
+        .run_budget_guest_ms_per_host_second = 0,
+        .run_budget_required_guest_ms_per_host_second = 5,
+        .run_budget_host_seconds = budget_observation_host_seconds,
+    });
+    try std.testing.expectEqual(State.violated, deficit.state);
+    try std.testing.expectEqual(@as(u64, 5), deficit.detail);
+
+    const healthy = judge(.no_run_budget_deficit, .{
+        .run_budget_observed = true,
+        .run_budget_deficit = false,
+        .run_budget_guest_ms_per_host_second = 6,
+        .run_budget_required_guest_ms_per_host_second = 5,
+        .run_budget_host_seconds = budget_observation_host_seconds,
+    });
+    try std.testing.expectEqual(State.satisfied, healthy.state);
+    try std.testing.expectEqual(@as(u64, 6), healthy.detail);
+    try std.testing.expectEqual(Class.pressure, Invariant.no_run_budget_deficit.class());
+    try std.testing.expectEqual(Owner.rosette_harness, Invariant.no_run_budget_deficit.owner());
+}
+
+test "only a causally proven deadlock is fatal" {
+    const ambiguous = judge(.no_proven_deadlock, .{
+        .liveness_scope = .guest_execution,
+        .deadlock_observed = true,
+        .deadlock_proven = false,
+        .deadlock_finding = 5,
+        .deadlock_waiters = 1,
+        .deadlock_park_steps = 2_000_000_000,
+    });
+    try std.testing.expectEqual(State.not_armed, ambiguous.state);
+
+    const pre_guest = judge(.no_proven_deadlock, .{
+        .liveness_scope = .pre_guest_startup,
+        .deadlock_observed = true,
+        .deadlock_proven = true,
+        .deadlock_finding = 4,
+        .deadlock_waiters = 1,
+        .deadlock_park_steps = 2_000_000_000,
+    });
+    try std.testing.expectEqual(State.not_armed, pre_guest.state);
+
+    const proven = judge(.no_proven_deadlock, .{
+        .liveness_scope = .guest_execution,
+        .deadlock_observed = true,
+        .deadlock_proven = true,
+        .deadlock_finding = 4,
+        .deadlock_waiters = 1,
+        .deadlock_park_steps = 2_000_000_000,
+    });
+    try std.testing.expectEqual(State.violated, proven.state);
+    try std.testing.expectEqual(@as(u64, 2_000_000_000), proven.detail);
+    try std.testing.expectEqual(Class.liveness, Invariant.no_proven_deadlock.class());
+    try std.testing.expectEqual(Owner.emulator_host, Invariant.no_proven_deadlock.owner());
+}
+
+test "an essential readiness gap is fatal once readiness is armed" {
+    const judgement = judge(.no_unproven_essential_component, .{
+        .component_readiness_armed = true,
+        .essential_component_gaps = 1,
+    });
+    try std.testing.expectEqual(State.violated, judgement.state);
+    try std.testing.expectEqual(@as(u64, 1), judgement.detail);
+    try std.testing.expect(Invariant.no_unproven_essential_component.nonBypassable());
+}
+
+test "readiness is not judged before a component is observed" {
+    try std.testing.expectEqual(
+        State.not_armed,
+        judge(.no_unproven_essential_component, .{}).state,
     );
 }
 
