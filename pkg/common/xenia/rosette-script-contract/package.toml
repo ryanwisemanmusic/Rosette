@@ -1,0 +1,8 @@
+name = "common-xenia-rosette-script-contract"
+version = "0.1.0-local"
+kind = "xenia-script-migration-contract"
+role = "hybrid"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
