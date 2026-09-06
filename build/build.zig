@@ -175,6 +175,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const x86_trace_asm_module = b.createModule(.{
+        .root_source_file = b.path("../src/x86-ASM/trace_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const trace_logger_module = b.createModule(.{
+        .root_source_file = b.path("../src/tooling/disasm_logger/x86_trace_logger.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const entrypoint_text_grid_module = b.createModule(.{
         .root_source_file = b.path("../src/entrypoint/text-grid/root.zig"),
         .target = target,
@@ -506,6 +516,97 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // The disc image container's layout, and what a damaged region of one
+    // costs. An offset alone cannot say whether a hole is fatal or merely
+    // unfortunate; this is what tells them apart.
+    const xenia_xiso_format_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/xiso-format/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // The host operations the emulator's behaviour rests on, and the
+    // cross-subsystem orderings that break under translation. Both are
+    // route-independent: they describe what a machine must do and what must
+    // happen before what, neither of which changes with the host Rosette is
+    // compiled for.
+    const rosette_host_capability_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/rosette/host-capability-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // Rosette owns the macOS/x86 host layout policy that Xenia used to keep
+    // in x86brew-specific scripts. It is vocabulary only; probing and shell
+    // setup remain at their respective edges.
+    const rosette_macos_host_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/rosette/macos-host-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // What must be shown to work before the guest depends on it. Route-
+    // independent: it names components and proof obligations, neither of which
+    // changes with the host Rosette is compiled for.
+    const rosette_component_readiness_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/rosette/component-readiness-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const rosette_mandatory_order_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/rosette/mandatory-order-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // Which of several counters of the same increasing fact a report may
+    // quote. Route-independent: it describes carriers and what each one can
+    // be short of, neither of which changes with the host Rosette is compiled
+    // for.
+    const rosette_monotone_witness_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/rosette/monotone-witness-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // The evidence ABI Rosette and Xenia both write and both read: fixed-width
+    // records, one schema version, and enums whose numeric values mean the same
+    // thing in both processes. Route-independent — it describes a wire format,
+    // and a wire format that changed with the compiling host would defeat its
+    // own purpose.
+    const rosette_graphics_bridge_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/rosette-graphics-bridge/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // The full graphics boundary surface: every function entry between a title
+    // asking the kernel for a display and a frame reaching a host surface, with
+    // its owner, its prerequisite and what an absence licenses a reader to
+    // conclude. Route-independent — it describes the console and the emulator's
+    // own symbol names, neither of which changes with the host Rosette is
+    // compiled for.
+    const xenia_gpu_bringup_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/gpu-bringup-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // The GPU observation envelope is build-time data consumed by both the
+    // earliest Rosette root and the live PM4 runtime. Keeping it as one module
+    // prevents the ring limits and causal-boundary vocabulary from drifting
+    // between diagnostics and execution.
+    const xenia_gpu_observation_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/gpu-observation-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // The common PM4 package already owns packet arithmetic/classification.
+    // Make the GPU executor consume that same build-time table instead of
+    // growing a second semantic vocabulary in lib.
+    const xenia_pm4_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/pm4-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // The complete graphics health schema is route-independent.  It owns the
     // immutable stage vocabulary and the alternative host/Vulkan/Xenos/VdSwap
     // paths; the mutable evidence ledger remains in lib/diagnostics.
@@ -524,6 +625,94 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Cocoa owns the native application/window/layer identities while SDL,
+    // Vulkan, Xenia and Rosette borrow or transfer explicitly named resources.
+    // Keeping this vocabulary route-independent prevents a successful host
+    // diagnostic clear from being mistaken for a guest VdSwap.
+    const cocoa_graphics_control_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/cocoa/graphics-control-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Rosette stands the window up before the guest runs, so a forwarding into
+    // it is either one Rosette has semantics for or one nobody can account for.
+    // Keeping the admission rule in a package means the fault policy is decided
+    // by a pure function that can be tested without a window.
+    const cocoa_window_admission_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/cocoa/window-admission-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // The standards a run has to meet to be allowed to continue. Kept in a
+    // package because the judgement has to be a pure function of stated
+    // measurements: an invariant decided from live ledgers cannot be replayed,
+    // and every one of these has to be reproducible without a window, a guest
+    // or an emulator.
+    const rosette_run_integrity_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/rosette/run-integrity-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Translation-cache ownership, geometry, mapping, and fail-fast cause
+    // policy are one route-independent contract. Keeping it outside Mach-O
+    // prevents lookup, invalidation, diagnostics, and future processor routes
+    // from growing subtly different hash or refusal rules.
+    const rosette_translation_cache_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/rosette/translation-cache-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Which side can answer for a boundary, and whether the two agree. An
+    // armed tracepoint the application never reached is only a defect where
+    // Rosette also has nothing to say about the same question.
+    const rosette_substantiation_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/rosette/substantiation-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Every hosted process has one Rosette authority. Subsystem-specific
+    // owners remain useful internal truths, but they are subordinate labels
+    // in the hosting boundary and must be logged as `subowner` rather than
+    // being mistaken for a second process owner.
+    const rosette_ownership_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/rosette/ownership-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // What a Xenos texture format may be served by on a host that lacks it,
+    // and what each substitution costs. Metal has no signed 2_10_10_10; the
+    // question this answers is whether the emulator's fallback preserves the
+    // values or reinterprets them.
+    const xenia_texture_format_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/texture-format-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // rosette_root is the earliest framework seam: it exposes immutable GPU
+    // facts before Mach-O state or a Xenia adapter is constructed. The roots
+    // remain one-way (package -> root -> lib) so runtime state cannot leak back
+    // into build-time assumptions.
+    const rosette_gpu_root_mod = b.createModule(.{
+        .root_source_file = b.path("../rosette_root/kernel/drivers/gpu/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    rosette_gpu_root_mod.addImport("xenia_gpu_observation_contract", xenia_gpu_observation_contract_mod);
+    const rosette_root_mod = b.createModule(.{
+        .root_source_file = b.path("../rosette_root/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    rosette_root_mod.addImport("rosette_gpu_root", rosette_gpu_root_mod);
+    ready_compiler_mod.addImport("rosette_root", rosette_root_mod);
+
     // The application framework is deliberately application-generic rather
     // than Xenia-specific. Its package owns only the fixed C ABI/schema; the
     // bounded mutable ledger lives in lib/framework and is bound to the live
@@ -533,18 +722,96 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const xenia_launch_assist_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/launch-assist-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const xenia_host_gpu_callback_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/host-gpu-callback-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const application_framework_mod = b.createModule(.{
         .root_source_file = b.path("../lib/framework/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     application_framework_mod.addImport("application_framework_contract", application_framework_contract_mod);
+    application_framework_mod.addImport("xenia_launch_assist_contract", xenia_launch_assist_contract_mod);
+    application_framework_mod.addImport("xenia_host_gpu_callback_contract", xenia_host_gpu_callback_contract_mod);
 
     // Who owns a piece of console platform state, when they took it, and
     // whether the handoff between the harness and the emulator held. Console
     // facts, so route-independent like the contracts above.
     const xenia_provisioning_contract_mod = b.createModule(.{
         .root_source_file = b.path("../pkg/common/xenia/provisioning-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Which of several disagreeing statements about the same fact is current.
+    // The emulator states the same facts from many code paths and never
+    // retracts a snapshot, so the loudest claim in the log is not the truest.
+    const xenia_claim_reconciliation_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/claim-reconciliation-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Xenia's PowerPC graphics callback and Rosette's model callback are
+    // separate execution domains. This contract names the registration ->
+    // dispatch -> return transaction without comparing their counters.
+    const xenia_interrupt_callback_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/interrupt-callback-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // What a diagnostic transport may do to the program it observes. Not a
+    // console fact, but a route-independent policy both the ring and any
+    // offline analysis have to agree on.
+    const diagnostics_async_log_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/diagnostics/async-log-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Whether translating a guest is a cost that ends or one that repeats.
+    // Route-independent: the classifier is arithmetic over decode counts, not
+    // a fact about any particular host.
+    const abi_translation_economics_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/abi/translation-economics-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    abi_translation_economics_contract_mod.addImport(
+        "rosette_translation_cache_contract",
+        rosette_translation_cache_contract_mod,
+    );
+
+    // Delivering a queued GPU completion to a guest callback, and knowing how
+    // much was assumed to do it. Console/ownership facts, route independent.
+    const xenia_draw_dispatch_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/draw-dispatch-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Who waits on what, who signals it, and whether the handshake between
+    // them is going anywhere. Console/ownership facts, route independent.
+    const xenia_wait_graph_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/wait-graph-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Runtime wait results have several deliberately non-interchangeable
+    // meanings. Keep the action policy in a package so the Mach-O scheduler,
+    // wait graph, and future application routes cannot each invent a different
+    // answer for timeouts, handshakes, or synthetic wakeups.
+    const xenia_wait_handshake_policy_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/wait-handshake-policy/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1050,6 +1317,16 @@ pub fn build(b: *std.Build) void {
     x86_asm_module.addImport("entrypoint_stack", entrypoint_stack_module);
     x86_asm_module.addImport("entrypoint", entrypoint_module);
     x86_asm_module.addImport("cleo", cleo_module);
+    x86_trace_asm_module.addImport("runtime_abi_handshake", runtime_abi_module);
+    x86_trace_asm_module.addImport("isa_registry", isa_module);
+    x86_trace_asm_module.addImport("isa_highway", isa_highway_module);
+    x86_trace_asm_module.addImport("entrypoint_code_text_segment", entrypoint_code_text_segment_module);
+    x86_trace_asm_module.addImport("bridge_register_tracing", bridge_register_trace_module);
+    x86_trace_asm_module.addImport("bridge_flags", bridge_flags_module);
+    x86_trace_asm_module.addImport("bridge_string_ops", bridge_string_ops_module);
+    x86_trace_asm_module.addImport("bridge_exceptions", bridge_exceptions_module);
+    x86_trace_asm_module.addImport("cleo", cleo_module);
+    trace_logger_module.addImport("x86_asm", x86_trace_asm_module);
     dos_scene_module.addImport("runtime_abi_handshake", runtime_abi_module);
     dos_scene_module.addImport("entrypoint_text_grid", entrypoint_text_grid_module);
 
@@ -1101,6 +1378,35 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&zig_tests.step);
     const application_framework_test = b.addTest(.{ .root_module = application_framework_mod });
     check_step.dependOn(&b.addRunArtifact(application_framework_test).step);
+    const xenia_host_gpu_callback_contract_test = b.addTest(.{ .root_module = xenia_host_gpu_callback_contract_mod });
+    check_step.dependOn(&b.addRunArtifact(xenia_host_gpu_callback_contract_test).step);
+    // The boundary surface is a `pub const` import inside lib/gpu, and a
+    // `pub const @import` does not root a module's tests. Without its own test
+    // target the contract's fifteen tests would compile and never run.
+    const xenia_gpu_bringup_contract_test = b.addTest(.{ .root_module = xenia_gpu_bringup_contract_mod });
+    check_step.dependOn(&b.addRunArtifact(xenia_gpu_bringup_contract_test).step);
+    const rosette_host_capability_contract_test = b.addTest(.{ .root_module = rosette_host_capability_contract_mod });
+    check_step.dependOn(&b.addRunArtifact(rosette_host_capability_contract_test).step);
+    const rosette_macos_host_contract_test = b.addTest(.{ .root_module = rosette_macos_host_contract_mod });
+    check_step.dependOn(&b.addRunArtifact(rosette_macos_host_contract_test).step);
+    const rosette_mandatory_order_contract_test = b.addTest(.{ .root_module = rosette_mandatory_order_contract_mod });
+    check_step.dependOn(&b.addRunArtifact(rosette_mandatory_order_contract_test).step);
+    const rosette_monotone_witness_contract_test = b.addTest(.{ .root_module = rosette_monotone_witness_contract_mod });
+    check_step.dependOn(&b.addRunArtifact(rosette_monotone_witness_contract_test).step);
+    const xenia_xiso_format_test = b.addTest(.{ .root_module = xenia_xiso_format_mod });
+    check_step.dependOn(&b.addRunArtifact(xenia_xiso_format_test).step);
+    const rosette_graphics_bridge_test = b.addTest(.{ .root_module = rosette_graphics_bridge_mod });
+    check_step.dependOn(&b.addRunArtifact(rosette_graphics_bridge_test).step);
+    const rosette_component_readiness_contract_test = b.addTest(.{ .root_module = rosette_component_readiness_contract_mod });
+    check_step.dependOn(&b.addRunArtifact(rosette_component_readiness_contract_test).step);
+    const xenia_host_gpu_callback_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("../lib/framework/xenia_host_gpu_callback.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    xenia_host_gpu_callback_runtime_mod.addImport("xenia_host_gpu_callback_contract", xenia_host_gpu_callback_contract_mod);
+    const xenia_host_gpu_callback_runtime_test = b.addTest(.{ .root_module = xenia_host_gpu_callback_runtime_mod });
+    check_step.dependOn(&b.addRunArtifact(xenia_host_gpu_callback_runtime_test).step);
 
     const third_party_test_files = [_][]const u8{
         "crypto/sha.zig",
@@ -1658,6 +1964,7 @@ pub fn build(b: *std.Build) void {
             root: []const u8,
             contract_name: []const u8,
             contract_root: []const u8,
+            needs_texture_format_contract: bool = false,
         };
         const subsystems = [_]Subsystem{
             .{
@@ -1684,6 +1991,7 @@ pub fn build(b: *std.Build) void {
                 .root = "../lib/gpu/texture_cache/root.zig",
                 .contract_name = "xenia_texture_contract",
                 .contract_root = "../pkg/common/xenia/texture-contract/src/root.zig",
+                .needs_texture_format_contract = true,
             },
         };
         inline for (subsystems) |subsystem| {
@@ -1697,6 +2005,13 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
             }));
+            if (subsystem.needs_texture_format_contract) {
+                // format_convert consumes the signed packed-format contract in
+                // addition to the cache's existing tiling/format contract.
+                // Keep both imports on the standalone subsystem test; the
+                // aggregate GPU module already receives this import below.
+                subsystem_mod.addImport("xenia_texture_format_contract", xenia_texture_format_contract_mod);
+            }
             const subsystem_test = b.addTest(.{ .root_module = subsystem_mod });
             check_step.dependOn(&b.addRunArtifact(subsystem_test).step);
         }
@@ -1820,7 +2135,14 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("../lib/preflight/root.zig"),
             .target = target,
             .optimize = optimize,
+            // The host-capability probes call mmap, mprotect, nanosleep and
+            // pthread directly. They have to: the question they answer is what
+            // the kernel does, and anything that went through a portable
+            // wrapper would be measuring the wrapper.
+            .link_libc = true,
         });
+        preflight_mod.addImport("rosette_host_capability_contract", rosette_host_capability_contract_mod);
+        preflight_mod.addImport("rosette_component_readiness_contract", rosette_component_readiness_contract_mod);
         const preflight_test = b.addTest(.{ .root_module = preflight_mod });
         check_step.dependOn(&b.addRunArtifact(preflight_test).step);
 
@@ -1870,12 +2192,23 @@ pub fn build(b: *std.Build) void {
             "../pkg/common/xenia/vd-ring-contract/src/root.zig",
             "../pkg/common/xenia/vd-swap-contract/src/root.zig",
             "../pkg/common/xenia/provisioning-contract/src/root.zig",
+            "../pkg/common/xenia/claim-reconciliation-contract/src/root.zig",
+            "../pkg/common/diagnostics/async-log-contract/src/root.zig",
+            "../pkg/common/abi/translation-economics-contract/src/root.zig",
+            "../pkg/common/rosette/translation-cache-contract/src/root.zig",
+            "../pkg/common/xenia/draw-dispatch-contract/src/root.zig",
+            "../pkg/common/xenia/wait-graph-contract/src/root.zig",
+            "../pkg/common/xenia/wait-handshake-policy/src/root.zig",
             "../pkg/common/xenia/pm4-contract/src/root.zig",
             "../pkg/common/xenia/xex-format/src/root.zig",
             "../pkg/common/xenia/notification-contract/src/root.zig",
             "../pkg/common/xenia/log-ring-contract/src/root.zig",
             "../pkg/common/xenia/xthread-contract/src/root.zig",
             "../pkg/common/xenia/vfs-device-contract/src/root.zig",
+            "../pkg/common/xenia/launch-assist-contract/src/root.zig",
+            "../pkg/common/rosette/ownership-contract/src/root.zig",
+            "../pkg/common/rosette/source-architecture-contract/src/root.zig",
+            "../pkg/common/xenia/rosette-script-contract/src/root.zig",
         };
         inline for (common_package_roots) |package_root| {
             const package_mod = b.createModule(.{
@@ -1893,6 +2226,7 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
             }));
+            package_mod.addImport("rosette_translation_cache_contract", rosette_translation_cache_contract_mod);
             const package_test = b.addTest(.{ .root_module = package_mod });
             check_step.dependOn(&b.addRunArtifact(package_test).step);
         }
@@ -2057,7 +2391,17 @@ pub fn build(b: *std.Build) void {
         gpu_mod.addImport("device_tree", device_tree_mod);
         gpu_mod.addImport("xenos_register_map", xenos_register_map_mod);
         gpu_mod.addImport("xenia_vd_swap_contract", xenia_vd_swap_contract_mod);
+        gpu_mod.addImport("xenia_gpu_bringup_contract", xenia_gpu_bringup_contract_mod);
+        gpu_mod.addImport("xenia_gpu_observation_contract", xenia_gpu_observation_contract_mod);
+        gpu_mod.addImport("xenia_pm4_contract", xenia_pm4_contract_mod);
+        gpu_mod.addImport("rosette_root", rosette_root_mod);
         gpu_mod.addImport("xenia_provisioning_contract", xenia_provisioning_contract_mod);
+        gpu_mod.addImport("xenia_draw_dispatch_contract", xenia_draw_dispatch_contract_mod);
+        gpu_mod.addImport("cocoa_graphics_control_contract", cocoa_graphics_control_contract_mod);
+        gpu_mod.addImport("cocoa_window_admission_contract", cocoa_window_admission_contract_mod);
+        gpu_mod.addImport("rosette_ownership_contract", rosette_ownership_contract_mod);
+        gpu_mod.addImport("xenia_texture_format_contract", xenia_texture_format_contract_mod);
+        gpu_mod.addImport("rosette_graphics_bridge", rosette_graphics_bridge_mod);
         // The full kernel export table, so lib/gpu/kernel_surface.zig can name
         // any ordinal a title imports rather than only the sixteen video ones
         // it models. Declared once and shared: two copies of 2913 entries in
@@ -2075,6 +2419,9 @@ pub fn build(b: *std.Build) void {
         dyld_mod.addImport("xenia_heap_range", xenia_heap_range_mod);
         dyld_mod.addImport("rosette_ppc_host_abi", rosette_ppc_host_abi_mod);
         dyld_mod.addImport("ppc_runtime", ppc_runtime_module);
+        dyld_mod.addImport("application_framework", application_framework_mod);
+        dyld_mod.addImport("xenia_launch_assist_contract", xenia_launch_assist_contract_mod);
+        dyld_mod.addImport("xenia_host_gpu_callback_contract", xenia_host_gpu_callback_contract_mod);
         const scheduler_mod = b.createModule(.{
             .root_source_file = b.path("../lib/scheduler/root.zig"),
             .target = target,
@@ -2160,7 +2507,10 @@ pub fn build(b: *std.Build) void {
         diagnostics_mod.addImport("xenia_shader_storage_contract", xenia_shader_storage_contract_mod);
         xenia_log_phrase_map_mod.addImport("phrase_filter", phrase_filter_mod);
         diagnostics_mod.addImport("xenia_log_phrase_map", xenia_log_phrase_map_mod);
+        diagnostics_mod.addImport("rosette_run_integrity_contract", rosette_run_integrity_contract_mod);
+        diagnostics_mod.addImport("rosette_substantiation_contract", rosette_substantiation_contract_mod);
         diagnostics_mod.addImport("vendor_library_contract", vendor_library_contract_mod);
+        diagnostics_mod.addImport("xenia_gpu_observation_contract", xenia_gpu_observation_contract_mod);
         // Package contract checks: rosette_pkg_log calls contractIsWellFormed()
         // on each at startup and writes results to .rosette/rosette-pkg.log.
         diagnostics_mod.addImport("xenia_mount_contract", b.createModule(.{
@@ -2219,12 +2569,19 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }));
-        diagnostics_mod.addImport("xenia_pm4_contract", b.createModule(.{
-            .root_source_file = b.path("../pkg/common/xenia/pm4-contract/src/root.zig"),
-            .target = target,
-            .optimize = optimize,
-        }));
+        diagnostics_mod.addImport("xenia_pm4_contract", xenia_pm4_contract_mod);
+        diagnostics_mod.addImport("rosette_mandatory_order_contract", rosette_mandatory_order_contract_mod);
+        diagnostics_mod.addImport("rosette_monotone_witness_contract", rosette_monotone_witness_contract_mod);
+        diagnostics_mod.addImport("rosette_graphics_bridge", rosette_graphics_bridge_mod);
         diagnostics_mod.addImport("xenia_vd_swap_contract", xenia_vd_swap_contract_mod);
+        diagnostics_mod.addImport("xenia_xiso_format", xenia_xiso_format_mod);
+        diagnostics_mod.addImport("xenia_claim_reconciliation_contract", xenia_claim_reconciliation_contract_mod);
+        diagnostics_mod.addImport("xenia_interrupt_callback_contract", xenia_interrupt_callback_contract_mod);
+        diagnostics_mod.addImport("xenia_host_gpu_callback_contract", xenia_host_gpu_callback_contract_mod);
+        diagnostics_mod.addImport("diagnostics_async_log_contract", diagnostics_async_log_contract_mod);
+        diagnostics_mod.addImport("abi_translation_economics_contract", abi_translation_economics_contract_mod);
+        diagnostics_mod.addImport("xenia_wait_graph_contract", xenia_wait_graph_contract_mod);
+        diagnostics_mod.addImport("xenia_wait_handshake_policy", xenia_wait_handshake_policy_mod);
         diagnostics_mod.addImport("xenia_graphics_health_contract", xenia_graphics_health_contract_mod);
         diagnostics_mod.addImport("xenia_application_controller_contract", xenia_application_controller_contract_mod);
         diagnostics_mod.addImport("application_framework_contract", application_framework_contract_mod);
@@ -2290,6 +2647,12 @@ pub fn build(b: *std.Build) void {
         });
         pthread_mod.addImport("scheduler", scheduler_mod);
         pthread_mod.addImport("event_log", event_log_mod);
+        pthread_mod.addImport("xenia_wait_handshake_policy", xenia_wait_handshake_policy_mod);
+        // Rooted so these run rather than merely exist: the module's
+        // twenty-five tests had never been built by the gate, and two of them
+        // no longer compiled against the code they cover.
+        const pthread_test = b.addTest(.{ .root_module = pthread_mod });
+        check_step.dependOn(&b.addRunArtifact(pthread_test).step);
         const guest_abi_mod = b.createModule(.{
             .root_source_file = b.path("../lib/runtime/guest-abi/root.zig"),
             .target = target,
@@ -2297,6 +2660,10 @@ pub fn build(b: *std.Build) void {
         });
         guest_abi_mod.addImport("event_log", event_log_mod);
         guest_abi_mod.addImport("libcpp_thread_abi", libcpp_thread_abi_mod);
+        // The native window runtime is the surface Xenia forwards into, so it
+        // is the layer that has to be able to say which forwardings Rosette has
+        // semantics for. The rule itself stays in the package.
+        guest_abi_mod.addImport("cocoa_window_admission_contract", cocoa_window_admission_contract_mod);
         const io_mod = b.createModule(.{
             .root_source_file = b.path("../lib/io/root.zig"),
             .target = target,
@@ -2308,7 +2675,30 @@ pub fn build(b: *std.Build) void {
         // Rooted and run: thread-local placement is an ABI contract, and the
         // previous implementation was wrong in a way that produced no error —
         // only another thread's data appearing inside yours.
-        const guest_abi_test = b.addTest(.{ .root_module = guest_abi_mod });
+        // A separate module for the tests rather than the shipped one: the
+        // native window runtime's Objective-C bridge has to be linked for its
+        // admission tests to run, and compiling that bridge into the module the
+        // processor already links it into would be a duplicate symbol.
+        const guest_abi_test_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/runtime/guest-abi/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        guest_abi_test_mod.addImport("event_log", event_log_mod);
+        guest_abi_test_mod.addImport("libcpp_thread_abi", libcpp_thread_abi_mod);
+        guest_abi_test_mod.addImport("cocoa_window_admission_contract", cocoa_window_admission_contract_mod);
+        if (is_macos) {
+            guest_abi_test_mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{macos_sdk_root}) });
+            guest_abi_test_mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{macos_sdk_root}) });
+            guest_abi_test_mod.addCSourceFile(.{
+                .file = b.path("../lib/Mach-O/native_window_bridge.m"),
+                .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
+            });
+            guest_abi_test_mod.linkFramework("AppKit", .{});
+            guest_abi_test_mod.linkFramework("QuartzCore", .{});
+            guest_abi_test_mod.linkFramework("Metal", .{});
+        }
+        const guest_abi_test = b.addTest(.{ .root_module = guest_abi_test_mod });
         check_step.dependOn(&b.addRunArtifact(guest_abi_test).step);
         const libcpp_thread_abi_test = b.addTest(.{ .root_module = libcpp_thread_abi_mod });
         check_step.dependOn(&b.addRunArtifact(libcpp_thread_abi_test).step);
@@ -2323,6 +2713,7 @@ pub fn build(b: *std.Build) void {
         macho_core_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
         macho_core_mod.addImport("exit_diagnostics", exit_diagnostics_module);
         macho_core_mod.addImport("guest_abi", guest_abi_mod);
+        macho_core_mod.addImport("rosette_translation_cache_contract", rosette_translation_cache_contract_mod);
 
         // Address-to-name, and the reason when there is no name. Rooted and run
         // because the defect this module replaces was a resolver that compiled,
@@ -2353,6 +2744,7 @@ pub fn build(b: *std.Build) void {
         macho_types_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
         macho_types_mod.addImport("exit_diagnostics", exit_diagnostics_module);
         macho_types_mod.addImport("guest_abi", guest_abi_mod);
+        macho_types_mod.addImport("rosette_translation_cache_contract", rosette_translation_cache_contract_mod);
         const macho_types_test = b.addTest(.{ .root_module = macho_types_mod });
         check_step.dependOn(&b.addRunArtifact(macho_types_test).step);
 
@@ -2595,13 +2987,18 @@ pub fn build(b: *std.Build) void {
         macho_processor_mod.addImport("process_core", process_core_mod);
         macho_processor_mod.addImport("dispatch_recovery", dispatch_recovery_mod);
         macho_processor_mod.addImport("gpu", gpu_mod);
+        macho_processor_mod.addImport("xenos_register_map", xenos_register_map_mod);
         macho_processor_mod.addImport("device_tree", device_tree_mod);
         macho_processor_mod.addImport("preflight", preflight_mod);
+        macho_processor_mod.addImport("rosette_macos_host_contract", rosette_macos_host_contract_mod);
         macho_processor_mod.addImport("ready_compiler", ready_compiler_mod);
         macho_processor_mod.addImport("xenia_heap_range", xenia_heap_range_mod);
         macho_processor_mod.addImport("ppc_runtime", ppc_runtime_module);
         macho_processor_mod.addImport("application_framework", application_framework_mod);
+        macho_processor_mod.addImport("xenia_launch_assist_contract", xenia_launch_assist_contract_mod);
+        macho_processor_mod.addImport("xenia_host_gpu_callback_contract", xenia_host_gpu_callback_contract_mod);
         macho_processor_mod.addImport("diagnostics", diagnostics_mod);
+        macho_processor_mod.addImport("xenia_xiso_format", xenia_xiso_format_mod);
         macho_processor_mod.addImport("memory", memory_mod);
         macho_processor_mod.addImport("io", io_mod);
         macho_processor_mod.addImport("guest_abi", guest_abi_mod);
@@ -2634,6 +3031,14 @@ pub fn build(b: *std.Build) void {
                 .file = b.path("../lib/Mach-O/application_framework_exports_anchor.c"),
                 .flags = &.{ "-Wall", "-Wextra" },
             });
+            macho_processor_mod.addCSourceFile(.{
+                .file = b.path("../lib/Mach-O/xenia_launch_assist_exports_anchor.c"),
+                .flags = &.{ "-Wall", "-Wextra" },
+            });
+            macho_processor_mod.addCSourceFile(.{
+                .file = b.path("../lib/Mach-O/xenia_host_gpu_callback_exports_anchor.c"),
+                .flags = &.{ "-Wall", "-Wextra" },
+            });
             macho_processor_mod.linkFramework("AppKit", .{});
             macho_processor_mod.linkFramework("QuartzCore", .{});
             macho_processor_mod.linkFramework("Metal", .{});
@@ -2655,6 +3060,14 @@ pub fn build(b: *std.Build) void {
         // guard (killed before any handler could run, so no crash point). Give
         // the main thread a stack that fits the actual frames with headroom.
         macho_processor.stack_size = 64 * 1024 * 1024;
+        // Xenia hosts its optional Rosette framework provider in this
+        // executable and resolves the ABI with dlsym(RTLD_DEFAULT). `pub
+        // export` keeps the provider live, but it does not by itself place
+        // the executable's symbols in the process-wide dynamic lookup table.
+        // Make the host boundary discoverable without changing the provider's
+        // contract: the callback still has to pass Rosette's runtime gates
+        // before it can authorize any host mutation.
+        macho_processor.rdynamic = true;
         const macho_processor_install = b.addInstallArtifact(macho_processor, .{});
         b.getInstallStep().dependOn(&macho_processor_install.step);
         const macho_processor_step = b.step(
@@ -2688,12 +3101,16 @@ pub fn build(b: *std.Build) void {
         macho_processor_test_mod.addImport("process_core", process_core_mod);
         macho_processor_test_mod.addImport("dispatch_recovery", dispatch_recovery_mod);
         macho_processor_test_mod.addImport("gpu", gpu_mod);
+        macho_processor_test_mod.addImport("xenos_register_map", xenos_register_map_mod);
         macho_processor_test_mod.addImport("device_tree", device_tree_mod);
         macho_processor_test_mod.addImport("preflight", preflight_mod);
+        macho_processor_test_mod.addImport("rosette_macos_host_contract", rosette_macos_host_contract_mod);
         macho_processor_test_mod.addImport("ready_compiler", ready_compiler_mod);
         macho_processor_test_mod.addImport("xenia_heap_range", xenia_heap_range_mod);
         macho_processor_test_mod.addImport("application_framework", application_framework_mod);
+        macho_processor_test_mod.addImport("xenia_host_gpu_callback_contract", xenia_host_gpu_callback_contract_mod);
         macho_processor_test_mod.addImport("diagnostics", diagnostics_mod);
+        macho_processor_test_mod.addImport("xenia_xiso_format", xenia_xiso_format_mod);
         macho_processor_test_mod.addImport("memory", memory_mod);
         macho_processor_test_mod.addImport("io", io_mod);
         macho_processor_test_mod.addImport("guest_abi", guest_abi_mod);
@@ -2729,6 +3146,69 @@ pub fn build(b: *std.Build) void {
         // likely to break something silently — had never executed under
         // `zig build check`.
         check_step.dependOn(&b.addRunArtifact(macho_processor_test).step);
+
+        // Keep the release census honest for the small source roots that are
+        // shipped by Rosette but were previously only compiled indirectly (or
+        // not at all) by a processor test. Each entry is a real run artifact,
+        // so named and anonymous declarations in these roots are not confused
+        // with compile-only imports. This block is deliberately independent
+        // of Xenia and never launches an emulator.
+        const source_test_specs = [_][]const u8{
+            "../lib/processor/bat_processor/root.zig",
+            "../lib/runtime/mode/root.zig",
+            "../lib/runtime/mode/runtime_mode_test.zig",
+            "../src/compat/source/bitcode_stub.zig",
+            "../src/compat/source/force_types.zig",
+            "../src/compat/source/include_compat.zig",
+            "../src/compat/source/narrow.zig",
+            "../src/memory/safety.zig",
+            "../src/tooling/app_parser/root.zig",
+            "../src/source_test_root.zig",
+            "../src/tooling/binary_exporter/dos_mz_exporter.zig",
+            "../src/tooling/disasm_logger/x86_trace_logger.zig",
+            "../src/tooling/exe_parser/launch_config.zig",
+            "../src/tooling/exe_parser/pe_parser.zig",
+            "../src/tooling/exe_parser/rosette_exe_runner.zig",
+            "../src/tooling/exe_parser/rosette_package.zig",
+            "../src/tooling/iso/root.zig",
+        };
+        inline for (source_test_specs) |source| {
+            const source_test_mod = b.createModule(.{
+                .root_source_file = b.path(source),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = std.mem.eql(u8, source, "../src/shell/global_config/rosette_shell.zig"),
+            });
+            if (std.mem.eql(u8, source, "../lib/runtime/mode/root.zig") or
+                std.mem.eql(u8, source, "../lib/runtime/mode/runtime_mode_test.zig"))
+            {
+                source_test_mod.addImport("event_log", event_log_mod);
+            }
+            if (std.mem.eql(u8, source, "../src/shell/global_config/rosette_shell.zig")) {
+                source_test_mod.addImport("entrypoint_alignment", entrypoint_alignment_module);
+                source_test_mod.addImport("entrypoint_kernel_process_guard", entrypoint_kernel_process_guard_module);
+                source_test_mod.addImport("compat_source_include_compat", b.createModule(.{
+                    .root_source_file = b.path("../src/compat/source/include_compat.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }));
+            }
+            if (std.mem.eql(u8, source, "../src/tooling/disasm_logger/x86_trace_logger.zig")) {
+                source_test_mod.addImport("x86_asm", x86_trace_asm_module);
+            }
+            if (std.mem.eql(u8, source, "../src/source_test_root.zig")) {
+                source_test_mod.addImport("runtime_abi_handshake", runtime_abi_module);
+                source_test_mod.addImport("bridge_register_tracing", bridge_register_trace_module);
+                source_test_mod.addImport("bridge_exceptions", bridge_exceptions_module);
+                source_test_mod.addImport("bridge_memory", bridge_memory_module);
+                source_test_mod.addImport("bridge_stack", bridge_stack_module);
+                source_test_mod.addImport("bridge_dos_runtime", bridge_dos_runtime_module);
+                source_test_mod.addImport("x86_asm", x86_asm_module);
+                source_test_mod.addImport("x86_trace_logger", trace_logger_module);
+            }
+            const source_test = b.addTest(.{ .root_module = source_test_mod });
+            check_step.dependOn(&b.addRunArtifact(source_test).step);
+        }
     }
 
     // Aggregate Win32 ABI handshake suite
