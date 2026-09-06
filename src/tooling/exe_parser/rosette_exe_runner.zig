@@ -7,6 +7,7 @@ fn bootWrite(text: []const u8) void {
 
 fn defaultTraceLogPath(allocator: std.mem.Allocator, exe_path: []const u8) ![:0]u8 {
     const log_text = try std.fmt.allocPrint(allocator, "{s}.trace.log", .{exe_path});
+    defer allocator.free(log_text);
     return allocator.dupeZ(u8, log_text);
 }
 
