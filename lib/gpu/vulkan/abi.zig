@@ -71,6 +71,7 @@ pub const STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT: 
 pub const STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT: u32 = 1_000_081_000;
 pub const STRUCTURE_TYPE_INSTANCE_CREATE_INFO: u32 = 1;
 pub const STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO: u32 = 2;
+pub const STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2: u32 = 1_000_145_003;
 pub const STRUCTURE_TYPE_DEVICE_CREATE_INFO: u32 = 3;
 pub const STRUCTURE_TYPE_SUBMIT_INFO: u32 = 4;
 pub const STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO: u32 = 5;
@@ -157,12 +158,18 @@ pub const FORMAT_B8G8R8A8_UNORM: u32 = 44;
 pub const FORMAT_B8G8R8A8_SRGB: u32 = 50;
 pub const FORMAT_A8B8G8R8_UNORM_PACK32: u32 = 51;
 pub const FORMAT_A2B10G10R10_UNORM_PACK32: u32 = 64;
+/// The signed 2:10:10:10 pack. Unusable as an image on Metal — both tiling
+/// feature fields read zero, because Metal has no signed 10:10:10:2 pixel
+/// format — and natively supported as a *vertex* attribute, where the driver
+/// reports `VERTEX_BUFFER_BIT` backed by `MTLVertexFormatInt1010102Normalized`.
+pub const FORMAT_A2B10G10R10_SNORM_PACK32: u32 = 65;
 pub const FORMAT_B4G4R4A4_UNORM_PACK16: u32 = 3;
 pub const FORMAT_R5G6B5_UNORM_PACK16: u32 = 4;
 pub const FORMAT_A1R5G5B5_UNORM_PACK16: u32 = 8;
 pub const FORMAT_G8B8G8R8_422_UNORM: u32 = 1_000_156_000;
 pub const FORMAT_B8G8R8G8_422_UNORM: u32 = 1_000_156_001;
 pub const FORMAT_R16_UNORM: u32 = 70;
+pub const FORMAT_R8G8B8A8_SNORM: u32 = 38;
 pub const FORMAT_R16G16_UNORM: u32 = 77;
 pub const FORMAT_R16G16_SNORM: u32 = 78;
 pub const FORMAT_R16_SFLOAT: u32 = 76;
@@ -211,6 +218,15 @@ pub const ACCESS_TRANSFER_READ_BIT: u32 = 0x0000_0800;
 /// texture format can back a sampled image at all, which is the question the
 /// texture-format substitution ladder asks of every candidate.
 pub const FORMAT_FEATURE_SAMPLED_IMAGE_BIT: u32 = 0x0000_0001;
+/// `VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT`. The bit that decides whether a
+/// format may be a vertex attribute, and the only one set for
+/// `A2B10G10R10_SNORM_PACK32` on Metal: the host has
+/// `MTLVertexFormatInt1010102Normalized` and no signed 10:10:10:2 *pixel*
+/// format at all. Reading image support alone reports that format as absent
+/// and sends a signed vertex stream through an unsigned reinterpretation the
+/// host never needed.
+pub const FORMAT_FEATURE_VERTEX_BUFFER_BIT: u32 = 0x0000_0040;
+pub const FORMAT_FEATURE_COLOR_ATTACHMENT_BIT: u32 = 0x0000_0080;
 pub const FORMAT_FEATURE_BLIT_SRC_BIT: u32 = 0x0000_0400;
 pub const FORMAT_FEATURE_BLIT_DST_BIT: u32 = 0x0000_0800;
 pub const FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT: u32 = 0x0000_1000;

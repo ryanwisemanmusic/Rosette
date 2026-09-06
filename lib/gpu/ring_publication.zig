@@ -70,6 +70,47 @@ pub const Geometry = struct {
     }
 };
 
+pub const max_advance_records: usize = 64;
+
+/// Provenance captured at the actual guest-side publication boundary. The
+/// command processor's worker thread is deliberately not an acceptable
+/// substitute: it can consume a ring without being the thread that filled or
+/// published it.
+pub const ProducerContext = struct {
+    valid: bool = false,
+    guest_thread: u64 = 0,
+    guest_pc: u64 = 0,
+    guest_lr: u64 = 0,
+    publication_epoch: u64 = 0,
+    ring_base: u64 = 0,
+    ring_size_bytes: u64 = 0,
+    span_dwords: u32 = 0,
+};
+
+/// One value-changing publication.  Retaining the value and its predecessor
+/// lets the transport audit join the source write to the cumulative read
+/// pointer write-back instead of manufacturing placeholder indices.
+pub const AdvanceRecord = struct {
+    previous_value: u32 = 0,
+    value: u32 = 0,
+    step: u64 = 0,
+    applied: bool = false,
+    worker_woken: bool = false,
+    consumed: bool = false,
+    guest_writeback: bool = false,
+    applied_step: u64 = 0,
+    worker_woken_step: u64 = 0,
+    consumed_step: u64 = 0,
+    guest_writeback_step: u64 = 0,
+    read_before: u32 = 0,
+    read_after: u32 = 0,
+    consumed_dwords: u32 = 0,
+    /// The source of the publication, if the producer logger carried a
+    /// guest-side context. `first_thread` in the old bring-up ledger was the
+    /// first observer (usually the CP worker), not this thread.
+    producer: ProducerContext = .{},
+};
+
 pub const Tracker = struct {
     /// Times the register was written, whatever the value.
     writes: u64 = 0,
@@ -77,8 +118,15 @@ pub const Tracker = struct {
     advances: u64 = 0,
     /// Times the same value was written again, publishing nothing.
     repeats: u64 = 0,
+    /// A ring snapshot taken before the first write is a valid predecessor.
+    /// Keeping it separate from `first_value` preserves the distinction
+    /// between an observed register write and a sampled current value.
+    baseline_value: ?u32 = null,
     first_value: ?u32 = null,
     last_value: ?u32 = null,
+    advance_records: [max_advance_records]AdvanceRecord = [_]AdvanceRecord{.{}} ** max_advance_records,
+    advance_record_count: usize = 0,
+    advance_records_dropped: u64 = 0,
     geometry: ?Geometry = null,
     /// The largest outstanding span ever observed. Retained because a span the
     /// command processor has since drained still proves the producer published.
@@ -120,27 +168,156 @@ pub const Tracker = struct {
     /// stamps at zero and makes `stalledSteps` return null rather than invent
     /// an age.
     pub fn observeWritePointerAt(self: *Tracker, value: u32, executed_steps: u64) Outcome {
+        return self.observeWritePointerAtWithContext(value, executed_steps, .{});
+    }
+
+    /// Observe a pointer write and retain producer provenance when the caller
+    /// has it. A context is optional because older Xenia logs did not expose
+    /// it; absence remains `valid=false` and is reported as attribution loss.
+    pub fn observeWritePointerAtWithContext(
+        self: *Tracker,
+        value: u32,
+        executed_steps: u64,
+        context: ProducerContext,
+    ) Outcome {
+        const before = self.advance_record_count;
+        const outcome = self.observeWritePointerCore(value, executed_steps);
+        if (outcome == .advanced and self.advance_record_count > before) {
+            self.advance_records[self.advance_record_count - 1].producer = context;
+        }
+        return outcome;
+    }
+
+    fn observeWritePointerCore(self: *Tracker, value: u32, executed_steps: u64) Outcome {
         self.writes +|= 1;
         if (executed_steps != 0) self.last_write_step = executed_steps;
         defer self.last_value = value;
+        const previous = self.last_value orelse self.baseline_value;
         if (self.first_value == null) {
             self.first_value = value;
-            if (executed_steps != 0) {
-                self.first_advance_step = executed_steps;
-                self.last_advance_step = executed_steps;
+            const baseline = previous orelse return .first_observation;
+            if (baseline == value) {
+                self.repeats +|= 1;
+                return .repeated;
             }
-            return .first_observation;
+            self.noteAdvance(baseline, value, executed_steps);
+            return .advanced;
         }
-        if (self.last_value.? == value) {
+        if (previous.? == value) {
             self.repeats +|= 1;
             return .repeated;
         }
+        self.noteAdvance(previous.?, value, executed_steps);
+        return .advanced;
+    }
+
+    fn noteAdvance(self: *Tracker, previous: u32, value: u32, executed_steps: u64) void {
         self.advances +|= 1;
+        if (self.advance_record_count < max_advance_records) {
+            self.advance_records[self.advance_record_count] = .{
+                .previous_value = previous,
+                .value = value,
+                .step = executed_steps,
+            };
+            self.advance_record_count += 1;
+        } else {
+            self.advance_records_dropped +|= 1;
+        }
         if (executed_steps != 0) {
             if (self.first_advance_step == 0) self.first_advance_step = executed_steps;
             self.last_advance_step = executed_steps;
         }
-        return .advanced;
+    }
+
+    pub fn retainedAdvances(self: *const Tracker) []const AdvanceRecord {
+        return self.advance_records[0..self.advance_record_count];
+    }
+
+    fn findAdvance(self: *Tracker, previous: u32, value: u32) ?*AdvanceRecord {
+        var index = self.advance_record_count;
+        while (index > 0) {
+            index -= 1;
+            const record = &self.advance_records[index];
+            if (record.previous_value == previous and record.value == value) return record;
+        }
+        return null;
+    }
+
+    /// Join Xenia's authoritative `WPTR advanced` statement to the source
+    /// write without treating the earlier diagnostic register print as proof
+    /// that the command processor applied it.
+    pub fn observeApplied(
+        self: *Tracker,
+        previous: u32,
+        value: u32,
+        worker_woken: bool,
+        step: u64,
+    ) bool {
+        return self.observeAppliedWithContext(previous, value, worker_woken, step, .{});
+    }
+
+    /// Join the command processor's applied line and its producer context to
+    /// one exact advance. The old overload remains for pre-context logs.
+    pub fn observeAppliedWithContext(
+        self: *Tracker,
+        previous: u32,
+        value: u32,
+        worker_woken: bool,
+        step: u64,
+        context: ProducerContext,
+    ) bool {
+        const record = self.findAdvance(previous, value) orelse return false;
+        if (!record.applied) record.applied_step = step;
+        record.applied = true;
+        if (worker_woken) {
+            if (!record.worker_woken) record.worker_woken_step = step;
+            record.worker_woken = true;
+        }
+        if (context.valid) record.producer = context;
+        return true;
+    }
+
+    /// Join the command processor's exact read interval to the publication it
+    /// drained. Duplicate summary lines are idempotent.
+    pub fn observeConsumption(
+        self: *Tracker,
+        read_before: u32,
+        read_after: u32,
+        write_value: u32,
+        dwords: u32,
+        step: u64,
+    ) bool {
+        const record = self.findAdvance(read_before, write_value) orelse return false;
+        if (!record.consumed) {
+            record.consumed_step = step;
+            record.read_before = read_before;
+            record.read_after = read_after;
+            record.consumed_dwords = dwords;
+        }
+        record.consumed = true;
+        return true;
+    }
+
+    /// A sampled write-back word acknowledges the transition whose published
+    /// index it equals. Earlier transitions remain historical rather than
+    /// being rewritten as if each intermediate value had been sampled.
+    pub fn observeGuestWriteback(self: *Tracker, value: u32, step: u64) bool {
+        var index = self.advance_record_count;
+        while (index > 0) {
+            index -= 1;
+            const record = &self.advance_records[index];
+            if (record.value != value or !record.consumed) continue;
+            if (!record.guest_writeback) record.guest_writeback_step = step;
+            record.guest_writeback = true;
+            return true;
+        }
+        return false;
+    }
+
+    /// Best known predecessor for the next write, whether supplied by a prior
+    /// write or by a pre-write geometry snapshot.
+    pub fn referenceValue(self: *const Tracker) ?u32 {
+        return self.last_value orelse self.baseline_value;
     }
 
     /// How long the producer has been quiet, in executed steps, or null when
@@ -156,6 +333,12 @@ pub const Tracker = struct {
     pub fn observeGeometry(self: *Tracker, geometry: Geometry) void {
         self.geometry = geometry;
         if (geometry.spanDwords()) |outstanding| {
+            // Only an empty snapshot is a safe pre-write baseline. A non-empty
+            // snapshot already proves publication, but it does not reveal the
+            // value that preceded it.
+            if (self.writes == 0 and self.baseline_value == null and outstanding == 0) {
+                self.baseline_value = geometry.write_pointer;
+            }
             if (outstanding > self.largest_span_dwords) self.largest_span_dwords = outstanding;
             if (outstanding == 0) self.drained_observations +|= 1;
         }
@@ -255,6 +438,59 @@ test "a changed write pointer is a publication" {
     try std.testing.expectEqual(Outcome.advanced, tracker.observeWritePointer(0x19));
     try std.testing.expect(tracker.published());
     try std.testing.expect(std.mem.indexOf(u8, tracker.verdict(), "downstream of publication") != null);
+}
+
+test "an empty geometry snapshot makes the first changed write an advance" {
+    var tracker = Tracker{};
+    tracker.observeGeometry(.{
+        .base = 0x1FC9_B000,
+        .size_bytes = 0x8000,
+        .read_pointer = 0,
+        .write_pointer = 0,
+    });
+    try std.testing.expectEqual(@as(?u32, 0), tracker.referenceValue());
+    try std.testing.expectEqual(Outcome.advanced, tracker.observeWritePointerAt(0x16, 100));
+    try std.testing.expectEqual(@as(u64, 1), tracker.advances);
+    try std.testing.expectEqual(@as(u64, 100), tracker.first_advance_step);
+    try std.testing.expectEqual(@as(usize, 1), tracker.retainedAdvances().len);
+    try std.testing.expectEqual(@as(u32, 0), tracker.retainedAdvances()[0].previous_value);
+    try std.testing.expectEqual(@as(u32, 0x16), tracker.retainedAdvances()[0].value);
+    try std.testing.expect(tracker.published());
+}
+
+test "an unbaselined first observation is not stamped as a publication" {
+    var tracker = Tracker{};
+    try std.testing.expectEqual(Outcome.first_observation, tracker.observeWritePointerAt(0x19, 100));
+    try std.testing.expectEqual(@as(u64, 0), tracker.advances);
+    try std.testing.expectEqual(@as(u64, 0), tracker.first_advance_step);
+    try std.testing.expectEqual(@as(u64, 0), tracker.last_advance_step);
+    try std.testing.expect(!tracker.published());
+}
+
+test "applied consumed and writeback evidence join the exact publication" {
+    var tracker = Tracker{};
+    tracker.observeGeometry(.{
+        .base = 0x1FC9_B000,
+        .size_bytes = 0x8000,
+        .read_pointer = 0,
+        .write_pointer = 0,
+    });
+    try std.testing.expectEqual(Outcome.advanced, tracker.observeWritePointerAt(0x16, 100));
+    try std.testing.expect(tracker.observeApplied(0, 0x16, true, 110));
+    try std.testing.expect(tracker.observeConsumption(0, 0x16, 0x16, 22, 120));
+    // The emulator emits both a detailed activity line and a milestone line.
+    // Replaying the latter must not double the consumed count.
+    try std.testing.expect(tracker.observeConsumption(0, 0x16, 0x16, 22, 121));
+    try std.testing.expect(tracker.observeGuestWriteback(0x16, 130));
+
+    const record = tracker.retainedAdvances()[0];
+    try std.testing.expect(record.applied);
+    try std.testing.expect(record.worker_woken);
+    try std.testing.expect(record.consumed);
+    try std.testing.expect(record.guest_writeback);
+    try std.testing.expectEqual(@as(u32, 0x16), record.read_after);
+    try std.testing.expectEqual(@as(u32, 22), record.consumed_dwords);
+    try std.testing.expectEqual(@as(u64, 120), record.consumed_step);
 }
 
 // A span the command processor has already drained still proves the producer

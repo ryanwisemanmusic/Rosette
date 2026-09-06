@@ -2,10 +2,11 @@
 //! means when the emulator keeps asking.
 //!
 //! The emulator emits a "callback-missing import probe" for each graphics
-//! export whenever it decides a callback has gone missing. The probe reports,
-//! per ordinal: whether the import slot is committed and translatable, the word
-//! in it, the thunk address, the first two instructions at the thunk, and
-//! whether those instructions are the kernel-export stub.
+//! export whenever it decides a callback has gone missing. During bootstrap it
+//! can also emit a "thunk readiness" line before the call. Both report, per
+//! ordinal: whether the import slot is committed/imported and translatable,
+//! the word in it, the thunk address, the first two instructions at the thunk,
+//! and whether those instructions are the kernel-export stub.
 //!
 //! Read carelessly, a probe firing looks like a binding failure — the emulator
 //! is asking whether the import is bound, so presumably it is not. Read
@@ -274,7 +275,7 @@ test "an unprobed ledger concludes nothing either way" {
 
 test "every binding state explains itself and only bound is healthy" {
     inline for (.{
-        Binding.unprobed, Binding.bound, Binding.thunk_not_a_stub,
+        Binding.unprobed,       Binding.bound,         Binding.thunk_not_a_stub,
         Binding.thunk_unmapped, Binding.slot_unmapped,
     }) |binding| {
         try std.testing.expect(binding.label().len > 0);

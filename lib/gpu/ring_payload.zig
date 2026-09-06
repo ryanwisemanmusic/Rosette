@@ -156,6 +156,110 @@ pub fn digest(bytes: []const u8, ring_dwords: u32, limit_dwords: u32) Digest {
     return result;
 }
 
+/// The window a command processor should be handed for a retained batch, as
+/// distinct from the window the batch's non-zero content occupies.
+///
+/// ## Why the two differ
+///
+/// `digest` finds runs of non-zero dwords, which is the right shape for saying
+/// what the producer wrote. It is the wrong shape for handing to a decoder: a
+/// PM4 packet's payload may legitimately contain a zero dword, so a
+/// content-derived envelope can end *in the middle of a packet*. The decoder
+/// then reads a header that declares more dwords than the window holds and
+/// refuses the whole batch — and on 2026-09-01 that is exactly what happened:
+/// a fourteen-dword envelope, `error=TruncatedRing`, and every render-target
+/// stage below the stateful executor reading zero for the rest of the run
+/// because the only thing that could have programmed them was thrown away.
+///
+/// So the extent is derived from the *frames*: start where the content starts,
+/// and end after the last packet whose header begins inside the content
+/// envelope. Nothing here reads or interprets payload — it walks headers.
+pub const FramedExtent = struct {
+    start: u32 = 0,
+    /// Dwords from `start`, covering whole packets.
+    dwords: u32 = 0,
+    /// Packet headers crossed. Zero means nothing in the envelope framed.
+    packets: u32 = 0,
+    /// A header began inside the envelope and its packet ends past the content
+    /// the envelope described. This is the case the content window cuts in
+    /// half, and a non-zero count is the reason the two numbers differ.
+    packets_beyond_content: u32 = 0,
+    /// A header began inside the envelope and its payload runs past the end of
+    /// the ring. The extent stops there and the batch really is truncated.
+    truncated_by_ring: bool = false,
+    /// The walk stopped on a header that declares no length. Nothing after it
+    /// can be framed from here.
+    stopped_at_unframed_dword: bool = false,
+    /// The walk hit its iteration bound before running out of packets.
+    stopped_at_limit: bool = false,
+
+    /// Whether the frame-derived window is wider than the content-derived one.
+    pub fn widensContentWindow(self: FramedExtent) bool {
+        return self.packets_beyond_content != 0;
+    }
+};
+
+/// Extend a content envelope to whole packets.
+///
+/// `envelope_dwords` is the content window (the digest's run envelope) and
+/// bounds which headers are considered: a packet is included when its *header*
+/// begins inside it. `limit_dwords` bounds the walk itself so a malformed ring
+/// cannot make this the dominant cost of a checkpoint.
+pub fn framedExtent(
+    bytes: []const u8,
+    ring_dwords: u32,
+    start: u32,
+    envelope_dwords: u32,
+    limit_dwords: u32,
+) FramedExtent {
+    var result = FramedExtent{ .start = start };
+    if (ring_dwords == 0 or envelope_dwords == 0) return result;
+    if (start >= ring_dwords) return result;
+    if (bytes.len < @as(usize, ring_dwords) * 4) return result;
+
+    const content_end = @min(start +| envelope_dwords, ring_dwords);
+    var at: u32 = start;
+    var steps: u32 = 0;
+    while (at < content_end) {
+        if (steps >= limit_dwords) {
+            result.stopped_at_limit = true;
+            break;
+        }
+        steps += 1;
+        const raw = readDwordBig(bytes, at);
+        // A zero dword is never a header. `decodeHeader` reads it as a
+        // two-dword type-0 packet, which is exactly the phantom packet the
+        // digest above excludes, and walking it would extend the window
+        // through untouched ring.
+        if (raw == 0) {
+            result.stopped_at_unframed_dword = true;
+            break;
+        }
+        const header = pm4.decodeHeader(raw);
+        const total = header.totalDwords();
+        if (total == 0) {
+            result.stopped_at_unframed_dword = true;
+            break;
+        }
+        const end = at +| total;
+        if (end > ring_dwords) {
+            result.truncated_by_ring = true;
+            break;
+        }
+        result.packets += 1;
+        if (end > content_end) result.packets_beyond_content += 1;
+        result.dwords = end - start;
+        at = end;
+    }
+    // Never narrower than the content the caller already knew about: a walk
+    // that framed nothing must not shrink the window and turn a decodable
+    // batch into an empty one.
+    if (result.dwords < @min(envelope_dwords, ring_dwords - start)) {
+        result.dwords = @min(envelope_dwords, ring_dwords - start);
+    }
+    return result;
+}
+
 /// Copy a run's dwords out for printing. Returns how many were written.
 pub fn dumpRun(bytes: []const u8, ring_dwords: u32, run: Run, out: []u32) u32 {
     if (ring_dwords == 0 or bytes.len < @as(usize, ring_dwords) * 4) return 0;
@@ -315,4 +419,92 @@ test "a ring shorter than its claimed size is refused rather than read out of bo
     try std.testing.expectEqual(@as(u32, 0), result.scanned_dwords);
     var out: [4]u32 = undefined;
     try std.testing.expectEqual(@as(u32, 0), dumpRun(&bytes, 256, .{ .start = 0, .length = 4 }, &out));
+}
+
+// The 2026-09-01 defect, reproduced. A packet whose payload contains a zero
+// dword splits the non-zero run, the content envelope ends inside the packet,
+// and the decoder handed that envelope refuses the entire batch.
+test "a packet whose payload holds a zero dword still frames completely" {
+    var bytes = [_]u8{0} ** (64 * 4);
+    // TYPE3 packet at dword 0 declaring six payload dwords, one of which is
+    // zero. The content run therefore ends at dword 5, mid-packet.
+    const header = pm4.packetType3(.set_constant, 6, false).?;
+    std.mem.writeInt(u32, bytes[0..4], header, .big);
+    for (1..7) |index| {
+        const value: u32 = if (index == 5) 0 else 0x1000 + @as(u32, @intCast(index));
+        std.mem.writeInt(u32, bytes[index * 4 ..][0..4], value, .big);
+    }
+
+    const content = digest(&bytes, 64, 64);
+    try std.testing.expect(content.run_count >= 1);
+    try std.testing.expectEqual(@as(u32, 0), content.runs[0].start);
+    // The content window is short: it stops at the zero dword inside the
+    // payload, which is the whole problem.
+    try std.testing.expect(content.runs[0].length < 7);
+
+    const framed = framedExtent(&bytes, 64, 0, content.runs[0].length, 64);
+    try std.testing.expectEqual(@as(u32, 7), framed.dwords);
+    try std.testing.expectEqual(@as(u32, 1), framed.packets);
+    try std.testing.expectEqual(@as(u32, 1), framed.packets_beyond_content);
+    try std.testing.expect(framed.widensContentWindow());
+    try std.testing.expect(!framed.truncated_by_ring);
+}
+
+// A batch that frames cleanly inside its content must not be widened: the
+// extent is a repair for a specific defect, not a licence to hand the decoder
+// dwords the producer never wrote.
+test "a cleanly framed batch is not widened" {
+    var bytes = [_]u8{0} ** (64 * 4);
+    const header = pm4.packetType3(.set_constant, 2, false).?;
+    std.mem.writeInt(u32, bytes[0..4], header, .big);
+    std.mem.writeInt(u32, bytes[4..8], 0x1111, .big);
+    std.mem.writeInt(u32, bytes[8..12], 0x2222, .big);
+
+    const content = digest(&bytes, 64, 64);
+    try std.testing.expectEqual(@as(u32, 3), content.runs[0].length);
+    const framed = framedExtent(&bytes, 64, 0, 3, 64);
+    try std.testing.expectEqual(@as(u32, 3), framed.dwords);
+    try std.testing.expectEqual(@as(u32, 0), framed.packets_beyond_content);
+    try std.testing.expect(!framed.widensContentWindow());
+}
+
+// A header whose payload genuinely runs past the ring is truncated, and saying
+// so is the difference between a windowing repair and a claim about the ring.
+test "a packet that runs past the ring end is reported as truncated" {
+    var bytes = [_]u8{0} ** (8 * 4);
+    const header = pm4.packetType3(.set_constant, 32, false).?;
+    std.mem.writeInt(u32, bytes[0..4], header, .big);
+    std.mem.writeInt(u32, bytes[4..8], 0x1234, .big);
+
+    const framed = framedExtent(&bytes, 8, 0, 2, 64);
+    try std.testing.expect(framed.truncated_by_ring);
+    try std.testing.expectEqual(@as(u32, 0), framed.packets);
+    // Never narrower than what the caller already had.
+    try std.testing.expectEqual(@as(u32, 2), framed.dwords);
+}
+
+// The walk is bounded and every degenerate shape has to terminate, or a
+// malformed ring turns a checkpoint into the run.
+test "the framed extent terminates on filler, on a bound and outside the ring" {
+    var bytes = [_]u8{0} ** (32 * 4);
+    // All zero: no frame at all, and the window stays what it was.
+    const empty = framedExtent(&bytes, 32, 0, 4, 64);
+    try std.testing.expectEqual(@as(u32, 4), empty.dwords);
+    try std.testing.expectEqual(@as(u32, 0), empty.packets);
+
+    // A start past the ring answers nothing rather than reading out of bounds.
+    const outside = framedExtent(&bytes, 32, 64, 4, 64);
+    try std.testing.expectEqual(@as(u32, 0), outside.dwords);
+
+    // An empty envelope is not a window.
+    try std.testing.expectEqual(@as(u32, 0), framedExtent(&bytes, 32, 0, 0, 64).dwords);
+
+    // A wall of one-dword type-2 filler against a tight iteration bound stops
+    // at the bound and says so.
+    for (0..32) |index| {
+        std.mem.writeInt(u32, bytes[index * 4 ..][0..4], @as(u32, 2) << 30, .big);
+    }
+    const bounded = framedExtent(&bytes, 32, 0, 32, 4);
+    try std.testing.expect(bounded.stopped_at_limit);
+    try std.testing.expect(bounded.packets <= 4);
 }

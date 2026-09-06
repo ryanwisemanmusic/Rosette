@@ -10,6 +10,7 @@ const pm4 = @import("pm4.zig");
 const pm4_fault_journal = @import("pm4_fault_journal.zig");
 const packet_trace = @import("packet_trace.zig");
 const regs = @import("xenos_registers.zig");
+const register_map = @import("xenos_register_map");
 
 pub const Failure = enum(u8) {
     truncated_packet,
@@ -99,10 +100,27 @@ pub const Executor = struct {
     indirect_buffer_count: u64 = 0,
     register_rmw_count: u64 = 0,
     conditional_write_count: u64 = 0,
+    /// Register writes encoded by the command stream itself. These exclude
+    /// executor bookkeeping such as CP_PROG_COUNTER, draw initiators and event
+    /// initiators, so a second decoder can compare what the title requested
+    /// without comparing Rosette's implementation side effects.
+    command_register_writes: u64 = 0,
+    command_unclassified_register_writes: u64 = 0,
+    command_out_of_range_register_writes: u64 = 0,
     predicated_skip_count: u64 = 0,
     bin_mask_updates: u64 = 0,
     bin_select_updates: u64 = 0,
     interrupt_count: u64 = 0,
+    /// How many times each type-3 opcode was dispatched.
+    ///
+    /// The aggregate counters above answer "how much did the title submit".
+    /// This answers a different question the aggregates cannot: **which**
+    /// packets were in the batch — and specifically whether the completion
+    /// packets were there at all. A title that submits draws and never encodes
+    /// an interrupt or an event write is not waiting on the GPU, and a title
+    /// that encodes one and gets nothing back is waiting on the emulator. Those
+    /// are opposite investigations and no aggregate separates them.
+    opcode_histogram: [128]u32 = [_]u32{0} ** 128,
     conditional_execute_count: u64 = 0,
     conditional_skip_count: u64 = 0,
     memory_counter_write_count: u64 = 0,
@@ -235,6 +253,8 @@ pub const Executor = struct {
                 .type0 => self.executeType0(header, payload),
                 .type1 => {
                     if (payload.len != 2) return self.fail(.invalid_packet);
+                    self.noteCommandRegister(header.register_index);
+                    self.noteCommandRegister(header.register_index_2);
                     self.register_file.write(header.register_index, payload[0]);
                     self.register_file.write(header.register_index_2, payload[1]);
                 },
@@ -260,8 +280,12 @@ pub const Executor = struct {
     fn executeType0(self: *Executor, header: pm4.Header, payload: []const u32) void {
         self.type0_count +%= 1;
         if (header.one_register) {
-            for (payload) |value| self.register_file.write(header.register_index, value);
+            for (payload) |value| {
+                self.noteCommandRegister(header.register_index);
+                self.register_file.write(header.register_index, value);
+            }
         } else {
+            self.noteCommandRegisterRange(header.register_index, payload.len);
             self.register_file.writeRange(header.register_index, payload);
         }
     }
@@ -269,6 +293,11 @@ pub const Executor = struct {
     fn executeType3(self: *Executor, opcode: pm4.Type3Opcode, payload: []const u32, packet: []const u32, predicated: bool) Error!void {
         self.type3_count +%= 1;
         const raw = @as(u32, @intFromEnum(opcode));
+        // Recorded before predication is considered: a packet the bin check
+        // skipped was still encoded by the title, and the census answers what
+        // the title asked for rather than what ran.
+        self.opcode_histogram[@as(usize, @intCast(raw & 0x7F))] +|= 1;
+        self.noteType3RegisterIntent(raw, payload);
         // Xenos predication is the bin check performed by Xenia's command
         // processor: a packet runs only when at least one selected bin is
         // enabled. XE_SWAP is never executed predicated, even if its bit is
@@ -322,6 +351,60 @@ pub const Executor = struct {
                 self.emitEvent(.{ .swap = swap });
             },
             else => self.unknown_opcode_count +%= 1,
+        }
+    }
+
+    fn noteCommandRegister(self: *Executor, register: u32) void {
+        self.command_register_writes +|= 1;
+        const block = register_map.blockForIndex(register) orelse {
+            self.command_out_of_range_register_writes +|= 1;
+            return;
+        };
+        if (block == .unclassified and !register_map.isKnownHardwareRegister(register)) {
+            self.command_unclassified_register_writes +|= 1;
+        }
+    }
+
+    fn noteCommandRegisterRange(self: *Executor, start: u32, count: usize) void {
+        for (0..count) |offset| {
+            self.noteCommandRegister(start +| @as(u32, @intCast(offset)));
+        }
+    }
+
+    /// Account for register effects encoded in the packet body before
+    /// predication or model execution. The independent PM4 walker parses the
+    /// same intent through its own header decoder; agreement therefore says
+    /// both readers framed the stream the same way, not merely that the model
+    /// happened to perform the same number of internal writes.
+    fn noteType3RegisterIntent(self: *Executor, opcode: u32, payload: []const u32) void {
+        switch (opcode) {
+            0x21 => {
+                if (payload.len >= 3) self.noteCommandRegister(payload[0] & 0x1FFF);
+            },
+            0x2D => {
+                if (payload.len < 2) return;
+                const base = constantBankBase((payload[0] >> 16) & 0xFF) orelse return;
+                self.noteCommandRegisterRange(base +| (payload[0] & 0x7FF), payload.len - 1);
+            },
+            0x2F => {
+                if (payload.len < 3) return;
+                const base = constantBankBase((payload[1] >> 16) & 0xFF) orelse return;
+                self.noteCommandRegisterRange(
+                    base +| (payload[1] & 0x7FF),
+                    @intCast(payload[2] & 0xFFF),
+                );
+            },
+            0x45 => {
+                if (payload.len >= 6 and (payload[0] & 0x100) == 0) {
+                    self.noteCommandRegister(payload[4]);
+                }
+            },
+            0x55, 0x56 => {
+                if (payload.len >= 2) {
+                    self.noteCommandRegisterRange(payload[0] & 0xFFFF, payload.len - 1);
+                }
+            },
+            else => {},
         }
     }
 
@@ -1240,4 +1323,43 @@ test "PM4 executor recognizes the authentic XE_SWAP message" {
     try executor.execute(&packet);
     try std.testing.expectEqual(@as(u64, 1), executor.swap_count);
     try std.testing.expectEqual(@as(u32, 1280), executor.last_swap.?.width);
+}
+
+// The aggregates answer how much was submitted; the histogram answers which
+// packets were in the batch, and only the second separates "the title never
+// asked for a completion" from "it asked and got nothing back".
+test "the opcode histogram records what the title encoded" {
+    var executor = Executor{};
+    const draw = pm4.packetType3(.draw_indx_2, 1, false).?;
+    const nop = pm4.packetType3(.nop, 1, false).?;
+    var dwords = [_]u32{ draw, 0, nop, 0 };
+    executor.execute(&dwords) catch {};
+    try std.testing.expect(executor.opcode_histogram[@intFromEnum(pm4.Type3Opcode.draw_indx_2)] != 0);
+    try std.testing.expect(executor.opcode_histogram[@intFromEnum(pm4.Type3Opcode.nop)] != 0);
+    try std.testing.expectEqual(@as(u32, 0), executor.opcode_histogram[0x54]);
+}
+
+test "command register intent excludes executor bookkeeping writes" {
+    const type0 = pm4.packetType0(regs.RB_COLOR_INFO, 2, false).?;
+    const rmw = pm4.packetType3(.reg_rmw, 3, false).?;
+    const out_of_range = pm4.packetType0(@intCast(register_map.register_count), 1, false).?;
+    var executor: Executor = .{};
+    try executor.execute(&.{
+        type0,
+        0x1111,
+        0x2222,
+        rmw,
+        0x1000,
+        0xFFFF_FFFF,
+        0,
+        out_of_range,
+        0x3333,
+    });
+    try std.testing.expectEqual(@as(u64, 4), executor.command_register_writes);
+    try std.testing.expectEqual(@as(u64, 1), executor.command_unclassified_register_writes);
+    try std.testing.expectEqual(@as(u64, 1), executor.command_out_of_range_register_writes);
+    // CP_PROG_COUNTER and the executed RMW also touch the model's journal; the
+    // authority counter deliberately does not absorb those implementation
+    // side effects.
+    try std.testing.expect(executor.register_file.journal.writes > executor.command_register_writes);
 }

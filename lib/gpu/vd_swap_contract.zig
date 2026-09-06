@@ -15,6 +15,8 @@ pub const Stage = contract.Stage;
 pub const Chain = contract.Chain;
 pub const Probe = contract.Probe;
 pub const ProbeOutcome = contract.ProbeOutcome;
+pub const StarvationCause = contract.StarvationCause;
+pub const StarvationOwner = contract.StarvationOwner;
 pub const Attribution = contract.Attribution;
 pub const ProbeLedger = probe_ledger.Ledger;
 pub const StageDiagnosis = probe_ledger.StageDiagnosis;
@@ -201,6 +203,14 @@ pub const Ledger = struct {
     last_packet_offset: ?u32 = null,
     last_observation_step: u64 = 0,
     source_mask: u32 = 0,
+    /// Emulator log lines this ledger has been offered.
+    ///
+    /// The evidence a breadcrumb probe needs to report honestly. "No line ever
+    /// named a front buffer" and "no line ever reached this ledger" are
+    /// opposite findings — the first is about the title, the second is about
+    /// Rosette's log plumbing — and a probe that only counts matches cannot
+    /// tell them apart.
+    log_lines_seen: u64 = 0,
 
     pub fn observeStage(self: *Ledger, stage: Stage, step: u64, source: Source) void {
         // Every positive observation already names its source, so the probe
@@ -461,6 +471,7 @@ pub const Ledger = struct {
     /// markers advance this ledger.  A line that merely mentions VdSwap in an
     /// export table is not a call.
     pub fn observeLogLine(self: *Ledger, line: []const u8, step: u64) bool {
+        self.log_lines_seen +|= 1;
         var observed_any = false;
         const source: Source = .guest_log;
         if (contains(line, "VDSWAP PATH: stage=entered") or contains(line, "] d> VdSwap(")) {
@@ -574,6 +585,25 @@ pub const Ledger = struct {
         self.probes.record(stage, which, outcome, detail, step);
     }
 
+    /// Record a probe that produced nothing, together with what it was
+    /// missing.
+    ///
+    /// `recordProbe` with a starved outcome still works and is counted as
+    /// unattributed, because a caller that genuinely does not know why must
+    /// not be forced to invent a cause. But a starvation with no cause names
+    /// no work, so every call site that does know says so here.
+    pub fn recordStarvation(
+        self: *Ledger,
+        stage: Stage,
+        which: Probe,
+        outcome: ProbeOutcome,
+        cause: StarvationCause,
+        detail: u64,
+        step: u64,
+    ) void {
+        self.probes.recordWithCause(stage, which, outcome, cause, detail, step);
+    }
+
     /// Record a probe that ran with real input: `observed` when it found the
     /// fact, `negative` when it did not.  A probe that had no input must call
     /// `recordProbe` with `.input_empty` instead — passing `false` here claims
@@ -618,6 +648,18 @@ pub const Ledger = struct {
 
     pub fn chainMet(self: *const Ledger, chain: Chain) usize {
         return contract.chainObservedCount(chain, self.observed_mask);
+    }
+
+    /// Whether any front-buffer candidate came from `source`.
+    ///
+    /// Each probe reports on its own evidence path, and `active_frontbuffer`
+    /// is the join of all of them: a probe that reported the joined answer
+    /// would claim to have seen what another probe found.
+    pub fn frontbufferSeenFrom(self: *const Ledger, source: Source) bool {
+        for (self.candidates[0..self.candidate_count]) |candidate| {
+            if (candidate.description != null and candidate.source == source) return true;
+        }
+        return false;
     }
 
     pub fn frontbufferKnown(self: *const Ledger) bool {
@@ -967,6 +1009,40 @@ test "the exact Xenia Mac VdSwap breadcrumbs retain arguments and extent" {
 
 test "the package invariants are visible through the runtime module" {
     try std.testing.expect(contract.contractIsWellFormed());
+}
+
+// The 2026-09-03 stop. `frontbuffer_validated` declares no prerequisite, so it
+// is reachable from step zero; all four of its probes were recorded only from
+// inside branches a drained-ring run never takes, and it read `not_attempted`
+// for two billion steps while the contract called its zero a fact about the
+// title.
+test "a front buffer named by one source is not claimed by another probe" {
+    var ledger = Ledger{};
+    try std.testing.expect(!ledger.frontbufferSeenFrom(.guest_log));
+    try std.testing.expect(!ledger.frontbufferSeenFrom(.vdswap_argument_capture));
+
+    ledger.observeFrontBuffer(
+        .{ .frontbuffer_physical_address = 0x1FC0_0000, .width = 1280, .height = 720 },
+        .guest_log,
+        4,
+    );
+    try std.testing.expect(ledger.frontbufferKnown());
+    try std.testing.expect(ledger.frontbufferSeenFrom(.guest_log));
+    // The join found it; the argument-capture probe did not, and must not say
+    // it did.
+    try std.testing.expect(!ledger.frontbufferSeenFrom(.vdswap_argument_capture));
+}
+
+// A breadcrumb probe that only counts matches cannot separate "no line named a
+// front buffer" from "no line ever reached this ledger". The first is about
+// the title, the second is about Rosette's log plumbing.
+test "the ledger counts every line it was offered, not only the ones it used" {
+    var ledger = Ledger{};
+    try std.testing.expectEqual(@as(u64, 0), ledger.log_lines_seen);
+    try std.testing.expect(!ledger.observeLogLine("[xenia] i> something unrelated", 1));
+    try std.testing.expectEqual(@as(u64, 1), ledger.log_lines_seen);
+    try std.testing.expect(ledger.observeLogLine("VDSWAP PATH: stage=entered", 2));
+    try std.testing.expectEqual(@as(u64, 2), ledger.log_lines_seen);
 }
 
 test "an observed stage credits the probe its source names" {

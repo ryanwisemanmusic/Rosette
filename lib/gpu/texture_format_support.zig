@@ -49,7 +49,61 @@ pub const Support = struct {
     /// True once a driver was actually asked. Without it a `false` above is
     /// "nobody looked", which is a different fact and must not read as absence.
     probed: bool = false,
+    /// `optimalTilingFeatures`. The field that decides textures and render
+    /// targets, and the only one this ledger used to keep.
     features: u32 = 0,
+    linear_features: u32 = 0,
+    /// `bufferFeatures`. Retained because a format can be unusable as an image
+    /// and native as a vertex attribute, and on this host exactly one format
+    /// is: `A2B10G10R10_SNORM_PACK32` reports 0/0/VERTEX_BUFFER. Recording
+    /// only the tiling half made the ledger say that format was absent, which
+    /// is the difference between reinterpreting a signed vertex stream through
+    /// an unsigned format and using the one the host already has.
+    buffer_features: u32 = 0,
+
+    /// Whether this format may be a vertex attribute.
+    pub fn vertexBuffer(self: Support) bool {
+        return self.probed and
+            self.buffer_features & abi.FORMAT_FEATURE_VERTEX_BUFFER_BIT != 0;
+    }
+
+    /// Whether this format may be a colour attachment with optimal tiling.
+    pub fn colorAttachment(self: Support) bool {
+        return self.probed and
+            self.features & abi.FORMAT_FEATURE_COLOR_ATTACHMENT_BIT != 0;
+    }
+
+    /// Why the format is not usable for the job that wanted it, stated as the
+    /// driver's own answer rather than as an absence.
+    ///
+    /// A fallback that only says "substituted" leaves a reader unable to tell
+    /// a hardware limit from a probe that never ran or a capability the run
+    /// declined to ask for. Those need different work, and only the first is
+    /// genuinely closed.
+    pub fn unavailability(self: Support) []const u8 {
+        if (!self.probed) return "no driver was asked; this is a gap in Rosette's probe, not a statement about the host";
+        if (self.features == 0 and self.linear_features == 0 and self.buffer_features == 0) {
+            return "the driver reports no feature at all for this format, in any tiling and for any buffer use. That is a hardware limit and no Rosette work reclaims it";
+        }
+        if (self.features == 0 and self.linear_features == 0) {
+            return "the driver reports no image feature in either tiling and does report buffer features. The format exists on this host and cannot be an image, so a texture or render-target use must substitute while a vertex use must not";
+        }
+        if (!self.sampled) return "the format has image features but is not sampleable with optimal tiling";
+        return "usable";
+    }
+
+    /// What this host will actually accept the format for, in a few words.
+    /// A single `sampled=NO` reads as "absent" and, for a format that is
+    /// image-incapable and vertex-capable, that is false.
+    pub fn usage(self: Support) []const u8 {
+        if (!self.probed) return "unprobed";
+        const image = self.features != 0 or self.linear_features != 0;
+        if (image and self.vertexBuffer()) return "image+vertex";
+        if (image) return "image-only";
+        if (self.vertexBuffer()) return "vertex-only";
+        if (self.buffer_features != 0) return "buffer-only";
+        return "unsupported";
+    }
 };
 
 pub const Record = struct {
@@ -119,15 +173,37 @@ pub const Ledger = struct {
     }
 
     /// Record one driver answer. `features` is `optimalTilingFeatures`.
+    ///
+    /// The image half only. Callers that have the whole `VkFormatProperties`
+    /// should use `noteSupportProperties`: a format this one records as
+    /// unsupported may still be a native vertex format.
     pub fn noteSupport(self: *Ledger, format: u32, features: u32) void {
+        self.noteSupportProperties(format, 0, features, 0);
+    }
+
+    /// Record every field the driver reported for one format.
+    pub fn noteSupportProperties(
+        self: *Ledger,
+        format: u32,
+        linear: u32,
+        optimal: u32,
+        buffer: u32,
+    ) void {
         for (&self.support) |*entry| {
             if (entry.format != format) continue;
             entry.probed = true;
-            entry.features = features;
-            entry.sampled = features & abi.FORMAT_FEATURE_SAMPLED_IMAGE_BIT != 0;
+            entry.features = optimal;
+            entry.linear_features = linear;
+            entry.buffer_features = buffer;
+            entry.sampled = optimal & abi.FORMAT_FEATURE_SAMPLED_IMAGE_BIT != 0;
             self.probes +|= 1;
             return;
         }
+    }
+
+    /// Whether this host will accept `format` as a vertex attribute.
+    pub fn vertexBufferCapable(self: *const Ledger, format: u32) bool {
+        return self.supportFor(format).vertexBuffer();
     }
 
     fn sampleable(self: *const Ledger, format: u32) bool {
@@ -273,6 +349,63 @@ test "an unprobed format is not the same as an absent one" {
     const probed = ledger.supportFor(contract.vk_format_a2b10g10r10_snorm_pack32);
     try std.testing.expect(probed.probed);
     try std.testing.expect(!probed.sampled);
+}
+
+// The 2026-09-03 audit. The ledger kept only `optimalTilingFeatures`, so the
+// report read `host-format 65 sampled=NO features=0x00000000` and a reader
+// concluded the host could not do format 65 at all. The driver actually
+// reports 0x0/0x0/0x40 for it: unusable as an image, and a native vertex
+// attribute. Those are different answers and only one of them was printed.
+test "a format can be image-incapable and still a native vertex format" {
+    var ledger = Ledger{};
+    // What this host really reports for A2B10G10R10_SNORM_PACK32.
+    ledger.noteSupportProperties(
+        contract.vk_format_a2b10g10r10_snorm_pack32,
+        0,
+        0,
+        abi.FORMAT_FEATURE_VERTEX_BUFFER_BIT,
+    );
+    const signed_pack = ledger.supportFor(contract.vk_format_a2b10g10r10_snorm_pack32);
+    try std.testing.expect(signed_pack.probed);
+    // Still not sampleable, so the texture ladder must keep substituting.
+    try std.testing.expect(!signed_pack.sampled);
+    try std.testing.expect(!signed_pack.colorAttachment());
+    // But the vertex path needs no substitution at all.
+    try std.testing.expect(signed_pack.vertexBuffer());
+    try std.testing.expect(ledger.vertexBufferCapable(contract.vk_format_a2b10g10r10_snorm_pack32));
+    try std.testing.expectEqualStrings("vertex-only", signed_pack.usage());
+
+    // And the fully-capable twin says so differently.
+    ledger.noteSupportProperties(
+        contract.vk_format_r16g16b16a16_snorm,
+        0x8000d403,
+        0x8000dd83,
+        0x80000058,
+    );
+    const widened = ledger.supportFor(contract.vk_format_r16g16b16a16_snorm);
+    try std.testing.expect(widened.sampled);
+    try std.testing.expect(widened.colorAttachment());
+    try std.testing.expect(widened.vertexBuffer());
+    try std.testing.expectEqualStrings("image+vertex", widened.usage());
+
+    // A format nobody asked about is unprobed, never "unsupported".
+    try std.testing.expectEqualStrings(
+        "unprobed",
+        ledger.supportFor(contract.vk_format_r16g16b16a16_sfloat).usage(),
+    );
+}
+
+// The image half alone is still the right question for a texture, and the
+// old entry point has to keep answering exactly as it did.
+test "the image-only probe still records what it always did" {
+    var ledger = Ledger{};
+    ledger.noteSupport(contract.vk_format_r16g16b16a16_snorm, 0x8000dd83);
+    const entry = ledger.supportFor(contract.vk_format_r16g16b16a16_snorm);
+    try std.testing.expect(entry.sampled);
+    try std.testing.expect(entry.colorAttachment());
+    // It never claimed to know about buffers, and must not pretend to.
+    try std.testing.expect(!entry.vertexBuffer());
+    try std.testing.expectEqualStrings("image-only", entry.usage());
 }
 
 test "Apple silicon substitutes the signed 2_10_10_10 paths losslessly" {

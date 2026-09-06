@@ -260,6 +260,44 @@ pub fn layout(raw_format: u32, width: u32, height: u32, depth: u32, tiling: Tili
     return .{ .row_pitch = row_pitch, .slice_pitch = slice_pitch, .size_bytes = size_bytes };
 }
 
+/// Whether a vertex stream's components are signed.
+///
+/// A property of the shader's `vfetch` instruction (`fomat_comp_all`), not of
+/// the fetch constant, so it has to travel with the format rather than be
+/// derived from it.
+pub const VertexSignedness = enum { unsigned, signed };
+
+/// The host vertex format for a Xenos vertex format and its signedness.
+///
+/// The signedness is not optional detail. A signed normalized stream fed
+/// through the unsigned host format reads every negative component as a large
+/// positive one — the same reinterpretation the texture-format contract exists
+/// to refuse — and it is exactly what this function did for every caller
+/// before it could be told.
+///
+/// `A2B10G10R10_SNORM_PACK32` is the case that matters most here. It is
+/// unusable as an image on Metal (both tiling feature fields read zero) and
+/// *natively supported as a vertex attribute* — the driver reports
+/// `VERTEX_BUFFER_BIT` for it, backed by
+/// `MTLVertexFormatInt1010102Normalized`. So the signed 2:10:10:10 vertex path
+/// needs no substitution at all; it needed only to be asked for.
+pub fn vertexVulkanFormatSigned(raw_format: u32, signedness: VertexSignedness) ?u32 {
+    if (signedness == .signed) {
+        const format: VertexFormat = @enumFromInt(@as(u8, @truncate(raw_format)));
+        // Only the normalized integer formats have a signed twin. The float
+        // and raw-integer formats already carry their own sign and fall
+        // through to the unsigned table unchanged.
+        switch (format) {
+            .r8g8b8a8 => return abi.FORMAT_R8G8B8A8_SNORM,
+            .a2r10g10b10 => return abi.FORMAT_A2B10G10R10_SNORM_PACK32,
+            .r16g16 => return abi.FORMAT_R16G16_SNORM,
+            .r16g16b16a16 => return abi.FORMAT_R16G16B16A16_SNORM,
+            else => {},
+        }
+    }
+    return vertexVulkanFormat(raw_format);
+}
+
 pub fn vertexVulkanFormat(raw_format: u32) ?u32 {
     const format: VertexFormat = @enumFromInt(@as(u8, @truncate(raw_format)));
     return switch (format) {
@@ -328,4 +366,48 @@ test "render target formats use the Xenos color-target table" {
     try std.testing.expectEqual(abi.FORMAT_R16G16B16A16_SFLOAT, renderTargetVulkanFormat(7).?);
     try std.testing.expectEqual(abi.FORMAT_R32G32_SFLOAT, renderTargetVulkanFormat(15).?);
     try std.testing.expect(renderTargetVulkanFormat(8) == null);
+}
+
+// The 2026-09-03 audit: `A2B10G10R10_SNORM_PACK32` is a native vertex format on
+// this host (the driver reports VERTEX_BUFFER_BIT for it) and the mapping could
+// not name it, because it had no way to be told the stream was signed. Every
+// signed 2:10:10:10 normal or tangent would have gone through the unsigned
+// format, reading each negative component as a large positive one.
+test "a signed vertex stream names the signed host format" {
+    const a2r10g10b10: u32 = 7;
+    try std.testing.expectEqual(
+        abi.FORMAT_A2B10G10R10_UNORM_PACK32,
+        vertexVulkanFormatSigned(a2r10g10b10, .unsigned).?,
+    );
+    try std.testing.expectEqual(
+        abi.FORMAT_A2B10G10R10_SNORM_PACK32,
+        vertexVulkanFormatSigned(a2r10g10b10, .signed).?,
+    );
+    // The other normalized integer formats have signed twins too, and this
+    // host supports all of them as vertex attributes.
+    try std.testing.expectEqual(abi.FORMAT_R8G8B8A8_SNORM, vertexVulkanFormatSigned(6, .signed).?);
+    try std.testing.expectEqual(abi.FORMAT_R16G16_SNORM, vertexVulkanFormatSigned(25, .signed).?);
+    try std.testing.expectEqual(abi.FORMAT_R16G16B16A16_SNORM, vertexVulkanFormatSigned(26, .signed).?);
+}
+
+// A float format already carries its own sign, so signedness must not move it.
+test "signedness leaves the float and unmapped formats alone" {
+    for ([_]u32{ 31, 32, 36, 37, 38, 57 }) |raw| {
+        try std.testing.expectEqual(
+            vertexVulkanFormat(raw),
+            vertexVulkanFormatSigned(raw, .signed),
+        );
+    }
+    // An unmapped format is still unmapped, whichever sign it claims.
+    try std.testing.expectEqual(@as(?u32, null), vertexVulkanFormatSigned(200, .signed));
+    try std.testing.expectEqual(@as(?u32, null), vertexVulkanFormatSigned(200, .unsigned));
+}
+
+// The unsigned entry point is what every existing caller uses, and it has to
+// keep meaning exactly what it meant.
+test "the unsigned entry point is unchanged" {
+    try std.testing.expectEqual(
+        abi.FORMAT_A2B10G10R10_UNORM_PACK32,
+        vertexVulkanFormat(7).?,
+    );
 }

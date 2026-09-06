@@ -245,6 +245,10 @@ pub const Finding = struct {
     imported_count: u32,
     usable_count: u32,
     unpopulated_imported: u32,
+    /// Imported exports whose population is not usable. This includes
+    /// optional imports: they are visible in the report, but they are never
+    /// confused with an export the title did not import at all.
+    invalid_imported: u32,
 };
 
 /// Is a value one a title could actually use for this export?
@@ -341,6 +345,46 @@ pub const Surface = struct {
         return self.entries[index(which)].imported;
     }
 
+    /// Whether every export the title actually imported has a usable binding
+    /// or value. Unimported optional exports are deliberately outside this
+    /// predicate: an absent optional import cannot hold up this title.
+    pub fn allImportedUsable(self: *const Surface) bool {
+        var imported_count: usize = 0;
+        var invalid_count: usize = 0;
+        inline for (@typeInfo(Export).@"enum".fields) |field| {
+            const which: Export = @enumFromInt(field.value);
+            const entry = self.entries[index(which)];
+            if (entry.imported) {
+                imported_count += 1;
+                if (!entry.population.usable()) invalid_count += 1;
+            }
+        }
+        return imported_count != 0 and invalid_count == 0;
+    }
+
+    /// Fingerprint only the contract state that makes an imported export
+    /// usable. Runtime call counts and activity bits are intentionally omitted:
+    /// they are useful breadcrumbs, but they do not change whether the kernel
+    /// surface is valid and would defeat collapse on every call.
+    pub fn detailFingerprint(self: *const Surface) u64 {
+        var hash: u64 = 0xcbf29ce484222325;
+        inline for (@typeInfo(Export).@"enum".fields) |field| {
+            const which: Export = @enumFromInt(field.value);
+            const entry = self.entries[index(which)];
+            hash ^= @as(u64, @intFromBool(entry.imported));
+            hash *%= 0x100000001b3;
+            hash ^= @as(u64, @intFromEnum(entry.population));
+            hash *%= 0x100000001b3;
+            hash ^= @as(u64, entry.address);
+            hash *%= 0x100000001b3;
+            hash ^= @as(u64, @intFromBool(entry.value_known));
+            hash *%= 0x100000001b3;
+            hash ^= entry.value;
+            hash *%= 0x100000001b3;
+        }
+        return hash;
+    }
+
     /// The first required export the title imported and cannot use, plus the
     /// tally. An export the title never imported is never blocking, however
     /// empty: it cannot be the reason a title it is not part of is stuck.
@@ -349,12 +393,14 @@ pub const Surface = struct {
         var imported_count: u32 = 0;
         var usable_count: u32 = 0;
         var unpopulated_imported: u32 = 0;
+        var invalid_imported: u32 = 0;
         inline for (@typeInfo(Export).@"enum".fields) |field| {
             const which: Export = @enumFromInt(field.value);
             const entry = self.entries[index(which)];
             if (entry.imported) imported_count += 1;
             if (entry.population.usable()) usable_count += 1;
             if (entry.imported and entry.population == .unpopulated) unpopulated_imported += 1;
+            if (entry.imported and !entry.population.usable()) invalid_imported += 1;
             if (blocking == null and entry.imported and
                 which.requiredForPresent() and !entry.population.usable())
             {
@@ -366,6 +412,7 @@ pub const Surface = struct {
             .imported_count = imported_count,
             .usable_count = usable_count,
             .unpopulated_imported = unpopulated_imported,
+            .invalid_imported = invalid_imported,
         };
     }
 
@@ -422,6 +469,43 @@ test "a populated value promotes the entry and clears the blocker" {
     surface.observeValue(.vd_global_device, 0x8200_1000);
     try std.testing.expectEqual(Population.populated, surface.population(.vd_global_device));
     try std.testing.expect(surface.finding().blocking == null);
+}
+
+test "complete surface ignores optional exports the title never imported" {
+    var surface = Surface{};
+    surface.observeBinding(.vd_get_system_command_buffer, true, true, 1);
+    surface.observeBinding(.vd_global_device, true, false, 0);
+    surface.observeValue(.vd_global_device, 0x8200_1000);
+    surface.observeBinding(.vd_initialize_engines, true, true, 1);
+    surface.observeBinding(.vd_initialize_ring_buffer, true, true, 1);
+    surface.observeBinding(.vd_is_hsio_training_succeeded, true, true, 1);
+    surface.observeBinding(.vd_enable_ring_buffer_rptr_writeback, true, true, 1);
+    surface.observeBinding(.vd_set_graphics_interrupt_callback, true, true, 1);
+    surface.observeBinding(.vd_swap, true, true, 1);
+    surface.observeBinding(.vd_retrain_edram, true, true, 1);
+    surface.observeBinding(.vd_retrain_edram_worker, true, true, 1);
+
+    try std.testing.expect(surface.allImportedUsable());
+    const finding = surface.finding();
+    try std.testing.expectEqual(@as(u32, 10), finding.imported_count);
+    try std.testing.expectEqual(@as(u32, 10), finding.usable_count);
+    try std.testing.expectEqual(@as(u32, 0), finding.invalid_imported);
+    // These are optional and not imported by the title, so they do not make
+    // the complete contract regress.
+    try std.testing.expect(!surface.imported(.vd_global_xam_device));
+    try std.testing.expect(!surface.imported(.vd_gpu_clock_in_mhz));
+    try std.testing.expect(surface.detailFingerprint() != 0);
+}
+
+test "surface completeness and fingerprint change when an imported value regresses" {
+    var surface = Surface{};
+    surface.observeBinding(.vd_global_device, true, false, 0);
+    const incomplete_fingerprint = surface.detailFingerprint();
+    try std.testing.expect(!surface.allImportedUsable());
+
+    surface.observeValue(.vd_global_device, 0x8200_1000);
+    try std.testing.expect(surface.allImportedUsable());
+    try std.testing.expect(surface.detailFingerprint() != incomplete_fingerprint);
 }
 
 // A zero that something actually wrote is a different bug from a slot nobody

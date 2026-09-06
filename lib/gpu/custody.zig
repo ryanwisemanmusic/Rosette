@@ -90,6 +90,16 @@ pub const Record = struct {
     pub fn loadBearing(self: Record) bool {
         return self.custody().loadBearing();
     }
+
+    /// True only for a refusal that leaves a console-owned resource both
+    /// unwritable and unprovisioned. Owner-rule refusals, already-present
+    /// values, and address discovery attempts are retained as diagnostics;
+    /// they are not permission for the harness to write guest-owned state.
+    pub fn actionableRefusal(self: Record) bool {
+        return self.owner.harnessMayProvision() and
+            self.custody() == .unprovisioned and
+            self.last_refusal == .storage_unwritable;
+    }
 };
 
 pub const Summary = struct {
@@ -376,8 +386,12 @@ test "attempts made before the address is known are counted, not lost" {
     try std.testing.expectEqual(@as(u32, 5), record.address_unknown_attempts);
     try std.testing.expectEqual(Refusal.address_unknown, record.last_refusal);
     try std.testing.expectEqual(Custody.unprovisioned, record.custody());
+    try std.testing.expect(!record.actionableRefusal());
     try std.testing.expectEqual(@as(u64, 5), ledger.summary().address_unknown_attempts);
     try std.testing.expectEqual(Finding.unprovisioned_platform_state, ledger.summary().finding());
+
+    ledger.noteRefusal(0x1C6, .storage_unwritable);
+    try std.testing.expect(ledger.entry(0x1C6).?.actionableRefusal());
 }
 
 test "only the first harness write decides timing" {

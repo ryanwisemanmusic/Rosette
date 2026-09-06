@@ -87,7 +87,7 @@ pub const Verdict = enum {
 
     pub fn describe(self: Verdict) []const u8 {
         return switch (self) {
-            .never_accessed => "the guest never executed a single access to the Xenos register aperture in this run. This is an observation, not a missing log line: the aperture's pages are unreadable by design, so any access would have faulted and been counted here. The title's code never reached its register writes, which puts the frontier upstream of the GPU entirely — look at what the title is doing instead of programming the GPU, not at the ring, the command processor or the presenter",
+            .never_accessed => "the guest never executed a single access to the Xenos register aperture in this run. This is an observation, not a missing log line: the aperture's pages are unreadable by design, so any access would have faulted and been counted here. It says nothing about whether registers were programmed — a title that programs its GPU through the command ring leaves this aperture at zero forever while writing hundreds of registers by PM4, which is the normal path. Read REGISTER PATH SPLIT and XENOS REGISTER JOURNAL before concluding anything about the title's register writes; this observer owns MMIO and does not own the ring",
             .accessed_but_no_ring_setup => "the guest reached the register aperture but never touched CP_RB_BASE, CP_RB_CNTL or CP_RB_WPTR. The GPU is being programmed, so the path works; the ring specifically is not being set up, which is a decision the title made and not a transport failure",
             .ring_setup_delivered => "the ring-setup registers were written and every write reached a guest handler. The register transport works end to end, so a ring that still does not start is a question for what the handler did with the values, not for whether they arrived",
             .ring_setup_lost => "the ring-setup registers were written and the writes reached no handler. The title is programming the GPU correctly and Rosette is dropping the stores on the floor — this is a fault-delivery defect in the runtime, and it is the whole reason the ring never starts",
@@ -207,12 +207,16 @@ test "the aperture's own addresses match the registers the emulator probes" {
     try testing.expect(xenos.registerIndexOf(0x7FC9_0000) == null);
 }
 
-// The finding the run actually produced, and the one that was previously
-// indistinguishable from a missing log line.
-test "no traffic at all is a positive finding about the title, not about the GPU" {
+// No traffic at all is a positive finding *about this aperture* — the pages
+// are unreadable by design, so an access could not have happened without being
+// counted here. It is not a finding about whether the title programmed its
+// GPU, and for three passes the wording said it was.
+test "no traffic at all is a finding about the aperture and not about the title" {
     const observer = Observer{};
     try testing.expectEqual(Verdict.never_accessed, observer.verdict());
-    try testing.expect(std.mem.indexOf(u8, observer.verdict().describe(), "upstream of the GPU") != null);
+    const text = observer.verdict().describe();
+    try testing.expect(std.mem.indexOf(u8, text, "unreadable by design") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "would have faulted") != null);
 }
 
 test "ring setup that reaches a handler is separated from ring setup that does not" {
@@ -291,4 +295,19 @@ test "the protection this aperture needs is the one that looks like corruption" 
         Ruling.unconstrained,
         xenos.checkRegisterProtection(0x8245_0390, true).ruling,
     );
+}
+
+// The 2026-08-31 run printed `verdict=never_accessed ... which puts the
+// frontier upstream of the GPU entirely — look at what the title is doing
+// instead of programming the GPU` beside a register journal recording a
+// hundred and fifty-six PM4 register writes. Both lines were in the same
+// report. This observer sees MMIO stores into the aperture window; it does not
+// see the ring, so it must not draw a conclusion about whether registers were
+// programmed.
+test "an untouched aperture makes no claim about the ring's register writes" {
+    const observer = Observer{};
+    const text = observer.verdict().describe();
+    try testing.expect(std.mem.indexOf(u8, text, "PM4") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "does not own the ring") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "frontier upstream of the GPU entirely") == null);
 }

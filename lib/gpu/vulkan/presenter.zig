@@ -123,6 +123,16 @@ pub const FrameReport = struct {
     submitted: bool = false,
     present_result: abi.Result = abi.SUCCESS,
     present_outcome: selection.PresentOutcome = .failed,
+    /// `vkQueuePresentKHR` accepted the request. This is intentionally not
+    /// `presented`: acceptance only enqueues work.
+    present_request_accepted: bool = false,
+    /// A host fence proved that the submission which fed the present finished
+    /// executing. This is the hardware-backed edge used by frame provenance.
+    hardware_completed: bool = false,
+    hardware_completion_waited: bool = false,
+    hardware_completion_result: abi.Result = abi.NOT_READY,
+    /// True only after both the present request and the host completion edge
+    /// were observed. A call returning success never sets this by itself.
     presented: bool = false,
     /// Set when the image was written by a copy from a real source rather than
     /// by a clear.
@@ -954,12 +964,25 @@ pub const Presenter = struct {
     /// have `A2B10G10R10_SNORM_PACK32`" itself instead of taking the emulator's
     /// word for it. The null is load-bearing: an unasked format and an absent
     /// one are different facts, and a zero for both would collapse them.
-    pub fn formatFeatures(self: *Presenter, format: u32) ?u32 {
+    /// Every field the driver reports for one format.
+    ///
+    /// `formatFeatures` below answers only the optimal-tiling half, which is
+    /// the right question for a texture or a render target and the wrong one
+    /// for anything else: `A2B10G10R10_SNORM_PACK32` is zero in both tiling
+    /// fields on Metal and carries `VERTEX_BUFFER_BIT` in the third. Discarding
+    /// that field is what made the host look incapable of a format it supports
+    /// natively for the one use the guest actually has for it.
+    pub fn formatProperties(self: *Presenter, format: u32) ?abi.FormatProperties {
         if (self.physical_device == null) return null;
         const entries = &(self.instance_entries orelse return null);
         var properties = abi.FormatProperties{};
         entries.get_format_properties(self.physical_device, format, &properties);
         self.ledger.noteNativeDriverCall();
+        return properties;
+    }
+
+    pub fn formatFeatures(self: *Presenter, format: u32) ?u32 {
+        const properties = self.formatProperties(format) orelse return null;
         return properties.optimal_tiling_features;
     }
 
@@ -1192,8 +1215,32 @@ pub const Presenter = struct {
         report.present_result = present_result;
         report.present_outcome = selection.classifyPresent(present_result);
         self.ring.note(frame.healthAfterPresent(report.present_outcome));
-        report.presented = report.present_outcome.requestAccepted();
+        report.present_request_accepted = report.present_outcome.requestAccepted();
         if (report.present_outcome == .device_lost) return self.reportDeviceLost(report, slot);
+
+        // `vkQueuePresentKHR` is asynchronous. The submit fence is the only
+        // synchronization edge this presenter owns that can prove the GPU
+        // commands feeding the acquired image completed. Without this wait a
+        // successful present would be an API-level claim, not a hardware-level
+        // frame. Keep `context.submitted` set until the normal slot-reuse wait
+        // observes the same fence; a timeout therefore leaves the work safely
+        // in flight and classifies this attempt as incomplete.
+        if (report.present_request_accepted) {
+            const completion_fences = [_]abi.Fence{context.in_flight_fence};
+            const completion = entries.wait_for_fences(
+                self.device,
+                1,
+                &completion_fences,
+                1,
+                fence_timeout_nanoseconds,
+            );
+            self.ledger.noteNativeDriverCall();
+            report.hardware_completion_waited = true;
+            report.hardware_completion_result = completion;
+            if (completion == abi.ERROR_DEVICE_LOST) return self.reportDeviceLost(report, slot);
+            report.hardware_completed = completion == abi.SUCCESS;
+        }
+        report.presented = report.present_request_accepted and report.hardware_completed;
 
         report.classification = self.ledger.record(.{
             .producer = switch (source) {
@@ -1204,7 +1251,8 @@ pub const Presenter = struct {
             .native_command_recording = true,
             .native_submission = true,
             .native_presentation = true,
-            .present_accepted = report.presented,
+            .present_accepted = report.present_request_accepted,
+            .hardware_completed = report.hardware_completed,
             .guest_swap_observed = switch (source) {
                 .clear => false,
                 .cpu_image => |image| image.guest_swap_observed,
@@ -1759,6 +1807,9 @@ pub const Presenter = struct {
         }
         if (self.ledger.native_present_requests == 0) {
             return "the native path is ready but no frame has been presented through it yet";
+        }
+        if (self.ledger.frames_incomplete != 0) {
+            return "the host accepted a present request but its GPU completion fence has not completed; no frame is counted yet";
         }
         return self.ledger.displayNote();
     }

@@ -278,7 +278,27 @@ pub fn blendOpFromXenos(raw: u32) BlendOp {
 }
 
 pub fn vertexAttribute(format: u32, location: u8, binding: u8, offset: u16) ?VertexAttribute {
-    return .{ .location = location, .binding = binding, .format = formats.vertexVulkanFormat(format) orelse return null, .offset = offset };
+    return vertexAttributeSigned(format, .unsigned, location, binding, offset);
+}
+
+/// The signed form, which is the one a real `vfetch` can answer.
+///
+/// Kept separate rather than replacing the call above so no existing caller
+/// silently changes meaning: an attribute built without a signedness is
+/// unsigned, which is what it always was.
+pub fn vertexAttributeSigned(
+    format: u32,
+    signedness: formats.VertexSignedness,
+    location: u8,
+    binding: u8,
+    offset: u16,
+) ?VertexAttribute {
+    return .{
+        .location = location,
+        .binding = binding,
+        .format = formats.vertexVulkanFormatSigned(format, signedness) orelse return null,
+        .offset = offset,
+    };
 }
 
 pub fn dynamicViewportFromRegisters(registers: *const regs.RegisterFile) Viewport {

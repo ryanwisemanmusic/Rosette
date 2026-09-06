@@ -49,6 +49,7 @@ pub const RB_BLENDCONTROL0 = register_map.RB_BLENDCONTROL0;
 pub const RB_COLORCONTROL = register_map.RB_COLORCONTROL;
 pub const PA_CL_CLIP_CNTL = register_map.PA_CL_CLIP_CNTL;
 pub const PA_SU_SC_MODE_CNTL = register_map.PA_SU_SC_MODE_CNTL;
+pub const PA_SU_VTX_CNTL = register_map.PA_SU_VTX_CNTL;
 pub const PA_CL_VTE_CNTL = register_map.PA_CL_VTE_CNTL;
 pub const RB_MODECONTROL = register_map.RB_MODECONTROL;
 pub const RB_BLENDCONTROL1 = register_map.RB_BLENDCONTROL1;
@@ -91,6 +92,10 @@ pub const RB_COPY_CONTROL = register_map.RB_COPY_CONTROL;
 pub const RB_COPY_DEST_BASE = register_map.RB_COPY_DEST_BASE;
 pub const RB_COPY_DEST_PITCH = register_map.RB_COPY_DEST_PITCH;
 pub const RB_COPY_DEST_INFO = register_map.RB_COPY_DEST_INFO;
+pub const RB_HIZ_CLEAR = register_map.RB_HIZ_CLEAR;
+pub const RB_DEPTH_CLEAR = register_map.RB_DEPTH_CLEAR;
+pub const RB_COLOR_CLEAR = register_map.RB_COLOR_CLEAR;
+pub const RB_COLOR_CLEAR_LO = register_map.RB_COLOR_CLEAR_LO;
 pub const RB_SAMPLE_COUNT_ADDR = register_map.RB_SAMPLE_COUNT_ADDR;
 pub const WRITEBACK_START = register_map.WRITEBACK_START;
 pub const WRITEBACK_SIZE = register_map.WRITEBACK_SIZE;
@@ -109,7 +114,6 @@ pub const shader_constant_bool_base = register_map.shader_constant_bool_base;
 pub const shader_constant_loop_base = register_map.shader_constant_loop_base;
 pub const shader_constant_register_base = register_map.shader_constant_register_base;
 pub const vertex_fetch_register_base = register_map.vertex_fetch_register_base;
-
 
 pub const PrimitiveType = enum(u8) {
     point_list = 0,
@@ -898,7 +902,11 @@ test "register indices match the Xenos register aperture" {
     try std.testing.expectEqual(@as(Register, 0x210F), PA_CL_VPORT_XSCALE);
     try std.testing.expectEqual(@as(Register, 0x2114), PA_CL_VPORT_ZOFFSET);
     try std.testing.expectEqual(@as(Register, 0x2102), VGT_INDX_OFFSET);
+    try std.testing.expectEqual(@as(Register, 0x2302), PA_SU_VTX_CNTL);
     try std.testing.expectEqual(@as(Register, 0x231B), RB_COPY_DEST_INFO);
+    try std.testing.expectEqual(@as(Register, 0x231D), RB_DEPTH_CLEAR);
+    try std.testing.expectEqual(@as(Register, 0x231E), RB_COLOR_CLEAR);
+    try std.testing.expectEqual(@as(Register, 0x231F), RB_COLOR_CLEAR_LO);
 }
 
 test "the register file journals which registers a write addressed" {

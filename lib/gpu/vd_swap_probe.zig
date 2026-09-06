@@ -29,6 +29,8 @@ pub const Probe = contract.Probe;
 pub const ProbeOutcome = contract.ProbeOutcome;
 pub const Attribution = contract.Attribution;
 pub const Chain = contract.Chain;
+pub const StarvationCause = contract.StarvationCause;
+pub const StarvationOwner = contract.StarvationOwner;
 
 pub const stage_count = contract.stage_count;
 pub const probe_count = contract.probe_count;
@@ -47,6 +49,17 @@ pub const Cell = struct {
     attempts: u64 = 0,
     evidence_attempts: u64 = 0,
     starved_attempts: u64 = 0,
+    /// What the most recent starvation was missing. Retained rather than
+    /// summarised because a probe that used to starve on unreadable memory and
+    /// now starves on a drained input has changed, and a count cannot say so.
+    starvation_cause: StarvationCause = .unspecified,
+    /// Starvations recorded with no cause. A non-zero count is a wiring gap at
+    /// a call site, and keeping it visible is what stops `unspecified` from
+    /// quietly becoming the common answer.
+    unattributed_starvations: u64 = 0,
+    /// The step of the first starvation, so a probe that has been blind since
+    /// the beginning is distinguishable from one that went blind.
+    first_starved_step: u64 = 0,
     /// A probe-defined magnitude: dwords examined, packets walked, registers
     /// read.  Zero alongside a `negative` outcome is a contradiction worth
     /// seeing, which is why it is retained rather than summarised.
@@ -86,6 +99,9 @@ pub const StageDiagnosis = struct {
     probes_attempted: usize = 0,
     probes_with_evidence: usize = 0,
     probes_starved: usize = 0,
+    /// The cause behind the starvation of the probe that decided this stage,
+    /// or of the first starved probe when the deciding one was not starved.
+    starvation_cause: StarvationCause = .unspecified,
     detail: u64 = 0,
     last_step: u64 = 0,
 
@@ -115,6 +131,24 @@ pub const Summary = struct {
     unprobed: usize = 0,
     starved: usize = 0,
     actionable: usize = 0,
+    /// Starved stages Rosette can un-starve on its own — an unwired probe or a
+    /// counter nothing feeds. Separated from the total because the rest are
+    /// waiting on a fact that has not happened, and no observer work brings
+    /// that forward.
+    starved_closable_by_rosette: usize = 0,
+    /// Starved stages whose cause was never recorded. A wiring gap at a call
+    /// site, and the first thing to close: until it is zero the report can say
+    /// a stage was unobserved and cannot say what it was missing.
+    starved_unattributed: usize = 0,
+    /// Actionable stages whose deciding probe declined by owner rule rather
+    /// than reading anything.
+    ///
+    /// These are genuine findings — a policy refused an observation that was
+    /// possible — and they are not the same finding as "a probe read real data
+    /// and the fact was absent". Counting them together made `findings=6` mean
+    /// two different things at once, and only one of them is answered by
+    /// looking at the stage's owner.
+    refused_by_owner: usize = 0,
 
     pub fn unmet(self: Summary) usize {
         return self.blocked_upstream + self.unprobed + self.starved + self.actionable;
@@ -132,8 +166,20 @@ pub const Summary = struct {
         if (self.unprobed != 0) {
             return "at least one stage with satisfied prerequisites has never been probed: the contract is reporting a hole in the observer as an absence in the title. Wire the probe before reading any zero below it";
         }
+        if (self.starved_unattributed != 0) {
+            return "at least one stage was probed only with empty or unreadable input and nothing recorded what was missing. Record the cause at the probe's call site: an unobserved stage with no named cause names no work";
+        }
+        if (self.starved_closable_by_rosette != 0) {
+            return "at least one stage is unobserved because its probe is not wired or reads a counter nothing feeds. That is Rosette's to close today and it needs nothing from the guest or the emulator";
+        }
         if (self.starved != 0) {
-            return "at least one stage was probed only with empty or unreadable input: it has not been shown false, only unobserved. Repair the probe's input before attributing the gap to the guest or the emulator";
+            return "at least one stage was probed only with empty or unreadable input: it has not been shown false, only unobserved. The recorded causes name what has not been produced yet, so the work is upstream of the probe rather than in it";
+        }
+        if (self.refused_by_owner != 0 and self.refused_by_owner == self.actionable) {
+            return "every unmet stage with satisfied prerequisites was decided by a probe that declined under an owner rule rather than by one that read data. The observation was possible and policy refused it: change the policy or the owner, and do not read these as absences in the title";
+        }
+        if (self.refused_by_owner != 0) {
+            return "the unmet stages with satisfied prerequisites are a mix: some were read against real data and are findings against their owners, and some were refused by an owner rule and are findings against the rule. The two are answered in different places";
         }
         return "every unmet stage with satisfied prerequisites was probed against real data; the remaining gaps are findings against their stage owners";
     }
@@ -146,6 +192,10 @@ pub const Ledger = struct {
     /// means the static `probesFor` table and the runtime wiring disagree, and
     /// the diagnosis below it is incomplete rather than wrong.
     unlisted_probe_records: u64 = 0,
+    /// Starvations recorded with no cause, across every cell.  Non-zero means
+    /// the report can say a stage was unobserved and cannot say what it was
+    /// missing, which is a gap in Rosette's own call sites.
+    unattributed_starvations: u64 = 0,
 
     pub fn cell(self: *const Ledger, stage: Stage, probe: Probe) Cell {
         return self.cells[@intFromEnum(stage)][@intFromEnum(probe)];
@@ -162,6 +212,26 @@ pub const Ledger = struct {
         detail: u64,
         step: u64,
     ) void {
+        self.recordWithCause(stage, probe, outcome, .unspecified, detail, step);
+    }
+
+    /// Record one run of one probe, together with what it was missing when it
+    /// produced nothing.
+    ///
+    /// A starvation with no cause is the least actionable line the report can
+    /// carry: it says a stage has not been shown false and gives no way to
+    /// find out what would show it. Every site that knows why its input was
+    /// absent says so here, and the ones that do not are counted rather than
+    /// defaulted, so the gap stays visible.
+    pub fn recordWithCause(
+        self: *Ledger,
+        stage: Stage,
+        probe: Probe,
+        outcome: ProbeOutcome,
+        cause: StarvationCause,
+        detail: u64,
+        step: u64,
+    ) void {
         self.records +|= 1;
         if (!probeIsListed(stage, probe)) self.unlisted_probe_records +|= 1;
         const entry = &self.cells[@intFromEnum(stage)][@intFromEnum(probe)];
@@ -170,7 +240,15 @@ pub const Ledger = struct {
         entry.last_step = step;
         entry.latest = outcome;
         if (outcome.isEvidence()) entry.evidence_attempts +|= 1;
-        if (outcome.isStarved()) entry.starved_attempts +|= 1;
+        if (outcome.isStarved()) {
+            if (entry.starved_attempts == 0) entry.first_starved_step = step;
+            entry.starved_attempts +|= 1;
+            entry.starvation_cause = cause;
+            if (cause == .unspecified) {
+                entry.unattributed_starvations +|= 1;
+                self.unattributed_starvations +|= 1;
+            }
+        }
         if (rank(outcome) >= rank(entry.outcome)) {
             entry.outcome = outcome;
             if (detail != 0 or outcome.isEvidence()) entry.detail = detail;
@@ -218,12 +296,24 @@ pub const Ledger = struct {
             const entry = self.cell(stage, probe);
             if (entry.attempted()) result.probes_attempted += 1;
             if (entry.outcome.isEvidence()) result.probes_with_evidence += 1;
-            if (entry.attempted() and entry.outcome.isStarved()) result.probes_starved += 1;
+            if (entry.attempted() and entry.outcome.isStarved()) {
+                result.probes_starved += 1;
+                // The first starved probe's cause stands in until the deciding
+                // probe supplies one of its own. A stage whose decider read
+                // real data does not need a cause; a stage whose decider was
+                // starved overwrites this below.
+                if (result.starvation_cause == .unspecified) {
+                    result.starvation_cause = entry.starvation_cause;
+                }
+            }
             if (entry.last_step > result.last_step) result.last_step = entry.last_step;
             if (rank(entry.outcome) >= rank(strongest)) {
                 strongest = entry.outcome;
                 result.decided_by = probe;
                 result.decided_outcome = entry.outcome;
+                if (entry.outcome.isStarved() and entry.starvation_cause != .unspecified) {
+                    result.starvation_cause = entry.starvation_cause;
+                }
                 if (entry.detail != 0) result.detail = entry.detail;
             }
         }
@@ -257,15 +347,49 @@ pub const Ledger = struct {
     pub fn summary(self: *const Ledger, observed_mask: u32) Summary {
         var totals = Summary{};
         for (contract.stage_order) |stage| {
-            switch (self.diagnose(stage, observed_mask).attribution) {
+            const diagnosis = self.diagnose(stage, observed_mask);
+            switch (diagnosis.attribution) {
                 .met => totals.met += 1,
                 .blocked_upstream => totals.blocked_upstream += 1,
                 .unprobed => totals.unprobed += 1,
-                .starved => totals.starved += 1,
-                .actionable => totals.actionable += 1,
+                .starved => {
+                    totals.starved += 1;
+                    if (diagnosis.starvation_cause == .unspecified) {
+                        totals.starved_unattributed += 1;
+                    } else if (diagnosis.starvation_cause.closableByRosette()) {
+                        totals.starved_closable_by_rosette += 1;
+                    }
+                },
+                .actionable => {
+                    totals.actionable += 1;
+                    if (diagnosis.decided_outcome == .refused_by_owner) {
+                        totals.refused_by_owner += 1;
+                    }
+                },
             }
         }
         return totals;
+    }
+
+    /// The most attempts any single probe has recorded.
+    ///
+    /// A floor on how many times the refresh that drives every probe has run,
+    /// and the only honest evidence that "this probe never ran" is a wiring
+    /// gap rather than a run that has not got there yet. A cold ledger has
+    /// every reachable stage unprobed and that means nothing; a ledger where
+    /// one probe has a hundred attempts and another has none has a probe that
+    /// is not on the driver's path, and no later checkpoint will change that.
+    ///
+    /// A full scan of a fixed table, called once per report rather than per
+    /// step.
+    pub fn maxAttempts(self: *const Ledger) u64 {
+        var most: u64 = 0;
+        for (self.cells) |row| {
+            for (row) |entry| {
+                if (entry.attempts > most) most = entry.attempts;
+            }
+        }
+        return most;
     }
 
     /// The stage a reader should look at first: the actionable wall furthest
@@ -291,6 +415,25 @@ fn probeIsListed(stage: Stage, probe: Probe) bool {
         if (listed == probe) return true;
     }
     return false;
+}
+
+// A cold ledger and a ledger with an unwired probe look identical stage by
+// stage. What separates them is whether the driver ran at all, and that is the
+// only thing that makes "never probed" a defect rather than a schedule.
+test "the attempt floor separates a cold ledger from an unwired probe" {
+    var ledger = Ledger{};
+    try std.testing.expectEqual(@as(u64, 0), ledger.maxAttempts());
+
+    // One probe driven a hundred times; another stage's probes never called.
+    for (0..100) |round| {
+        ledger.record(.guest_vdswap_entered, .guest_log_breadcrumb, .negative, 0, round);
+    }
+    try std.testing.expectEqual(@as(u64, 100), ledger.maxAttempts());
+    // The stage nothing looked at is still unprobed, and now that is a fact
+    // about the wiring rather than about the clock.
+    const cold = ledger.diagnose(.frontbuffer_validated, 0);
+    try std.testing.expectEqual(Attribution.unprobed, cold.attribution);
+    try std.testing.expectEqual(@as(usize, 0), cold.probes_attempted);
 }
 
 test "an empty ledger reports every unmet stage as unprobed or blocked" {
@@ -432,4 +575,144 @@ test "a complete contract has no walls and no observer defects" {
     try std.testing.expectEqual(@as(usize, 0), totals.observerDefects());
     try std.testing.expect(ledger.primaryWall(observed) == null);
     try std.testing.expectEqual(@as(u64, 0), ledger.unlisted_probe_records);
+}
+
+// The line the 2026-09-01 run produced was `starved=1
+// decided=guest-progress-counter/input-unavailable`, and it named neither what
+// the counter was missing nor whether anyone could do anything about it.
+test "a starved stage carries what its probe was missing" {
+    var ledger = Ledger{};
+    const observed: u32 = contract.stageBit(.draw_consumed);
+
+    ledger.recordWithCause(
+        .guest_producer_progressed_after_draw,
+        .guest_progress_counter,
+        .input_unavailable,
+        .upstream_producer_idle,
+        0,
+        4_200_000,
+    );
+
+    const diagnosis = ledger.diagnose(.guest_producer_progressed_after_draw, observed);
+    try std.testing.expectEqual(Attribution.starved, diagnosis.attribution);
+    try std.testing.expectEqual(StarvationCause.upstream_producer_idle, diagnosis.starvation_cause);
+    // Nothing an observer can do brings this forward, so it must not appear in
+    // the count of holes Rosette can close today.
+    try std.testing.expectEqual(StarvationOwner.upstream_fact, diagnosis.starvation_cause.owner());
+
+    const cell = ledger.cell(.guest_producer_progressed_after_draw, .guest_progress_counter);
+    try std.testing.expectEqual(@as(u64, 4_200_000), cell.first_starved_step);
+    try std.testing.expectEqual(@as(u64, 0), cell.unattributed_starvations);
+
+    const totals = ledger.summary(observed);
+    try std.testing.expectEqual(@as(usize, 0), totals.starved_unattributed);
+    try std.testing.expectEqual(@as(usize, 0), totals.starved_closable_by_rosette);
+}
+
+// A cause nobody recorded is a wiring gap at a call site. It has to be
+// countable, or `unspecified` quietly becomes the common answer and the report
+// is back where it started.
+test "a starvation with no cause is counted rather than defaulted" {
+    var ledger = Ledger{};
+    const observed: u32 = contract.stageBit(.draw_consumed);
+    ledger.record(.guest_producer_progressed_after_draw, .guest_progress_counter, .input_unavailable, 0, 10);
+
+    try std.testing.expectEqual(@as(u64, 1), ledger.unattributed_starvations);
+    const diagnosis = ledger.diagnose(.guest_producer_progressed_after_draw, observed);
+    try std.testing.expectEqual(StarvationCause.unspecified, diagnosis.starvation_cause);
+    const totals = ledger.summary(observed);
+    try std.testing.expectEqual(@as(usize, 1), totals.starved_unattributed);
+}
+
+// The two starvations that are worth separating: one the guest has to reach
+// and one Rosette never wired. Both read `starved=1` and only the second is
+// work available today.
+test "an unwired probe is separated from an input nothing has produced" {
+    var ledger = Ledger{};
+    const observed: u32 = contract.stageBit(.draw_consumed);
+    ledger.recordWithCause(
+        .guest_producer_progressed_after_draw,
+        .guest_progress_counter,
+        .input_unavailable,
+        .source_never_fed,
+        0,
+        10,
+    );
+    const totals = ledger.summary(observed);
+    try std.testing.expectEqual(@as(usize, 1), totals.starved);
+    try std.testing.expectEqual(@as(usize, 1), totals.starved_closable_by_rosette);
+    try std.testing.expectEqual(@as(usize, 0), totals.starved_unattributed);
+}
+
+// The verdict ranks the three kinds of starvation, because they are three
+// different pieces of work and the most fixable one has to be said first. An
+// unprobed stage still outranks all of them: a probe that never ran is a
+// stronger statement about the observer than one that ran and found nothing.
+test "the verdict names the most closable starvation first" {
+    const unattributed = Summary{ .met = 1, .starved = 2, .starved_unattributed = 1, .starved_closable_by_rosette = 1 };
+    try std.testing.expect(std.mem.indexOf(u8, unattributed.verdict(), "names no work") != null);
+
+    const closable = Summary{ .met = 1, .starved = 2, .starved_closable_by_rosette = 1 };
+    try std.testing.expect(std.mem.indexOf(u8, closable.verdict(), "Rosette's to close today") != null);
+
+    const upstream = Summary{ .met = 1, .starved = 2 };
+    try std.testing.expect(std.mem.indexOf(u8, upstream.verdict(), "upstream of the probe") != null);
+
+    // An unprobed stage outranks every kind of starvation.
+    const unprobed = Summary{ .met = 1, .unprobed = 1, .starved = 1, .starved_unattributed = 1 };
+    try std.testing.expect(std.mem.indexOf(u8, unprobed.verdict(), "never been probed") != null);
+
+    try std.testing.expectEqual(@as(usize, 0), (Summary{ .met = 3 }).unmet());
+    try std.testing.expect(std.mem.indexOf(u8, (Summary{ .met = 3 }).verdict(), "handoff is complete") != null);
+}
+
+// The cause is the *latest* one, so a probe that used to starve on unreadable
+// memory and now starves on a drained input reads as having changed.
+test "the retained cause is the most recent starvation, not the first" {
+    var ledger = Ledger{};
+    ledger.recordWithCause(.pm4_stream_observed, .outstanding_span_scan, .input_unavailable, .memory_unreadable, 0, 10);
+    try std.testing.expectEqual(
+        StarvationCause.memory_unreadable,
+        ledger.cell(.pm4_stream_observed, .outstanding_span_scan).starvation_cause,
+    );
+    ledger.recordWithCause(.pm4_stream_observed, .outstanding_span_scan, .input_empty, .input_drained, 0, 20);
+    const cell = ledger.cell(.pm4_stream_observed, .outstanding_span_scan);
+    try std.testing.expectEqual(StarvationCause.input_drained, cell.starvation_cause);
+    // The first starvation's step is kept, so a probe blind from the start is
+    // distinguishable from one that went blind later.
+    try std.testing.expectEqual(@as(u64, 10), cell.first_starved_step);
+    try std.testing.expectEqual(@as(u64, 2), cell.starved_attempts);
+}
+
+// A refusal and an absence read identically in a `findings=` count and are
+// answered in completely different places: one by changing a policy, the other
+// by looking at what the title did.
+test "a stage decided by a refusal is separated from one decided by evidence" {
+    var ledger = Ledger{};
+    const observed: u32 = contract.stageBit(.xe_swap_packet_decoded) |
+        contract.stageBit(.authentic_xe_swap_consumed);
+
+    ledger.record(.issue_swap_entered, .presenter_tracepoint, .refused_by_owner, 0, 10);
+    const refused = ledger.diagnose(.issue_swap_entered, observed);
+    // A refusal is a decision, so the stage is actionable and not starved.
+    try std.testing.expectEqual(Attribution.actionable, refused.attribution);
+    try std.testing.expect(!refused.observerDefect());
+
+    const totals = ledger.summary(observed);
+    try std.testing.expect(totals.actionable != 0);
+    try std.testing.expectEqual(@as(usize, 1), totals.refused_by_owner);
+    try std.testing.expect(std.mem.indexOf(u8, (Summary{
+        .met = 1,
+        .actionable = 1,
+        .refused_by_owner = 1,
+    }).verdict(), "policy refused it") != null);
+
+    // A stage decided by real data alongside it makes the report a mixture,
+    // and the sentence has to say so rather than pick one.
+    const mixed = Summary{ .met = 1, .actionable = 2, .refused_by_owner = 1 };
+    try std.testing.expect(std.mem.indexOf(u8, mixed.verdict(), "answered in different places") != null);
+
+    // No refusals at all keeps the original sentence.
+    const evidenced = Summary{ .met = 1, .actionable = 2 };
+    try std.testing.expect(std.mem.indexOf(u8, evidenced.verdict(), "findings against their stage owners") != null);
 }

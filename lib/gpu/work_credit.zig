@@ -19,6 +19,10 @@ pub const Kind = enum(u8) {
     callback_dispatch,
     guest_swap_request,
     guest_frame,
+    native_submission,
+    native_present_request,
+    native_gpu_completion,
+    diagnostic_present,
     native_present,
 
     pub fn label(self: Kind) []const u8 {
@@ -31,6 +35,10 @@ pub const Kind = enum(u8) {
             .callback_dispatch => "callback-dispatch",
             .guest_swap_request => "guest-swap-request",
             .guest_frame => "guest-frame",
+            .native_submission => "native-submission",
+            .native_present_request => "native-present-request",
+            .native_gpu_completion => "native-gpu-completion",
+            .diagnostic_present => "diagnostic-present",
             .native_present => "native-present",
         };
     }

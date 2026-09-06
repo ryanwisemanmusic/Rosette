@@ -53,6 +53,10 @@ pub const Link = enum(u8) {
     native_submission,
     native_presentation,
     present_accepted,
+    /// A host fence or command-buffer status proved that the submitted GPU
+    /// work completed.  A present request is only an enqueue operation; it is
+    /// not this link.
+    hardware_completed,
     guest_swap_observed,
 
     pub fn label(self: Link) []const u8 {
@@ -62,6 +66,7 @@ pub const Link = enum(u8) {
             .native_submission => "a native vkQueueSubmit",
             .native_presentation => "a native vkQueuePresentKHR",
             .present_accepted => "a presentation request the engine accepted",
+            .hardware_completed => "host GPU work completed on a fence",
             .guest_swap_observed => "a VdSwap the guest actually performed",
         };
     }
@@ -82,6 +87,11 @@ pub const Evidence = struct {
     native_presentation: bool = false,
     /// The presentation engine accepted the request. Acceptance, not sight.
     present_accepted: bool = false,
+    /// A host synchronization primitive proved that the submitted GPU work
+    /// completed. This is deliberately separate from `present_accepted`:
+    /// Vulkan can accept a present while its preceding submission is still in
+    /// flight.
+    hardware_completed: bool = false,
     /// The guest performed a swap for this frame.
     guest_swap_observed: bool = false,
 
@@ -93,6 +103,7 @@ pub const Evidence = struct {
         if (!self.native_submission) return .native_submission;
         if (!self.native_presentation) return .native_presentation;
         if (!self.present_accepted) return .present_accepted;
+        if (!self.hardware_completed) return .hardware_completed;
         if (!self.guest_swap_observed) return .guest_swap_observed;
         return null;
     }
@@ -101,7 +112,8 @@ pub const Evidence = struct {
     /// Xenia-produced host frame satisfies.
     pub fn nativeChainComplete(self: Evidence) bool {
         return self.source_ready and self.native_command_recording and
-            self.native_submission and self.native_presentation and self.present_accepted;
+            self.native_submission and self.native_presentation and self.present_accepted and
+            self.hardware_completed;
     }
 };
 
@@ -110,6 +122,10 @@ pub const Evidence = struct {
 pub const Classification = enum(u8) {
     /// Nothing reached the display. Not a frame.
     rejected,
+    /// The host accepted a presentation request, but no host synchronization
+    /// edge has proved that the submitted GPU work completed. It is not safe
+    /// to call this diagnostic, host, or guest output.
+    incomplete_frame,
     /// A host-generated liveness frame. Says the window works.
     diagnostic_frame,
     /// Xenia's host renderer reached the display through the native driver.
@@ -120,6 +136,7 @@ pub const Classification = enum(u8) {
     pub fn label(self: Classification) []const u8 {
         return switch (self) {
             .rejected => "rejected",
+            .incomplete_frame => "incomplete_frame",
             .diagnostic_frame => "diagnostic_frame",
             .host_frame => "host_frame",
             .guest_output_frame => "guest_output_frame",
@@ -134,6 +151,7 @@ pub const Classification = enum(u8) {
 
 pub fn classify(evidence: Evidence) Classification {
     if (!evidence.present_accepted) return .rejected;
+    if (!evidence.hardware_completed) return .incomplete_frame;
     if (evidence.producer == .guest and evidence.nativeChainComplete() and evidence.guest_swap_observed) {
         return .guest_output_frame;
     }
@@ -161,6 +179,10 @@ pub const Ledger = struct {
     guest_output_frames_presented: u64 = 0,
     /// Frames whose presentation request was never accepted.
     frames_rejected: u64 = 0,
+    /// Requests accepted by the presentation engine before a host fence proved
+    /// that the submitted GPU work completed. These are neither rejected nor
+    /// presented frames.
+    frames_incomplete: u64 = 0,
     /// Frames classified below what the caller claimed. A non-zero value here
     /// means some part of the runtime believes it is more native than it is.
     claims_demoted: u64 = 0,
@@ -203,6 +225,7 @@ pub const Ledger = struct {
         if (@intFromEnum(actual) < @intFromEnum(claimed)) self.claims_demoted +|= 1;
         switch (actual) {
             .rejected => self.frames_rejected +|= 1,
+            .incomplete_frame => self.frames_incomplete +|= 1,
             .diagnostic_frame => self.diagnostic_frames_presented +|= 1,
             .host_frame => self.host_frames_presented +|= 1,
             .guest_output_frame => self.guest_output_frames_presented +|= 1,
@@ -222,6 +245,9 @@ pub const Ledger = struct {
         }
         if (self.diagnostic_frames_presented != 0) {
             return "everything displayed so far is a Rosette diagnostic frame. It proves the window and the presentation path are alive and says NOTHING about the guest's rendering";
+        }
+        if (self.frames_incomplete != 0) {
+            return "the presentation engine accepted work, but no host fence has proved GPU completion; no frame is counted until that edge exists";
         }
         return "nothing has reached the display";
     }
@@ -243,6 +269,7 @@ test "a diagnostic clear cannot move the guest-output counter" {
         .producer = .diagnostic,
         .source_ready = true,
         .present_accepted = true,
+        .hardware_completed = true,
     });
     try std.testing.expectEqual(Classification.diagnostic_frame, result);
     try std.testing.expectEqual(@as(u64, 1), ledger.diagnostic_frames_presented);
@@ -263,6 +290,7 @@ test "an over-claimed frame is demoted and the demotion is counted" {
         .native_submission = true,
         .native_presentation = true,
         .present_accepted = true,
+        .hardware_completed = true,
         // The guest never swapped.
         .guest_swap_observed = false,
     });
@@ -281,6 +309,7 @@ test "a full chain with a guest swap is the only route to guest output" {
         .native_submission = true,
         .native_presentation = true,
         .present_accepted = true,
+        .hardware_completed = true,
         .guest_swap_observed = true,
     };
     try std.testing.expectEqual(Classification.guest_output_frame, ledger.record(evidence));
@@ -302,6 +331,7 @@ test "an authentic host-rendered frame is neither diagnostic nor guest output" {
         .native_submission = true,
         .native_presentation = true,
         .present_accepted = true,
+        .hardware_completed = true,
     });
     try std.testing.expectEqual(Classification.host_frame, result);
     try std.testing.expectEqual(@as(u64, 1), ledger.host_frames_presented);
@@ -309,21 +339,39 @@ test "an authentic host-rendered frame is neither diagnostic nor guest output" {
     try std.testing.expectEqual(@as(u64, 0), ledger.guest_output_frames_presented);
 }
 
-// A present that went through Rosette's own compositor instead of the driver is
-// the case that looks most like success and is furthest from it.
-test "presentation that bypassed the host driver stays diagnostic" {
+// An accepted host request without a completion edge cannot be called a frame
+// at all: strict provenance requires hardware completion before even the
+// weaker diagnostic/host classifications are available.
+test "presentation without host completion stays incomplete" {
     var ledger = Ledger{};
     const result = ledger.record(.{
         .producer = .xenia_host,
         .source_ready = true,
         .native_command_recording = true,
         .native_submission = true,
-        .native_presentation = false,
+        .native_presentation = true,
         .present_accepted = true,
     });
-    try std.testing.expectEqual(Classification.diagnostic_frame, result);
-    try std.testing.expectEqual(Link.native_presentation, ledger.last_missing_link.?);
+    try std.testing.expectEqual(Classification.incomplete_frame, result);
+    try std.testing.expectEqual(Link.hardware_completed, ledger.last_missing_link.?);
     try std.testing.expectEqual(@as(u64, 1), ledger.claims_demoted);
+    try std.testing.expectEqual(@as(u64, 1), ledger.frames_incomplete);
+}
+
+test "an accepted request without a host completion edge is not a frame" {
+    var ledger = Ledger{};
+    const result = ledger.record(.{
+        .producer = .diagnostic,
+        .source_ready = true,
+        .native_command_recording = true,
+        .native_submission = true,
+        .native_presentation = true,
+        .present_accepted = true,
+    });
+    try std.testing.expectEqual(Classification.incomplete_frame, result);
+    try std.testing.expectEqual(@as(u64, 1), ledger.frames_incomplete);
+    try std.testing.expectEqual(Link.hardware_completed, ledger.last_missing_link.?);
+    try std.testing.expectEqual(@as(u64, 0), ledger.diagnostic_frames_presented);
 }
 
 test "the first missing link names the next thing to build" {

@@ -213,6 +213,7 @@ pub const HandshakeRequest = extern struct {
     pub fn xeniaHostExecution() HandshakeRequest {
         var result = xeniaObservation();
         result.required = CapabilitySet.from(&.{
+            .backend_instance,
             .physical_adapter,
             .logical_device,
             .queue_graphics,
@@ -231,6 +232,18 @@ pub const HandshakeRequest = extern struct {
             .semaphore_binary,
         });
         result.required_queue_mask = QueueMask.graphics;
+        return result;
+    }
+
+    /// Authoritative device-creation contract. Unlike the broad observation
+    /// profile, this request is evaluated immediately after the guest's real
+    /// VkDevice and queue have been created, before surface/presentation
+    /// objects necessarily exist. A loader-open probe must never be reported
+    /// as this contract: it is pending until these native facts are present.
+    pub fn xeniaDeviceExecution() HandshakeRequest {
+        var result = xeniaHostExecution();
+        result.desired = .{};
+        result.desired_queue_mask = 0;
         return result;
     }
 };
@@ -466,4 +479,13 @@ test "Xenia execution profile is stricter than observation" {
     try std.testing.expect(execution.required.contains(.logical_device));
     try std.testing.expect(execution.required.contains(.guest_memory_mapping));
     try std.testing.expect(!execution.required.contains(.backend_escape));
+}
+
+test "Xenia device execution is authoritative without pre-device WSI desires" {
+    const request = HandshakeRequest.xeniaDeviceExecution();
+    try std.testing.expect(request.required.contains(.backend_instance));
+    try std.testing.expect(request.required.contains(.logical_device));
+    try std.testing.expect(request.required.contains(.semaphore_binary));
+    try std.testing.expect(request.desired.isEmpty());
+    try std.testing.expectEqual(@as(u32, 0), request.desired_queue_mask);
 }

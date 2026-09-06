@@ -75,6 +75,9 @@ pub const VulkanSnapshot = struct {
     ready: bool = false,
     submissions: u64 = 0,
     presents: u64 = 0,
+    /// Present requests for which a host queue-idle or fence edge completed.
+    /// This is never inferred from `presents`.
+    completed_presents: u64 = 0,
     diagnostic_frames: u64 = 0,
     host_frames: u64 = 0,
     guest_output_frames: u64 = 0,
@@ -271,6 +274,7 @@ pub const Runtime = struct {
     last_diagnostic_custody: u64 = 0,
     last_xenia_submissions: u64 = 0,
     last_xenia_presents: u64 = 0,
+    last_xenia_present_completions: u64 = 0,
     last_frame_serial: u64 = 0,
 
     pub fn configure(self: *Runtime, policy: RoutePolicy) void {
@@ -458,6 +462,7 @@ pub const Runtime = struct {
         observeVulkanStages(&self.control, vk, .xenia_vulkan, step);
         observeStage(&self.control, .xenia_vulkan_submission_seen, vk.submissions != 0, vk.submissions != 0, vk.queue, generation, .completed_call, step);
         observeStage(&self.control, .xenia_vulkan_present_seen, vk.presents != 0, vk.presents != 0, vk.swapchain, generation, .completed_call, step);
+        observeStage(&self.control, .xenia_vulkan_present_completed, vk.completed_presents != 0, vk.completed_presents != 0, vk.swapchain, generation, .hardware_completed, step);
     }
 
     fn observeXenos(self: *Runtime, xenos: XenosSnapshot, step: u64) void {
@@ -543,7 +548,7 @@ pub const Runtime = struct {
             .rosette_runtime,
             nonzero(source.rosette_vulkan.swapchain),
             nonzero(source.rosette_vulkan.generation),
-            .native_present,
+            .diagnostic_present,
             source.step,
         );
         self.claimDelta(
@@ -563,7 +568,7 @@ pub const Runtime = struct {
             .rosette_runtime,
             nonzero(source.native.metal_layer),
             1,
-            .native_present,
+            .diagnostic_present,
             source.step,
         );
         self.claimDelta(
@@ -593,7 +598,7 @@ pub const Runtime = struct {
             .xenia_vulkan,
             source.xenia_vulkan.queue,
             nonzero(source.xenia_vulkan.generation),
-            .pm4_batch,
+            .native_submission,
             source.step,
         );
         self.claimDelta(
@@ -603,7 +608,17 @@ pub const Runtime = struct {
             .xenia_vulkan,
             source.xenia_vulkan.swapchain,
             nonzero(source.xenia_vulkan.generation),
-            .native_present,
+            .native_present_request,
+            source.step,
+        );
+        self.claimDelta(
+            &self.last_xenia_present_completions,
+            source.xenia_vulkan.completed_presents,
+            run,
+            .xenia_vulkan,
+            source.xenia_vulkan.queue,
+            nonzero(source.xenia_vulkan.generation),
+            .native_gpu_completion,
             source.step,
         );
 
@@ -616,14 +631,14 @@ pub const Runtime = struct {
                 .generation = diagnostic_frames,
                 .actor = .rosette_runtime,
                 .authority = .diagnostic_substitute,
-                .evidence = .completed_call,
+                .evidence = .hardware_completed,
                 .step = source.step,
             });
             _ = self.control.recordStage(
                 .diagnostic_frame_presented,
                 .ready,
                 .rosette_runtime,
-                .completed_call,
+                .hardware_completed,
                 identity,
                 diagnostic_frames,
                 source.step,
@@ -761,7 +776,7 @@ pub const Runtime = struct {
                 else => null,
             };
             if (presentation_stage) |stage| {
-                _ = self.control.recordStage(stage, .ready, .rosette_runtime, .completed_call, identity.source, identity.serial, step);
+                _ = self.control.recordStage(stage, .ready, .rosette_runtime, .hardware_completed, identity.source, identity.serial, step);
             }
         }
         if (entry.state == .presented) {
@@ -1173,6 +1188,27 @@ test "a diagnostic frame never earns guest-frame work credit" {
     _ = runtime.reconcile(snapshot);
     try std.testing.expectEqual(@as(u64, 0), runtime.credits.units(.guest_frame));
     try std.testing.expectEqual(@as(u64, 1), runtime.frames.summary().diagnostic);
+}
+
+test "aggregate work keeps requests, diagnostics, and completed frames distinct" {
+    var runtime = Runtime{};
+    runtime.configure(.verified_guest_fallback);
+    var snapshot = completeSnapshot();
+    snapshot.rosette_vulkan.diagnostic_frames = 2;
+    snapshot.xenia_vulkan.queue = 0x706;
+    snapshot.xenia_vulkan.swapchain = 0x707;
+    snapshot.xenia_vulkan.generation = 4;
+    snapshot.xenia_vulkan.submissions = 3;
+    snapshot.xenia_vulkan.presents = 4;
+    snapshot.xenia_vulkan.completed_presents = 2;
+    _ = runtime.reconcile(snapshot);
+
+    try std.testing.expectEqual(@as(u64, 2), runtime.credits.units(.diagnostic_present));
+    try std.testing.expectEqual(@as(u64, 3), runtime.credits.units(.native_submission));
+    try std.testing.expectEqual(@as(u64, 4), runtime.credits.units(.native_present_request));
+    try std.testing.expectEqual(@as(u64, 2), runtime.credits.units(.native_gpu_completion));
+    try std.testing.expectEqual(@as(u64, 0), runtime.credits.units(.native_present));
+    try std.testing.expectEqual(@as(u64, 0), runtime.credits.units(.guest_frame));
 }
 
 test "a guest frame always takes the custody slot over a diagnostic one" {

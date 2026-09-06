@@ -145,11 +145,13 @@ pub const Runtime = struct {
     /// the handle API itself. The Vulkan presenter predates the generic handle
     /// surface and owns its swapchain directly, but its real queue submissions
     /// and accepted presentation requests are still facts about this runtime's
-    /// host execution boundary. Observing them here keeps bridge health honest
-    /// without fabricating a guest frame or a guest GPU command.
-    pub fn observeBackendProgress(self: *Runtime, submitted: bool, presented: bool) void {
+    /// host execution boundary. The second argument is deliberately a
+    /// completion edge, not a successful API request: observing it here keeps
+    /// bridge health honest without fabricating a guest frame or a guest GPU
+    /// command.
+    pub fn observeBackendProgress(self: *Runtime, submitted: bool, hardware_completed: bool) void {
         if (submitted) self.submissions +|= 1;
-        if (presented) self.presentations +|= 1;
+        if (hardware_completed) self.presentations +|= 1;
     }
 
     pub fn hardwareDescription(self: *const Runtime) ?*const device_tree.Tree {

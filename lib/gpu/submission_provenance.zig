@@ -1,7 +1,7 @@
 //! Who moved the ring's write pointer, and whether the observers agree that
 //! anyone did.
 //!
-//! Three independent things in this run claim to know whether the producer
+//! Several independent things in this run claim to know whether the producer
 //! published, and in the run this was written for they disagreed completely:
 //!
 //!   * Rosette's ring tracker: two writes, one advance, `published=YES`.
@@ -9,15 +9,19 @@
 //!     last_source=unknown)`.
 //!   * The register aperture observer: `verdict=never_accessed` — not one
 //!     access to the memory-mapped register the write pointer lives in.
+//!   * The value-keyed transport chain: source write, apply, worker wake,
+//!     consumption, and guest writeback for the same publication.
 //!
 //! All three cannot be right, and the interesting part is *why* each believes
 //! what it believes. Rosette's tracker is fed by parsing a line the emulator
 //! printed; the emulator's counter is incremented where it actually applies a
 //! pointer update; the aperture observer sees the faults a guest store to the
 //! register would raise. So the disagreement is not noise — it localises the
-//! event. A pointer the emulator printed and never applied means the print site
-//! and the apply site are different code paths. A pointer nothing stored means
-//! it never came from the title at all.
+//! event. A pointer the emulator printed and no later stage acknowledged may
+//! mean the print site and the apply site are different code paths. But a
+//! completed transport chain refutes "not applied" even when a direct counter
+//! hook missed it: a command processor cannot consume and acknowledge an
+//! unapplied publication.
 //!
 //! ## Why this is a predictor and not a counter
 //!
@@ -45,6 +49,10 @@ pub const Source = enum(u8) {
     /// Command dwords found in ring memory. Not the pointer itself, but the
     /// only direct evidence that a producer wrote anything at all.
     ring_memory_contents = 3,
+    /// A value-keyed publication reached apply, worker wake,
+    /// command-processor consumption, and guest-visible writeback. This is not
+    /// a direct pointer observer, but it conclusively proves application.
+    transport_completion = 4,
 
     pub fn label(self: Source) []const u8 {
         return switch (self) {
@@ -52,6 +60,7 @@ pub const Source = enum(u8) {
             .emulator_counter => "emulator_counter",
             .guest_register_store => "guest_register_store",
             .ring_memory_contents => "ring_memory_contents",
+            .transport_completion => "transport_completion",
         };
     }
 
@@ -61,11 +70,12 @@ pub const Source = enum(u8) {
             .emulator_counter => "moderate: the emulator incremented this where it applies an update, so it is a claim about the emulator's own state machine",
             .guest_register_store => "strongest for the pointer: the aperture's pages are unreadable by design, so a guest store to the register cannot happen without faulting into this observer",
             .ring_memory_contents => "strongest for the payload: dwords in the ring were written by something, whatever any pointer counter says",
+            .transport_completion => "strongest for application: the same value-keyed publication reached apply, worker wake, consumption, and guest writeback; it proves transport even when a direct pointer hook was bypassed",
         };
     }
 };
 
-pub const source_count = 4;
+pub const source_count = 5;
 
 /// What one observer counted.
 pub const Observation = struct {
@@ -94,6 +104,10 @@ pub const Finding = enum {
     /// The emulator printed a pointer update that neither its own counter nor
     /// the aperture saw. The print site and the apply site have diverged.
     printed_but_not_applied,
+    /// Direct apply observers missed the pointer path, but a value-keyed
+    /// transport chain completed. The missing direct observation is an
+    /// instrumentation/source-attribution gap rather than a GPU fault.
+    consumed_with_direct_observer_gap,
     /// Command dwords are in the ring and no observer saw a pointer move. The
     /// payload exists and was never published.
     payload_without_publication,
@@ -107,6 +121,7 @@ pub const Finding = enum {
             .agreed_published => "agreed_published",
             .agreed_silent => "agreed_silent",
             .printed_but_not_applied => "PRINTED_BUT_NOT_APPLIED",
+            .consumed_with_direct_observer_gap => "CONSUMED_WITH_DIRECT_OBSERVER_GAP",
             .payload_without_publication => "PAYLOAD_WITHOUT_PUBLICATION",
             .publication_without_payload => "PUBLICATION_WITHOUT_PAYLOAD",
         };
@@ -117,7 +132,8 @@ pub const Finding = enum {
             .nothing_observed => "no observer has seen anything yet, so nothing can be concluded about the producer",
             .agreed_published => "every active observer agrees the producer published a span, so treating the ring as live is safe",
             .agreed_silent => "every active observer agrees nothing has been submitted. The producer has not run, and no counter downstream of it means anything yet",
-            .printed_but_not_applied => "the emulator printed a write-pointer update that neither its own applied-update counter nor the register aperture observed. Its logging ran and its state machine did not, so the two are different code paths — and every downstream latch fed by that log line is asserting something the emulator does not itself believe. Trust the counter and the aperture over the line",
+            .printed_but_not_applied => "the emulator printed a write-pointer update that neither its own applied-update counter nor the register aperture observed. Its logging ran and no downstream transport stage corroborated it, so the print and apply paths may have diverged. Trust the direct observers until a value-keyed transport chain proves otherwise",
+            .consumed_with_direct_observer_gap => "the direct applied-update observers missed the pointer path, but a value-keyed guest publication completed apply, worker wake, command-processor consumption, and guest writeback. That downstream chain refutes 'not applied': this is an observer/source-attribution gap, not a submission or command-processor failure",
             .payload_without_publication => "command dwords are in ring memory and no observer saw the write pointer move. The producer built a batch and never published it, which is a control-flow problem in the submitting thread rather than anything downstream of the ring",
             .publication_without_payload => "the write pointer moved and the ring holds no command dwords. The producer published an empty span: its submission path ran with nothing behind it, which is the opposite of a consumer that failed to drain",
         };
@@ -136,6 +152,7 @@ pub const Ledger = struct {
         .{ .source = .emulator_counter },
         .{ .source = .guest_register_store },
         .{ .source = .ring_memory_contents },
+        .{ .source = .transport_completion },
     },
 
     pub fn record(self: *Ledger, source: Source, active: bool, events: u64) void {
@@ -161,7 +178,7 @@ pub const Ledger = struct {
     pub fn strongestPointerEvidence(self: *const Ledger) ?Source {
         var chosen: ?Source = null;
         for (self.observations) |entry| {
-            if (entry.source == .ring_memory_contents) continue;
+            if (entry.source == .ring_memory_contents or entry.source == .transport_completion) continue;
             if (!entry.claimsMovement()) continue;
             if (chosen == null or @intFromEnum(entry.source) > @intFromEnum(chosen.?)) chosen = entry.source;
         }
@@ -175,9 +192,16 @@ pub const Ledger = struct {
         const line = self.get(.emulator_log_line);
         const counter = self.get(.emulator_counter);
         const aperture = self.get(.guest_register_store);
+        const transport = self.get(.transport_completion);
 
         const pointer_moved = line.claimsMovement() or counter.claimsMovement() or aperture.claimsMovement();
         const corroborated = counter.claimsMovement() or aperture.claimsMovement();
+
+        // The completed transport is downstream proof of application. It does
+        // not become direct pointer evidence, but it prevents a missing direct
+        // hook from turning consumed work into PRINTED_BUT_NOT_APPLIED.
+        if (transport.claimsMovement() and !corroborated)
+            return .consumed_with_direct_observer_gap;
 
         // The specific disagreement this module was written for, and it has to
         // be checked before the agreement cases: a log line asserting movement
@@ -212,8 +236,18 @@ test "a printed pointer nobody applied is a divergence rather than a publication
     const ledger = observedRun();
     try std.testing.expectEqual(Finding.printed_but_not_applied, ledger.finding());
     try std.testing.expect(ledger.finding().undermines_publication());
-    try std.testing.expect(std.mem.indexOf(u8, ledger.finding().meaning(), "different code paths") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ledger.finding().meaning(), "no downstream transport") != null);
     // The strongest thing believing the pointer moved is the weakest source.
+    try std.testing.expectEqual(Source.emulator_log_line, ledger.strongestPointerEvidence().?);
+}
+
+test "completed transport refutes printed but not applied" {
+    var ledger = observedRun();
+    ledger.record(.transport_completion, true, 2);
+    try std.testing.expectEqual(Finding.consumed_with_direct_observer_gap, ledger.finding());
+    try std.testing.expect(!ledger.finding().undermines_publication());
+    try std.testing.expect(std.mem.indexOf(u8, ledger.finding().meaning(), "refutes 'not applied'") != null);
+    // Transport proves application, not which direct pointer path supplied it.
     try std.testing.expectEqual(Source.emulator_log_line, ledger.strongestPointerEvidence().?);
 }
 
@@ -286,16 +320,18 @@ test "ring contents never count as evidence that the pointer moved" {
 
 test "every source and finding explains itself" {
     inline for (.{
-        Source.emulator_log_line,     Source.emulator_counter,
-        Source.guest_register_store,  Source.ring_memory_contents,
+        Source.emulator_log_line,    Source.emulator_counter,
+        Source.guest_register_store, Source.ring_memory_contents,
+        Source.transport_completion,
     }) |source| {
         try std.testing.expect(source.label().len > 0);
         try std.testing.expect(source.strength().len > 40);
     }
     inline for (.{
-        Finding.nothing_observed,             Finding.agreed_published,
-        Finding.agreed_silent,                Finding.printed_but_not_applied,
-        Finding.payload_without_publication,  Finding.publication_without_payload,
+        Finding.nothing_observed,                  Finding.agreed_published,
+        Finding.agreed_silent,                     Finding.printed_but_not_applied,
+        Finding.consumed_with_direct_observer_gap, Finding.payload_without_publication,
+        Finding.publication_without_payload,
     }) |finding| {
         try std.testing.expect(finding.label().len > 0);
         try std.testing.expect(finding.meaning().len > 40);

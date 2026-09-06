@@ -90,10 +90,18 @@ pub const Report = struct {
     draws: u64 = 0,
     events: u64 = 0,
     swaps: u64 = 0,
+    packet_errors: u64 = 0,
+    invalid_packets: u64 = 0,
     draw_completion_observations: u64 = 0,
     draw_completion_signals: u64 = 0,
+    renderable_draw_observations: u64 = 0,
     unknown_opcodes: u64 = 0,
     truncated: bool = false,
+    /// The batch's last packet did not fit the window and everything before it
+    /// decoded. Distinct from `truncated`, which is also set when the caller's
+    /// span simply exceeded the ring: this one says a partial observation was
+    /// kept rather than a batch refused.
+    truncated_tail_retained: bool = false,
     indirect_buffers: u64 = 0,
     indirect_dwords_requested: u64 = 0,
     indirect_dwords_read: u64 = 0,
@@ -106,6 +114,24 @@ pub const Report = struct {
     indirect_last_status: IndirectStatus = .not_attempted,
     indirect_last_address: u32 = 0,
     indirect_last_missing_address: ?u32 = null,
+    register_writes: u64 = 0,
+    /// Writes this execution made into the render-backend block: colour,
+    /// depth, surface and masks.
+    ///
+    /// The stage `render-target state observed` has two evidence paths and
+    /// only one of them was ever recorded on the success path — the register
+    /// file, read after the fact. This is the other one: what *this batch*
+    /// programmed, which is the question the frontier is actually asking.
+    render_target_register_writes: u64 = 0,
+    /// EDRAM colour resolves this execution observed.
+    color_resolves: u64 = 0,
+    unclassified_register_writes: u64 = 0,
+    out_of_range_register_writes: u64 = 0,
+    /// Guest-encoded register intent, excluding the executor's internal
+    /// register-file side effects. These are the authority-comparable counts.
+    command_register_writes: u64 = 0,
+    command_unclassified_register_writes: u64 = 0,
+    command_out_of_range_register_writes: u64 = 0,
     packet_summary: packet_trace.Summary = .{},
 };
 
@@ -133,6 +159,15 @@ pub const RenderTargetEvidence = struct {
     raw_color_info: u32 = 0,
     raw_depth_info: u32 = 0,
     raw_surface_info: u32 = 0,
+
+    /// A target is output-ready only when the observer saw an explicit colour
+    /// target, a non-zero surface pitch, and a non-zero colour write mask. The
+    /// weaker `plausible` flag remains useful for register diagnostics; this
+    /// predicate is deliberately stricter because it can arm frame handling.
+    pub fn outputReady(self: RenderTargetEvidence) bool {
+        return self.plausible and self.raw_color_info != 0 and
+            self.raw_surface_info != 0 and self.color_mask != 0;
+    }
 };
 
 const ActiveIndirectRange = struct {
@@ -150,10 +185,33 @@ pub const Runtime = struct {
     swap_count: u64 = 0,
     draw_completion_signals: u64 = 0,
     draw_completion_observations: u64 = 0,
+    renderable_draw_observations: u64 = 0,
     retained_draw_observations: u64 = 0,
     retained_event_observations: u64 = 0,
     execution_disposition: ExecutionDisposition = .live,
     color_resolve_observations: u64 = 0,
+    /// These counters intentionally exclude retained/replayed inspection. A
+    /// retained batch is useful for reconstructing state, but allowing it to
+    /// satisfy a live PM4 quality gate would turn historical bytes into a new
+    /// runtime fact.
+    live_packets_observed: u64 = 0,
+    live_packets_executed: u64 = 0,
+    live_packet_errors: u64 = 0,
+    live_invalid_packets: u64 = 0,
+    live_unknown_opcodes: u64 = 0,
+    live_truncated_rings: u64 = 0,
+    live_indirect_unreadable: u64 = 0,
+    live_indirect_truncated: u64 = 0,
+    live_indirect_invalid: u64 = 0,
+    live_indirect_depth_limited: u64 = 0,
+    live_indirect_budget_limited: u64 = 0,
+    live_indirect_cycles: u64 = 0,
+    live_unclassified_register_writes: u64 = 0,
+    live_out_of_range_register_writes: u64 = 0,
+    /// Retained batches whose last packet did not fit the window and whose
+    /// decoded prefix was kept. Counted so a run cannot quietly build its
+    /// render-target picture out of partial batches without saying so.
+    retained_truncated_tails: u64 = 0,
     packet_errors: u64 = 0,
     truncated_rings: u64 = 0,
     indirect_depth: u8 = 0,
@@ -273,6 +331,28 @@ pub const Runtime = struct {
         return if (nonzero) fetch else null;
     }
 
+    /// Return only quality evidence from live PM4 consumption. The common
+    /// package owns the verdict arithmetic; this method is the sole bridge
+    /// from the stateful executor to that contract.
+    pub fn runtimeEvidence(self: *const Runtime) pm4_contract.RuntimeEvidence {
+        return .{
+            .packets_observed = self.live_packets_observed,
+            .packets_executed = self.live_packets_executed,
+            .packet_errors = self.live_packet_errors,
+            .invalid_packets = self.live_invalid_packets,
+            .unknown_opcodes = self.live_unknown_opcodes,
+            .truncated_rings = self.live_truncated_rings,
+            .indirect_unreadable = self.live_indirect_unreadable,
+            .indirect_truncated = self.live_indirect_truncated,
+            .indirect_invalid = self.live_indirect_invalid,
+            .indirect_depth_limited = self.live_indirect_depth_limited,
+            .indirect_budget_limited = self.live_indirect_budget_limited,
+            .indirect_cycles = self.live_indirect_cycles,
+            .unclassified_register_writes = self.live_unclassified_register_writes,
+            .out_of_range_register_writes = self.live_out_of_range_register_writes,
+        };
+    }
+
     pub fn executeRingBytes(self: *Runtime, bytes: []const u8, read_pointer: u32, span_dwords: u32, ring_dwords: u32) ExecuteError!Report {
         if (ring_dwords == 0 or ring_dwords > max_ring_dwords or @as(u64, ring_dwords) * 4 > bytes.len) return error.InvalidRing;
         self.activate();
@@ -291,8 +371,12 @@ pub const Runtime = struct {
         const draws_before = self.executor.draw_count;
         const events_before = self.executor.event_count;
         const swaps_before = self.executor.swap_count;
+        const packet_errors_before = self.packet_errors;
+        const invalid_packets_before = self.executor.invalid_packet_count;
+        const unknown_opcodes_before = self.executor.unknown_opcode_count;
         const draw_observations_before = self.draw_completion_observations;
         const draw_signals_before = self.draw_completion_signals;
+        const renderable_draws_before = self.renderable_draw_observations;
         const indirect_buffers_before = self.indirect_buffers;
         const indirect_requested_before = self.indirect_dwords_requested;
         const indirect_read_before = self.indirect_dwords_read;
@@ -302,6 +386,14 @@ pub const Runtime = struct {
         const indirect_depth_limited_before = self.indirect_depth_limited;
         const indirect_budget_limited_before = self.indirect_budget_limited;
         const indirect_cycles_before = self.indirect_cycles;
+        const register_writes_before = self.executor.register_file.journal.writes;
+        const render_target_writes_before = self.executor.register_file.journal.block(.render_backend).writes;
+        const color_resolves_before = self.color_resolve_observations;
+        const unclassified_register_writes_before = self.executor.register_file.journal.unknown_in_range_writes;
+        const out_of_range_register_writes_before = self.executor.register_file.journal.out_of_range_writes;
+        const command_register_writes_before = self.executor.command_register_writes;
+        const command_unclassified_register_writes_before = self.executor.command_unclassified_register_writes;
+        const command_out_of_range_register_writes_before = self.executor.command_out_of_range_register_writes;
         self.indirect_last_status = .not_attempted;
         self.indirect_last_address = 0;
         self.indirect_last_missing_address = null;
@@ -323,23 +415,26 @@ pub const Runtime = struct {
         self.swap_count = self.executor.swap_count;
         self.last_draw = self.executor.last_draw;
         self.last_swap = self.executor.last_swap;
+        var execution_error: ?ExecuteError = null;
         self.executor.execute(words[0..@as(usize, @intCast(report.dwords))]) catch |err| {
             self.packet_errors +|= 1;
             if (err == error.truncated_packet) {
                 report.truncated = true;
-                self.truncated_rings +|= 1;
-                return error.TruncatedRing;
+                execution_error = error.TruncatedRing;
+            } else {
+                execution_error = error.PacketError;
             }
-            return error.PacketError;
         };
-        self.cacheLastShader();
         report.packets_after = self.executor.packet_count;
         report.draws = self.executor.draw_count - draws_before;
         report.events = self.executor.event_count - events_before;
         report.swaps = self.executor.swap_count - swaps_before;
+        report.packet_errors = self.packet_errors -| packet_errors_before;
+        report.invalid_packets = self.executor.invalid_packet_count -| invalid_packets_before;
         report.draw_completion_observations = self.draw_completion_observations - draw_observations_before;
         report.draw_completion_signals = self.draw_completion_signals - draw_signals_before;
-        report.unknown_opcodes = self.executor.unknown_opcode_count;
+        report.renderable_draw_observations = self.renderable_draw_observations - renderable_draws_before;
+        report.unknown_opcodes = self.executor.unknown_opcode_count -| unknown_opcodes_before;
         report.indirect_buffers = self.indirect_buffers - indirect_buffers_before;
         report.indirect_dwords_requested = self.indirect_dwords_requested - indirect_requested_before;
         report.indirect_dwords_read = self.indirect_dwords_read - indirect_read_before;
@@ -352,12 +447,61 @@ pub const Runtime = struct {
         report.indirect_last_status = self.indirect_last_status;
         report.indirect_last_address = self.indirect_last_address;
         report.indirect_last_missing_address = self.indirect_last_missing_address;
+        report.register_writes = self.executor.register_file.journal.writes -| register_writes_before;
+        report.render_target_register_writes =
+            self.executor.register_file.journal.block(.render_backend).writes -| render_target_writes_before;
+        report.color_resolves = self.color_resolve_observations -| color_resolves_before;
+        report.unclassified_register_writes = self.executor.register_file.journal.unknown_in_range_writes -| unclassified_register_writes_before;
+        report.out_of_range_register_writes = self.executor.register_file.journal.out_of_range_writes -| out_of_range_register_writes_before;
+        report.command_register_writes = self.executor.command_register_writes -| command_register_writes_before;
+        report.command_unclassified_register_writes = self.executor.command_unclassified_register_writes -| command_unclassified_register_writes_before;
+        report.command_out_of_range_register_writes = self.executor.command_out_of_range_register_writes -| command_out_of_range_register_writes_before;
         report.packet_summary = self.packet_timeline.snapshot().delta(packet_before);
+        if (report.truncated) self.truncated_rings +|= 1;
+        if (self.execution_disposition.publishesEffects()) {
+            self.live_packets_observed +|= report.packet_summary.packets;
+            self.live_packets_executed +|= report.packet_summary.executed_packets;
+            self.live_packet_errors +|= report.packet_errors;
+            self.live_invalid_packets +|= report.invalid_packets;
+            self.live_unknown_opcodes +|= report.unknown_opcodes;
+            if (report.truncated) self.live_truncated_rings +|= 1;
+            self.live_indirect_unreadable +|= report.indirect_unreadable;
+            self.live_indirect_truncated +|= report.indirect_truncated;
+            self.live_indirect_invalid +|= report.indirect_invalid;
+            self.live_indirect_depth_limited +|= report.indirect_depth_limited;
+            self.live_indirect_budget_limited +|= report.indirect_budget_limited;
+            self.live_indirect_cycles +|= report.indirect_cycles;
+            self.live_unclassified_register_writes +|= report.unclassified_register_writes;
+            self.live_out_of_range_register_writes +|= report.out_of_range_register_writes;
+        }
+        if (execution_error == null) self.cacheLastShader();
         self.draw_count = self.executor.draw_count;
         self.event_count = self.executor.event_count;
         self.swap_count = self.executor.swap_count;
         self.last_draw = self.executor.last_draw;
         self.last_swap = self.executor.last_swap;
+        if (execution_error) |err| {
+            // A truncated *tail* is a statement about the window, not about
+            // the batch. Every packet before the cut has already run: the
+            // register file, draw state and completion counters were mutated
+            // as the executor walked, and the deltas above are populated. For
+            // a retained batch — one the emulator has already consumed, which
+            // Rosette is only reading to recover state — throwing that away
+            // and returning an error discards the only source of render-target
+            // registers in the whole run, which is exactly what happened on
+            // 2026-09-01.
+            //
+            // The live path still errors. There the batch is about to be
+            // executed for real, and a partially executed one is a defect
+            // rather than a partial reading.
+            if (err == error.TruncatedRing and !self.execution_disposition.publishesEffects()) {
+                report.truncated_tail_retained = true;
+                self.retained_truncated_tails +|= 1;
+                self.cacheLastShader();
+                return report;
+            }
+            return err;
+        }
         return report;
     }
 
@@ -611,6 +755,12 @@ pub const Runtime = struct {
             self.retained_draw_observations +|= 1;
             return;
         }
+        // A live draw is only output evidence when the command processor had
+        // an explicit, writable colour destination at the moment it consumed
+        // the draw. Syntactic or retained draws remain visible in their own
+        // counters but cannot arm the guest-output handoff.
+        if (draw.count != 0 and self.renderTargetEvidence().outputReady())
+            self.renderable_draw_observations +|= 1;
         self.draw_completion_signals +|= 1;
         self.interrupts.publish(.draw_complete, registers.VGT_DRAW_INITIATOR, draw.count);
     }
@@ -939,8 +1089,35 @@ test "Xenos runtime distinguishes default target structure from programmed targe
     const evidence = runtime.renderTargetEvidence();
     try std.testing.expect(evidence.state_observed);
     try std.testing.expect(evidence.plausible);
+    try std.testing.expect(!evidence.outputReady());
+    runtime.executor.register_file.write(registers.RB_COLOR_MASK, 0xF);
+    try std.testing.expect(runtime.renderTargetEvidence().outputReady());
     try std.testing.expectEqual(@as(u32, 1280), evidence.surface_pitch_pixels);
     try std.testing.expectEqual(@as(u32, 6), evidence.color_format);
+}
+
+test "only a live draw with an explicit writable target is renderable output" {
+    var runtime = Runtime.init();
+    runtime.executor.register_file.write(registers.RB_SURFACE_INFO, 1280);
+    runtime.executor.register_file.write(registers.RB_COLOR_INFO, 0x101 | (6 << 16));
+    runtime.executor.register_file.write(registers.RB_COLOR_MASK, 0xF);
+
+    var bytes = [_]u8{0} ** 8;
+    const header = pm4.packetType3(.draw_indx_2, 1, false).?;
+    std.mem.writeInt(u32, bytes[0..4], header, .big);
+    std.mem.writeInt(u32, bytes[4..8], (registers.DrawInitiator{
+        .primitive = .triangle_list,
+        .source = .auto_index,
+        .major_mode_explicit = false,
+        .index_format = .uint16,
+        .not_end_of_pipe = false,
+        .index_count = 3,
+    }).encode(), .big);
+
+    const report = try runtime.executeRingBytes(&bytes, 0, 2, 2);
+    try std.testing.expectEqual(@as(u64, 1), report.draws);
+    try std.testing.expectEqual(@as(u64, 1), report.renderable_draw_observations);
+    try std.testing.expectEqual(@as(u64, 1), runtime.renderable_draw_observations);
 }
 
 test "Xenos runtime exposes typed resource and pipeline state" {
@@ -1070,4 +1247,84 @@ test "the same batch with a write callback attached does apply its guest writes"
     _ = try runtime.executeRingBytes(&bytes, 0, 3, 16);
     try std.testing.expectEqual(@as(u64, 0), runtime.executor.deferred_memory_count);
     try std.testing.expectEqual(@as(u32, 0xDEAD_BEEF), memory.words[0x100 / 4]);
+}
+
+// The 2026-09-01 defect at the executor's own boundary: a retained batch whose
+// last packet does not fit the window had every packet before it decoded, and
+// returning an error discarded all of it — including the render-target
+// registers that are the only reason the batch is replayed.
+test "a retained batch keeps what decoded before a truncated tail" {
+    var runtime = Runtime{};
+    var bytes = [_]u8{0} ** (32 * 4);
+
+    // A complete SET_CONSTANT, then a header claiming more than the window has.
+    const complete = pm4.packetType3(.set_constant, 2, false).?;
+    std.mem.writeInt(u32, bytes[0..4], complete, .big);
+    std.mem.writeInt(u32, bytes[4..8], 0x1111, .big);
+    std.mem.writeInt(u32, bytes[8..12], 0x2222, .big);
+    const overlong = pm4.packetType3(.set_constant, 16, false).?;
+    std.mem.writeInt(u32, bytes[12..16], overlong, .big);
+
+    // The live path still refuses: a partially executed batch is a defect.
+    try std.testing.expectError(
+        error.TruncatedRing,
+        runtime.executeRingBytes(&bytes, 0, 5, 32),
+    );
+
+    // The retained path keeps the prefix and says the tail was cut.
+    var observer = Runtime{};
+    const report = try observer.inspectRetainedRingBytes(&bytes, 0, 5, 32);
+    try std.testing.expect(report.truncated_tail_retained);
+    try std.testing.expect(report.truncated);
+    try std.testing.expectEqual(@as(u64, 1), observer.retained_truncated_tails);
+    // The packet before the cut was decoded, which is the whole point.
+    try std.testing.expect(report.packets_after > report.packets_before);
+    try std.testing.expectEqual(ExecutionDisposition.retained_observation, report.disposition);
+}
+
+// A retained batch with no truncation must not be labelled a partial reading,
+// or every batch in the run becomes one.
+test "a complete retained batch is not reported as a partial one" {
+    var runtime = Runtime{};
+    var bytes = [_]u8{0} ** (32 * 4);
+    const complete = pm4.packetType3(.set_constant, 2, false).?;
+    std.mem.writeInt(u32, bytes[0..4], complete, .big);
+    std.mem.writeInt(u32, bytes[4..8], 0x1111, .big);
+    std.mem.writeInt(u32, bytes[8..12], 0x2222, .big);
+
+    const report = try runtime.inspectRetainedRingBytes(&bytes, 0, 3, 32);
+    try std.testing.expect(!report.truncated_tail_retained);
+    try std.testing.expectEqual(@as(u64, 0), runtime.retained_truncated_tails);
+}
+
+// The stage `render-target state observed` has two evidence paths and only the
+// register file was ever recorded on the success path — so a batch that
+// executed cleanly left the executor's own probe reading `not-attempted`, the
+// sole source of render-target state silent about what it had just done.
+test "an execution reports what it programmed, not only what is configured now" {
+    var runtime = Runtime{};
+    var bytes = [_]u8{0} ** (32 * 4);
+
+    // A TYPE0 write into the render-backend block, then one into raster setup.
+    std.mem.writeInt(u32, bytes[0..4], pm4.packetType0(registers.RB_COLOR_INFO, 1, false).?, .big);
+    std.mem.writeInt(u32, bytes[4..8], 0x0000_1234, .big);
+    std.mem.writeInt(u32, bytes[8..12], pm4.packetType0(registers.PA_SC_WINDOW_SCISSOR_BR, 1, false).?, .big);
+    std.mem.writeInt(u32, bytes[12..16], 0x0500_0280, .big);
+
+    const report = try runtime.inspectRetainedRingBytes(&bytes, 0, 4, 32);
+    try std.testing.expect(report.register_writes != 0);
+    // Only the render-backend write counts toward the target evidence, which
+    // is the distinction the whole report turned on: a scissor write is not a
+    // render-target write.
+    try std.testing.expect(report.render_target_register_writes != 0);
+    try std.testing.expect(report.render_target_register_writes < report.register_writes);
+    try std.testing.expectEqual(@as(u64, 0), report.color_resolves);
+
+    // A second execution reports its own delta rather than the total.
+    var again = [_]u8{0} ** (32 * 4);
+    std.mem.writeInt(u32, again[0..4], pm4.packetType0(registers.PA_SC_WINDOW_OFFSET, 1, false).?, .big);
+    std.mem.writeInt(u32, again[4..8], 0, .big);
+    const second = try runtime.inspectRetainedRingBytes(&again, 0, 2, 32);
+    try std.testing.expect(second.register_writes != 0);
+    try std.testing.expectEqual(@as(u64, 0), second.render_target_register_writes);
 }
