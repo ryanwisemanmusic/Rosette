@@ -16,7 +16,7 @@ source_isa = "x86"
 target_isa = "arm64_neon"
 x86_table = "PERMUTE/VPERMILPS.inc"
 x86_handler = "x86_vpermilps"
-neon_lowering = "arm64_neon_tbl1"
+neon_lowering = "arm64_neon_tbl"
 lowering_kind = "neon_vector"
 
 
@@ -31,11 +31,23 @@ lanes_512 = 16
 mxcsr_used = true
 
 encodings = [
-  { opcode = "0E 30 80 30 TBL Vd.16B, {Vn.16B}, Vm.16B", form = "VPERMILPS Vd.4S, Vn.4S, Vm.4S", op_en = "A", feature = "NEON", mode = "V/V", handler = "arm64_neon_tbl1" }
+  { opcode = "NEON.TBL.128", form = "VPERMILPS xmm1, xmm2, xmm3/m128", op_en = "A", feature = "NEON", mode = "V/V", handler = "arm64_neon_tbl" },
+  { opcode = "NEON.TBL.256", form = "VPERMILPS ymm1, ymm2, ymm3/m256", op_en = "A", feature = "NEON", mode = "V/V", handler = "arm64_neon_tbl" },
+  { opcode = "NEON.TBL.EVEX.128", form = "VPERMILPS xmm1 {k1}{z}, xmm2, xmm3/m128/m32bcst", op_en = "C", feature = "NEON", mode = "V/V", tuple = "Full", handler = "arm64_neon_tbl" },
+  { opcode = "NEON.TBL.EVEX.256", form = "VPERMILPS ymm1 {k1}{z}, ymm2, ymm3/m256/m32bcst", op_en = "C", feature = "NEON", mode = "V/V", tuple = "Full", handler = "arm64_neon_tbl" },
+  { opcode = "NEON.TBL.EVEX.512", form = "VPERMILPS zmm1 {k1}{z}, zmm2, zmm3/m512/m32bcst", op_en = "C", feature = "NEON", mode = "V/V", tuple = "Full", handler = "arm64_neon_tbl" },
+  { opcode = "NEON.TBL.IMM.128", form = "VPERMILPS xmm1, xmm2, xmm3/m128, imm8", op_en = "B", feature = "NEON", mode = "V/V", handler = "arm64_neon_tbl" },
+  { opcode = "NEON.TBL.IMM.256", form = "VPERMILPS ymm1, ymm2, ymm3/m256, imm8", op_en = "B", feature = "NEON", mode = "V/V", handler = "arm64_neon_tbl" },
+  { opcode = "NEON.TBL.EVEX.IMM.128", form = "VPERMILPS xmm1 {k1}{z}, xmm2, xmm3/m128/m32bcst, imm8", op_en = "D", feature = "NEON", mode = "V/V", tuple = "Full", handler = "arm64_neon_tbl" },
+  { opcode = "NEON.TBL.EVEX.IMM.256", form = "VPERMILPS ymm1 {k1}{z}, ymm2, ymm3/m256/m32bcst, imm8", op_en = "D", feature = "NEON", mode = "V/V", tuple = "Full", handler = "arm64_neon_tbl" },
+  { opcode = "NEON.TBL.EVEX.IMM.512", form = "VPERMILPS zmm1 {k1}{z}, zmm2, zmm3/m512/m32bcst, imm8", op_en = "D", feature = "NEON", mode = "V/V", tuple = "Full", handler = "arm64_neon_tbl" }
 ]
 
 operand_encodings = [
-  { op_en = "A", tuple = "N/A", operand1 = "Vd (w)", operand2 = "Vn (r)", operand3 = "Vm (r)", operand4 = "N/A" }
+  { op_en = "A", tuple = "N/A", operand1 = "Vd (w)", operand2 = "Vn (r)", operand3 = "Vm (r)", operand4 = "N/A" },
+  { op_en = "B", tuple = "N/A", operand1 = "Vd (w)", operand2 = "Vn (r)", operand3 = "Vm (r)", operand4 = "imm8" },
+  { op_en = "C", tuple = "Full", operand1 = "Vd (w)", operand2 = "Vn (r)", operand3 = "Vm (r)", operand4 = "N/A" },
+  { op_en = "D", tuple = "Full", operand1 = "Vd (w)", operand2 = "Vn (r)", operand3 = "Vm (r)", operand4 = "imm8" }
 ]
 
 semantic_legacy = """
@@ -74,7 +86,7 @@ simd_fp_exceptions = ["invalid", "denormal"]
 other_exceptions = ["VEX Type 2 class exceptions", "EVEX Type E2 class exceptions"]
 
 handler = "x86_vpermilps"
-jit_lowering = "arm64_neon_tbl1"
+jit_lowering = "arm64_neon_tbl"
 
 
 neon_register_model = """
@@ -86,7 +98,7 @@ MXCSR exception/status behavior is preserved through Rosette SIMD floating-point
 """
 
 neon_assembly = """
-tbl vD.16b, {vN.16b}, vM.16b
+ tbl vD.16b, {vN.16b}, vM.16b
 bl rosette_apply_mxcsr_float_exceptions
 """
 

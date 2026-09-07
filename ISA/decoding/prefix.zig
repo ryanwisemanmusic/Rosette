@@ -16,6 +16,7 @@ const Segment = types.Segment;
 const SegmentState = types.SegmentState;
 const ExecutionMode = types.ExecutionMode;
 const MemoryReferenceKind = types.MemoryReferenceKind;
+const StringRepeat = types.StringRepeat;
 const RFL_CF = types.RFL_CF;
 const RFL_PF = types.RFL_PF;
 const RFL_AF = types.RFL_AF;
@@ -54,7 +55,7 @@ pub const LegacyPrefixes = struct {
     operand_size_override: bool = false,
     address_size_override: bool = false,
     lock: bool = false,
-    repeat: enum { none, repne, rep } = .none,
+    repeat: StringRepeat = .none,
     segment_override: ?Segment = null,
 
     pub fn rexW(self: LegacyPrefixes) bool {
@@ -104,14 +105,14 @@ pub const EvexPrefix = struct {
     r: bool = true,
     x: bool = true,
     b: bool = true,
-    r_prime: bool = true, // R' from P0 bit 4 (high bit of ModRM.reg)
-    v_prime: bool = true, // V' from P2 bit 3 (high bit of vvvv)
+    r_prime: bool = false, // R' from P0 bit 4 (high bit of ModRM.reg)
+    v_prime: bool = false, // V' from P2 bit 3 (high bit of vvvv)
     vvvv: u4 = 0,
     z: bool = false, // zero-masking (P2 bit 7)
     vector_length: u2 = 0, // L'L: 0=128, 1=256, 2=512, 3=reserved
     broadcast: bool = false, // b flag (P2 bit 4)
     opmask: u3 = 0, // aaa field (P2 bits 2-0)
-    m: u2 = 0, // opcode map (P0 bits 1-0): 0=0F, 1=0F38, 2=0F3A
+    m: u3 = 0, // opcode map (P0 bits 2-0): 1=0F, 2=0F38, 3=0F3A
 };
 
 pub fn decodeLegacyPrefixes(bytes: []const u8) LegacyPrefixes {
@@ -195,17 +196,21 @@ pub fn decodeEvexPrefix(bytes: []const u8) ?EvexPrefix {
 
     var result = EvexPrefix{};
 
-    // P0 (byte 1): R, X, B, R', 0, 0, m, m
+    // P0 (byte 1): R, X, B, R', 0, m, m, m.  The four register-extension
+    // bits are inverted in the encoding; keep them as effective extension
+    // bits in the returned prefix, just as VEX decoding does.
     const p0 = bytes[1];
     result.r = (p0 & 0x80) == 0;
     result.x = (p0 & 0x40) == 0;
     result.b = (p0 & 0x20) == 0;
-    result.r_prime = (p0 & 0x10) != 0;
-    // bits 3-2 are reserved (must be 0)
-    result.m = @truncate(p0 & 0x03);
+    result.r_prime = (p0 & 0x10) == 0;
+    // P0 bit 3 is reserved and m-mmmm occupies the low three bits.
+    if ((p0 & 0x08) != 0) return null;
+    result.m = @truncate(p0 & 0x07);
 
     // P1 (byte 2): W, v, v, v, v, 1, pp, pp
     const p1 = bytes[2];
+    if ((p1 & 0x04) == 0) return null;
     result.w = (p1 & 0x80) != 0;
     result.vvvv = ~@as(u4, @truncate((p1 >> 3) & 0x0F));
     // bit 2 is always 1 in valid EVEX
@@ -218,8 +223,9 @@ pub fn decodeEvexPrefix(bytes: []const u8) ?EvexPrefix {
     const p2 = bytes[3];
     result.z = (p2 & 0x80) != 0;
     result.vector_length = @truncate((p2 >> 5) & 0x03);
+    if (result.vector_length == 3) return null;
     result.broadcast = (p2 & 0x10) != 0;
-    result.v_prime = (p2 & 0x08) != 0;
+    result.v_prime = (p2 & 0x08) == 0;
     result.opmask = @truncate(p2 & 0x07);
 
     result.len = 4;

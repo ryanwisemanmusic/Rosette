@@ -29,6 +29,7 @@ const call_ret_call = @import("CALL-RET/CALL.zig");
 const call_ret_leave = @import("CALL-RET/LEAVE.zig");
 const call_ret_ret = @import("CALL-RET/RET.zig");
 const cmp_cmp = @import("CMP/CMP.zig");
+const cmp_cmps = @import("CMP/CMPS.zig");
 const cmp_cmppd = @import("CMP/CMPPD.zig");
 const cmp_cmpps = @import("CMP/CMPPS.zig");
 const cmp_cmpsd = @import("CMP/CMPSD.zig");
@@ -1164,6 +1165,8 @@ const arithmetic_vpaddb = @import("ARITHMETIC/vpaddb.zig");
 const arithmetic_vpaddd = @import("ARITHMETIC/vpaddd.zig");
 const arithmetic_vpaddq = @import("ARITHMETIC/vpaddq.zig");
 const arithmetic_vpaddw = @import("ARITHMETIC/vpaddw.zig");
+const arithmetic_vpaddsb = @import("ARITHMETIC/vpaddsb.zig");
+const arithmetic_vpaddsw = @import("ARITHMETIC/vpaddsw.zig");
 const atomic_cmpxchg = @import("ATOMIC/cmpxchg.zig");
 const atomic_cmpxchg8b = @import("ATOMIC/cmpxchg8b.zig");
 const atomic_cmpxchg16b = @import("ATOMIC/cmpxchg16b.zig");
@@ -1175,11 +1178,15 @@ const insert_extract_vpextrd = @import("INSERT_EXTRACT/vpextrd.zig");
 const insert_extract_vpextrq = @import("INSERT_EXTRACT/vpextrq.zig");
 const insert_extract_vpextrw = @import("INSERT_EXTRACT/vpextrw.zig");
 const insert_extract_vextractf128 = @import("INSERT_EXTRACT/vextractf128.zig");
+const insert_extract_vextracti32x4 = @import("INSERT_EXTRACT/vextracti32x4.zig");
+const insert_extract_vextracti64x4 = @import("INSERT_EXTRACT/vextracti64x4.zig");
 const round_vroundpd = @import("ROUND/vroundpd.zig");
 const round_vroundps = @import("ROUND/vroundps.zig");
 const round_vroundsd = @import("ROUND/vroundsd.zig");
 const round_vroundss = @import("ROUND/vroundss.zig");
 const shuffle_vpshufd = @import("SHUFFLE/vpshufd.zig");
+const shuffle_vpshuflw = @import("SHUFFLE/vpshuflw.zig");
+const shuffle_vpshufhw = @import("SHUFFLE/vpshufhw.zig");
 const shuffle_vpunpckldq = @import("SHUFFLE/VPUNPCKLDQ.zig");
 const shuffle_vpermilpd = @import("SHUFFLE/VPERMILPD.zig");
 const unordered_vucomiss = @import("UNORDERED/vucomiss.zig");
@@ -1214,6 +1221,7 @@ pub const specs = blk: {
         spec(call_ret_leave.meta),
         spec(call_ret_ret.meta),
         spec(cmp_cmp.meta),
+        spec(cmp_cmps.meta),
         spec(cmp_cmppd.meta),
         spec(cmp_cmpps.meta),
         spec(cmp_cmpsd.meta),
@@ -2348,6 +2356,8 @@ pub const specs = blk: {
         spec(arithmetic_vpaddd.meta),
         spec(arithmetic_vpaddq.meta),
         spec(arithmetic_vpaddw.meta),
+        spec(arithmetic_vpaddsb.meta),
+        spec(arithmetic_vpaddsw.meta),
         spec(atomic_cmpxchg.meta),
         spec(atomic_cmpxchg8b.meta),
         spec(atomic_cmpxchg16b.meta),
@@ -2359,11 +2369,15 @@ pub const specs = blk: {
         spec(insert_extract_vpextrq.meta),
         spec(insert_extract_vpextrw.meta),
         spec(insert_extract_vextractf128.meta),
+        spec(insert_extract_vextracti32x4.meta),
+        spec(insert_extract_vextracti64x4.meta),
         spec(round_vroundpd.meta),
         spec(round_vroundps.meta),
         spec(round_vroundsd.meta),
         spec(round_vroundss.meta),
         spec(shuffle_vpshufd.meta),
+        spec(shuffle_vpshuflw.meta),
+        spec(shuffle_vpshufhw.meta),
         spec(shuffle_vpunpckldq.meta),
         spec(shuffle_vpermilpd.meta),
         spec(unordered_vucomiss.meta),
@@ -2398,6 +2412,7 @@ pub const proof_reports = [_]proofs.ProofReport{
     call_ret_leave.proof_report,
     call_ret_ret.proof_report,
     cmp_cmp.proof_report,
+    cmp_cmps.proof_report,
     cmp_cmppd.proof_report,
     cmp_cmpps.proof_report,
     cmp_cmpsd.proof_report,
@@ -3532,6 +3547,8 @@ pub const proof_reports = [_]proofs.ProofReport{
     arithmetic_vpaddd.proof_report,
     arithmetic_vpaddq.proof_report,
     arithmetic_vpaddw.proof_report,
+    arithmetic_vpaddsb.proof_report,
+    arithmetic_vpaddsw.proof_report,
     atomic_cmpxchg.proof_report,
     atomic_cmpxchg8b.proof_report,
     atomic_cmpxchg16b.proof_report,
@@ -3543,11 +3560,15 @@ pub const proof_reports = [_]proofs.ProofReport{
     insert_extract_vpextrq.proof_report,
     insert_extract_vpextrw.proof_report,
     insert_extract_vextractf128.proof_report,
+    insert_extract_vextracti32x4.proof_report,
+    insert_extract_vextracti64x4.proof_report,
     round_vroundpd.proof_report,
     round_vroundps.proof_report,
     round_vroundsd.proof_report,
     round_vroundss.proof_report,
     shuffle_vpshufd.proof_report,
+    shuffle_vpshuflw.proof_report,
+    shuffle_vpshufhw.proof_report,
     shuffle_vpunpckldq.proof_report,
     shuffle_vpermilpd.proof_report,
     unordered_vucomiss.proof_report,
@@ -3609,7 +3630,7 @@ fn validateSpec(instruction_spec: core.InstructionMathSpec) void {
 }
 
 test "x86 math specs cover current ISA tables" {
-    try std.testing.expectEqual(@as(usize, 1180), tableCount());
+    try std.testing.expectEqual(@as(usize, 1187), tableCount());
     try std.testing.expectEqual(tableCount(), proofReportCount());
     // Every table has a report, every report has a case, and any report that
     // models arithmetic carries at least two of them. A blanket "two cases per

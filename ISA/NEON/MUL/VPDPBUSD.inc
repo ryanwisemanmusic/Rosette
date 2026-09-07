@@ -13,7 +13,7 @@ source_isa = "x86"
 target_isa = "arm64_neon"
 x86_table = "MUL/VPDPBUSD.inc"
 x86_handler = "x86_vpdpbusd"
-neon_lowering = "arm64_neon_udot"
+neon_lowering = "arm64_neon_sdot"
 lowering_kind = "neon_vector"
 
 name = "VPDPBUSD"
@@ -75,7 +75,7 @@ DEST[MAXVL-1:VL] = 0
 """
 
 handler = "x86_vpdpbusd"
-jit_lowering = "arm64_neon_udot"
+jit_lowering = "arm64_neon_sdot"
 fallback = "zig_lane_loop"
 
 neon_register_model = """
@@ -87,7 +87,8 @@ No flags are written by VPDPBUSD.
 """
 
 neon_assembly = """
-udot vD.4s, vN.16b, vM.16b
+// Mixed unsigned*signed bytes require sign-normalization around the dot product.
+sdot vD.4s, vN.16b, vM.16b
 """
 
 neon_notes = [

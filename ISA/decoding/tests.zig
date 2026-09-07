@@ -164,6 +164,135 @@ test "VEX packed min/max decodes through the production three-byte path" {
     }
 }
 
+test "VEX 128-bit lane insertion and extraction preserve operand direction" {
+    // VINSERTF128 ymm0, ymm0, xmm1, 0.
+    const insert_f = vex.decodeVex3(&[_]u8{ 0xC4, 0xE3, 0x7D, 0x18, 0xC1, 0x00 }, 0);
+    try std.testing.expectEqual(types.Op.vinsertf128, insert_f.op);
+    try std.testing.expectEqual(@as(u8, 0), insert_f.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), insert_f.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), insert_f.xmm_src2);
+    try std.testing.expect(insert_f.is_reg_form);
+    try std.testing.expectEqual(@as(u64, 0), insert_f.imm);
+    try std.testing.expectEqual(@as(u8, 6), insert_f.len);
+
+    // VEXTRACTF128 xmm1, ymm0, 1. The source is ModRM.reg and the
+    // destination is ModRM.r/m; a generic NDS decoder would swap these.
+    const extract_f = vex.decodeVex3(&[_]u8{ 0xC4, 0xE3, 0x7D, 0x19, 0xC1, 0x01 }, 0);
+    try std.testing.expectEqual(types.Op.vextractf128, extract_f.op);
+    try std.testing.expectEqual(@as(u8, 0), extract_f.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), extract_f.xmm_dst);
+    try std.testing.expect(extract_f.is_reg_form);
+    try std.testing.expectEqual(@as(u64, 1), extract_f.imm);
+
+    // VINSERTI128 uses the same lane semantics with the AVX2 opcode 38.
+    const insert_i = vex.decodeVex3(&[_]u8{ 0xC4, 0xE3, 0x7D, 0x38, 0xC1, 0x01 }, 0);
+    try std.testing.expectEqual(types.Op.vinserti128, insert_i.op);
+    try std.testing.expectEqual(@as(u8, 0), insert_i.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), insert_i.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), insert_i.xmm_src2);
+    try std.testing.expectEqual(@as(u64, 1), insert_i.imm);
+}
+
+test "VEX integer lane alias, two-source permutation, and min-position decode" {
+    // VEXTRACTI128 xmm1, ymm0, 1. The integer opcode is normalized to the
+    // same bitwise lane executor used by VEXTRACTF128.
+    const extract_i = vex.decodeVex3(&[_]u8{ 0xC4, 0xE3, 0x7D, 0x39, 0xC1, 0x01 }, 0);
+    try std.testing.expectEqual(types.Op.vextractf128, extract_i.op);
+    try std.testing.expectEqual(@as(u8, 0), extract_i.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), extract_i.xmm_dst);
+    try std.testing.expect(extract_i.is_reg_form);
+    try std.testing.expectEqual(@as(u64, 1), extract_i.imm);
+    try std.testing.expectEqual(@as(u8, 6), extract_i.len);
+
+    // VPERM2F128 ymm0, ymm2, ymm1, 0x1B.
+    const permute = vex.decodeVex3(&[_]u8{ 0xC4, 0xE3, 0x6D, 0x06, 0xC1, 0x1B }, 0);
+    try std.testing.expectEqual(types.Op.vperm2f128, permute.op);
+    try std.testing.expectEqual(@as(u8, 0), permute.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 2), permute.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), permute.xmm_src2);
+    try std.testing.expect(permute.is_reg_form);
+    try std.testing.expect(permute.vector_256);
+    try std.testing.expectEqual(@as(u64, 0x1B), permute.imm);
+    try std.testing.expectEqual(@as(u8, 6), permute.len);
+
+    // VPHMINPOSUW xmm0, xmm1. VEX.vvvv is reserved and must not become SRC2.
+    const min_position = vex.decodeVex3(&[_]u8{ 0xC4, 0xE2, 0x79, 0x41, 0xC1 }, 0);
+    try std.testing.expectEqual(types.Op.vphminposuw, min_position.op);
+    try std.testing.expectEqual(@as(u8, 0), min_position.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 1), min_position.xmm_src);
+    try std.testing.expect(min_position.is_reg_form);
+    try std.testing.expect(!min_position.vector_256);
+    try std.testing.expectEqual(@as(u8, 5), min_position.len);
+}
+
+test "VPSHUFLW and VPSHUFHW decode in both VEX forms" {
+    // The mandatory-prefix mapping is intentionally explicit here: pp=11b is
+    // F2 (low words), while pp=10b is F3 (high words). VEX.vvvv is reserved
+    // and therefore encoded as 1111 in both forms.
+    const low_two = [_]u8{ 0xC5, 0xFB, 0x70, 0xC1, 0x1B };
+    const high_two = [_]u8{ 0xC5, 0xFA, 0x70, 0xC1, 0x1B };
+    try std.testing.expectEqual(types.Op.vpshuflw, vex.decodeVex2(&low_two, 0).op);
+    try std.testing.expectEqual(types.Op.vpshufhw, vex.decodeVex2(&high_two, 0).op);
+    try std.testing.expectEqual(types.Op.vpshuflw, legacy.decodeLegacyInstruction(&low_two, .long64).op);
+    try std.testing.expectEqual(types.Op.vpshufhw, legacy.decodeLegacyInstruction(&high_two, .long64).op);
+
+    const low_three = [_]u8{ 0xC4, 0xE1, 0x7B, 0x70, 0xC1, 0x1B };
+    const high_three = [_]u8{ 0xC4, 0xE1, 0x7A, 0x70, 0xC1, 0x1B };
+    try std.testing.expectEqual(types.Op.vpshuflw, vex.decodeVex3(&low_three, 0).op);
+    try std.testing.expectEqual(types.Op.vpshufhw, vex.decodeVex3(&high_three, 0).op);
+    try std.testing.expectEqual(@as(u8, 1), vex.decodeVex3(&low_three, 0).xmm_src);
+    try std.testing.expectEqual(@as(u64, 0x1B), vex.decodeVex3(&low_three, 0).imm);
+
+    // Encoded vvvv != 1111 is reserved for these unary forms; accepting it
+    // would turn malformed bytes into a valid instruction with a phantom
+    // source register.
+    try std.testing.expectEqual(types.Op.invalid, vex.decodeVex2(&[_]u8{ 0xC5, 0xF3, 0x70, 0xC1, 0x1B }, 0).op);
+}
+
+test "VMASKMOV and VPALIGNR decode their distinct VEX operand roles" {
+    // VEX.256.66.0F38.2C /r: VMASKMOVPS ymm0, ymm1, [rcx]. The mask is
+    // VEX.vvvv, while ModRM.reg is the load destination.
+    const mask_load = [_]u8{ 0xC4, 0xE2, 0x75, 0x2C, 0x01 };
+    const decoded_load = vex.decodeVex3(&mask_load, 0);
+    try std.testing.expectEqual(types.Op.vmaskmovps_load, decoded_load.op);
+    try std.testing.expectEqual(@as(u8, 0), decoded_load.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 1), decoded_load.xmm_src);
+    try std.testing.expect(!decoded_load.is_reg_form);
+    try std.testing.expect(decoded_load.vector_256);
+    try std.testing.expectEqual(@as(u8, 5), decoded_load.len);
+
+    // VEX.256.66.0F38.2F /r: VMASKMOVPD [rcx], ymm0, ymm1. Stores reverse
+    // the data/mask roles but retain the same VEX.vvvv mask encoding.
+    const mask_store = [_]u8{ 0xC4, 0xE2, 0x75, 0x2F, 0x01 };
+    const decoded_store = vex.decodeVex3(&mask_store, 0);
+    try std.testing.expectEqual(types.Op.vmaskmovpd_store, decoded_store.op);
+    try std.testing.expectEqual(@as(u8, 0), decoded_store.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), decoded_store.xmm_src2);
+    try std.testing.expect(!decoded_store.is_reg_form);
+    try std.testing.expect(decoded_store.vector_256);
+    try std.testing.expectEqual(@as(u8, 5), decoded_store.len);
+
+    // The register form is reserved for VMASKMOV and must not be accepted as
+    // a normal vector operation with an accidental register-to-register path.
+    try std.testing.expectEqual(
+        types.Op.invalid,
+        vex.decodeVex3(&[_]u8{ 0xC4, 0xE2, 0x75, 0x2C, 0xC1 }, 0).op,
+    );
+
+    // V PALIGNR is NDS: VEX.vvvv is SRC1 and ModRM.r/m is SRC2. The known
+    // AVX2 encoding is vpalignr ymm2, ymm6, ymm4, 7.
+    const align_bytes = [_]u8{ 0xC4, 0xE3, 0x4D, 0x0F, 0xD4, 0x07 };
+    const decoded_align = vex.decodeVex3(&align_bytes, 0);
+    try std.testing.expectEqual(types.Op.vpalignr, decoded_align.op);
+    try std.testing.expectEqual(@as(u8, 2), decoded_align.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 6), decoded_align.xmm_src);
+    try std.testing.expectEqual(@as(u8, 4), decoded_align.xmm_src2);
+    try std.testing.expect(decoded_align.is_reg_form);
+    try std.testing.expect(decoded_align.vector_256);
+    try std.testing.expectEqual(@as(u64, 7), decoded_align.imm);
+    try std.testing.expectEqual(@as(u8, 6), decoded_align.len);
+}
+
 test "VPUNPCK unpack family decodes in both VEX forms with correct opcodes" {
     // The unpack family spans 66.0F 60-6D: LBW/LWD/LDQ at 60-62, HBW/HWD/HDQ
     // at 68-6A, LQDQ at 6C, HQDQ at 6D. Regression: 0x6D (VPUNPCKHQDQ) was

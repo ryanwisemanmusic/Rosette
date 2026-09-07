@@ -49,4 +49,4 @@ simd_fp_exceptions = ["invalid"]
 other_exceptions = ["VEX Type 4 class exceptions"]
 
 handler = "x86_vperm2f128"
-jit_lowering = "arm64_neon_tbl"
+jit_lowering = "arm64_neon_ext_imm8"

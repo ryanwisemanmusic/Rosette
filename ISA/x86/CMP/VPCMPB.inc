@@ -52,3 +52,7 @@ DEST[MAX_OPMASK_BITS-1:VL] = 0;
 
 flags_written = []
 simd_fp_exceptions = []
+
+handler = "x86_vpcmpb"
+jit_lowering = "arm64_documented_contract_vpcmpb"
+fallback = "zig_vpcmpb_mask_loop"

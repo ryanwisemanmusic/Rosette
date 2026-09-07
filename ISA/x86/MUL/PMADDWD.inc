@@ -1,5 +1,10 @@
 // PMADDWD.inc
 
+semantic = """
+PMADDWD: multiply signed words, add adjacent products, and write signed
+dwords. The form-specific blocks below preserve legacy, VEX, and EVEX lanes.
+"""
+
 operand_encoding = [
   { op_en = "A", operand_1 = "ModRM:reg (r, w)", operand_2 = "ModRM:r/m (r)", operand_3 = "N/A", operand_4 = "N/A" },
   { op_en = "B", operand_1 = "ModRM:reg (w)", operand_2 = "VEX.vvvv (r)", operand_3 = "ModRM:r/m (r)", operand_4 = "N/A" },

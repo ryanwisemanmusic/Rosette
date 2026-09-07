@@ -27,6 +27,7 @@ const call_ret_call = @import("CALL-RET/CALL.zig");
 const call_ret_leave = @import("CALL-RET/LEAVE.zig");
 const call_ret_ret = @import("CALL-RET/RET.zig");
 const cmp_cmp = @import("CMP/CMP.zig");
+const cmp_cmps = @import("CMP/CMPS.zig");
 const cmp_cmppd = @import("CMP/CMPPD.zig");
 const cmp_cmpps = @import("CMP/CMPPS.zig");
 const cmp_cmpsd = @import("CMP/CMPSD.zig");
@@ -1897,6 +1898,8 @@ const arithmetic_vpaddb = @import("ARITHMETIC/vpaddb.zig");
 const arithmetic_vpaddd = @import("ARITHMETIC/vpaddd.zig");
 const arithmetic_vpaddq = @import("ARITHMETIC/vpaddq.zig");
 const arithmetic_vpaddw = @import("ARITHMETIC/vpaddw.zig");
+const arithmetic_vpaddsb = @import("ARITHMETIC/vpaddsb.zig");
+const arithmetic_vpaddsw = @import("ARITHMETIC/vpaddsw.zig");
 const atomic_cmpxchg = @import("ATOMIC/cmpxchg.zig");
 const atomic_cmpxchg8b = @import("ATOMIC/cmpxchg8b.zig");
 const atomic_cmpxchg16b = @import("ATOMIC/cmpxchg16b.zig");
@@ -1908,11 +1911,15 @@ const insert_extract_vpextrd = @import("INSERT_EXTRACT/vpextrd.zig");
 const insert_extract_vpextrq = @import("INSERT_EXTRACT/vpextrq.zig");
 const insert_extract_vpextrw = @import("INSERT_EXTRACT/vpextrw.zig");
 const insert_extract_vextractf128 = @import("INSERT_EXTRACT/vextractf128.zig");
+const insert_extract_vextracti32x4 = @import("INSERT_EXTRACT/vextracti32x4.zig");
+const insert_extract_vextracti64x4 = @import("INSERT_EXTRACT/vextracti64x4.zig");
 const round_vroundpd = @import("ROUND/vroundpd.zig");
 const round_vroundps = @import("ROUND/vroundps.zig");
 const round_vroundsd = @import("ROUND/vroundsd.zig");
 const round_vroundss = @import("ROUND/vroundss.zig");
 const shuffle_vpshufd = @import("SHUFFLE/vpshufd.zig");
+const shuffle_vpshuflw = @import("SHUFFLE/vpshuflw.zig");
+const shuffle_vpshufhw = @import("SHUFFLE/vpshufhw.zig");
 const unordered_vucomiss = @import("UNORDERED/vucomiss.zig");
 
 pub const tables = blk: {
@@ -1945,6 +1952,7 @@ pub const tables = blk: {
         entry(call_ret_leave.family, call_ret_leave.path, call_ret_leave.source),
         entry(call_ret_ret.family, call_ret_ret.path, call_ret_ret.source),
         entry(cmp_cmp.family, cmp_cmp.path, cmp_cmp.source),
+        entry(cmp_cmps.family, cmp_cmps.path, cmp_cmps.source),
         entry(cmp_cmppd.family, cmp_cmppd.path, cmp_cmppd.source),
         entry(cmp_cmpps.family, cmp_cmpps.path, cmp_cmpps.source),
         entry(cmp_cmpsd.family, cmp_cmpsd.path, cmp_cmpsd.source),
@@ -3081,6 +3089,8 @@ pub const tables = blk: {
         entry(arithmetic_vpaddd.family, arithmetic_vpaddd.path, arithmetic_vpaddd.source),
         entry(arithmetic_vpaddq.family, arithmetic_vpaddq.path, arithmetic_vpaddq.source),
         entry(arithmetic_vpaddw.family, arithmetic_vpaddw.path, arithmetic_vpaddw.source),
+        entry(arithmetic_vpaddsb.family, arithmetic_vpaddsb.path, arithmetic_vpaddsb.source),
+        entry(arithmetic_vpaddsw.family, arithmetic_vpaddsw.path, arithmetic_vpaddsw.source),
         entry(atomic_cmpxchg.family, atomic_cmpxchg.path, atomic_cmpxchg.source),
         entry(atomic_cmpxchg8b.family, atomic_cmpxchg8b.path, atomic_cmpxchg8b.source),
         entry(atomic_cmpxchg16b.family, atomic_cmpxchg16b.path, atomic_cmpxchg16b.source),
@@ -3092,11 +3102,15 @@ pub const tables = blk: {
         entry(insert_extract_vpextrq.family, insert_extract_vpextrq.path, insert_extract_vpextrq.source),
         entry(insert_extract_vpextrw.family, insert_extract_vpextrw.path, insert_extract_vpextrw.source),
         entry(insert_extract_vextractf128.family, insert_extract_vextractf128.path, insert_extract_vextractf128.source),
+        entry(insert_extract_vextracti32x4.family, insert_extract_vextracti32x4.path, insert_extract_vextracti32x4.source),
+        entry(insert_extract_vextracti64x4.family, insert_extract_vextracti64x4.path, insert_extract_vextracti64x4.source),
         entry(round_vroundpd.family, round_vroundpd.path, round_vroundpd.source),
         entry(round_vroundps.family, round_vroundps.path, round_vroundps.source),
         entry(round_vroundsd.family, round_vroundsd.path, round_vroundsd.source),
         entry(round_vroundss.family, round_vroundss.path, round_vroundss.source),
         entry(shuffle_vpshufd.family, shuffle_vpshufd.path, shuffle_vpshufd.source),
+        entry(shuffle_vpshuflw.family, shuffle_vpshuflw.path, shuffle_vpshuflw.source),
+        entry(shuffle_vpshufhw.family, shuffle_vpshufhw.path, shuffle_vpshufhw.source),
         entry(unordered_vucomiss.family, unordered_vucomiss.path, unordered_vucomiss.source),
     };
 };
@@ -3321,7 +3335,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 1040), tableCount());
+    try std.testing.expectEqual(@as(usize, 1043), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();

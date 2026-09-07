@@ -33,6 +33,11 @@ operand_encoding = {
 
 lanes = { xmm = 4, ymm = 8, zmm = 16 }
 flags_written = []
+semantic = """
+VPBROADCASTD broadcasts the selected 32-bit source element to every destination
+dword lane and clears the upper portion of the architectural vector when using
+the VEX form.
+"""
 simd_fp_exceptions = []
 other_exceptions = [
   "EVEX-encoded instructions use Type E6 class exception conditions",

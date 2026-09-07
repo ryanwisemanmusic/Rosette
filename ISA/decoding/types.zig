@@ -33,6 +33,15 @@ pub const MemoryReferenceKind = enum {
     string_destination,
 };
 
+/// Repeat-prefix state carried by legacy string instructions. Keeping this in
+/// the shared decoded form prevents the executor from rescanning bytes after
+/// the decode-cache has already accepted them.
+pub const StringRepeat = enum {
+    none,
+    repne,
+    rep,
+};
+
 pub const RFL_CF = flags.RFL_CF;
 pub const RFL_PF = flags.RFL_PF;
 pub const RFL_AF = flags.RFL_AF;
@@ -504,6 +513,8 @@ pub const Op = enum(u16) {
     vphsubd,
     vphsubsw,
     vpshufd,
+    vpshuflw,
+    vpshufhw,
     vshufps,
     vpmuludq,
     vpblendw,
@@ -737,6 +748,18 @@ pub const Op = enum(u16) {
     vpmaxsd,
     vpmaxuw,
     vpmaxud,
+    // Additional AVX2 packed integer operations present in optimized
+    // Windows/Xenia code. These are appended so existing trace/cache ids stay
+    // stable while the decoder can report their actual architectural opcode.
+    vpminub,
+    vpmaxub,
+    vpsubsb,
+    vpsubsw,
+    vpsubusw,
+    vpmulhw,
+    vpmulhuw,
+    vpaddsb,
+    vpaddsw,
     vphminposuw,
     vpsrlvd,
     vpsravd,
@@ -876,6 +899,97 @@ pub const Op = enum(u16) {
     // by trace and decode-cache consumers.
     vblendvps,
     vblendvpd,
+    // Legacy implicit string operations. Appended to preserve the numeric
+    // values of all existing operations used by decode caches and traces.
+    movs,
+    cmps,
+    stos,
+    scas,
+    // Additional legacy x87 register operations. These are appended so the
+    // numeric identities already used by decode caches and trace consumers
+    // remain stable.
+    fldz,
+    fucomi_st,
+    fcomi_st,
+    fcomip_st,
+    fcmovb_st,
+    fcmove_st,
+    fcmovbe_st,
+    fcmovu_st,
+    fcmovnb_st,
+    fcmovne_st,
+    fcmovnbe_st,
+    fcmovnu_st,
+    // FISTTP m64int is appended so the numeric identities above remain
+    // stable for decode-cache and trace consumers.
+    fisttp_mem64,
+    // BMI1/BMI2 VEX-encoded GPR operations. These are appended rather than
+    // inserted so trace records and decode-cache entries retain their
+    // established numeric identities.
+    andn,
+    bzhi,
+    mulx,
+    rorx,
+    shlx,
+    shrx,
+    sarx,
+    // VEX bit-test and dot-product operations used by optimized Xenia code.
+    vtestps,
+    vtestpd,
+    vpdpbusd,
+    // EVEX/AVX-512 operations present in optimized Windows/Xenia code.
+    // Appended to preserve all existing decode-cache and trace identities.
+    vpsadbw,
+    vpmaddubsw,
+    vpmaddwd,
+    vpcmpb,
+    vpmovqd,
+    vextracti32x4,
+    vextracti64x4,
+    movdir64b,
+    kmovw,
+    kmovd,
+    kmovq,
+    // Architectural boundaries that were previously represented as NOPs.
+    // Keep these appended so trace records and decode-cache entries retain
+    // the numeric identities of every operation above.
+    mfence,
+    lfence,
+    sfence,
+    rdtsc,
+    rdtscp,
+    emms,
+    wait,
+    vinsertf128,
+    vinserti128,
+    // VPERM2F128 is appended so existing decode-cache and trace identities
+    // remain stable while the AVX2 lane-permutation path becomes executable.
+    vperm2f128,
+    // Additional AVX/AVX2 operations used by optimized Windows/Xenia code.
+    // These stay at the end of the enum so persisted decode-cache and trace
+    // identities above remain stable.
+    vpackssdw,
+    vblendps,
+    vshufpd,
+    vpermilps,
+    vpbroadcastw,
+    vpbroadcastd,
+    vpbroadcastq,
+    vextractps,
+    vmovntdq,
+    vmovntps,
+    vmovntdqa,
+    vpcmpistri,
+    vpmaxsw,
+    vcvtdq2pd,
+    vcvttpd2dq,
+    // Legacy AVX masked vector memory operations. Keep load/store forms
+    // distinct because the same architectural mnemonic has opposite
+    // ModR/M data flow in the two encodings.
+    vmaskmovps_load,
+    vmaskmovps_store,
+    vmaskmovpd_load,
+    vmaskmovpd_store,
 };
 
 fn canonicalMnemonic(op: Op, buffer: *[32]u8) ?[]const u8 {
@@ -943,11 +1057,22 @@ pub const DecodedInsn = struct {
     rip_relative: bool = false,
     segment: Segment = .ds,
     has_0x67: bool = false,
+    repeat: StringRepeat = .none,
     is_reg_form: bool = false,
     cond: Condition = .e,
     xmm_dst: u8 = 0,
     xmm_src: u8 = 0,
     xmm_src2: u8 = 0,
+    // True when an SSE operation is using the legacy two-operand encoding.
+    // The executor can then share the VEX arithmetic/bitwise implementation
+    // while preserving the architectural upper-YMM state that legacy SSE
+    // leaves untouched (VEX instructions clear it).
+    legacy_sse: bool = false,
+    // The BMI VEX forms use the VEX.vvvv field for a second GPR source or
+    // destination. Keeping these separate from the XMM fields makes the
+    // operand role explicit and avoids lossy register reinterpretation.
+    dst_reg2: RegId = .al_ax_eax_rax,
+    src_reg2: RegId = .al_ax_eax_rax,
     // Fourth XMM operand (register index). Used by AVX variable-blend
     // instructions (VBLENDVPS/VBLENDVPD/VPBLENDVB) whose mask register is
     // encoded in imm8[7:4].
@@ -957,7 +1082,14 @@ pub const DecodedInsn = struct {
     lock: bool = false,
     // EVEX-specific fields
     opmask: u3 = 0,
+    dst_k: u3 = 0,
+    src_k: u3 = 0,
+    mask_to_gpr: bool = false,
     zero_mask: bool = false,
     evex_broadcast: bool = false,
+    // Element width used by EVEX masking/broadcast rules for the decoded
+    // instruction. Zero means the executor derives it from the operation.
+    evex_element_bytes: u8 = 0,
     vector_512: bool = false,
+    is_evex: bool = false,
 };

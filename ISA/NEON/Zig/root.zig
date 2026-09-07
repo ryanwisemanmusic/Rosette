@@ -28,6 +28,7 @@ const call_ret_call = @import("CALL-RET/CALL.zig");
 const call_ret_leave = @import("CALL-RET/LEAVE.zig");
 const call_ret_ret = @import("CALL-RET/RET.zig");
 const cmp_cmp = @import("CMP/CMP.zig");
+const cmp_cmps = @import("CMP/CMPS.zig");
 const cmp_cmppd = @import("CMP/CMPPD.zig");
 const cmp_cmpps = @import("CMP/CMPPS.zig");
 const cmp_cmpsd = @import("CMP/CMPSD.zig");
@@ -1238,6 +1239,8 @@ const arithmetic_vpaddb = @import("ARITHMETIC/vpaddb.zig");
 const arithmetic_vpaddd = @import("ARITHMETIC/vpaddd.zig");
 const arithmetic_vpaddq = @import("ARITHMETIC/vpaddq.zig");
 const arithmetic_vpaddw = @import("ARITHMETIC/vpaddw.zig");
+const arithmetic_vpaddsb = @import("ARITHMETIC/vpaddsb.zig");
+const arithmetic_vpaddsw = @import("ARITHMETIC/vpaddsw.zig");
 const atomic_cmpxchg = @import("ATOMIC/cmpxchg.zig");
 const atomic_cmpxchg8b = @import("ATOMIC/cmpxchg8b.zig");
 const atomic_cmpxchg16b = @import("ATOMIC/cmpxchg16b.zig");
@@ -1249,11 +1252,15 @@ const insert_extract_vpextrd = @import("INSERT_EXTRACT/vpextrd.zig");
 const insert_extract_vpextrq = @import("INSERT_EXTRACT/vpextrq.zig");
 const insert_extract_vpextrw = @import("INSERT_EXTRACT/vpextrw.zig");
 const insert_extract_vextractf128 = @import("INSERT_EXTRACT/vextractf128.zig");
+const insert_extract_vextracti32x4 = @import("INSERT_EXTRACT/vextracti32x4.zig");
+const insert_extract_vextracti64x4 = @import("INSERT_EXTRACT/vextracti64x4.zig");
 const round_vroundpd = @import("ROUND/vroundpd.zig");
 const round_vroundps = @import("ROUND/vroundps.zig");
 const round_vroundsd = @import("ROUND/vroundsd.zig");
 const round_vroundss = @import("ROUND/vroundss.zig");
 const shuffle_vpshufd = @import("SHUFFLE/vpshufd.zig");
+const shuffle_vpshuflw = @import("SHUFFLE/vpshuflw.zig");
+const shuffle_vpshufhw = @import("SHUFFLE/vpshufhw.zig");
 const unordered_vucomiss = @import("UNORDERED/vucomiss.zig");
 
 pub const mirror_tables = blk: {
@@ -1286,6 +1293,7 @@ pub const mirror_tables = blk: {
         mirror(call_ret_leave.family, call_ret_leave.path, call_ret_leave.source),
         mirror(call_ret_ret.family, call_ret_ret.path, call_ret_ret.source),
         mirror(cmp_cmp.family, cmp_cmp.path, cmp_cmp.source),
+        mirror(cmp_cmps.family, cmp_cmps.path, cmp_cmps.source),
         mirror(cmp_cmppd.family, cmp_cmppd.path, cmp_cmppd.source),
         mirror(cmp_cmpps.family, cmp_cmpps.path, cmp_cmpps.source),
         mirror(cmp_cmpsd.family, cmp_cmpsd.path, cmp_cmpsd.source),
@@ -2422,6 +2430,8 @@ pub const mirror_tables = blk: {
         mirror(arithmetic_vpaddd.family, arithmetic_vpaddd.path, arithmetic_vpaddd.source),
         mirror(arithmetic_vpaddq.family, arithmetic_vpaddq.path, arithmetic_vpaddq.source),
         mirror(arithmetic_vpaddw.family, arithmetic_vpaddw.path, arithmetic_vpaddw.source),
+        mirror(arithmetic_vpaddsb.family, arithmetic_vpaddsb.path, arithmetic_vpaddsb.source),
+        mirror(arithmetic_vpaddsw.family, arithmetic_vpaddsw.path, arithmetic_vpaddsw.source),
         mirror(atomic_cmpxchg.family, atomic_cmpxchg.path, atomic_cmpxchg.source),
         mirror(atomic_cmpxchg8b.family, atomic_cmpxchg8b.path, atomic_cmpxchg8b.source),
         mirror(atomic_cmpxchg16b.family, atomic_cmpxchg16b.path, atomic_cmpxchg16b.source),
@@ -2433,11 +2443,15 @@ pub const mirror_tables = blk: {
         mirror(insert_extract_vpextrq.family, insert_extract_vpextrq.path, insert_extract_vpextrq.source),
         mirror(insert_extract_vpextrw.family, insert_extract_vpextrw.path, insert_extract_vpextrw.source),
         mirror(insert_extract_vextractf128.family, insert_extract_vextractf128.path, insert_extract_vextractf128.source),
+        mirror(insert_extract_vextracti32x4.family, insert_extract_vextracti32x4.path, insert_extract_vextracti32x4.source),
+        mirror(insert_extract_vextracti64x4.family, insert_extract_vextracti64x4.path, insert_extract_vextracti64x4.source),
         mirror(round_vroundpd.family, round_vroundpd.path, round_vroundpd.source),
         mirror(round_vroundps.family, round_vroundps.path, round_vroundps.source),
         mirror(round_vroundsd.family, round_vroundsd.path, round_vroundsd.source),
         mirror(round_vroundss.family, round_vroundss.path, round_vroundss.source),
         mirror(shuffle_vpshufd.family, shuffle_vpshufd.path, shuffle_vpshufd.source),
+        mirror(shuffle_vpshuflw.family, shuffle_vpshuflw.path, shuffle_vpshuflw.source),
+        mirror(shuffle_vpshufhw.family, shuffle_vpshufhw.path, shuffle_vpshufhw.source),
         mirror(unordered_vucomiss.family, unordered_vucomiss.path, unordered_vucomiss.source),
     };
 };
@@ -2537,6 +2551,7 @@ fn mappedLowering(lowering: []const u8) MappedLowering {
     if (std.mem.eql(u8, lowering, "arm64_neon_fsub_pd")) return .{ .kind = .neon_vector, .assembly = "fsub vD.2d, vN.2d, vM.2d\nbl rosette_apply_mxcsr_float_exceptions" };
     if (std.mem.eql(u8, lowering, "arm64_neon_fsub_ss")) return .{ .kind = .neon_scalar, .assembly = "fsub sD, sN, sM\nbl rosette_merge_scalar_high_lanes\nbl rosette_apply_mxcsr_float_exceptions" };
     if (std.mem.eql(u8, lowering, "arm64_neon_fsub_sd")) return .{ .kind = .neon_scalar, .assembly = "fsub dD, dN, dM\nbl rosette_merge_scalar_high_lanes\nbl rosette_apply_mxcsr_float_exceptions" };
+    if (std.mem.eql(u8, lowering, "arm64_neon_ext_imm8")) return .{ .kind = .neon_vector, .assembly = "ext vD.16b, vN.16b, vM.16b, #8\nbl rosette_apply_vperm2f128_imm8" };
     return .{ .kind = .fallback, .assembly = "bl rosette_x86_instruction_fallback", .can_lower = false };
 }
 

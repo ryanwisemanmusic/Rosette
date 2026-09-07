@@ -1,5 +1,11 @@
 // PMADDUBSW.inc
 
+semantic = """
+PMADDUBSW: multiply unsigned bytes by signed bytes, add adjacent products, and
+saturate each result to a signed word. The form-specific blocks below preserve
+the legacy, VEX, and EVEX lane behavior.
+"""
+
 operand_encoding = [
   { op_en = "A", operand_1 = "ModRM:reg (r, w)", operand_2 = "ModRM:r/m (r)", operand_3 = "N/A", operand_4 = "N/A" },
   { op_en = "B", operand_1 = "ModRM:reg (w)", operand_2 = "VEX.vvvv (r)", operand_3 = "ModRM:r/m (r)", operand_4 = "N/A" },

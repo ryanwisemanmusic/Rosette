@@ -21,7 +21,6 @@ element_type = "mask"
 element_size = 16
 
 encodings = [
-  { opcode = "VEX.L1.0F.W0 90 /r", form = "KMOVW k1, k2", op_en = "RVR", feature = "AVX512F", vector_length = 0, encoding = "vex" },
   { opcode = "VEX.L1.0F.W0 90 /r", form = "KMOVW k1, m16", op_en = "RM", feature = "AVX512F", vector_length = 0, encoding = "vex" },
   { opcode = "VEX.L1.0F.W0 91 /r", form = "KMOVW m16, k1", op_en = "MR", feature = "AVX512F", vector_length = 0, encoding = "vex" },
   { opcode = "VEX.L1.0F.W0 92 /r", form = "KMOVW r32, k1", op_en = "RR", feature = "AVX512F", vector_length = 0, encoding = "vex" },

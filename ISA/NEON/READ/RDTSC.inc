@@ -6,7 +6,7 @@ source_isa = "x86"
 target_isa = "arm64_neon"
 x86_table = "READ/RDTSC.inc"
 x86_handler = "x86_rdtsc"
-neon_lowering = "arm64_cntvct_read"
+neon_lowering = "arm64_sysreg_read"
 lowering_kind = "arm64_documented_contract"
 
 name = "RDTSC"
@@ -16,7 +16,9 @@ feature = "x86_system"
 element_type = "none"
 element_size = 0
 
-encodings = []
+encodings = [
+  { opcode = "0F 31", form = "RDTSC", op_en = "ZO", vector_length = 0, encoding = "legacy" }
+]
 
 operand_encoding = { ZO = [] }
 

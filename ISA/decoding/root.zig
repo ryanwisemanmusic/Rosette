@@ -89,6 +89,7 @@ pub const Segment = types.Segment;
 pub const SegmentState = types.SegmentState;
 pub const ExecutionMode = types.ExecutionMode;
 pub const MemoryReferenceKind = types.MemoryReferenceKind;
+pub const StringRepeat = types.StringRepeat;
 pub const RFL_CF = types.RFL_CF;
 pub const RFL_PF = types.RFL_PF;
 pub const RFL_AF = types.RFL_AF;

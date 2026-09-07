@@ -100,6 +100,31 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         return d;
     }
 
+    if (opcode2 == 0x31) {
+        // RDTSC has no ModR/M operand and writes EDX:EAX. The executor uses
+        // the deterministic guest step clock rather than the host wall clock
+        // so translated code observes a stable, monotonic time source.
+        d.op = .rdtsc;
+        d.len = @as(u8, @intCast(pos.*));
+        return d;
+    }
+
+    if (opcode2 == 0x77) {
+        d.op = .emms;
+        d.len = @as(u8, @intCast(pos.*));
+        return d;
+    }
+
+    if (opcode2 == 0x01 and has_f3 and !has_66 and !has_f2 and pos.* < bytes.len and bytes[pos.*] == 0xF9) {
+        // RDTSCP is the F3 0F 01 F9 form. Its mandatory prefix is checked
+        // here so the reserved unprefixed form cannot be mistaken for a
+        // valid system-register read.
+        pos.* += 1;
+        d.op = .rdtscp;
+        d.len = @as(u8, @intCast(pos.*));
+        return d;
+    }
+
     if (opcode2 == 0x18 or opcode2 == 0x0D) {
         if (pos.* >= bytes.len) return .{};
         const rm = readModRM(&d, bytes, pos, rex_r, rex_x, rex_b, .bits8);
@@ -305,10 +330,22 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
     }
 
     if (opcode2 == 0x2E or opcode2 == 0x2F) {
-        d.op = .nop;
-        const extra = if (pos.* + 1 <= bytes.len and hasModRM(bytes[pos.*])) @as(u8, 1) else @as(u8, 0);
-        d.len = @as(u8, @intCast(pos.* + extra));
-        return d;
+        // COMISS/UCOMISS and their 66-prefixed double-precision forms are
+        // legacy two-operand comparisons. Reuse the VEX comparison executor
+        // by making ModRM.reg both the destination and its first source; the
+        // legacy_sse bit keeps the upper YMM state unchanged where relevant.
+        if (has_f2 or has_f3 or pos.* >= bytes.len) return .{};
+        var decoded = DecodedInsn{ .legacy_sse = true };
+        const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, if (has_66) .bits64 else .bits32);
+        decoded.xmm_src = @intFromEnum(rm.reg);
+        decoded.op = if (has_66) .vucomisd else .vucomiss;
+        if (decoded.is_reg_form) {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        } else {
+            decoded.addr = rm.addr;
+        }
+        decoded.len = @intCast(pos.*);
+        return decoded;
     }
 
     if (opcode2 == 0x38) {
@@ -325,32 +362,117 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         return d;
     }
 
-    if (opcode2 == 0x50 or opcode2 == 0x51) {
-        d.op = .nop;
-        d.len = @as(u8, @intCast(pos.*));
-        return d;
+    if (opcode2 == 0x50) {
+        // MOVMSKPS/MOVMSKPD only accept a register-form XMM source.
+        if (pos.* >= bytes.len) return .{};
+        var decoded = DecodedInsn{ .legacy_sse = true };
+        const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, .bits64);
+        if (!decoded.is_reg_form) return .{};
+        decoded.op = if (has_66) .vmovmskpd else .vmovmskps;
+        decoded.dst_reg = rm.reg;
+        decoded.xmm_src = @intCast(rm.addr);
+        decoded.len = @intCast(pos.*);
+        return decoded;
     }
 
-    if (opcode2 == 0x54) {
-        return decodeSseBytes(bytes, &pos.*, rex_r, rex_x, rex_b, rex_w, has_66, opcode2, .@"and");
+    if (opcode2 == 0x51) {
+        // SQRTPS/SQRTPD and scalar SQRTSS/SQRTSD. Scalar legacy forms merge
+        // their low result into the old destination, while packed forms use
+        // the r/m vector directly.
+        if (pos.* >= bytes.len or (has_66 and has_f2) or (has_66 and has_f3)) return .{};
+        var decoded = DecodedInsn{ .legacy_sse = true };
+        const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, if (has_f2 or has_66) .bits64 else .bits32);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = decoded.xmm_dst;
+        decoded.op = if (has_f2)
+            .vsqrtsd
+        else if (has_f3)
+            .vsqrtss
+        else if (has_66)
+            .vsqrtpd
+        else
+            .vsqrtps;
+        if (decoded.is_reg_form) {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        } else {
+            decoded.addr = rm.addr;
+        }
+        decoded.len = @intCast(pos.*);
+        return decoded;
     }
 
-    if (opcode2 == 0x55) {
-        return decodeSseBytes(bytes, &pos.*, rex_r, rex_x, rex_b, rex_w, has_66, opcode2, .@"and");
+    if (opcode2 == 0x6E or opcode2 == 0x7E) {
+        // MOVD xmm,r/m32 and MOVD r/m32,xmm require the 66 prefix in the
+        // XMM form. The legacy operation shares the VEX executor, but unlike
+        // VEX it does not clear the destination register's upper YMM half.
+        if (!has_66 or has_f2 or has_f3 or pos.* >= bytes.len) return .{};
+        var decoded = DecodedInsn{ .legacy_sse = true };
+        const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, .bits32);
+        if (opcode2 == 0x6E) {
+            decoded.op = if (decoded.is_reg_form) .vmovd_xmm_reg32 else .vmovd_xmm_mem32;
+            decoded.xmm_dst = @intFromEnum(rm.reg);
+            if (decoded.is_reg_form) {
+                decoded.src_reg = @enumFromInt(rm.addr);
+            } else {
+                decoded.addr = rm.addr;
+            }
+        } else {
+            decoded.op = if (decoded.is_reg_form) .vmovd_reg32_xmm else .vmovd_mem32_xmm;
+            decoded.xmm_src = @intFromEnum(rm.reg);
+            if (decoded.is_reg_form) {
+                decoded.dst_reg = @enumFromInt(rm.addr);
+            } else {
+                decoded.addr = rm.addr;
+            }
+        }
+        decoded.len = @intCast(pos.*);
+        return decoded;
     }
 
-    if (opcode2 == 0x56) {
-        return decodeSseBytes(bytes, &pos.*, rex_r, rex_x, rex_b, rex_w, has_66, opcode2, .@"or");
+    if (opcode2 == 0x6F or opcode2 == 0x7F) {
+        // MOVDQA (66) and MOVDQU (F3) are the two XMM forms of the legacy
+        // aligned/unaligned vector move family.  Plain 0F 6F/7F is an MMX
+        // move and is intentionally left to the MMX boundary until that
+        // register file is modeled.
+        const is_dqa = has_66 and !has_f2 and !has_f3;
+        const is_dqu = has_f3 and !has_66 and !has_f2;
+        if ((!is_dqa and !is_dqu) or pos.* >= bytes.len) return .{};
+        var decoded = DecodedInsn{ .legacy_sse = true };
+        const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, .bits64);
+        if (opcode2 == 0x6F) {
+            decoded.op = if (is_dqa)
+                (if (decoded.is_reg_form) .vmovdqa_xmm_xmm else .vmovdqa_xmm_mem)
+            else
+                (if (decoded.is_reg_form) .vmovdqu_xmm_xmm else .vmovdqu_xmm_mem);
+            decoded.xmm_dst = @intFromEnum(rm.reg);
+            if (decoded.is_reg_form) {
+                decoded.xmm_src = @intCast(rm.addr);
+            } else {
+                decoded.addr = rm.addr;
+            }
+        } else {
+            decoded.op = if (is_dqa)
+                (if (decoded.is_reg_form) .vmovdqa_xmm_xmm else .vmovdqa_mem_xmm)
+            else
+                (if (decoded.is_reg_form) .vmovdqu_xmm_xmm else .vmovdqu_mem_xmm);
+            if (decoded.is_reg_form) {
+                decoded.xmm_dst = @intCast(rm.addr);
+                decoded.xmm_src = @intFromEnum(rm.reg);
+            } else {
+                decoded.xmm_src = @intFromEnum(rm.reg);
+                decoded.addr = rm.addr;
+            }
+        }
+        decoded.len = @intCast(pos.*);
+        return decoded;
     }
 
-    if (opcode2 == 0x57) {
-        return decodeSseBytes(bytes, &pos.*, rex_r, rex_x, rex_b, rex_w, has_66, opcode2, .xor);
+    if (opcode2 >= 0x54 and opcode2 <= 0x57) {
+        return decodeLegacySseBinary(bytes, &pos.*, rex_r, rex_x, rex_b, has_66, has_f2, has_f3, opcode2);
     }
 
-    if (opcode2 == 0x58 or opcode2 == 0x59 or opcode2 == 0x5C or opcode2 == 0x5E or opcode2 == 0x5F) {
-        d.op = .nop;
-        d.len = @as(u8, @intCast(pos.* + 2));
-        return d;
+    if (opcode2 == 0x58 or opcode2 == 0x59 or opcode2 == 0x5C or opcode2 == 0x5D or opcode2 == 0x5E or opcode2 == 0x5F) {
+        return decodeLegacySseArithmetic(bytes, &pos.*, rex_r, rex_x, rex_b, has_66, has_f2, has_f3, opcode2);
     }
 
     if (opcode2 == 0x70) {
@@ -408,15 +530,28 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         const modrm = bytes[pos.*];
         const group = (modrm >> 3) & 7;
         const rm = readModRM(&d, bytes, pos, rex_r, rex_x, rex_b, .bits32);
-        // LDMXCSR/STMXCSR require a memory operand. The remaining 0F AE
-        // groups (FXSAVE/FXRSTOR and fences) are retained as boundary-safe
-        // NOPs until their state contracts are needed.
-        d.op = if (!d.is_reg_form and group == 2)
-            .ldmxcsr_mem32
-        else if (!d.is_reg_form and group == 3)
-            .stmxcsr_mem32
-        else
-            .nop;
+        // Fences use a register-form ModR/M byte whose r/m field is ignored.
+        // The decoder must identify them explicitly: treating MFENCE as a
+        // NOP allows host/guest memory-ordering races to pass unnoticed.
+        // Keep MOD=11 and the opcode-extension bits, while ignoring the
+        // architecturally unused r/m field.  0xC7 would discard bit 3 and
+        // turn LFENCE (E8) into C0; the fence encodings are E8/F0/F8.
+        const fence_code = modrm & 0xF8;
+        if (d.is_reg_form and fence_code == 0xE8) {
+            d.op = .lfence;
+        } else if (d.is_reg_form and fence_code == 0xF0) {
+            d.op = .mfence;
+        } else if (d.is_reg_form and fence_code == 0xF8) {
+            d.op = .sfence;
+        } else if (!d.is_reg_form and group == 2) {
+            d.op = .ldmxcsr_mem32;
+        } else if (!d.is_reg_form and group == 3) {
+            d.op = .stmxcsr_mem32;
+        } else {
+            // Preserve the existing boundary-safe behavior for 0F AE forms
+            // whose full architectural state model is not yet represented.
+            d.op = .nop;
+        }
         d.size = .bits32;
         d.addr = rm.addr;
         d.len = @intCast(pos.*);
@@ -470,6 +605,24 @@ pub fn decodeThreeByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool,
             decoded.len = @intCast(pos.*);
             return decoded;
         }
+    }
+
+    // MOVDIR64B is encoded as 66 0F 38 F8 /r.  The ModR/M.reg operand is a
+    // GPR containing the 64-byte destination address; the r/m operand is the
+    // source memory block.  It is not a normal register-to-memory move, so it
+    // needs its own operation identity instead of being mistaken for MOVBE.
+    if (opcode == 0x38 and has_66 and !has_f2 and !has_f3 and pos.* < bytes.len and bytes[pos.*] == 0xF8) {
+        pos.* += 1;
+        if (pos.* >= bytes.len) return .{};
+        var decoded = DecodedInsn{};
+        const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, .bits64);
+        if (decoded.is_reg_form) return .{};
+        decoded.op = .movdir64b;
+        decoded.size = .bits64;
+        decoded.dst_reg = rm.reg;
+        decoded.addr = rm.addr;
+        decoded.len = @intCast(pos.*);
+        return decoded;
     }
 
     // MOVBE is deliberately handled separately from F2-prefixed CRC32 even
@@ -549,4 +702,87 @@ pub fn decodeSseBytes(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, 
         d.len = @as(u8, @intCast(pos.*));
         return d;
     }
+}
+
+fn decodeLegacySseBinary(
+    bytes: []const u8,
+    pos: *usize,
+    rex_r: bool,
+    rex_x: bool,
+    rex_b: bool,
+    has_66: bool,
+    has_f2: bool,
+    has_f3: bool,
+    opcode: u8,
+) DecodedInsn {
+    // AND/ANDN/OR/XOR packed single/double accept no mandatory prefix or
+    // 66. F2/F3 are different scalar instruction families and must not be
+    // accidentally reinterpreted as a bitwise operation.
+    if (has_f2 or has_f3 or pos.* >= bytes.len) return .{};
+    var decoded = DecodedInsn{ .legacy_sse = true };
+    const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, .bits64);
+    decoded.xmm_dst = @intFromEnum(rm.reg);
+    decoded.xmm_src = decoded.xmm_dst;
+    // Keep the long-standing two-register XORPS representation used by the
+    // ELF processor. The shared VEX-shaped representation remains useful for
+    // the other legacy SSE forms (and for the memory form), but changing this
+    // established operation tag would make an otherwise unrelated decoder
+    // contract regress.
+    if (!has_66 and opcode == 0x57 and decoded.is_reg_form) {
+        decoded.op = .xorps_xmm_xmm;
+        decoded.xmm_src = @intCast(rm.addr);
+        decoded.len = @intCast(pos.*);
+        return decoded;
+    }
+    decoded.op = switch (opcode) {
+        0x54 => if (has_66) .vandpd else .vandps,
+        0x55 => if (has_66) .vandnpd else .vandnps,
+        0x56 => if (has_66) .vorpd else .vorps,
+        0x57 => if (has_66) .vxorpd else .vxorps,
+        else => return .{},
+    };
+    if (decoded.is_reg_form) {
+        decoded.xmm_src2 = @intCast(rm.addr);
+    } else {
+        decoded.addr = rm.addr;
+    }
+    decoded.len = @intCast(pos.*);
+    return decoded;
+}
+
+fn decodeLegacySseArithmetic(
+    bytes: []const u8,
+    pos: *usize,
+    rex_r: bool,
+    rex_x: bool,
+    rex_b: bool,
+    has_66: bool,
+    has_f2: bool,
+    has_f3: bool,
+    opcode: u8,
+) DecodedInsn {
+    if (has_66 and (has_f2 or has_f3)) return .{};
+    if (pos.* >= bytes.len) return .{};
+    var decoded = DecodedInsn{ .legacy_sse = true };
+    const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, if (has_66 or has_f2) .bits64 else .bits32);
+    decoded.xmm_dst = @intFromEnum(rm.reg);
+    // Legacy SSE has DEST as the first source; the VEX executor's source1
+    // field is therefore normalized to the same XMM register.
+    decoded.xmm_src = decoded.xmm_dst;
+    decoded.op = switch (opcode) {
+        0x58 => if (has_f3) .vaddss else if (has_f2) .vaddsd else if (has_66) .vaddpd else .vaddps,
+        0x59 => if (has_f3) .vmulss else if (has_f2) .vmulsd else if (has_66) .vmulpd else .vmulps,
+        0x5C => if (has_f3) .vsubss else if (has_f2) .vsubsd else if (has_66) .vsubpd else .vsubps,
+        0x5D => if (has_f3) .vminss else if (has_f2) .vminsd else if (has_66) .vminpd else .vminps,
+        0x5E => if (has_f3) .vdivss else if (has_f2) .vdivsd else if (has_66) .vdivpd else .vdivps,
+        0x5F => if (has_f3) .vmaxss else if (has_f2) .vmaxsd else if (has_66) .vmaxpd else .vmaxps,
+        else => return .{},
+    };
+    if (decoded.is_reg_form) {
+        decoded.xmm_src2 = @intCast(rm.addr);
+    } else {
+        decoded.addr = rm.addr;
+    }
+    decoded.len = @intCast(pos.*);
+    return decoded;
 }

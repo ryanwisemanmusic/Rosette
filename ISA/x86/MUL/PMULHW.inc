@@ -11,6 +11,11 @@ category = "simd_int_mul_high"
 feature = "MMX"
 element_type = "i16"
 
+semantic = """
+PMULHW multiplies packed signed 16-bit elements and retains the high 16 bits of each product.
+The VEX and EVEX forms use the corresponding three-operand and masked vector contracts below.
+"""
+
 encodings = [
   { opcode = "NP 0F E5 /r", form = "PMULHW mm, mm/m64", op_en = "A", feature = "MMX" },
   { opcode = "66 0F E5 /r", form = "PMULHW xmm1, xmm2/m128", op_en = "A", feature = "SSE2" },

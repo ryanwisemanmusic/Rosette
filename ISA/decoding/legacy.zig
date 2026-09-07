@@ -427,6 +427,188 @@ test "shared VEX decoder owns MXCSR transfer encodings" {
     try std.testing.expect(decodeVexInstruction(&[_]u8{ 0xC5, 0xF8, 0xAE, 0xD0 }) == null);
 }
 
+test "shared legacy path decodes VEX BMI GPR operands" {
+    const shlx = decodeLegacyInstruction(&[_]u8{ 0xC4, 0xE2, 0xC1, 0xF7, 0xC0 }, .long64);
+    try std.testing.expectEqual(Op.shlx, shlx.op);
+    try std.testing.expectEqual(OperandSize.bits64, shlx.size);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, shlx.dst_reg);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, shlx.src_reg);
+    try std.testing.expectEqual(RegId.bh_di_edi_rdi, shlx.src_reg2);
+    try std.testing.expectEqual(@as(u8, 5), shlx.len);
+
+    const shrx = decodeLegacyInstruction(&[_]u8{ 0xC4, 0x42, 0xE3, 0xF7, 0xDB }, .long64);
+    try std.testing.expectEqual(Op.shrx, shrx.op);
+    try std.testing.expectEqual(RegId.r11b_r11w_r11d_r11, shrx.dst_reg);
+    try std.testing.expectEqual(RegId.r11b_r11w_r11d_r11, shrx.src_reg);
+    try std.testing.expectEqual(RegId.bl_bx_ebx_rbx, shrx.src_reg2);
+
+    const andn = decodeLegacyInstruction(&[_]u8{ 0xC4, 0x42, 0xF0, 0xF2, 0xE0 }, .long64);
+    try std.testing.expectEqual(Op.andn, andn.op);
+    try std.testing.expectEqual(RegId.r12b_r12w_r12d_r12, andn.dst_reg);
+    try std.testing.expectEqual(RegId.r8b_r8w_r8d_r8, andn.src_reg);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, andn.src_reg2);
+
+    const bzhi = decodeLegacyInstruction(&[_]u8{ 0xC4, 0x42, 0x88, 0xF5, 0xF7 }, .long64);
+    try std.testing.expectEqual(Op.bzhi, bzhi.op);
+    try std.testing.expectEqual(RegId.r14b_r14w_r14d_r14, bzhi.dst_reg);
+    try std.testing.expectEqual(RegId.r15b_r15w_r15d_r15, bzhi.src_reg);
+    try std.testing.expectEqual(RegId.r14b_r14w_r14d_r14, bzhi.src_reg2);
+
+    const mulx = decodeLegacyInstruction(&[_]u8{ 0xC4, 0xE2, 0xEB, 0xF6, 0xF6 }, .long64);
+    try std.testing.expectEqual(Op.mulx, mulx.op);
+    try std.testing.expectEqual(RegId.dh_si_esi_rsi, mulx.dst_reg);
+    try std.testing.expectEqual(RegId.dh_si_esi_rsi, mulx.src_reg);
+    try std.testing.expectEqual(RegId.dl_dx_edx_rdx, mulx.dst_reg2);
+
+    const rorx = decodeLegacyInstruction(&[_]u8{ 0xC4, 0xE3, 0x7B, 0xF0, 0xF6, 0x01 }, .long64);
+    try std.testing.expectEqual(Op.rorx, rorx.op);
+    try std.testing.expectEqual(OperandSize.bits32, rorx.size);
+    try std.testing.expectEqual(RegId.dh_si_esi_rsi, rorx.dst_reg);
+    try std.testing.expectEqual(RegId.dh_si_esi_rsi, rorx.src_reg);
+    try std.testing.expectEqual(@as(u64, 1), rorx.imm);
+    try std.testing.expectEqual(@as(u8, 6), rorx.len);
+}
+
+test "shared legacy path recognizes timing, fence, and x87 boundaries" {
+    const rdtsc = decodeLegacyInstruction(&[_]u8{ 0x0F, 0x31 }, .long64);
+    try std.testing.expectEqual(Op.rdtsc, rdtsc.op);
+    try std.testing.expectEqual(@as(u8, 2), rdtsc.len);
+
+    const rdtscp = decodeLegacyInstruction(&[_]u8{ 0xF3, 0x0F, 0x01, 0xF9 }, .long64);
+    try std.testing.expectEqual(Op.rdtscp, rdtscp.op);
+    try std.testing.expectEqual(@as(u8, 4), rdtscp.len);
+
+    const emms = decodeLegacyInstruction(&[_]u8{ 0x0F, 0x77 }, .long64);
+    try std.testing.expectEqual(Op.emms, emms.op);
+    try std.testing.expectEqual(@as(u8, 2), emms.len);
+
+    const wait = decodeLegacyInstruction(&[_]u8{0x9B}, .long64);
+    try std.testing.expectEqual(Op.wait, wait.op);
+    try std.testing.expectEqual(@as(u8, 1), wait.len);
+
+    const fences = [_]struct { bytes: []const u8, op: Op }{
+        .{ .bytes = &[_]u8{ 0x0F, 0xAE, 0xE8 }, .op = .lfence },
+        .{ .bytes = &[_]u8{ 0x0F, 0xAE, 0xF0 }, .op = .mfence },
+        .{ .bytes = &[_]u8{ 0x0F, 0xAE, 0xF8 }, .op = .sfence },
+    };
+    for (fences) |case| {
+        const decoded = decodeLegacyInstruction(case.bytes, .long64);
+        try std.testing.expectEqual(case.op, decoded.op);
+        try std.testing.expectEqual(@as(u8, 3), decoded.len);
+        try std.testing.expect(decoded.is_reg_form);
+    }
+}
+
+test "shared legacy path decodes opmask register transfers" {
+    const to_mask = decodeLegacyInstruction(&[_]u8{ 0xC5, 0xFB, 0x92, 0xC8 }, .long64);
+    try std.testing.expectEqual(Op.kmovd, to_mask.op);
+    try std.testing.expectEqual(@as(u3, 1), to_mask.dst_k);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, to_mask.src_reg);
+    try std.testing.expect(to_mask.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 4), to_mask.len);
+
+    const from_mask = decodeLegacyInstruction(&[_]u8{ 0xC5, 0xFB, 0x93, 0xC1 }, .long64);
+    try std.testing.expectEqual(Op.kmovd, from_mask.op);
+    try std.testing.expect(from_mask.mask_to_gpr);
+    try std.testing.expectEqual(@as(u3, 1), from_mask.src_k);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, from_mask.dst_reg);
+
+    const qword = decodeLegacyInstruction(&[_]u8{ 0xC4, 0xE1, 0xFB, 0x92, 0xC8 }, .long64);
+    try std.testing.expectEqual(Op.kmovq, qword.op);
+    try std.testing.expectEqual(@as(u3, 1), qword.dst_k);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, qword.src_reg);
+
+    const word = decodeLegacyInstruction(&[_]u8{ 0xC5, 0xF8, 0x92, 0xD1 }, .long64);
+    try std.testing.expectEqual(Op.kmovw, word.op);
+    try std.testing.expectEqual(@as(u3, 2), word.dst_k);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, word.src_reg);
+
+    const dword_load = decodeLegacyInstruction(&[_]u8{ 0xC4, 0xE1, 0xF9, 0x90, 0x08 }, .long64);
+    try std.testing.expectEqual(Op.kmovd, dword_load.op);
+    try std.testing.expectEqual(@as(u3, 1), dword_load.dst_k);
+    try std.testing.expect(!dword_load.is_reg_form);
+
+    const dword_store = decodeLegacyInstruction(&[_]u8{ 0xC4, 0xE1, 0xF9, 0x91, 0x08 }, .long64);
+    try std.testing.expectEqual(Op.kmovd, dword_store.op);
+    try std.testing.expect(dword_store.mask_to_gpr);
+    try std.testing.expectEqual(@as(u3, 1), dword_store.src_k);
+    try std.testing.expect(!dword_store.is_reg_form);
+}
+
+test "shared legacy path decodes VEX bit-test and dot-product forms" {
+    const vtest = decodeLegacyInstruction(&[_]u8{ 0xC4, 0xE2, 0x79, 0x0E, 0xC0 }, .long64);
+    try std.testing.expectEqual(Op.vtestps, vtest.op);
+    try std.testing.expectEqual(@as(u8, 0), vtest.xmm_src);
+    try std.testing.expectEqual(@as(u8, 0), vtest.xmm_src2);
+    try std.testing.expect(vtest.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 5), vtest.len);
+
+    const dot = decodeLegacyInstruction(&[_]u8{ 0xC4, 0xE2, 0x79, 0x50, 0xC0 }, .long64);
+    try std.testing.expectEqual(Op.vpdpbusd, dot.op);
+    try std.testing.expectEqual(@as(u8, 0), dot.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), dot.xmm_src);
+    try std.testing.expectEqual(@as(u8, 0), dot.xmm_src2);
+    try std.testing.expect(dot.is_reg_form);
+}
+
+test "shared legacy path decodes Windows Xenia EVEX vector forms" {
+    const high_register = decodeLegacyInstruction(
+        &[_]u8{ 0x62, 0xA2, 0x7E, 0x28, 0x35, 0xC9 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vpmovqd, high_register.op);
+    try std.testing.expect(high_register.is_evex);
+    try std.testing.expect(high_register.vector_256);
+    try std.testing.expectEqual(@as(u8, 17), high_register.xmm_src);
+    try std.testing.expectEqual(@as(u8, 17), high_register.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 6), high_register.len);
+
+    const masked_compare = decodeLegacyInstruction(
+        &[_]u8{ 0x62, 0xD1, 0x7F, 0xC9, 0x6F, 0x00 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vmovdqu_ymm_mem, masked_compare.op);
+    try std.testing.expect(masked_compare.is_evex);
+    try std.testing.expectEqual(@as(u8, 1), masked_compare.opmask);
+    try std.testing.expect(masked_compare.zero_mask);
+    try std.testing.expectEqual(@as(u8, 0), masked_compare.xmm_dst);
+    try std.testing.expectEqual(RegId.r8b_r8w_r8d_r8, masked_compare.sib_base_reg);
+    try std.testing.expectEqual(@as(u8, 6), masked_compare.len);
+
+    const extract = decodeLegacyInstruction(
+        &[_]u8{ 0x62, 0xA3, 0xFD, 0x48, 0x3B, 0xC1, 0x01 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vextracti64x4, extract.op);
+    try std.testing.expect(extract.is_evex);
+    try std.testing.expectEqual(@as(u8, 16), extract.xmm_src);
+    try std.testing.expectEqual(@as(u8, 17), extract.xmm_dst);
+    try std.testing.expectEqual(@as(u64, 1), extract.imm);
+    try std.testing.expectEqual(@as(u8, 7), extract.len);
+
+    const compare_bytes = [_]u8{ 0x62, 0xF3, 0x6D, 0x08, 0x3F, 0x0D, 0x4B, 0x2D, 0x6E, 0x00, 0x01 };
+    const compare = decodeLegacyInstruction(&compare_bytes, .long64);
+    try std.testing.expectEqual(Op.vpcmpb, compare.op);
+    try std.testing.expect(compare.is_evex);
+    try std.testing.expectEqual(@as(u3, 1), compare.dst_k);
+    try std.testing.expectEqual(@as(u8, 2), compare.xmm_src);
+    try std.testing.expect(!compare.is_reg_form);
+    try std.testing.expectEqual(@as(u64, 1), compare.imm);
+    try std.testing.expectEqual(@as(u8, 11), compare.len);
+}
+
+test "shared legacy path decodes MOVDIR64B as a 64-byte memory move" {
+    const decoded = decodeLegacyInstruction(
+        &[_]u8{ 0x66, 0x44, 0x0F, 0x38, 0xF8, 0x0C, 0x02 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.movdir64b, decoded.op);
+    try std.testing.expect(!decoded.is_reg_form);
+    try std.testing.expectEqual(RegId.dl_dx_edx_rdx, decoded.sib_base_reg);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, decoded.sib_index_reg);
+    try std.testing.expectEqual(@as(u8, 7), decoded.len);
+}
+
 test "shared MOV decoder preserves high-byte versus REX low-byte registers" {
     const legacy = decodeMovForTest(&[_]u8{ 0x88, 0xE0 }) orelse return error.ExpectedMov; // mov al, ah
     try std.testing.expectEqual(Op.mov_reg8_reg8, legacy.op);
@@ -580,6 +762,35 @@ test "shared legacy decoder preserves address-size override for MOV EAX,[EBX]" {
     try std.testing.expectEqual(@as(u8, 3), decoded.len);
 }
 
+test "shared legacy decoder recognizes REP MOVSQ and the full string family" {
+    const movsq = decodeLegacyInstruction(&[_]u8{ 0xF3, 0x48, 0xA5, 0x48, 0x8D, 0x7D }, .long64);
+    try std.testing.expectEqual(Op.movs, movsq.op);
+    try std.testing.expectEqual(Size.bits64, movsq.size);
+    try std.testing.expectEqual(@as(@TypeOf(movsq.repeat), .rep), movsq.repeat);
+    try std.testing.expect(!movsq.has_0x67);
+    try std.testing.expectEqual(@as(u8, 3), movsq.len);
+
+    const movsd_address32 = decodeLegacyInstruction(&[_]u8{ 0x67, 0xF3, 0xA5 }, .long64);
+    try std.testing.expectEqual(Op.movs, movsd_address32.op);
+    try std.testing.expectEqual(Size.bits32, movsd_address32.size);
+    try std.testing.expectEqual(@as(@TypeOf(movsd_address32.repeat), .rep), movsd_address32.repeat);
+    try std.testing.expect(movsd_address32.has_0x67);
+    try std.testing.expectEqual(@as(u8, 3), movsd_address32.len);
+
+    const cmpsw = decodeLegacyInstruction(&[_]u8{ 0x66, 0xA7 }, .long64);
+    try std.testing.expectEqual(Op.cmps, cmpsw.op);
+    try std.testing.expectEqual(Size.bits16, cmpsw.size);
+    try std.testing.expectEqual(@as(u8, 2), cmpsw.len);
+
+    const scas = decodeLegacyInstruction(&[_]u8{ 0xF2, 0xAF }, .long64);
+    try std.testing.expectEqual(Op.scas, scas.op);
+    try std.testing.expectEqual(Size.bits32, scas.size);
+    try std.testing.expectEqual(@as(@TypeOf(scas.repeat), .repne), scas.repeat);
+
+    try std.testing.expectEqual(Op.stos, decodeLegacyInstruction(&[_]u8{0xAA}, .long64).op);
+    try std.testing.expectEqual(Op.lods, decodeLegacyInstruction(&[_]u8{0xAC}, .long64).op);
+}
+
 pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedInsn {
     if (bytes.len == 0) return .{};
     var pos: usize = 0;
@@ -641,8 +852,22 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
     _ = op_size;
 
     d.size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
+    d.has_0x67 = prefixes.address_size_override;
+    d.repeat = prefixes.repeat;
+    d.lock = prefixes.lock;
+    d.segment = selectSegment(.string_source, .dh_si_esi_rsi, prefixes.segment_override);
 
     const opcode = bytes[pos];
+
+    if (opcode == 0x62) {
+        // In 64-bit mode 0x62 is the EVEX prefix. Route it through the same
+        // decoder used by standalone ISA tests; treating it as legacy BOUND
+        // here would make every AVX-512 instruction invalid in production.
+        var evex = decodeVexInstruction(bytes[pos..]) orelse return .{};
+        evex.lock = has_f0;
+        evex.len = @intCast(@as(usize, evex.len) + pos);
+        return evex;
+    }
 
     if (opcode == 0xC4) {
         var vex = decodeVex3(bytes, pos);
@@ -727,9 +952,19 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
             }
         },
 
-        0xAC, 0xAD => {
-            d.op = .lods;
-            d.size = if (opcode == 0xAC) .bits8 else if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
+        0xA4, 0xA5, 0xA6, 0xA7, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF => {
+            d.op = switch (opcode) {
+                0xA4, 0xA5 => .movs,
+                0xA6, 0xA7 => .cmps,
+                0xAA, 0xAB => .stos,
+                0xAC, 0xAD => .lods,
+                0xAE, 0xAF => .scas,
+                else => unreachable,
+            };
+            d.size = switch (opcode) {
+                0xA4, 0xA6, 0xAA, 0xAC, 0xAE => .bits8,
+                else => if (rex_w) .bits64 else if (has_66) .bits16 else .bits32,
+            };
             d.len = @as(u8, @intCast(pos + 1));
         },
 
@@ -855,9 +1090,8 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
                 return x87;
             }
             if (x87.is_reg_form) {
-                x87.imm = rm.addr & 7;
                 x87.len = @intCast(modrm_pos);
-                if (opcode == 0xD9 and group == 0) x87.op = .fld_st else if (opcode == 0xD9 and group == 1) x87.op = .fxch_st else if (opcode == 0xDB and bytes[pos + 1] == 0xE3) x87.op = .fninit else if (opcode == 0xDD and group == 0) x87.op = .ffree_st else if (opcode == 0xDD and group == 3) x87.op = .fstp_st else if (opcode == 0xDA and group <= 3) x87.op = .nop else if (opcode == 0xDF and bytes[pos + 1] == 0xE0) x87.op = .fnstsw_ax else if (opcode == 0xDF and bytes[pos + 1] >= 0xE8 and bytes[pos + 1] <= 0xEF) x87.op = .fucomip_st else return .{};
+                if (!decodeX87RegisterForm(opcode, bytes[pos + 1], group, @intCast(rm.addr & 7), &x87)) return .{};
                 return x87;
             }
             x87.addr = rm.addr;
@@ -878,6 +1112,7 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
                 },
                 0xDD => switch (group) {
                     0 => x87.op = .fld_mem64,
+                    1 => x87.op = .fisttp_mem64,
                     3 => x87.op = .fstp_mem64,
                     else => return .{},
                 },
@@ -949,7 +1184,7 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
         },
 
         0x9B => {
-            d.op = .nop;
+            d.op = .wait;
             d.len = @as(u8, @intCast(pos + 1));
         },
 
@@ -1177,6 +1412,101 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
 
     d.lock = has_f0;
     return d;
+}
+
+fn decodeX87RegisterForm(opcode: u8, modrm: u8, group: u8, source: u8, d: *DecodedInsn) bool {
+    d.imm = source;
+    switch (opcode) {
+        0xD9 => {
+            if (group == 0) {
+                d.op = .fld_st;
+                return true;
+            }
+            if (group == 1) {
+                d.op = .fxch_st;
+                return true;
+            }
+            if (modrm == 0xEE) {
+                d.op = .fldz;
+                d.imm = 0;
+                return true;
+            }
+        },
+        0xDA => {
+            d.op = switch (group) {
+                0 => .fcmovb_st,
+                1 => .fcmove_st,
+                2 => .fcmovbe_st,
+                3 => .fcmovu_st,
+                else => return false,
+            };
+            d.cond = switch (group) {
+                0 => .b,
+                1 => .e,
+                2 => .be,
+                3 => .p,
+                else => unreachable,
+            };
+            return true;
+        },
+        0xDB => {
+            if (group <= 3) {
+                d.op = switch (group) {
+                    0 => .fcmovnb_st,
+                    1 => .fcmovne_st,
+                    2 => .fcmovnbe_st,
+                    3 => .fcmovnu_st,
+                    else => unreachable,
+                };
+                d.cond = switch (group) {
+                    0 => .ae,
+                    1 => .ne,
+                    2 => .a,
+                    3 => .np,
+                    else => unreachable,
+                };
+                return true;
+            }
+            if (group == 4 and modrm == 0xE3) {
+                d.op = .fninit;
+                return true;
+            }
+            if (group == 5 and modrm >= 0xE8 and modrm <= 0xEF) {
+                d.op = .fucomi_st;
+                return true;
+            }
+            if (group == 6 and modrm >= 0xF0 and modrm <= 0xF7) {
+                d.op = .fcomi_st;
+                return true;
+            }
+        },
+        0xDD => {
+            if (group == 0) {
+                d.op = .ffree_st;
+                return true;
+            }
+            if (group == 3) {
+                d.op = .fstp_st;
+                return true;
+            }
+        },
+        0xDF => {
+            if (group == 4 and modrm == 0xE0) {
+                d.op = .fnstsw_ax;
+                return true;
+            }
+            if (group == 5 and modrm >= 0xE8 and modrm <= 0xEF) {
+                d.op = .fucomip_st;
+                return true;
+            }
+            if (group == 6 and modrm >= 0xF0 and modrm <= 0xF7) {
+                d.op = .fcomip_st;
+                return true;
+            }
+        },
+        else => {},
+    }
+    return false;
 }
 
 pub fn x87BinaryOperation(opcode: u8, group: u8) ?u3 {

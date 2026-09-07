@@ -17,12 +17,17 @@ element_type = "none"
 element_size = 0
 
 encodings = [
+  { opcode = "AE", form = "SCAS m8", op_en = "ZO", feature = "general", vector_length = 0, encoding = "legacy" },
+  { opcode = "AF", form = "SCAS m16", op_en = "ZO", feature = "general", vector_length = 0, encoding = "legacy" },
+  { opcode = "AF", form = "SCAS m32", op_en = "ZO", feature = "general", vector_length = 0, encoding = "legacy" },
+  { opcode = "REX.W + AF", form = "SCAS m64", op_en = "ZO", feature = "general", vector_length = 0, encoding = "legacy" },
 ]
 
 operand_encoding = {
   ZO = []
 }
 
+flags_affected = ["OF", "SF", "ZF", "AF", "PF", "CF"]
 simd_fp_exceptions = []
 
 semantic_general = """
@@ -50,4 +55,3 @@ neon_notes = [
 ]
 
 abi_contract = ["x86_table_shape", "neon_mirror_shape", "arm64_lowering_shape", "full_scope_preserved"]
-

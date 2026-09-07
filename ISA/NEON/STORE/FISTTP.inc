@@ -14,7 +14,9 @@ element_type = "float"
 legacy_width = 0
 
 encodings = [
-  { opcode = "ARM64 FPU store", form = "FISTTP", op_en = "DOC", feature = "NEON", mode = "V/V", handler = "arm64_fisttp" }
+  { opcode = "DF /1", form = "FISTTP m16int", op_en = "M", feature = "SSE3", vector_length = 0, encoding = "legacy" },
+  { opcode = "DB /1", form = "FISTTP m32int", op_en = "M", feature = "SSE3", vector_length = 0, encoding = "legacy" },
+  { opcode = "DD /1", form = "FISTTP m64int", op_en = "M", feature = "SSE3", vector_length = 0, encoding = "legacy" }
 ]
 
 operand_encodings = [

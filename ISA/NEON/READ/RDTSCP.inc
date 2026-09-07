@@ -6,7 +6,7 @@ source_isa = "x86"
 target_isa = "arm64_neon"
 x86_table = "READ/RDTSCP.inc"
 x86_handler = "x86_rdtscp"
-neon_lowering = "arm64_cntvct_read"
+neon_lowering = "arm64_sysreg_read"
 lowering_kind = "arm64_documented_contract"
 
 name = "RDTSCP"
@@ -16,7 +16,9 @@ feature = "RDTSCP"
 element_type = "none"
 element_size = 0
 
-encodings = []
+encodings = [
+  { opcode = "0F 01 F9", form = "RDTSCP", op_en = "ZO", vector_length = 0, encoding = "legacy" }
+]
 
 operand_encoding = { ZO = [] }
 

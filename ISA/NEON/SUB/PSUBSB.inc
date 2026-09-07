@@ -31,7 +31,13 @@ lanes_512 = 64
 mxcsr_used = false
 
 encodings = [
-  { opcode = "0E 30 80 20", form = "SQSUB Vd.16B, Vn.16B, Vm.16B", op_en = "A", feature = "NEON", mode = "V/V", handler = "arm64_sqsub_vd16b_vn16b_vm16b" }
+  { opcode = "NP 0F E8 /r", form = "PSUBSB mm1, mm2/m64", op_en = "A", feature = "MMX", mode = "V/V", handler = "arm64_sqsub_vd16b_vn16b_vm16b" },
+  { opcode = "66 0F E8 /r", form = "PSUBSB xmm1, xmm2/m128", op_en = "A", feature = "SSE2", mode = "V/V", handler = "arm64_sqsub_vd16b_vn16b_vm16b" },
+  { opcode = "VEX.128.66.0F.WIG E8 /r", form = "VPSUBSB xmm1, xmm2, xmm3/m128", op_en = "B", feature = "AVX", mode = "V/V", handler = "arm64_sqsub_vd16b_vn16b_vm16b" },
+  { opcode = "VEX.256.66.0F.WIG E8 /r", form = "VPSUBSB ymm1, ymm2, ymm3/m256", op_en = "B", feature = "AVX2", mode = "V/V", handler = "arm64_sqsub_vd16b_vn16b_vm16b" },
+  { opcode = "EVEX.128.66.0F.WIG E8 /r", form = "VPSUBSB xmm1 {k1}{z}, xmm2, xmm3/m128", op_en = "C", feature = "AVX512BW AVX512VL", tuple = "Full", handler = "arm64_sqsub_vd16b_vn16b_vm16b" },
+  { opcode = "EVEX.256.66.0F.WIG E8 /r", form = "VPSUBSB ymm1 {k1}{z}, ymm2, ymm3/m256", op_en = "C", feature = "AVX512BW AVX512VL", tuple = "Full", handler = "arm64_sqsub_vd16b_vn16b_vm16b" },
+  { opcode = "EVEX.512.66.0F.WIG E8 /r", form = "VPSUBSB zmm1 {k1}{z}, zmm2, zmm3/m512", op_en = "C", feature = "AVX512BW", tuple = "Full", handler = "arm64_sqsub_vd16b_vn16b_vm16b" }
 ]
 
 operand_encodings = [

@@ -14,7 +14,14 @@ element_type = "integer"
 legacy_width = 0
 
 encodings = [
-  { opcode = "ARM64 str_post_idx", form = "STOS", op_en = "DOC", feature = "NEON", mode = "V/V", handler = "arm64_stos" }
+  { opcode = "AA", form = "STOS m8", op_en = "ZO", feature = "8086", vector_length = 0, encoding = "legacy" },
+  { opcode = "AB", form = "STOS m16", op_en = "ZO", feature = "8086", vector_length = 0, encoding = "legacy" },
+  { opcode = "AB", form = "STOS m32", op_en = "ZO", feature = "8086", vector_length = 0, encoding = "legacy" },
+  { opcode = "REX.W + AB", form = "STOS m64", op_en = "ZO", feature = "8086", vector_length = 0, encoding = "legacy" },
+  { opcode = "AA", form = "STOSB", op_en = "ZO", feature = "8086", vector_length = 0, encoding = "legacy" },
+  { opcode = "AB", form = "STOSW", op_en = "ZO", feature = "8086", vector_length = 0, encoding = "legacy" },
+  { opcode = "AB", form = "STOSD", op_en = "ZO", feature = "8086", vector_length = 0, encoding = "legacy" },
+  { opcode = "REX.W + AB", form = "STOSQ", op_en = "ZO", feature = "8086", vector_length = 0, encoding = "legacy" },
 ]
 
 operand_encodings = [

@@ -11,6 +11,11 @@ category = "simd_int_mul_high"
 feature = "SSE"
 element_type = "u16"
 
+semantic = """
+PMULHUW multiplies packed unsigned 16-bit elements and retains the high 16 bits of each product.
+The VEX and EVEX forms use the corresponding three-operand and masked vector contracts below.
+"""
+
 encodings = [
   { opcode = "NP 0F E4 /r", form = "PMULHUW mm1, mm2/m64", op_en = "A", feature = "SSE" },
   { opcode = "66 0F E4 /r", form = "PMULHUW xmm1, xmm2/m128", op_en = "A", feature = "SSE2" },

@@ -13,7 +13,7 @@ source_isa = "x86"
 target_isa = "arm64_neon"
 x86_table = "INSERT/VINSERTI128.inc"
 x86_handler = "x86_vinserti128"
-neon_lowering = "arm64_neon_insert_i128"
+neon_lowering = "arm64_insert_subvector"
 lowering_kind = "arm64_documented_contract"
 
 // INSERT/VINSERTI128.inc

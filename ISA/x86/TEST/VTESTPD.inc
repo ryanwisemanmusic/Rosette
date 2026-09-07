@@ -46,6 +46,8 @@ SF = 0;
 DEST (SRC1) unchanged;
 """
 
+flags_written = ["ZF", "CF", "OF", "AF", "PF", "SF"]
+
 other_exceptions = ["#UD if CR4.OSFXSR = 0", "#UD if LOCK prefix used", "#UD if VEX.L > 0 on 128-bit-only implementations"]
 
 handler = "x86_vtestpd"

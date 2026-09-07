@@ -29,7 +29,8 @@ lanes_128 = 2
 lanes_256 = 4
 
 encodings = [
-  { opcode = "7E 30 C0 70", form = "CMEQ Vd.2D, Vn.2D, Vm.2D", op_en = "A", feature = "NEON", mode = "V/V", handler = "arm64_cmeq_v2d_v2d_v2d" }
+  { opcode = "7E 30 C0 70", form = "CMEQ Vd.2D, Vn.2D, Vm.2D (low 128 bits)", op_en = "A", feature = "NEON", mode = "V/V", handler = "arm64_cmeq_v2d_v2d_v2d" },
+  { opcode = "7E 30 C0 70", form = "CMEQ Vd.2D, Vn.2D, Vm.2D (high 128 bits of a 256-bit source)", op_en = "A", feature = "NEON", mode = "V/V", handler = "arm64_cmeq_v2d_v2d_v2d" }
 ]
 
 operand_encodings = [
@@ -42,6 +43,8 @@ ZF = (ALL lanes of TEMP == 0) ? 1 : 0;
 CF = (ALL lanes of TEMP == all-ones) ? 1 : 0;
 OF = 0; AF = 0; PF = 0; SF = 0;
 """
+
+flags_written = ["ZF", "CF", "OF", "AF", "PF", "SF"]
 
 other_exceptions = ["#UD if CR4.OSFXSR = 0", "#UD if LOCK prefix used"]
 
