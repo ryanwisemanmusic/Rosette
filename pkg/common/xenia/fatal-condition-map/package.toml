@@ -1,0 +1,7 @@
+name = "common-xenia-fatal-condition-map"
+version = "0.1.0-local"
+kind = "console-fatal-condition-map"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
