@@ -525,6 +525,23 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Which subsystems an emulator image must contain for a run to be worth
+    // starting. Read before the first guest instruction, so a build that could
+    // never reach a frame is refused in milliseconds instead of minutes.
+    const xenia_prelaunch_audit_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/prelaunch-audit-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Log lines whose presence means the run's outcome is already decided.
+    const xenia_fatal_condition_map_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/fatal-condition-map/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    xenia_fatal_condition_map_mod.addImport("phrase_filter", phrase_filter_mod);
+
     // The host operations the emulator's behaviour rests on, and the
     // cross-subsystem orderings that break under translation. Both are
     // route-independent: they describe what a machine must do and what must
@@ -1395,6 +1412,10 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&b.addRunArtifact(rosette_monotone_witness_contract_test).step);
     const xenia_xiso_format_test = b.addTest(.{ .root_module = xenia_xiso_format_mod });
     check_step.dependOn(&b.addRunArtifact(xenia_xiso_format_test).step);
+    const xenia_prelaunch_audit_contract_test = b.addTest(.{ .root_module = xenia_prelaunch_audit_contract_mod });
+    check_step.dependOn(&b.addRunArtifact(xenia_prelaunch_audit_contract_test).step);
+    const xenia_fatal_condition_map_test = b.addTest(.{ .root_module = xenia_fatal_condition_map_mod });
+    check_step.dependOn(&b.addRunArtifact(xenia_fatal_condition_map_test).step);
     const rosette_graphics_bridge_test = b.addTest(.{ .root_module = rosette_graphics_bridge_mod });
     check_step.dependOn(&b.addRunArtifact(rosette_graphics_bridge_test).step);
     const rosette_component_readiness_contract_test = b.addTest(.{ .root_module = rosette_component_readiness_contract_mod });
@@ -1897,6 +1918,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // EVEX execution is shared by the Mach-O and ELF interpreters. Keep it as
+    // a small standalone module so the ELF processor does not reach outside
+    // its module root with a relative import.
+    const evex_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("../lib/runtime/process-core/evex.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    evex_runtime_mod.addImport("x64_decoder", x64_decoder_mod);
+    evex_runtime_mod.addImport("exit_diagnostics", exit_diagnostics_module);
+
     // ELF processor (x86-64 ELF binary loader/emulator)
     {
         const x64_linux_runtime_mod = b.createModule(.{
@@ -1928,6 +1960,7 @@ pub fn build(b: *std.Build) void {
         elf_processor_mod.addImport("exit_diagnostics", exit_diagnostics_module);
         elf_processor_mod.addImport("cleo_routing", cleo_routing_mod);
         elf_processor_mod.addImport("execution_history", execution_history_mod);
+        elf_processor_mod.addImport("evex_runtime", evex_runtime_mod);
         const elf_processor = b.addExecutable(.{
             .name = "elf_processor",
             .root_module = elf_processor_mod,
@@ -1947,6 +1980,7 @@ pub fn build(b: *std.Build) void {
         elf_processor_test_mod.addImport("exit_diagnostics", exit_diagnostics_module);
         elf_processor_test_mod.addImport("cleo_routing", cleo_routing_mod);
         elf_processor_test_mod.addImport("execution_history", execution_history_mod);
+        elf_processor_test_mod.addImport("evex_runtime", evex_runtime_mod);
         const elf_processor_test = b.addTest(.{ .root_module = elf_processor_test_mod });
         check_step.dependOn(&b.addRunArtifact(elf_processor_test).step);
 
@@ -2141,6 +2175,8 @@ pub fn build(b: *std.Build) void {
             // wrapper would be measuring the wrapper.
             .link_libc = true,
         });
+        preflight_mod.addImport("xenia_prelaunch_audit_contract", xenia_prelaunch_audit_contract_mod);
+        preflight_mod.addImport("xenia_gpu_bringup_contract", xenia_gpu_bringup_contract_mod);
         preflight_mod.addImport("rosette_host_capability_contract", rosette_host_capability_contract_mod);
         preflight_mod.addImport("rosette_component_readiness_contract", rosette_component_readiness_contract_mod);
         const preflight_test = b.addTest(.{ .root_module = preflight_mod });
@@ -2575,6 +2611,7 @@ pub fn build(b: *std.Build) void {
         diagnostics_mod.addImport("rosette_graphics_bridge", rosette_graphics_bridge_mod);
         diagnostics_mod.addImport("xenia_vd_swap_contract", xenia_vd_swap_contract_mod);
         diagnostics_mod.addImport("xenia_xiso_format", xenia_xiso_format_mod);
+        diagnostics_mod.addImport("xenia_fatal_condition_map", xenia_fatal_condition_map_mod);
         diagnostics_mod.addImport("xenia_claim_reconciliation_contract", xenia_claim_reconciliation_contract_mod);
         diagnostics_mod.addImport("xenia_interrupt_callback_contract", xenia_interrupt_callback_contract_mod);
         diagnostics_mod.addImport("xenia_host_gpu_callback_contract", xenia_host_gpu_callback_contract_mod);
@@ -2836,6 +2873,7 @@ pub fn build(b: *std.Build) void {
         process_core_mod.addImport("guest_abi", guest_abi_mod);
         process_core_mod.addImport("vtable", vtable_mod);
         process_core_mod.addImport("execution_history", execution_history_mod);
+        process_core_mod.addImport("evex_runtime", evex_runtime_mod);
         process_core_mod.addImport("ownership", ownership_mod);
         process_core_mod.addImport("guest_address_space", guest_address_space_mod);
 
@@ -2961,6 +2999,15 @@ pub fn build(b: *std.Build) void {
         import_handler_mod.addImport("guest_abi", guest_abi_mod);
         import_handler_mod.addImport("diagnostics", diagnostics_mod);
         import_handler_mod.addImport("scheduler", scheduler_mod);
+        // Rooted for the same reason process_core is: as a dependency of the
+        // processor build these test blocks only ever type-check, and a test
+        // that cannot fail is not a test. The guest environment lookup lives
+        // here, and it is the channel Rosette uses to hand the emulator its own
+        // run identity — the one place where a silently wrong answer is read as
+        // a graphics-system failure thousands of lines away.
+        const import_handler_test = b.addTest(.{ .root_module = import_handler_mod });
+        check_step.dependOn(&b.addRunArtifact(import_handler_test).step);
+
         const macho_processor_mod = b.createModule(.{
             .root_source_file = b.path("../lib/Mach-O/main.zig"),
             .target = target,
