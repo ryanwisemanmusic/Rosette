@@ -1,0 +1,2 @@
+/* Prefer the MinGW-w64 intrinsic declarations over Clang's host intrin.h. */
+#include "@MINGW_ROOT@/include/intrin.h"

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+windres="@WINDRES@"
+icon="@ICON_PATH@"
+support_tmp="@SUPPORT_TMP@"
+
+args=("$@")
+rewritten=()
+temporary_sources=()
+index=0
+
+cleanup() {
+  [ "${#temporary_sources[@]}" -gt 0 ] || return 0
+  local path
+  for path in "${temporary_sources[@]}"; do
+    rm -f "$path"
+  done
+}
+trap cleanup EXIT
+
+while [ "$index" -lt "${#args[@]}" ]; do
+  arg="${args[$index]}"
+  case "$arg" in
+    -MD)
+      index=$((index + 1))
+      continue
+      ;;
+    -MF)
+      index=$((index + 2))
+      continue
+      ;;
+    */main_resources.rc)
+      source_temp="$(mktemp "$support_tmp/main-resources.XXXXXX")"
+      source_override="$source_temp.rc"
+      icon_escaped="$(printf '%s' "$icon" | sed 's/[\\&|]/\\&/g')"
+      sed "s|^MAINICON.*|MAINICON ICON \"$icon_escaped\"|" \
+        "$arg" > "$source_override"
+      temporary_sources+=("$source_temp" "$source_override")
+      rewritten+=("$source_override")
+      ;;
+    *)
+      rewritten+=("$arg")
+      ;;
+  esac
+  index=$((index + 1))
+done
+
+"$windres" "${rewritten[@]}"

@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+clang="@CLANG@"
+source_root="@SOURCE_ROOT@"
+libusb_config="@LIBUSB_CONFIG@"
+
+rewritten=()
+for arg in "$@"; do
+  case "$arg" in
+    -fuse-ld=lld)
+      rewritten+=("-fuse-ld=@LLD@")
+      ;;
+    *)
+      rewritten+=("$arg")
+      ;;
+  esac
+done
+
+for arg in "${rewritten[@]}"; do
+  case "$arg" in
+    "$source_root"/third_party/libusb/*)
+      exec "$clang" \
+        -DSDL_USE_BUILTIN_OPENGL_DEFINITIONS=1 \
+        -D__GNUC__=13 -D__GNUC_MINOR__=2 -D__GNUC_PATCHLEVEL__=0 \
+        -I"$libusb_config" "${rewritten[@]}"
+      ;;
+  esac
+done
+
+exec "$clang" \
+  -DSDL_USE_BUILTIN_OPENGL_DEFINITIONS=1 \
+  -D__GNUC__=13 -D__GNUC_MINOR__=2 -D__GNUC_PATCHLEVEL__=0 \
+  "${rewritten[@]}"

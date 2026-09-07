@@ -1,0 +1,14 @@
+#!/bin/sh
+
+# Xenia's shader helper invokes "wine <compiler>" on non-Windows hosts.
+# The selected DXC may be a native macOS executable, so this shim preserves
+# the helper's command line while allowing a caller-supplied launcher.
+if [ -n "$VULKAN_SDK" ] && [ -d "$VULKAN_SDK/lib" ]; then
+  export DYLD_LIBRARY_PATH="$VULKAN_SDK/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+fi
+
+launcher="@SHADER_LAUNCHER@"
+if [ -n "$launcher" ]; then
+  exec "$launcher" "$@"
+fi
+exec "$@"

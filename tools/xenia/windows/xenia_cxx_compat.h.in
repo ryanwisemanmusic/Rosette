@@ -1,0 +1,161 @@
+/* C++-only preinclude for the external Windows validation build. */
+#ifndef XENIA_CANARY_CXX_COMPAT_H_
+#define XENIA_CANARY_CXX_COMPAT_H_
+
+#include "xenia_windows_compat.h"
+
+/* Load MinGW's ordinary Windows headers before advertising the MSVC macro.
+ * DirectX-Headers and DXC then select their C++ ABI declarations without
+ * changing how the MinGW Shell/COM headers were parsed. */
+#include "@SOURCE_ROOT@/src/xenia/base/platform_win.h"
+#include <cstdlib>
+
+/* Forward declarations for the interface types whose UUIDs are supplied by
+ * DirectX-Headers, DXC, or the optional PIX stub later in the include graph.
+ * MinGW's headers provide __CRT_UUID_DECL specializations for their own COM
+ * interfaces, but those third-party headers use MSVC's __declspec(uuid(...))
+ * form and do not emit MinGW specializations. */
+struct ID3D12Debug;
+struct ID3D12Device;
+struct ID3D12InfoQueue;
+struct ID3D12CommandQueue;
+struct ID3D12Resource;
+struct ID3D12CommandAllocator;
+struct ID3D12GraphicsCommandList;
+struct ID3D12GraphicsCommandList1;
+struct ID3D12GraphicsCommandList2;
+struct ID3D12DescriptorHeap;
+struct ID3D12Fence;
+struct ID3D12PipelineState;
+struct ID3D12RootSignature;
+struct ID3D12Heap;
+struct ID3D12QueryHeap;
+struct IDXGraphicsAnalysis;
+struct IDxbcConverter;
+struct IDxcUtils;
+struct IDxcCompiler;
+
+/* This MinGW libstdc++ configuration has no CRT quick_exit entry even though
+ * the C++ header exposes the function on native MSVC. Xenia uses it only for
+ * the fatal title-exit path; preserve the no-return behavior for this
+ * validation build without changing the upstream source. */
+#if __cplusplus >= 201103L && !defined(_GLIBCXX_HAVE_QUICK_EXIT)
+namespace std {
+[[noreturn]] inline void quick_exit(int status) noexcept {
+  (void)status;
+  std::abort();
+}
+}  // namespace std
+#endif
+
+/* MinGW's rpcndr.h reduces MIDL_INTERFACE to a plain struct, but the
+ * DirectX-Headers interfaces use __uuidof through IID_PPV_ARGS. */
+#ifdef MIDL_INTERFACE
+#undef MIDL_INTERFACE
+#endif
+#define MIDL_INTERFACE(x) struct __declspec(uuid(x))
+
+#ifndef _MSC_VER
+#define _MSC_VER 1939
+#endif
+
+/* The MinGW __uuidof emulation cannot derive GUIDs from MSVC-style
+ * __declspec(uuid(...)) declarations. XAudio2's private compatibility
+ * interfaces use that declaration form, so provide the two corresponding
+ * specializations in this external build header. */
+namespace xe {
+namespace apu {
+namespace xaudio2 {
+namespace api {
+class XAudio2_7;
+struct IXAudio2_7;
+}  // namespace api
+}  // namespace xaudio2
+}  // namespace apu
+}  // namespace xe
+
+__CRT_UUID_DECL(xe::apu::xaudio2::api::XAudio2_7, 0x5a508685, 0xa254,
+                0x4fba, 0x9b, 0x82, 0x9a, 0x24, 0xb0, 0x03, 0x06, 0xaf)
+__CRT_UUID_DECL(xe::apu::xaudio2::api::IXAudio2_7, 0x8bcf1f58, 0x9fe7,
+                0x4583, 0x8a, 0xc6, 0xe2, 0xad, 0xc4, 0x65, 0xc8, 0xbb)
+
+__CRT_UUID_DECL(ID3D12Debug, 0x344488b7, 0x6846, 0x474b, 0xb9, 0x89, 0xf0,
+                0x27, 0x44, 0x82, 0x45, 0xe0)
+__CRT_UUID_DECL(ID3D12Device, 0x189819f1, 0x1db6, 0x4b57, 0xbe, 0x54, 0x18,
+                0x21, 0x33, 0x9b, 0x85, 0xf7)
+__CRT_UUID_DECL(ID3D12InfoQueue, 0x0742a90b, 0xc387, 0x483f, 0xb9, 0x46, 0x30,
+                0xa7, 0xe4, 0xe6, 0x14, 0x58)
+__CRT_UUID_DECL(ID3D12CommandQueue, 0x0ec870a6, 0x5d7e, 0x4c22, 0x8c, 0xfc,
+                0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed)
+__CRT_UUID_DECL(ID3D12Resource, 0x696442be, 0xa72e, 0x4059, 0xbc, 0x79, 0x5b,
+                0x5c, 0x98, 0x04, 0x0f, 0xad)
+__CRT_UUID_DECL(ID3D12CommandAllocator, 0x6102dee4, 0xaf59, 0x4b09, 0xb9,
+                0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24)
+__CRT_UUID_DECL(ID3D12GraphicsCommandList, 0x5b160d0f, 0xac1b, 0x4185, 0x8b,
+                0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55)
+__CRT_UUID_DECL(ID3D12GraphicsCommandList1, 0x553103fb, 0x1fe7, 0x4557, 0xbb,
+                0x38, 0x94, 0x6d, 0x7d, 0x0e, 0x7c, 0xa7)
+__CRT_UUID_DECL(ID3D12GraphicsCommandList2, 0x38c3e585, 0xff17, 0x412c, 0x91,
+                0x50, 0x4f, 0xc6, 0xf9, 0xd7, 0x2a, 0x28)
+__CRT_UUID_DECL(ID3D12DescriptorHeap, 0x8efb471d, 0x616c, 0x4f49, 0x90, 0xf7,
+                0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51)
+__CRT_UUID_DECL(ID3D12Fence, 0x0a753dcf, 0xc4d8, 0x4b91, 0xad, 0xf6, 0xbe,
+                0x5a, 0x60, 0xd9, 0x5a, 0x76)
+__CRT_UUID_DECL(ID3D12PipelineState, 0x765a30f3, 0xf624, 0x4c6f, 0xa8, 0x28,
+                0xac, 0xe9, 0x48, 0x62, 0x24, 0x45)
+__CRT_UUID_DECL(ID3D12RootSignature, 0xc54a6b66, 0x72df, 0x4ee8, 0x8b, 0xe5,
+                0xa9, 0x46, 0xa1, 0x42, 0x92, 0x14)
+__CRT_UUID_DECL(ID3D12Heap, 0x6b3b2502, 0x6e51, 0x45b3, 0x90, 0xee, 0x98,
+                0x84, 0x26, 0x5e, 0x8d, 0xf3)
+__CRT_UUID_DECL(ID3D12QueryHeap, 0x0d9658ae, 0xed45, 0x469e, 0xa6, 0x1d,
+                0x97, 0x0e, 0xc5, 0x83, 0xca, 0xb4)
+__CRT_UUID_DECL(IDXGraphicsAnalysis, 0x00000000, 0x0000, 0x0000, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x01)
+__CRT_UUID_DECL(IDxbcConverter, 0x5f956ed5, 0x78d1, 0x4b15, 0x82, 0x47, 0xf7,
+                0x18, 0x76, 0x14, 0xa0, 0x41)
+__CRT_UUID_DECL(IDxcUtils, 0x4605c4cb, 0x2019, 0x492a, 0xad, 0xa4, 0x65, 0xf2,
+                0x0b, 0xb7, 0xd6, 0x7f)
+__CRT_UUID_DECL(IDxcCompiler, 0x8c210bf3, 0x011f, 0x4422, 0x8d, 0x70, 0x6f,
+                0x9a, 0xcb, 0x8d, 0xb6, 0x17)
+
+/* The Xbox-kernel source intentionally uses these names as members of its
+ * guest CreateOptions enum. Win32 exposes the same spellings as macros, so
+ * remove only the colliding aliases after the system headers have consumed
+ * them. */
+#ifdef FILE_DIRECTORY_FILE
+#undef FILE_DIRECTORY_FILE
+#endif
+#ifdef FILE_SEQUENTIAL_ONLY
+#undef FILE_SEQUENTIAL_ONLY
+#endif
+#ifdef FILE_SYNCHRONOUS_IO_ALERT
+#undef FILE_SYNCHRONOUS_IO_ALERT
+#endif
+#ifdef FILE_SYNCHRONOUS_IO_NONALERT
+#undef FILE_SYNCHRONOUS_IO_NONALERT
+#endif
+#ifdef FILE_NON_DIRECTORY_FILE
+#undef FILE_NON_DIRECTORY_FILE
+#endif
+#ifdef FILE_RANDOM_ACCESS
+#undef FILE_RANDOM_ACCESS
+#endif
+
+/* MinGW suppresses its __cpuidex declaration for GCC 11 and newer. Clang's
+ * MS-compatibility mode does not provide the declaration either, while Xbyak
+ * uses the MSVC spelling on the Windows target. The MinGW intrin header has
+ * already supplied __cpuid_count by this point, so preserve the same inline
+ * implementation without modifying the third-party source. */
+#ifndef XENIA_CANARY_CPUIDEX_SHIM
+#define XENIA_CANARY_CPUIDEX_SHIM 1
+static inline void xenia_canary_cpuidex(int CPUInfo[4], int function_id,
+                                        int subfunction_id) {
+  __cpuid_count(function_id, subfunction_id, CPUInfo[0], CPUInfo[1],
+                CPUInfo[2], CPUInfo[3]);
+}
+#ifndef __cpuidex
+#define __cpuidex xenia_canary_cpuidex
+#endif
+#endif
+
+#endif

@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+clangxx="@CLANGXX@"
+source_root="@SOURCE_ROOT@"
+support_tmp="@SUPPORT_TMP@"
+support_include="@SUPPORT_DIR@/include"
+
+rewritten=()
+temporary_sources=()
+args=("$@")
+index=0
+needs_winsock=0
+is_link=1
+
+cleanup() {
+  [ "${#temporary_sources[@]}" -gt 0 ] || return 0
+  local path
+  for path in "${temporary_sources[@]}"; do
+    rm -f "$path"
+  done
+}
+trap cleanup EXIT
+
+while [ "$index" -lt "${#args[@]}" ]; do
+  arg="${args[$index]}"
+  case "$arg" in
+    -c|-E|-S)
+      is_link=0
+      ;;
+  esac
+
+  if [ "$arg" = "-Xclang" ] &&
+    [ "$((index + 1))" -lt "${#args[@]}" ]; then
+    next="${args[$((index + 1))]}"
+    case "$next" in
+      --dependent-lib=*)
+        index=$((index + 2))
+        continue
+        ;;
+    esac
+  fi
+
+  case "$arg" in
+    */socket_win.cc)
+      needs_winsock=1
+      ;;
+    */mapped_memory_win.cc)
+      source_temp="$(mktemp "$support_tmp/mapped-memory.XXXXXX")"
+      source_override="$source_temp.cc"
+      sed \
+        's/static inline constexpr HANDLE kFileHandleInvalid/static inline const HANDLE kFileHandleInvalid/' \
+        "$arg" > "$source_override"
+      temporary_sources+=("$source_temp" "$source_override")
+      rewritten+=("$source_override")
+      index=$((index + 1))
+      continue
+      ;;
+    */stack_walker_win.cc)
+      source_temp="$(mktemp "$support_tmp/stack-walker.XXXXXX")"
+      source_override="$source_temp.cc"
+      sed -E 's/__in[[:space:]]+//g' "$arg" > "$source_override"
+      temporary_sources+=("$source_temp" "$source_override")
+      rewritten+=("$source_override")
+      index=$((index + 1))
+      continue
+      ;;
+  esac
+
+  case "$arg" in
+    -fuse-ld=lld)
+      rewritten+=("-fuse-ld=@LLD@")
+      ;;
+    -l*.lib)
+      rewritten+=("${arg%.lib}")
+      ;;
+    -fuse-ld=lld-link|-loldnames|-nostartfiles|-nostdlib|/arch:SSE2)
+      ;;
+    *)
+      rewritten+=("$arg")
+      ;;
+  esac
+  index=$((index + 1))
+done
+
+compiler_args=(
+  -fms-extensions
+  -fms-compatibility
+  -fms-compatibility-version=19
+  -D__GNUC__=13 -D__GNUC_MINOR__=2 -D__GNUC_PATCHLEVEL__=0
+  -D__GCC_ATOMIC_BOOL_LOCK_FREE=2
+  -D__GCC_ATOMIC_CHAR8_T_LOCK_FREE=2
+  -D__GCC_ATOMIC_CHAR16_T_LOCK_FREE=2
+  -D__GCC_ATOMIC_CHAR32_T_LOCK_FREE=2
+  -D__GCC_ATOMIC_CHAR_LOCK_FREE=2
+  -D__GCC_ATOMIC_INT_LOCK_FREE=2
+  -D__GCC_ATOMIC_LLONG_LOCK_FREE=2
+  -D__GCC_ATOMIC_LONG_LOCK_FREE=2
+  -D__GCC_ATOMIC_POINTER_LOCK_FREE=2
+  -D__GCC_ATOMIC_SHORT_LOCK_FREE=2
+  -D__GCC_ATOMIC_TEST_AND_SET_TRUEVAL=1
+  -D__GCC_ATOMIC_WCHAR_T_LOCK_FREE=2
+  -DXE_COMPILER_MSVC=1
+  -DXE_COMPILER_CLANG_CL=1
+  -DXE_COMPILER_HAS_MSVC_EXTENSIONS=1
+  -DUNICODE -D_UNICODE
+  -include "$support_include/xenia_cxx_compat.h"
+)
+if [ "$needs_winsock" -eq 1 ]; then
+  compiler_args+=(-include winsock2.h)
+fi
+compiler_args+=(
+  -I"$source_root"
+  -I"$source_root/src"
+  -I"$support_include"
+  -Wno-error=macro-redefined
+  -Wno-error=cpp
+  -Wno-error=format
+  -Wno-error=tautological-pointer-compare
+  -Wno-error=microsoft-cast
+  -Wno-error=ignored-pragmas
+  -Wno-error=unknown-warning-option
+  -Wno-error=undefined-inline
+  -Wno-error=multichar
+)
+if [ "${#rewritten[@]}" -gt 0 ]; then
+  compiler_args+=("${rewritten[@]}")
+fi
+if [ "$is_link" -eq 1 ]; then
+  compiler_args+=(
+    -municode
+    -lntdll
+    -lwsock32
+    -lws2_32
+    -lxinput
+    -lcomctl32
+    -lshcore
+    -lshlwapi
+    -ldxguid
+    -lksuser
+    -lksguid
+    -lwinpthread
+    -lucrt
+  )
+fi
+
+"$clangxx" "${compiler_args[@]}"
