@@ -133,6 +133,14 @@ BUILD_IDENTITY_OUT := $(ROOT_DIR)/.rosette/build-identity.json
 XENIA_FORK_MANIFEST_SCRIPT := $(ROOT_DIR)/tools/build_xenia_fork_manifest.py
 XENIA_FORK_MANIFEST_OUT := $(ROOT_DIR)/.rosette/xenia-fork-manifest.json
 XENIA_ROOT ?= /Volumes/2023 Drive/xenia/xenia
+XENIA_WINDOWS_BUILD_SCRIPT := $(ROOT_DIR)/tools/xenia/scripts/rosette-xenia-windows.sh
+XENIA_WINDOWS_SOURCE_ROOT ?= $(XENIA_ROOT)
+XENIA_WINDOWS_BUILD_DIR ?= $(ROOT_DIR)/.rosette/xenia-windows
+XENIA_WINDOWS_BUNDLE_DIR ?= $(XENIA_WINDOWS_BUILD_DIR)/bundle
+XENIA_WINDOWS_CONFIG ?= Release
+XENIA_WINDOWS_TARGET ?= xenia-app
+XENIA_WINDOWS_JOBS ?=
+XENIA_WINDOWS_MEDIA_IMAGE ?=
 EVIDENCE_REPLAY_SCRIPT := $(ROOT_DIR)/tools/replay_evidence.py
 EVIDENCE_REPLAY_JOURNAL ?= $(ROOT_DIR)/.rosette/rosette-evidence.r3j
 COMPAT_ROUTER_SRC := $(ROOT_DIR)/src/compat/rosetta2/main.zig
@@ -244,7 +252,7 @@ ISO_BIN := $(ZIG_OUT_DIR)/bin/rosette-iso
 ISO_SRC := $(ROOT_DIR)/src/tooling/iso/main.zig
 XBOX360_MEDIA_TOOL := $(ROOT_DIR)/tools/xbox360_media.py
 
-.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build link-audit-build pkg-boundary-audit vendor-library-audit vendor-audit shell-helper-build test-census xenia-fork-manifest build-identity replay-evidence shell shell-update shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse iso-build iso-run app-wrapper installer uninstaller app-all release notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
+.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build link-audit-build pkg-boundary-audit vendor-library-audit vendor-audit shell-helper-build test-census xenia-fork-manifest xenia-windows-prepare xenia-windows-build build-identity replay-evidence shell shell-update shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse iso-build iso-run app-wrapper installer uninstaller app-all release notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
 
 all: headers-check zig-build test-run
 
@@ -270,6 +278,8 @@ help:
 		'  make shell-update Refresh the Rosette shell helper/snippet/wrappers and record its identity' \
 		'  make test-census  Execute zig build check and write the source/artifact test census' \
 		'  make xenia-fork-manifest  Record the pinned Xenia base and classify every fork path' \
+		'  make xenia-windows-prepare  Stage an isolated Windows Xenia source mirror and support capsule' \
+		'  make xenia-windows-build    Configure/build/bundle the Rosette-owned Windows Xenia PE' \
 		'  make build-identity  Hash Rosette/Xenia/build/test/shell inputs into an admission manifest' \
 		'  make replay-evidence Replay a durable .r3j journal without the original runtime' \
 		'  make vendor-audit Audit vendored library sources, target records, and host providers' \
@@ -351,7 +361,7 @@ clean: exe-runner-cleanup
 
 elf-processor-build:
 	@mkdir -p "$(ZIG_CACHE_DIR)/global"
-	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build-exe -O "$(ROSETTE_RUNTIME_OPTIMIZE)" --dep x64_decoder --dep x64_interpreter --dep x64_linux_runtime --dep x64_syscalls --dep x64_guest_abi --dep exit_diagnostics --dep cleo_routing --dep guard_rollback --dep execution_history -Mroot="$(ELF_PROCESSOR_SRC)" --dep isa_highway --dep isa_registry --dep isa_decode --dep runtime_abi_handshake --dep flags --dep cpu_state --dep bit_test --dep capabilities -Mx64_decoder=ISA/decoding/root.zig --dep flags -Mcpu_state=src/x64-ASM/cpu_state.zig --dep flags -Mbit_test=src/x64-ASM/bit_test.zig -Mflags=src/x64-ASM/flags.zig -Mcapabilities=src/x64-ASM/capabilities.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig --dep x64_syscalls -Mx64_linux_runtime=src/x64-ASM/linux_runtime.zig -Mx64_syscalls=src/x64-ASM/syscalls.zig -Mx64_guest_abi=src/x64-ASM/guest_abi.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -Misa_highway=ISA/highway.zig -Misa_registry=ISA/root.zig -Misa_decode=ISA/decode/root.zig -Mruntime_abi_handshake=src/tooling/runtime-abi-handshake/runtime.zig -Mguard_rollback=lib/runtime/guard-rollback/root.zig -Mcleo_routing=lib/CLEO/cleo_routing.zig -Mexecution_history=lib/runtime/execution-history/root.zig -femit-bin="$(ELF_PROCESSOR_BIN)"
+	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build-exe -O "$(ROSETTE_RUNTIME_OPTIMIZE)" --dep x64_decoder --dep x64_interpreter --dep x64_linux_runtime --dep x64_syscalls --dep x64_guest_abi --dep exit_diagnostics --dep cleo_routing --dep guard_rollback --dep execution_history --dep evex_runtime -Mroot="$(ELF_PROCESSOR_SRC)" --dep isa_highway --dep isa_registry --dep isa_decode --dep runtime_abi_handshake --dep flags --dep cpu_state --dep bit_test --dep capabilities -Mx64_decoder=ISA/decoding/root.zig --dep flags -Mcpu_state=src/x64-ASM/cpu_state.zig --dep flags -Mbit_test=src/x64-ASM/bit_test.zig -Mflags=src/x64-ASM/flags.zig -Mcapabilities=src/x64-ASM/capabilities.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig --dep x64_syscalls -Mx64_linux_runtime=src/x64-ASM/linux_runtime.zig -Mx64_syscalls=src/x64-ASM/syscalls.zig -Mx64_guest_abi=src/x64-ASM/guest_abi.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -Misa_highway=ISA/highway.zig -Misa_registry=ISA/root.zig -Misa_decode=ISA/decode/root.zig -Mruntime_abi_handshake=src/tooling/runtime-abi-handshake/runtime.zig -Mguard_rollback=lib/runtime/guard-rollback/root.zig -Mcleo_routing=lib/CLEO/cleo_routing.zig -Mexecution_history=lib/runtime/execution-history/root.zig --dep x64_decoder --dep exit_diagnostics -Mevex_runtime=lib/runtime/process-core/evex.zig -femit-bin="$(ELF_PROCESSOR_BIN)"
 
 macho-processor-build:
 	@mkdir -p "$(ZIG_CACHE_DIR)/global"
@@ -418,6 +428,15 @@ test-census:
 # base without pretending that a source census is a behavior proof.
 xenia-fork-manifest:
 	@cd "$(ROOT_DIR)" && python3 "$(XENIA_FORK_MANIFEST_SCRIPT)" --root "$(XENIA_ROOT)" --output "$(XENIA_FORK_MANIFEST_OUT)"
+
+# The Windows path is deliberately isolated from the supplied Xenia checkout.
+# The adapter mirrors the complete source tree before CMake generates version,
+# dependency, shader, and resource artifacts, then emits a runnable PE bundle.
+xenia-windows-prepare:
+	@cd "$(ROOT_DIR)" && bash "$(XENIA_WINDOWS_BUILD_SCRIPT)" --source-root "$(XENIA_WINDOWS_SOURCE_ROOT)" --build-dir "$(XENIA_WINDOWS_BUILD_DIR)" --bundle-dir "$(XENIA_WINDOWS_BUNDLE_DIR)" --config "$(XENIA_WINDOWS_CONFIG)" --target "$(XENIA_WINDOWS_TARGET)" $(if $(strip $(XENIA_WINDOWS_JOBS)),--jobs "$(XENIA_WINDOWS_JOBS)",) $(if $(strip $(XENIA_WINDOWS_MEDIA_IMAGE)),--media-image "$(XENIA_WINDOWS_MEDIA_IMAGE)",) --prepare
+
+xenia-windows-build:
+	@cd "$(ROOT_DIR)" && bash "$(XENIA_WINDOWS_BUILD_SCRIPT)" --source-root "$(XENIA_WINDOWS_SOURCE_ROOT)" --build-dir "$(XENIA_WINDOWS_BUILD_DIR)" --bundle-dir "$(XENIA_WINDOWS_BUNDLE_DIR)" --config "$(XENIA_WINDOWS_CONFIG)" --target "$(XENIA_WINDOWS_TARGET)" $(if $(strip $(XENIA_WINDOWS_JOBS)),--jobs "$(XENIA_WINDOWS_JOBS)",) $(if $(strip $(XENIA_WINDOWS_MEDIA_IMAGE)),--media-image "$(XENIA_WINDOWS_MEDIA_IMAGE)",) --configure --build --bundle
 
 # The manifest is deliberately generated after the check artifacts exist. It
 # hashes their bytes and the shell-update record, while keeping filesystem
