@@ -395,6 +395,79 @@ test "shared VEX decoder handles both VMOVD transfer directions" {
     try std.testing.expect(!to_memory.is_reg_form);
 }
 
+test "shared VEX decoder recognizes broadcast families" {
+    const scalar_single = decodeLegacyInstruction(
+        &[_]u8{ 0xC4, 0xE2, 0x79, 0x18, 0x05, 0x10, 0x00, 0x00, 0x00 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vbroadcastss, scalar_single.op);
+    try std.testing.expectEqual(OperandSize.bits32, scalar_single.size);
+    try std.testing.expect(!scalar_single.vector_256);
+    try std.testing.expect(!scalar_single.is_reg_form);
+    try std.testing.expectEqual(@as(u64, 0x10), scalar_single.addr);
+    try std.testing.expectEqual(@as(u8, 9), scalar_single.len);
+
+    const wide_double = decodeLegacyInstruction(
+        &[_]u8{ 0xC4, 0xE2, 0x7D, 0x19, 0x05, 0x10, 0x00, 0x00, 0x00 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vbroadcastsd, wide_double.op);
+    try std.testing.expectEqual(OperandSize.bits64, wide_double.size);
+    try std.testing.expect(wide_double.vector_256);
+
+    const invalid_double_width = decodeLegacyInstruction(
+        &[_]u8{ 0xC4, 0xE2, 0xF9, 0x19, 0x05, 0x10, 0x00, 0x00, 0x00 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.invalid, invalid_double_width.op);
+
+    const wide_single = decodeLegacyInstruction(
+        &[_]u8{ 0xC4, 0xE2, 0x7D, 0x18, 0x05, 0x10, 0x00, 0x00, 0x00 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vbroadcastss, wide_single.op);
+    try std.testing.expect(wide_single.vector_256);
+
+    const wide_integer = decodeLegacyInstruction(
+        &[_]u8{ 0xC4, 0xE2, 0x7D, 0x5A, 0x05, 0x10, 0x00, 0x00, 0x00 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vbroadcasti128, wide_integer.op);
+    try std.testing.expect(wide_integer.vector_256);
+
+    const missing_reserved_vvvv = decodeLegacyInstruction(
+        &[_]u8{ 0xC4, 0xE2, 0x41, 0x18, 0x05, 0x10, 0x00, 0x00, 0x00 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.invalid, missing_reserved_vvvv.op);
+}
+
+test "shared VEX decoder recognizes VMOVQ memory stores" {
+    const decoded = decodeLegacyInstruction(
+        &[_]u8{ 0xC5, 0xF9, 0xD6, 0x05, 0x10, 0x00, 0x00, 0x00 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vmovq_mem64_xmm, decoded.op);
+    try std.testing.expectEqual(OperandSize.bits64, decoded.size);
+    try std.testing.expectEqual(@as(u8, 0), decoded.xmm_src);
+    try std.testing.expect(!decoded.is_reg_form);
+    try std.testing.expectEqual(@as(u64, 0x10), decoded.addr);
+}
+
+test "shared VEX decoder recognizes VPERMILPD immediate form" {
+    const decoded = decodeLegacyInstruction(
+        &[_]u8{ 0xC4, 0xE3, 0x79, 0x05, 0x94, 0x24, 0xA8, 0x00, 0x00, 0x00, 0x01 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vpermilpd, decoded.op);
+    try std.testing.expectEqual(@as(u8, 2), decoded.xmm_dst);
+    try std.testing.expect(!decoded.is_reg_form);
+    try std.testing.expect(decoded.uses_imm);
+    try std.testing.expectEqual(@as(u64, 1), decoded.imm);
+    try std.testing.expectEqual(@as(u64, 0xA8), decoded.addr);
+    try std.testing.expectEqual(@as(u8, 11), decoded.len);
+}
+
 test "shared legacy path decodes Xenia VMINSD absolute SIB form" {
     const decoded = decodeLegacyInstruction(
         &[_]u8{ 0xC5, 0xDB, 0x5D, 0x0C, 0x25, 0x10, 0xC4, 0x77, 0x06 },
@@ -692,6 +765,67 @@ test "top-level ADC decoder covers generated register and memory forms" {
     try std.testing.expect(store8.src_high8);
 }
 
+test "Group1 full-width register immediates keep their immediate width" {
+    const add = decodeLegacyInstruction(&[_]u8{ 0x81, 0xC1, 0x39, 0x01, 0x00, 0x00 }, .long64);
+    try std.testing.expectEqual(Op.add_reg32_imm32, add.op);
+    try std.testing.expectEqual(Size.bits32, add.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, add.dst_reg);
+    try std.testing.expectEqual(@as(u64, 0x139), add.imm);
+    try std.testing.expectEqual(@as(u8, 6), add.len);
+
+    const add_imm8 = decodeLegacyInstruction(&[_]u8{ 0x83, 0xC1, 0x39 }, .long64);
+    try std.testing.expectEqual(Op.add_reg32_imm8, add_imm8.op);
+    try std.testing.expectEqual(@as(u64, 0x39), add_imm8.imm);
+    try std.testing.expectEqual(@as(u8, 3), add_imm8.len);
+
+    const and_full = decodeLegacyInstruction(&[_]u8{ 0x81, 0xE1, 0xFF, 0x00, 0x00, 0x00 }, .long64);
+    try std.testing.expectEqual(Op.and_reg32_imm32, and_full.op);
+
+    const or_full = decodeLegacyInstruction(&[_]u8{ 0x81, 0xC9, 0x39, 0x01, 0x00, 0x00 }, .long64);
+    try std.testing.expectEqual(Op.or_reg32_imm32, or_full.op);
+    try std.testing.expectEqual(@as(u8, 6), or_full.len);
+
+    const sub_memory = decodeLegacyInstruction(&[_]u8{ 0x83, 0x68, 0x08, 0x01 }, .long64);
+    try std.testing.expectEqual(Op.sub_mem32_imm8, sub_memory.op);
+    try std.testing.expectEqual(Size.bits32, sub_memory.size);
+    try std.testing.expectEqual(@as(u64, 8), sub_memory.addr);
+    try std.testing.expectEqual(@as(u64, 1), sub_memory.imm);
+    try std.testing.expectEqual(@as(u8, 4), sub_memory.len);
+
+    const adc_full = decodeLegacyInstruction(&[_]u8{ 0x81, 0xD1, 0x39, 0x01, 0x00, 0x00 }, .long64);
+    try std.testing.expectEqual(Op.adc_reg32_imm32, adc_full.op);
+
+    const sbb_full = decodeLegacyInstruction(&[_]u8{ 0x81, 0xD9, 0x39, 0x01, 0x00, 0x00 }, .long64);
+    try std.testing.expectEqual(Op.sbb_reg32_imm32, sbb_full.op);
+
+    const xor_full = decodeLegacyInstruction(&[_]u8{ 0x81, 0xF1, 0x39, 0x01, 0x00, 0x00 }, .long64);
+    try std.testing.expectEqual(Op.xor_reg32_imm32, xor_full.op);
+
+    const cmp_full = decodeLegacyInstruction(&[_]u8{ 0x48, 0x81, 0xFB, 0x80, 0x00, 0x00, 0x00 }, .long64);
+    try std.testing.expectEqual(Op.cmp_reg64_imm32, cmp_full.op);
+    try std.testing.expectEqual(Size.bits64, cmp_full.size);
+    try std.testing.expectEqual(@as(u64, 0x80), cmp_full.imm);
+    try std.testing.expectEqual(@as(u8, 7), cmp_full.len);
+
+    const byte_alias = decodeLegacyInstruction(&[_]u8{ 0x82, 0xC1, 0x39 }, .long64);
+    try std.testing.expectEqual(Op.add_reg8_imm8, byte_alias.op);
+    try std.testing.expectEqual(Size.bits8, byte_alias.size);
+}
+
+test "TEST register and memory forms preserve the decoded operand width" {
+    const byte_register = decodeLegacyInstruction(&[_]u8{ 0x84, 0xC0 }, .long64);
+    try std.testing.expectEqual(Op.test_reg8_reg8, byte_register.op);
+    try std.testing.expectEqual(Size.bits8, byte_register.size);
+
+    const byte_memory = decodeLegacyInstruction(&[_]u8{ 0x84, 0x00 }, .long64);
+    try std.testing.expectEqual(Op.test_mem8_reg8, byte_memory.op);
+    try std.testing.expectEqual(Size.bits8, byte_memory.size);
+
+    const dword_register = decodeLegacyInstruction(&[_]u8{ 0x85, 0xC0 }, .long64);
+    try std.testing.expectEqual(Op.test_reg32_reg32, dword_register.op);
+    try std.testing.expectEqual(Size.bits32, dword_register.size);
+}
+
 test "top-level MOV dispatch uses the shared high-byte decoder" {
     const decoded = decodeLegacyInstruction(&[_]u8{ 0x88, 0xE0 }, .long64); // mov al, ah
     try std.testing.expectEqual(Op.mov_reg8_reg8, decoded.op);
@@ -789,6 +923,144 @@ test "shared legacy decoder recognizes REP MOVSQ and the full string family" {
 
     try std.testing.expectEqual(Op.stos, decodeLegacyInstruction(&[_]u8{0xAA}, .long64).op);
     try std.testing.expectEqual(Op.lods, decodeLegacyInstruction(&[_]u8{0xAC}, .long64).op);
+}
+
+test "shared legacy decoder recognizes SSE2 PUNPCK XMM forms" {
+    const cases = [_]struct {
+        opcode: u8,
+        want: Op,
+    }{
+        .{ .opcode = 0x60, .want = .vpunpcklbw },
+        .{ .opcode = 0x61, .want = .vpunpcklwd },
+        .{ .opcode = 0x62, .want = .vpunpckldq },
+        .{ .opcode = 0x68, .want = .vpunpckhbw },
+        .{ .opcode = 0x69, .want = .vpunpckhwd },
+        .{ .opcode = 0x6A, .want = .vpunpckhdq },
+        .{ .opcode = 0x6C, .want = .vpunpcklqdq },
+        .{ .opcode = 0x6D, .want = .vpunpckhqdq },
+    };
+    for (cases) |case| {
+        const bytes = [_]u8{ 0x66, 0x0F, case.opcode, 0xF1 };
+        const decoded = decodeLegacyInstruction(&bytes, .long64);
+        try std.testing.expectEqual(case.want, decoded.op);
+        try std.testing.expect(decoded.legacy_sse);
+        try std.testing.expect(decoded.is_reg_form);
+        try std.testing.expectEqual(@as(u8, 4), decoded.len);
+    }
+}
+
+test "shared legacy decoder recognizes SSE2 PXOR without consuming the next instruction" {
+    const decoded = decodeLegacyInstruction(&[_]u8{
+        0x66, 0x0F, 0xEF, 0xC1,
+        0xC7, 0x40, 0x08, 0x00,
+        0x00, 0x00, 0x00,
+    }, .long64);
+    try std.testing.expectEqual(Op.vpxor, decoded.op);
+    try std.testing.expect(decoded.legacy_sse);
+    try std.testing.expect(decoded.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 0), decoded.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 1), decoded.xmm_src2);
+    try std.testing.expectEqual(@as(u8, 4), decoded.len);
+
+    const unprefixed = decodeLegacyInstruction(&[_]u8{ 0x0F, 0xEF, 0xC1 }, .long64);
+    try std.testing.expectEqual(Op.invalid, unprefixed.op);
+    try std.testing.expectEqual(@as(u8, 0), unprefixed.len);
+}
+
+test "shared legacy decoder recognizes MOVHPS and MOVLHPS forms" {
+    const memory_load = decodeLegacyInstruction(&[_]u8{ 0x0F, 0x16, 0x35, 0xD0, 0x40, 0x01, 0x00 }, .long64);
+    try std.testing.expectEqual(Op.vmovhps_xmm_xmm_mem64, memory_load.op);
+    try std.testing.expect(memory_load.legacy_sse);
+    try std.testing.expect(!memory_load.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 6), memory_load.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 7), memory_load.len);
+
+    const register_move = decodeLegacyInstruction(&[_]u8{ 0x0F, 0x16, 0xC1 }, .long64);
+    try std.testing.expectEqual(Op.vmovlhps, register_move.op);
+    try std.testing.expect(register_move.legacy_sse);
+    try std.testing.expect(register_move.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 0), register_move.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 1), register_move.xmm_src);
+    try std.testing.expectEqual(@as(u8, 3), register_move.len);
+}
+
+test "shared legacy decoder recognizes scalar SSE conversion forms" {
+    const cvtss2sd = decodeLegacyInstruction(&[_]u8{ 0xF3, 0x0F, 0x5A, 0xC9 }, .long64);
+    try std.testing.expectEqual(Op.vcvtss2sd, cvtss2sd.op);
+    try std.testing.expect(cvtss2sd.legacy_sse);
+    try std.testing.expect(cvtss2sd.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 1), cvtss2sd.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 1), cvtss2sd.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), cvtss2sd.xmm_src2);
+    try std.testing.expectEqual(@as(u8, 4), cvtss2sd.len);
+
+    const cvtsd2ss = decodeLegacyInstruction(&[_]u8{ 0xF2, 0x0F, 0x5A, 0xD2 }, .long64);
+    try std.testing.expectEqual(Op.vcvtsd2ss, cvtsd2ss.op);
+    try std.testing.expect(cvtsd2ss.legacy_sse);
+    try std.testing.expect(cvtsd2ss.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 2), cvtsd2ss.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 2), cvtsd2ss.xmm_src);
+    try std.testing.expectEqual(@as(u8, 2), cvtsd2ss.xmm_src2);
+    try std.testing.expectEqual(@as(u8, 4), cvtsd2ss.len);
+
+    const cvtps2pd = decodeLegacyInstruction(&[_]u8{ 0x0F, 0x5A, 0xC1 }, .long64);
+    try std.testing.expectEqual(Op.vcvtps2pd, cvtps2pd.op);
+    try std.testing.expect(cvtps2pd.legacy_sse);
+    try std.testing.expectEqual(@as(u8, 3), cvtps2pd.len);
+
+    const cvtpd2ps = decodeLegacyInstruction(&[_]u8{ 0x66, 0x0F, 0x5A, 0xE3 }, .long64);
+    try std.testing.expectEqual(Op.vcvtpd2ps, cvtpd2ps.op);
+    try std.testing.expect(cvtpd2ps.legacy_sse);
+    try std.testing.expectEqual(@as(u8, 4), cvtpd2ps.len);
+
+    const conflicting_prefixes = decodeLegacyInstruction(&[_]u8{ 0x66, 0xF3, 0x0F, 0x5A, 0xC1 }, .long64);
+    try std.testing.expectEqual(Op.invalid, conflicting_prefixes.op);
+    try std.testing.expectEqual(@as(u8, 0), conflicting_prefixes.len);
+}
+
+test "shared legacy decoder recognizes integer-to-scalar SSE conversions" {
+    const cvtsi2sd_reg = decodeLegacyInstruction(&[_]u8{ 0xF2, 0x49, 0x0F, 0x2A, 0xD0 }, .long64);
+    try std.testing.expectEqual(Op.vcvtsi2sd_xmm_reg, cvtsi2sd_reg.op);
+    try std.testing.expect(cvtsi2sd_reg.legacy_sse);
+    try std.testing.expect(cvtsi2sd_reg.is_reg_form);
+    try std.testing.expectEqual(Size.bits64, cvtsi2sd_reg.size);
+    try std.testing.expectEqual(@as(u8, 2), cvtsi2sd_reg.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 2), cvtsi2sd_reg.xmm_src);
+    try std.testing.expectEqual(RegId.r8b_r8w_r8d_r8, cvtsi2sd_reg.src_reg);
+    try std.testing.expectEqual(@as(u8, 5), cvtsi2sd_reg.len);
+
+    const cvtsi2ss_mem = decodeLegacyInstruction(&[_]u8{ 0xF3, 0x0F, 0x2A, 0x04, 0x25, 0x20, 0x10, 0x00, 0x00 }, .long64);
+    try std.testing.expectEqual(Op.vcvtsi2ss_xmm_mem, cvtsi2ss_mem.op);
+    try std.testing.expect(cvtsi2ss_mem.legacy_sse);
+    try std.testing.expect(!cvtsi2ss_mem.is_reg_form);
+    try std.testing.expectEqual(Size.bits32, cvtsi2ss_mem.size);
+    try std.testing.expectEqual(@as(u8, 9), cvtsi2ss_mem.len);
+
+    const missing_precision_prefix = decodeLegacyInstruction(&[_]u8{ 0x0F, 0x2A, 0xC1 }, .long64);
+    try std.testing.expectEqual(Op.invalid, missing_precision_prefix.op);
+    try std.testing.expectEqual(@as(u8, 0), missing_precision_prefix.len);
+}
+
+test "shared legacy decoder recognizes scalar SSE conversions to integer" {
+    const trunc_sd = decodeLegacyInstruction(&[_]u8{ 0xF2, 0x48, 0x0F, 0x2C, 0xC0 }, .long64);
+    try std.testing.expectEqual(Op.vcvttsd2si, trunc_sd.op);
+    try std.testing.expect(trunc_sd.legacy_sse);
+    try std.testing.expect(trunc_sd.is_reg_form);
+    try std.testing.expectEqual(Size.bits64, trunc_sd.size);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, trunc_sd.dst_reg);
+    try std.testing.expectEqual(@as(u8, 0), trunc_sd.xmm_src);
+    try std.testing.expectEqual(@as(u8, 5), trunc_sd.len);
+
+    const rounded_ss = decodeLegacyInstruction(&[_]u8{ 0xF3, 0x0F, 0x2D, 0x05, 0x20, 0x10, 0x00, 0x00 }, .long64);
+    try std.testing.expectEqual(Op.vcvtss2si, rounded_ss.op);
+    try std.testing.expect(rounded_ss.legacy_sse);
+    try std.testing.expect(!rounded_ss.is_reg_form);
+    try std.testing.expectEqual(Size.bits32, rounded_ss.size);
+    try std.testing.expectEqual(@as(u8, 8), rounded_ss.len);
+
+    const missing_precision_prefix = decodeLegacyInstruction(&[_]u8{ 0x0F, 0x2C, 0xC1 }, .long64);
+    try std.testing.expectEqual(Op.invalid, missing_precision_prefix.op);
+    try std.testing.expectEqual(@as(u8, 0), missing_precision_prefix.len);
 }
 
 pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedInsn {

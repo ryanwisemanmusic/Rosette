@@ -212,6 +212,9 @@ pub const Op = enum(u16) {
     sub_reg64_reg64,
     // sub r/m, imm8 (80 /5)
     sub_mem8_imm8,
+    sub_mem16_imm8,
+    sub_mem32_imm8,
+    sub_mem64_imm8,
     sub_reg8_imm8,
     sub_reg16_imm8,
     sub_reg32_imm8,
@@ -373,6 +376,24 @@ pub const Op = enum(u16) {
     cmp_reg16_imm8,
     cmp_reg32_imm8,
     cmp_reg64_imm8,
+    // Group 1 register, full-width immediate forms (0x81 /r). The 16-bit
+    // members consume imm16; the 32/64-bit members consume imm32, with the
+    // 64-bit form sign-extending that immediate as required by x86.
+    or_reg16_imm32,
+    or_reg32_imm32,
+    or_reg64_imm32,
+    adc_reg16_imm32,
+    adc_reg32_imm32,
+    adc_reg64_imm32,
+    sbb_reg16_imm32,
+    sbb_reg32_imm32,
+    sbb_reg64_imm32,
+    xor_reg16_imm32,
+    xor_reg32_imm32,
+    xor_reg64_imm32,
+    cmp_reg16_imm32,
+    cmp_reg32_imm32,
+    cmp_reg64_imm32,
     // inc/dec
     inc_mem8,
     inc_mem16,

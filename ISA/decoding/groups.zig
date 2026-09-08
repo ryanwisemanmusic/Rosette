@@ -276,9 +276,9 @@ pub fn decodeGroup1Imm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: 
     const group_op = (modrm >> 3) & 7;
     const is_mem = modrm < 0xC0;
 
-    const sz: Size = if (rex_w) .bits64 else if (has_66) .bits16 else if (opcode == 0x80) .bits8 else .bits32;
+    const sz: Size = if (rex_w) .bits64 else if (has_66) .bits16 else if (opcode == 0x80 or opcode == 0x82) .bits8 else .bits32;
 
-    const is_byte_imm = opcode == 0x80 or opcode == 0x83;
+    const is_byte_imm = opcode == 0x80 or opcode == 0x82 or opcode == 0x83;
     const imm_size: u8 = if (is_byte_imm) 1 else if (sz == .bits16) 2 else 4;
 
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
@@ -323,8 +323,8 @@ pub fn decodeGroup1Imm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: 
             return d;
         }
         const mem_group_ops: [8]Op = .{
-            .add_mem8_imm8, .invalid, .invalid, .invalid,
-            .invalid,       .invalid, .invalid, .cmp_mem8_imm8,
+            .add_mem8_imm8, .invalid,       .invalid, .invalid,
+            .invalid,       .sub_mem8_imm8, .invalid, .cmp_mem8_imm8,
         };
         const base = mem_group_ops[group_op];
         if (base == .invalid) {
@@ -336,9 +336,69 @@ pub fn decodeGroup1Imm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: 
         d.op = @enumFromInt(@intFromEnum(base) + off);
         d.addr = rm.addr;
     } else {
-        const base = group_ops[group_op];
-        const off = @intFromEnum(base_sz) - @intFromEnum(Size.bits8);
-        d.op = @enumFromInt(@intFromEnum(base) + off);
+        // 0x81 carries a full-width immediate (16/32 bits, or a
+        // sign-extended 32-bit immediate for a 64-bit operand). The compact
+        // enum-offset mapping is valid only for the contiguous imm8
+        // families. Reusing it for 0x81 mislabels
+        // `81 C1 39 01 00 00` (`add ecx, 0x139`) as `add_reg32_imm8` and
+        // loses the instruction's immediate-width contract.
+        if (!is_byte_imm) {
+            d.op = switch (group_op) {
+                0 => switch (base_sz) {
+                    .bits16 => .add_reg16_imm32,
+                    .bits32 => .add_reg32_imm32,
+                    .bits64 => .add_reg64_imm32,
+                    .bits8 => unreachable,
+                },
+                1 => switch (base_sz) {
+                    .bits16 => .or_reg16_imm32,
+                    .bits32 => .or_reg32_imm32,
+                    .bits64 => .or_reg64_imm32,
+                    .bits8 => unreachable,
+                },
+                2 => switch (base_sz) {
+                    .bits16 => .adc_reg16_imm32,
+                    .bits32 => .adc_reg32_imm32,
+                    .bits64 => .adc_reg64_imm32,
+                    .bits8 => unreachable,
+                },
+                3 => switch (base_sz) {
+                    .bits16 => .sbb_reg16_imm32,
+                    .bits32 => .sbb_reg32_imm32,
+                    .bits64 => .sbb_reg64_imm32,
+                    .bits8 => unreachable,
+                },
+                4 => switch (base_sz) {
+                    .bits16 => .and_reg16_imm32,
+                    .bits32 => .and_reg32_imm32,
+                    .bits64 => .and_reg64_imm32,
+                    .bits8 => unreachable,
+                },
+                5 => switch (base_sz) {
+                    .bits16 => .sub_reg16_imm32,
+                    .bits32 => .sub_reg32_imm32,
+                    .bits64 => .sub_reg64_imm32,
+                    .bits8 => unreachable,
+                },
+                6 => switch (base_sz) {
+                    .bits16 => .xor_reg16_imm32,
+                    .bits32 => .xor_reg32_imm32,
+                    .bits64 => .xor_reg64_imm32,
+                    .bits8 => unreachable,
+                },
+                7 => switch (base_sz) {
+                    .bits16 => .cmp_reg16_imm32,
+                    .bits32 => .cmp_reg32_imm32,
+                    .bits64 => .cmp_reg64_imm32,
+                    .bits8 => unreachable,
+                },
+                else => unreachable,
+            };
+        } else {
+            const base = group_ops[group_op];
+            const off = @intFromEnum(base_sz) - @intFromEnum(Size.bits8);
+            d.op = @enumFromInt(@intFromEnum(base) + off);
+        }
         d.dst_reg = @enumFromInt(rm.addr);
     }
 
@@ -715,6 +775,7 @@ pub fn decodeTestRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: 
     const sz: Size = if (rex_w) .bits64 else if (has_66) .bits16 else if (opcode == 0x84) .bits8 else .bits32;
     const is_mem = modrm < 0xC0;
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
+    d.size = sz;
 
     if (is_mem) {
         d.op = switch (sz) {

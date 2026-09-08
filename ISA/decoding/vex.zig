@@ -861,6 +861,20 @@ pub fn decodeVexInstruction(bytes: []const u8) ?DecodedInsn {
                 .addr = modrm_decoded.addr,
             };
         },
+        0xD6 => {
+            // VMOVQ xmm/m64, xmm is the memory-store direction of the VEX
+            // move family. The register form uses opcode 7E; D6 with
+            // ModRM.mod=3 is not a second XMM-to-XMM spelling.
+            if (!vex.has_66_prefix or vex.w or vex.l or vex.vvvv != 0 or modrm_decoded.is_reg_form) return null;
+            return .{
+                .op = .vmovq_mem64_xmm,
+                .size = .bits64,
+                .len = @intCast(pos),
+                .xmm_src = modrm_decoded.dst_xmm,
+                .is_reg_form = false,
+                .addr = modrm_decoded.addr,
+            };
+        },
         0x7F => {
             // VMOVDQA (VEX.66.0F 7F) / VMOVDQU (VEX.F3.0F 7F) — store forms
             if (vex.has_66_prefix) {
@@ -1240,8 +1254,15 @@ fn decodeVexUnaryImmReturn(vex: VexPrefix, pos: usize, op_enum: Op, modrm: anyty
     };
 }
 
-fn decodeVexBroadcastReturn(vex: VexPrefix, pos: usize, op_enum: Op, modrm: anytype, size: Size) ?DecodedInsn {
-    if (!vex.has_66_prefix or vex.w or vex.vvvv != 0) return null;
+fn decodeVexBroadcastReturn(
+    vex: VexPrefix,
+    pos: usize,
+    op_enum: Op,
+    modrm: anytype,
+    size: Size,
+    expected_w: bool,
+) ?DecodedInsn {
+    if (!vex.has_66_prefix or vex.w != expected_w or vex.vvvv != 0) return null;
     return .{
         .op = op_enum,
         .size = size,
@@ -1251,6 +1272,44 @@ fn decodeVexBroadcastReturn(vex: VexPrefix, pos: usize, op_enum: Op, modrm: anyt
         .is_reg_form = modrm.is_reg_form,
         .addr = modrm.addr,
         .vector_256 = vex.l,
+    };
+}
+
+/// Decode scalar floating-point broadcasts. The W bit selects the source
+/// element width for VBROADCASTSS/VBROADCASTSD; the source is memory-only and
+/// VEX.vvvv is reserved.
+fn decodeVexFloatBroadcastReturn(
+    vex: VexPrefix,
+    pos: usize,
+    op_enum: Op,
+    modrm: anytype,
+    size: Size,
+    expected_w: bool,
+) ?DecodedInsn {
+    if (!vex.has_66_prefix or vex.w != expected_w or vex.vvvv != 0 or modrm.is_reg_form) return null;
+    return .{
+        .op = op_enum,
+        .size = size,
+        .len = @intCast(pos),
+        .xmm_dst = modrm.dst_xmm,
+        .is_reg_form = false,
+        .addr = modrm.addr,
+        .vector_256 = vex.l,
+    };
+}
+
+/// Decode the 256-bit memory broadcasts of a full 128-bit vector. These are
+/// VEX.256 forms only and also use a reserved VEX.vvvv field.
+fn decodeVexWideBroadcastReturn(vex: VexPrefix, pos: usize, op_enum: Op, modrm: anytype) ?DecodedInsn {
+    if (!vex.has_66_prefix or vex.w or !vex.l or vex.vvvv != 0 or modrm.is_reg_form) return null;
+    return .{
+        .op = op_enum,
+        .size = .bits64,
+        .len = @intCast(pos),
+        .xmm_dst = modrm.dst_xmm,
+        .is_reg_form = false,
+        .addr = modrm.addr,
+        .vector_256 = true,
     };
 }
 
@@ -1871,9 +1930,19 @@ fn decodeVexMap38(vex: VexPrefix, pos: usize, opcode: u8, modrm: anytype) ?Decod
         0x4C => decodeVexReturn(vex, pos, .vpblendvb, modrm),
         0x4D => decodeVexReturn(vex, pos, .vpblendw, modrm), // VEX.0F3A 0E fallback
         0x50 => decodeVexDotProductReturn(vex, pos, modrm),
-        0x58 => decodeVexBroadcastReturn(vex, pos, .vpbroadcastd, modrm, .bits32),
-        0x59 => decodeVexBroadcastReturn(vex, pos, .vpbroadcastq, modrm, .bits64),
-        0x79 => decodeVexBroadcastReturn(vex, pos, .vpbroadcastw, modrm, .bits16),
+        0x18 => decodeVexFloatBroadcastReturn(vex, pos, .vbroadcastss, modrm, .bits32, false),
+        // VBROADCASTSD is the W0 AVX2 form (the element width is selected by
+        // the opcode, not by VEX.W). Its only architectural destination is a
+        // 256-bit YMM register; accepting W1 here would manufacture a
+        // non-existent XMM form.
+        0x19 => decodeVexFloatBroadcastReturn(vex, pos, .vbroadcastsd, modrm, .bits64, false),
+        0x1A => decodeVexWideBroadcastReturn(vex, pos, .vbroadcastf128, modrm),
+        0x58 => decodeVexBroadcastReturn(vex, pos, .vpbroadcastd, modrm, .bits32, false),
+        // VPBROADCASTQ uses the W0 YMM encoding as well; W is not the
+        // element-width selector for these fixed-width broadcast opcodes.
+        0x59 => decodeVexBroadcastReturn(vex, pos, .vpbroadcastq, modrm, .bits64, false),
+        0x5A => decodeVexWideBroadcastReturn(vex, pos, .vbroadcasti128, modrm),
+        0x79 => decodeVexBroadcastReturn(vex, pos, .vpbroadcastw, modrm, .bits16, false),
         0xF5 => decodeVexPackedBinaryReturn(vex, pos, .vpmaddwd, modrm),
         // VEX.0F38 FMA — PS/PD variants selected by VEX.W bit
         0x96 => decodeVexReturn(vex, pos, if (vex.w) .vfmaddsub132pd else .vfmaddsub132ps, modrm),
@@ -1904,6 +1973,10 @@ fn decodeVexMap3A(vex: VexPrefix, pos: usize, opcode: u8, modrm: anytype, imm: u
             decodeVexUnaryImmReturn(vex, pos, .vpermilps, modrm, imm)
         else
             null, // VPERMILPS immediate form
+        0x05 => if (vex.has_66_prefix and !vex.w and vex.vvvv == 0)
+            decodeVexUnaryImmReturn(vex, pos, .vpermilpd, modrm, imm)
+        else
+            null, // VPERMILPD immediate form
         0x08 => if (vex.has_66_prefix and !vex.w and vex.vvvv == 0)
             decodeVexUnaryImmReturn(vex, pos, .vroundps, modrm, imm)
         else
@@ -2039,6 +2112,19 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         } else {
             return .{};
         }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VMOVQ xmm/m64, xmm: VEX.128.66.0F.W0 D6 /r. This is a store-only
+    // encoding; the register-to-register spelling uses opcode 7E instead.
+    if (opcode == 0xD6 and (vex & 0x78) == 0x78 and !vector_256 and prefix == 1) {
+        var decoded = DecodedInsn{ .op = .vmovq_mem64_xmm, .size = .bits64 };
+        var pos = start_pos + 3;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        if (decoded.is_reg_form) return .{};
+        decoded.xmm_src = @intFromEnum(rm.reg);
+        decoded.addr = rm.addr;
         decoded.len = @intCast(pos);
         return decoded;
     }
@@ -2969,6 +3055,13 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
     if (opcode_map == 1 and prefix == 0 and !rex_w and vector_256 and opcode == 0x2B) {
         return decodeVex3Store(bytes, start_pos, vex, .vmovntps) orelse .{};
     }
+    if (opcode_map == 1 and prefix == 1 and !rex_w and !vector_256 and
+        vex.vvvv == 0 and opcode == 0xD6)
+    {
+        var decoded = decodeVex3Store(bytes, start_pos, vex, .vmovq_mem64_xmm) orelse return .{};
+        decoded.size = .bits64;
+        return decoded;
+    }
     if (opcode_map == 1 and prefix == 1 and !rex_w and vector_256 and opcode == 0xE7) {
         return decodeVex3Store(bytes, start_pos, vex, .vmovntdq) orelse .{};
     }
@@ -2980,6 +3073,8 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
     }
     if (opcode_map == 2 and prefix == 1 and !rex_w) {
         switch (opcode) {
+            0x18 => if (vex.vvvv == 0) return decodeVex3Broadcast(bytes, start_pos, vex, .vbroadcastss, .bits32) orelse .{},
+            0x1A => if (vex.vvvv == 0 and vector_256) return decodeVex3Broadcast(bytes, start_pos, vex, .vbroadcastf128, .bits64) orelse .{},
             0x2C => return decodeVex3MaskMove(bytes, start_pos, vex, .vmaskmovps_load) orelse .{},
             0x2D => return decodeVex3MaskMove(bytes, start_pos, vex, .vmaskmovpd_load) orelse .{},
             0x2E => return decodeVex3MaskMove(bytes, start_pos, vex, .vmaskmovps_store) orelse .{},
@@ -3012,11 +3107,21 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
             0x37 => return decodeVex3Nds(bytes, start_pos, vex, .vpcmpgtq, false) orelse .{},
             0x42 => return decodeVex3Nds(bytes, start_pos, vex, .vpsadbw, false) orelse .{},
             0x58 => if (vex.vvvv == 0) return decodeVex3Broadcast(bytes, start_pos, vex, .vpbroadcastd, .bits32) orelse .{},
-            0x59 => if (vex.vvvv == 0) return decodeVex3Broadcast(bytes, start_pos, vex, .vpbroadcastq, .bits64) orelse .{},
+            0x5A => if (vex.vvvv == 0 and vector_256) return decodeVex3Broadcast(bytes, start_pos, vex, .vbroadcasti128, .bits64) orelse .{},
             0x79 => if (vex.vvvv == 0) return decodeVex3Broadcast(bytes, start_pos, vex, .vpbroadcastw, .bits16) orelse .{},
             0xF5 => return decodeVex3Nds(bytes, start_pos, vex, .vpmaddwd, false) orelse .{},
             else => {},
         }
+    }
+    // VBROADCASTSD ymm, xmm/m64 is VEX.256.66.0F38.W0 19 /r. Xenia's
+    // MicroProfile initializer uses the RIP-relative memory form with this
+    // exact encoding, so keep the production three-byte path in agreement
+    // with the shared map-38 decoder above.
+    if (opcode_map == 2 and prefix == 1 and !rex_w and vex.vvvv == 0 and opcode == 0x19) {
+        return decodeVex3Broadcast(bytes, start_pos, vex, .vbroadcastsd, .bits64) orelse .{};
+    }
+    if (opcode_map == 2 and prefix == 1 and !rex_w and vex.vvvv == 0 and opcode == 0x59) {
+        return decodeVex3Broadcast(bytes, start_pos, vex, .vpbroadcastq, .bits64) orelse .{};
     }
     if (opcode_map == 3 and prefix == 1 and !rex_w) {
         switch (opcode) {
@@ -3776,7 +3881,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decodeVexLane128(vex, pos + 1, op, modrm, bytes[pos]) orelse .{};
     }
 
-    if (opcode_map == 3 and opcode == 0x05 and prefix == 1) {
+    if (opcode_map == 3 and opcode == 0x05 and prefix == 1 and !rex_w and vex.vvvv == 0) {
         var decoded = DecodedInsn{ .op = .vpermilpd, .vector_256 = vector_256 };
         var pos = start_pos + 4;
         const is_memory = bytes[pos] < 0xC0;
@@ -3787,8 +3892,9 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src = @intCast(rm.addr);
+            decoded.xmm_src2 = @intCast(rm.addr);
         }
+        decoded.uses_imm = true;
         decoded.imm = bytes[pos];
         pos += 1;
         decoded.len = @intCast(pos);

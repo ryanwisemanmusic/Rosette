@@ -331,6 +331,35 @@ test "a SIB that does have a base register keeps it" {
     try std.testing.expectEqual(@as(u64, 0x20), rm.addr);
 }
 
+test "REX.X turns SIB index code four into R12" {
+    // `lea rdx, [r14 + r12*2]` — the index field is 100, which means no
+    // index without REX.X but R12 when the extension bit is present.
+    var decoded = DecodedInsn{};
+    var pos: usize = 0;
+    const bytes = [_]u8{ 0x54, 0x66, 0x00 };
+    const rm = readModRM(&decoded, &bytes, &pos, false, true, true, .bits64);
+
+    try std.testing.expectEqual(RegId.r12b_r12w_r12d_r12, decoded.sib_index_reg);
+    try std.testing.expect(decoded.sib_has_index);
+    try std.testing.expectEqual(@as(u2, 1), decoded.sib_scale);
+    try std.testing.expect(decoded.sib_has_base);
+    try std.testing.expectEqual(RegId.r14b_r14w_r14d_r14, decoded.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 0), rm.addr);
+
+    var regs = Regs{};
+    regs.r12 = 0x64;
+    regs.r14 = 0x1000;
+    try std.testing.expectEqual(@as(u64, 0x10c8), resolveMemoryAddress(&regs, .{
+        .displacement = rm.addr,
+        .has_index = decoded.sib_has_index,
+        .index_reg = decoded.sib_index_reg,
+        .scale = decoded.sib_scale,
+        .has_base = decoded.sib_has_base,
+        .base_reg = decoded.sib_base_reg,
+        .segment = decoded.segment,
+    }, 0, .bits64, .long64, false));
+}
+
 pub fn hasModRM(byte: u8) bool {
     _ = byte;
     return true;
@@ -388,7 +417,9 @@ pub fn readModRM(d: *DecodedInsn, bytes: []const u8, pos: *usize, rex_r: bool, r
         const index_num = (sib >> 3) & 7;
         const base_num = sib & 7;
 
-        if (index_num != 4) {
+        // SIB index code 4 means "no index" only when REX.X is clear. With
+        // REX.X set, the same low bits select the extended R12 register.
+        if (index_num != 4 or rex_x) {
             d.sib_has_index = true;
             d.sib_index_reg = mapReg(index_num, rex_x);
             d.sib_scale = @as(u2, @intCast(scale));
