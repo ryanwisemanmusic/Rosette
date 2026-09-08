@@ -338,6 +338,46 @@ test "VPUNPCK unpack family decodes in both VEX forms with correct opcodes" {
     try std.testing.expectEqual(types.Op.vpcmpgtd, vex.decodeVex2(&[_]u8{ 0xC5, 0xF9, 0x66, 0xC1 }, 0).op);
 }
 
+test "VEX operand roles cover arithmetic moves and scalar lane forms" {
+    // VPSUBD xmm3, xmm2, xmm1: VEX.vvvv is SRC1 and ModR/M.r/m is SRC2.
+    const sub = vex.decodeVex2(&[_]u8{ 0xC5, 0xE9, 0xFA, 0xD9 }, 0);
+    try std.testing.expectEqual(types.Op.vpsubd, sub.op);
+    try std.testing.expectEqual(@as(u8, 3), sub.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 2), sub.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), sub.xmm_src2);
+
+    // VMOVDQA xmm2, xmm3 in the register-form store encoding. The ModR/M
+    // direction is opposite the load form: ModR/M.reg is the source and
+    // ModR/M.r/m is the destination.
+    const store = vex.decodeVex2(&[_]u8{ 0xC5, 0xF9, 0x7F, 0xDA }, 0);
+    try std.testing.expectEqual(types.Op.vmovdqa_xmm_xmm, store.op);
+    try std.testing.expectEqual(@as(u8, 2), store.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 3), store.xmm_src);
+
+    // VROUNDPS xmm0, xmm1, 0: unary VEX form, with VEX.vvvv reserved.
+    const round = vex.decodeVex3(&[_]u8{ 0xC4, 0xE3, 0x79, 0x08, 0xC1, 0x00 }, 0);
+    try std.testing.expectEqual(types.Op.vroundps, round.op);
+    try std.testing.expectEqual(@as(u8, 0), round.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 1), round.xmm_src);
+    try std.testing.expect(round.uses_imm);
+
+    // VPINSRB xmm1, xmm2, eax, 5: the scalar source is a GPR, not xmm0.
+    const insert = vex.decodeVex3(&[_]u8{ 0xC4, 0xE3, 0x69, 0x20, 0xC8, 0x05 }, 0);
+    try std.testing.expectEqual(types.Op.vpinsrb_xmm_xmm_reg32, insert.op);
+    try std.testing.expectEqual(@as(u8, 1), insert.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 2), insert.xmm_src);
+    try std.testing.expectEqual(types.RegId.al_ax_eax_rax, insert.src_reg);
+    try std.testing.expect(insert.is_reg_form);
+
+    // VPEXTRD ecx, xmm0, 2: the vector source is ModR/M.reg and the GPR
+    // destination is ModR/M.r/m.
+    const extract = vex.decodeVex3(&[_]u8{ 0xC4, 0xE3, 0x79, 0x16, 0xC1, 0x02 }, 0);
+    try std.testing.expectEqual(types.Op.vpextrd, extract.op);
+    try std.testing.expectEqual(@as(u8, 0), extract.xmm_src);
+    try std.testing.expectEqual(types.RegId.cl_cx_ecx_rcx, extract.dst_reg);
+    try std.testing.expect(extract.is_reg_form);
+}
+
 test "every decoder family analyzes cleanly (refAllDecls)" {
     std.testing.refAllDecls(types);
     std.testing.refAllDecls(prefix);

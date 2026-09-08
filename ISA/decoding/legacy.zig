@@ -1132,6 +1132,15 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
             d.len = @as(u8, @intCast(pos + 1));
         },
 
+        // HLT has both the one-byte C1/INT3-adjacent breakpoint-shaped
+        // spelling used by the historical decoder above and its architectural
+        // F4 opcode.  PE64 bounded runs use the architectural form as their
+        // in-guest termination sentinel, so it must decode identically.
+        0xF4 => {
+            d.op = .hlt;
+            d.len = @as(u8, @intCast(pos + 1));
+        },
+
         0xE8 => {
             if (pos + 5 > bytes.len) return .{};
             d.op = .call_rel32;
