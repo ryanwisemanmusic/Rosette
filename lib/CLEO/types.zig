@@ -65,6 +65,15 @@ pub const FeatureSet = struct {
             .aarch64 => {
                 result.sse = true;
                 result.sse2 = true;
+                // CLEO is Rosetta's software lowering for Intel vector
+                // instructions on ARM64.  These are capabilities of the
+                // emulation layer, not claims about the host CPU's CPUID
+                // leaves.  Keep AVX-512/AMX claims out of this set until the
+                // corresponding EVEX state and tile semantics are proven by
+                // their own executor.
+                result.avx = true;
+                result.avx2 = true;
+                result.fma = true;
             },
             .x86_64 => {
                 result.avx = true;

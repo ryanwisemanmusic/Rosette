@@ -18,6 +18,27 @@ pub const RoutingDecision = struct {
 /// Both the Mach-O decoder and ELF processor should import and use this
 /// module to determine if a decoded instruction can be executed via CLEO.
 pub const CleoRouter = struct {
+    fn findCanonicalInstruction(name: []const u8) ?types.InstructionMeta {
+        if (registry.findByName(name)) |meta| return meta;
+
+        // Decoder operation tags carry implementation detail that is not part
+        // of the ISA mnemonic (for example `vaddps` and
+        // `vmovdqu_xmm_xmm`). CLEO's registry intentionally stores one
+        // canonical mnemonic per family, so try the architectural spelling
+        // before declaring the instruction unavailable.
+        if (name.len > 1 and (name[0] == 'v' or name[0] == 'V')) {
+            if (registry.findByName(name[1..])) |meta| return meta;
+        }
+        if (std.mem.indexOfScalar(u8, name, '_')) |suffix| {
+            const base = name[0..suffix];
+            if (registry.findByName(base)) |meta| return meta;
+            if (base.len > 1 and (base[0] == 'v' or base[0] == 'V')) {
+                if (registry.findByName(base[1..])) |meta| return meta;
+            }
+        }
+        return null;
+    }
+
     /// Lookup an instruction by name in the CLEO registry.
     /// Returns the InstructionMeta if found, or null if not registered.
     pub fn findInstruction(name: []const u8) ?types.InstructionMeta {
@@ -38,7 +59,7 @@ pub const CleoRouter = struct {
     /// CLEO handles all widths that match the instruction meta's
     /// `max_width_bits`.  Pass 0 to skip the width check.
     pub fn route(name: []const u8, features: types.FeatureSet, op_width_bits: usize) RoutingDecision {
-        const meta = registry.findByName(name) orelse {
+        const meta = findCanonicalInstruction(name) orelse {
             return RoutingDecision{
                 .can_route = false,
                 .meta = null,
@@ -96,4 +117,10 @@ test "CleoRouter feature-aware routing" {
     const count = CleoRouter.availableCount(all_features);
     try std.testing.expectEqual(CleoRouter.totalCount(), count);
     try std.testing.expect(count > 0);
+}
+
+test "CleoRouter canonicalizes decoder operation tags" {
+    const features = types.FeatureSet.cleoEmulated();
+    try std.testing.expect(CleoRouter.route("vaddps", features, 256).can_route);
+    try std.testing.expect(CleoRouter.route("vmovdqu_xmm_xmm", features, 128).can_route);
 }

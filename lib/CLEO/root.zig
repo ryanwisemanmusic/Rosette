@@ -16,6 +16,7 @@ pub const AVX512BW = registry.AVX512BW;
 pub const AVX512BF16 = registry.AVX512BF16;
 pub const VAES = registry.VAES;
 pub const SYSTEM = registry.SYSTEM;
+pub const CleoRouter = @import("cleo_routing.zig").CleoRouter;
 
 pub fn validateAll() void {
     registry.validateAll() catch unreachable;
