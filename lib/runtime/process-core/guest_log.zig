@@ -417,6 +417,11 @@ pub fn describeGuestAddress(self: anytype, address: u64) void {
 /// where the kernel serialises concurrent write syscalls.
 fn writeMirroredLine(self: anytype, prefix: []const u8, message: []const u8) void {
     writeLineAtomic(self.guest_log_mirror_fd, &.{ prefix, message });
+    // The message, not the prefix: the prefix is Rosette's own decoration and
+    // a terminal phrase always belongs to the emulator's own text. Offered
+    // after the write so the line reaches the log even if an observer decides
+    // this is where the run ends.
+    macho_log.observeExternalLine(message);
 }
 
 /// Coalesce one log line (prefix + message + optional newline) into a single

@@ -11,6 +11,36 @@ pub fn strlen(_: SlotIndex, ctx: *const PrimitiveContext) Result {
     return .handled;
 }
 
+/// Implements `strchr` — finds the first occurrence of a byte in a C string.
+///
+/// The returned pointer must remain a guest address. Returning a host pointer
+/// here would make the caller's subsequent dereference cross the emulated
+/// address-space boundary. A search for `\0` is special: `readCString` returns
+/// the bytes before the terminator, so the terminator's guest address is one
+/// byte past the returned slice.
+/// ABI: rdi = string, rsi = int character. Returns a guest pointer or null.
+pub fn strchr(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    const string_ptr = ctx.readArg(0);
+    const needle = ctx.readArg(1) & 0xff;
+    const string = ctx.readCString(string_ptr) orelse return .unsupported;
+
+    if (needle == 0) {
+        const terminator = std.math.add(u64, string_ptr, @intCast(string.len)) catch return .unsupported;
+        ctx.setResult(terminator);
+        return .handled;
+    }
+
+    for (string, 0..) |byte, index| {
+        if (byte != needle) continue;
+        const match = std.math.add(u64, string_ptr, @intCast(index)) catch return .unsupported;
+        ctx.setResult(match);
+        return .handled;
+    }
+
+    ctx.setResult(0);
+    return .handled;
+}
+
 pub fn cxaGuardAcquire(_: SlotIndex, ctx: *const PrimitiveContext) Result {
     const guard_ptr = ctx.readArg(0);
     const guard_bytes = ctx.readGuest(guard_ptr, 8) orelse return .unsupported;
@@ -517,6 +547,121 @@ pub fn strtol(_: SlotIndex, ctx: *const PrimitiveContext) Result {
     return .handled;
 }
 
+fn writeGuestPointer(ctx: *const PrimitiveContext, destination: u64, value: u64) bool {
+    if (destination == 0) return true;
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .little);
+    ctx.writeGuest(destination, &bytes) orelse return false;
+    return true;
+}
+
+fn parseIntegerDigit(byte: u8) ?u8 {
+    if (byte >= '0' and byte <= '9') return byte - '0';
+    if (byte >= 'a' and byte <= 'z') return byte - 'a' + 10;
+    if (byte >= 'A' and byte <= 'Z') return byte - 'A' + 10;
+    return null;
+}
+
+fn isAsciiSpace(byte: u8) bool {
+    return byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r' or
+        byte == '\x0c' or byte == '\x0b';
+}
+
+/// Implements `strtoull` — parses an unsigned long long from a C string.
+///
+/// This follows the libc contract needed by the Xenia launch/identity parser:
+/// whitespace and an optional sign are accepted, base zero selects octal or
+/// decimal (with a real `0x` hexadecimal prefix), bases 2..36 are supported,
+/// `endptr` receives the first unconsumed guest address, and overflow clamps
+/// to ULLONG_MAX. No host `errno` is touched; the caller only relies on the
+/// value and end pointer. Invalid bases are treated as a failed conversion and
+/// leave `endptr` at the original string, matching the useful observable
+/// behavior without exposing a host pointer.
+/// ABI: rdi = string, rsi = char**, rdx = int base.
+pub fn strtoull(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    const string_ptr = ctx.readArg(0);
+    const endptr = ctx.readArg(1);
+    const raw_base = ctx.readArg(2);
+    const signed_base: i32 = @bitCast(@as(u32, @truncate(raw_base)));
+
+    if (signed_base != 0 and (signed_base < 2 or signed_base > 36)) {
+        if (!writeGuestPointer(ctx, endptr, string_ptr)) return .unsupported;
+        ctx.setResult(0);
+        return .handled;
+    }
+
+    const string = ctx.readCString(string_ptr) orelse return .unsupported;
+    var index: usize = 0;
+    while (index < string.len and isAsciiSpace(string[index])) : (index += 1) {}
+
+    var negative = false;
+    if (index < string.len) {
+        if (string[index] == '-') {
+            negative = true;
+            index += 1;
+        } else if (string[index] == '+') {
+            index += 1;
+        }
+    }
+
+    const requested_base: u8 = @intCast(signed_base);
+    var effective_base: u8 = if (requested_base == 0) 10 else requested_base;
+    if (requested_base == 0 and index < string.len and string[index] == '0') {
+        effective_base = 8;
+    }
+
+    // C's 0x prefix is consumed only when a hexadecimal digit follows it.
+    // Otherwise the leading zero remains an ordinary digit, so inputs such as
+    // "0x" convert the zero and leave endptr at the x.
+    if ((requested_base == 0 or requested_base == 16) and
+        index + 2 < string.len and string[index] == '0' and
+        (string[index + 1] == 'x' or string[index + 1] == 'X'))
+    {
+        if (parseIntegerDigit(string[index + 2])) |digit| {
+            if (digit < 16) {
+                effective_base = 16;
+                index += 2;
+            }
+        }
+    }
+
+    const digit_start = index;
+    var value: u64 = 0;
+    var overflow = false;
+    while (index < string.len) : (index += 1) {
+        const digit = parseIntegerDigit(string[index]) orelse break;
+        if (digit >= effective_base) break;
+
+        if (!overflow) {
+            const digit_value: u64 = digit;
+            const base_value: u64 = effective_base;
+            if (value > (std.math.maxInt(u64) - digit_value) / base_value) {
+                value = std.math.maxInt(u64);
+                overflow = true;
+            } else {
+                value = value * base_value + digit_value;
+            }
+        }
+    }
+
+    if (index == digit_start) {
+        if (!writeGuestPointer(ctx, endptr, string_ptr)) return .unsupported;
+        ctx.setResult(0);
+        return .handled;
+    }
+
+    const result = if (overflow)
+        std.math.maxInt(u64)
+    else if (negative)
+        0 -% value
+    else
+        value;
+    const end_address = std.math.add(u64, string_ptr, @intCast(index)) catch return .unsupported;
+    if (!writeGuestPointer(ctx, endptr, end_address)) return .unsupported;
+    ctx.setResult(result);
+    return .handled;
+}
+
 /// Implements `abs` — returns the absolute value of an int.
 /// ABI: rdi = signed 32-bit int value (sign-extended to 64 in rdi).
 /// Returns the absolute value (non-negative int).
@@ -934,6 +1079,151 @@ test "handlers: strlen reads cstring and returns length" {
 
     try std.testing.expectEqual(Result.handled, strlen(0, &ctx));
     try std.testing.expectEqual(@as(u64, 11), state.result);
+}
+
+test "handlers: strchr returns guest addresses including the terminator" {
+    const TestState = struct {
+        args: [6]u64 = .{0} ** 6,
+        result: u64 = 0,
+        memory: [128]u8 = .{0} ** 128,
+
+        fn readArg(ptr: *anyopaque, index: u8) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return if (index < 6) self.args[index] else 0;
+        }
+        fn setResult(ptr: *anyopaque, value: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.result = value;
+        }
+        fn readGuest(ptr: *const anyopaque, address: u64, size: usize) ?[]const u8 {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            const start: usize = @intCast(address);
+            const end = std.math.add(usize, start, size) catch return null;
+            if (end > self.memory.len) return null;
+            return self.memory[start..end];
+        }
+        fn writeGuest(ptr: *anyopaque, address: u64, data: []const u8) ?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const start: usize = @intCast(address);
+            const end = std.math.add(usize, start, data.len) catch return null;
+            if (end > self.memory.len) return null;
+            @memcpy(self.memory[start..end], data);
+            return {};
+        }
+        fn readCString(ptr: *const anyopaque, address: u64) ?[]const u8 {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            const start: usize = @intCast(address);
+            if (start >= self.memory.len) return null;
+            return std.mem.sliceTo(self.memory[start..], 0);
+        }
+        fn callGuest(_: *anyopaque, _: u64, _: [6]u64) u64 {
+            return 0;
+        }
+    };
+
+    var state = TestState{};
+    const string_address: u64 = 16;
+    const text = "alpha";
+    @memcpy(state.memory[string_address .. string_address + text.len], text);
+    state.memory[string_address + text.len] = 0;
+    state.args[0] = string_address;
+
+    const ctx = PrimitiveContext{
+        .ptr = &state,
+        .readArgFn = TestState.readArg,
+        .setResultFn = TestState.setResult,
+        .readGuestFn = TestState.readGuest,
+        .writeGuestFn = TestState.writeGuest,
+        .readCStringFn = TestState.readCString,
+        .callGuestFn = TestState.callGuest,
+    };
+
+    state.args[1] = 'p';
+    try std.testing.expectEqual(Result.handled, strchr(0, &ctx));
+    try std.testing.expectEqual(string_address + 2, state.result);
+
+    state.args[1] = 0;
+    try std.testing.expectEqual(Result.handled, strchr(0, &ctx));
+    try std.testing.expectEqual(string_address + text.len, state.result);
+
+    state.args[1] = 'z';
+    try std.testing.expectEqual(Result.handled, strchr(0, &ctx));
+    try std.testing.expectEqual(@as(u64, 0), state.result);
+}
+
+test "handlers: strtoull parses bases, end pointers, signs, and overflow" {
+    const TestState = struct {
+        args: [6]u64 = .{0} ** 6,
+        result: u64 = 0,
+        memory: [192]u8 = .{0} ** 192,
+
+        fn readArg(ptr: *anyopaque, index: u8) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return if (index < 6) self.args[index] else 0;
+        }
+        fn setResult(ptr: *anyopaque, value: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.result = value;
+        }
+        fn readGuest(ptr: *const anyopaque, address: u64, size: usize) ?[]const u8 {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            const start: usize = @intCast(address);
+            const end = std.math.add(usize, start, size) catch return null;
+            if (end > self.memory.len) return null;
+            return self.memory[start..end];
+        }
+        fn writeGuest(ptr: *anyopaque, address: u64, data: []const u8) ?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const start: usize = @intCast(address);
+            const end = std.math.add(usize, start, data.len) catch return null;
+            if (end > self.memory.len) return null;
+            @memcpy(self.memory[start..end], data);
+            return {};
+        }
+        fn readCString(ptr: *const anyopaque, address: u64) ?[]const u8 {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            const start: usize = @intCast(address);
+            if (start >= self.memory.len) return null;
+            return std.mem.sliceTo(self.memory[start..], 0);
+        }
+        fn callGuest(_: *anyopaque, _: u64, _: [6]u64) u64 {
+            return 0;
+        }
+    };
+
+    var state = TestState{};
+    const input = "  -0x1f-tail";
+    @memcpy(state.memory[0..input.len], input);
+    state.memory[input.len] = 0;
+    state.args = .{ 0, 128, 0, 0, 0, 0 };
+
+    const ctx = PrimitiveContext{
+        .ptr = &state,
+        .readArgFn = TestState.readArg,
+        .setResultFn = TestState.setResult,
+        .readGuestFn = TestState.readGuest,
+        .writeGuestFn = TestState.writeGuest,
+        .readCStringFn = TestState.readCString,
+        .callGuestFn = TestState.callGuest,
+    };
+
+    try std.testing.expectEqual(Result.handled, strtoull(0, &ctx));
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -31))), state.result);
+    try std.testing.expectEqual(
+        @as(u64, 7),
+        std.mem.readInt(u64, state.memory[128..136], .little),
+    );
+
+    const overflow_input = "18446744073709551616";
+    @memcpy(state.memory[32 .. 32 + overflow_input.len], overflow_input);
+    state.memory[32 + overflow_input.len] = 0;
+    state.args = .{ 32, 136, 10, 0, 0, 0 };
+    try std.testing.expectEqual(Result.handled, strtoull(0, &ctx));
+    try std.testing.expectEqual(std.math.maxInt(u64), state.result);
+    try std.testing.expectEqual(
+        @as(u64, 32 + overflow_input.len),
+        std.mem.readInt(u64, state.memory[136..144], .little),
+    );
 }
 
 test "handlers: cxaGuardRelease sets bit 0" {

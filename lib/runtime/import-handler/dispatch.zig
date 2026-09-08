@@ -28,7 +28,133 @@ const x64_backend_diagnostics = @import("diagnostics").x64_backend_diagnostics;
 const symbol_assembly_context = macho_core.symbol_assembly_context;
 const scheduler = @import("scheduler");
 
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn unsetenv(name: [*:0]const u8) c_int;
+
 const log = std.log.scoped(.macho_import_dispatch);
+
+/// Longest environment variable name the guest may ask about, including room
+/// for the terminator this handler adds before consulting the host.
+const guest_environment_name_limit: usize = 256;
+
+/// Answer the run-identity names from Rosette's own sealed manifest.
+///
+/// Rosette publishes these with `setenv` and the guest reads them back through
+/// this very handler, so the whole handshake is a round trip through one
+/// process's environment block carrying values Rosette already holds. That
+/// round trip has exactly one failure mode worth having — the guest reads a
+/// value Rosette never sealed — and several that are not: the publish step not
+/// running, the name not surviving the lookup, an ambient variable disagreeing.
+/// None of those are visible to the guest, which sees only an absent variable
+/// and refuses its own start with no way to say why.
+///
+/// Answering from the sealed manifest removes the round trip. The guest cannot
+/// read an identity Rosette has not sealed, and a sealed identity cannot fail
+/// to reach the guest. The environment publish is kept for anything outside
+/// this process that wants to read it.
+fn auditIdentityText(self: anytype, key: []const u8, buffer: []u8) ?[]const u8 {
+    const State = @TypeOf(self.*);
+    if (!@hasField(State, "audit_manifest")) return null;
+    // An unsealed manifest has no identity to hand over. Falling through to the
+    // environment here is deliberate: it keeps a pre-seal read honest instead
+    // of inventing a value that nothing has committed to.
+    if (!self.audit_manifest.sealIntact()) return null;
+    if (std.mem.eql(u8, key, "ROSETTE_BACKEND")) {
+        if (!@hasField(State, "audit_backend_name") or
+            !@hasField(State, "audit_backend_name_length")) return null;
+        const length = self.audit_backend_name_length;
+        if (length == 0 or length > self.audit_backend_name.len) return null;
+        // Copy into the caller's bounded scratch buffer so the answer has the
+        // same lifetime and ownership rules as every other guest environment
+        // value. Keeping one backend branch also prevents a future change from
+        // accidentally making the canonical sealed answer unreachable.
+        @memcpy(buffer[0..length], self.audit_backend_name[0..length]);
+        return buffer[0..length];
+    }
+    const value: u64 = if (std.mem.eql(u8, key, "ROSETTE_RUN_ID"))
+        self.audit_manifest.identity.run_id
+    else if (std.mem.eql(u8, key, "ROSETTE_MANIFEST_HASH"))
+        self.audit_manifest.fingerprint()
+    else if (std.mem.eql(u8, key, "ROSETTE_BUILD_IDENTITY_HASH"))
+        (if (@hasField(State, "audit_build_identity_hash")) self.audit_build_identity_hash else 0)
+    else
+        return null;
+    // The reader rejects a zero as absent, so a zero is not an answer.
+    if (value == 0) return null;
+    return std.fmt.bufPrint(buffer, "0x{x}", .{value}) catch null;
+}
+
+/// How many environment answers have been traced so far.
+///
+/// Bounded because a guest that polls a variable in a loop would otherwise
+/// bury the run in its own log; the surface a real title reads is fifteen
+/// names, so the cap is never reached in practice and its being reached is
+/// itself worth seeing.
+var traced_environment_answers: u32 = 0;
+const max_traced_environment_answers: u32 = 64;
+
+/// Record what the guest asked for and what it got.
+///
+/// This channel has now failed three separate ways that were invisible from
+/// both ends: a name outside a hardcoded list, a value published but not
+/// readable, and an audit that reported a name answerable without ever asking
+/// the code that answers it. In each case the guest saw "unset" and refused its
+/// own start thousands of lines later. The answer is cheap to write down and
+/// the absence of it has been expensive.
+fn traceEnvironmentAnswer(key: []const u8, answer: ?[]const u8) void {
+    if (traced_environment_answers >= max_traced_environment_answers) return;
+    traced_environment_answers += 1;
+    if (answer) |value| {
+        // A run-identity value is short and is the thing under suspicion, so it
+        // is printed. Anything else could be a path from the operator's machine
+        // and only its presence matters here.
+        if (std.mem.startsWith(u8, key, "ROSETTE_")) {
+            machoCapturePrint(
+                "macho-processor: GUEST ENVIRONMENT: name={s} answered=YES value={s}\n",
+                .{ key, value },
+            );
+        } else {
+            machoCapturePrint(
+                "macho-processor: GUEST ENVIRONMENT: name={s} answered=YES bytes={d}\n",
+                .{ key, value.len },
+            );
+        }
+    } else {
+        machoCapturePrint(
+            "macho-processor: GUEST ENVIRONMENT: name={s} answered=NO; the guest cannot tell this from a variable that is genuinely unset\n",
+            .{key},
+        );
+    }
+}
+
+/// Answer a name exactly as the guest's own lookup will.
+///
+/// Exported so a pre-launch audit can establish answerability by *asking*
+/// rather than by checking a proxy for it. An audit that concludes a name is
+/// answerable from something other than the answering code has only checked its
+/// own assumption, and this one did: it reported the run identity readable on a
+/// run where the guest could not read it.
+pub fn guestCanAnswerEnvironmentName(self: anytype, key: []const u8) bool {
+    var identity_buffer: [32]u8 = undefined;
+    var key_buffer: [guest_environment_name_limit]u8 = undefined;
+    if (auditIdentityText(self, key, &identity_buffer) != null) return true;
+    return hostEnvironmentValue(key, &key_buffer) != null;
+}
+
+/// Look one guest-supplied name up in the host environment.
+///
+/// Kept separate from the dispatch path so the terminator handling is
+/// testable. The guest hands over a length-bounded slice and the host expects a
+/// sentinel-terminated string; joining those two without writing the
+/// terminator reads whatever follows the name in guest memory and looks up a
+/// variable nobody asked for.
+fn hostEnvironmentValue(key: []const u8, buffer: *[guest_environment_name_limit]u8) ?[]const u8 {
+    if (key.len == 0 or key.len >= buffer.len) return null;
+    @memcpy(buffer[0..key.len], key);
+    buffer[key.len] = 0;
+    const raw = std.c.getenv(buffer[0..key.len :0]) orelse return null;
+    return std.mem.sliceTo(raw, 0);
+}
 const ImportHandlerResult = types.ImportHandlerResult;
 const ImportRoute = types.ImportRoute;
 const ImportTraceEntry = types.ImportTraceEntry;
@@ -823,23 +949,45 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         return .{ .handled = result };
     }
     if ((name_hash == importNameHash("_getenv") and std.mem.eql(u8, name, "_getenv"))) {
-        const key = self.guestCString(self.regs.rdi, 256) orelse return .{ .handled = 0 };
-        const raw = if (std.mem.eql(u8, key, "HOME"))
-            std.c.getenv("HOME")
-        else if (std.mem.eql(u8, key, "XDG_DATA_HOME"))
-            std.c.getenv("XDG_DATA_HOME")
-        else if (std.mem.eql(u8, key, "TMPDIR"))
-            std.c.getenv("TMPDIR")
-        else if (std.mem.eql(u8, key, "USER"))
-            std.c.getenv("USER")
-        else if (std.mem.eql(u8, key, "PATH"))
-            std.c.getenv("PATH")
-        else
-            null;
-        const host_value = raw orelse return .{ .handled = 0 };
-        const value = std.mem.sliceTo(host_value, 0);
-        const allocation = self.guestAlloc(value.len + 1, 1) orelse return .{ .handled = 0 };
-        if (!self.guestWriteCString(allocation, value)) return .{ .handled = 0 };
+        // Answer from the real environment, not from a list of names someone
+        // remembered to add.
+        //
+        // This used to serve only HOME, XDG_DATA_HOME, TMPDIR, USER and PATH —
+        // the set a windowed application needs to locate its own directories —
+        // and returned null for everything else. To the guest that is
+        // indistinguishable from a variable which is genuinely unset, so every
+        // handshake Rosette conducts with the guest through the environment
+        // failed silently and then read as the guest's fault.
+        //
+        // Rosette's own run-identity handoff was the first casualty. It
+        // publishes ROSETTE_RUN_ID and the manifest hash with setenv before the
+        // first guest instruction and the emulator reads them back to bind its
+        // causal ledger to this run; with those two names outside the list, the
+        // emulator refused its own authentic start over variables Rosette had
+        // already set for it, and reported it as a graphics-system failure
+        // several thousand log lines away from the cause.
+        const key = self.guestCString(self.regs.rdi, guest_environment_name_limit) orelse
+            return .{ .handled = 0 };
+        var identity_buffer: [32]u8 = undefined;
+        var key_buffer: [guest_environment_name_limit]u8 = undefined;
+        const answer = auditIdentityText(self, key, &identity_buffer) orelse
+            hostEnvironmentValue(key, &key_buffer);
+        traceEnvironmentAnswer(key, answer);
+        const value = answer orelse return .{ .handled = 0 };
+        const allocation = self.guestAlloc(value.len + 1, 1) orelse {
+            machoCapturePrint(
+                "macho-processor: GUEST ENVIRONMENT: name={s} answered=YES but the guest allocation failed, so the guest reads it as unset\n",
+                .{key},
+            );
+            return .{ .handled = 0 };
+        };
+        if (!self.guestWriteCString(allocation, value)) {
+            machoCapturePrint(
+                "macho-processor: GUEST ENVIRONMENT: name={s} answered=YES but the value could not be written into guest memory, so the guest reads it as unset\n",
+                .{key},
+            );
+            return .{ .handled = 0 };
+        }
         return .{ .handled = allocation };
     }
     if ((name_hash == importNameHash("_getpwuid_r") and std.mem.eql(u8, name, "_getpwuid_r"))) {
@@ -2960,4 +3108,59 @@ test "base-2 math imports return the value, at the width the ABI expects" {
     // Domain edges match libm rather than trapping.
     try std.testing.expect(std.math.isNegativeInf(log2Double(0.0)));
     try std.testing.expect(std.math.isNan(log2Double(-1.0)));
+}
+
+test "the guest reads the real host environment, not a list of remembered names" {
+    // The defect this covers: the lookup used to answer five hardcoded names
+    // and return null for everything else, so Rosette's own run-identity
+    // handoff — published with setenv before the first guest instruction —
+    // came back absent and the emulator refused its own authentic start.
+    const name = "ROSETTE_DISPATCH_GETENV_PROBE";
+    const value = "0x35b38b1f527cfe58";
+    try std.testing.expectEqual(@as(c_int, 0), setenv(name, value, 1));
+    defer _ = unsetenv(name);
+
+    var buffer: [guest_environment_name_limit]u8 = undefined;
+    const found = hostEnvironmentValue(name, &buffer) orelse return error.NameShouldResolve;
+    try std.testing.expectEqualStrings(value, found);
+
+    // The names that used to be the whole list still work, so the generalised
+    // lookup is a superset rather than a swap.
+    _ = hostEnvironmentValue("PATH", &buffer);
+    _ = hostEnvironmentValue("HOME", &buffer);
+}
+
+test "a name the host does not carry reads as absent rather than as empty" {
+    var buffer: [guest_environment_name_limit]u8 = undefined;
+    try std.testing.expect(hostEnvironmentValue("ROSETTE_NAME_THAT_IS_NOT_SET_ANYWHERE", &buffer) == null);
+}
+
+test "an empty or over-long name is refused instead of read past" {
+    var buffer: [guest_environment_name_limit]u8 = undefined;
+    // An empty name has no terminator position worth writing and no variable
+    // to find.
+    try std.testing.expect(hostEnvironmentValue("", &buffer) == null);
+    // A name that fills the buffer leaves nowhere for the terminator, so it is
+    // refused rather than truncated into a different variable's name.
+    const oversized = [_]u8{'A'} ** guest_environment_name_limit;
+    try std.testing.expect(hostEnvironmentValue(&oversized, &buffer) == null);
+    const longest_allowed = [_]u8{'A'} ** (guest_environment_name_limit - 1);
+    // One shorter fits, and simply resolves to nothing because no such
+    // variable exists — refusal and absence stay distinguishable in the code
+    // even though both reach the guest as null.
+    try std.testing.expect(hostEnvironmentValue(&longest_allowed, &buffer) == null);
+}
+
+test "a name is terminated at its own length, not at whatever follows it" {
+    // Guest memory is not null-terminated where the slice ends. Reusing a
+    // dirty buffer must not extend the name into the previous one.
+    const name = "ROSETTE_DISPATCH_TERMINATION_PROBE";
+    try std.testing.expectEqual(@as(c_int, 0), setenv(name, "kept", 1));
+    defer _ = unsetenv(name);
+
+    var buffer: [guest_environment_name_limit]u8 = undefined;
+    @memset(&buffer, 'Z');
+    const found = hostEnvironmentValue(name, &buffer) orelse return error.NameShouldResolve;
+    try std.testing.expectEqualStrings("kept", found);
+    try std.testing.expectEqual(@as(u8, 0), buffer[name.len]);
 }

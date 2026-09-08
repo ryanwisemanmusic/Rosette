@@ -57,6 +57,7 @@ pub fn beginCooperativeMainLoop(self: anytype) bool {
         .regs = self.regs,
         .xmm = self.xmm,
         .ymm_hi = self.ymm_hi,
+        .zmm_hi = self.zmm_hi,
         .k = self.k,
         .x87 = self.x87,
         .signal_state = captureActiveGuestSignalState(self),
@@ -89,8 +90,9 @@ pub fn startDeferredGuestThread(self: anytype, deferred: pthread_runtime.Deferre
     const stack_base = self.guestAlloc(stack_size, 16) orelse return false;
 
     self.regs = .{};
-    self.xmm = [_][16]u8{[_]u8{0} ** 16} ** 16;
-    self.ymm_hi = [_][16]u8{[_]u8{0} ** 16} ** 16;
+    self.xmm = [_][16]u8{[_]u8{0} ** 16} ** 32;
+    self.ymm_hi = [_][16]u8{[_]u8{0} ** 16} ** 32;
+    self.zmm_hi = [_][32]u8{[_]u8{0} ** 32} ** 32;
     self.k = [_]u64{0xFFFF_FFFF_FFFF_FFFF} ** 8;
     self.x87 = .{};
     resetActiveGuestSignalState(self);
@@ -123,6 +125,7 @@ pub fn saveActiveGuestThread(self: anytype, reason: []const u8) bool {
         .regs = self.regs,
         .xmm = self.xmm,
         .ymm_hi = self.ymm_hi,
+        .zmm_hi = self.zmm_hi,
         .k = self.k,
         .x87 = self.x87,
         .signal_state = captureActiveGuestSignalState(self),
@@ -199,6 +202,7 @@ pub fn resumeSuspendedGuestThread(self: anytype) bool {
         self.regs = context.regs;
         self.xmm = context.xmm;
         self.ymm_hi = context.ymm_hi;
+        self.zmm_hi = context.zmm_hi;
         self.k = context.k;
         self.x87 = context.x87;
         self.last_guest_assertion = context.assertion_context;
@@ -896,6 +900,7 @@ pub fn startNextIdleCallback(self: anytype, reason: []const u8, active_already_s
         self.regs = context.regs;
         self.xmm = context.xmm;
         self.ymm_hi = context.ymm_hi;
+        self.zmm_hi = context.zmm_hi;
         self.k = context.k;
         self.x87 = context.x87;
         resetActiveGuestSignalState(self);
@@ -1113,6 +1118,7 @@ pub fn restoreMainLoopCaller(self: anytype, reason: []const u8) void {
     self.regs = context.regs;
     self.xmm = context.xmm;
     self.ymm_hi = context.ymm_hi;
+    self.zmm_hi = context.zmm_hi;
     self.k = context.k;
     self.x87 = context.x87;
     restoreActiveGuestSignalState(self, context.signal_state);

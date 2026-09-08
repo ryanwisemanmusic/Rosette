@@ -153,6 +153,7 @@ pub fn deliverGuestSignal(
     frame.saved_regs = self.regs;
     frame.saved_xmm = self.xmm;
     frame.saved_ymm_hi = self.ymm_hi;
+    frame.saved_zmm_hi = self.zmm_hi;
     frame.saved_k = self.k;
     frame.saved_x87 = self.x87;
     self.signal_frame_count += 1;
@@ -302,6 +303,7 @@ pub fn finishGuestSignalReturn(self: anytype) bool {
     // handler work leak into the interrupted guest thread.
     self.xmm = frame.saved_xmm;
     self.ymm_hi = frame.saved_ymm_hi;
+    self.zmm_hi = frame.saved_zmm_hi;
     self.k = frame.saved_k;
     self.x87 = frame.saved_x87;
     self.last_guest_assertion = frame.saved_assertion_context;

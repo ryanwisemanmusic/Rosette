@@ -1,5 +1,6 @@
 const std = @import("std");
 const x64_decoder = @import("x64_decoder");
+const evex = @import("evex_runtime");
 const cleo_routing = @import("cleo_routing");
 const exit_diagnostics = @import("exit_diagnostics");
 const macho_log = @import("dyld").event_log;
@@ -74,6 +75,7 @@ const blendPackedWords = packed_ops.blendPackedWords;
 const blendPackedElements = packed_ops.blendPackedElements;
 const shiftPackedBytes = packed_ops.shiftPackedBytes;
 const packedMinMax = packed_ops.packedMinMax;
+const packedIntegerMulHigh = packed_ops.packedIntegerMulHigh;
 const shiftPackedElements = packed_ops.shiftPackedElements;
 const arithmeticShiftPackedElements = packed_ops.arithmeticShiftPackedElements;
 const threeOperandImulResult = utils.threeOperandImulResult;
@@ -96,11 +98,204 @@ fn arithmeticShiftRight(value: u64, size: Size, count: u6) u64 {
     return @as(u64, @bitCast(signed >> count)) & maskForSize(size);
 }
 
+fn bmiSource(self: anytype, d: DecodedInsn) u64 {
+    return if (d.is_reg_form) self.regVal(d.src_reg, d.size) else self.readMemVal(d.addr, d.size);
+}
+
+/// Execute the scalar GPR BMI family. These instructions are VEX encoded,
+/// but they operate on the ordinary x86 register file rather than XMM/YMM
+/// state. Keeping them in the interpreter also makes memory-source forms use
+/// the same guest-memory and fault machinery as the rest of the executor.
+fn executeBmi(self: anytype, d: DecodedInsn) void {
+    const mask = maskForSize(d.size);
+    const width: u7 = if (d.size == .bits64) 64 else 32;
+
+    switch (d.op) {
+        .andn => {
+            const source1 = self.regVal(d.src_reg2, d.size);
+            const source2 = bmiSource(self, d);
+            const result = (~source1 & source2) & mask;
+            self.setReg(d.dst_reg, d.size, result);
+            self.setFlagsLogic(result, d.size);
+        },
+        .bzhi => {
+            const source = bmiSource(self, d) & mask;
+            // BZHI uses the low eight bits of the index operand. The index is
+            // deliberately not truncated to the data width before this test:
+            // an index of 32/64 or greater selects the unchanged source and
+            // sets CF.
+            const index = self.regVal(d.src_reg2, d.size) & 0xFF;
+            const result = if (index >= width)
+                source
+            else if (index == 0)
+                0
+            else
+                source & ((@as(u64, 1) << @as(u6, @intCast(index))) - 1);
+            self.setReg(d.dst_reg, d.size, result);
+            self.setFlag(RFL_CF, index >= width);
+        },
+        .mulx => {
+            // Intel syntax names the ModRM.reg destination as the high half
+            // and VEX.vvvv as the low half. Read both operands before either
+            // write so overlapping destinations (common in Xenia's generated
+            // code) remain architecturally correct.
+            const multiplicand = self.regVal(.dl_dx_edx_rdx, d.size);
+            const source = bmiSource(self, d);
+            const product = @as(u128, multiplicand) * @as(u128, source);
+            const low = @as(u64, @truncate(product)) & mask;
+            const high = @as(u64, @truncate(product >> width)) & mask;
+            self.setReg(d.dst_reg, d.size, high);
+            self.setReg(d.dst_reg2, d.size, low);
+        },
+        .rorx => {
+            const source = bmiSource(self, d) & mask;
+            const count: u6 = @intCast(d.imm & (width - 1));
+            const result = if (count == 0) blk: {
+                break :blk source;
+            } else blk: {
+                const rotate_back: u6 = @intCast((width - count) & 63);
+                break :blk ((source >> count) | (source << rotate_back)) & mask;
+            };
+            self.setReg(d.dst_reg, d.size, result);
+        },
+        .shlx => {
+            const source = bmiSource(self, d) & mask;
+            const count: u6 = @intCast(self.regVal(d.src_reg2, d.size) & (width - 1));
+            self.setReg(d.dst_reg, d.size, (source << count) & mask);
+        },
+        .shrx => {
+            const source = bmiSource(self, d) & mask;
+            const count: u6 = @intCast(self.regVal(d.src_reg2, d.size) & (width - 1));
+            self.setReg(d.dst_reg, d.size, source >> count);
+        },
+        .sarx => {
+            const source = bmiSource(self, d) & mask;
+            const count: u6 = @intCast(self.regVal(d.src_reg2, d.size) & (width - 1));
+            self.setReg(d.dst_reg, d.size, arithmeticShiftRight(source, d.size, count));
+        },
+        else => unreachable,
+    }
+}
+
+fn vpdpbusdBlock(accumulator: [16]u8, unsigned_source: [16]u8, signed_source: [16]u8) [16]u8 {
+    var result = accumulator;
+    for (0..4) |lane| {
+        const offset = lane * 4;
+        var total: i64 = @as(i64, @as(i32, @bitCast(std.mem.readInt(u32, accumulator[offset..][0..4], .little))));
+        for (0..4) |byte_index| {
+            const unsigned_value: i64 = unsigned_source[offset + byte_index];
+            const signed_value: i64 = @as(i8, @bitCast(signed_source[offset + byte_index]));
+            total += unsigned_value * signed_value;
+        }
+        std.mem.writeInt(u32, result[offset..][0..4], @truncate(@as(u64, @bitCast(total))), .little);
+    }
+    return result;
+}
+
+fn executeVpdpbusd(self: anytype, d: DecodedInsn) void {
+    const low_unsigned = self.xmm[d.xmm_src];
+    const low_signed = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+    self.xmm[d.xmm_dst] = vpdpbusdBlock(self.xmm[d.xmm_dst], low_unsigned, low_signed);
+
+    if (d.vector_256) {
+        const high_unsigned = self.ymm_hi[d.xmm_src];
+        const high_signed = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+        self.ymm_hi[d.xmm_dst] = vpdpbusdBlock(self.ymm_hi[d.xmm_dst], high_unsigned, high_signed);
+    } else {
+        // VEX.128 writes the architectural upper half of the YMM register as
+        // zero, just like the other VEX instruction families.
+        @memset(&self.ymm_hi[d.xmm_dst], 0);
+    }
+}
+
+fn executeVexLane128(self: anytype, d: DecodedInsn) void {
+    if (d.op == .vextractf128) {
+        // VEXTRACTF128/VEXTRACTI128 select one 128-bit half of a YMM source.
+        // The decoder normalizes the integer alias to vextractf128 because
+        // both forms are bitwise-identical at this layer.
+        const selected = if ((d.imm & 1) == 0) self.xmm[d.xmm_src] else self.ymm_hi[d.xmm_src];
+        if (d.is_reg_form) {
+            self.xmm[d.xmm_dst] = selected;
+            @memset(&self.ymm_hi[d.xmm_dst], 0);
+        } else {
+            self.writeMem128(d.addr, selected);
+        }
+        return;
+    }
+
+    // VINSERTF128/VINSERTI128 retain the unselected 128-bit half of SRC1 and
+    // replace the selected half with SRC2 (the ModR/M.r/m operand).
+    const source2 = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+    const source1_low = self.xmm[d.xmm_src];
+    const source1_high = self.ymm_hi[d.xmm_src];
+    const low = if ((d.imm & 1) == 0) source2 else source1_low;
+    const high = if ((d.imm & 1) == 0) source1_high else source2;
+    self.xmm[d.xmm_dst] = low;
+    self.ymm_hi[d.xmm_dst] = high;
+}
+
+/// Execute VPERM2F128. The immediate selects each destination 128-bit lane
+/// independently from the low/high halves of either source; bits 3 and 7
+/// zero the corresponding destination lane. Read all operands before writing
+/// the destination because the destination may alias either source register.
+fn executeVexPermute2x128(self: anytype, d: DecodedInsn) void {
+    const source1_low = self.xmm[d.xmm_src];
+    const source1_high = self.ymm_hi[d.xmm_src];
+    const source2_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+    const source2_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+
+    const selectedLow = switch (d.imm & 0x03) {
+        0 => source1_low,
+        1 => source1_high,
+        2 => source2_low,
+        3 => source2_high,
+        else => unreachable,
+    };
+    const selectedHigh = switch ((d.imm >> 4) & 0x03) {
+        0 => source1_low,
+        1 => source1_high,
+        2 => source2_low,
+        3 => source2_high,
+        else => unreachable,
+    };
+
+    var result_low = selectedLow;
+    var result_high = selectedHigh;
+    if ((d.imm & 0x08) != 0) @memset(&result_low, 0);
+    if ((d.imm & 0x80) != 0) @memset(&result_high, 0);
+    self.xmm[d.xmm_dst] = result_low;
+    self.ymm_hi[d.xmm_dst] = result_high;
+}
+
+/// Execute the 128-bit VPHMINPOSUW reduction. The first result word is the
+/// unsigned minimum, the second is its lowest index, and the remaining words
+/// are architecturally zero.
+fn executeVphminposuw(self: anytype, d: DecodedInsn) void {
+    const source = if (d.is_reg_form) self.xmm[d.xmm_src] else self.readMem128(d.addr);
+    var minimum: u16 = std.math.maxInt(u16);
+    var minimum_index: u16 = 0;
+    for (0..8) |lane| {
+        const value = std.mem.readInt(u16, source[lane * 2 ..][0..2], .little);
+        if (value < minimum) {
+            minimum = value;
+            minimum_index = @intCast(lane);
+        }
+    }
+    var result = [_]u8{0} ** 16;
+    std.mem.writeInt(u16, result[0..2], minimum, .little);
+    std.mem.writeInt(u16, result[2..4], minimum_index, .little);
+    self.xmm[d.xmm_dst] = result;
+    @memset(&self.ymm_hi[d.xmm_dst], 0);
+}
+
 fn packedIntegerOperation(op: Op) PackedIntegerOperation {
     return switch (op) {
         .vpaddb, .vpaddw, .vpaddd, .vpaddq => .add,
         .vpsubb, .vpsubw, .vpsubd, .vpsubq => .sub,
-        .vpmullw => .mul_low,
+        .vpmullw, .vpmulld_38 => .mul_low,
+        .vpsubsb, .vpsubsw => .sub_signed_saturate,
+        .vpsubusw => .sub_unsigned_saturate,
+        .vpaddsb, .vpaddsw => .add_signed_saturate,
         else => unreachable,
     };
 }
@@ -108,15 +303,18 @@ fn packedIntegerOperation(op: Op) PackedIntegerOperation {
 fn packedIntegerLaneBits(op: Op) u8 {
     return switch (op) {
         .vpaddb, .vpsubb => 8,
-        .vpaddw, .vpsubw, .vpmullw => 16,
-        .vpaddd, .vpsubd => 32,
+        .vpaddw, .vpsubw, .vpmullw, .vpsubsb, .vpsubsw, .vpsubusw, .vpaddsw, .vpmulhw, .vpmulhuw => 16,
+        .vpaddd, .vpsubd, .vpmulld_38 => 32,
         .vpaddq, .vpsubq => 64,
+        .vpaddsb => 8,
         else => unreachable,
     };
 }
 
 fn packedMinMaxKind(op: Op) packed_ops.MinMaxKind {
     return switch (op) {
+        .vpminub => .{ .lane_bits = 8, .signed = false, .take_max = false },
+        .vpmaxub => .{ .lane_bits = 8, .signed = false, .take_max = true },
         .vpminsb => .{ .lane_bits = 8, .signed = true, .take_max = false },
         .vpmaxsb => .{ .lane_bits = 8, .signed = true, .take_max = true },
         .vpminuw => .{ .lane_bits = 16, .signed = false, .take_max = false },
@@ -140,6 +338,114 @@ fn packedShiftLaneBits(op: Op) u8 {
 
 fn isCooperativeYieldImport(name: []const u8) bool {
     return std.mem.eql(u8, name, "_pthread_yield_np") or std.mem.eql(u8, name, "_sched_yield");
+}
+
+fn stringStride(size: Size) u64 {
+    return switch (size) {
+        .bits8 => 1,
+        .bits16 => 2,
+        .bits32 => 4,
+        .bits64 => 8,
+    };
+}
+
+fn stringAddress(self: anytype, index: RegId, address_size: Size, segment: x64_decoder.Segment) u64 {
+    const offset = x64_decoder.regVal(&self.regs, index, address_size);
+    return offset +% x64_decoder.segmentBase(&self.regs, segment, .long64);
+}
+
+fn advanceStringIndex(self: anytype, index: RegId, address_size: Size, stride: u64, backwards: bool) void {
+    const old = x64_decoder.regVal(&self.regs, index, address_size);
+    const next = if (backwards) old -% stride else old +% stride;
+    x64_decoder.setReg(&self.regs, index, address_size, next);
+}
+
+fn readStringValue(self: anytype, address: u64, size: Size) ?u64 {
+    const value = self.readMemVal(address, size);
+    if (self.terminated) return null;
+    return value;
+}
+
+/// Execute the implicit legacy string-operation family.  REP is completed
+/// here rather than by re-entering the instruction at the same RIP: the Mach-O
+/// stepper advances RIP once after this function returns, while RCX and the
+/// index registers retain the architectural post-REP state.  A terminating
+/// memory fault returns before mutating the current iteration's indexes or
+/// count, preserving the partial-progress state needed by diagnostics.
+fn executeStringOperation(self: anytype, d: DecodedInsn) void {
+    const address_size: Size = if (d.has_0x67) .bits32 else .bits64;
+    const stride = stringStride(d.size);
+    const backwards = (self.regs.rflags & RFL_DF) != 0;
+    const repeated = d.repeat != .none;
+    var remaining: u64 = if (repeated)
+        x64_decoder.regVal(&self.regs, .cl_cx_ecx_rcx, address_size)
+    else
+        1;
+
+    // REP with a zero count is a no-op, including no pointer/flag updates.
+    if (remaining == 0) return;
+
+    while (remaining != 0) {
+        switch (d.op) {
+            .movs => {
+                const source_address = stringAddress(self, .dh_si_esi_rsi, address_size, d.segment);
+                const destination_address = stringAddress(self, .bh_di_edi_rdi, address_size, .es);
+                const value = readStringValue(self, source_address, d.size) orelse return;
+                self.writeMemVal(destination_address, d.size, value);
+                if (self.terminated) return;
+                advanceStringIndex(self, .dh_si_esi_rsi, address_size, stride, backwards);
+                advanceStringIndex(self, .bh_di_edi_rdi, address_size, stride, backwards);
+            },
+            .cmps => {
+                const source_address = stringAddress(self, .dh_si_esi_rsi, address_size, d.segment);
+                const destination_address = stringAddress(self, .bh_di_edi_rdi, address_size, .es);
+                const source = readStringValue(self, source_address, d.size) orelse return;
+                const destination = readStringValue(self, destination_address, d.size) orelse return;
+                const result = source -% destination;
+                x64_decoder.applySub(&self.regs.rflags, source, destination, result, d.size);
+                advanceStringIndex(self, .dh_si_esi_rsi, address_size, stride, backwards);
+                advanceStringIndex(self, .bh_di_edi_rdi, address_size, stride, backwards);
+            },
+            .stos => {
+                const destination_address = stringAddress(self, .bh_di_edi_rdi, address_size, .es);
+                const value = x64_decoder.regVal(&self.regs, .al_ax_eax_rax, d.size);
+                self.writeMemVal(destination_address, d.size, value);
+                if (self.terminated) return;
+                advanceStringIndex(self, .bh_di_edi_rdi, address_size, stride, backwards);
+            },
+            .lods => {
+                const source_address = stringAddress(self, .dh_si_esi_rsi, address_size, d.segment);
+                const value = readStringValue(self, source_address, d.size) orelse return;
+                x64_decoder.setReg(&self.regs, .al_ax_eax_rax, d.size, value);
+                advanceStringIndex(self, .dh_si_esi_rsi, address_size, stride, backwards);
+            },
+            .scas => {
+                const destination_address = stringAddress(self, .bh_di_edi_rdi, address_size, .es);
+                const accumulator = x64_decoder.regVal(&self.regs, .al_ax_eax_rax, d.size);
+                const destination = readStringValue(self, destination_address, d.size) orelse return;
+                const result = accumulator -% destination;
+                x64_decoder.applySub(&self.regs.rflags, accumulator, destination, result, d.size);
+                advanceStringIndex(self, .bh_di_edi_rdi, address_size, stride, backwards);
+            },
+            else => unreachable,
+        }
+
+        if (!repeated) break;
+        remaining -%= 1;
+        x64_decoder.setReg(&self.regs, .cl_cx_ecx_rcx, address_size, remaining);
+
+        // CMPS/SCAS use the result flags to decide whether REP continues.
+        // MOVS/STOS/LODS repeat solely according to the remaining count.
+        if ((d.op == .cmps or d.op == .scas) and remaining != 0) {
+            const equal = (self.regs.rflags & x64_decoder.RFL_ZF) != 0;
+            const continue_repeating = switch (d.repeat) {
+                .rep => equal,
+                .repne => !equal,
+                .none => false,
+            };
+            if (!continue_repeating) break;
+        }
+    }
 }
 
 const cleo_runtime_features = cleo_routing.types.FeatureSet.cleoEmulated();
@@ -190,6 +496,14 @@ inline fn cleoHandles(op: Op) bool {
 }
 
 pub fn execute(self: anytype, initial_d: DecodedInsn) void {
+    // EVEX uses a distinct 32-register vector file and mask semantics. Route
+    // it before CLEO and the legacy VEX switch so high ZMM operands cannot be
+    // truncated to the old 16-register XMM/YMM representation.
+    if (initial_d.is_evex or initial_d.op == .movdir64b or evex.handles(initial_d.op)) {
+        evex.execute(self, initial_d);
+        return;
+    }
+
     // CLEO supports a small subset of DecodedInsn operations. The former path
     // linearly scanned all 424 CLEO metadata records for every scalar guest
     // instruction. Resolve names once at compile time, then make the common
@@ -503,6 +817,33 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             };
             _ = self.x87.push(readExtendedFloat80(input));
         },
+        .fisttp_mem64 => {
+            const output = self.guestMemory(d.addr, 8) orelse {
+                self.terminateForGuestAccess(d.addr, 8, .write, "fisttp_mem64");
+                return;
+            };
+            const value = self.x87.get(0) orelse return;
+
+            // FISTTP always truncates toward zero and stores a signed 64-bit
+            // integer, independently of the x87 rounding-control field. The
+            // x86 indefinite integer value is required for NaN, infinity, and
+            // values outside the signed destination range. 2^63 is used as
+            // the upper bound because i64::MAX is not exactly representable
+            // in an f64, while -2^63 is exact and valid.
+            const min_i64 = -0x1p63;
+            const invalid = std.math.isNan(value) or
+                !std.math.isFinite(value) or
+                value < min_i64 or
+                value >= 0x1p63;
+            const integer = if (invalid)
+                std.math.minInt(i64)
+            else
+                @as(i64, @intFromFloat(value));
+            if (invalid) self.x87.stackFault(false);
+            _ = self.x87.pop();
+            self.writeMemVal(d.addr, .bits64, @bitCast(integer));
+            _ = output;
+        },
         .fstp_mem80 => {
             const output = self.guestMemory(d.addr, 10) orelse {
                 self.terminateForGuestAccess(d.addr, 10, .write, "fstp_mem80");
@@ -545,7 +886,20 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             @truncate(d.imm),
             (d.imm & (1 << 9)) != 0,
         ),
+        .fldz => _ = self.x87.push(0.0),
+        .fucomi_st => self.executeFucomi(@truncate(d.imm)),
+        .fcomi_st => self.executeFcomi(@truncate(d.imm)),
         .fucomip_st => self.executeFucomip(@truncate(d.imm)),
+        .fcomip_st => self.executeFcomip(@truncate(d.imm)),
+        .fcmovb_st,
+        .fcmove_st,
+        .fcmovbe_st,
+        .fcmovu_st,
+        .fcmovnb_st,
+        .fcmovne_st,
+        .fcmovnbe_st,
+        .fcmovnu_st,
+        => self.executeFcmov(@truncate(d.imm), d.cond),
 
         .mov_reg8_mem8 => {
             self.setRegOperand(d.dst_reg, .bits8, d.dst_high8, self.readMemVal(d.addr, .bits8));
@@ -916,26 +1270,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             self.writeMemVal(d.addr, .bits64, self.pop());
         },
 
-        .lods => {
-            const src_addr = self.regs.rsi;
-            switch (d.size) {
-                .bits8 => self.setReg(.al_ax_eax_rax, .bits8, self.readMemVal(src_addr, .bits8)),
-                .bits16 => self.setReg(.al_ax_eax_rax, .bits16, self.readMemVal(src_addr, .bits16)),
-                .bits32 => self.setReg(.al_ax_eax_rax, .bits32, self.readMemVal(src_addr, .bits32)),
-                .bits64 => self.setReg(.al_ax_eax_rax, .bits64, self.readMemVal(src_addr, .bits64)),
-            }
-            const stride: u64 = switch (d.size) {
-                .bits8 => 1,
-                .bits16 => 2,
-                .bits32 => 4,
-                .bits64 => 8,
-            };
-            if ((self.regs.rflags & RFL_DF) != 0) {
-                self.regs.rsi -|= stride;
-            } else {
-                self.regs.rsi +|= stride;
-            }
-        },
+        .movs, .cmps, .stos, .lods, .scas => executeStringOperation(self, d),
 
         .call_rel32 => {
             const from_rip = self.regs.rip;
@@ -1328,6 +1663,8 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         .lzcnt_reg_reg,
         .lzcnt_reg_mem,
         => self.executeBitScan(d),
+
+        .andn, .bzhi, .mulx, .rorx, .shlx, .shrx, .sarx => executeBmi(self, d),
 
         .popcnt_reg_reg, .popcnt_reg_mem => {
             const source = if (d.op == .popcnt_reg_mem)
@@ -1797,7 +2134,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             else
                 self.readMemVal(d.addr, .bits32));
             @memset(&self.xmm[d.xmm_dst], 0);
-            @memset(&self.ymm_hi[d.xmm_dst], 0);
+            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
             std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], value, .little);
         },
         .vmovd_reg32_xmm, .vmovd_mem32_xmm => {
@@ -1815,7 +2152,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             else
                 self.readMemVal(d.addr, .bits64);
             @memset(&self.xmm[d.xmm_dst], 0);
-            @memset(&self.ymm_hi[d.xmm_dst], 0);
+            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
             std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], value, .little);
         },
         .vmovq_reg64_xmm, .vmovq_mem64_xmm => {
@@ -1826,6 +2163,9 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 self.writeMemVal(d.addr, .bits64, value);
             }
         },
+        .vextractf128, .vinsertf128, .vinserti128 => executeVexLane128(self, d),
+        .vperm2f128 => executeVexPermute2x128(self, d),
+        .vphminposuw => executeVphminposuw(self, d),
         .vpinsrb_xmm_xmm_reg32, .vpinsrb_xmm_xmm_mem8 => {
             self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
             const value: u8 = @truncate(if (d.op == .vpinsrb_xmm_xmm_reg32)
@@ -1877,7 +2217,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }
         },
-        .vptest => {
+        .vptest, .vtestps, .vtestpd => {
             const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
             const low_zf = bitwiseAndAllZero(self.xmm[d.xmm_src], rhs_low);
             const low_cf = bitwiseAndNotAllZero(self.xmm[d.xmm_src], rhs_low);
@@ -1892,6 +2232,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 if (low_cf) self.regs.rflags |= RFL_CF;
             }
         },
+        .vpdpbusd => executeVpdpbusd(self, d),
         .vpunpckldq => {
             const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
             self.xmm[d.xmm_dst] = unpackLowDwords(self.xmm[d.xmm_src], rhs_low);
@@ -1924,11 +2265,11 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         },
         .vmovdqu_xmm_xmm, .vmovdqa_xmm_xmm, .vmovups_xmm_xmm, .vmovaps_xmm_xmm, .vmovupd_xmm_xmm, .vmovapd_xmm_xmm => {
             self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
-            @memset(&self.ymm_hi[d.xmm_dst], 0);
+            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
         },
         .vmovdqu_xmm_mem, .vmovdqa_xmm_mem, .vmovups_xmm_mem, .vmovaps_xmm_mem, .vmovupd_xmm_mem, .vmovapd_xmm_mem => {
             self.xmm[d.xmm_dst] = self.readMem128(d.addr);
-            @memset(&self.ymm_hi[d.xmm_dst], 0);
+            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
         },
         .vmovdqu_mem_xmm, .vmovdqa_mem_xmm, .vmovups_mem_xmm, .vmovaps_mem_xmm, .vmovupd_mem_xmm, .vmovapd_mem_xmm => {
             self.writeMem128(d.addr, self.xmm[d.xmm_src]);
@@ -2159,6 +2500,28 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             }
             self.setReg(d.dst_reg, .bits32, mask);
         },
+        .vmovmskps, .vmovmskpd => {
+            // MOVMSKPS/PD extracts sign bits from each packed lane. The VEX
+            // form can use a YMM source; the legacy form is XMM-only and is
+            // marked by vector_256=false. The destination is always a
+            // zero-extended 32-bit GPR.
+            const lane_bytes: usize = if (d.op == .vmovmskps) 4 else 8;
+            const lane_count: usize = if (d.vector_256) 32 / lane_bytes else 16 / lane_bytes;
+            var mask: u32 = 0;
+            for (0..lane_count) |lane| {
+                const vector = if (lane < 16 / lane_bytes)
+                    self.xmm[d.xmm_src]
+                else
+                    self.ymm_hi[d.xmm_src];
+                const offset = (lane % (16 / lane_bytes)) * lane_bytes;
+                const sign = if (lane_bytes == 4)
+                    (std.mem.readInt(u32, vector[offset..][0..4], .little) & 0x8000_0000) != 0
+                else
+                    (std.mem.readInt(u64, vector[offset..][0..8], .little) & 0x8000_0000_0000_0000) != 0;
+                if (sign) mask |= @as(u32, 1) << @intCast(lane);
+            }
+            self.setReg(d.dst_reg, .bits32, mask);
+        },
         .vandps, .vandpd, .vandnps, .vandnpd, .vorps, .vorpd, .vxorps, .vxorpd, .vpor, .vpand, .vpandn, .vpxor => {
             self.executeVexBitwise(d, vexBitwiseForOp(d.op));
         },
@@ -2335,7 +2698,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }
         },
-        .vpminsb, .vpminsd, .vpminuw, .vpminud, .vpmaxsb, .vpmaxsd, .vpmaxuw, .vpmaxud => {
+        .vpminub, .vpminsb, .vpminsd, .vpminuw, .vpminud, .vpmaxub, .vpmaxsb, .vpmaxsd, .vpmaxuw, .vpmaxud => {
             const kind = packedMinMaxKind(d.op);
             const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
             self.xmm[d.xmm_dst] = packedMinMax(self.xmm[d.xmm_src], rhs_low, kind);
@@ -2346,7 +2709,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }
         },
-        .vpsubb, .vpsubd, .vpsubq, .vpsubw, .vpaddb, .vpaddd, .vpaddq, .vpaddw, .vpmullw => {
+        .vpsubb, .vpsubd, .vpsubq, .vpsubw, .vpaddb, .vpaddd, .vpaddq, .vpaddw, .vpmullw, .vpmulld_38, .vpsubsb, .vpsubsw, .vpsubusw, .vpaddsb, .vpaddsw => {
             const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
             self.xmm[d.xmm_dst] = packedIntegerBinary(
                 self.xmm[d.xmm_src],
@@ -2362,6 +2725,17 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                     packedIntegerLaneBits(d.op),
                     packedIntegerOperation(d.op),
                 );
+            } else {
+                @memset(&self.ymm_hi[d.xmm_dst], 0);
+            }
+        },
+        .vpmulhw, .vpmulhuw => {
+            const signed = d.op == .vpmulhw;
+            const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+            self.xmm[d.xmm_dst] = packedIntegerMulHigh(self.xmm[d.xmm_src], rhs_low, signed);
+            if (d.vector_256) {
+                const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+                self.ymm_hi[d.xmm_dst] = packedIntegerMulHigh(self.ymm_hi[d.xmm_src], rhs_high, signed);
             } else {
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }
@@ -2431,6 +2805,41 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             log.info("xgetbv: xcr=0x{x} -> xcr0=0x{x} profile={s}", .{ self.regs.rcx, xcr0, self.cpu_profile.label() });
             self.setReg(.al_ax_eax_rax, .bits32, @truncate(xcr0));
             self.setReg(.dl_dx_edx_rdx, .bits32, @truncate(xcr0 >> 32));
+        },
+
+        .rdtsc, .rdtscp => {
+            // Keep TSC reads tied to the guest execution clock. A host
+            // monotonic timestamp would make translated Windows timing
+            // depend on scheduler jitter and would make replay/diagnostics
+            // non-deterministic. The low/high dwords are architecturally
+            // returned in EAX/EDX; RDTSCP also returns IA32_TSC_AUX in ECX.
+            const ticks = self.executed_steps;
+            self.setReg(.al_ax_eax_rax, .bits32, @truncate(ticks));
+            self.setReg(.dl_dx_edx_rdx, .bits32, @truncate(ticks >> 32));
+            if (d.op == .rdtscp) self.setReg(.cl_cx_ecx_rcx, .bits32, 0);
+        },
+
+        .mfence, .lfence, .sfence => releaseBarrier(),
+        .emms, .wait => {},
+
+        .kmovw, .kmovd, .kmovq => {
+            const is_word = d.op == .kmovw;
+            const register_size: Size = if (d.op == .kmovq) .bits64 else .bits32;
+            const memory_size: Size = if (is_word) .bits16 else register_size;
+            const mask: u64 = if (is_word) 0xFFFF else if (d.op == .kmovq) std.math.maxInt(u64) else 0xFFFF_FFFF;
+            if (d.mask_to_gpr) {
+                const value = self.k[d.src_k] & mask;
+                if (d.is_reg_form)
+                    self.setReg(d.dst_reg, register_size, value)
+                else
+                    self.writeMemVal(d.addr, memory_size, value);
+            } else {
+                const value = if (d.is_reg_form)
+                    self.regVal(d.src_reg, register_size)
+                else
+                    self.readMemVal(d.addr, memory_size);
+                self.k[d.dst_k] = value & mask;
+            }
         },
 
         .hlt => {

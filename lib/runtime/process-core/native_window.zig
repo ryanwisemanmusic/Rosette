@@ -23,6 +23,9 @@ pub fn ensureNativeApplication(self: anytype) bool {
 }
 
 pub fn ensureNativeWindow(self: anytype) bool {
+    if (self.graphics_preflight_enabled and !self.graphics_preflight_window_allowed) {
+        return false;
+    }
     const ready = self.native_window.ensureWindow();
     if (ready) registerNativeWindowHandles(self);
     return ready;

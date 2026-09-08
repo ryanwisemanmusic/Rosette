@@ -155,6 +155,38 @@ pub fn machoCapturePrint(comptime fmt: []const u8, args: anytype) void {
     if (ready_compiler_fd >= 0 and isReadyCompilerLine(text)) {
         writeLineAtomic(ready_compiler_fd, text);
     }
+
+    // Last, deliberately. `capture_buffer` is module-level and `text` points
+    // into it, so an observer that logs would overwrite the line still being
+    // written if it ran any earlier. Here the buffer's work is done and an
+    // observer is free to report and to stop the run.
+    if (line_observer) |observe| observe(text);
+}
+
+/// Watches every diagnostic line this process emits, guest mirror included.
+pub const LineObserverFn = *const fn (line: []const u8) void;
+
+var line_observer: ?LineObserverFn = null;
+
+/// Offer a line that did not come through `machoCapturePrint`.
+///
+/// The guest log mirror writes straight to its file descriptor for atomicity,
+/// so mirrored emulator output never passes the funnel. That made the line
+/// observer blind to precisely the lines it exists for: a terminal refusal
+/// printed by the emulator went unseen while Rosette watched its own
+/// diagnostics for it. Any writer that bypasses the funnel has to offer its
+/// line here or it is invisible to everything downstream.
+pub fn observeExternalLine(line: []const u8) void {
+    if (line_observer) |observe| observe(line);
+}
+
+/// Install the observer, or clear it with null.
+///
+/// Kept as a plain function pointer so the logger owes nothing to whatever
+/// watches it: the funnel is the lowest layer here and must not acquire a
+/// dependency on a diagnostic that sits above it.
+pub fn setLineObserver(observer: ?LineObserverFn) void {
+    line_observer = observer;
 }
 
 /// Write one diagnostic line as a single write syscall, adding the newline

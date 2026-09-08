@@ -33,6 +33,8 @@ pub const PrimitiveRegistry = struct {
             if (xenia_primitive_contract.lookup(symbol_name)) |family| {
                 return switch (family) {
                     .strlen => handlers.strlen,
+                    .strchr => handlers.strchr,
+                    .strtoull => handlers.strtoull,
                     .memcmp => handlers.memcmp,
                     .memcpy => handlers.memcpy,
                     .strcmp => handlers.strcmp,
@@ -77,6 +79,8 @@ const builtin_primitives = [_]PrimitiveDef{
     .{ .name_pattern = "_raise", .handler = @import("handlers.zig").raiseSignal, .match_kind = .exact },
     .{ .name_pattern = "llabs", .handler = @import("handlers.zig").llabs },
     .{ .name_pattern = "strlen", .handler = @import("handlers.zig").strlen },
+    .{ .name_pattern = "_strchr", .handler = @import("handlers.zig").strchr, .match_kind = .exact },
+    .{ .name_pattern = "_strtoull", .handler = @import("handlers.zig").strtoull, .match_kind = .exact },
     .{ .name_pattern = "memcmp", .handler = @import("handlers.zig").memcmp },
     .{ .name_pattern = "memcpy", .handler = @import("handlers.zig").memcpy },
     .{ .name_pattern = "strcmp", .handler = @import("handlers.zig").strcmp },
@@ -125,6 +129,8 @@ pub fn builtin() PrimitiveRegistry {
 test "registry: match symbol by pattern" {
     const reg = builtin();
     try std.testing.expect(reg.matchSymbol("_strlen") != null);
+    try std.testing.expect(reg.matchSymbol("_strchr") != null);
+    try std.testing.expect(reg.matchSymbol("_strtoull") != null);
     try std.testing.expect(reg.matchSymbol("__cxa_guard_acquire") != null);
     try std.testing.expect(reg.matchSymbol("_vsnprintf") != null);
     try std.testing.expect(reg.matchSymbol("_sysctl") != null);

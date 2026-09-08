@@ -166,6 +166,9 @@ pub const ImportHandler = struct {
 };
 
 test {
+    // Reference the dispatch module so its tests are part of this root's test
+    // build; a `pub const` import alone does not root them.
+    _ = dispatch;
     var handler = ImportHandler.init(std.testing.allocator);
     defer handler.deinit();
     try std.testing.expectEqual(@as(u64, 0), handler.primitive_dispatch_hits);

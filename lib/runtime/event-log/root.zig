@@ -7,6 +7,9 @@
 
 const el = @import("event_log.zig");
 pub const machoCapturePrint = el.machoCapturePrint;
+pub const setLineObserver = el.setLineObserver;
+pub const observeExternalLine = el.observeExternalLine;
+pub const LineObserverFn = el.LineObserverFn;
 pub const primitiveCapturePrint = el.primitiveCapturePrint;
 pub const setThreadFds = el.setThreadFds;
 pub const resetThreadFds = el.resetThreadFds;
