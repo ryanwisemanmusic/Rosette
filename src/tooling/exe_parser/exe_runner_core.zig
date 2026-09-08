@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const fmt = @import("pe_format.zig");
 const parser = @import("pe_parser.zig");
 const pkg = @import("rosette_package.zig");
@@ -13,12 +14,105 @@ const traps = runtime_abi.traps;
 const code_text = @import("entrypoint_code_text_segment");
 const imports_mod = @import("imports/imports.zig");
 const clr_runtime = @import("clr_runtime");
+const pe64_runtime = @import("pe64_runtime.zig");
+const elf_processor_state = @import("elf_processor_state");
+const native_windows_graphics = @import("native_windows_graphics");
 
 const image_scn_mem_execute: u32 = 0x2000_0000;
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn system(command: [*:0]const u8) c_int;
 extern fn chdir(path: [*:0]const u8) c_int;
+extern fn rosette_macho_native_application_ensure() c_int;
+extern fn rosette_macho_native_window_ensure(width: u32, height: u32, title: [*:0]const u8) c_int;
+extern fn rosette_macho_native_window_show() c_int;
+extern fn rosette_macho_native_window_pump_events() u32;
+
+fn nativeEnsureApplication(_: ?*anyopaque) callconv(.c) c_int {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    return rosette_macho_native_application_ensure();
+}
+
+fn nativeEnsureWindow(_: ?*anyopaque, width: u32, height: u32, title: [*:0]const u8) callconv(.c) c_int {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    return rosette_macho_native_window_ensure(width, height, title);
+}
+
+fn nativeShowWindow(_: ?*anyopaque) callconv(.c) c_int {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    return rosette_macho_native_window_show();
+}
+
+fn nativePumpEvents(_: ?*anyopaque) callconv(.c) u32 {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    return rosette_macho_native_window_pump_events();
+}
+
+fn nativeGraphics(context: ?*anyopaque) ?*native_windows_graphics.NativeWindowsGraphics {
+    const value = context orelse return null;
+    return @ptrCast(@alignCast(value));
+}
+
+fn nativePresenterStart(context: ?*anyopaque, width: u32, height: u32) callconv(.c) c_int {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    const bridge = nativeGraphics(context) orelse return 0;
+    return if (bridge.bringUp(width, height)) 1 else 0;
+}
+
+fn nativePresenterStage(context: ?*anyopaque) callconv(.c) u32 {
+    const bridge = nativeGraphics(context) orelse return 0;
+    return bridge.stageCode();
+}
+
+fn nativePresenterIsReady(context: ?*anyopaque) callconv(.c) c_int {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    const bridge = nativeGraphics(context) orelse return 0;
+    return if (bridge.ready()) 1 else 0;
+}
+
+fn nativePresenterDiagnostic(context: ?*anyopaque, serial: u64, width: u32, height: u32, phase: u32) callconv(.c) u64 {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    const bridge = nativeGraphics(context) orelse return 0;
+    return bridge.presentDiagnostic(serial, width, height, phase);
+}
+
+fn nativeMetalLayerHostPointer(context: ?*anyopaque) callconv(.c) usize {
+    const bridge = nativeGraphics(context) orelse return 0;
+    return bridge.metalLayerHostPointer();
+}
+
+fn nativeVulkanDispatch(
+    context: ?*anyopaque,
+    state_pointer: *anyopaque,
+    name_pointer: [*]const u8,
+    name_length: usize,
+    direct_return_rip: u64,
+    has_direct_return: c_int,
+) callconv(.c) c_int {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    const bridge = nativeGraphics(context) orelse return 0;
+    const state: *elf_processor_state.ElfState = @ptrCast(@alignCast(state_pointer));
+    const name = name_pointer[0..name_length];
+    const return_rip = if (has_direct_return != 0) direct_return_rip else null;
+    return if (bridge.dispatchVulkan(state, name, return_rip)) 1 else 0;
+}
+
+fn windowsGraphicsHooks(native_context: ?*anyopaque) pe64_runtime.GraphicsHooks {
+    if (comptime builtin.target.os.tag != .macos) return .{};
+    return .{
+        .ensure_application = nativeEnsureApplication,
+        .ensure_window = nativeEnsureWindow,
+        .show_window = nativeShowWindow,
+        .pump_events = nativePumpEvents,
+        .native_context = native_context,
+        .native_presenter_start = nativePresenterStart,
+        .native_presenter_stage = nativePresenterStage,
+        .native_presenter_is_ready = nativePresenterIsReady,
+        .native_presenter_present_diagnostic = nativePresenterDiagnostic,
+        .native_vulkan_dispatch = nativeVulkanDispatch,
+        .native_metal_layer_host_pointer = nativeMetalLayerHostPointer,
+    };
+}
 
 fn machineName(machine: u16) []const u8 {
     return switch (machine) {
@@ -562,6 +656,126 @@ pub fn run(init: std.process.Init, exe_path: []const u8, log_path: [:0]const u8,
         "  launch config: {s}\n  working directory: {s}\n  architecture: {s}\n  UI mode: {s}\n",
         .{ @tagName(profile.source), profile.working_directory, @tagName(profile.architecture), @tagName(profile.ui_mode) },
     );
+
+    // A PE32+ image cannot enter the legacy 32-bit raw executor.  Run the
+    // shared x86-64 decoder preflight first, then use the bounded PE64 state
+    // loader.  Keeping this decision here makes the Windows route explicit in
+    // the Rosetta runner and leaves the inspected Xenia tree untouched.
+    if (image.isPe32Plus()) {
+        bootLog("7_pe64_preflight: proving the reachable x86-64 entry path");
+        var pe64_report = try pe64_runtime.preflight(allocator, exe_bytes, &image);
+        defer pe64_report.deinit(allocator);
+        var pe64_report_buf: [2048]u8 = undefined;
+        trace.logText(pe64_runtime.formatPreflight(&pe64_report_buf, pe64_report));
+        std.debug.print("  PE64 preflight: {s} reachable={d} decoded={d} invalid={d} imports={d} unsupported_imports={d} indirect={d}\n", .{
+            if (pe64_report.ready()) "ready" else "blocked",
+            pe64_report.reachable_instructions,
+            pe64_report.decoded_instructions,
+            pe64_report.invalid_instructions,
+            pe64_report.imports,
+            pe64_report.unsupported_imports,
+            pe64_report.indirect_control_transfers,
+        });
+        if (!launch_allowed) {
+            trace.logText("launch_skipped = parse_only\n");
+            return;
+        }
+        if (!pe64_report.ready()) {
+            trace.logText("launch_blocked = pe64_preflight\n");
+            return error.Pe64PreflightFailed;
+        }
+
+        const previous_cwd = try currentWorkingDirectory(allocator);
+        try changeWorkingDirectory(allocator, profile.working_directory);
+        defer changeWorkingDirectory(allocator, previous_cwd) catch {};
+
+        bootLog("8_pe64_execute: starting bounded Windows x64 state");
+        const max_steps: u64 = if (std.c.getenv("ROSETTE_PE64_MAX_STEPS")) |value_ptr|
+            std.fmt.parseInt(u64, std.mem.sliceTo(value_ptr, 0), 10) catch 20_000_000
+        else
+            20_000_000;
+        var policy_buf: [256]u8 = undefined;
+        const policy = try std.fmt.bufPrint(&policy_buf, "pe64_execution = true\npe64_max_steps = {d}\n", .{max_steps});
+        trace.logText(policy);
+        var native_graphics = native_windows_graphics.NativeWindowsGraphics{};
+        defer native_graphics.shutdown();
+        const result = pe64_runtime.loadAndRun(allocator, exe_bytes, &image, .{
+            .max_steps = max_steps,
+            .host_io = init.io,
+            .host_working_directory = profile.working_directory,
+            .graphics_hooks = windowsGraphicsHooks(&native_graphics),
+        }) catch |err| {
+            var error_buf: [256]u8 = undefined;
+            const error_line = std.fmt.bufPrint(&error_buf, "pe64_execution_error = {s}\n", .{@errorName(err)}) catch "";
+            trace.logText(error_line);
+            return err;
+        };
+        var result_buf: [768]u8 = undefined;
+        const graphics = result.graphics;
+        const result_line = try std.fmt.bufPrint(&result_buf, "pe64_execution_result = terminated={}; faulted={}; steps={d}; exit_code=0x{X}; rip=0x{X}; file_opens={d}; file_reads={d}; file_writes={d}; file_failures={d}\n", .{
+            result.terminated,
+            result.faulted,
+            result.executed_steps,
+            result.exit_code,
+            result.rip,
+            result.windows_file_open_calls,
+            result.windows_file_read_calls,
+            result.windows_file_write_calls,
+            result.windows_file_failures,
+        });
+        trace.logText(result_line);
+
+        var graphics_buf: [2048]u8 = undefined;
+        const graphics_line = try std.fmt.bufPrint(&graphics_buf, "pe64_graphics = phase={s}; contract_ready={}; window_ready={}; native_window_ready={}; native_window_visible={}; instance_ready={}; surface_ready={}; device_ready={}; queue_ready={}; swapchain_ready={}; frame_resources_ready={}; guest_present_observed={}; native_vulkan_forwarding={}; native_vulkan_calls={d}; native_vulkan_failures={d}; window={d}x{d}; calls={d}; proc_queries={d}; commands={d}; submits={d}; presents={d}; ordering_violations={d}; unmodeled_calls={d}; last_call={s}; last_failure={s}\n", .{
+            @tagName(graphics.phase),
+            graphics.contractReady(),
+            graphics.window_ready,
+            graphics.native_window_ready,
+            graphics.native_window_visible,
+            graphics.instance_ready,
+            graphics.surface_ready,
+            graphics.device_ready,
+            graphics.queue_ready,
+            graphics.swapchain_ready,
+            graphics.frame_resources_ready,
+            graphics.guest_present_observed,
+            graphics.native_vulkan_forwarding,
+            graphics.native_vulkan_calls,
+            graphics.native_vulkan_failures,
+            graphics.window_width,
+            graphics.window_height,
+            graphics.vulkan_calls,
+            graphics.proc_queries,
+            graphics.command_calls,
+            graphics.queue_submits,
+            graphics.presents,
+            graphics.ordering_violations,
+            graphics.unmodeled_calls,
+            std.mem.sliceTo(&graphics.last_call, 0),
+            std.mem.sliceTo(&graphics.last_failure, 0),
+        });
+        trace.logText(graphics_line);
+        var native_graphics_buf: [1024]u8 = undefined;
+        const native_graphics_line = try std.fmt.bufPrint(&native_graphics_buf, "pe64_graphics_native = presenter_started={}; presenter_ready={}; presenter_stage={d}; presenter_attempts={d}; presenter_failures={d}; diagnostic_attempts={d}; diagnostic_frames={d}; diagnostic_failures={d}\n", .{
+            graphics.native_presenter_started,
+            graphics.native_presenter_ready,
+            graphics.native_presenter_stage,
+            graphics.native_presenter_attempts,
+            graphics.native_presenter_failures,
+            graphics.native_diagnostic_attempts,
+            graphics.native_diagnostic_frames,
+            graphics.native_diagnostic_failures,
+        });
+        trace.logText(native_graphics_line);
+        std.debug.print("  PE64 execution: terminated={} faulted={} steps={d} exit=0x{X} rip=0x{X}\n", .{
+            result.terminated,
+            result.faulted,
+            result.executed_steps,
+            result.exit_code,
+            result.rip,
+        });
+        return;
+    }
 
     if (launch_allowed) {
         const previous_cwd = try currentWorkingDirectory(allocator);

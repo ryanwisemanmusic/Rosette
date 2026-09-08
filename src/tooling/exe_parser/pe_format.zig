@@ -24,11 +24,13 @@ pub const data_dir = struct {
 };
 
 pub const opt32 = struct {
+    pub const minimum_size: u16 = 96;
     pub const number_of_rva_and_sizes_off: u16 = 92;
     pub const data_dir_off: u16 = 96;
 };
 
 pub const opt64 = struct {
+    pub const minimum_size: u16 = 112;
     pub const number_of_rva_and_sizes_off: u16 = 108;
     pub const data_dir_off: u16 = 112;
 };
@@ -36,4 +38,5 @@ pub const opt64 = struct {
 pub const import = struct {
     pub const descriptor_size: u16 = 20;
     pub const ordinal_flag32: u32 = 0x80000000;
+    pub const ordinal_flag64: u64 = 0x8000000000000000;
 };
