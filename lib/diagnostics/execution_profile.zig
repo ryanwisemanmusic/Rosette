@@ -76,6 +76,11 @@ pub const Region = enum(u8) {
     /// leaf of one of the categories above, and worth separating so it does
     /// not inflate `unclassified`.
     host_runtime,
+    /// Executable code inside the Mach-O image whose address has no covering
+    /// symbol. This is valid text in a stripped or statically linked region;
+    /// keep the symbol-coverage debt visible without treating it as an
+    /// unclassified runtime region.
+    image_executable_unsymbolized,
     /// The sample landed where no symbol could be resolved *and* the address
     /// is inside the image, so one should have existed. A fact about the
     /// symbol table rather than a region, and never folded into a neighbour.
@@ -95,6 +100,7 @@ pub const Region = enum(u8) {
             .guest_memory => "guest-memory",
             .guest_emulation => "guest-emulation",
             .host_runtime => "host-runtime",
+            .image_executable_unsymbolized => "image-executable-unsymbolized",
             .unresolved_symbol => "unresolved-symbol",
         };
     }
@@ -111,6 +117,7 @@ pub const Region = enum(u8) {
             .guest_memory => "the run is spending itself on allocation and mapping. Large here usually means a working set that does not fit rather than a slow allocator",
             .guest_emulation => "the run is spending itself inside the emulator's own subsystems. This is the emulator doing its job, and the question it raises is which subsystem rather than whether anything is wrong",
             .host_runtime => "the samples resolved to the C++ runtime and general-purpose primitives the emulator is built on. That is a leaf of whatever called it, so this share bounds how much of the profile is uninformative rather than naming a cost",
+            .image_executable_unsymbolized => "the samples landed in executable Mach-O image text without a covering symbol. The instruction stream is real and mapped; the remaining debt is debug-symbol coverage, so the witness address is the useful identifier rather than a fabricated function name",
             .unresolved_symbol => "the samples landed inside the image where no symbol covers them. That is a gap in the symbol table, not a region, and it bounds how much of the profile is readable at all. An address outside the image is not this: it is generated code and has its own region",
         };
     }
@@ -132,6 +139,11 @@ pub const Origin = enum {
     /// Inside a loaded image section. A name that could not be placed here is
     /// genuine classifier debt and a missing symbol is a genuine gap.
     image,
+    /// Inside an executable loaded-image section with no symbol covering the
+    /// sampled address. This is valid code in a stripped or statically linked
+    /// region; keep it visible without treating missing debug coverage as a
+    /// runtime classification failure.
+    image_executable_unsymbolized,
     /// Outside every image section, in memory the run made executable at run
     /// time. Under this runtime that is the emulator's own generated code.
     generated_code,
@@ -210,7 +222,9 @@ pub fn regionOf(symbol: []const u8) Region {
     const support = [_][]const u8{
         "XXH",     "xxhash",  "MurmurHash", "crc32",
         "adler32", "inflate", "deflate",    "llvm",
-        "LLVM",    "3fmt",    "4utf8",
+        "LLVM",    "3fmt",    "4utf8",      "sha1",
+        "SHA1",    "sha256",  "SHA256",     "sha512",
+        "SHA512",
     };
     for (support) |needle| {
         if (std.mem.indexOf(u8, symbol, needle) != null) return .host_runtime;
@@ -237,6 +251,7 @@ pub fn classifyAt(symbol: []const u8, origin: Origin) Region {
     }
     return switch (origin) {
         .generated_code => .guest_generated_code,
+        .image_executable_unsymbolized => .image_executable_unsymbolized,
         .unstated, .image, .outside_image_data => by_name,
     };
 }
@@ -571,6 +586,13 @@ test "an unnamed address outside the image is generated code, not a missing symb
         Region.unresolved_symbol,
         classifyAt("<unknown>", .image),
     );
+    // Executable text inside the image is valid even when the Mach-O has no
+    // symbol covering the sampled address. Keep that coverage debt explicit,
+    // but do not turn it into an execution-profile violation.
+    try std.testing.expectEqual(
+        Region.image_executable_unsymbolized,
+        classifyAt("<image:unsymbolized>", .image_executable_unsymbolized),
+    );
     // Outside the image, in memory the run made executable, is the answer.
     try std.testing.expectEqual(
         Region.guest_generated_code,
@@ -618,6 +640,13 @@ test "the process entry frame and general-purpose primitives are classified" {
         regionOf("__ZL24XXH3_accumulate_512_sse2PvPKvS1_"),
     );
     try std.testing.expectEqual(Region.host_runtime, regionOf("_crc32_z"));
+    // The linked SHA implementation is support code, not an unknown
+    // emulator subsystem. This exact symbol was the late profile gap that
+    // armed no-unclassified-execution-profile in the current run.
+    try std.testing.expectEqual(
+        Region.host_runtime,
+        regionOf("__ZN4sha14SHA112processBlockEPKvS2_"),
+    );
     // LLVM support containers are linked into Xenia's compiler and are a
     // host-runtime leaf, not an unknown emulator subsystem. This exact
     // operator[] sample was the final classifier gap in the 2026-09-04 run.

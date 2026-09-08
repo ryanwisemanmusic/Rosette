@@ -49,6 +49,7 @@ pub const storage_integrity = @import("storage_integrity.zig");
 pub const execution_profile = @import("execution_profile.zig");
 pub const run_budget = @import("run_budget.zig");
 pub const run_manifest = @import("run_manifest.zig");
+pub const fatal_conditions = @import("fatal_conditions.zig");
 pub const xiso_preflight = @import("xiso_preflight.zig");
 pub const kernel_service_readiness = @import("kernel_service_readiness.zig");
 pub const import_integrity = @import("import_integrity.zig");
@@ -152,6 +153,7 @@ test {
     _ = run_budget;
     _ = execution_profile;
     _ = run_manifest;
+    _ = fatal_conditions;
     _ = xiso_preflight;
     _ = kernel_service_readiness;
     _ = import_integrity;

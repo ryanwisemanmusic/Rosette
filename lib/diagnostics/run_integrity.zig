@@ -45,6 +45,26 @@ pub fn livenessScope(guest_main_ready: bool, gpu_activity: bool) LivenessScope {
     return .pre_guest_startup;
 }
 
+/// Decide whether raw host wait silence has a causal liveness obligation.
+///
+/// `progress_since_park` deliberately tracks meaningful subsystem witnesses,
+/// not instruction retirement: the latter can advance through a long JIT or
+/// translation loop without producing a new wait-audit axis. Therefore a flat
+/// witness is not evidence that the whole run is frozen. Host-worker silence
+/// becomes actionable only when a guest/classified wait supplies the causal
+/// obligation, or when guest execution itself stopped between checkpoints.
+pub fn proveLivenessObligation(
+    waiters_without_notifier: u64,
+    guest_wait_obligation: bool,
+    registry_wait_obligation: bool,
+    run_execution_frozen: bool,
+    progress_since_park: bool,
+) bool {
+    return waiters_without_notifier != 0 and
+        (guest_wait_obligation or registry_wait_obligation or
+            (run_execution_frozen and !progress_since_park));
+}
+
 /// A state transition is retained separately from the current state so a
 /// report can say whether a violation just appeared, regressed, or merely
 /// changed its measured detail. This is the event boundary used by the
@@ -310,6 +330,12 @@ pub fn traceCause(invariant: Invariant, observation: Observation) []const u8 {
         .wait_receives_signals => "a wait subject timed out repeatedly without receiving a signal",
         .no_unsatisfied_capability => "an exercised capability remains unsatisfied after the progress quiet window",
         .no_harness_substitution => "Rosette substitution produced application-visible work",
+        // Deliberately cause-first rather than policy-first. Strict fault mode
+        // decides *whether* a fill stops the run; it never decides what the
+        // fill was, and a trace that answered "a miss occurred" would send the
+        // reader back to the counter they are already looking at. The one
+        // class that cannot appear here is the compulsory first touch, which
+        // is not fail-fast evidence under any policy.
         .translation_cache_converges => if (observation.translation_conflict_fills != 0)
             "translation fills are dominated by set conflicts"
         else if (observation.translation_cold_evictions != 0)
@@ -378,14 +404,14 @@ pub fn traceGate(invariant: Invariant) []const u8 {
         .presented_frames_in_custody => "frames_presented_to_window > 0",
         .swap_boundary_offered => "swap_boundaries_reached > 0",
         .guest_output_handoff_connected => "presenter_ready && guest_output_opportunity_observed && granular_output_evidence && producer_quiet_steps >= threshold",
-        .no_never_notified_park => "liveness_scope != pre_guest_startup && never_notified_park_steps >= threshold",
+        .no_never_notified_park => "liveness_scope != pre_guest_startup && actionable_waiters_without_a_notifier > 0 && liveness_obligation_proven && never_notified_park_steps >= threshold",
         .no_stalled_wait_handshake => "liveness_scope != pre_guest_startup && wait_graph_events > 0 && a mature wait-graph finding exists",
         .wait_receives_signals => "liveness_scope != pre_guest_startup && unsignalled_wait_timeouts >= threshold",
         .no_unsatisfied_capability => "capabilities_exercised > 0 && capability_progress_quiet_steps >= threshold",
         .no_harness_substitution => "harness_substitutions > 0",
         .translation_cache_converges => "translation cache is populated and the pressure window is actionable",
         .no_recorded_anomaly => "recorded_anomalies + pause_transaction_defects > 0",
-        .every_waiter_has_a_notifier => "liveness_scope != pre_guest_startup && waiters_without_a_notifier > 0",
+        .every_waiter_has_a_notifier => "liveness_scope != pre_guest_startup && actionable_waiters_without_a_notifier > 0 && liveness_obligation_proven",
         .every_park_has_a_reason => "parks_without_a_reason > 0",
         .single_master_owner => "ownership_violations > 0",
         .every_boundary_substantiated => "substantiation_armed && an answerable boundary is unresolved",
@@ -674,6 +700,23 @@ test "liveness scope does not arm before guest execution" {
         LivenessScope.gpu_activity,
         livenessScope(false, true),
     );
+}
+
+test "host wait silence requires a causal wait or a genuinely frozen run" {
+    // The latest Xenia run had advancing guest steps but no new non-step
+    // witness axis. That shape is an idle host worker, not a lost wakeup.
+    try std.testing.expect(!proveLivenessObligation(2, false, false, false, false));
+    try std.testing.expect(!proveLivenessObligation(2, false, false, true, true));
+
+    // A checkpoint with no guest-step advance is the independent evidence that
+    // permits the host wait census to become actionable.
+    try std.testing.expect(proveLivenessObligation(2, false, false, true, false));
+
+    // Explicit guest or classified synchronization evidence remains causal
+    // even while another subsystem progress axis is moving.
+    try std.testing.expect(proveLivenessObligation(2, true, false, false, true));
+    try std.testing.expect(proveLivenessObligation(2, false, true, false, true));
+    try std.testing.expect(!proveLivenessObligation(0, true, true, true, false));
 }
 
 test "the fingerprint moves only when a judgement changes" {

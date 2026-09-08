@@ -140,6 +140,19 @@ pub const Status = enum(u8) {
 /// The capability surface. Adding to this list is how the model learns; the
 /// list being incomplete is the model's known weakness, and the report says so
 /// rather than implying the enumeration is exhaustive.
+/// Who can exercise a capability.
+pub const Owner = enum(u8) {
+    rosette_host,
+    guest_title,
+
+    pub fn label(self: Owner) []const u8 {
+        return switch (self) {
+            .rosette_host => "rosette:host",
+            .guest_title => "guest:title",
+        };
+    }
+};
+
 pub const Capability = enum(u8) {
     guest_memory_mapping,
     memory_protection,
@@ -175,6 +188,52 @@ pub const Capability = enum(u8) {
             .graphics_command_execution, .frame_source, .window_surface, .frame_presentation => .presentation,
             .exception_unwinding, .code_generation, .locale_and_time => .platform_services,
         };
+    }
+
+    /// Who can exercise this capability.
+    ///
+    /// This is the difference between a gap and a wait. A capability Rosette
+    /// owns and has never exercised is genuinely unknown *and* closeable
+    /// before the window opens. One the title owns cannot be answered before
+    /// the title runs — asking the harness to satisfy it would mean fabricating
+    /// the very evidence the run exists to gather.
+    pub fn owner(self: Capability) Owner {
+        return switch (self) {
+            .guest_memory_mapping,
+            .memory_protection,
+            .address_space_translation,
+            .thread_creation,
+            .thread_scheduling,
+            .sync_primitives,
+            .wait_signal_handshake,
+            .file_read,
+            .disc_image,
+            .window_surface,
+            .exception_unwinding,
+            .code_generation,
+            .locale_and_time,
+            => .rosette_host,
+
+            // The title imports the kernel surface, drives GPU bring-up, and
+            // is the only source of a frame. None of these has an answer
+            // before it runs.
+            .kernel_variable_surface,
+            .kernel_export_binding,
+            .gpu_engine_init,
+            .gpu_ring_buffer,
+            .gpu_interrupt_callback,
+            .gpu_command_flow,
+            .guest_swap_request,
+            .graphics_command_execution,
+            .frame_source,
+            .frame_presentation,
+            => .guest_title,
+        };
+    }
+
+    /// Whether an untested reading is a gap that could be closed now.
+    pub fn answerableBeforeWindow(self: Capability) bool {
+        return self.owner() == .rosette_host;
     }
 
     pub fn weight(self: Capability) Weight {
@@ -323,11 +382,46 @@ pub const Report = struct {
     }
 };
 
+/// What is still unknown at the moment the window would open.
+///
+/// The two numbers are deliberately not summed. A host-owned capability that
+/// nothing has exercised is a gap in the harness and is closeable now; a
+/// guest-owned one is deferred by construction. Adding them produces a single
+/// "untested" count that reads as one problem and is two different things — and
+/// the larger half is not a problem at all.
+pub const PreWindowCoverage = struct {
+    host_untested: u8 = 0,
+    host_failing: u8 = 0,
+    guest_deferred: u8 = 0,
+    host_satisfied: u8 = 0,
+    first_host_gap: ?Capability = null,
+    first_host_failure: ?Capability = null,
+
+    /// Whether the window should open.
+    ///
+    /// Every host-owned capability must have a verdict before the window opens.
+    /// The guest-owned half is deliberately excluded: those edges are the
+    /// reason the guest is being run and cannot be answered without fabricating
+    /// guest evidence.  A host gap is different.  Rosette owns it, can probe
+    /// it without the guest, and allowing an untested foundation to sit under
+    /// a later guest failure makes that failure impossible to attribute.
+    pub fn blocksWindow(self: PreWindowCoverage) bool {
+        return self.host_failing != 0 or self.host_untested != 0;
+    }
+};
+
 pub const Ledger = struct {
     entries: [capability_count]Entry = [_]Entry{.{}} ** capability_count,
 
     pub fn record(self: *Ledger, capability: Capability, value: Status, note: []const u8) void {
         const record_entry = &self.entries[@intFromEnum(capability)];
+        // Runtime refreshes are intentionally allowed to be conservative: a
+        // checkpoint with no new evidence must not erase a pre-window proof
+        // and turn a healthy foundation back into an "unknown" one.  Real
+        // negative evidence still supersedes an earlier pass, so this is not
+        // a sticky-green latch; it is an evidence-preserving no-op for the
+        // absence of evidence.
+        if (value == .untested and record_entry.status != .untested) return;
         record_entry.status = value;
         const length = @min(note.len, record_entry.note_storage.len);
         @memcpy(record_entry.note_storage[0..length], note[0..length]);
@@ -340,6 +434,34 @@ pub const Ledger = struct {
 
     pub fn entry(self: *const Ledger, capability: Capability) Entry {
         return self.entries[@intFromEnum(capability)];
+    }
+
+    /// Partition what is still unknown by who could answer it.
+    pub fn preWindowCoverage(self: *const Ledger) PreWindowCoverage {
+        var result = PreWindowCoverage{};
+        var index: u8 = 0;
+        while (index < capability_count) : (index += 1) {
+            const capability: Capability = @enumFromInt(index);
+            const entry_status = self.entries[index].status;
+            if (!capability.answerableBeforeWindow()) {
+                if (entry_status != .satisfied) {
+                    result.guest_deferred += 1;
+                }
+                continue;
+            }
+            switch (entry_status) {
+                .satisfied => result.host_satisfied += 1,
+                .untested => {
+                    result.host_untested += 1;
+                    if (result.first_host_gap == null) result.first_host_gap = capability;
+                },
+                .unsatisfied, .degraded => {
+                    result.host_failing += 1;
+                    if (result.first_host_failure == null) result.first_host_failure = capability;
+                },
+            }
+        }
+        return result;
     }
 
     pub fn report(self: *const Ledger) Report {
@@ -539,6 +661,22 @@ test "a note travels with every status so it is never a bare assertion" {
     try std.testing.expectEqual(@as(usize, 96), ledger.entry(.gpu_ring_buffer).note().len);
 }
 
+test "a conservative runtime refresh does not erase a pre-window proof" {
+    var ledger = Ledger{};
+    ledger.record(.thread_creation, .satisfied, "preflight worker spawned and joined");
+    ledger.record(.thread_creation, .untested, "no guest thread has been observed yet");
+    try std.testing.expectEqual(Status.satisfied, ledger.status(.thread_creation));
+    try std.testing.expectEqualStrings(
+        "preflight worker spawned and joined",
+        ledger.entry(.thread_creation).note(),
+    );
+
+    // A later negative observation is real evidence and must still replace the
+    // earlier pass; only absence of evidence is sticky.
+    ledger.record(.thread_creation, .unsatisfied, "worker stopped responding");
+    try std.testing.expectEqual(Status.unsatisfied, ledger.status(.thread_creation));
+}
+
 test "a fully satisfied ledger admits the model may be incomplete" {
     var ledger = Ledger{};
     inline for (@typeInfo(Capability).@"enum".fields) |field| {
@@ -636,4 +774,87 @@ test "diagnostic native presents never degrade the guest frame capability" {
     );
     try std.testing.expectEqual(Status.unsatisfied, guestPresentationStatus(.{}, true, 0));
     try std.testing.expectEqual(Status.satisfied, guestPresentationStatus(.{}, true, 1));
+}
+
+test "an untested guest capability is deferred, not counted as a harness gap" {
+    var ledger = Ledger{};
+    // Nothing has run: every capability is untested.
+    const coverage = ledger.preWindowCoverage();
+    // Ten of the twenty-three belong to the title and cannot be answered
+    // before it runs. Counting them as gaps would make every run look broken
+    // at the moment it is most obviously not.
+    try std.testing.expectEqual(@as(u8, 10), coverage.guest_deferred);
+    try std.testing.expectEqual(@as(u8, 13), coverage.host_untested);
+    try std.testing.expectEqual(@as(u8, 0), coverage.host_failing);
+    // The guest half is deferred, but the host half is a closeable gap.  The
+    // strict admission gate refuses until Rosette has exercised those rows.
+    try std.testing.expect(coverage.blocksWindow());
+    try std.testing.expectEqual(Capability.guest_memory_mapping, coverage.first_host_gap.?);
+}
+
+test "a host capability that was exercised and failed refuses the window" {
+    var ledger = Ledger{};
+    ledger.record(.memory_protection, .unsatisfied, "probe failed");
+    const coverage = ledger.preWindowCoverage();
+    try std.testing.expectEqual(@as(u8, 1), coverage.host_failing);
+    try std.testing.expectEqual(Capability.memory_protection, coverage.first_host_failure.?);
+    try std.testing.expect(coverage.blocksWindow());
+}
+
+test "a degraded host capability refuses the window too" {
+    var ledger = Ledger{};
+    // Degraded is the dangerous state: it answers every call and does not do
+    // the job, so letting a window open on it hides the failure downstream.
+    ledger.record(.thread_scheduling, .degraded, "answers but does not schedule");
+    try std.testing.expect(ledger.preWindowCoverage().blocksWindow());
+}
+
+test "a guest capability failing never refuses the window" {
+    var ledger = Ledger{};
+    // The title's own bring-up failing is what the run exists to observe; the
+    // harness refusing over it would prevent the observation.
+    ledger.record(.gpu_ring_buffer, .unsatisfied, "guest never programmed the ring");
+    const coverage = ledger.preWindowCoverage();
+    try std.testing.expectEqual(@as(u8, 0), coverage.host_failing);
+    // Guest-owned failures are observed after admission and do not become
+    // host-foundation failures.  The host rows are still untested in this
+    // synthetic ledger, so this test supplies their proofs before checking
+    // the guest result.
+    inline for (@typeInfo(Capability).@"enum".fields) |field| {
+        const capability: Capability = @enumFromInt(field.value);
+        if (capability.answerableBeforeWindow()) {
+            ledger.record(capability, .satisfied, "pre-window proof");
+        }
+    }
+    try std.testing.expect(!ledger.preWindowCoverage().blocksWindow());
+}
+
+test "every capability is owned by exactly one side and the split is complete" {
+    var host: u8 = 0;
+    var guest: u8 = 0;
+    var index: u8 = 0;
+    while (index < capability_count) : (index += 1) {
+        const capability: Capability = @enumFromInt(index);
+        switch (capability.owner()) {
+            .rosette_host => {
+                host += 1;
+                try std.testing.expect(capability.answerableBeforeWindow());
+            },
+            .guest_title => {
+                guest += 1;
+                try std.testing.expect(!capability.answerableBeforeWindow());
+            },
+        }
+    }
+    try std.testing.expectEqual(@as(u8, capability_count), host + guest);
+    try std.testing.expectEqualStrings("rosette:host", Owner.rosette_host.label());
+    try std.testing.expectEqualStrings("guest:title", Owner.guest_title.label());
+}
+
+test "a satisfied host capability leaves no gap behind" {
+    var ledger = Ledger{};
+    ledger.record(.code_generation, .satisfied, "exercised");
+    const coverage = ledger.preWindowCoverage();
+    try std.testing.expectEqual(@as(u8, 1), coverage.host_satisfied);
+    try std.testing.expectEqual(@as(u8, 12), coverage.host_untested);
 }
