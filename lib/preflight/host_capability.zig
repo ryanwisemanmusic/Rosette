@@ -525,12 +525,108 @@ pub fn probe() Report {
     return report;
 }
 
+/// A real cross-thread signal/ wait handshake, kept separate from the timed
+/// wait measurement above.  The timed-wait probe proves that a deadline is
+/// honoured; this one proves that a notification can cross the mutex/condvar
+/// boundary and release a waiter before that deadline.  Rosette's guest wait
+/// ledger depends on both facts, and a timeout-only probe cannot stand in for
+/// the signal half.
+const SignalWaitProbe = struct {
+    mutex: std.c.pthread_mutex_t = .{},
+    condition: std.c.pthread_cond_t = .{},
+    ready: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    waiting: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    signaled: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    woke: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+};
+
+fn signalWaitProbeBody(probe_state: *SignalWaitProbe) void {
+    if (std.c.pthread_mutex_lock(&probe_state.mutex) != .SUCCESS) return;
+    probe_state.ready.store(1, .release);
+
+    // The deadline is only a safety net for a host where the mutex/condition
+    // primitive itself is damaged.  The normal path wakes from the explicit
+    // signal below, so this does not turn a successful signal into a timed
+    // wait observation.
+    var realtime: std.c.timespec = undefined;
+    if (std.c.clock_gettime(@as(std.c.clockid_t, .REALTIME), &realtime) != 0) {
+        _ = std.c.pthread_mutex_unlock(&probe_state.mutex);
+        return;
+    }
+    const timeout_ns: u64 = 250 * std.time.ns_per_ms;
+    const total_ns = @as(u64, @intCast(realtime.nsec)) + timeout_ns;
+    var deadline = realtime;
+    deadline.sec += @intCast(total_ns / std.time.ns_per_s);
+    deadline.nsec = @intCast(total_ns % std.time.ns_per_s);
+
+    while (probe_state.signaled.load(.acquire) == 0) {
+        // Set this while holding the mutex.  The caller waits for this witness
+        // before acquiring the mutex, which means the signal cannot race in
+        // before the worker has entered the condition wait.
+        probe_state.waiting.store(1, .release);
+        if (std.c.pthread_cond_timedwait(&probe_state.condition, &probe_state.mutex, &deadline) != .SUCCESS) {
+            _ = std.c.pthread_mutex_unlock(&probe_state.mutex);
+            return;
+        }
+    }
+    if (probe_state.signaled.load(.acquire) != 0) probe_state.woke.store(1, .release);
+    _ = std.c.pthread_mutex_unlock(&probe_state.mutex);
+}
+
+/// Perform the notification half of the host synchronisation contract.
+///
+/// This deliberately uses the same libc pthread objects that the translated
+/// C++ runtime ultimately reaches.  A Zig condition variable would prove a
+/// different implementation and leave the actual bridge's signal path
+/// untested.
+pub fn probeSignalHandshake() bool {
+    var probe_state = SignalWaitProbe{};
+    const thread = std.Thread.spawn(.{}, signalWaitProbeBody, .{&probe_state}) catch return false;
+
+    const timeout_ns: u64 = 250 * std.time.ns_per_ms;
+    const started = monotonicNanoseconds();
+    var waiting = false;
+    while (probe_state.waiting.load(.acquire) == 0) {
+        const now = monotonicNanoseconds();
+        if (started == 0 or now == 0 or now -| started >= timeout_ns) break;
+        std.atomic.spinLoopHint();
+    }
+    waiting = probe_state.waiting.load(.acquire) != 0;
+
+    const locked = std.c.pthread_mutex_lock(&probe_state.mutex) == .SUCCESS;
+    if (locked) {
+        probe_state.signaled.store(1, .release);
+        _ = std.c.pthread_cond_signal(&probe_state.condition);
+        _ = std.c.pthread_mutex_unlock(&probe_state.mutex);
+    }
+    thread.join();
+
+    return waiting and locked and
+        probe_state.ready.load(.acquire) == 1 and
+        probe_state.woke.load(.acquire) == 1;
+}
+
+/// Query the process locale through libc.  This is intentionally a read-only
+/// query (`locale = null`), so the preflight neither changes the application's
+/// locale nor makes a later guest result depend on this test's ordering.
+pub fn probeLocaleQuery() bool {
+    return std.c.setlocale(.ALL, null) != null;
+}
+
 test "an unprobed report says nothing about the host" {
     const report = Report{};
     const totals = report.summary();
     try std.testing.expectEqual(@as(u8, 0), totals.probed);
     try std.testing.expect(report.firstFinding() == null);
     try std.testing.expect(totals.foundationHolds());
+}
+
+test "a libc condition signal releases a waiter" {
+    try std.testing.expect(probeSignalHandshake());
+}
+
+test "libc can answer the current locale without changing it" {
+    try std.testing.expect(probeLocaleQuery());
 }
 
 // Every capability this module can answer, it answers. The contract names the

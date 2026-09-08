@@ -34,6 +34,10 @@ pub const component_readiness = @import("component_readiness.zig");
 pub const xenia = @import("xenia.zig");
 pub const observation = @import("observation.zig");
 pub const collector = @import("collector.zig");
+pub const prelaunch_audit = @import("prelaunch_audit.zig");
+pub const interop_audit = @import("interop_audit.zig");
+pub const graphics_readiness = @import("graphics_readiness.zig");
+pub const graphics_path_probe = @import("graphics_path_probe.zig");
 
 pub const Severity = check.Severity;
 pub const Outcome = check.Outcome;
@@ -65,6 +69,10 @@ test {
     _ = host_capability;
     _ = component_readiness;
     _ = xenia;
+    _ = prelaunch_audit;
+    _ = interop_audit;
+    _ = graphics_readiness;
+    _ = graphics_path_probe;
     _ = observation;
     _ = collector;
 }
