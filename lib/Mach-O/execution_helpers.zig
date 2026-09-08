@@ -11,8 +11,15 @@ const DecodedInsn = x64_decoder.DecodedInsn;
 const BitScanKind = x64_decoder.BitScanKind;
 const bitScan = x64_decoder.bitScan;
 const decoder = @import("decoder.zig");
-const VexArithmetic = @import("decoder.zig").VexArithmetic;
-const VexBitwise = @import("decoder.zig").VexBitwise;
+const packed_ops = @import("packed_ops.zig");
+/// Public aliases let the PE/ELF executor share the exact operation mapping
+/// used by the Mach-O executor without duplicating the arithmetic enum.  The
+/// implementations below remain backend-agnostic (`anytype` self), so this
+/// module is intentionally safe to use from both processor front-ends.
+pub const VexArithmetic = @import("decoder.zig").VexArithmetic;
+pub const VexBitwise = @import("decoder.zig").VexBitwise;
+pub const PackedIntegerOperation = packed_ops.PackedIntegerOperation;
+pub const MinMaxKind = packed_ops.MinMaxKind;
 const applyVexArithmetic = @import("decoder.zig").applyVexArithmetic;
 const applyVexPackedF32 = @import("decoder.zig").applyVexPackedF32;
 const applyVexPackedF64 = @import("decoder.zig").applyVexPackedF64;
@@ -69,18 +76,62 @@ pub fn signExtend(value: u64, source_size: Size, destination_size: Size) u64 {
     return extended & maskForSize(destination_size);
 }
 
-pub fn executeFucomip(self: anytype, source: u3) void {
+/// Produce the architectural integer flags for the x87 *I comparison family.
+/// These instructions write ZF/PF/CF and explicitly clear OF/SF/AF; every
+/// other RFLAGS bit is preserved. The unordered result is represented by all
+/// three comparison flags set, matching the x86 contract used by FCMOVU and
+/// its inverse conditions.
+pub fn x87CompareFlags(rflags: u32, lhs: f64, rhs: f64) u32 {
+    var result = rflags & ~(RFL_ZF | RFL_PF | RFL_CF | RFL_OF | RFL_SF | RFL_AF);
+    if (std.math.isNan(lhs) or std.math.isNan(rhs)) {
+        result |= RFL_ZF | RFL_PF | RFL_CF;
+    } else if (lhs < rhs) {
+        result |= RFL_CF;
+    } else if (lhs == rhs) {
+        result |= RFL_ZF;
+    }
+    return result;
+}
+
+pub fn executeX87Compare(self: anytype, source: u3, pop_result: bool) void {
     const lhs = self.x87.get(0) orelse return;
     const rhs = self.x87.get(source) orelse return;
-    self.regs.rflags &= ~(RFL_ZF | RFL_PF | RFL_CF);
-    if (std.math.isNan(lhs) or std.math.isNan(rhs)) {
-        self.regs.rflags |= RFL_ZF | RFL_PF | RFL_CF;
-    } else if (lhs < rhs) {
-        self.regs.rflags |= RFL_CF;
-    } else if (lhs == rhs) {
-        self.regs.rflags |= RFL_ZF;
-    }
-    _ = self.x87.pop();
+    self.regs.rflags = x87CompareFlags(self.regs.rflags, lhs, rhs);
+    if (pop_result) _ = self.x87.pop();
+}
+
+pub fn executeFucomi(self: anytype, source: u3) void {
+    executeX87Compare(self, source, false);
+}
+
+pub fn executeFcomi(self: anytype, source: u3) void {
+    // The current guest x87 model has masked exceptions and no separate
+    // invalid-operation delivery path, so the observable integer flags are
+    // the same as FUCOMI for the supported finite/unordered values.
+    executeX87Compare(self, source, false);
+}
+
+pub fn executeFucomip(self: anytype, source: u3) void {
+    executeX87Compare(self, source, true);
+}
+
+pub fn executeFcomip(self: anytype, source: u3) void {
+    executeX87Compare(self, source, true);
+}
+
+pub fn executeFcmov(self: anytype, source: u3, condition: x64_decoder.Condition) void {
+    if (!x64_decoder.evalCond(self.regs.rflags, condition)) return;
+    const value = self.x87.get(source) orelse return;
+    _ = self.x87.set(0, value);
+}
+
+test "x87 integer compare flags clear the explicitly cleared flags" {
+    const initial = RFL_CF | RFL_PF | RFL_AF | RFL_ZF | RFL_SF | RFL_OF | (1 << 9);
+    const less = x87CompareFlags(initial, 1.0, 2.0);
+    try std.testing.expectEqual(@as(u32, (1 << 9) | RFL_CF), less);
+
+    const unordered = x87CompareFlags(initial, std.math.nan(f64), 2.0);
+    try std.testing.expectEqual(@as(u32, (1 << 9) | RFL_ZF | RFL_PF | RFL_CF), unordered);
 }
 
 test "sign extension honors the full architectural destination width" {
@@ -164,7 +215,7 @@ pub fn executeVexScalarF32(self: anytype, d: DecodedInsn, operation: VexArithmet
 
     self.xmm[d.xmm_dst] = source1;
     std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], @bitCast(applyVexArithmetic(f32, source1_value, source2_value, operation)), .little);
-    @memset(&self.ymm_hi[d.xmm_dst], 0);
+    if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
 }
 
 pub fn executeVexScalarF64(self: anytype, d: DecodedInsn, operation: VexArithmetic) void {
@@ -178,7 +229,7 @@ pub fn executeVexScalarF64(self: anytype, d: DecodedInsn, operation: VexArithmet
 
     self.xmm[d.xmm_dst] = source1;
     std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], @bitCast(applyVexArithmetic(f64, source1_value, source2_value, operation)), .little);
-    @memset(&self.ymm_hi[d.xmm_dst], 0);
+    if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
 }
 
 pub fn executeVexPackedF32(self: anytype, d: DecodedInsn, operation: VexArithmetic) void {
@@ -190,7 +241,7 @@ pub fn executeVexPackedF32(self: anytype, d: DecodedInsn, operation: VexArithmet
         const source1_high = self.ymm_hi[d.xmm_src];
         const source2_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
         self.ymm_hi[d.xmm_dst] = applyVexPackedF32(source1_high, source2_high, operation);
-    } else {
+    } else if (!d.legacy_sse) {
         @memset(&self.ymm_hi[d.xmm_dst], 0);
     }
 }
@@ -204,7 +255,7 @@ pub fn executeVexPackedF64(self: anytype, d: DecodedInsn, operation: VexArithmet
         const source1_high = self.ymm_hi[d.xmm_src];
         const source2_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
         self.ymm_hi[d.xmm_dst] = applyVexPackedF64(source1_high, source2_high, operation);
-    } else {
+    } else if (!d.legacy_sse) {
         @memset(&self.ymm_hi[d.xmm_dst], 0);
     }
 }
@@ -218,7 +269,7 @@ pub fn executeVexSqrtScalarF32(self: anytype, d: DecodedInsn) void {
 
     self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
     std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], @bitCast(@sqrt(source_value)), .little);
-    @memset(&self.ymm_hi[d.xmm_dst], 0);
+    if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
 }
 
 pub fn executeVexSqrtScalarF64(self: anytype, d: DecodedInsn) void {
@@ -230,7 +281,7 @@ pub fn executeVexSqrtScalarF64(self: anytype, d: DecodedInsn) void {
 
     self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
     std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], @bitCast(@sqrt(source_value)), .little);
-    @memset(&self.ymm_hi[d.xmm_dst], 0);
+    if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
 }
 
 pub fn executeVexSqrtPackedF32(self: anytype, d: DecodedInsn) void {
@@ -239,7 +290,7 @@ pub fn executeVexSqrtPackedF32(self: anytype, d: DecodedInsn) void {
     if (d.vector_256) {
         const source_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
         self.ymm_hi[d.xmm_dst] = sqrtVexPackedF32(source_high);
-    } else {
+    } else if (!d.legacy_sse) {
         @memset(&self.ymm_hi[d.xmm_dst], 0);
     }
 }
@@ -250,7 +301,7 @@ pub fn executeVexSqrtPackedF64(self: anytype, d: DecodedInsn) void {
     if (d.vector_256) {
         const source_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
         self.ymm_hi[d.xmm_dst] = sqrtVexPackedF64(source_high);
-    } else {
+    } else if (!d.legacy_sse) {
         @memset(&self.ymm_hi[d.xmm_dst], 0);
     }
 }
@@ -275,7 +326,7 @@ pub fn executeVexBitwise(self: anytype, d: DecodedInsn, operation: VexBitwise) v
         const source1_high = self.ymm_hi[d.xmm_src];
         const source2_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
         self.ymm_hi[d.xmm_dst] = applyVexBitwise(source1_high, source2_high, operation);
-    } else {
+    } else if (!d.legacy_sse) {
         @memset(&self.ymm_hi[d.xmm_dst], 0);
     }
 }
@@ -295,7 +346,7 @@ pub fn executeVexComparePacked(self: anytype, d: DecodedInsn, comptime double: b
     if (d.vector_256) {
         const right_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
         self.ymm_hi[d.xmm_dst] = compare(self.ymm_hi[d.xmm_src], right_high, predicate);
-    } else {
+    } else if (!d.legacy_sse) {
         @memset(&self.ymm_hi[d.xmm_dst], 0);
     }
     return true;
@@ -382,4 +433,243 @@ pub fn executeVexReciprocalScalar(self: anytype, d: DecodedInsn, comptime square
     self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
     std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], @bitCast(computed), .little);
     @memset(&self.ymm_hi[d.xmm_dst], 0);
+}
+
+pub fn executeVexRoundScalarF32(self: anytype, d: DecodedInsn) void {
+    const source1 = self.xmm[d.xmm_src];
+    const source2_bits: u32 = if (d.is_reg_form)
+        std.mem.readInt(u32, self.xmm[d.xmm_src2][0..4], .little)
+    else
+        @truncate(self.readMemVal(d.addr, .bits32));
+    self.xmm[d.xmm_dst] = source1;
+    std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], @bitCast(decoder.roundVexFloat(f32, @as(f32, @bitCast(source2_bits)), @truncate(d.imm))), .little);
+    @memset(&self.ymm_hi[d.xmm_dst], 0);
+}
+
+pub fn executeVexRoundScalarF64(self: anytype, d: DecodedInsn) void {
+    const source1 = self.xmm[d.xmm_src];
+    const source2_bits: u64 = if (d.is_reg_form)
+        std.mem.readInt(u64, self.xmm[d.xmm_src2][0..8], .little)
+    else
+        self.readMemVal(d.addr, .bits64);
+    self.xmm[d.xmm_dst] = source1;
+    std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], @bitCast(decoder.roundVexFloat(f64, @as(f64, @bitCast(source2_bits)), @truncate(d.imm))), .little);
+    @memset(&self.ymm_hi[d.xmm_dst], 0);
+}
+
+pub fn executeVexRoundPackedF32(self: anytype, d: DecodedInsn) void {
+    const source_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+    self.xmm[d.xmm_dst] = decoder.roundVexPackedF32(source_low, @truncate(d.imm));
+    if (d.vector_256) {
+        const source_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+        self.ymm_hi[d.xmm_dst] = decoder.roundVexPackedF32(source_high, @truncate(d.imm));
+    } else {
+        @memset(&self.ymm_hi[d.xmm_dst], 0);
+    }
+}
+
+pub fn executeVexRoundPackedF64(self: anytype, d: DecodedInsn) void {
+    const source_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+    self.xmm[d.xmm_dst] = decoder.roundVexPackedF64(source_low, @truncate(d.imm));
+    if (d.vector_256) {
+        const source_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+        self.ymm_hi[d.xmm_dst] = decoder.roundVexPackedF64(source_high, @truncate(d.imm));
+    } else {
+        @memset(&self.ymm_hi[d.xmm_dst], 0);
+    }
+}
+
+pub fn executeVexFloatToSigned(self: anytype, d: DecodedInsn, comptime double: bool, comptime truncate: bool) void {
+    if (double) {
+        const source_bits: u64 = if (d.is_reg_form)
+            std.mem.readInt(u64, self.xmm[d.xmm_src][0..8], .little)
+        else
+            self.readMemVal(d.addr, .bits64);
+        const source: f64 = @bitCast(source_bits);
+        self.setReg(d.dst_reg, d.size, decoder.convertVexFloatToSigned(f64, source, d.size, truncate));
+    } else {
+        const source_bits: u32 = if (d.is_reg_form)
+            std.mem.readInt(u32, self.xmm[d.xmm_src][0..4], .little)
+        else
+            @truncate(self.readMemVal(d.addr, .bits32));
+        const source: f32 = @bitCast(source_bits);
+        self.setReg(d.dst_reg, d.size, decoder.convertVexFloatToSigned(f32, source, d.size, truncate));
+    }
+}
+
+pub fn executeVexMoveMask(self: anytype, d: DecodedInsn) void {
+    switch (d.op) {
+        .pmovmskb, .vpmovmskb => {
+            var mask: u32 = 0;
+            for (self.xmm[d.xmm_src], 0..) |byte, index| {
+                if (byte & 0x80 != 0) mask |= @as(u32, 1) << @intCast(index);
+            }
+            self.setReg(d.dst_reg, .bits32, mask);
+        },
+        .vpmovmskb_ymm => {
+            var mask: u32 = 0;
+            for (self.xmm[d.xmm_src], 0..) |byte, index| {
+                if (byte & 0x80 != 0) mask |= @as(u32, 1) << @intCast(index);
+            }
+            for (self.ymm_hi[d.xmm_src], 0..) |byte, index| {
+                if (byte & 0x80 != 0) mask |= @as(u32, 1) << @intCast(index + 16);
+            }
+            self.setReg(d.dst_reg, .bits32, mask);
+        },
+        .vmovmskps, .vmovmskpd => {
+            const lane_bytes: usize = if (d.op == .vmovmskps) 4 else 8;
+            const lanes_per_half = 16 / lane_bytes;
+            const lane_count = if (d.vector_256) lanes_per_half * 2 else lanes_per_half;
+            var mask: u32 = 0;
+            for (0..lane_count) |lane| {
+                const half = if (lane < lanes_per_half) self.xmm[d.xmm_src] else self.ymm_hi[d.xmm_src];
+                const offset = (lane % lanes_per_half) * lane_bytes;
+                const negative = if (lane_bytes == 4)
+                    (std.mem.readInt(u32, half[offset..][0..4], .little) & 0x8000_0000) != 0
+                else
+                    (std.mem.readInt(u64, half[offset..][0..8], .little) & 0x8000_0000_0000_0000) != 0;
+                if (negative) mask |= @as(u32, 1) << @intCast(lane);
+            }
+            self.setReg(d.dst_reg, .bits32, mask);
+        },
+        else => unreachable,
+    }
+}
+
+fn vexSource128(self: anytype, d: DecodedInsn, source_index: u8, memory: bool, high: bool) [16]u8 {
+    const offset: u64 = if (high) 16 else 0;
+    if (memory) return self.readMem128(d.addr +% offset);
+    return if (high) self.ymm_hi[source_index] else self.xmm[source_index];
+}
+
+pub fn executeVexPackedInteger(self: anytype, d: DecodedInsn, lane_bits: u8, operation: PackedIntegerOperation) void {
+    const right_is_memory = !d.is_reg_form;
+    self.xmm[d.xmm_dst] = packed_ops.packedIntegerBinary(
+        vexSource128(self, d, d.xmm_src, false, false),
+        vexSource128(self, d, d.xmm_src2, right_is_memory, false),
+        lane_bits,
+        operation,
+    );
+    if (d.vector_256) {
+        self.ymm_hi[d.xmm_dst] = packed_ops.packedIntegerBinary(
+            vexSource128(self, d, d.xmm_src, false, true),
+            vexSource128(self, d, d.xmm_src2, right_is_memory, true),
+            lane_bits,
+            operation,
+        );
+    } else {
+        @memset(&self.ymm_hi[d.xmm_dst], 0);
+    }
+}
+
+pub fn executeVexPackedMinMax(self: anytype, d: DecodedInsn, kind: MinMaxKind) void {
+    const right_is_memory = !d.is_reg_form;
+    self.xmm[d.xmm_dst] = packed_ops.packedMinMax(
+        vexSource128(self, d, d.xmm_src, false, false),
+        vexSource128(self, d, d.xmm_src2, right_is_memory, false),
+        kind,
+    );
+    if (d.vector_256) {
+        self.ymm_hi[d.xmm_dst] = packed_ops.packedMinMax(
+            vexSource128(self, d, d.xmm_src, false, true),
+            vexSource128(self, d, d.xmm_src2, right_is_memory, true),
+            kind,
+        );
+    } else {
+        @memset(&self.ymm_hi[d.xmm_dst], 0);
+    }
+}
+
+pub fn executeVexPackedMulHigh(self: anytype, d: DecodedInsn, signed: bool) void {
+    const right_is_memory = !d.is_reg_form;
+    self.xmm[d.xmm_dst] = packed_ops.packedIntegerMulHigh(
+        vexSource128(self, d, d.xmm_src, false, false),
+        vexSource128(self, d, d.xmm_src2, right_is_memory, false),
+        signed,
+    );
+    if (d.vector_256) {
+        self.ymm_hi[d.xmm_dst] = packed_ops.packedIntegerMulHigh(
+            vexSource128(self, d, d.xmm_src, false, true),
+            vexSource128(self, d, d.xmm_src2, right_is_memory, true),
+            signed,
+        );
+    } else {
+        @memset(&self.ymm_hi[d.xmm_dst], 0);
+    }
+}
+
+pub fn executeVexMultiplyUnsignedEvenDwords(self: anytype, d: DecodedInsn) void {
+    const right_is_memory = !d.is_reg_form;
+    self.xmm[d.xmm_dst] = packed_ops.multiplyUnsignedEvenDwords(
+        vexSource128(self, d, d.xmm_src, false, false),
+        vexSource128(self, d, d.xmm_src2, right_is_memory, false),
+    );
+    if (d.vector_256) {
+        self.ymm_hi[d.xmm_dst] = packed_ops.multiplyUnsignedEvenDwords(
+            vexSource128(self, d, d.xmm_src, false, true),
+            vexSource128(self, d, d.xmm_src2, right_is_memory, true),
+        );
+    } else {
+        @memset(&self.ymm_hi[d.xmm_dst], 0);
+    }
+}
+
+pub fn executeVexBlendWords(self: anytype, d: DecodedInsn) void {
+    const right_is_memory = !d.is_reg_form;
+    self.xmm[d.xmm_dst] = packed_ops.blendPackedWords(
+        vexSource128(self, d, d.xmm_src, false, false),
+        vexSource128(self, d, d.xmm_src2, right_is_memory, false),
+        @truncate(d.imm),
+    );
+    if (d.vector_256) {
+        self.ymm_hi[d.xmm_dst] = packed_ops.blendPackedWords(
+            vexSource128(self, d, d.xmm_src, false, true),
+            vexSource128(self, d, d.xmm_src2, right_is_memory, true),
+            @truncate(d.imm),
+        );
+    } else {
+        @memset(&self.ymm_hi[d.xmm_dst], 0);
+    }
+}
+
+pub fn executeVexBlendVariable(self: anytype, d: DecodedInsn, lane_bits: u8) void {
+    const right_is_memory = !d.is_reg_form;
+    self.xmm[d.xmm_dst] = packed_ops.blendPackedElements(
+        vexSource128(self, d, d.xmm_src, false, false),
+        vexSource128(self, d, d.xmm_src2, right_is_memory, false),
+        self.xmm[d.xmm_mask],
+        lane_bits,
+    );
+    if (d.vector_256) {
+        self.ymm_hi[d.xmm_dst] = packed_ops.blendPackedElements(
+            vexSource128(self, d, d.xmm_src, false, true),
+            vexSource128(self, d, d.xmm_src2, right_is_memory, true),
+            self.ymm_hi[d.xmm_mask],
+            lane_bits,
+        );
+    } else {
+        @memset(&self.ymm_hi[d.xmm_dst], 0);
+    }
+}
+
+pub fn executeVexPackedShift(self: anytype, d: DecodedInsn, lane_bits: u8, left: bool, arithmetic: bool, whole_bytes: bool) void {
+    const source_low = vexSource128(self, d, d.xmm_src, !d.is_reg_form, false);
+    const shift = if (whole_bytes)
+        packed_ops.shiftPackedBytes(source_low, d.imm, left)
+    else if (arithmetic)
+        packed_ops.arithmeticShiftPackedElements(source_low, lane_bits, d.imm)
+    else
+        packed_ops.shiftPackedElements(source_low, lane_bits, d.imm, left);
+    self.xmm[d.xmm_dst] = shift;
+    if (d.vector_256) {
+        const source_high = vexSource128(self, d, d.xmm_src, !d.is_reg_form, true);
+        self.ymm_hi[d.xmm_dst] = if (whole_bytes)
+            packed_ops.shiftPackedBytes(source_high, d.imm, left)
+        else if (arithmetic)
+            packed_ops.arithmeticShiftPackedElements(source_high, lane_bits, d.imm)
+        else
+            packed_ops.shiftPackedElements(source_high, lane_bits, d.imm, left);
+    } else {
+        @memset(&self.ymm_hi[d.xmm_dst], 0);
+    }
 }

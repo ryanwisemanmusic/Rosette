@@ -1768,6 +1768,11 @@ test "decode x87 memory and stack forms" {
 
     const fld64 = decodeInsn(&[_]u8{ 0xDD, 0x00 });
     try std.testing.expectEqual(Op.fld_mem64, fld64.op);
+    const fisttp64 = decodeInsn(&[_]u8{ 0xDD, 0x4D, 0xB8 });
+    try std.testing.expectEqual(Op.fisttp_mem64, fisttp64.op);
+    try std.testing.expectEqual(RegId.ch_bp_ebp_rbp, fisttp64.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -72))), fisttp64.addr);
+    try std.testing.expectEqual(@as(u8, 3), fisttp64.len);
     const fstp32 = decodeInsn(&[_]u8{ 0xD9, 0x18 });
     try std.testing.expectEqual(Op.fstp_mem32, fstp32.op);
     const fld_st3 = decodeInsn(&[_]u8{ 0xD9, 0xC3 });
@@ -1783,6 +1788,37 @@ test "decode x87 memory and stack forms" {
     const fucomip = decodeInsn(&[_]u8{ 0xDF, 0xE9 });
     try std.testing.expectEqual(Op.fucomip_st, fucomip.op);
     try std.testing.expectEqual(@as(u64, 1), fucomip.imm);
+}
+
+test "decode x87 compare, zero-load, and conditional-move forms" {
+    const fucomi = decodeInsn(&[_]u8{ 0xDB, 0xE9 });
+    try std.testing.expectEqual(Op.fucomi_st, fucomi.op);
+    try std.testing.expectEqual(@as(u64, 1), fucomi.imm);
+    try std.testing.expectEqual(@as(u8, 2), fucomi.len);
+
+    const fldz = decodeInsn(&[_]u8{ 0xD9, 0xEE });
+    try std.testing.expectEqual(Op.fldz, fldz.op);
+    try std.testing.expectEqual(@as(u8, 2), fldz.len);
+
+    const fcmovnb = decodeInsn(&[_]u8{ 0xDB, 0xC2 });
+    try std.testing.expectEqual(Op.fcmovnb_st, fcmovnb.op);
+    try std.testing.expectEqual(@as(u64, 2), fcmovnb.imm);
+    try std.testing.expectEqual(Cond.ae, fcmovnb.cond);
+
+    const fcomi = decodeInsn(&[_]u8{ 0xDB, 0xF3 });
+    try std.testing.expectEqual(Op.fcomi_st, fcomi.op);
+    try std.testing.expectEqual(@as(u64, 3), fcomi.imm);
+
+    const fcomip = decodeInsn(&[_]u8{ 0xDF, 0xF1 });
+    try std.testing.expectEqual(Op.fcomip_st, fcomip.op);
+    try std.testing.expectEqual(@as(u64, 1), fcomip.imm);
+}
+
+test "x87 pop subtract encodings preserve operand direction" {
+    // DE E1 is FSUBRP ST(1), ST(0): ST(1) becomes ST(0) - ST(1).
+    try std.testing.expectEqual(@as(u3, 3), x87BinaryOperation(0xDE, 4).?);
+    // DE E9 is FSUBP ST(1), ST(0): ST(1) becomes ST(1) - ST(0).
+    try std.testing.expectEqual(@as(u3, 2), x87BinaryOperation(0xDE, 5).?);
 }
 
 test "x87 FMULP writes ST(i) before popping ST(0)" {

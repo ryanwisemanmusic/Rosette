@@ -67,16 +67,31 @@ pub const GUEST_LOG_BUFFER_SIZE: u64 = 64 * 1024;
 /// was decoding immutable Mach-O text again because unrelated instructions
 /// competed for two slots. Each of the four ownership banks now has 65,536
 /// local sets with sixteen ways, for 4,194,304 total entries. This is about
-/// 368 MiB at the current entry size, small beside the translated process
-/// heap and sized to keep the later graphics-setup working set from turning a
-/// dispersed address stream into a 17th-resident conflict.
+/// Banks are sized by measured demand rather than split evenly, so this total
+/// is smaller than the previous equal split *and* gives the static-image bank
+/// twice the room it had. See `primary_layout` for the census it was sized
+/// from; `translation bank occupancy` in the runtime log reports what each
+/// bank is actually holding.
+/// The host cache line Rosette is translating *onto*.
+///
+/// Apple Silicon uses 128-byte lines, twice the x86-64 line the guest was
+/// compiled for, so a structure that looked line-sized on the source machine
+/// is half a line here. Every translation tier is allocated on this boundary:
+/// a set is `ways * @sizeOf(DecodeCacheEntry)` bytes and the entry is 8-byte
+/// aligned, so a set is always a whole number of 128-byte lines — but only
+/// from a line-aligned base. From the natural 8-byte alignment every set in
+/// the table inherits the base's offset within its line, so one misaligned
+/// allocation makes every sixteen-way scan touch an extra line.
+pub const HOST_CACHE_LINE_BYTES: usize = 128;
+pub const HOST_CACHE_LINE_ALIGNMENT: std.mem.Alignment = .fromByteUnits(HOST_CACHE_LINE_BYTES);
+
 pub const DECODE_CACHE_ENTRY_COUNT: usize = translation_cache.primary_layout.entryCount();
-/// Sixteen-way set associativity plus the expanded local-set budget gives each
-/// ownership bank both lower dispersed occupancy and substantial same-set
-/// room. Replacement uses the contract-owned reference/reuse policy in
+/// Sixteen-way set associativity plus two balanced hashed set choices gives a
+/// bank both low dispersed occupancy and substantial same-set room.
+/// Replacement uses the contract-owned reference/reuse policy in
 /// `process.zig`; no fixed final way absorbs all evictions.
 pub const DECODE_CACHE_WAYS: usize = translation_cache.primary_layout.ways;
-pub const DECODE_CACHE_SET_COUNT: usize = translation_cache.primary_layout.total_set_count;
+pub const DECODE_CACHE_SET_COUNT: usize = translation_cache.primary_layout.totalSetCount();
 
 /// Small second-level victim cache for entries displaced from the primary
 /// decode set.  A primary conflict is only harmful when the displaced code is
@@ -85,7 +100,7 @@ pub const DECODE_CACHE_SET_COUNT: usize = translation_cache.primary_layout.total
 /// Four-way sets keep the miss-side probe bounded while adding only a small
 /// amount of storage beside the 4,194K-entry primary table.
 pub const DECODE_VICTIM_CACHE_WAYS: usize = translation_cache.victim_layout.ways;
-pub const DECODE_VICTIM_CACHE_SET_COUNT: usize = translation_cache.victim_layout.total_set_count;
+pub const DECODE_VICTIM_CACHE_SET_COUNT: usize = translation_cache.victim_layout.totalSetCount();
 pub const DECODE_VICTIM_CACHE_ENTRY_COUNT: usize = translation_cache.victim_layout.entryCount();
 
 /// Persistent second-level cache for immutable Mach-O image decodes. The
@@ -93,8 +108,12 @@ pub const DECODE_VICTIM_CACHE_ENTRY_COUNT: usize = translation_cache.victim_layo
 /// but a compiler burst can still churn the static bank's L1 ways. Keeping a
 /// small static-only L2 lets an image instruction refill an L1 way without
 /// fetching bytes or invoking the decoder again.
+///
+/// It is populated on eviction, never on a fill: a fill happens precisely
+/// because no tier held the address, so copying there could not answer any
+/// lookup the primary would not have answered first.
 pub const DECODE_STATIC_L2_WAYS: usize = translation_cache.static_l2_layout.ways;
-pub const DECODE_STATIC_L2_SET_COUNT: usize = translation_cache.static_l2_layout.total_set_count;
+pub const DECODE_STATIC_L2_SET_COUNT: usize = translation_cache.static_l2_layout.totalSetCount();
 pub const DECODE_STATIC_L2_ENTRY_COUNT: usize = translation_cache.static_l2_layout.entryCount();
 
 /// Compatibility helper retained for constants-only consumers. It returns the

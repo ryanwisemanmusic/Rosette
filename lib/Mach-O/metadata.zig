@@ -12,6 +12,13 @@ const N_TYPE: u8 = 0x0e;
 const N_SECT: u8 = 0x0e;
 const N_WEAK_REF: u16 = 0x0040;
 
+// Mach-O section flags used to distinguish executable image text from other
+// sections in an executable segment. `__text` is covered explicitly because
+// some linkers omit the instruction attribute on it; the attributes cover
+// nonstandard instruction sections and keep this independent of section names.
+const S_ATTR_PURE_INSTRUCTIONS: u32 = 0x8000_0000;
+const S_ATTR_SOME_INSTRUCTIONS: u32 = 0x0000_0400;
+
 const MACH_HEADER_64_SIZE: usize = 32;
 const SEGMENT_COMMAND_64_SIZE: usize = 72;
 const SECTION_64_SIZE: usize = 80;
@@ -299,6 +306,20 @@ pub const Metadata = struct {
         const section = self.sections[self.section_lookup[best_index]];
         if (address - section.address < section.size) return section;
         return null;
+    }
+
+    /// Whether an address belongs to executable code in the loaded Mach-O
+    /// image. This is deliberately separate from `sparse_memory.isExecutable`:
+    /// image pages are backed by the Mach-O mapping, not by the sparse guest
+    /// page table used for generated code.
+    pub fn isExecutableImageAddress(self: *const Metadata, address: u64) bool {
+        const section = self.sectionAtAddress(address) orelse return false;
+        if (!std.mem.eql(u8, section.segment_name, "__TEXT") and
+            !std.mem.eql(u8, section.segment_name, "__TEXT_EXEC")) return false;
+        if (std.mem.eql(u8, section.name, "__text") or
+            std.mem.eql(u8, section.name, "__stubs") or
+            std.mem.eql(u8, section.name, "__stub_helper")) return true;
+        return section.flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS) != 0;
     }
 
     /// Nearest defined symbol at or below `address`, **bounded** to addresses
@@ -901,8 +922,8 @@ test "sectionAtAddress binary search finds the containing section" {
 
     sections[0] = .{ .name = "b", .segment_name = "__TEXT", .address = 0x2000, .size = 0x100, .file_offset = 0, .flags = 0, .indirect_symbol_start = 0, .stub_size = 0 };
     sections[1] = .{ .name = "c", .segment_name = "__TEXT", .address = 0x4000, .size = 0x100, .file_offset = 0, .flags = 0, .indirect_symbol_start = 0, .stub_size = 0 };
-    sections[2] = .{ .name = "a", .segment_name = "__TEXT", .address = 0x1000, .size = 0x100, .file_offset = 0, .flags = 0, .indirect_symbol_start = 0, .stub_size = 0 };
-    // Address-sorted: 0x1000 (a), 0x2000 (b), 0x4000 (c) — deliberately not
+    sections[2] = .{ .name = "__text", .segment_name = "__TEXT", .address = 0x1000, .size = 0x100, .file_offset = 0, .flags = 0, .indirect_symbol_start = 0, .stub_size = 0 };
+    // Address-sorted: 0x1000 (__text), 0x2000 (b), 0x4000 (c) — deliberately not
     // file order, exercising the sorted lookup built at load.
     lookup[0] = 2;
     lookup[1] = 0;
@@ -927,8 +948,10 @@ test "sectionAtAddress binary search finds the containing section" {
     };
     defer metadata.defined_symbols.deinit();
 
-    try std.testing.expectEqualStrings("a", metadata.sectionAtAddress(0x1000).?.name);
-    try std.testing.expectEqualStrings("a", metadata.sectionAtAddress(0x10ff).?.name);
+    try std.testing.expectEqualStrings("__text", metadata.sectionAtAddress(0x1000).?.name);
+    try std.testing.expectEqualStrings("__text", metadata.sectionAtAddress(0x10ff).?.name);
+    try std.testing.expect(metadata.isExecutableImageAddress(0x1000));
+    try std.testing.expect(!metadata.isExecutableImageAddress(0x2000));
     try std.testing.expectEqualStrings("b", metadata.sectionAtAddress(0x2000).?.name);
     try std.testing.expectEqualStrings("c", metadata.sectionAtAddress(0x40ff).?.name);
     try std.testing.expect(metadata.sectionAtAddress(0x0fff) == null);

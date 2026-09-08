@@ -646,8 +646,13 @@ pub const InitializerCheckpoint = struct {
 
 pub const CooperativeUiContext = struct {
     regs: Regs,
-    xmm: [16][16]u8,
-    ymm_hi: [16][16]u8,
+    // The guest register file is AVX-512 wide: 32 vector registers, each
+    // carried in three pieces — XMM low 128 bits, the YMM upper 128, and the
+    // ZMM upper 256. A context that saves fewer registers than the file holds
+    // silently drops the high half of every EVEX operand across a switch.
+    xmm: [32][16]u8,
+    ymm_hi: [32][16]u8,
+    zmm_hi: [32][32]u8,
     k: [8]u64 = [_]u64{0xFFFF_FFFF_FFFF_FFFF} ** 8,
     x87: X87State,
     /// Signal handlers are guest-thread execution state, just like the
@@ -795,8 +800,9 @@ pub const SuspendedGuestThread = struct {
     suspended_step: u64 = 0,
     reason: []const u8 = "",
     regs: Regs = .{},
-    xmm: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
-    ymm_hi: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
+    xmm: [32][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 32,
+    ymm_hi: [32][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 32,
+    zmm_hi: [32][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** 32,
     k: [8]u64 = [_]u64{0xFFFF_FFFF_FFFF_FFFF} ** 8,
     x87: X87State = .{},
     /// POSIX signal nesting belongs to this guest thread, not to the one host
@@ -876,8 +882,9 @@ pub const GuestSignalFrame = struct {
     /// `self.regs` value after an unresolved return is not necessarily the
     /// state that caused the protection fault.
     saved_regs: Regs = .{},
-    saved_xmm: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
-    saved_ymm_hi: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
+    saved_xmm: [32][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 32,
+    saved_ymm_hi: [32][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 32,
+    saved_zmm_hi: [32][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** 32,
     saved_k: [8]u64 = [_]u64{0xFFFF_FFFF_FFFF_FFFF} ** 8,
     saved_x87: X87State = .{},
 };
@@ -980,4 +987,52 @@ test "a trace snapshot maps every register id onto its own field" {
     }
     // The faulting-base register of the dispatch layout these walks exist for.
     try std.testing.expectEqual(@as(u64, 0x33), entry.registerValue(.bl_bx_ebx_rbx));
+}
+
+// Rosette translates x86-64 onto ARM64, and the two do not agree about what a
+// cache line is: the guest was compiled for 64-byte lines and Apple Silicon
+// uses 128. The decode cache is the hottest data structure in the process — a
+// lookup scans sixteen ways of two independently hashed sets before it will
+// call a fetch a miss — so the relationship between the entry, the way count
+// and the host line is a property worth stating rather than inheriting.
+//
+// These are deliberate tripwires. A field added to `DecodeCacheEntry` is not
+// free: it widens every set scan by the same proportion, and this is where
+// that shows up in a diff instead of only in a profile.
+test "a decode-cache set is a whole number of host cache lines" {
+    const line = constants.HOST_CACHE_LINE_BYTES;
+    const set_bytes = @sizeOf(DecodeCacheEntry) * constants.DECODE_CACHE_WAYS;
+
+    // Sixteen ways of an 8-byte-aligned entry is always a multiple of 128, so
+    // an aligned table gives every set an exact line count and no set pulls in
+    // an extra line for a field that spilled past the boundary. A way count
+    // that stopped being a multiple of sixteen would give that up silently.
+    try std.testing.expectEqual(@as(usize, 0), @alignOf(DecodeCacheEntry) % 8);
+    try std.testing.expectEqual(@as(usize, 0), set_bytes % line);
+    try std.testing.expectEqual(@as(usize, 0), constants.DECODE_CACHE_WAYS % (line / 8));
+
+    // 104 bytes x 16 ways = 1664 = 13 lines. The lookup touches this many
+    // lines per set choice, twice, to declare a miss.
+    try std.testing.expectEqual(@as(usize, 104), @sizeOf(DecodeCacheEntry));
+    try std.testing.expectEqual(@as(usize, 13), set_bytes / line);
+}
+
+// Banks sized by measured demand, against the equal split they replaced. The
+// static-image bank doubled *and* the whole table got smaller, because two of
+// the four equal banks had never held a decode.
+test "demand-sized banks cost less than the equal split they replaced" {
+    const entry = @sizeOf(DecodeCacheEntry);
+    const equal_split_entries = (1 << 16) * translation_domain.count * constants.DECODE_CACHE_WAYS;
+    const total = constants.DECODE_CACHE_ENTRY_COUNT +
+        constants.DECODE_VICTIM_CACHE_ENTRY_COUNT +
+        constants.DECODE_STATIC_L2_ENTRY_COUNT;
+
+    try std.testing.expect(constants.DECODE_CACHE_ENTRY_COUNT < equal_split_entries);
+    // The bank that does the work has twice the room it had under the split.
+    try std.testing.expectEqual(
+        @as(usize, 1 << 17),
+        translation_domain.primary_layout.localSetCount(.static_image),
+    );
+    // Every tier together stays under 350 MiB, down from 430.
+    try std.testing.expect(total * entry < 350 * 1024 * 1024);
 }

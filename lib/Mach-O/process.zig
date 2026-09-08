@@ -97,6 +97,7 @@ const guest_alias_contract = @import("diagnostics").guest_alias_contract;
 const storage_integrity = @import("diagnostics").storage_integrity;
 const run_budget = @import("diagnostics").run_budget;
 const run_manifest = @import("diagnostics").run_manifest;
+const fatal_conditions = @import("diagnostics").fatal_conditions;
 const xiso_preflight = @import("diagnostics").xiso_preflight;
 const xiso_format = @import("xenia_xiso_format");
 const kernel_service_readiness = @import("diagnostics").kernel_service_readiness;
@@ -459,11 +460,16 @@ pub const MachOState = struct {
     heap_next: u64,
     lock_fence: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     regs: Regs = .{},
-    xmm: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
+    // AVX-512 exposes sixteen architectural vector registers plus the
+    // EVEX R'/B/X extensions (zmm16-zmm31). Keep the complete register file
+    // in the interpreter state so a decoded high-register operand cannot
+    // alias or index past the legacy XMM/YMM arrays.
+    xmm: [32][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 32,
     // AVX-512 opmask registers (k0-k7). k0 is always all-1s when read as
     // a mask operand; k1-k7 hold actual mask values for predicated operations.
     k: [8]u64 = [_]u64{0xFFFF_FFFF_FFFF_FFFF} ** 8,
-    ymm_hi: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
+    ymm_hi: [32][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 32,
+    zmm_hi: [32][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** 32,
     cpu_profile: x64_decoder.capabilities.Profile = .xenia,
     compat: compat_runtime.Runtime = .{},
     terminated: bool = false,
@@ -798,6 +804,34 @@ pub const MachOState = struct {
     preflight: preflight_lib.Collector = .{},
     preflight_report: preflight_lib.Report = .{},
     preflight_evaluated: bool = false,
+    /// The image-wide subsystem census is retained so the graphics preflight
+    /// can consume the same evidence without walking the symbol table twice.
+    prelaunch_audit_summary: ?preflight_lib.prelaunch_audit.Summary = null,
+    /// Static graphics readiness established after the image is indexed, host
+    /// capabilities are probed, and the full graphics boundary observer set is
+    /// sealed.  This is deliberately separate from the runtime graphics
+    /// ledger: a ready static image is not evidence that the guest has reached
+    /// VdSwap, and an untested runtime path is not allowed to masquerade as a
+    /// static link failure.
+    graphics_preflight_report: preflight_lib.graphics_readiness.Report = .{},
+    /// Results of the executable host/guest graphics path tests performed at
+    /// admission. This is separate from the static report above and from the
+    /// runtime ledger: an untested or not-yet-reachable stage must remain
+    /// visible instead of being silently treated as a pass.
+    graphics_path_preflight: preflight_lib.graphics_path_probe.Report = .{},
+    graphics_preflight_enabled: bool = false,
+    graphics_preflight_window_allowed: bool = true,
+    /// A normal guest exit can follow a failed Xenia setup and otherwise look
+    /// like a Rosette crash because the host UI requests deferred shutdown.
+    /// Keep the syscall evidence so the final diagnosis can name that path.
+    guest_exit_observed: bool = false,
+    guest_exit_code: u64 = 0,
+    guest_exit_step: u64 = 0,
+    /// The selected backend is part of the guest-facing authentic admission
+    /// contract. Keep the spelling, not only its identity hash, because the
+    /// title asks for it through getenv during GraphicsSystem::Setup.
+    audit_backend_name: [32]u8 = [_]u8{0} ** 32,
+    audit_backend_name_length: u8 = 0,
     /// Set when Rosette builds the configuration dump itself from the file. The
     /// dump then restates the file rather than reporting what the guest bound,
     /// so it must never be used as the second, independent reading.
@@ -971,6 +1005,8 @@ pub const MachOState = struct {
     audit_build_identity_loaded: bool = false,
     audit_identity_conflict: bool = false,
     audit_media_fingerprint: u64 = 0,
+    audit_media_preflight_evaluated: bool = false,
+    audit_media_preflight_passed: bool = false,
     audit_config_fingerprint: u64 = 0,
     audit_title_id: u32 = 0,
     /// The binary journal is deliberately a small writer, not the 512 KiB
@@ -1433,6 +1469,13 @@ pub const MachOState = struct {
     /// What this machine actually did when asked to perform the operations the
     /// emulator depends on. Filled once, before the guest runs.
     host_capabilities: preflight_lib.host_capability.Report = .{},
+    /// Supplemental host operations whose subjects are outside the generic
+    /// capability prober: the actual libc notification edge and a read-only
+    /// libc locale query.  Keep the results on the run state so the final
+    /// admission snapshot consumes exactly the operations that were logged,
+    /// rather than probing again and letting the two lines disagree.
+    host_signal_handshake_proven: bool = false,
+    host_locale_query_proven: bool = false,
     /// What is actually in the graphics interrupt callback slot, from the
     /// emulator's own `SetInterruptCallback` line. The slot holds one address
     /// and the newest statement is the true one; every earlier one is a
@@ -1700,15 +1743,15 @@ pub const MachOState = struct {
     endian_evidence_filled: bool = false,
     guest_files: [GUEST_FILE_MAX]GuestFile = [_]GuestFile{GuestFile{}} ** GUEST_FILE_MAX,
     bound_import_thunks: []BoundImportThunk = &.{},
-    decode_cache: []DecodeCacheEntry,
+    decode_cache: []align(constants.HOST_CACHE_LINE_BYTES) DecodeCacheEntry,
     /// Recently displaced primary entries.  This is probed only after a
     /// primary miss, so the common hit path remains a single set lookup while
     /// returning code can survive a short cold-stream eviction burst.
-    decode_victim_cache: []DecodeCacheEntry,
+    decode_victim_cache: []align(constants.HOST_CACHE_LINE_BYTES) DecodeCacheEntry,
     /// Static-image L2. Unlike the generation-sensitive primary/victim
     /// caches, this bank survives unrelated generated-code writes and only
     /// leaves on an explicit executable-range invalidation.
-    static_decode_l2: []DecodeCacheEntry,
+    static_decode_l2: []align(constants.HOST_CACHE_LINE_BYTES) DecodeCacheEntry,
     /// Faulting instructions retried after a guest SIGSEGV handler resolved
     /// the page's protection. See `signal_handling.protectionFaultResolved`.
     guest_protection_retries: u64 = 0,
@@ -1821,15 +1864,31 @@ pub const MachOState = struct {
         }
 
         const initializer_count = metadata.initializer_addresses.len;
-        const decode_cache = try allocator.alloc(DecodeCacheEntry, DECODE_CACHE_ENTRY_COUNT);
-        @memset(decode_cache, .{});
-        const decode_victim_cache = try allocator.alloc(
+        // Align every translation tier to the host cache line.
+        //
+        // A set is `ways * @sizeOf(DecodeCacheEntry)` bytes, and because the
+        // entry is 8-byte aligned that product is always a whole number of
+        // 128-byte lines on Apple Silicon — but only if the table's base is
+        // line-aligned too. At the natural 8-byte alignment every set in the
+        // table shares the base's offset within its line, so a misaligned
+        // base makes *every* set straddle one extra line, on a scan that
+        // reads all sixteen ways. Asking for the alignment costs a few bytes
+        // once and takes it out of the allocator's hands.
+        const decode_cache = try allocator.alignedAlloc(
             DecodeCacheEntry,
+            constants.HOST_CACHE_LINE_ALIGNMENT,
+            DECODE_CACHE_ENTRY_COUNT,
+        );
+        @memset(decode_cache, .{});
+        const decode_victim_cache = try allocator.alignedAlloc(
+            DecodeCacheEntry,
+            constants.HOST_CACHE_LINE_ALIGNMENT,
             constants.DECODE_VICTIM_CACHE_ENTRY_COUNT,
         );
         @memset(decode_victim_cache, .{});
-        const static_decode_l2 = try allocator.alloc(
+        const static_decode_l2 = try allocator.alignedAlloc(
             DecodeCacheEntry,
+            constants.HOST_CACHE_LINE_ALIGNMENT,
             constants.DECODE_STATIC_L2_ENTRY_COUNT,
         );
         @memset(static_decode_l2, .{});
@@ -2197,31 +2256,109 @@ pub const MachOState = struct {
         return run_manifest.hashFromEnvironment(name) == expected;
     }
 
+    fn setAuditBackend(self: *MachOState, backend: []const u8) bool {
+        if (backend.len == 0 or backend.len > self.audit_backend_name.len) return false;
+        @memset(&self.audit_backend_name, 0);
+        @memcpy(self.audit_backend_name[0..backend.len], backend);
+        self.audit_backend_name_length = @intCast(backend.len);
+        return true;
+    }
+
+    fn auditBackend(self: *const MachOState) []const u8 {
+        return self.audit_backend_name[0..self.audit_backend_name_length];
+    }
+
     fn publishAuditEnvironment(self: *const MachOState, allocator: std.mem.Allocator) bool {
         if (!self.audit_manifest.sealIntact()) return false;
 
         const manifest_hash = self.audit_manifest.fingerprint();
-        if (!self.auditEnvironmentMatches("ROSETTE_RUN_ID", self.audit_manifest.identity.run_id) or
-            !self.auditEnvironmentMatches("ROSETTE_MANIFEST_HASH", manifest_hash) or
-            (self.audit_build_identity_hash != 0 and
-                !self.auditEnvironmentMatches("ROSETTE_BUILD_IDENTITY_HASH", self.audit_build_identity_hash)))
-        {
+        const run_matches = self.auditEnvironmentMatches("ROSETTE_RUN_ID", self.audit_manifest.identity.run_id);
+        const manifest_matches = self.auditEnvironmentMatches("ROSETTE_MANIFEST_HASH", manifest_hash);
+        const build_identity_matches = self.audit_build_identity_hash == 0 or
+            self.auditEnvironmentMatches("ROSETTE_BUILD_IDENTITY_HASH", self.audit_build_identity_hash);
+        if (!run_matches or !manifest_matches or !build_identity_matches) {
+            machoCapturePrint(
+                "macho-processor: AUDIT IDENTITY: refusing publication; pre-existing environment agrees run={} manifest={} build_identity={}\n",
+                .{ run_matches, manifest_matches, build_identity_matches },
+            );
             return false;
         }
 
         var buffer: [32]u8 = undefined;
         const publish = struct {
             fn value(allocator_out: std.mem.Allocator, name: [*:0]const u8, number: u64, buffer_out: []u8) bool {
+                // A zero is not a value the reader can accept: the emulator's
+                // run context rejects a zero hash as absent, so publishing one
+                // would produce a refusal on the far side of the handshake
+                // rather than here, where the cause is. Refuse it locally and
+                // let the admission line name it.
+                if (number == 0) return false;
                 const text = std.fmt.bufPrint(buffer_out, "0x{x}", .{number}) catch return false;
                 const text_z = allocator_out.dupeZ(u8, text) catch return false;
                 return setenv(name, text_z.ptr, 1) == 0;
             }
         }.value;
-        if (!publish(allocator, "ROSETTE_RUN_ID", self.audit_manifest.identity.run_id, &buffer)) return false;
-        if (!publish(allocator, "ROSETTE_MANIFEST_HASH", manifest_hash, &buffer)) return false;
+        const publishText = struct {
+            fn value(allocator_out: std.mem.Allocator, name: [*:0]const u8, text: []const u8) bool {
+                if (text.len == 0) return false;
+                const text_z = allocator_out.dupeZ(u8, text) catch return false;
+                return setenv(name, text_z.ptr, 1) == 0;
+            }
+        }.value;
+        if (!publish(allocator, "ROSETTE_RUN_ID", self.audit_manifest.identity.run_id, &buffer)) {
+            machoCapturePrint("macho-processor: AUDIT IDENTITY: publication failed field=ROSETTE_RUN_ID\n", .{});
+            return false;
+        }
+        if (!publish(allocator, "ROSETTE_MANIFEST_HASH", manifest_hash, &buffer)) {
+            machoCapturePrint("macho-processor: AUDIT IDENTITY: publication failed field=ROSETTE_MANIFEST_HASH\n", .{});
+            return false;
+        }
         if (self.audit_build_identity_hash != 0 and
-            !publish(allocator, "ROSETTE_BUILD_IDENTITY_HASH", self.audit_build_identity_hash, &buffer)) return false;
-        return true;
+            !publish(allocator, "ROSETTE_BUILD_IDENTITY_HASH", self.audit_build_identity_hash, &buffer))
+        {
+            machoCapturePrint("macho-processor: AUDIT IDENTITY: publication failed field=ROSETTE_BUILD_IDENTITY_HASH\n", .{});
+            return false;
+        }
+        if (!publishText(allocator, "ROSETTE_BACKEND", self.auditBackend())) {
+            machoCapturePrint("macho-processor: AUDIT IDENTITY: publication failed field=ROSETTE_BACKEND\n", .{});
+            return false;
+        }
+        // Read back through the same call the guest's own lookup will make.
+        //
+        // A publish that reports success and a variable that cannot be read
+        // afterwards are indistinguishable from here, and that difference was
+        // worth several hours: the guest refused its own start over an absent
+        // identity while this step believed it had handed one over.
+        const run_readback = run_manifest.hashFromEnvironment("ROSETTE_RUN_ID");
+        const manifest_readback = run_manifest.hashFromEnvironment("ROSETTE_MANIFEST_HASH");
+        const build_identity_readback = if (self.audit_build_identity_hash != 0)
+            run_manifest.hashFromEnvironment("ROSETTE_BUILD_IDENTITY_HASH")
+        else
+            0;
+        const backend_readback = if (std.c.getenv("ROSETTE_BACKEND")) |raw|
+            std.mem.eql(u8, std.mem.span(raw), self.auditBackend())
+        else
+            false;
+        const agrees = run_readback == self.audit_manifest.identity.run_id and
+            manifest_readback == manifest_hash and
+            (self.audit_build_identity_hash == 0 or
+                build_identity_readback == self.audit_build_identity_hash) and
+            backend_readback;
+        machoCapturePrint(
+            "macho-processor: AUDIT IDENTITY: published run=0x{x} manifest=0x{x} build_identity=0x{x} backend={s}; readback run=0x{x} manifest=0x{x} build_identity=0x{x} backend_agrees={} agrees={}\n",
+            .{
+                self.audit_manifest.identity.run_id,
+                manifest_hash,
+                self.audit_build_identity_hash,
+                self.auditBackend(),
+                run_readback,
+                manifest_readback,
+                build_identity_readback,
+                backend_readback,
+                agrees,
+            },
+        );
+        return agrees;
     }
 
     /// Configure the cross-process identity and the one execution profile
@@ -6273,9 +6410,12 @@ pub const MachOState = struct {
         const allow: []const u8 = if (allow_raw) |raw| std.mem.span(raw) else "";
         self.run_integrity.configure(policy, allow);
         // `observe` is the explicit non-invasive mode. Both `fault` and
-        // `warn` select the evidence-first predicates so a diagnostic run
-        // cannot quietly classify a proven reusable eviction or deadlock as
-        // harmless merely because an unrelated counter is moving.
+        // `warn` select the evidence-first predicates; `fault` additionally
+        // lets the fill hook raise SIGSEGV at the first miss the cache could
+        // have avoided, while `warn` retains that same miss as a
+        // non-terminating violation. Neither arms the compulsory first touch:
+        // the cache is empty at step zero, so that would stop every run on its
+        // first guest instruction.
         self.run_integrity_strict = policy != .observe;
         machoCapturePrint(
             "macho-processor: RUN INTEGRITY: schema={d} policy={s} strict_fail_fast={} invariants={d} allow=[{s}] (ROSETTE_RUN_INTEGRITY=fault|warn|observe, ROSETTE_RUN_INTEGRITY_ALLOW=<labels>). Each invariant states what arms it, so an unarmed one is unobserved rather than passing; the first armed violation stops the run and names its owner\n",
@@ -6603,7 +6743,9 @@ pub const MachOState = struct {
         // Whether the run advanced alongside those parks. Captured once when a
         // never-notified park is first seen and re-based whenever an axis
         // moves, so the comparison is always against the start of the current
-        // quiet window rather than against the start of the run.
+        // quiet window rather than against the start of the run. This witness
+        // intentionally excludes raw instruction retirement: long JIT/compiler
+        // loops can execute guest instructions without moving a subsystem axis.
         var progress_since_park = false;
         if (waiters_without_notifier != 0) {
             if (!self.never_notified_witness_valid) {
@@ -6616,6 +6758,14 @@ pub const MachOState = struct {
         } else {
             self.never_notified_witness_valid = false;
         }
+
+        // A flat non-step witness is not the same thing as a frozen guest. Use
+        // the step counter only for the stronger question: did this checkpoint
+        // observe exactly the same guest execution position as the previous
+        // integrity checkpoint? This keeps idle host workers diagnostic while
+        // preserving the fail-fast path for a genuinely stopped run.
+        const run_execution_frozen = self.run_integrity.evaluations != 0 and
+            self.executed_steps == self.run_integrity.last_observation.step;
 
         // A wait subject that has timed out repeatedly and been signalled zero
         // times. A finite manual-reset poll is a completed guest timeout, not
@@ -6679,9 +6829,9 @@ pub const MachOState = struct {
         // itself, proof that a guest producer was lost. Promote the raw census
         // only when there is a causal witness: an actual guest wait with no
         // signal, a classified sync-registry object whose waiter obligation is
-        // promotable, or a run that has stopped advancing altogether. This
-        // keeps fail-fast strictness for real contradictions while preventing
-        // idle host workers from terminating a healthy guest run.
+        // promotable, or a run whose guest execution position is unchanged
+        // between integrity checkpoints. A flat non-step progress witness is
+        // not enough, because translation/JIT work can still be executing.
         const guest_wait_obligation = wait_graph_blocker.address != 0 and
             wait_graph_blocker.waits != 0 and
             wait_graph_blocker.signals == 0;
@@ -6692,8 +6842,13 @@ pub const MachOState = struct {
                 break;
             }
         }
-        const liveness_obligation_proven = waiters_without_notifier != 0 and
-            (guest_wait_obligation or registry_wait_obligation or !progress_since_park);
+        const liveness_obligation_proven = run_integrity.proveLivenessObligation(
+            waiters_without_notifier,
+            guest_wait_obligation,
+            registry_wait_obligation,
+            run_execution_frozen,
+            progress_since_park,
+        );
         const actionable_waiters_without_notifier = if (liveness_obligation_proven)
             waiters_without_notifier
         else
@@ -6847,6 +7002,7 @@ pub const MachOState = struct {
             .waiters_without_a_notifier = waiters_without_notifier,
             .actionable_waiters_without_a_notifier = actionable_waiters_without_notifier,
             .liveness_obligation_proven = liveness_obligation_proven,
+            .run_execution_frozen = run_execution_frozen,
             .progress_since_never_notified_park = progress_since_park,
             .reinterpreted_texture_formats = self.texture_format_summary.reinterpreted,
             .texture_formats_probed = self.texture_format_summary.probed != 0,
@@ -7483,13 +7639,14 @@ pub const MachOState = struct {
     ) void {
         _ = self;
         machoCapturePrint(
-            "    integrity-trace snapshot={s} step={d} liveness_scope={s} liveness_armed={} progress_since_park={} window(forwardings/unaccountable)={d}/{d} frames(presented/custody)={d}/{d} swap(reached/offered)={d}/{d}\n",
+            "    integrity-trace snapshot={s} step={d} liveness_scope={s} liveness_armed={} progress_since_park={} execution_frozen={} window(forwardings/unaccountable)={d}/{d} frames(presented/custody)={d}/{d} swap(reached/offered)={d}/{d}\n",
             .{
                 label,
                 observation.step,
                 observation.liveness_scope.label(),
                 observation.liveness_scope.notifierChecksArmed(),
                 observation.progress_since_never_notified_park,
+                observation.run_execution_frozen,
                 observation.window_forwardings,
                 observation.window_unaccountable,
                 observation.frames_presented_to_window,
@@ -7510,7 +7667,7 @@ pub const MachOState = struct {
             },
         );
         machoCapturePrint(
-            "    integrity-trace snapshot={s} output(presenter_ready/raw_draws/renderable_draws/target_state/target_output_ready/completion_signals/color_resolves/swap_boundaries/vdswap_encoded/opportunity/published/producer_quiet)={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{} liveness(park_steps/wait_timeouts/waiters_without_notifier/actionable_without_notifier/obligation_proven/parks_without_reason)={}/{}/{}/{}/{}/{}\n",
+            "    integrity-trace snapshot={s} output(presenter_ready/raw_draws/renderable_draws/target_state/target_output_ready/completion_signals/color_resolves/swap_boundaries/vdswap_encoded/opportunity/published/producer_quiet)={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{} liveness(park_steps/wait_timeouts/waiters_without_notifier/actionable_without_notifier/obligation_proven/execution_frozen/progress_since_park/parks_without_reason)={}/{}/{}/{}/{}/{}/{}/{}\n",
             .{
                 label,
                 observation.presenter_ready,
@@ -7530,6 +7687,8 @@ pub const MachOState = struct {
                 observation.waiters_without_a_notifier,
                 observation.actionable_waiters_without_a_notifier,
                 observation.liveness_obligation_proven,
+                observation.run_execution_frozen,
+                observation.progress_since_never_notified_park,
                 observation.parks_without_a_reason,
             },
         );
@@ -8276,13 +8435,14 @@ pub const MachOState = struct {
             },
         );
         machoCapturePrint(
-            "macho-processor: RUN INTEGRITY LIVENESS: scope={s} armed={} waiters_without_notifier={d} actionable={d} obligation_proven={}; verdict={s}\n",
+            "macho-processor: RUN INTEGRITY LIVENESS: scope={s} armed={} waiters_without_notifier={d} actionable={d} obligation_proven={} execution_frozen={}; verdict={s}\n",
             .{
                 observation.liveness_scope.label(),
                 observation.liveness_scope.notifierChecksArmed(),
                 observation.waiters_without_a_notifier,
                 observation.actionable_waiters_without_a_notifier,
                 observation.liveness_obligation_proven,
+                observation.run_execution_frozen,
                 summary.verdict(),
             },
         );
@@ -8351,7 +8511,7 @@ pub const MachOState = struct {
             },
         );
         machoCapturePrint(
-            "macho-processor: RUN INTEGRITY POLICY: strict_fail_fast={} anomaly_ledger_records={d} pause_transaction_defects={d}; fault/warn modes stop or expose the first proven reusable eviction, classified liveness contradiction, or pause-ledger defect; observe mode retains the settling-window policy\n",
+            "macho-processor: RUN INTEGRITY POLICY: strict_fail_fast={} anomaly_ledger_records={d} pause_transaction_defects={d}; fault mode stops on the first avoidable cache miss or other proven defect, warn exposes it without stopping, and observe retains the settling-window policy\n",
             .{
                 self.run_integrity_strict,
                 observation.recorded_anomalies,
@@ -8434,8 +8594,12 @@ pub const MachOState = struct {
             observation.actionable_waiters_without_a_notifier == 0)
         {
             machoCapturePrint(
-                "macho-processor: RUN INTEGRITY LIVENESS: raw host waiters_without_notifier={d} retained diagnostically, but no causal notifier obligation was proven; the fatal notifier invariants remain unarmed. Guest wait graph/classified sync evidence or a fully frozen run is required\n",
-                .{observation.waiters_without_a_notifier},
+                "macho-processor: RUN INTEGRITY LIVENESS: raw host waiters_without_notifier={d} retained diagnostically, but no causal notifier obligation was proven; execution_frozen={} progress_since_park={}; the fatal notifier invariants remain unarmed. Guest wait graph/classified sync evidence or a fully frozen run is required\n",
+                .{
+                    observation.waiters_without_a_notifier,
+                    observation.run_execution_frozen,
+                    observation.progress_since_never_notified_park,
+                },
             );
         }
         // Keep the translation evidence beside the terminal integrity report.
@@ -8526,7 +8690,7 @@ pub const MachOState = struct {
         }
     }
 
-    /// Stop at the cache fill that proves a reusable decode was evicted.
+    /// Stop at the cache fill when strict fault policy is miss-intolerant.
     ///
     /// The periodic run-integrity checkpoint remains the authoritative
     /// summary, but waiting for that checkpoint would let a cache conflict
@@ -8555,7 +8719,10 @@ pub const MachOState = struct {
         })) return;
 
         const global_set: usize = set_base / constants.DECODE_CACHE_WAYS;
-        const bank_set: usize = global_set % translation_cache.primary_layout.localSetCount();
+        // Banks are unequal, so the bank-local coordinate is the offset from
+        // this domain's first set. A modulo by "the" bank size would name a
+        // set in the wrong domain the moment the banks stopped matching.
+        const bank_set: usize = global_set - translation_cache.primary_layout.bankFirstSet(domain);
         const alternate_set_base = self.decodeCacheAlternateSetBaseFor(address, domain);
         const alternate_global_set: usize = alternate_set_base / constants.DECODE_CACHE_WAYS;
         const source_symbol = self.metadata.nearestSymbol(address);
@@ -8675,7 +8842,7 @@ pub const MachOState = struct {
         }
         const totals = self.translation_economics.summary();
         machoCapturePrint(
-            "macho-processor: TRANSLATION FAIL-FAST: invariant={s} cause={s} address=0x{x} domain={s} step={d} totals(fills/vacant/conflict/cold/stale/flush)={d}/{d}/{d}/{d}/{d}/{d}; a proven reusable eviction or executable-byte integrity event cannot continue under the fault policy\n",
+            "macho-processor: TRANSLATION FAIL-FAST: invariant={s} cause={s} address=0x{x} domain={s} step={d} totals(fills/vacant/conflict/cold/stale/flush)={d}/{d}/{d}/{d}/{d}/{d}; a discarded decode or executable-byte integrity event cannot continue under the fault policy\n",
             .{
                 invariant.label(),
                 cause.label(),
@@ -9310,12 +9477,13 @@ pub const MachOState = struct {
             if (path_report.complete() and detail_established) {
                 complete_paths += 1;
             } else machoCapturePrint(
-                "  health path={s: <16} complete={s} progress={d}/{d} satisfied={d} degraded={d} blocked={d} untested={d} first_missing={s}\n",
+                "  health path={s: <16} complete={s} progress={d}/{d} percent={d} satisfied={d} degraded={d} blocked={d} untested={d} first_missing={s}\n",
                 .{
                     path.label(),
                     if (path_report.complete()) "YES" else "NO",
-                    path_report.percent(),
+                    path_report.satisfied,
                     path_report.total,
+                    path_report.percent(),
                     path_report.satisfied,
                     path_report.degraded,
                     path_report.blocked,
@@ -11374,6 +11542,7 @@ pub const MachOState = struct {
         var compulsory_misses: u64 = 0;
         var deferred_misses: u64 = 0;
         var actionable_misses: u64 = 0;
+        var fail_fast_misses: u64 = 0;
         inline for (@typeInfo(translation_economics.Cause).@"enum".fields) |field| {
             const cause: translation_economics.Cause = @enumFromInt(field.value);
             const count: u64 = switch (cause) {
@@ -11390,6 +11559,7 @@ pub const MachOState = struct {
             } else {
                 deferred_misses +|= count;
             }
+            if (cause.requiresFailFast()) fail_fast_misses +|= count;
             machoCapturePrint(
                 "  translation miss {s: <18} count={d: <10} share={d}% fatal={s} {s}\n",
                 .{
@@ -11402,8 +11572,8 @@ pub const MachOState = struct {
             );
         }
         machoCapturePrint(
-            "  translation miss accounting: compulsory={d} deferred_cold={d} actionable_recurring={d} of {d}; only actionable recurring classes arm no-unverified-translation-miss. A compulsory miss is one an instruction pays once, a cold eviction is non-empty but never-reused working-set evidence, and conflicts/stale/flush are proven avoidable loss\n",
-            .{ compulsory_misses, deferred_misses, actionable_misses, totals.decodes },
+            "  translation miss accounting: compulsory={d} deferred_cold={d} actionable_recurring={d} fatal_on_strict_fault={d} of {d}; every fill the cache could have avoided arms the strict fault hook and a compulsory first touch never does, while the cause classes stay separate: compulsory is first-touch work, cold is never-reused working-set evidence, and conflicts/stale/flush are avoidable loss\n",
+            .{ compulsory_misses, deferred_misses, actionable_misses, fail_fast_misses, totals.decodes },
         );
 
         // The hit rate is independent of why the misses occurred. Keep it next
@@ -11445,6 +11615,25 @@ pub const MachOState = struct {
             self.decode_domain_misses[translation_domain.Domain.unknown.bank()],
             self.decode_domain_fills[translation_domain.Domain.unknown.bank()],
         });
+        // Occupancy, not fills. Fills only ever grow, so a bank that is full
+        // and a bank that filled once and was invalidated read the same. This
+        // row is the one that says whether a bank is about to start evicting,
+        // and whether the capacity it was given matches the work it is doing.
+        var occupancy: [translation_domain.count]BankOccupancy = undefined;
+        for (translation_domain.all) |domain| {
+            occupancy[domain.bank()] = self.sampleBankOccupancy(domain);
+        }
+        machoCapturePrint(
+            "  translation bank occupancy: static={d}%({d}/{d}) dynamic={d}%({d}/{d}) thunk={d}%({d}/{d}) unknown={d}%({d}/{d}) sampled_sets={d}/{d}/{d}/{d}; banks are sized by measured demand, so an uneven row is the routing working rather than an unfair split — read it against the fill census above, because fills never come back down and occupancy does\n",
+            .{
+                occupancy[0].percent(),        occupancy[0].estimated(),    occupancy[0].capacity,
+                occupancy[1].percent(),        occupancy[1].estimated(),    occupancy[1].capacity,
+                occupancy[2].percent(),        occupancy[2].estimated(),    occupancy[2].capacity,
+                occupancy[3].percent(),        occupancy[3].estimated(),    occupancy[3].capacity,
+                occupancy[0].sampled_sets,     occupancy[1].sampled_sets,
+                occupancy[2].sampled_sets,     occupancy[3].sampled_sets,
+            },
+        );
 
         if (totals.hottest_recurring != 0) {
             var hottest: [25]translation_economics.PageRecord = undefined;
@@ -14795,6 +14984,311 @@ pub const MachOState = struct {
         }
     }
 
+    fn preflightOutcomeStatus(
+        outcome: preflight_lib.host_capability.Outcome,
+    ) host_contract_coverage.Status {
+        return switch (outcome) {
+            .verified => .satisfied,
+            .degraded => .degraded,
+            .failed, .unavailable => .unsatisfied,
+            .unprobed => .untested,
+        };
+    }
+
+    /// Exercise the pure address-space contract with the same fixed-view
+    /// geometry Xenia publishes at runtime.  The base is deliberately a
+    /// synthetic value: before the guest runs there is no live Xenia mapping
+    /// to inspect, and inventing one from a process address would turn a model
+    /// test into a false claim about the guest.
+    fn preflightAddressTranslation() bool {
+        const model_base: u64 = 0x1000_0000;
+        var model: xenia_memory_views.Model = .{};
+        if (model.observeFixedFileView(
+            model_base,
+            xenia_memory_views.primary_view_length,
+            0,
+            false,
+        ) != .discovered) {
+            return false;
+        }
+        if (!model.ready()) return false;
+
+        const virtual_address = model.virtualHostAddress(0xFFCAB000) orelse return false;
+        const unbiased_address = model.primaryUnbiasedHostAddress(0xFFCAB000) orelse return false;
+        if (virtual_address -| unbiased_address != xenia_memory_views.physical_4k_bias) return false;
+
+        const physical_address = xenia_memory_views.Model.physicalAddressForVirtual(0xFFCAB000) orelse return false;
+        if (physical_address != 0x01FCAC000) return false;
+        if (model.physicalHostAddress(physical_address) == null) return false;
+        inline for ([_]xenia_memory_views.PhysicalProjection{
+            .physical,
+            .a_virtual,
+            .c_virtual,
+            .e_virtual,
+        }) |projection| {
+            if (model.physicalProjectionHostAddress(0x0510C040, projection) == null) return false;
+        }
+        return model.physicalProjectionHostAddress(0xFFF, .e_virtual) == null;
+    }
+
+    /// Seed the host half of the coverage ledger from operations Rosette has
+    /// already performed without guest execution.  Runtime observation still
+    /// refines these rows later, but this is the first complete answer and is
+    /// intentionally kept separate from the guest-owned ten rows.
+    pub fn seedPreWindowHostCoverage(self: *MachOState) void {
+        const C = host_contract_coverage.Capability;
+        const host = &self.host_capabilities;
+
+        const image_mapped = self.segments.len != 0 and
+            self.entry_point_vaddr != 0 and
+            self.guestMemoryConst(self.entry_point_vaddr, 1) != null;
+        self.host_coverage.record(
+            C.guest_memory_mapping,
+            if (image_mapped) .satisfied else .unsatisfied,
+            if (image_mapped)
+                "Mach-O segments and the entry point are mapped and readable before guest execution"
+            else
+                "the loaded Mach-O has no readable mapped entry point",
+        );
+
+        const host_page = host.finding(.host_page_granularity);
+        const protection = host.finding(.protection_cycle);
+        const overlay = host.finding(.guest_page_protection_fidelity);
+        const protection_status: host_contract_coverage.Status = blk: {
+            if (protection.outcome == .failed or protection.outcome == .unavailable) {
+                break :blk .unsatisfied;
+            }
+            // On a coarse host the overlay is the proof of the effective
+            // contract.  On a 4 KiB host, the direct protection-cycle probe is
+            // already the exact guest-sized operation.
+            if (overlay.outcome == .verified) {
+                break :blk preflightOutcomeStatus(protection.outcome);
+            }
+            if (host_page.outcome == .verified and host_page.measured_value <= 4096) {
+                break :blk preflightOutcomeStatus(protection.outcome);
+            }
+            if (overlay.outcome == .degraded or
+                host_page.outcome == .degraded or
+                protection.outcome == .degraded)
+            {
+                break :blk .degraded;
+            }
+            if (host_page.outcome == .failed or host_page.outcome == .unavailable) {
+                break :blk .unsatisfied;
+            }
+            break :blk .untested;
+        };
+        self.host_coverage.record(
+            C.memory_protection,
+            protection_status,
+            switch (protection_status) {
+                .satisfied => if (overlay.outcome == .verified)
+                    "host protection cycle passed and Rosette's guest-page overlay restored the requested granularity"
+                else
+                    "host protection cycle passed at the guest's 4 KiB page granularity",
+                .degraded => "the host protection operation or its guest-page compensation is coarser than requested",
+                .unsatisfied => "the host protection contract was exercised and failed",
+                .untested => "the host protection contract has no complete granularity proof",
+            },
+        );
+
+        const translation_ok = preflightAddressTranslation();
+        self.host_coverage.record(
+            C.address_space_translation,
+            if (translation_ok) .satisfied else .unsatisfied,
+            if (translation_ok)
+                "virtual, physical and A/C/E alias projections passed the model self-test; the live Xenia base remains guest-deferred"
+            else
+                "the console virtual/physical alias model failed its pre-window self-test",
+        );
+
+        const thread_status = preflightOutcomeStatus(host.finding(.thread_creation).outcome);
+        self.host_coverage.record(
+            C.thread_creation,
+            thread_status,
+            "a host thread was spawned, executed a release-store witness and joined during preflight",
+        );
+        self.host_coverage.record(
+            C.thread_scheduling,
+            thread_status,
+            "the preflight worker ran on the host scheduler and completed before the join returned",
+        );
+
+        const timed_wait_status = preflightOutcomeStatus(host.finding(.timed_wait_fidelity).outcome);
+        const sync_status: host_contract_coverage.Status = if (!self.host_signal_handshake_proven)
+            .unsatisfied
+        else switch (timed_wait_status) {
+            .satisfied => .satisfied,
+            .degraded => .degraded,
+            .unsatisfied => .unsatisfied,
+            .untested => .untested,
+        };
+        self.host_coverage.record(
+            C.sync_primitives,
+            sync_status,
+            if (self.host_signal_handshake_proven and sync_status == .satisfied)
+                "libc mutex/condition primitives signalled and released a real waiter"
+            else
+                "the host mutex/condition contract did not provide a complete timed and signalled proof",
+        );
+        self.host_coverage.record(
+            C.wait_signal_handshake,
+            if (self.host_signal_handshake_proven) .satisfied else .unsatisfied,
+            if (self.host_signal_handshake_proven)
+                "a pthread condition signal crossed from the producer thread to the waiting thread"
+            else
+                "a pthread condition signal did not release the waiting thread",
+        );
+
+        const file_ok = self.data.len != 0 and self.segments.len != 0;
+        self.host_coverage.record(
+            C.file_read,
+            if (file_ok) .satisfied else .unsatisfied,
+            if (file_ok)
+                "the Mach-O image was read into memory and indexed before admission"
+            else
+                "the Mach-O image read/index operation produced no usable bytes",
+        );
+        self.host_coverage.record(
+            C.disc_image,
+            if (self.audit_media_fingerprint == 0)
+                .unsatisfied
+            else if (self.audit_media_preflight_evaluated and !self.audit_media_preflight_passed)
+                .degraded
+            else if (self.audit_media_preflight_evaluated and self.audit_media_preflight_passed)
+                .satisfied
+            else
+                .degraded,
+            if (self.audit_media_fingerprint == 0)
+                "no verified Xenia media content identity exists before admission"
+            else if (self.audit_media_preflight_evaluated and !self.audit_media_preflight_passed)
+                "the selected media hash exists, but the XISO structure preflight did not pass"
+            else if (self.audit_media_preflight_evaluated and self.audit_media_preflight_passed)
+                "the selected Xenia media input and content identity passed before admission"
+            else
+                "the selected media has a content identity but no format-level preflight proof",
+        );
+
+        if (self.graphics_preflight_enabled) {
+            self.host_coverage.record(
+                C.window_surface,
+                if (self.graphics_path_preflight.windowGateAllows()) .satisfied else .unsatisfied,
+                if (self.graphics_path_preflight.windowGateAllows())
+                    "native window/layer/backend host stages passed the pre-window path probe"
+                else
+                    "the native window path probe has a blocking host-stage failure",
+            );
+        }
+
+        const unwind_ok = self.unwinder.compact != null;
+        self.host_coverage.record(
+            C.exception_unwinding,
+            if (unwind_ok) .satisfied else .unsatisfied,
+            if (unwind_ok)
+                "the Mach-O compact-unwind index is configured before guest execution"
+            else
+                "the Mach-O has no configured compact-unwind index",
+        );
+
+        const codegen_ok = self.ready.enabled() and
+            self.ready.compile_check_count != 0 and
+            self.ready.compile_checks_dropped == 0 and
+            self.ready.failure.kind == .none;
+        self.host_coverage.record(
+            C.code_generation,
+            if (codegen_ok)
+                .satisfied
+            else if (self.ready.failure.kind != .none)
+                .unsatisfied
+            else
+                .untested,
+            if (codegen_ok)
+                "the required startup compile plan completed with retained passing checks"
+            else if (self.ready.failure.kind != .none)
+                "the startup compiler recorded a typed failure before guest execution"
+            else
+                "no complete startup code-generation proof was retained before guest execution",
+        );
+
+        const clock_status = preflightOutcomeStatus(host.finding(.monotonic_clock_resolution).outcome);
+        const locale_status: host_contract_coverage.Status = if (!self.host_locale_query_proven)
+            .unsatisfied
+        else switch (clock_status) {
+            .satisfied => .satisfied,
+            .degraded => .degraded,
+            .unsatisfied => .unsatisfied,
+            .untested => .untested,
+        };
+        self.host_coverage.record(
+            C.locale_and_time,
+            locale_status,
+            if (self.host_locale_query_proven and locale_status == .satisfied)
+                "libc answered the current locale and the monotonic clock resolution probe passed"
+            else
+                "the locale/time host contract did not provide a complete pre-window proof",
+        );
+    }
+
+    /// Close the host side of admission at the last point before any guest
+    /// initializer can execute.  Every host-owned row must now be satisfied;
+    /// the ten guest-owned rows remain explicit deferred work for the run.
+    pub fn enforcePreWindowHostCoverage(self: *MachOState) bool {
+        self.seedPreWindowHostCoverage();
+        // This catches any evidence already available from the generic runtime
+        // ledgers while Ledger.record's conservative `.untested` rule keeps a
+        // no-evidence refresh from erasing the preflight proofs above.
+        self.refreshHostCoverage();
+
+        const coverage = self.host_coverage.preWindowCoverage();
+        const bypass = environmentFlag("ROSETTE_PREWINDOW_COVERAGE_OFF");
+        machoCapturePrint(
+            "macho-processor: PRE-WINDOW COVERAGE: phase=final host(satisfied/untested/failing)={d}/{d}/{d} guest_deferred={d} strict={s} bypass={s}\n",
+            .{
+                coverage.host_satisfied,
+                coverage.host_untested,
+                coverage.host_failing,
+                coverage.guest_deferred,
+                if (self.audit_profile == .authentic) "YES" else "NO",
+                if (bypass) "YES" else "NO",
+            },
+        );
+        var capability_index: u8 = 0;
+        while (capability_index < host_contract_coverage.capability_count) : (capability_index += 1) {
+            const capability: host_contract_coverage.Capability = @enumFromInt(capability_index);
+            if (!capability.answerableBeforeWindow()) continue;
+            const entry = self.host_coverage.entry(capability);
+            machoCapturePrint(
+                "  pre-window capability={s} status={s} owner={s} layer={s} evidence={s}\n",
+                .{
+                    capability.label(),
+                    entry.status.label(),
+                    capability.owner().label(),
+                    capability.layer().label(),
+                    entry.note(),
+                },
+            );
+        }
+
+        if (coverage.blocksWindow() and !bypass) {
+            machoCapturePrint(
+                "macho-processor: PRE-WINDOW COVERAGE: BLOCKED host_foundation_gaps={d} host_failures={d}; no native window or guest initializer is permitted until every Rosette-owned capability has a verdict\n",
+                .{ coverage.host_untested, coverage.host_failing },
+            );
+            return false;
+        }
+        if (bypass and coverage.blocksWindow()) {
+            machoCapturePrint(
+                "macho-processor: PRE-WINDOW COVERAGE: explicit diagnostic bypass accepted; host gaps remain authoritative and every downstream finding is marked conditional on this bypass\n",
+                .{},
+            );
+        }
+        machoCapturePrint(
+            "macho-processor: PRE-WINDOW COVERAGE: host foundation closed; guest-owned edges deferred to runtime and may now be observed without confusing an untested Rosette capability for a title failure\n",
+            .{},
+        );
+        return true;
+    }
+
     /// Score the host capability surface from what this run actually observed.
     ///
     /// Derived rather than maintained, like the graphics contract: every fact
@@ -14996,8 +15490,22 @@ pub const MachOState = struct {
         }
         ledger.record(
             C.code_generation,
-            if (self.deferred_work.total_failures == 0) .satisfied else .degraded,
-            "translation works except for functions an emitter error left undefined",
+            if (!self.ready.enabled())
+                .untested
+            else if (self.ready.compile_check_count == 0 or self.ready.compile_checks_dropped != 0)
+                .untested
+            else if (self.ready.failure.kind != .none or self.deferred_work.total_failures != 0)
+                .degraded
+            else
+                .satisfied,
+            if (!self.ready.enabled())
+                "the startup code-generation gate was not enabled, so no readiness verdict exists"
+            else if (self.ready.compile_check_count == 0 or self.ready.compile_checks_dropped != 0)
+                "the readiness gate was enabled but retained no complete compile-check set"
+            else if (self.ready.failure.kind != .none or self.deferred_work.total_failures != 0)
+                "translation has a recorded readiness or deferred-emission failure"
+            else
+                "the enabled readiness path has no recorded compiler or deferred-emission failure",
         );
         if (self.dynamic_forwarder.forwarded != 0) {
             ledger.record(C.locale_and_time, .satisfied, "host library forwarding is servicing queries");
@@ -15025,6 +15533,18 @@ pub const MachOState = struct {
                 host_contract_coverage.capability_count,
                 self.executed_steps,
                 ledger.verdict(),
+            },
+        );
+        const pre_window = ledger.preWindowCoverage();
+        machoCapturePrint(
+            "macho-processor: HOST CONTRACT PRE-WINDOW: host(satisfied/untested/failing)={d}/{d}/{d} guest_deferred={d} strict_gate={s} step={d}; host rows are Rosette-owned evidence and guest rows are intentionally deferred until the title exercises them\n",
+            .{
+                pre_window.host_satisfied,
+                pre_window.host_untested,
+                pre_window.host_failing,
+                pre_window.guest_deferred,
+                if (pre_window.blocksWindow()) "BLOCKED" else "CLOSED",
+                self.executed_steps,
             },
         );
         inline for (@typeInfo(host_contract_coverage.Layer).@"enum".fields) |field| {
@@ -17601,6 +18121,22 @@ pub const MachOState = struct {
                 );
             }
         }
+
+        // The generic host probe measures timed waiting, but it deliberately
+        // does not signal a second thread.  Exercise the actual notification
+        // edge separately so the pre-window ledger can distinguish
+        // "deadlines work" from "a producer can wake a consumer".  Locale is
+        // likewise a supplemental libc operation rather than a memory/timing
+        // probe, and is kept as its own read-only fact.
+        self.host_signal_handshake_proven = capability.probeSignalHandshake();
+        self.host_locale_query_proven = capability.probeLocaleQuery();
+        machoCapturePrint(
+            "macho-processor: HOST SUPPLEMENTAL: signal_handshake={s} locale_query={s}; both are direct libc operations exercised before guest execution\n",
+            .{
+                if (self.host_signal_handshake_proven) "verified" else "FAILED",
+                if (self.host_locale_query_proven) "verified" else "FAILED",
+            },
+        );
 
         const totals = report.summary();
         machoCapturePrint(
@@ -20454,6 +20990,63 @@ pub const MachOState = struct {
         empty: bool,
     };
 
+    /// One bank's measured occupancy, from a bounded uniform sample.
+    const BankOccupancy = struct {
+        capacity: usize,
+        sampled_sets: usize,
+        sampled_entries: usize,
+        occupied: usize,
+
+        fn percent(self: BankOccupancy) usize {
+            if (self.sampled_entries == 0) return 0;
+            return (self.occupied * 100) / self.sampled_entries;
+        }
+
+        /// The whole bank's live entry count, estimated from the sample.
+        fn estimated(self: BankOccupancy) usize {
+            if (self.sampled_entries == 0) return 0;
+            return (self.occupied * self.capacity) / self.sampled_entries;
+        }
+    };
+
+    /// Sample a bank's occupancy rather than counting it on the hot path.
+    ///
+    /// Occupancy is the number that decides whether a bank is about to start
+    /// evicting, and nothing was reporting it: the 2026-09-07 run printed
+    /// per-domain hits, misses and fills at every checkpoint while the static
+    /// bank sat at 86% and two other banks had never held a single decode.
+    /// Fills alone cannot say that — they never come back down.
+    ///
+    /// A live counter would need a decrement at every clear site (precise
+    /// invalidation, stale rejection, coarse flush) and would silently lie
+    /// after the first missed one. A stride sample cannot drift, costs nothing
+    /// between checkpoints, and is far more precise than the question needs:
+    /// 1/64th of a bank is tens of thousands of entries, so the estimate is
+    /// within a fraction of a percent.
+    fn sampleBankOccupancy(self: *const MachOState, domain: translation_domain.Domain) BankOccupancy {
+        const layout = translation_cache.primary_layout;
+        const local_sets = layout.localSetCount(domain);
+        const first_set = layout.bankFirstSet(domain);
+        const stride: usize = 64;
+        var result = BankOccupancy{
+            .capacity = local_sets * layout.ways,
+            .sampled_sets = 0,
+            .sampled_entries = 0,
+            .occupied = 0,
+        };
+        var local: usize = 0;
+        while (local < local_sets) : (local += stride) {
+            const set_base = (first_set + local) * layout.ways;
+            if (set_base + layout.ways > self.decode_cache.len) break;
+            for (self.decode_cache[set_base..][0..layout.ways]) |*entry| {
+                if (decodeCacheEntryOccupied(entry)) result.occupied += 1;
+            }
+            result.sampled_sets += 1;
+            result.sampled_entries += layout.ways;
+        }
+        return result;
+    }
+
     const PrimaryDecodeCacheSelection = struct {
         entry: *DecodeCacheEntry,
         empty: bool,
@@ -20485,43 +21078,74 @@ pub const MachOState = struct {
     }
 
     /// Choose a primary destination from both independently hashed set
-    /// choices. An empty way in either set wins immediately. If both choices
-    /// are occupied, choose the set whose contract-selected victim has the
-    /// smaller reuse count, preserving the strict fail-fast response when
-    /// both sets are genuinely made entirely of reused residents.
+    /// choices, comparing their depth rather than taking the first that has
+    /// room.
+    ///
+    /// Returning the first choice with a free way is first-fit, and it wastes
+    /// the second hash: the alternate set is only ever consulted for an
+    /// address whose first choice is already completely full, so set depth
+    /// follows the single-choice balls-in-bins tail. That is what produced the
+    /// 2026-09-07 `cold-eviction` at `spirv_cross::Parser::parse+0x397` —
+    /// 470,192 fills into a bank that was 45% occupied, with one address
+    /// unlucky enough to hash to two sixteen-deep sets. Comparing the two
+    /// depths holds the same stream at ten of sixteen; the contract's
+    /// `chooseSet` carries the measurement.
+    ///
+    /// Occupancy is counted with a side-effect-free scan so the replacement
+    /// policy — which clears reference bits when the epoch rolls — never runs
+    /// on a set this fill is not going to use. It is also the same 32 ways the
+    /// lookup immediately above just walked to declare the miss, so the lines
+    /// are already resident.
     fn selectPrimaryDecodeCacheSet(
         self: *MachOState,
         set_bases: [translation_cache.primary_set_choice_count]usize,
     ) PrimaryDecodeCacheSelection {
-        var best: ?PrimaryDecodeCacheSelection = null;
-        for (set_bases) |set_base| {
+        var candidates: [translation_cache.primary_set_choice_count]translation_cache.SetOccupancy = undefined;
+        var any_free = false;
+        for (set_bases, 0..) |set_base, index| {
+            const ways = self.decode_cache[set_base..][0..constants.DECODE_CACHE_WAYS];
+            var occupied: usize = 0;
+            for (ways) |*candidate| {
+                if (decodeCacheEntryOccupied(candidate)) occupied += 1;
+            }
+            candidates[index] = .{ .occupied = occupied, .ways = ways.len };
+            if (occupied < ways.len) any_free = true;
+        }
+        if (any_free) {
+            const index = translation_cache.chooseSet(&candidates) orelse unreachable;
+            const set_base = set_bases[index];
             const ways = self.decode_cache[set_base..][0..constants.DECODE_CACHE_WAYS];
             const choice = selectDecodeCacheWay(ways);
-            const candidate = PrimaryDecodeCacheSelection{
-                .entry = choice.entry,
-                .empty = choice.empty,
-                .set_base = set_base,
-            };
-            if (candidate.empty) return candidate;
-            if (best == null) {
-                best = candidate;
-                continue;
-            }
-            const current = best.?;
-            if (candidate.entry.reuse_count < current.entry.reuse_count or
-                (candidate.entry.reuse_count == current.entry.reuse_count and
-                    !candidate.entry.recently_used and current.entry.recently_used))
-            {
-                best = candidate;
-            }
+            return .{ .entry = choice.entry, .empty = choice.empty, .set_base = set_base };
         }
-        return best orelse unreachable;
+        // Every choice is full. Only now is the replacement policy worth
+        // running on both sets, and only now is the working set genuinely
+        // over capacity — which is the condition strict policy exists to stop
+        // on, so nothing here tries to soften it.
+        var victims: [translation_cache.primary_set_choice_count]*DecodeCacheEntry = undefined;
+        for (set_bases, 0..) |set_base, index| {
+            const ways = self.decode_cache[set_base..][0..constants.DECODE_CACHE_WAYS];
+            const choice = selectDecodeCacheWay(ways);
+            victims[index] = choice.entry;
+            candidates[index].victim_reuse_count = choice.entry.reuse_count;
+            candidates[index].victim_recently_used = choice.entry.recently_used;
+        }
+        const index = translation_cache.chooseSet(&candidates) orelse unreachable;
+        return .{ .entry = victims[index], .empty = false, .set_base = set_bases[index] };
     }
 
-    /// Retain an immutable image decode in the persistent static L2. This is
-    /// intentionally independent of the generation-keyed L1: writes to
-    /// generated code must not age image entries out of the only cache that
-    /// can cheaply recover them.
+    /// Retain an immutable image decode that is being displaced from the
+    /// primary cache. This is intentionally independent of the
+    /// generation-keyed L1: writes to generated code must not age image
+    /// entries out of the only cache that can cheaply recover them.
+    ///
+    /// Called on eviction, never on a fill. Populating it from the fill path
+    /// made it write-only: a fill happens because the address was in no tier,
+    /// so the copy could not be answering any future lookup that the primary
+    /// would not have answered first. The 2026-09-07 run measured exactly
+    /// that — `static_l2(entries/hits/fills)=131072/0/903034`, 903,034 copies
+    /// of a 104-byte entry into a 13 MiB table that was never once read. An
+    /// eviction is the only event that can make a later lookup need this tier.
     fn saveStaticDecodeL2(self: *MachOState, source: *const DecodeCacheEntry) void {
         if (source.domain != .static_image or !decodeCacheEntryOccupied(source)) return;
         const set_base = translation_cache.staticL2SetBase(source.rip);
@@ -20847,7 +21471,14 @@ pub const MachOState = struct {
         set_base = selection.set_base;
         const victim_is_empty = selection.empty;
         const victim_was_reused = !victim_is_empty and entry.reuse_count != 0;
-        if (!victim_is_empty) self.saveDecodeCacheVictim(entry);
+        if (!victim_is_empty) {
+            // The displaced decode is about to be overwritten. Both secondary
+            // tiers are populated here, at the one point where a decode is
+            // genuinely leaving the primary and a later lookup could need it
+            // back without paying for the decoder again.
+            self.saveDecodeCacheVictim(entry);
+            self.saveStaticDecodeL2(entry);
+        }
         if (victim_is_empty) {
             self.decode_cache_vacant_misses +|= 1;
         } else if (victim_was_reused) {
@@ -20957,7 +21588,6 @@ pub const MachOState = struct {
             entry.instruction_bytes[0..instruction_byte_count],
             bytes[0..instruction_byte_count],
         );
-        self.saveStaticDecodeL2(entry);
         return decoded;
     }
 
@@ -21640,7 +22270,10 @@ pub const MachOState = struct {
         self: *MachOState,
         address: u64,
     ) diagnostics_execution_profile.Origin {
-        if (self.metadata.addressKind(address) != .outside_image) return .image;
+        const address_kind = self.metadata.addressKind(address);
+        if (address_kind == .image_unsymbolized and
+            self.metadata.isExecutableImageAddress(address)) return .image_executable_unsymbolized;
+        if (address_kind != .outside_image) return .image;
         // A program counter is in executable memory by construction, so this
         // asks the page state rather than assuming it: the distinction matters
         // the day a runaway branch puts a PC somewhere it cannot execute.
@@ -21654,16 +22287,17 @@ pub const MachOState = struct {
         // stopped, and the exit path never runs in that case.
         self.logGraphicsFrontier(false);
         const hb_symbol = self.metadata.nearestSymbol(self.regs.rip);
+        const hb_symbol_label = self.metadata.symbolLabel(self.regs.rip);
         native_crash.recordGuestProgress(
             steps,
             self.regs.rip,
             self.active_guest_thread,
-            if (hb_symbol) |resolved| resolved.name else "",
+            hb_symbol_label,
         );
         const heartbeat_snapshot: startup_observer.Snapshot = .{
             .step = steps,
             .rip = self.regs.rip,
-            .symbol = if (hb_symbol) |resolved| resolved.name else "<unknown>",
+            .symbol = hb_symbol_label,
             .symbol_offset = if (hb_symbol) |resolved| resolved.offset else 0,
             .symbol_origin = self.executionProfileOrigin(self.regs.rip),
             .heap_next = self.heap_next,
@@ -21732,6 +22366,20 @@ pub const MachOState = struct {
                 }
             }
         }
+        if (self.graphics_preflight_enabled and
+            self.guest_exit_observed and
+            self.guest_exit_code == 0 and
+            self.xenia_pipeline.hasReached(.graphics_setup_started) and
+            !self.xenia_pipeline.hasReached(.emulator_setup_ready))
+        {
+            machoCapturePrint(
+                "macho-processor: EARLY GUEST EXIT: exit_code=0 reason=exit_syscall step={d} xenia_frontier={s} setup did not reach emulator_setup_ready; this is a controlled guest/UI termination after setup refusal, not a native Rosette crash\n",
+                .{
+                    self.guest_exit_step,
+                    if (self.xenia_pipeline.frontier) |stage| @tagName(stage) else "none",
+                },
+            );
+        }
         self.jit_log.emit(.{
             .kind = .monitor_snapshot,
             .step = steps,
@@ -21752,7 +22400,7 @@ pub const MachOState = struct {
             .condvar_waits = self.pthreads.collapsed_waits,
             .import_calls = self.import_resolver.total_calls,
             .reason = "heartbeat",
-            .symbol = if (hb_symbol) |resolved| resolved.name else "",
+            .symbol = hb_symbol_label,
         });
         self.logJitHealth(false);
         self.pollReadyCompiler(steps);
@@ -22339,6 +22987,22 @@ pub const MachOState = struct {
         execution_helpers.executeFucomip(self, source);
     }
 
+    pub fn executeFucomi(self: *MachOState, source: u3) void {
+        execution_helpers.executeFucomi(self, source);
+    }
+
+    pub fn executeFcomi(self: *MachOState, source: u3) void {
+        execution_helpers.executeFcomi(self, source);
+    }
+
+    pub fn executeFcomip(self: *MachOState, source: u3) void {
+        execution_helpers.executeFcomip(self, source);
+    }
+
+    pub fn executeFcmov(self: *MachOState, source: u3, condition: Cond) void {
+        execution_helpers.executeFcmov(self, source, condition);
+    }
+
     pub fn executeBitScan(self: *MachOState, d: DecodedInsn) void {
         execution_helpers.executeBitScan(self, d);
     }
@@ -22467,6 +23131,9 @@ pub const MachOState = struct {
             @intFromEnum(macho_runtime.Syscall.exit) => {
                 const exit_code = arg1;
                 log.info("exit({d})", .{exit_code});
+                self.guest_exit_observed = true;
+                self.guest_exit_code = exit_code;
+                self.guest_exit_step = self.executed_steps;
                 self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.exit_syscall);
                 self.terminated = true;
                 self.exit_code = exit_code;
@@ -22985,6 +23652,745 @@ fn reportInputSurveyStart(offset: u64, budget_ns: u64) void {
 /// error name alone does not choose between them. These lines carry the
 /// evidence that does: how long the device took to refuse, whether the file
 /// holds every byte it claims, and how far the unreadable region runs.
+/// Do the subsystems reach each other, and can the guest ask us what it needs?
+///
+/// Runs after the run identity is sealed and before the first guest
+/// instruction. It has to be after the seal: the guest asks for the identity by
+/// name, and whether Rosette can answer is not decidable until there is an
+/// identity to answer with.
+fn reportInteropAudit(allocator: std.mem.Allocator, state: *const MachOState) bool {
+    const audit = preflight_lib.interop_audit;
+    // Answer through the guest's own lookup rather than a stand-in for it.
+    const Resolver = struct {
+        state: *const MachOState,
+        fn answer(context: ?*anyopaque, name: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return import_dispatch.guestCanAnswerEnvironmentName(self.state, name);
+        }
+    };
+    var resolver = Resolver{ .state = state };
+    const findings = audit.auditImage(allocator, &state.metadata, .{
+        .identity_sealed = state.audit_manifest.sealIntact(),
+        .context = @ptrCast(&resolver),
+        .answer = Resolver.answer,
+    }) catch {
+        machoCapturePrint(
+            "macho-processor: INTEROP AUDIT: UNEVALUATED; the image could not be walked, so nothing was established about how its subsystems reach each other\n",
+            .{},
+        );
+        // An unevaluated graph is not a pass.  The old return value allowed a
+        // failed allocator walk to continue into guest setup, where the same
+        // missing edge would surface as a late graphics or environment error.
+        return false;
+    };
+
+    machoCapturePrint(
+        "macho-processor: INTEROP AUDIT: symbols={d} text_bytes={d} direct_edges={d} lost_links={d} names={d} elapsed_ms={d}; direct calls only — indirect dispatch through the kernel ordinal table and through vtables leaves no call edge, so an absent link is not a finding and only a lost one is\n",
+        .{
+            findings.symbols,
+            findings.text_bytes,
+            findings.direct_edges,
+            findings.lost_links,
+            findings.environment_count,
+            @divTrunc(findings.elapsed_ns, std.time.ns_per_ms),
+        },
+    );
+
+    // Only the links that are gone. Seven "present" lines on every healthy run
+    // are seven lines that never change; the summary above already carries
+    // lost_links, and the detail is what a reader needs only when it is not
+    // zero.
+    for (preflight_lib.interop_audit.contract_links) |link| {
+        if (findings.edgeCount(link.from, link.to) != 0) continue;
+        machoCapturePrint(
+            "  link LOST {s} -> {s}; {s}\n",
+            .{ link.from.label(), link.to.label(), link.why },
+        );
+    }
+
+    // Only the names the run cannot answer. A guest reading fifteen variables
+    // successfully is not news; one it needs and cannot get is the whole
+    // finding.
+    for (findings.names()) |use| {
+        if (use.answerable) continue;
+        machoCapturePrint(
+            "  guest reads {s} sites={d} required={s} answerable=NO{s}\n",
+            .{
+                use.name,
+                use.sites,
+                if (use.required) "YES" else "NO",
+                if (use.required) "; the guest cannot start without this" else "; the guest is expected to cope with this being unset",
+            },
+        );
+    }
+    if (findings.environment_overflow) {
+        machoCapturePrint(
+            "  guest reads MORE names than there was room to record; the list above is a prefix, not the surface\n",
+            .{},
+        );
+    }
+
+    if (findings.blocksLaunch()) {
+        machoCapturePrint(
+            "macho-processor: INTEROP AUDIT: BLOCKED name={s}; the guest reads this to bind its run to ours and Rosette cannot answer it. To the guest an unanswerable name is an unset one, and it refuses its own start over it — which is this failure, moved forward to where the cause is\n",
+            .{findings.first_unanswerable},
+        );
+        return false;
+    }
+    if (findings.lost_links != 0) {
+        const lost = findings.first_lost.?;
+        machoCapturePrint(
+            "macho-processor: INTEROP AUDIT: LINK LOST {s} -> {s}; a build that reached graphics had direct calls here and this one has none. That is worth reading before a run, but it does not refuse one: the graph cannot see indirect dispatch, so the call may have moved rather than gone\n",
+            .{ lost.from.label(), lost.to.label() },
+        );
+        return true;
+    }
+    machoCapturePrint(
+        "macho-processor: INTEROP AUDIT: PASS; every link a working build had is still here and every name the guest asks for can be answered\n",
+        .{},
+    );
+    return true;
+}
+
+/// The state a fatal-condition report reads its machine context from.
+///
+/// A file-scope pointer because the condition is matched inside the logging
+/// funnel, which has no argument to carry one.
+var fatal_context_state: ?*const MachOState = null;
+
+fn fatalConditionContext() fatal_conditions.FaultContext {
+    const state = fatal_context_state orelse return .{};
+    const rip = state.regs.rip;
+    var context = fatal_conditions.FaultContext{
+        .valid = true,
+        .step = state.executed_steps,
+        .rip = rip,
+        .thread = state.active_guest_thread,
+        .address_kind = state.metadata.addressKind(rip).label(),
+    };
+    if (state.metadata.sectionAtAddress(rip)) |section| context.section = section.name;
+    if (state.metadata.nearestSymbol(rip)) |match| {
+        context.symbol = match.name;
+        context.symbol_offset = match.offset;
+    }
+    return context;
+}
+
+/// Read the emulator image's subsystem surface before anything else.
+///
+/// Returns false when the build cannot reach a frame at all. This runs ahead of
+/// the media hash on purpose: refusing a build that never linked its command
+/// processor should not cost six gigabytes of reads first.
+fn reportPrelaunchAudit(state: *MachOState) bool {
+    const audit = preflight_lib.prelaunch_audit;
+    const summary = audit.auditImage(&state.metadata);
+    state.prelaunch_audit_summary = summary;
+
+    machoCapturePrint(
+        "macho-processor: PRELAUNCH AUDIT: verdict={s} symbols={d} import_stubs={d} elapsed_ms={d}; the image's subsystem surface is read before the first guest instruction, so a build that could never reach a frame is answered here rather than after minutes of emulated boot\n",
+        .{
+            summary.verdict.label(),
+            summary.symbols_walked,
+            summary.import_stubs,
+            @divTrunc(summary.elapsed_ns, std.time.ns_per_ms),
+        },
+    );
+
+    for (audit.contract_stages) |stage| {
+        const facts = summary.classified(stage);
+        machoCapturePrint(
+            "  stage {s} symbols={d} fingerprint=0x{x} range=0x{x}..0x{x} blocking={s}\n",
+            .{
+                stage.label(),
+                facts.symbols,
+                facts.fingerprint,
+                facts.lowest_address,
+                facts.highest_address,
+                if (stage.blocksLaunch()) "YES" else "NO",
+            },
+        );
+        // Names are printed only where they are evidence.
+        //
+        // Every stage listing four examples was forty lines that said the same
+        // thing on every healthy run: the build is fine. The names are only
+        // worth reading when a stage is actually holding the run back, so a
+        // blocking stage that carries no code names itself and everything else
+        // stays quiet.
+        if (stage.blocksLaunch() and facts.isEmpty()) {
+            machoCapturePrint(
+                "    contains blocking: nothing at all; this stage is required for a frame and has no code, which is the link failure\n",
+                .{},
+            );
+        }
+    }
+
+    switch (summary.verdict) {
+        .ready => machoCapturePrint(
+            "macho-processor: PRELAUNCH AUDIT: PASS; every subsystem a frame depends on carries code. This says they linked, not that they work — presence is the only thing a symbol table can prove\n",
+            .{},
+        ),
+        .unevaluated => machoCapturePrint(
+            "macho-processor: PRELAUNCH AUDIT: UNEVALUATED; no classified symbol was read from the image, so nothing was established about this build. That is a statement about the reader, not an accusation against the build\n",
+            .{},
+        ),
+        .blocked => {
+            const gap = summary.blocking_gap orelse .unclassified;
+            machoCapturePrint(
+                "macho-processor: PRELAUNCH AUDIT: BLOCKED stage={s}; the image contains no code for a subsystem a frame cannot be produced without. Running longer cannot reach it and no guest behaviour explains it — this is a link failure in the emulator build\n",
+                .{gap.label()},
+            );
+        },
+    }
+    // An unevaluated census is not a pass.  The legacy report used to allow it
+    // through because it could not distinguish an empty image from an absent
+    // reader; the graphics preflight now consumes the same summary and keeps
+    // the distinction explicit.  Refusing here saves the media hash and gives
+    // the caller the earliest actionable failure.
+    return summary.verdict == .ready;
+}
+
+/// Decode one image entry without executing it.  The full image scan is a
+/// bounded startup operation; its result is a coverage signal, while the
+/// normal interpreter remains the authority for guest execution.
+fn preflightDecodeInstruction(bytes: []const u8) preflight_lib.graphics_readiness.DecodeResult {
+    const decoded = x64_decoder.decodeLegacyInstruction(bytes, .long64);
+    return .{
+        .valid = decoded.len != 0 and decoded.op != .invalid,
+        .length = @intCast(@min(decoded.len, std.math.maxInt(u8))),
+    };
+}
+
+fn graphicsTracepointFacts(state: *const MachOState) preflight_lib.graphics_readiness.TracepointFacts {
+    var facts = preflight_lib.graphics_readiness.TracepointFacts{
+        .sealed = state.execution_tracepoints.sealed,
+        .armed_total = @intCast(state.execution_tracepoints.count),
+        .unresolved = state.execution_tracepoints.unresolved,
+        .saturated = state.execution_tracepoints.saturated(),
+    };
+    for (state.execution_tracepoints.entries[0..state.execution_tracepoints.count]) |entry| {
+        if (entry.boundary == execution_tracepoints.unbound_boundary or
+            entry.boundary >= preflight_lib.graphics_readiness.boundary_count)
+        {
+            continue;
+        }
+        facts.armed_by_boundary[entry.boundary] +|= 1;
+    }
+    return facts;
+}
+
+/// Seed the executable path report before the host smoke test. Static image
+/// evidence is not a runtime pass: host stages stay untested until exercised,
+/// while guest-owned stages are explicitly not-reached because this function
+/// runs before guest start.
+fn seedGraphicsPathFacts(state: *MachOState) preflight_lib.graphics_path_probe.Facts {
+    const probe = preflight_lib.graphics_path_probe;
+    var facts = probe.Facts{};
+    for (0..probe.stage_count) |index| {
+        const stage: probe.Stage = @enumFromInt(index);
+        const host_admission_stage = switch (stage) {
+            .native_application_ready, .native_window_ready, .native_layer_attached, .vulkan_loader_resolved, .vulkan_instance_ready, .vulkan_surface_ready, .physical_adapter_ready, .logical_device_ready, .graphics_queue_ready, .swapchain_ready, .frame_resources_ready, .native_present_completed => true,
+            else => false,
+        };
+        if (!host_admission_stage) {
+            facts.set(
+                stage,
+                .not_reached,
+                "this downstream stage cannot execute before guest start; it is not a pre-window pass",
+                "guest start",
+            );
+        }
+    }
+    facts.set(
+        .application_started,
+        if (state.event_stream.run_id != 0) .satisfied else .unknown,
+        "Rosette established the run identity before admission",
+        "run identity",
+    );
+    facts.set(
+        .guest_image_mapped,
+        .satisfied,
+        "the translated guest image is mapped and available to the preflight observer",
+        "",
+    );
+    return facts;
+}
+
+const hostGraphicsAdmissionStages = [_]preflight_lib.graphics_path_probe.Stage{
+    .native_application_ready,
+    .native_window_ready,
+    .native_layer_attached,
+    .vulkan_loader_resolved,
+    .vulkan_instance_ready,
+    .vulkan_surface_ready,
+    .physical_adapter_ready,
+    .logical_device_ready,
+    .graphics_queue_ready,
+    .swapchain_ready,
+    .frame_resources_ready,
+    .native_present_completed,
+};
+
+fn markHostAdmissionFailure(
+    facts: *preflight_lib.graphics_path_probe.Facts,
+    failed_stage: preflight_lib.graphics_path_probe.Stage,
+    detail: []const u8,
+) void {
+    var found = false;
+    for (hostGraphicsAdmissionStages) |stage| {
+        if (stage == failed_stage) {
+            facts.set(stage, .blocked, detail, failed_stage.label());
+            found = true;
+        } else if (found) {
+            facts.set(stage, .not_reached, "the host admission probe stopped at its first failed stage", failed_stage.label());
+        }
+    }
+}
+
+fn hostPresenterFailureIndex(stage: gpu.NativePresenterStage) ?usize {
+    return switch (stage) {
+        .loader_unavailable => 0,
+        .instance_extensions_missing, .instance_failed => 1,
+        .surface_failed => 2,
+        .no_supported_physical_device => 3,
+        .device_failed, .device_lost => 4,
+        .frame_resources_failed => 7,
+        .swapchain_failed, .surface_not_presentable => 6,
+        .unstarted, .ready => null,
+    };
+}
+
+fn markHostPresenterFacts(
+    facts: *preflight_lib.graphics_path_probe.Facts,
+    stage: gpu.NativePresenterStage,
+) void {
+    const probe = preflight_lib.graphics_path_probe;
+    const host_stages = [_]probe.Stage{
+        .vulkan_loader_resolved,
+        .vulkan_instance_ready,
+        .vulkan_surface_ready,
+        .physical_adapter_ready,
+        .logical_device_ready,
+        .graphics_queue_ready,
+        .swapchain_ready,
+        .frame_resources_ready,
+    };
+
+    if (stage == .ready) {
+        for (host_stages) |host_stage| {
+            facts.set(host_stage, .satisfied, "native presenter smoke test completed this stage", "");
+        }
+        facts.set(
+            .native_present_completed,
+            .not_reached,
+            "a guest-produced source is required; the preflight never promotes a host clear to guest output",
+            "guest frame source",
+        );
+        return;
+    }
+
+    const failure_index = hostPresenterFailureIndex(stage) orelse return;
+    for (host_stages, 0..) |host_stage, index| {
+        if (index < failure_index) {
+            facts.set(host_stage, .satisfied, "native presenter smoke test completed this stage", "");
+        } else if (index == failure_index) {
+            facts.set(
+                host_stage,
+                if (stage == .surface_not_presentable) .degraded else .blocked,
+                stage.label(),
+                stage.label(),
+            );
+        } else {
+            facts.set(host_stage, .not_reached, "the native presenter stopped at its first failed stage", stage.label());
+        }
+    }
+    facts.set(
+        .native_present_completed,
+        .not_reached,
+        "the native presenter did not reach a guest-owned presentation request",
+        stage.label(),
+    );
+}
+
+fn runGraphicsPathPreflight(
+    state: *MachOState,
+    static_report: *const preflight_lib.graphics_readiness.Report,
+) preflight_lib.graphics_path_probe.Report {
+    const probe = preflight_lib.graphics_path_probe;
+    var facts = seedGraphicsPathFacts(state);
+
+    // A static failure is intentionally not repaired by the executable probe.
+    // Preserve the common image facts, leave host stages untested, and let the
+    // two reports explain whether the refusal was structural or operational.
+    // The host portion remains UNTESTED when static admission fails: no
+    // executable probe was attempted. That is different from the
+    // NOT_REACHED tail produced after a probe actually stops at a blocker.
+    if (!static_report.allowsGuestStart()) return probe.evaluate(facts);
+
+    // The native window gate normally prevents this operation from running
+    // before the static report is complete. The probe is the authority that
+    // earns the permission, so open the gate only for this hidden smoke test;
+    // no show call is made and no guest pixels are presented.
+    state.graphics_preflight_window_allowed = true;
+    const application_ready = state.ensureNativeApplication();
+    if (!application_ready) {
+        markHostAdmissionFailure(&facts, .native_application_ready, "NSApplication ensure failed during the host smoke test");
+        return probe.evaluate(facts);
+    }
+    facts.set(.native_application_ready, .satisfied, "NSApplication ensure completed", "");
+
+    const window_ready = state.ensureNativeWindow();
+    if (!window_ready) {
+        markHostAdmissionFailure(&facts, .native_window_ready, "NSWindow ensure failed during the host smoke test");
+        return probe.evaluate(facts);
+    }
+    facts.set(.native_window_ready, .satisfied, "NSWindow ensure completed without making it visible", "");
+
+    const layer_ready = state.native_window.attachLayer(native_window_runtime.METAL_LAYER_TOKEN);
+    if (!layer_ready) {
+        markHostAdmissionFailure(&facts, .native_layer_attached, "CAMetalLayer attachment failed during the host smoke test");
+        return probe.evaluate(facts);
+    }
+    facts.set(.native_layer_attached, .satisfied, "CAMetalLayer attachment completed", "");
+
+    const presenter_stage = state.dynamic_forwarder.preflightNativePresenter(state);
+    markHostPresenterFacts(&facts, presenter_stage);
+    return probe.evaluate(facts);
+}
+
+fn graphicsPathStageLabel(stage: ?preflight_lib.graphics_path_probe.Stage) []const u8 {
+    return if (stage) |value| value.label() else "none";
+}
+
+fn logGraphicsPathPreflight(report: *const preflight_lib.graphics_path_probe.Report) void {
+    machoCapturePrint(
+        "macho-processor: GRAPHICS PREFLIGHT TESTS: schema={d} verdict={s} admission={s} window_gate={} plan_complete={} planned_stages={d} stages={d} evaluated={d} evaluated_percent={d} satisfied={d} coverage_percent={d} degraded={d} blocked={d} untested={d} not_reached={d} unknown={d} actionable={d} deferred={d} first_actionable={s} first_deferred={s}; terminal_on_admission_failure=YES; guest-owned phases are deferred, never counted as passes\n",
+        .{
+            preflight_lib.graphics_path_probe.schema_version,
+            report.verdict.label(),
+            if (report.windowGateAllows()) "ALLOW" else "REFUSE",
+            report.windowGateAllows(),
+            report.plan_complete,
+            report.planned_stages,
+            report.total,
+            report.tested(),
+            report.testedPercent(),
+            report.satisfied,
+            report.coveragePercent(),
+            report.degraded,
+            report.blocked,
+            report.untested,
+            report.not_reached,
+            report.unknown,
+            report.actionable,
+            report.deferred,
+            graphicsPathStageLabel(report.first_actionable),
+            graphicsPathStageLabel(report.first_deferred),
+        },
+    );
+    for (report.paths) |path_report| {
+        machoCapturePrint(
+            "  graphics-health-test path={s} complete={} progress={d}/{d} coverage_percent={d} satisfied={d} degraded={d} blocked={d} untested={d} not_reached={d} unknown={d} evaluated={d}/{d} evaluated_percent={d} actionable={d} deferred={d} first_missing={s} first_actionable={s} first_deferred={s}\n",
+            .{
+                path_report.path.label(),
+                path_report.complete(),
+                path_report.progress(),
+                path_report.total,
+                path_report.coveragePercent(),
+                path_report.satisfied,
+                path_report.degraded,
+                path_report.blocked,
+                path_report.untested,
+                path_report.not_reached,
+                path_report.unknown,
+                path_report.tested(),
+                path_report.total,
+                path_report.testedPercent(),
+                path_report.actionable(),
+                path_report.deferred(),
+                graphicsPathStageLabel(path_report.first_missing),
+                graphicsPathStageLabel(path_report.first_actionable),
+                graphicsPathStageLabel(path_report.first_deferred),
+            },
+        );
+    }
+    for (report.layers) |layer_report| {
+        machoCapturePrint(
+            "  graphics-health-test layer={s} stages={d} satisfied={d} degraded={d} blocked={d} untested={d} not_reached={d} unknown={d} actionable={d} deferred={d} first_actionable={s} first_deferred={s}\n",
+            .{
+                layer_report.layer.label(),
+                layer_report.total,
+                layer_report.satisfied,
+                layer_report.degraded,
+                layer_report.blocked,
+                layer_report.untested,
+                layer_report.not_reached,
+                layer_report.unknown,
+                layer_report.actionable(),
+                layer_report.deferred(),
+                graphicsPathStageLabel(layer_report.first_actionable),
+                graphicsPathStageLabel(layer_report.first_deferred),
+            },
+        );
+    }
+    for (report.stages) |stage_report| {
+        machoCapturePrint(
+            "  graphics-health-test stage_index={d} stage={s} state={s} phase={s} probe={s} owner={s} layer={s} detail={s} blocked_by={s} next_action={s}\n",
+            .{
+                @intFromEnum(stage_report.stage),
+                stage_report.stage.label(),
+                stage_report.state.label(),
+                stage_report.phase.label(),
+                stage_report.probe,
+                stage_report.owner.label(),
+                stage_report.layer.label(),
+                stage_report.detail,
+                if (stage_report.blocked_by.len != 0) stage_report.blocked_by else "none",
+                stage_report.next_action,
+            },
+        );
+    }
+    machoCapturePrint(
+        "  graphics-health-test window_gate={d}/{d} first_missing={s} first_actionable={s} first_deferred={s} reason={s}; native_present_completed is intentionally downstream of a guest-owned frame source\n",
+        .{
+            report.window_gate_satisfied,
+            report.window_gate_total,
+            graphicsPathStageLabel(report.window_gate_first_missing),
+            graphicsPathStageLabel(report.first_actionable),
+            graphicsPathStageLabel(report.first_deferred),
+            report.admissionReason(),
+        },
+    );
+}
+
+/// Preserve the raw host probe inputs beside the derived stage verdict. The
+/// stage line says *which* contract stopped; this snapshot says whether the
+/// cause was AppKit state, surface binding, loader discovery, driver
+/// selection, or a native Vulkan result. It is emitted only once at admission
+/// and therefore cannot create a per-frame logging cost.
+fn logGraphicsHostPreflightSnapshot(state: *const MachOState) void {
+    const status = state.native_window.snapshot();
+    const presenter = &state.dynamic_forwarder.native_presenter.report;
+    const stage = state.dynamic_forwarder.nativePresenterStage();
+    machoCapturePrint(
+        "macho-processor: GRAPHICS PREFLIGHT HOST SNAPSHOT: app=0x{x} window=0x{x} view=0x{x} layer=0x{x} metal_device=0x{x} drawable={d}x{d} ready(app/window/layer/main)={}/{}/{}/{} surface_bindings={d} native_stage={s} native_attempts={d} loader_attempts/failures={d}/{d} VkResult={d} rejection={s} physical_devices={d} queues(graphics/present/unified)={d}/{d}/{} swapchain_images={d} swapchain_extent={d}x{d} native_present_completed=NO\n",
+        .{
+            status.application,
+            status.window,
+            status.view,
+            status.metal_layer,
+            status.metal_device,
+            status.width,
+            status.height,
+            status.application_ready != 0,
+            status.window_ready != 0,
+            status.layer_attached != 0,
+            status.on_main_thread != 0,
+            state.native_window.surface_bindings,
+            @tagName(stage),
+            state.dynamic_forwarder.native_presenter_attempts,
+            state.dynamic_forwarder.native_vulkan_loader_attempts,
+            state.dynamic_forwarder.native_vulkan_loader_failures,
+            presenter.last_result,
+            presenter.rejectionLabel(),
+            presenter.physical_device_count,
+            presenter.graphics_family,
+            presenter.present_family,
+            presenter.unified_queue,
+            presenter.swapchain_image_count,
+            presenter.extent_width,
+            presenter.extent_height,
+        },
+    );
+}
+
+fn reportGraphicsPreflight(state: *MachOState, decoder_ready: bool) bool {
+    const readiness = preflight_lib.graphics_readiness;
+    const report = readiness.auditMetadata(state.allocator, &state.metadata, .{
+        .entry_point = state.entry_point_vaddr,
+        .image_is_x86_64 = true,
+        .tracepoints = graphicsTracepointFacts(state),
+        .decoder_baseline_ready = decoder_ready,
+        .decode_instruction = preflightDecodeInstruction,
+        .host_capabilities = &state.host_capabilities,
+        .image_fingerprint = state.audit_image_fingerprint,
+        .prelaunch = state.prelaunch_audit_summary,
+    }) catch |err| {
+        state.graphics_preflight_report = .{};
+        state.graphics_preflight_window_allowed = false;
+        machoCapturePrint(
+            "macho-processor: GRAPHICS PREFLIGHT: verdict=UNKNOWN error={s}; the static graphics contract could not be evaluated, so no window is admitted\n",
+            .{@errorName(err)},
+        );
+        return false;
+    };
+    state.graphics_preflight_report = report;
+
+    machoCapturePrint(
+        "macho-processor: GRAPHICS PREFLIGHT: static_verdict={s} admission={s} complete={} checks={d} satisfied={d} degraded={d} blocked={d} unknown={d} required_unknown={d} check_overflowed={} checks_dropped={d} elapsed_scope=static; admission is fail-closed for required findings, while advisory unknowns remain visible and keep complete=false\n",
+        .{
+            report.verdict.label(),
+            if (report.allowsGuestStart()) "ALLOW" else "REFUSE",
+            report.complete(),
+            report.check_count,
+            report.satisfied,
+            report.degraded,
+            report.blocked,
+            report.unknown,
+            report.required_unknown,
+            report.check_overflowed,
+            report.checks_dropped,
+        },
+    );
+    if (report.firstBlockedCheck()) |item| {
+        machoCapturePrint(
+            "  graphics-preflight first_blocked state={s} required={} observed={d} expected={d} check={s} action={s}\n",
+            .{ item.state.label(), item.required, item.observed, item.expected, item.name, item.detail },
+        );
+    }
+    if (report.firstRequiredUnknownCheck()) |item| {
+        machoCapturePrint(
+            "  graphics-preflight first_required_unknown state={s} required={} observed={d} expected={d} check={s} action={s}\n",
+            .{ item.state.label(), item.required, item.observed, item.expected, item.name, item.detail },
+        );
+    }
+    if (report.firstNonSatisfiedCheck()) |item| {
+        machoCapturePrint(
+            "  graphics-preflight first_non_satisfied state={s} required={} observed={d} expected={d} check={s} action={s}\n",
+            .{ item.state.label(), item.required, item.observed, item.expected, item.name, item.detail },
+        );
+    }
+    machoCapturePrint(
+        "  image x86_64={} image_hash=0x{x} text_hash=0x{x} contract_hash=0x{x} text_bytes={d} symbols={d}/{d} imports={d} dylibs={d} bindings={d} decoder_entries={d} decoder_invalid={d} linear_decode={d}/{d} linear_invalid={d} linear_bytes={d}/{d} graph_nodes={d} graph_reachable={d} direct_edges={d} graph_complete={}\n",
+        .{
+            report.image_is_x86_64,
+            report.image_fingerprint,
+            report.text_fingerprint,
+            report.contract_fingerprint,
+            report.text_bytes,
+            report.symbol_entries,
+            report.unique_symbol_entries,
+            report.import_stubs,
+            report.dylibs,
+            report.bindings,
+            report.decoder_checked,
+            report.decoder_invalid,
+            report.linear_decoder_valid,
+            report.linear_decoder_checked,
+            report.linear_decoder_invalid,
+            report.linear_decoder_bytes_covered,
+            report.text_bytes,
+            report.graph.nodes,
+            report.graph.reachable_nodes,
+            report.graph.direct_edges,
+            report.graph.complete,
+        },
+    );
+    if (report.linear_first_invalid_address != 0) {
+        machoCapturePrint(
+            "  decoder linear_first_invalid=0x{x}; arbitrary-byte linear sweeps can encounter literal data, so this is retained as coverage unknown rather than treated as a required instruction failure\n",
+            .{report.linear_first_invalid_address},
+        );
+    }
+    if (report.prelaunch.evaluated) {
+        machoCapturePrint(
+            "  prelaunch census verdict={s} symbols={d} import_stubs={d}; all classified stages are included below and empty nonblocking stages remain visible\n",
+            .{ report.prelaunch.verdict.label(), report.prelaunch.symbols, report.prelaunch.import_stubs },
+        );
+        for (preflight_lib.prelaunch_audit.contract_stages) |stage| {
+            const stage_facts = report.prelaunch.stages[@intFromEnum(stage)];
+            machoCapturePrint(
+                "  prelaunch-stage {s} symbols={d} fingerprint=0x{x} range=0x{x}..0x{x} blocking={}\n",
+                .{
+                    stage.label(),
+                    stage_facts.symbols,
+                    stage_facts.fingerprint,
+                    stage_facts.lowest_address,
+                    stage_facts.highest_address,
+                    stage.blocksLaunch(),
+                },
+            );
+        }
+    }
+    for (report.components) |component| {
+        machoCapturePrint(
+            "  graphics-component {s} owner={s} proof={s} state={s} essential={} obligation={s}\n",
+            .{
+                component.component.label(),
+                component.component.owner(),
+                component.proof.label(),
+                component.state.label(),
+                component.essential,
+                component.component.obligation(),
+            },
+        );
+    }
+    if (report.first_invalid_address != 0) {
+        machoCapturePrint(
+            "  decoder first_invalid_entry=0x{x}; symbol-entry coverage is advisory unless a required graphics boundary has no decodable candidate\n",
+            .{report.first_invalid_address},
+        );
+    }
+    for (report.checks[0..report.check_count]) |item| {
+        machoCapturePrint(
+            "  graphics-preflight check={s} state={s} required={} observed={d} expected={d} detail={s}\n",
+            .{ item.name, item.state.label(), item.required, item.observed, item.expected, item.detail },
+        );
+    }
+    for (report.boundaries) |fact| {
+        machoCapturePrint(
+            "  graphics-boundary {s} requirement={s} owner={s} symbols={d} executable={d} candidates={d} decodable={d} armed={d} direct_reachable={} direct_inbound={}\n",
+            .{
+                fact.boundary.label(),
+                fact.boundary.requirement().label(),
+                fact.boundary.owner().label(),
+                fact.symbol_matches,
+                fact.executable_candidates,
+                fact.candidate_count,
+                fact.decoder_valid_candidates,
+                fact.armed_candidates,
+                fact.direct_reachable,
+                fact.direct_inbound,
+            },
+        );
+    }
+
+    const path_report = runGraphicsPathPreflight(state, &report);
+    state.graphics_path_preflight = path_report;
+    logGraphicsPathPreflight(&path_report);
+    logGraphicsHostPreflightSnapshot(state);
+    const static_allowed = report.allowsGuestStart();
+    const host_allowed = path_report.windowGateAllows();
+    state.graphics_preflight_window_allowed = static_allowed and host_allowed;
+    machoCapturePrint(
+        "macho-processor: GRAPHICS PREFLIGHT DECISION: static_admission={s} host_window_admission={s} prewindow_candidate={s} final_host_closure=DEFERRED terminal_on_failure=YES static_reason={s} path_reason={s}; no bypass is implicit\n",
+        .{
+            if (static_allowed) "ALLOW" else "REFUSE",
+            if (host_allowed) "ALLOW" else "REFUSE",
+            if (static_allowed and host_allowed) "ALLOW" else "REFUSE",
+            if (report.firstBlockedCheck()) |item| item.detail else if (report.firstRequiredUnknownCheck()) |item| item.detail else "no required static finding",
+            path_report.admissionReason(),
+        },
+    );
+
+    machoCapturePrint(
+        "macho-processor: PRE-WINDOW COVERAGE: static and host-path probes complete; full Rosette-owned closure is deferred until identity, interop, and the startup compiler have sealed their evidence\n",
+        .{},
+    );
+    if (!path_report.windowGateAllows()) {
+        machoCapturePrint(
+            "macho-processor: GRAPHICS PREFLIGHT: refusing native window admission; first_missing={s} first_actionable={s} probe={s} phase={s} next_action={s}. Static image presence is insufficient\n",
+            .{
+                graphicsPathStageLabel(path_report.window_gate_first_missing),
+                graphicsPathStageLabel(path_report.first_actionable),
+                if (path_report.first_actionable) |stage| stage.preflightProbe() else "none",
+                if (path_report.first_actionable) |stage| stage.preflightPhase().label() else "none",
+                if (path_report.first_actionable) |stage| stage.guidance() else "no actionable host gap",
+            },
+        );
+    }
+    return static_allowed and host_allowed;
+}
+
 /// What the image pre-flight established about the media being hashed.
 ///
 /// The hash's fault observer is a bare function pointer with nowhere to carry a
@@ -22993,6 +24399,7 @@ fn reportInputSurveyStart(offset: u64, budget_ns: u64) void {
 /// fails.
 var audited_image_volume: ?xiso_format.VolumeDescriptor = null;
 var audited_image_bytes: u64 = 0;
+var audited_image_preflight_passed: bool = false;
 
 /// Establish whether the image is *usable* before anything reads it whole.
 ///
@@ -23015,6 +24422,7 @@ fn reportMediaPreflight(io: std.Io, path: []const u8) void {
     });
     audited_image_volume = finding.volume;
     audited_image_bytes = finding.image_bytes;
+    audited_image_preflight_passed = finding.outcome == .structure_intact;
 
     machoCapturePrint(
         "macho-processor: AUDIT INPUTS: image preflight outcome={s} bytes={d} probes={d} refusals={d} samples={d}/{d} elapsed_ms={d}\n",
@@ -23371,6 +24779,15 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         "macho-processor: STARTUP: runtime diagnostics open; launch-input verification is next\n",
         .{},
     );
+    // Armed before the launch-input audit so the watch covers everything from
+    // here on, Rosette's own lines and the guest's mirrored ones alike.
+    fatal_conditions.configure(
+        fatal_conditions.policyFromText(environmentText("ROSETTE_FATAL_CONDITIONS")),
+        environmentText("ROSETTE_FATAL_CONDITIONS_ALLOW"),
+    );
+    fatal_context_state = &state;
+    fatal_conditions.setContextProvider(fatalConditionContext);
+    fatal_conditions.arm();
 
     const media_path = launchMediaPath(options.args);
     const config_path = launchOptionValue(options.args, "--config") orelse
@@ -23378,9 +24795,31 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         launchOptionValue(options.args, "--config-path");
     native_crash.recordPhase("input-hash");
     output.human("Verifying launch inputs...\n", .{});
+    // Ahead of the media hash: a build that cannot reach a frame should be
+    // refused before six gigabytes are read to identify what it would have run.
+    if (!reportPrelaunchAudit(&state) and !environmentFlag("ROSETTE_PRELAUNCH_AUDIT_OFF")) {
+        machoCapturePrint(
+            "macho-processor: PRELAUNCH AUDIT: refusing to start this build; set ROSETTE_PRELAUNCH_AUDIT_OFF=1 to launch it anyway and read the failure at runtime instead\n",
+            .{},
+        );
+        // 123, not 124: the launchers already exit 124 for their own
+        // input-hash stall kill, and a refusal that cannot be told apart from
+        // a timeout is a refusal nobody can act on.
+        return 123;
+    }
     if (media_path) |image_path| {
         if (hasPathSuffixIgnoreCase(image_path, ".iso") or hasPathSuffixIgnoreCase(image_path, ".xiso")) {
             reportMediaPreflight(io, image_path);
+            state.audit_media_preflight_evaluated = true;
+            state.audit_media_preflight_passed = audited_image_volume != null and audited_image_preflight_passed;
+        } else if (hasPathSuffixIgnoreCase(image_path, ".xex")) {
+            // A loose XEX is a valid Xenia launch input, not a disc image. Its
+            // format parser belongs to the guest, while Rosette can still
+            // prove the host-side input operation through the content hash.
+            // Mark the disc-format portion not-applicable rather than making
+            // loose-XEX launches fail for a check that has no subject.
+            state.audit_media_preflight_evaluated = true;
+            state.audit_media_preflight_passed = true;
         }
     }
     const media_input = configuredInputFingerprint(
@@ -23568,6 +25007,13 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     ) catch "launch-config-descriptor-unavailable";
     const selected_backend = launchOptionValue(options.args, "--gpu") orelse
         runtimeValue("ROSETTE_BACKEND", "vulkan");
+    if (!state.setAuditBackend(selected_backend)) {
+        machoCapturePrint(
+            "macho-processor: AUDIT IDENTITY: refusing to continue; selected backend name is empty or exceeds the guest admission field\n",
+            .{},
+        );
+        return 125;
+    }
     var device_identity_buffer: [320]u8 = undefined;
     const device_identity = std.fmt.bufPrint(
         &device_identity_buffer,
@@ -23810,8 +25256,27 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.logHostCapabilities();
     state.armGraphicsTracepoints();
     const image_is_xenia = has_xbdm_diagnostics or
-        std.mem.indexOf(u8, options.path, "xenia") != null or
-        std.mem.indexOf(u8, slice, "VdSwap") != null;
+        std.ascii.indexOfIgnoreCase(options.path, "xenia") != null or
+        std.ascii.indexOfIgnoreCase(slice, "vdswap") != null;
+    state.graphics_preflight_enabled = image_is_xenia or
+        environmentFlag("ROSETTE_GRAPHICS_PREFLIGHT");
+    if (state.graphics_preflight_enabled) {
+        const graphics_preflight_off = environmentFlag("ROSETTE_GRAPHICS_PREFLIGHT_OFF");
+        if (!reportGraphicsPreflight(&state, vex_audit.ready()) and !graphics_preflight_off) {
+            machoCapturePrint(
+                "macho-processor: GRAPHICS PREFLIGHT: refusing guest/window start; a required static graphics condition is blocked or unevaluated. Set ROSETTE_GRAPHICS_PREFLIGHT_OFF=1 only to bypass this gate for diagnostics\n",
+                .{},
+            );
+            return 122;
+        }
+        if (graphics_preflight_off) {
+            state.graphics_preflight_window_allowed = true;
+            machoCapturePrint(
+                "macho-processor: GRAPHICS PREFLIGHT: explicit bypass enabled; static findings remain authoritative and native window admission will still enforce its runtime contract\n",
+                .{},
+            );
+        }
+    }
     // Xenia gets the framework by default because its native host callbacks
     // are the exact boundary this ledger is meant to make observable. Other
     // translated applications opt in explicitly to avoid paying for extra
@@ -23875,6 +25340,15 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
             return 125;
         }
     }
+    // After the seal, before the guest: whether Rosette can answer the identity
+    // the guest asks for is not decidable until there is one to answer with.
+    if (!reportInteropAudit(allocator, &state) and !environmentFlag("ROSETTE_PRELAUNCH_AUDIT_OFF")) {
+        machoCapturePrint(
+            "macho-processor: INTEROP AUDIT: refusing to start this build; set ROSETTE_PRELAUNCH_AUDIT_OFF=1 to launch it anyway and read the refusal from the guest instead\n",
+            .{},
+        );
+        return 123;
+    }
     const ready_gate_requested = environmentFlag("ROSETTE_MACHO_READY_GATE") or image_is_xenia;
     const ready_gate_enabled = ready_gate_requested and
         !environmentFlag("ROSETTE_MACHO_READY_GATE_OFF");
@@ -23899,6 +25373,28 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
             .{},
         );
         return 125;
+    }
+    // This is the final pre-guest boundary.  The graphics report above can
+    // only answer static obligations and host path stages; identity/interop
+    // and the startup compiler complete the remaining Rosette-owned evidence
+    // here.  Guest-owned GPU, swap, frame and presentation edges remain
+    // explicitly deferred, because satisfying them before execution would be
+    // fabricating the evidence the run is meant to collect.
+    if (state.graphics_preflight_enabled or environmentFlag("ROSETTE_PREWINDOW_COVERAGE")) {
+        const host_closure_ok = state.enforcePreWindowHostCoverage();
+        if (!host_closure_ok and state.audit_profile == .authentic) {
+            machoCapturePrint(
+                "macho-processor: PRE-WINDOW COVERAGE: refusing guest/window start; the Rosette-owned host contract is not closed. Set ROSETTE_PREWINDOW_COVERAGE_OFF=1 only for a conditional diagnostic run\n",
+                .{},
+            );
+            return 126;
+        }
+        if (!host_closure_ok) {
+            machoCapturePrint(
+                "macho-processor: PRE-WINDOW COVERAGE: non-authentic profile is continuing over the host-closure finding; all runtime conclusions are conditional\n",
+                .{},
+            );
+        }
     }
     state.launch_options.logConfiguration(state.internal_targets.cvar_add_to_launch_options_count);
     machoCapturePrint("ROSETTE: MachO state setup completed successfully\n", .{});

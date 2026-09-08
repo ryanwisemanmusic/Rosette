@@ -1,7 +1,18 @@
 const std = @import("std");
 
 /// Packed integer operations supported by the SIMD execution engine.
-pub const PackedIntegerOperation = enum { add, sub, mul_low };
+///
+/// The saturating forms are kept here beside the ordinary modulo arithmetic
+/// because they share the same lane traversal and differ only in the scalar
+/// operation applied to each lane.
+pub const PackedIntegerOperation = enum {
+    add,
+    sub,
+    mul_low,
+    add_signed_saturate,
+    sub_signed_saturate,
+    sub_unsigned_saturate,
+};
 
 /// Multiplies unsigned even-indexed dword lanes from two 16-byte vectors,
 /// producing 64-bit results in the corresponding qword lanes.
@@ -69,6 +80,63 @@ pub fn packedMinMax(lhs: [16]u8, rhs: [16]u8, kind: MinMaxKind) [16]u8 {
         else => unreachable,
     }
     return result;
+}
+
+fn signedSaturate8(value: i16) u8 {
+    const clamped: i8 = if (value > 127)
+        127
+    else if (value < -128)
+        -128
+    else
+        @intCast(value);
+    return @bitCast(clamped);
+}
+
+fn signedSaturate16(value: i32) u16 {
+    const clamped: i16 = if (value > 32767)
+        32767
+    else if (value < -32768)
+        -32768
+    else
+        @intCast(value);
+    return @bitCast(clamped);
+}
+
+/// Computes the high 16 bits of each signed or unsigned 16x16 multiplication.
+/// The result is the bit pattern of the high half, so signed and unsigned
+/// modes differ only in how the source words are interpreted.
+pub fn packedIntegerMulHigh(lhs: [16]u8, rhs: [16]u8, signed: bool) [16]u8 {
+    var result = [_]u8{0} ** 16;
+    for (0..8) |lane| {
+        const offset = lane * 2;
+        const left = std.mem.readInt(u16, lhs[offset..][0..2], .little);
+        const right = std.mem.readInt(u16, rhs[offset..][0..2], .little);
+        const high: u16 = if (signed) blk: {
+            const product: i32 = @as(i32, @as(i16, @bitCast(left))) *
+                @as(i32, @as(i16, @bitCast(right)));
+            const shifted: i16 = @truncate(product >> 16);
+            break :blk @bitCast(shifted);
+        } else blk: {
+            const product: u32 = @as(u32, left) * @as(u32, right);
+            break :blk @truncate(product >> 16);
+        };
+        std.mem.writeInt(u16, result[offset..][0..2], high, .little);
+    }
+    return result;
+}
+
+test "packed integer high multiply preserves signed and unsigned halves" {
+    var lhs = [_]u8{0} ** 16;
+    var rhs = [_]u8{0} ** 16;
+    std.mem.writeInt(u16, lhs[0..2], @bitCast(@as(i16, -2)), .little);
+    std.mem.writeInt(u16, rhs[0..2], @bitCast(@as(i16, 3)), .little);
+    const signed_high = packedIntegerMulHigh(lhs, rhs, true);
+    try std.testing.expectEqual(@as(i16, -1), @as(i16, @bitCast(std.mem.readInt(u16, signed_high[0..2], .little))));
+
+    std.mem.writeInt(u16, lhs[0..2], 0xFFFF, .little);
+    std.mem.writeInt(u16, rhs[0..2], 2, .little);
+    const unsigned_high = packedIntegerMulHigh(lhs, rhs, false);
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, unsigned_high[0..2], .little));
 }
 
 test "packed min/max separates signed from unsigned comparison" {
@@ -261,8 +329,9 @@ pub fn blendPackedElements(lhs: [16]u8, rhs: [16]u8, mask: [16]u8, lane_bits: u8
     return result;
 }
 
-/// Performs a packed integer binary operation (add, sub, or mul_low) across
-/// all lanes of the specified bit width.
+/// Performs a packed integer binary operation across all lanes of the
+/// specified bit width. Saturating operations are valid for the lane widths
+/// used by their x86 encodings (8 or 16 bits).
 pub fn packedIntegerBinary(lhs: [16]u8, rhs: [16]u8, lane_bits: u8, operation: PackedIntegerOperation) [16]u8 {
     var result: [16]u8 = undefined;
     switch (lane_bits) {
@@ -271,6 +340,15 @@ pub fn packedIntegerBinary(lhs: [16]u8, rhs: [16]u8, lane_bits: u8, operation: P
                 .add => lhs[lane] +% rhs[lane],
                 .sub => lhs[lane] -% rhs[lane],
                 .mul_low => lhs[lane] *% rhs[lane],
+                .add_signed_saturate => signedSaturate8(
+                    @as(i16, @as(i8, @bitCast(lhs[lane]))) +
+                        @as(i16, @as(i8, @bitCast(rhs[lane]))),
+                ),
+                .sub_signed_saturate => signedSaturate8(
+                    @as(i16, @as(i8, @bitCast(lhs[lane]))) -
+                        @as(i16, @as(i8, @bitCast(rhs[lane]))),
+                ),
+                .sub_unsigned_saturate => if (lhs[lane] < rhs[lane]) 0 else lhs[lane] - rhs[lane],
             };
         },
         16 => for (0..8) |lane| {
@@ -281,6 +359,15 @@ pub fn packedIntegerBinary(lhs: [16]u8, rhs: [16]u8, lane_bits: u8, operation: P
                 .add => left +% right,
                 .sub => left -% right,
                 .mul_low => left *% right,
+                .add_signed_saturate => signedSaturate16(
+                    @as(i32, @as(i16, @bitCast(left))) +
+                        @as(i32, @as(i16, @bitCast(right))),
+                ),
+                .sub_signed_saturate => signedSaturate16(
+                    @as(i32, @as(i16, @bitCast(left))) -
+                        @as(i32, @as(i16, @bitCast(right))),
+                ),
+                .sub_unsigned_saturate => if (left < right) 0 else left - right,
             };
             std.mem.writeInt(u16, result[offset..][0..2], value, .little);
         },
@@ -292,6 +379,7 @@ pub fn packedIntegerBinary(lhs: [16]u8, rhs: [16]u8, lane_bits: u8, operation: P
                 .add => left +% right,
                 .sub => left -% right,
                 .mul_low => left *% right,
+                .add_signed_saturate, .sub_signed_saturate, .sub_unsigned_saturate => unreachable,
             };
             std.mem.writeInt(u32, result[offset..][0..4], value, .little);
         },
@@ -303,6 +391,7 @@ pub fn packedIntegerBinary(lhs: [16]u8, rhs: [16]u8, lane_bits: u8, operation: P
                 .add => left +% right,
                 .sub => left -% right,
                 .mul_low => left *% right,
+                .add_signed_saturate, .sub_signed_saturate, .sub_unsigned_saturate => unreachable,
             };
             std.mem.writeInt(u64, result[offset..][0..8], value, .little);
         },
