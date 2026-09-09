@@ -1,6 +1,10 @@
 const std = @import("std");
 const x64_syscalls = @import("x64_syscalls");
 const x64_interactive_bridge = @import("interactive_bridge.zig");
+const windows_runtime = @import("windows_runtime");
+
+pub const SYNTHETIC_PTHREAD_ONCE_RETURN = windows_runtime.SYNTHETIC_PTHREAD_ONCE_RETURN;
+pub const SYNTHETIC_INITTERM_RETURN = windows_runtime.SYNTHETIC_INITTERM_RETURN;
 
 pub fn setupInitialStack(state: anytype, argv: []const []const u8) !void {
     const default_argv = [_][]const u8{"program"};
@@ -62,20 +66,50 @@ pub fn tryLibcStartMainTrampoline(state: anytype, d: anytype, return_rip: u64) b
 }
 
 pub fn tryDynamicFunctionShim(state: anytype, got_addr: u64, direct_return_rip: ?u64) bool {
-    const name = dynamicRelocationName(state, got_addr) orelse {
+    const relocation = dynamicRelocation(state, got_addr) orelse {
         if (direct_return_rip != null) return false;
         const resolver_name = dynamicPltResolverRelocationName(state) orelse return false;
         const old_rsp = state.regs.rsp;
         state.regs.rsp +%= 16;
         if (tryNamedFunctionShim(state, resolver_name, null)) return true;
         state.regs.rsp = old_rsp;
+        if (tryWindowsLazyImport(state, resolver_name)) return true;
         std.log.scoped(.x64_linux_runtime).warn("unsupported lazy PLT symbol {s}", .{resolver_name});
         return false;
     };
-    if (tryNamedFunctionShim(state, name, direct_return_rip)) return true;
+    const name = relocation.name;
+    // PE32+ calls use the Microsoft x64 register ABI (RCX/RDX/R8/R9), while
+    // these historical named shims are SysV-only (RDI/RSI/RDX/RCX/R8/R9).
+    // Running a Windows import such as calloc through the SysV branch reads
+    // unrelated guest registers as its count/element size and can turn a
+    // small allocation into a bogus multi-gigabyte request before the
+    // Windows bridge gets a chance to handle it. Once the PE state enables
+    // the Windows runtime, route the import directly to that bridge.
+    const windows_mode = if (comptime @hasField(@TypeOf(state.*), "windows_runtime_enabled"))
+        state.windows_runtime_enabled
+    else
+        false;
+    if (!windows_mode and tryNamedFunctionShim(state, name, direct_return_rip)) return true;
+    if (tryWindowsFunction(state, relocation.dll_name, name, direct_return_rip)) return true;
     if (symbolNameEql(name, "__libc_start_main")) return false;
     std.log.scoped(.x64_linux_runtime).warn("unsupported PLT symbol {s}", .{name});
     return false;
+}
+
+/// Route a PE proc-address target through the same Windows ABI surface used by
+/// import-table calls. Keeping this wrapper here lets the ELF state own all
+/// x86-64 call/return bookkeeping while the Windows layer remains reusable by
+/// the static preflight and indirect-stub path.
+pub fn tryWindowsFunction(state: anytype, dll_name: []const u8, name: []const u8, direct_return_rip: ?u64) bool {
+    return windows_runtime.tryFunction(state, dll_name, name, direct_return_rip);
+}
+
+/// Complete a Rosetta-owned semantic compatibility boundary for a Windows
+/// guest before its first instruction executes. This stays alongside the
+/// Windows ABI bridge so the ELF executor only owns the architectural return
+/// bookkeeping.
+pub fn tryWindowsGuestCompatibility(state: anytype) bool {
+    return windows_runtime.tryGuestCompatibility(state);
 }
 
 pub fn tryLocalFunctionShim(state: anytype, target: u64, direct_return_rip: u64) bool {
@@ -352,9 +386,35 @@ fn dynamicPltResolverRelocationName(state: anytype) ?[]const u8 {
     return null;
 }
 
-fn dynamicRelocationName(state: anytype, got_addr: u64) ?[]const u8 {
-    for (state.dynamic_relocations) |reloc| {
-        if (reloc.offset == got_addr) return reloc.name;
+fn tryWindowsLazyImport(state: anytype, name: []const u8) bool {
+    const windows_mode = if (comptime @hasField(@TypeOf(state.*), "windows_runtime_enabled"))
+        state.windows_runtime_enabled
+    else
+        false;
+    if (!windows_mode or name.len == 0) return false;
+
+    // A PE import thunk does not carry the ELF relocation's DLL alongside the
+    // resolver index. Try the small set of ABI namespaces used by the Windows
+    // runner, in order from the broad core namespace to the graphics ones. The
+    // classifier remains authoritative: an unknown name is not made runnable
+    // merely because it passed through this fallback.
+    const candidate_dlls = [_][]const u8{
+        "kernel32.dll",
+        "gdi32.dll",
+        "user32.dll",
+        "vulkan-1.dll",
+        "dxgi.dll",
+    };
+    for (candidate_dlls) |dll_name| {
+        if (!windows_runtime.isSupportedImport(dll_name, name)) continue;
+        if (tryWindowsFunction(state, dll_name, name, null)) return true;
+    }
+    return false;
+}
+
+fn dynamicRelocation(state: anytype, got_addr: u64) ?*const @TypeOf(state.dynamic_relocations[0]) {
+    for (state.dynamic_relocations) |*reloc| {
+        if (reloc.offset == got_addr) return reloc;
     }
     return null;
 }

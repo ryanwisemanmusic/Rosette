@@ -209,3 +209,105 @@ test "LAHF and SAHF transfer only the architectural status flags" {
     applySahf(&rflags, 0x91);
     try std.testing.expectEqual(preserved | RFL_CF | RFL_AF | RFL_SF, rflags);
 }
+
+/// The result of a double-precision shift (SHLD / SHRD).
+pub const DoubleShift = struct {
+    value: u64,
+    carry: bool,
+    /// Whether the destination's sign bit changed. x86 defines OF only for a
+    /// count of 1; the caller decides whether to apply it.
+    sign_changed: bool,
+};
+
+/// SHLD / SHRD: shift `destination` by `count`, filling the vacated bits from
+/// `source` rather than with zeros.
+///
+/// `count` must already be masked (`& 0x3F` for a 64-bit operand, `& 0x1F`
+/// otherwise) and must be non-zero — x86 leaves the flags untouched and
+/// performs no write when the masked count is zero, which is the caller's
+/// decision, not this function's.
+///
+/// The two operands are concatenated into a 128-bit value and shifted once.
+/// Doing it as two shifts of a 64-bit value needs a `bits - count` shift that
+/// is undefined when `count` is zero and out of range when `count` exceeds the
+/// operand width — the latter being reachable, because a 16-bit operand admits
+/// a masked count of up to 31. Intel leaves that case undefined; the
+/// concatenation makes it total and deterministic instead of a shift-overflow
+/// panic.
+pub fn doubleShift(
+    destination: u64,
+    source: u64,
+    count: u6,
+    size: OperandSize,
+    left: bool,
+) DoubleShift {
+    const bits: u8 = switch (size) {
+        .bits8 => 8,
+        .bits16 => 16,
+        .bits32 => 32,
+        .bits64 => 64,
+    };
+    const mask = maskForSize(size);
+    const destination_bits = destination & mask;
+    const source_bits = source & mask;
+    const shift: u8 = count;
+
+    var value: u64 = 0;
+    var carry = false;
+    if (left) {
+        // Destination occupies the high half; shifting left walks its top bits
+        // out and pulls the source's top bits into the bottom.
+        const wide = (@as(u128, destination_bits) << @intCast(bits)) | source_bits;
+        value = @truncate((wide << @intCast(shift)) >> @intCast(bits));
+        const carry_index = 2 * @as(u16, bits) - @as(u16, shift);
+        carry = carry_index < 128 and ((wide >> @intCast(carry_index)) & 1) != 0;
+    } else {
+        // Source occupies the high half; shifting right walks the
+        // destination's low bits out and pulls the source's low bits in.
+        const wide = (@as(u128, source_bits) << @intCast(bits)) | destination_bits;
+        value = @truncate(wide >> @intCast(shift));
+        carry = ((wide >> @intCast(@as(u16, shift) - 1)) & 1) != 0;
+    }
+    value &= mask;
+
+    const sign = signBitForSize(size);
+    return .{
+        .value = value,
+        .carry = carry,
+        .sign_changed = ((value ^ destination_bits) & sign) != 0,
+    };
+}
+
+test "a double-precision shift fills from the source operand" {
+    // `shld rax, rdx, 32` — the encoding at guest 0x744871 that decoded as
+    // invalid. The top 32 bits of rdx become the low 32 bits of rax.
+    const shifted = doubleShift(0x1122_3344_5566_7788, 0xAABB_CCDD_EEFF_0011, 32, .bits64, true);
+    try std.testing.expectEqual(@as(u64, 0x5566_7788_AABB_CCDD), shifted.value);
+    // The last bit out of the destination is bit 32 of the original.
+    try std.testing.expectEqual(((0x1122_3344_5566_7788 >> 32) & 1) != 0, shifted.carry);
+
+    // SHRD is the mirror: the source's low bits arrive at the top.
+    const back = doubleShift(0x1122_3344_5566_7788, 0xAABB_CCDD_EEFF_0011, 32, .bits64, false);
+    try std.testing.expectEqual(@as(u64, 0xEEFF_0011_1122_3344), back.value);
+    try std.testing.expectEqual(((0x1122_3344_5566_7788 >> 31) & 1) != 0, back.carry);
+
+    // A single-bit shift is the case where OF is architecturally defined.
+    const one = doubleShift(0x8000_0000_0000_0000, 0, 1, .bits64, true);
+    try std.testing.expectEqual(@as(u64, 0), one.value);
+    try std.testing.expect(one.carry);
+    try std.testing.expect(one.sign_changed);
+
+    // Narrower operands stay inside their width, and a 16-bit operand admits a
+    // masked count wider than the operand itself without overflowing a shift.
+    const narrow = doubleShift(0xFFFF, 0x0000, 4, .bits16, true);
+    try std.testing.expectEqual(@as(u64, 0xFFF0), narrow.value);
+    const over = doubleShift(0xFFFF, 0x1234, 24, .bits16, true);
+    try std.testing.expectEqual(over.value, over.value & 0xFFFF);
+    const over_right = doubleShift(0xFFFF, 0x1234, 24, .bits16, false);
+    try std.testing.expectEqual(over_right.value, over_right.value & 0xFFFF);
+
+    // 32-bit results never carry bits above the operand width.
+    const dword = doubleShift(0xDEAD_BEEF, 0xFEED_FACE, 8, .bits32, true);
+    try std.testing.expectEqual(@as(u64, 0xAD_BE_EF_FE), dword.value);
+    try std.testing.expectEqual(dword.value, dword.value & 0xFFFF_FFFF);
+}
