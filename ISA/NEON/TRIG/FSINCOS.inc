@@ -17,6 +17,7 @@ element_type = "f80"
 element_size = 80
 
 encodings = [
+  { opcode = "D9 FB", form = "FSINCOS", op_en = "ZO", feature = "x87_fpu", vector_length = 0, encoding = "legacy" }
 ]
 
 operand_encoding = {
@@ -24,6 +25,7 @@ operand_encoding = {
 }
 
 simd_fp_exceptions = []
+flags_affected = ["C1", "C0", "C2", "C3"]
 
 semantic_general = """
 Sine and Cosine.
@@ -50,4 +52,3 @@ neon_notes = [
 ]
 
 abi_contract = ["x86_table_shape", "neon_mirror_shape", "arm64_lowering_shape", "full_scope_preserved"]
-

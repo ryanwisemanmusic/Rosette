@@ -17,6 +17,7 @@ const addressing = @import("addressing.zig");
 const cpu = @import("cpu.zig");
 const groups = @import("groups.zig");
 const legacy = @import("legacy.zig");
+const decode_coverage = @import("coverage.zig");
 const prefix = @import("prefix.zig");
 const twobyte = @import("twobyte.zig");
 const types = @import("types.zig");
@@ -65,6 +66,9 @@ pub const registerOperandValue = legacy.registerOperandValue;
 pub const setRegisterOperand = legacy.setRegisterOperand;
 pub const decodeLegacyMov = legacy.decodeLegacyMov;
 pub const decodeLegacyInstruction = legacy.decodeLegacyInstruction;
+/// The x86-64 opcode-space census. Pure and allocation-free: it asks this
+/// same decoder about every slot of every map.
+pub const coverage = decode_coverage;
 pub const x87BinaryOperation = legacy.x87BinaryOperation;
 pub const decodeAccumulatorImmediate = legacy.decodeAccumulatorImmediate;
 pub const LegacyPrefixes = prefix.LegacyPrefixes;
@@ -112,6 +116,8 @@ pub const applySbb = types.applySbb;
 pub const applyAdd = types.applyAdd;
 pub const applyIncDec = types.applyIncDec;
 pub const applyLogic = types.applyLogic;
+pub const doubleShift = types.doubleShift;
+pub const DoubleShift = types.DoubleShift;
 pub const evalCond = types.evalCond;
 pub const regVal = types.regVal;
 pub const setReg = types.setReg;

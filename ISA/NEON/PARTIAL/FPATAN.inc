@@ -10,6 +10,9 @@ PopRegisterStack;
 source_isa = "arm64_neon"
 target_isa = "x86"
 x86_table = "PARTIAL/FPATAN.inc"
+x86_handler = "x86_fpatan"
+neon_lowering = "arm64_fpatan"
+lowering_kind = "arm64_scalar"
 
 name = "FPATAN"
 aliases = []
@@ -41,4 +44,16 @@ other_exceptions = [
 semantic_general = """
 ST(1) := arctan(ST(1) / ST(0));
 PopRegisterStack;
+"""
+
+neon_register_model = """
+x87 FPU stack mapped to ARM64 vN registers. FPATAN is a scalar x87 transcendental operation.
+"""
+
+neon_flag_model = """
+ARM64 does not directly update x87 C flags. C1 tracking may require separate flag management.
+"""
+
+neon_assembly = """
+// NEON lowering: software-emulated x87 transcendental via ARM64 FPU or runtime helper.
 """

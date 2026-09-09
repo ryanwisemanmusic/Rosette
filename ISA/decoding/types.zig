@@ -91,6 +91,8 @@ pub const applySbb = flags.applySbb;
 pub const applyAdd = flags.applyAdd;
 pub const applyIncDec = flags.applyIncDec;
 pub const applyLogic = flags.applyLogic;
+pub const doubleShift = flags.doubleShift;
+pub const DoubleShift = flags.DoubleShift;
 pub const evalCond = flags.evalCond;
 pub const regVal = cpu_state.regVal;
 pub const setReg = cpu_state.setReg;
@@ -115,6 +117,21 @@ pub const Op = enum(u16) {
     invalid,
     nop,
     cmc,
+    // Direction flag. The string operations already read `RFL_DF` to choose
+    // their stride, so without these the guest was subject to a flag it had no
+    // encoding to change — and a `cld` in a memcpy prologue stopped the run.
+    cld,
+    std,
+    // XCHG rAX, r64 (0x91-0x97). The general `0x87` form was present; these
+    // opcode-embedded register forms were not.
+    xchg_accum_reg,
+    // Counted loops and the RCX-zero branch (0xE0-0xE3), rel8.
+    loopne,
+    loope,
+    loop,
+    jrcxz,
+    // Table lookup: AL = [rBX + AL] (0xD7).
+    xlat,
     clc,
     stc,
     fild_mem16,
@@ -131,6 +148,9 @@ pub const Op = enum(u16) {
     fxch_st,
     ffree_st,
     fninit,
+    fsin,
+    fcos,
+    fprem1,
     fnstsw_ax,
     fnstcw_mem16,
     fldcw_mem16,
@@ -185,7 +205,24 @@ pub const Op = enum(u16) {
     adc_reg16_imm8,
     adc_reg32_imm8,
     adc_reg64_imm8,
+    adc_mem8_imm8,
+    adc_mem16_imm8,
+    adc_mem32_imm8,
+    adc_mem64_imm8,
+    adc_mem16_imm32,
+    adc_mem32_imm32,
+    adc_mem64_imm32,
     sbb_reg8_imm8,
+    sbb_reg16_imm8,
+    sbb_reg32_imm8,
+    sbb_reg64_imm8,
+    sbb_mem8_imm8,
+    sbb_mem16_imm8,
+    sbb_mem32_imm8,
+    sbb_mem64_imm8,
+    sbb_mem16_imm32,
+    sbb_mem32_imm32,
+    sbb_mem64_imm32,
     add_reg16_imm32,
     add_reg32_imm32,
     add_reg64_imm32,
@@ -193,6 +230,9 @@ pub const Op = enum(u16) {
     add_mem16_imm8,
     add_mem32_imm8,
     add_mem64_imm8,
+    add_mem16_imm32,
+    add_mem32_imm32,
+    add_mem64_imm32,
     adc_reg8_mem8,
     sbb_reg8_mem8,
     // sub (reg, r/m) d=1
@@ -215,6 +255,9 @@ pub const Op = enum(u16) {
     sub_mem16_imm8,
     sub_mem32_imm8,
     sub_mem64_imm8,
+    sub_mem16_imm32,
+    sub_mem32_imm32,
+    sub_mem64_imm32,
     sub_reg8_imm8,
     sub_reg16_imm8,
     sub_reg32_imm8,
@@ -243,6 +286,13 @@ pub const Op = enum(u16) {
     and_reg16_imm8,
     and_reg32_imm8,
     and_reg64_imm8,
+    and_mem8_imm8,
+    and_mem16_imm8,
+    and_mem32_imm8,
+    and_mem64_imm8,
+    and_mem16_imm32,
+    and_mem32_imm32,
+    and_mem64_imm32,
     and_reg16_imm32,
     and_reg32_imm32,
     and_reg64_imm32,
@@ -285,6 +335,13 @@ pub const Op = enum(u16) {
     xor_reg16_imm8,
     xor_reg32_imm8,
     xor_reg64_imm8,
+    xor_mem8_imm8,
+    xor_mem16_imm8,
+    xor_mem32_imm8,
+    xor_mem64_imm8,
+    xor_mem16_imm32,
+    xor_mem32_imm32,
+    xor_mem64_imm32,
     // shifts
     rol_reg_cl,
     rol_mem_cl,
@@ -296,6 +353,18 @@ pub const Op = enum(u16) {
     shr_mem_cl,
     sar_reg_cl,
     sar_mem_cl,
+    // Double-precision shifts (0F A4/A5 SHLD, 0F AC/AD SHRD). The operand
+    // width rides in `d.size` and the fill operand in `d.src_reg`, the same
+    // shape the single-operand shifts above use, so a wider operand needs no
+    // new opcode.
+    shld_reg_imm8,
+    shld_mem_imm8,
+    shld_reg_cl,
+    shld_mem_cl,
+    shrd_reg_imm8,
+    shrd_mem_imm8,
+    shrd_reg_cl,
+    shrd_mem_cl,
     rol_reg_imm,
     rol_mem_imm,
     ror_reg_imm,
@@ -372,6 +441,9 @@ pub const Op = enum(u16) {
     cmp_mem16_imm8,
     cmp_mem32_imm8,
     cmp_mem64_imm8,
+    cmp_mem16_imm32,
+    cmp_mem32_imm32,
+    cmp_mem64_imm32,
     cmp_reg8_imm8,
     cmp_reg16_imm8,
     cmp_reg32_imm8,
@@ -930,6 +1002,15 @@ pub const Op = enum(u16) {
     // numeric identities already used by decode caches and trace consumers
     // remain stable.
     fldz,
+    // x87 built-in constants. Keep these appended with the other register
+    // forms so persisted decode-cache and trace operation identities remain
+    // stable while the D9 E8-EF family gets an explicit execution contract.
+    fld1,
+    fldl2t,
+    fldl2e,
+    fldpi,
+    fldlg2,
+    fldln2,
     fucomi_st,
     fcomi_st,
     fcomip_st,
@@ -1011,6 +1092,54 @@ pub const Op = enum(u16) {
     vmaskmovps_store,
     vmaskmovpd_load,
     vmaskmovpd_store,
+    // Three-operand IMUL immediate-width forms. These are appended so the
+    // numeric identities of the older decoder operations remain stable for
+    // persisted decode-cache and trace records. Opcode 0x6B carries imm8;
+    // opcode 0x69 carries imm16 for a 16-bit operand and imm32 for 32/64-bit
+    // operands.
+    imul_reg16_mem16_imm8,
+    imul_reg16_reg16_imm8,
+    imul_reg16_mem16_imm16,
+    imul_reg16_reg16_imm16,
+    imul_reg32_mem32_imm32,
+    imul_reg32_reg32_imm32,
+    imul_reg64_mem64_imm32,
+    imul_reg64_reg64_imm32,
+    // Legacy SSE scalar register-to-register moves. Memory forms already
+    // use vmovss_xmm_mem/vmovsd_xmm_mem; these appended tags keep the older
+    // operation numbers stable while giving the two-operand register forms
+    // an explicit execution contract.
+    vmovss_xmm_xmm,
+    vmovsd_xmm_xmm,
+    // F3 0F 7E /r MOVQ between XMM registers. This is distinct from the
+    // GPR-to-XMM vmovq_xmm_reg64 form even though both transfer 64 bits.
+    vmovq_xmm_xmm,
+    // Synthetic dispatcher for the D8/DA/DC/DE x87 memory arithmetic forms.
+    // It is appended so all existing decode-cache and trace operation
+    // identities remain stable.
+    x87_memory,
+    // D9 x87 transcendental/status operations. These are appended to keep
+    // persisted operation identities stable while the long-double math path
+    // gains explicit execution coverage.
+    fchs,
+    fabs,
+    ftst,
+    fxam,
+    f2xm1,
+    fyl2x,
+    fptan,
+    fpatan,
+    fxtract,
+    fdecstp,
+    fincstp,
+    fprem,
+    fyl2xp1,
+    fsqrt,
+    fsincos,
+    frndint,
+    fscale,
+    fnop,
+    fclex,
 };
 
 fn canonicalMnemonic(op: Op, buffer: *[32]u8) ?[]const u8 {
@@ -1018,7 +1147,7 @@ fn canonicalMnemonic(op: Op, buffer: *[32]u8) ?[]const u8 {
     // Synthetic dispatcher ops do not name a single instruction: x87_binary
     // covers the whole D8-DF arithmetic family (execution switches on
     // `x87.imm`), so there is no one ISA ABI contract for it.
-    if (op == .x87_binary) return null;
+    if (op == .x87_binary or op == .x87_memory) return null;
 
     const tag = @tagName(op);
     const stem = tag[0 .. std.mem.indexOfScalar(u8, tag, '_') orelse tag.len];

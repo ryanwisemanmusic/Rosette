@@ -9,6 +9,9 @@ ST(0) := |ST(0)|
 source_isa = "arm64_neon"
 target_isa = "x86"
 x86_table = "ABSOLUTE/FABS.inc"
+x86_handler = "x86_fabs"
+neon_lowering = "arm64_fabs"
+lowering_kind = "arm64_scalar"
 
 name = "FABS"
 aliases = []
@@ -35,4 +38,16 @@ other_exceptions = [
 
 semantic_general = """
 ST(0) := |ST(0)|;
+"""
+
+neon_register_model = """
+x87 FPU stack mapped to ARM64 vN registers. FABS is a scalar absolute-value operation on the x87 top-of-stack.
+"""
+
+neon_flag_model = """
+ARM64 FABS does not update flags. x87 C1 flag needs separate tracking if required.
+"""
+
+neon_assembly = """
+// NEON lowering: fabs dDEST, dSRC
 """

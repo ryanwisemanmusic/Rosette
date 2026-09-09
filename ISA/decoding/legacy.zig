@@ -395,6 +395,83 @@ test "shared VEX decoder handles both VMOVD transfer directions" {
     try std.testing.expect(!to_memory.is_reg_form);
 }
 
+test "shared legacy decoder preserves REX.W for MOVQ transfers" {
+    const to_xmm = decodeLegacyInstruction(
+        &[_]u8{ 0x66, 0x49, 0x0F, 0x6E, 0xC5 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vmovq_xmm_reg64, to_xmm.op);
+    try std.testing.expectEqual(OperandSize.bits64, to_xmm.size);
+    try std.testing.expect(to_xmm.legacy_sse);
+    try std.testing.expectEqual(@as(u8, 0), to_xmm.xmm_dst);
+    try std.testing.expectEqual(RegId.r13b_r13w_r13d_r13, to_xmm.src_reg);
+    try std.testing.expectEqual(@as(u8, 5), to_xmm.len);
+
+    const to_gpr = decodeLegacyInstruction(
+        &[_]u8{ 0x66, 0x49, 0x0F, 0x7E, 0xC5 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vmovq_reg64_xmm, to_gpr.op);
+    try std.testing.expectEqual(OperandSize.bits64, to_gpr.size);
+    try std.testing.expect(to_gpr.legacy_sse);
+    try std.testing.expectEqual(RegId.r13b_r13w_r13d_r13, to_gpr.dst_reg);
+    try std.testing.expectEqual(@as(u8, 0), to_gpr.xmm_src);
+
+    const memory_load = decodeLegacyInstruction(
+        &[_]u8{ 0x66, 0x48, 0x0F, 0x6E, 0x05, 0x10, 0x00, 0x00, 0x00 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vmovq_xmm_mem64, memory_load.op);
+    try std.testing.expectEqual(OperandSize.bits64, memory_load.size);
+    try std.testing.expect(memory_load.legacy_sse);
+    try std.testing.expectEqual(@as(u64, 0x10), memory_load.addr);
+
+    const legacy_movd = decodeLegacyInstruction(
+        &[_]u8{ 0x66, 0x0F, 0x6E, 0xC5 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vmovd_xmm_reg32, legacy_movd.op);
+    try std.testing.expectEqual(OperandSize.bits32, legacy_movd.size);
+
+    const f3_movq_memory = decodeLegacyInstruction(
+        &[_]u8{ 0xF3, 0x0F, 0x7E, 0x43, 0x20 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vmovq_xmm_mem64, f3_movq_memory.op);
+    try std.testing.expectEqual(OperandSize.bits64, f3_movq_memory.size);
+    try std.testing.expect(f3_movq_memory.legacy_sse);
+    try std.testing.expectEqual(@as(u8, 0), f3_movq_memory.xmm_dst);
+    try std.testing.expectEqual(@as(u64, 0x20), f3_movq_memory.addr);
+
+    const f3_movq_register = decodeLegacyInstruction(
+        &[_]u8{ 0xF3, 0x0F, 0x7E, 0xC1 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vmovq_xmm_xmm, f3_movq_register.op);
+    try std.testing.expectEqual(OperandSize.bits64, f3_movq_register.size);
+    try std.testing.expect(f3_movq_register.legacy_sse);
+    try std.testing.expectEqual(@as(u8, 0), f3_movq_register.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 1), f3_movq_register.xmm_src);
+
+    const movq_memory_store = decodeLegacyInstruction(
+        &[_]u8{ 0x66, 0x0F, 0xD6, 0x43, 0x60 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vmovq_mem64_xmm, movq_memory_store.op);
+    try std.testing.expectEqual(OperandSize.bits64, movq_memory_store.size);
+    try std.testing.expect(movq_memory_store.legacy_sse);
+    try std.testing.expectEqual(@as(u8, 0), movq_memory_store.xmm_src);
+    try std.testing.expectEqual(@as(u64, 0x60), movq_memory_store.addr);
+
+    const movq_register_store = decodeLegacyInstruction(
+        &[_]u8{ 0x66, 0x0F, 0xD6, 0xC1 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vmovq_xmm_xmm, movq_register_store.op);
+    try std.testing.expectEqual(@as(u8, 0), movq_register_store.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), movq_register_store.xmm_dst);
+}
+
 test "shared VEX decoder recognizes broadcast families" {
     const scalar_single = decodeLegacyInstruction(
         &[_]u8{ 0xC4, 0xE2, 0x79, 0x18, 0x05, 0x10, 0x00, 0x00, 0x00 },
@@ -569,6 +646,72 @@ test "shared legacy path recognizes timing, fence, and x87 boundaries" {
         try std.testing.expectEqual(case.op, decoded.op);
         try std.testing.expectEqual(@as(u8, 3), decoded.len);
         try std.testing.expect(decoded.is_reg_form);
+    }
+
+    const fsin = decodeLegacyInstruction(&[_]u8{ 0xD9, 0xFE }, .long64);
+    try std.testing.expectEqual(Op.fsin, fsin.op);
+    try std.testing.expectEqual(@as(u8, 2), fsin.len);
+
+    const fcos = decodeLegacyInstruction(&[_]u8{ 0xD9, 0xFF }, .long64);
+    try std.testing.expectEqual(Op.fcos, fcos.op);
+    try std.testing.expectEqual(@as(u8, 2), fcos.len);
+
+    const fprem1 = decodeLegacyInstruction(&[_]u8{ 0xD9, 0xF5 }, .long64);
+    try std.testing.expectEqual(Op.fprem1, fprem1.op);
+    try std.testing.expectEqual(@as(u8, 2), fprem1.len);
+
+    const fadd_mem64 = decodeLegacyInstruction(&[_]u8{ 0xDC, 0x25, 0xE4, 0xFF, 0xFF, 0xFF }, .long64);
+    try std.testing.expectEqual(Op.x87_memory, fadd_mem64.op);
+    try std.testing.expectEqual(Size.bits64, fadd_mem64.size);
+    try std.testing.expect(!fadd_mem64.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 6), fadd_mem64.len);
+
+    const fcomp_mem64 = decodeLegacyInstruction(&[_]u8{ 0xDC, 0x1D, 0xE2, 0xFF, 0xFF, 0xFF }, .long64);
+    try std.testing.expectEqual(Op.x87_memory, fcomp_mem64.op);
+    try std.testing.expectEqual(@as(u64, 7), fcomp_mem64.imm & 7);
+
+    const unary = [_]struct { opcode: u8, op: Op }{
+        .{ .opcode = 0xE0, .op = .fchs },
+        .{ .opcode = 0xE1, .op = .fabs },
+        .{ .opcode = 0xE4, .op = .ftst },
+        .{ .opcode = 0xE5, .op = .fxam },
+        .{ .opcode = 0xF0, .op = .f2xm1 },
+        .{ .opcode = 0xF1, .op = .fyl2x },
+        .{ .opcode = 0xF2, .op = .fptan },
+        .{ .opcode = 0xF3, .op = .fpatan },
+        .{ .opcode = 0xF4, .op = .fxtract },
+        .{ .opcode = 0xF6, .op = .fdecstp },
+        .{ .opcode = 0xF7, .op = .fincstp },
+        .{ .opcode = 0xF8, .op = .fprem },
+        .{ .opcode = 0xF9, .op = .fyl2xp1 },
+        .{ .opcode = 0xFA, .op = .fsqrt },
+        .{ .opcode = 0xFB, .op = .fsincos },
+        .{ .opcode = 0xFC, .op = .frndint },
+        .{ .opcode = 0xFD, .op = .fscale },
+    };
+    for (unary) |case| {
+        const decoded = decodeLegacyInstruction(&[_]u8{ 0xD9, case.opcode }, .long64);
+        try std.testing.expectEqual(case.op, decoded.op);
+        try std.testing.expectEqual(@as(u8, 2), decoded.len);
+    }
+
+    const fnop = decodeLegacyInstruction(&[_]u8{ 0xD9, 0xD0 }, .long64);
+    try std.testing.expectEqual(Op.fnop, fnop.op);
+    const fclex = decodeLegacyInstruction(&[_]u8{ 0xDB, 0xE2 }, .long64);
+    try std.testing.expectEqual(Op.fclex, fclex.op);
+
+    const constants = [_]struct { opcode: u8, op: Op }{
+        .{ .opcode = 0xE8, .op = .fld1 },
+        .{ .opcode = 0xE9, .op = .fldl2t },
+        .{ .opcode = 0xEA, .op = .fldl2e },
+        .{ .opcode = 0xEB, .op = .fldpi },
+        .{ .opcode = 0xEC, .op = .fldlg2 },
+        .{ .opcode = 0xED, .op = .fldln2 },
+    };
+    for (constants) |case| {
+        const decoded = decodeLegacyInstruction(&[_]u8{ 0xD9, case.opcode }, .long64);
+        try std.testing.expectEqual(case.op, decoded.op);
+        try std.testing.expectEqual(@as(u8, 2), decoded.len);
     }
 }
 
@@ -1018,6 +1161,69 @@ test "shared legacy decoder recognizes scalar SSE conversion forms" {
     try std.testing.expectEqual(@as(u8, 0), conflicting_prefixes.len);
 }
 
+test "shared legacy decoder recognizes scalar and packed move prefixes" {
+    const movsd_load = decodeLegacyInstruction(
+        &[_]u8{ 0xF2, 0x0F, 0x10, 0x05, 0x20, 0x10, 0x00, 0x00 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vmovsd_xmm_mem, movsd_load.op);
+    try std.testing.expect(movsd_load.legacy_sse);
+    try std.testing.expect(!movsd_load.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 0), movsd_load.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 8), movsd_load.len);
+
+    const movsd_store = decodeLegacyInstruction(
+        &[_]u8{ 0xF2, 0x0F, 0x11, 0x0D, 0x20, 0x10, 0x00, 0x00 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vmovsd_mem_xmm, movsd_store.op);
+    try std.testing.expect(movsd_store.legacy_sse);
+    try std.testing.expect(!movsd_store.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 1), movsd_store.xmm_src);
+    try std.testing.expectEqual(@as(u8, 8), movsd_store.len);
+
+    const movss_register = decodeLegacyInstruction(
+        &[_]u8{ 0xF3, 0x0F, 0x10, 0xC1 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vmovss_xmm_xmm, movss_register.op);
+    try std.testing.expect(movss_register.legacy_sse);
+    try std.testing.expect(movss_register.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 0), movss_register.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 1), movss_register.xmm_src);
+    try std.testing.expectEqual(@as(u8, 4), movss_register.len);
+
+    const movupd_register = decodeLegacyInstruction(
+        &[_]u8{ 0x66, 0x0F, 0x10, 0xD3 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vmovupd_xmm_xmm, movupd_register.op);
+    try std.testing.expect(movupd_register.legacy_sse);
+    try std.testing.expect(movupd_register.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 2), movupd_register.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 3), movupd_register.xmm_src);
+
+    const cmpsd = decodeLegacyInstruction(
+        &[_]u8{ 0xF2, 0x0F, 0xC2, 0xE0, 0x06 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vcmpsd, cmpsd.op);
+    try std.testing.expect(cmpsd.legacy_sse);
+    try std.testing.expect(cmpsd.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 4), cmpsd.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 4), cmpsd.xmm_src);
+    try std.testing.expectEqual(@as(u8, 0), cmpsd.xmm_src2);
+    try std.testing.expectEqual(@as(u64, 6), cmpsd.imm);
+    try std.testing.expectEqual(@as(u8, 5), cmpsd.len);
+
+    const conflicting_prefixes = decodeLegacyInstruction(
+        &[_]u8{ 0x66, 0xF2, 0x0F, 0x10, 0xC1 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.invalid, conflicting_prefixes.op);
+    try std.testing.expectEqual(@as(u8, 0), conflicting_prefixes.len);
+}
+
 test "shared legacy decoder recognizes integer-to-scalar SSE conversions" {
     const cvtsi2sd_reg = decodeLegacyInstruction(&[_]u8{ 0xF2, 0x49, 0x0F, 0x2A, 0xD0 }, .long64);
     try std.testing.expectEqual(Op.vcvtsi2sd_xmm_reg, cvtsi2sd_reg.op);
@@ -1167,13 +1373,56 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
         return d;
     }
 
-    if (opcode == 0xF5 or opcode == 0xF8 or opcode == 0xF9) {
+    if (opcode == 0xF5 or opcode == 0xF8 or opcode == 0xF9 or
+        opcode == 0xFC or opcode == 0xFD)
+    {
         d.op = switch (opcode) {
             0xF5 => .cmc,
             0xF8 => .clc,
             0xF9 => .stc,
+            0xFC => .cld,
+            0xFD => .std,
             else => unreachable,
         };
+        d.len = @intCast(pos + 1);
+        return d;
+    }
+
+    // XCHG rAX, r64. `0x90` is NOP and is handled above; with REX.B the same
+    // byte is `xchg rax, r8`, which is a real exchange rather than a nop, so
+    // the check below must come after the plain-`0x90` case and must still
+    // admit it when REX.B is set.
+    if (opcode >= 0x91 and opcode <= 0x97) {
+        d.op = .xchg_accum_reg;
+        d.size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
+        d.dst_reg = .al_ax_eax_rax;
+        d.src_reg = mapReg(opcode - 0x90, rex_b);
+        d.len = @intCast(pos + 1);
+        return d;
+    }
+
+    // LOOPNE/LOOPE/LOOP/JRCXZ, each with a signed byte displacement.
+    if (opcode >= 0xE0 and opcode <= 0xE3) {
+        if (pos + 1 >= bytes.len) return d;
+        d.op = switch (opcode) {
+            0xE0 => .loopne,
+            0xE1 => .loope,
+            0xE2 => .loop,
+            0xE3 => .jrcxz,
+            else => unreachable,
+        };
+        d.imm = @bitCast(@as(i64, @as(i8, @bitCast(bytes[pos + 1]))));
+        // The displacement is what this instruction carries; the counter width
+        // is chosen by the address-size override, which the fill path records
+        // in `has_0x67`, so the executor reads it there rather than having it
+        // baked into the opcode.
+        d.size = .bits64;
+        d.len = @intCast(pos + 2);
+        return d;
+    }
+
+    if (opcode == 0xD7) {
+        d.op = .xlat;
         d.len = @intCast(pos + 1);
         return d;
     }
@@ -1300,7 +1549,7 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
         },
 
         0x80...0x83 => {
-            return decodeGroup1Imm(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode);
+            return decodeGroup1Imm(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, rex != 0, opcode);
         },
 
         0xC0, 0xC1, 0xD0, 0xD1, 0xD2, 0xD3 => {
@@ -1350,14 +1599,29 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
             var modrm_pos = pos + 1;
             const rm = readModRM(&x87, bytes, &modrm_pos, rex_r, rex_x, rex_b, .bits64);
             const group = @intFromEnum(rm.reg) & 7;
-            if (opcode == 0xD8 or opcode == 0xDC or opcode == 0xDE) {
-                if (!x87.is_reg_form) return .{};
-                const operation = x87BinaryOperation(opcode, group) orelse return .{};
-                const stack_index: u64 = rm.addr & 7;
-                const destination: u64 = if (opcode == 0xD8) 0 else stack_index;
-                const source: u64 = if (opcode == 0xD8) stack_index else 0;
-                x87.op = .x87_binary;
-                x87.imm = @as(u64, operation) | (destination << 3) | (source << 6) | (if (opcode == 0xDE) @as(u64, 1) << 9 else 0);
+            if (opcode == 0xD8 or opcode == 0xDA or opcode == 0xDC or opcode == 0xDE) {
+                if (x87.is_reg_form) {
+                    const operation = x87BinaryOperation(opcode, group) orelse return .{};
+                    const stack_index: u64 = rm.addr & 7;
+                    const destination: u64 = if (opcode == 0xD8) 0 else stack_index;
+                    const source: u64 = if (opcode == 0xD8) stack_index else 0;
+                    x87.op = .x87_binary;
+                    x87.imm = @as(u64, operation) | (destination << 3) | (source << 6) | (if (opcode == 0xDE) @as(u64, 1) << 9 else 0);
+                    x87.len = @intCast(modrm_pos);
+                    return x87;
+                }
+                const operation = x87MemoryOperation(opcode, group) orelse return .{};
+                x87.op = .x87_memory;
+                x87.imm = operation;
+                x87.size = switch (opcode) {
+                    0xD8, 0xDA => .bits32,
+                    0xDC => .bits64,
+                    0xDE => .bits16,
+                    else => unreachable,
+                };
+                // DA/DE address the integer-memory forms (FI*), while
+                // D8/DC address single/double floating-point memory.
+                if (opcode == 0xDA or opcode == 0xDE) x87.imm |= @as(u64, 1) << 3;
                 x87.len = @intCast(modrm_pos);
                 return x87;
             }
@@ -1707,9 +1971,67 @@ fn decodeX87RegisterForm(opcode: u8, modrm: u8, group: u8, source: u8, d: *Decod
                 d.op = .fxch_st;
                 return true;
             }
+            if (modrm == 0xD0) {
+                d.op = .fnop;
+                return true;
+            }
+            if (modrm == 0xE0 or modrm == 0xE1 or modrm == 0xE4 or modrm == 0xE5) {
+                d.op = switch (modrm) {
+                    0xE0 => .fchs,
+                    0xE1 => .fabs,
+                    0xE4 => .ftst,
+                    0xE5 => .fxam,
+                    else => unreachable,
+                };
+                return true;
+            }
+            if (modrm == 0xF5) {
+                d.op = .fprem1;
+                return true;
+            }
+            if (modrm >= 0xF0 and modrm <= 0xFD) {
+                d.op = switch (modrm) {
+                    0xF0 => .f2xm1,
+                    0xF1 => .fyl2x,
+                    0xF2 => .fptan,
+                    0xF3 => .fpatan,
+                    0xF4 => .fxtract,
+                    0xF6 => .fdecstp,
+                    0xF7 => .fincstp,
+                    0xF8 => .fprem,
+                    0xF9 => .fyl2xp1,
+                    0xFA => .fsqrt,
+                    0xFB => .fsincos,
+                    0xFC => .frndint,
+                    0xFD => .fscale,
+                    else => return false,
+                };
+                return true;
+            }
+            if (modrm == 0xFE) {
+                d.op = .fsin;
+                return true;
+            }
             if (modrm == 0xEE) {
                 d.op = .fldz;
                 d.imm = 0;
+                return true;
+            }
+            if (modrm >= 0xE8 and modrm <= 0xED) {
+                d.op = switch (modrm) {
+                    0xE8 => .fld1,
+                    0xE9 => .fldl2t,
+                    0xEA => .fldl2e,
+                    0xEB => .fldpi,
+                    0xEC => .fldlg2,
+                    0xED => .fldln2,
+                    else => unreachable,
+                };
+                d.imm = 0;
+                return true;
+            }
+            if (modrm == 0xFF) {
+                d.op = .fcos;
                 return true;
             }
         },
@@ -1748,8 +2070,8 @@ fn decodeX87RegisterForm(opcode: u8, modrm: u8, group: u8, source: u8, d: *Decod
                 };
                 return true;
             }
-            if (group == 4 and modrm == 0xE3) {
-                d.op = .fninit;
+            if (group == 4 and (modrm == 0xE2 or modrm == 0xE3)) {
+                d.op = if (modrm == 0xE2) .fclex else .fninit;
                 return true;
             }
             if (group == 5 and modrm >= 0xE8 and modrm <= 0xEF) {
@@ -1792,7 +2114,7 @@ fn decodeX87RegisterForm(opcode: u8, modrm: u8, group: u8, source: u8, d: *Decod
 
 pub fn x87BinaryOperation(opcode: u8, group: u8) ?u3 {
     return switch (opcode) {
-        0xD8 => switch (group) {
+        0xD8, 0xDA => switch (group) {
             0 => 0, // FADD ST(0), ST(i)
             1 => 1, // FMUL ST(0), ST(i)
             4 => 2, // FSUB ST(0), ST(i)
@@ -1808,6 +2130,23 @@ pub fn x87BinaryOperation(opcode: u8, group: u8) ?u3 {
             5 => 2, // FSUB[P] ST(i), ST(0)
             6 => 5, // FDIVR[P] ST(i), ST(0)
             7 => 4, // FDIV[P] ST(i), ST(0)
+            else => null,
+        },
+        else => null,
+    };
+}
+
+fn x87MemoryOperation(opcode: u8, group: u8) ?u3 {
+    return switch (opcode) {
+        0xD8, 0xDA, 0xDC, 0xDE => switch (group) {
+            0 => 0, // FADD/ FIADD ST(0), memory
+            1 => 1, // FMUL/ FIMUL ST(0), memory
+            2 => 6, // FCOM/ FICOM ST(0), memory
+            3 => 7, // FCOMP/ FICOMP ST(0), memory
+            4 => 2, // FSUB/ FISUB ST(0), memory
+            5 => 3, // FSUBR/ FISUBR memory, ST(0)
+            6 => 4, // FDIV/ FIDIV ST(0), memory
+            7 => 5, // FDIVR/ FIDIVR memory, ST(0)
             else => null,
         },
         else => null,

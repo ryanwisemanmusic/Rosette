@@ -268,7 +268,7 @@ pub fn decodePopRm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
     return d;
 }
 
-pub fn decodeGroup1Imm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode: u8) DecodedInsn {
+pub fn decodeGroup1Imm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, has_rex: bool, opcode: u8) DecodedInsn {
     var d = DecodedInsn{};
     var pos = start_pos + 1;
     if (pos >= bytes.len) return .{};
@@ -296,110 +296,84 @@ pub fn decodeGroup1Imm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: 
 
     const base_sz = if (sz == .bits8) Size.bits8 else if (sz == .bits16) Size.bits16 else if (sz == .bits32) Size.bits32 else Size.bits64;
 
-    const group_ops: [8]Op = .{
-        .add_reg8_imm8, .or_reg8_imm8,  .adc_reg8_imm8, .sbb_reg8_imm8,
-        .and_reg8_imm8, .sub_reg8_imm8, .xor_reg8_imm8, .cmp_reg8_imm8,
+    // Group 1 in full: eight operations x {register, memory} x {imm8, imm32}
+    // x four operand widths, written out rather than derived.
+    //
+    // The previous mapping computed the wider members as
+    // `@intFromEnum(base) + (size - bits8)`, which is only correct while every
+    // family happens to declare its four members contiguously. `sbb` declared
+    // one. `83 /3` on a 16/32/64-bit operand therefore indexed past the end of
+    // its family and resolved to the `add_reg*_imm32` members: `sbb rax, 8`
+    // decoded, executed, and subtracted nothing — it added, ignored the carry
+    // flag, and reported no error. Nothing about the arithmetic makes that
+    // visible, so the arithmetic is gone.
+    //
+    // The first column of an imm32 table is unreachable: 0x81 has no 8-bit
+    // form (0x80 is the byte-immediate encoding). It holds the imm8 opcode so
+    // every cell is total and no index can fall off the end.
+    // 0x80 /r and 0x83 /r, register destination.
+    const reg_imm8_ops: [8][4]Op = .{
+        .{ .add_reg8_imm8, .add_reg16_imm8, .add_reg32_imm8, .add_reg64_imm8 },
+        .{ .or_reg8_imm8, .or_reg16_imm8, .or_reg32_imm8, .or_reg64_imm8 },
+        .{ .adc_reg8_imm8, .adc_reg16_imm8, .adc_reg32_imm8, .adc_reg64_imm8 },
+        .{ .sbb_reg8_imm8, .sbb_reg16_imm8, .sbb_reg32_imm8, .sbb_reg64_imm8 },
+        .{ .and_reg8_imm8, .and_reg16_imm8, .and_reg32_imm8, .and_reg64_imm8 },
+        .{ .sub_reg8_imm8, .sub_reg16_imm8, .sub_reg32_imm8, .sub_reg64_imm8 },
+        .{ .xor_reg8_imm8, .xor_reg16_imm8, .xor_reg32_imm8, .xor_reg64_imm8 },
+        .{ .cmp_reg8_imm8, .cmp_reg16_imm8, .cmp_reg32_imm8, .cmp_reg64_imm8 },
     };
 
+    // 0x81 /r, register destination.
+    const reg_imm32_ops: [8][4]Op = .{
+        .{ .add_reg8_imm8, .add_reg16_imm32, .add_reg32_imm32, .add_reg64_imm32 },
+        .{ .or_reg8_imm8, .or_reg16_imm32, .or_reg32_imm32, .or_reg64_imm32 },
+        .{ .adc_reg8_imm8, .adc_reg16_imm32, .adc_reg32_imm32, .adc_reg64_imm32 },
+        .{ .sbb_reg8_imm8, .sbb_reg16_imm32, .sbb_reg32_imm32, .sbb_reg64_imm32 },
+        .{ .and_reg8_imm8, .and_reg16_imm32, .and_reg32_imm32, .and_reg64_imm32 },
+        .{ .sub_reg8_imm8, .sub_reg16_imm32, .sub_reg32_imm32, .sub_reg64_imm32 },
+        .{ .xor_reg8_imm8, .xor_reg16_imm32, .xor_reg32_imm32, .xor_reg64_imm32 },
+        .{ .cmp_reg8_imm8, .cmp_reg16_imm32, .cmp_reg32_imm32, .cmp_reg64_imm32 },
+    };
+
+    // 0x80 /r and 0x83 /r, memory destination.
+    const mem_imm8_ops: [8][4]Op = .{
+        .{ .add_mem8_imm8, .add_mem16_imm8, .add_mem32_imm8, .add_mem64_imm8 },
+        .{ .or_mem8_imm8, .or_mem16_imm8, .or_mem32_imm8, .or_mem64_imm8 },
+        .{ .adc_mem8_imm8, .adc_mem16_imm8, .adc_mem32_imm8, .adc_mem64_imm8 },
+        .{ .sbb_mem8_imm8, .sbb_mem16_imm8, .sbb_mem32_imm8, .sbb_mem64_imm8 },
+        .{ .and_mem8_imm8, .and_mem16_imm8, .and_mem32_imm8, .and_mem64_imm8 },
+        .{ .sub_mem8_imm8, .sub_mem16_imm8, .sub_mem32_imm8, .sub_mem64_imm8 },
+        .{ .xor_mem8_imm8, .xor_mem16_imm8, .xor_mem32_imm8, .xor_mem64_imm8 },
+        .{ .cmp_mem8_imm8, .cmp_mem16_imm8, .cmp_mem32_imm8, .cmp_mem64_imm8 },
+    };
+
+    // 0x81 /r, memory destination.
+    const mem_imm32_ops: [8][4]Op = .{
+        .{ .add_mem8_imm8, .add_mem16_imm32, .add_mem32_imm32, .add_mem64_imm32 },
+        .{ .or_mem8_imm8, .or_mem16_imm32, .or_mem32_imm32, .or_mem64_imm32 },
+        .{ .adc_mem8_imm8, .adc_mem16_imm32, .adc_mem32_imm32, .adc_mem64_imm32 },
+        .{ .sbb_mem8_imm8, .sbb_mem16_imm32, .sbb_mem32_imm32, .sbb_mem64_imm32 },
+        .{ .and_mem8_imm8, .and_mem16_imm32, .and_mem32_imm32, .and_mem64_imm32 },
+        .{ .sub_mem8_imm8, .sub_mem16_imm32, .sub_mem32_imm32, .sub_mem64_imm32 },
+        .{ .xor_mem8_imm8, .xor_mem16_imm32, .xor_mem32_imm32, .xor_mem64_imm32 },
+        .{ .cmp_mem8_imm8, .cmp_mem16_imm32, .cmp_mem32_imm32, .cmp_mem64_imm32 },
+    };
+
+    const size_index: usize = @intFromEnum(base_sz) - @intFromEnum(Size.bits8);
     if (is_mem) {
-        if (group_op == 1) {
-            d.op = if (is_byte_imm)
-                switch (base_sz) {
-                    .bits8 => .or_mem8_imm8,
-                    .bits16 => .or_mem16_imm8,
-                    .bits32 => .or_mem32_imm8,
-                    .bits64 => .or_mem64_imm8,
-                }
-            else switch (base_sz) {
-                .bits8 => .or_mem8_imm8,
-                .bits16 => .or_mem16_imm32,
-                .bits32 => .or_mem32_imm32,
-                .bits64 => .or_mem64_imm32,
-            };
-            d.addr = rm.addr;
-            d.imm = imm;
-            d.size = base_sz;
-            d.len = @intCast(pos);
-            return d;
-        }
-        const mem_group_ops: [8]Op = .{
-            .add_mem8_imm8, .invalid,       .invalid, .invalid,
-            .invalid,       .sub_mem8_imm8, .invalid, .cmp_mem8_imm8,
-        };
-        const base = mem_group_ops[group_op];
-        if (base == .invalid) {
-            d.op = .invalid;
-            d.len = @as(u8, @intCast(pos));
-            return d;
-        }
-        const off = @intFromEnum(base_sz) - @intFromEnum(Size.bits8);
-        d.op = @enumFromInt(@intFromEnum(base) + off);
+        d.op = if (is_byte_imm) mem_imm8_ops[group_op][size_index] else mem_imm32_ops[group_op][size_index];
         d.addr = rm.addr;
     } else {
-        // 0x81 carries a full-width immediate (16/32 bits, or a
-        // sign-extended 32-bit immediate for a 64-bit operand). The compact
-        // enum-offset mapping is valid only for the contiguous imm8
-        // families. Reusing it for 0x81 mislabels
-        // `81 C1 39 01 00 00` (`add ecx, 0x139`) as `add_reg32_imm8` and
-        // loses the instruction's immediate-width contract.
-        if (!is_byte_imm) {
-            d.op = switch (group_op) {
-                0 => switch (base_sz) {
-                    .bits16 => .add_reg16_imm32,
-                    .bits32 => .add_reg32_imm32,
-                    .bits64 => .add_reg64_imm32,
-                    .bits8 => unreachable,
-                },
-                1 => switch (base_sz) {
-                    .bits16 => .or_reg16_imm32,
-                    .bits32 => .or_reg32_imm32,
-                    .bits64 => .or_reg64_imm32,
-                    .bits8 => unreachable,
-                },
-                2 => switch (base_sz) {
-                    .bits16 => .adc_reg16_imm32,
-                    .bits32 => .adc_reg32_imm32,
-                    .bits64 => .adc_reg64_imm32,
-                    .bits8 => unreachable,
-                },
-                3 => switch (base_sz) {
-                    .bits16 => .sbb_reg16_imm32,
-                    .bits32 => .sbb_reg32_imm32,
-                    .bits64 => .sbb_reg64_imm32,
-                    .bits8 => unreachable,
-                },
-                4 => switch (base_sz) {
-                    .bits16 => .and_reg16_imm32,
-                    .bits32 => .and_reg32_imm32,
-                    .bits64 => .and_reg64_imm32,
-                    .bits8 => unreachable,
-                },
-                5 => switch (base_sz) {
-                    .bits16 => .sub_reg16_imm32,
-                    .bits32 => .sub_reg32_imm32,
-                    .bits64 => .sub_reg64_imm32,
-                    .bits8 => unreachable,
-                },
-                6 => switch (base_sz) {
-                    .bits16 => .xor_reg16_imm32,
-                    .bits32 => .xor_reg32_imm32,
-                    .bits64 => .xor_reg64_imm32,
-                    .bits8 => unreachable,
-                },
-                7 => switch (base_sz) {
-                    .bits16 => .cmp_reg16_imm32,
-                    .bits32 => .cmp_reg32_imm32,
-                    .bits64 => .cmp_reg64_imm32,
-                    .bits8 => unreachable,
-                },
-                else => unreachable,
-            };
-        } else {
-            const base = group_ops[group_op];
-            const off = @intFromEnum(base_sz) - @intFromEnum(Size.bits8);
-            d.op = @enumFromInt(@intFromEnum(base) + off);
-        }
-        d.dst_reg = @enumFromInt(rm.addr);
+        d.op = if (is_byte_imm) reg_imm8_ops[group_op][size_index] else reg_imm32_ops[group_op][size_index];
+        // The r/m byte-register encodings 4...7 mean AH/CH/DH/BH unless a
+        // REX prefix is present. `readModRM` predates the operand-aware
+        // decoder and returns only the numeric register id, so recover the
+        // architectural high-byte alias here before execution. Leaving the
+        // raw id in `dst_reg` turns `80 E4 ib` (AND AH, ib) into an operation
+        // on RSP, which corrupts the return stack in CRT code.
+        const register = decodeRegister(modrm & 7, rex_b, sz == .bits8, has_rex);
+        d.dst_reg = register.id;
+        d.dst_high8 = register.high8;
     }
 
     d.imm = imm;
@@ -809,6 +783,7 @@ pub fn decodeXchgRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: 
     const sz: Size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
     const is_mem = modrm < 0xC0;
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
+    d.size = sz;
 
     if (is_mem) {
         d.op = switch (sz) {
@@ -846,27 +821,34 @@ pub fn decodeImulImm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bo
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
 
     if (pos + imm_size > bytes.len) return .{};
+    // Keep the immediate in its architectural signed form. This matters for
+    // 0x69 in long mode: the encoding is imm32, sign-extended to the 64-bit
+    // operand width. Treating it as an imm8 (the old behavior) turned the
+    // valid immediate 0xD0 into -48 and corrupted vector allocation sizes.
     const imm: u64 = if (imm_is_byte)
         @as(u64, @bitCast(@as(i64, @as(i8, @bitCast(bytes[pos])))))
     else if (imm_size == 2)
-        std.mem.readInt(u16, bytes[pos..][0..2], .little)
+        @as(u64, @bitCast(@as(i64, @as(i16, @bitCast(std.mem.readInt(u16, bytes[pos..][0..2], .little))))))
     else
-        std.mem.readInt(u32, bytes[pos..][0..4], .little);
+        @as(u64, @bitCast(@as(i64, @as(i32, @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little))))));
     pos += imm_size;
 
+    d.size = sz;
     if (is_mem) {
         d.op = switch (sz) {
-            .bits32 => .imul_reg32_mem32_imm8,
-            .bits64 => .imul_reg64_mem64_imm8,
-            else => .imul_reg32_mem32_imm8,
+            .bits16 => if (imm_is_byte) .imul_reg16_mem16_imm8 else .imul_reg16_mem16_imm16,
+            .bits32 => if (imm_is_byte) .imul_reg32_mem32_imm8 else .imul_reg32_mem32_imm32,
+            .bits64 => if (imm_is_byte) .imul_reg64_mem64_imm8 else .imul_reg64_mem64_imm32,
+            .bits8 => .invalid,
         };
         d.dst_reg = rm.reg;
         d.addr = rm.addr;
     } else {
         d.op = switch (sz) {
-            .bits32 => .imul_reg32_reg32_imm8,
-            .bits64 => .imul_reg64_reg64_imm8,
-            else => .imul_reg32_reg32_imm8,
+            .bits16 => if (imm_is_byte) .imul_reg16_reg16_imm8 else .imul_reg16_reg16_imm16,
+            .bits32 => if (imm_is_byte) .imul_reg32_reg32_imm8 else .imul_reg32_reg32_imm32,
+            .bits64 => if (imm_is_byte) .imul_reg64_reg64_imm8 else .imul_reg64_reg64_imm32,
+            .bits8 => .invalid,
         };
         d.dst_reg = rm.reg;
         d.src_reg = @enumFromInt(rm.addr);
@@ -1078,38 +1060,38 @@ pub fn decodeSetcc(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
 
 pub fn decodeMovupsMovss(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, has_f2: bool, has_f3: bool, opcode2: u8) DecodedInsn {
     _ = rex_w;
-    _ = has_66;
-    var d = DecodedInsn{};
+    // 0F 10/11 selects MOVUPS, 66 selects MOVUPD, F3 selects MOVSS, and F2
+    // selects MOVSD. These are mandatory-prefix families, not hints. In
+    // particular, treating F2/F3 as NOP (the old fallback) leaves a scalar
+    // constant load unexecuted and poisons the first libstdc++ rehash policy
+    // calculation reached by Xenia during startup.
+    if ((has_f2 and has_f3) or (has_66 and (has_f2 or has_f3))) return .{};
+    var d = DecodedInsn{ .legacy_sse = true };
     var pos = start_pos + 1;
     if (pos >= bytes.len) return .{};
-    const modrm = bytes[pos];
-    const is_mem = modrm < 0xC0;
     const to_reg = opcode2 == 0x10;
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
 
-    // Scalar MOVSS/MOVSD need lane-preserving semantics. MOVUPS transfers the
-    // full register and is required by Xbyak's feature-mask bookkeeping.
-    if (has_f2 or has_f3) {
-        d.op = .nop;
-    } else if (to_reg) {
+    if (to_reg) {
         d.xmm_dst = @intFromEnum(rm.reg);
-        if (is_mem) {
-            d.op = .movups_xmm_mem;
-            d.addr = rm.addr;
-        } else {
-            d.op = .movups_xmm_xmm;
+        if (d.is_reg_form) {
             d.xmm_src = @intCast(rm.addr);
+            d.op = if (has_f2) .vmovsd_xmm_xmm else if (has_f3) .vmovss_xmm_xmm else if (has_66) .vmovupd_xmm_xmm else .movups_xmm_xmm;
+        } else {
+            d.addr = rm.addr;
+            d.op = if (has_f2) .vmovsd_xmm_mem else if (has_f3) .vmovss_xmm_mem else if (has_66) .vmovupd_xmm_mem else .movups_xmm_mem;
         }
     } else {
         d.xmm_src = @intFromEnum(rm.reg);
-        if (is_mem) {
-            d.op = .movups_mem_xmm;
-            d.addr = rm.addr;
-        } else {
-            d.op = .movups_xmm_xmm;
+        if (d.is_reg_form) {
             d.xmm_dst = @intCast(rm.addr);
+            d.op = if (has_f2) .vmovsd_xmm_xmm else if (has_f3) .vmovss_xmm_xmm else if (has_66) .vmovupd_xmm_xmm else .movups_xmm_xmm;
+        } else {
+            d.addr = rm.addr;
+            d.op = if (has_f2) .vmovsd_mem_xmm else if (has_f3) .vmovss_mem_xmm else if (has_66) .vmovupd_mem_xmm else .movups_mem_xmm;
         }
     }
+    d.size = if (has_f2) .bits64 else .bits32;
     d.len = @as(u8, @intCast(pos));
     return d;
 }
@@ -1117,7 +1099,7 @@ pub fn decodeMovupsMovss(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x
 pub fn decodeMovaps(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode2: u8) DecodedInsn {
     _ = rex_w;
     _ = has_66;
-    var d = DecodedInsn{};
+    var d = DecodedInsn{ .legacy_sse = true };
     var pos = start_pos + 1;
     if (pos >= bytes.len) return .{};
     const modrm = bytes[pos];

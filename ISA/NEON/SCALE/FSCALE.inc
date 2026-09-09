@@ -6,7 +6,7 @@ source_isa = "x86"
 target_isa = "arm64_neon"
 x86_table = "SCALE/FSCALE.inc"
 x86_handler = "x86_fscale"
-neon_lowering = "arm64_documented_contract_fscale"
+neon_lowering = "arm64_fscale"
 lowering_kind = "arm64_documented_contract"
 
 name = "FSCALE"
@@ -18,7 +18,7 @@ element_size = 80
 lanes = 1
 
 encodings = [
-  { opcode = "D9 FC", form = "FSCALE", op_en = "ZO", feature = "x87", vector_length = 0, encoding = "legacy" }
+  { opcode = "D9 FD", form = "FSCALE", op_en = "ZO", feature = "x87", vector_length = 0, encoding = "legacy" }
 ]
 
 operand_encoding = {
@@ -36,7 +36,7 @@ C1 set to 0 if underflow/overflow, C2 set to 1 if ST(1) not integer.
 """
 
 handler = "x86_fscale"
-jit_lowering = "arm64_documented_contract_fscale"
+jit_lowering = "arm64_fscale"
 fallback = "zig_x87_fscale"
 
 neon_register_model = """

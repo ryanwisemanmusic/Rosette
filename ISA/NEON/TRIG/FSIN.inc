@@ -17,6 +17,7 @@ element_type = "f80"
 element_size = 80
 
 encodings = [
+  { opcode = "D9 FE", form = "FSIN", op_en = "ZO", feature = "x87_fpu", vector_length = 0, encoding = "legacy" }
 ]
 
 operand_encoding = {
@@ -50,4 +51,3 @@ neon_notes = [
 ]
 
 abi_contract = ["x86_table_shape", "neon_mirror_shape", "arm64_lowering_shape", "full_scope_preserved"]
-

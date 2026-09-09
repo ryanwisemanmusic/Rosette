@@ -33,5 +33,7 @@ ST(0) unchanged;
 
 other_exceptions = ["#IS if FPU stack underflow (C1 = 1, exception pending)", "#D x87 FPU stack underflow"]
 
+flags_affected = ["C3", "C2", "C1", "C0"]
+
 handler = "x86_ftst"
 jit_lowering = "arm64_neon_fcmp_sd"

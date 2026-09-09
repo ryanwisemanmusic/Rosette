@@ -27,9 +27,26 @@ const prefix = @import("prefix.zig");
 const addressing = @import("addressing.zig");
 const cpu = @import("cpu.zig");
 const legacy = @import("legacy.zig");
+const coverage = @import("coverage.zig");
 const twobyte = @import("twobyte.zig");
 const vex = @import("vex.zig");
 const groups = @import("groups.zig");
+
+test "legacy MOV decodes the register form used by the Windows message loop" {
+    // Win32WindowedAppContext::RunMainMessageLoop contains `mov ebx, eax`
+    // (89 C3). Keep this exact ModR/M form in the shared decoder contract so
+    // a production decoder regression cannot hide behind the broader MOV
+    // family tests.
+    const decoded = legacy.decodeLegacyInstruction(
+        &[_]u8{ 0x89, 0xC3, 0x8D, 0x43, 0x01 },
+        .long64,
+    );
+    try std.testing.expectEqual(types.Op.mov_reg32_reg32, decoded.op);
+    try std.testing.expectEqual(types.RegId.bl_bx_ebx_rbx, decoded.dst_reg);
+    try std.testing.expectEqual(types.RegId.al_ax_eax_rax, decoded.src_reg);
+    try std.testing.expectEqual(@as(u8, 2), decoded.len);
+    try std.testing.expect(decoded.is_reg_form);
+}
 
 // The two VEX prefixes are not two instruction sets. A two-byte VEX is exactly
 // a three-byte VEX with R unextended, X and B unused, the 0F map and W=0 — so
@@ -117,6 +134,20 @@ test "VEX packed arithmetic shifts decode in both the C5 and C4 forms" {
     try std.testing.expectEqual(types.Op.vpsrad, three_byte.op);
     try std.testing.expectEqual(types.Op.vpsraw, vex.decodeVex2(&[_]u8{ 0xC5, 0xF1, 0xE1, 0xCC }, 0).op);
     try std.testing.expectEqual(types.Op.vpsraw, vex.decodeVex3(&[_]u8{ 0xC4, 0xE1, 0x71, 0xE1, 0xCC }, 0).op);
+}
+
+test "VEX2 VSHUFPD decodes its mandatory 66 packed-double form" {
+    const decoded = vex.decodeVex2(&[_]u8{ 0xC5, 0xF9, 0xC6, 0xC8, 0x01 }, 0);
+    try std.testing.expectEqual(types.Op.vshufpd, decoded.op);
+    try std.testing.expectEqual(@as(u8, 1), decoded.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), decoded.xmm_src);
+    try std.testing.expectEqual(@as(u8, 0), decoded.xmm_src2);
+    try std.testing.expect(decoded.is_reg_form);
+    try std.testing.expect(decoded.uses_imm);
+    try std.testing.expectEqual(@as(u8, 5), decoded.len);
+
+    const dispatched = legacy.decodeLegacyInstruction(&[_]u8{ 0xC5, 0xF9, 0xC6, 0xC8, 0x01 }, .long64);
+    try std.testing.expectEqual(types.Op.vshufpd, dispatched.op);
 }
 
 test "VEX immediate shift group 4 is arithmetic, not a left shift" {
@@ -376,10 +407,19 @@ test "VEX operand roles cover arithmetic moves and scalar lane forms" {
     try std.testing.expectEqual(@as(u8, 0), extract.xmm_src);
     try std.testing.expectEqual(types.RegId.cl_cx_ecx_rcx, extract.dst_reg);
     try std.testing.expect(extract.is_reg_form);
+
+    // VPEXTRQ rbx, xmm0, 2: opcode 16 with VEX.W=1 selects the qword form.
+    const extract_q = vex.decodeVex3(&[_]u8{ 0xC4, 0xE3, 0xF9, 0x16, 0xC3, 0x02 }, 0);
+    try std.testing.expectEqual(types.Op.vpextrq, extract_q.op);
+    try std.testing.expectEqual(@as(u8, 0), extract_q.xmm_src);
+    try std.testing.expectEqual(types.RegId.bl_bx_ebx_rbx, extract_q.dst_reg);
+    try std.testing.expectEqual(@as(u64, 2), extract_q.imm);
+    try std.testing.expect(extract_q.is_reg_form);
 }
 
 test "every decoder family analyzes cleanly (refAllDecls)" {
     std.testing.refAllDecls(types);
+    std.testing.refAllDecls(coverage);
     std.testing.refAllDecls(prefix);
     std.testing.refAllDecls(addressing);
     std.testing.refAllDecls(cpu);
@@ -387,4 +427,184 @@ test "every decoder family analyzes cleanly (refAllDecls)" {
     std.testing.refAllDecls(twobyte);
     std.testing.refAllDecls(vex);
     std.testing.refAllDecls(groups);
+}
+
+// The complete group-1 matrix, decoded from real encodings.
+//
+// Group 1 is `0x80`/`0x81`/`0x83` with the operation in ModRM.reg, and the
+// opcode it produces used to be derived as `@intFromEnum(base) + (size -
+// bits8)`. That is only correct while every family declares four contiguous
+// members. `sbb` declared one. `48 83 D8 08` (`sbb rax, 8`) therefore indexed
+// past its family and resolved to `add_reg64_imm32`: it decoded, it executed,
+// and it added — ignoring the borrow and the carry flag — with no diagnostic
+// anywhere. A run has no way to notice that.
+//
+// The mapping is explicit now, and this walks all eight operations across both
+// immediate widths, all four operand widths and both destination kinds,
+// checking the opcode by name. Deriving the expected name the same way the
+// tables do would prove nothing, so the names are spelled out.
+test "every group 1 encoding decodes to its own operation" {
+    const Case = struct { op: u3, name: []const u8 };
+    const cases = [_]Case{
+        .{ .op = 0, .name = "add" }, .{ .op = 1, .name = "or" },
+        .{ .op = 2, .name = "adc" }, .{ .op = 3, .name = "sbb" },
+        .{ .op = 4, .name = "and" }, .{ .op = 5, .name = "sub" },
+        .{ .op = 6, .name = "xor" }, .{ .op = 7, .name = "cmp" },
+    };
+
+    for (cases) |case| {
+        const reg_modrm: u8 = 0xC0 | (@as(u8, case.op) << 3); // mod=11, rm=rax
+        const mem_modrm: u8 = 0x40 | (@as(u8, case.op) << 3); // mod=01, rm=[rax+disp8]
+
+        // 0x83: sign-extended imm8, register and memory, 32- and 64-bit.
+        {
+            const bytes = [_]u8{ 0x83, reg_modrm, 0x08 };
+            const d = legacy.decodeLegacyInstruction(&bytes, .long64);
+            try expectOpNamed(d.op, case.name, "reg32_imm8");
+        }
+        {
+            const bytes = [_]u8{ 0x48, 0x83, reg_modrm, 0x08 };
+            const d = legacy.decodeLegacyInstruction(&bytes, .long64);
+            try expectOpNamed(d.op, case.name, "reg64_imm8");
+        }
+        {
+            // The reported failure: `48 83 50 08 00` is `adc qword ptr
+            // [rax+8], 0` and decoded as `invalid`.
+            const bytes = [_]u8{ 0x48, 0x83, mem_modrm, 0x08, 0x00 };
+            const d = legacy.decodeLegacyInstruction(&bytes, .long64);
+            try expectOpNamed(d.op, case.name, "mem64_imm8");
+            try std.testing.expectEqual(@as(u8, 5), d.len);
+        }
+        {
+            const bytes = [_]u8{ 0x83, mem_modrm, 0x08, 0x00 };
+            const d = legacy.decodeLegacyInstruction(&bytes, .long64);
+            try expectOpNamed(d.op, case.name, "mem32_imm8");
+        }
+
+        // 0x80: byte operand, register and memory.
+        {
+            const bytes = [_]u8{ 0x80, reg_modrm, 0x08 };
+            const d = legacy.decodeLegacyInstruction(&bytes, .long64);
+            try expectOpNamed(d.op, case.name, "reg8_imm8");
+        }
+        {
+            const bytes = [_]u8{ 0x80, mem_modrm, 0x08, 0x00 };
+            const d = legacy.decodeLegacyInstruction(&bytes, .long64);
+            try expectOpNamed(d.op, case.name, "mem8_imm8");
+        }
+
+        // 0x81: full-width immediate. The 64-bit form sign-extends imm32.
+        {
+            const bytes = [_]u8{ 0x81, reg_modrm, 0x39, 0x01, 0x00, 0x00 };
+            const d = legacy.decodeLegacyInstruction(&bytes, .long64);
+            try expectOpNamed(d.op, case.name, "reg32_imm32");
+            try std.testing.expectEqual(@as(u64, 0x139), d.imm);
+        }
+        {
+            const bytes = [_]u8{ 0x48, 0x81, reg_modrm, 0x39, 0x01, 0x00, 0x00 };
+            const d = legacy.decodeLegacyInstruction(&bytes, .long64);
+            try expectOpNamed(d.op, case.name, "reg64_imm32");
+        }
+        {
+            const bytes = [_]u8{ 0x48, 0x81, mem_modrm, 0x08, 0x39, 0x01, 0x00, 0x00 };
+            const d = legacy.decodeLegacyInstruction(&bytes, .long64);
+            try expectOpNamed(d.op, case.name, "mem64_imm32");
+        }
+        {
+            const bytes = [_]u8{ 0x81, mem_modrm, 0x08, 0x39, 0x01, 0x00, 0x00 };
+            const d = legacy.decodeLegacyInstruction(&bytes, .long64);
+            try expectOpNamed(d.op, case.name, "mem32_imm32");
+        }
+        {
+            const bytes = [_]u8{ 0x66, 0x81, reg_modrm, 0x39, 0x01 };
+            const d = legacy.decodeLegacyInstruction(&bytes, .long64);
+            try expectOpNamed(d.op, case.name, "reg16_imm32");
+        }
+    }
+}
+
+// `sbb rax, 8`, the encoding that silently added. Kept as its own case so the
+// regression is findable by the instruction rather than by the matrix.
+test "sbb with a sign-extended byte immediate is a subtraction" {
+    const bytes = [_]u8{ 0x48, 0x83, 0xD8, 0x08 };
+    const d = legacy.decodeLegacyInstruction(&bytes, .long64);
+    try std.testing.expectEqual(types.Op.sbb_reg64_imm8, d.op);
+    try std.testing.expectEqual(@as(u64, 8), d.imm);
+    try std.testing.expectEqual(types.Size.bits64, d.size);
+    try std.testing.expectEqual(@as(u8, 4), d.len);
+}
+
+fn expectOpNamed(op: types.Op, family: []const u8, suffix: []const u8) !void {
+    var expected: [64]u8 = undefined;
+    const want = std.fmt.bufPrint(&expected, "{s}_{s}", .{ family, suffix }) catch unreachable;
+    const actual = @tagName(op);
+    if (!std.mem.eql(u8, want, actual)) {
+        std.debug.print("group 1: expected {s}, decoded {s}\n", .{ want, actual });
+        return error.WrongGroup1Opcode;
+    }
+}
+
+// SHLD/SHRD, both count sources and both destination kinds.
+//
+// `48 0F A4 D0 20` — `shld rax, rdx, 32` at guest 0x744871 — decoded as
+// `invalid` because the whole family was absent: no opcode, no decode, no
+// execution. ModRM.reg is the *source* whose bits fill the vacated end, not a
+// second destination, so a decoder that treats it like the neighbouring
+// `0F A3` bit-test forms gets the operands backwards.
+test "double-precision shifts decode with the fill register as the source" {
+    // The reported encoding.
+    {
+        const bytes = [_]u8{ 0x48, 0x0F, 0xA4, 0xD0, 0x20 };
+        const d = legacy.decodeLegacyInstruction(&bytes, .long64);
+        try std.testing.expectEqual(types.Op.shld_reg_imm8, d.op);
+        try std.testing.expectEqual(types.Size.bits64, d.size);
+        try std.testing.expectEqual(@as(u64, 32), d.imm);
+        try std.testing.expectEqual(@as(u8, 5), d.len);
+        // rm=rax is the destination, reg=rdx is the fill source.
+        try std.testing.expectEqual(types.RegId.al_ax_eax_rax, d.dst_reg);
+        try std.testing.expectEqual(types.RegId.dl_dx_edx_rdx, d.src_reg);
+    }
+
+    const Case = struct { opcode: u8, imm: bool, op_reg: types.Op, op_mem: types.Op };
+    const cases = [_]Case{
+        .{ .opcode = 0xA4, .imm = true, .op_reg = .shld_reg_imm8, .op_mem = .shld_mem_imm8 },
+        .{ .opcode = 0xA5, .imm = false, .op_reg = .shld_reg_cl, .op_mem = .shld_mem_cl },
+        .{ .opcode = 0xAC, .imm = true, .op_reg = .shrd_reg_imm8, .op_mem = .shrd_mem_imm8 },
+        .{ .opcode = 0xAD, .imm = false, .op_reg = .shrd_reg_cl, .op_mem = .shrd_mem_cl },
+    };
+    for (cases) |case| {
+        // Register destination, 32- and 64-bit.
+        {
+            var bytes = [_]u8{ 0x0F, case.opcode, 0xD0, 0x04 };
+            const d = legacy.decodeLegacyInstruction(bytes[0..if (case.imm) 4 else 3], .long64);
+            try std.testing.expectEqual(case.op_reg, d.op);
+            try std.testing.expectEqual(types.Size.bits32, d.size);
+        }
+        {
+            var bytes = [_]u8{ 0x48, 0x0F, case.opcode, 0xD0, 0x04 };
+            const d = legacy.decodeLegacyInstruction(bytes[0..if (case.imm) 5 else 4], .long64);
+            try std.testing.expectEqual(case.op_reg, d.op);
+            try std.testing.expectEqual(types.Size.bits64, d.size);
+        }
+        // Memory destination: mod=01 rm=rax with a byte displacement.
+        {
+            var bytes = [_]u8{ 0x48, 0x0F, case.opcode, 0x50, 0x08, 0x04 };
+            const d = legacy.decodeLegacyInstruction(bytes[0..if (case.imm) 6 else 5], .long64);
+            try std.testing.expectEqual(case.op_mem, d.op);
+            try std.testing.expectEqual(types.Size.bits64, d.size);
+        }
+        // 16-bit operand through the 0x66 prefix.
+        {
+            var bytes = [_]u8{ 0x66, 0x0F, case.opcode, 0xD0, 0x04 };
+            const d = legacy.decodeLegacyInstruction(bytes[0..if (case.imm) 5 else 4], .long64);
+            try std.testing.expectEqual(case.op_reg, d.op);
+            try std.testing.expectEqual(types.Size.bits16, d.size);
+        }
+    }
+}
+
+// The opcode-space census lives beside the decoder it measures, so its tests
+// run wherever the decoder's do.
+test {
+    _ = coverage;
 }

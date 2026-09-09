@@ -1159,6 +1159,9 @@ fn decodeVexExtractElementReturn(
     size: Size,
 ) ?DecodedInsn {
     if (!vex.has_66_prefix or vex.l or vex.vvvv != 0) return null;
+    // VPEXTRB/W/D use W=0; VPEXTRQ reuses opcode 16 with W=1. Opcode 17
+    // belongs to EXTRACTPS, not to the qword extraction form.
+    if ((op_enum == .vpextrq) != vex.w) return null;
     return .{
         .op = op_enum,
         .size = size,
@@ -1527,6 +1530,7 @@ fn decodeVex3ExtractElement(
     size: Size,
 ) ?DecodedInsn {
     if (start_pos + 4 > bytes.len or vex.l or !vex.has_66_prefix or vex.vvvv != 0) return null;
+    if ((op == .vpextrq) != vex.w) return null;
     var decoded = DecodedInsn{ .op = op, .size = size };
     var pos = start_pos + 4;
     const rm = readModRM(&decoded, bytes, &pos, vex.r, vex.x, vex.b, size);
@@ -1994,11 +1998,11 @@ fn decodeVexMap3A(vex: VexPrefix, pos: usize, opcode: u8, modrm: anytype, imm: u
         0x0F => decodeVexNdsImm(vex, pos, .vpalignr, modrm, imm), // VPALIGNR
         0x14 => decodeVexExtractElementReturn(vex, pos, .vpextrb, modrm, imm, .bits8), // VPEXTRB
         0x15 => decodeVexExtractElementReturn(vex, pos, .vpextrw, modrm, imm, .bits16), // VPEXTRW
-        0x16 => decodeVexExtractElementReturn(vex, pos, .vpextrd, modrm, imm, .bits32), // VPEXTRD
-        0x17 => if (vex.w)
+        0x16 => if (vex.w)
             decodeVexExtractElementReturn(vex, pos, .vpextrq, modrm, imm, .bits64)
         else
-            decodeVexExtractPsReturn(vex, pos, modrm, imm), // VPEXTRQ / EXTRACTPS
+            decodeVexExtractElementReturn(vex, pos, .vpextrd, modrm, imm, .bits32), // VPEXTRD / VPEXTRQ
+        0x17 => decodeVexExtractPsReturn(vex, pos, modrm, imm), // EXTRACTPS
         0x06 => decodeVexPermute2x128(vex, pos, modrm, imm), // VPERM2F128
         0x18 => decodeVexLane128(vex, pos, .vinsertf128, modrm, imm), // VINSERTF128
         0x19 => decodeVexLane128(vex, pos, .vextractf128, modrm, imm), // VEXTRACTF128
@@ -2210,6 +2214,30 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         // Immediate byte for shuffle control
         if (pos >= bytes.len) return .{};
         decoded.imm = bytes[pos];
+        pos += 1;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VSHUFPD: VEX.NDS.128/256.66.0F.WIG C6 /r ib. The mandatory 66 prefix
+    // selects packed doubles while VEX.vvvv and ModR/M.r/m carry the two
+    // source vectors.
+    if (opcode == 0xC6 and prefix == 1) {
+        var decoded = DecodedInsn{ .op = .vshufpd, .vector_256 = vector_256 };
+        var pos = start_pos + 3;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        if (pos >= bytes.len) return .{};
+        decoded.imm = bytes[pos];
+        decoded.uses_imm = true;
         pos += 1;
         decoded.len = @intCast(pos);
         return decoded;
@@ -3135,8 +3163,11 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
             0x0E => return decodeVex3Nds(bytes, start_pos, vex, .vpblendw, true) orelse .{},
             0x14 => return decodeVex3ExtractElement(bytes, start_pos, vex, .vpextrb, .bits8) orelse .{},
             0x15 => return decodeVex3ExtractElement(bytes, start_pos, vex, .vpextrw, .bits16) orelse .{},
-            0x16 => return decodeVex3ExtractElement(bytes, start_pos, vex, .vpextrd, .bits32) orelse .{},
-            0x17 => if (vex.vvvv == 0) return decodeVex3ExtractPs(bytes, start_pos, vex) orelse .{},
+            0x16 => if (rex_w)
+                return decodeVex3ExtractElement(bytes, start_pos, vex, .vpextrq, .bits64) orelse .{}
+            else
+                return decodeVex3ExtractElement(bytes, start_pos, vex, .vpextrd, .bits32) orelse .{},
+            0x17 => if (!rex_w and vex.vvvv == 0) return decodeVex3ExtractPs(bytes, start_pos, vex) orelse .{},
             0x20 => return decodeVex3InsertElement(bytes, start_pos, vex, .vpinsrb_xmm_xmm_reg32, .bits8) orelse .{},
             0x21 => return decodeVex3InsertPs(bytes, start_pos, vex) orelse .{},
             0x63 => if (vex.vvvv == 0) return decodeVex3String(bytes, start_pos, vex) orelse .{},
@@ -3144,7 +3175,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         }
     }
 
-    if (opcode_map == 3 and prefix == 1 and rex_w and !vector_256 and opcode == 0x17) {
+    if (opcode_map == 3 and prefix == 1 and rex_w and !vector_256 and opcode == 0x16) {
         return decodeVex3ExtractElement(bytes, start_pos, vex, .vpextrq, .bits64) orelse .{};
     }
 
@@ -3298,6 +3329,32 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
     // extension bits or an explicit 0F map are required.
     if (opcode_map == 1 and opcode == 0xC6 and prefix == 0) {
         var decoded = DecodedInsn{ .op = .vshufps, .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        if (pos >= bytes.len) return .{};
+        decoded.imm = bytes[pos];
+        decoded.uses_imm = true;
+        pos += 1;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VSHUFPD: VEX.NDS.128/256.66.0F.WIG C6 /r ib. Keep the three-byte
+    // production path symmetric with decodeVex2: Xenia can reach this form
+    // when register allocation needs an extended XMM register, and leaving
+    // it out turns an otherwise valid packed-double shuffle into an invalid
+    // instruction at runtime.
+    if (opcode_map == 1 and opcode == 0xC6 and prefix == 1) {
+        var decoded = DecodedInsn{ .op = .vshufpd, .vector_256 = vector_256 };
         var pos = start_pos + 4;
         const is_memory = bytes[pos] < 0xC0;
         const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
@@ -4106,21 +4163,22 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
-    // VPEXTRB/W/D/Q: VEX.NDD.LIG.66.0F3A.W0 14/15/16, W1 17 /r ib
+    // VPEXTRB/W/D/Q: VEX.NDD.LIG.66.0F3A.W0 14/15/16, W1 16 /r ib
     // ModRM.reg is the source XMM (VEX.R extends); ModRM.r/m is the
     // destination GPR or memory (VEX.B extends). VEX.L must be 0 and
-    // VEX.vvvv reserved (1111b). VPEXTRQ is the W1 form; B/W/D are W0.
+    // VEX.vvvv reserved (1111b). VPEXTRQ is the W1 form of opcode 16;
+    // opcode 17 is EXTRACTPS and B/W/D use W0.
     // Xbyak emits these for byte/word/dword/qword lane extraction in
     // JIT-generated code.
     if (opcode_map == 3 and (opcode == 0x14 or opcode == 0x15 or opcode == 0x16 or opcode == 0x17) and prefix == 1) {
         if (vector_256 or (vex_control & 0x78) != 0x78) return .{};
-        const w_ok = if (opcode == 0x17) rex_w else !rex_w;
+        const w_ok = if (opcode == 0x16) true else !rex_w;
         if (!w_ok) return .{};
         const extract_size: Size = switch (opcode) {
             0x14 => .bits8,
             0x15 => .bits16,
-            0x16 => .bits32,
-            0x17 => .bits64,
+            0x16 => if (rex_w) .bits64 else .bits32,
+            0x17 => .bits32,
             else => unreachable,
         };
         var decoded = DecodedInsn{ .size = extract_size };
@@ -4140,8 +4198,8 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         decoded.op = switch (opcode) {
             0x14 => .vpextrb,
             0x15 => .vpextrw,
-            0x16 => .vpextrd,
-            0x17 => .vpextrq,
+            0x16 => if (rex_w) .vpextrq else .vpextrd,
+            0x17 => .vextractps,
             else => unreachable,
         };
         decoded.len = @intCast(pos);
