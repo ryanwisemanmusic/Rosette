@@ -28,10 +28,51 @@ fn usage(exe_name: []const u8) void {
         \\Rosette standalone EXE runner
         \\
         \\Usage:
-        \\  {s} --open <program.exe> [--parse-only]
-        \\  {s} <program.exe> [trace.log] [--parse-only]
+        \\  {s} --open <program.exe> [--arg <value> ...] [--media <host-path>] [--parse-only]
+        \\  {s} <program.exe> [trace.log] [--arg <value> ...] [--media <host-path>] [--parse-only]
         \\
     , .{ exe_name, exe_name });
+}
+
+const ParsedLaunchOptions = struct {
+    launch_allowed: bool = true,
+    windows_args: std.ArrayListUnmanaged([]const u8) = .empty,
+    media_path: ?[]const u8 = null,
+};
+
+fn isRunnerOption(value: []const u8) bool {
+    return std.mem.eql(u8, value, "--parse-only") or
+        std.mem.eql(u8, value, "--arg") or
+        std.mem.eql(u8, value, "--media");
+}
+
+fn parseLaunchOptions(allocator: std.mem.Allocator, args: []const []const u8) !ParsedLaunchOptions {
+    var parsed: ParsedLaunchOptions = .{};
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const value = args[index];
+        if (std.mem.eql(u8, value, "--parse-only")) {
+            parsed.launch_allowed = false;
+        } else if (std.mem.eql(u8, value, "--arg")) {
+            index += 1;
+            if (index == args.len) {
+                std.debug.print("--arg requires a Windows argument\n", .{});
+                return error.InvalidArgument;
+            }
+            try parsed.windows_args.append(allocator, args[index]);
+        } else if (std.mem.eql(u8, value, "--media")) {
+            index += 1;
+            if (index == args.len) {
+                std.debug.print("--media requires a host path\n", .{});
+                return error.InvalidArgument;
+            }
+            parsed.media_path = args[index];
+        } else {
+            std.debug.print("unknown argument: {s}\n", .{value});
+            return error.InvalidArgument;
+        }
+    }
+    return parsed;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -47,7 +88,7 @@ pub fn main(init: std.process.Init) !void {
 
     var exe_path: []const u8 = undefined;
     var trace_arg: ?[]const u8 = null;
-    var launch_allowed = true;
+    var option_start: usize = 0;
 
     if (std.mem.eql(u8, args[1], "--open")) {
         if (args.len < 3) {
@@ -55,30 +96,33 @@ pub fn main(init: std.process.Init) !void {
             return error.MissingExePath;
         }
         exe_path = args[2];
-        for (args[3..]) |arg| {
-            if (std.mem.eql(u8, arg, "--parse-only")) {
-                launch_allowed = false;
-            } else {
-                std.debug.print("unknown argument: {s}\n", .{arg});
-                usage(args[0]);
-                return error.InvalidArgument;
-            }
-        }
+        option_start = 3;
     } else {
         exe_path = args[1];
-        if (args.len >= 3 and !std.mem.eql(u8, args[2], "--parse-only")) {
+        if (args.len >= 3 and !isRunnerOption(args[2])) {
             trace_arg = args[2];
         }
-        const option_start: usize = if (trace_arg == null) 2 else 3;
-        for (args[option_start..]) |arg| {
-            if (std.mem.eql(u8, arg, "--parse-only")) {
-                launch_allowed = false;
-            } else {
-                std.debug.print("unknown argument: {s}\n", .{arg});
-                usage(args[0]);
-                return error.InvalidArgument;
-            }
+        option_start = if (trace_arg == null) 2 else 3;
+    }
+
+    var parsed = parseLaunchOptions(allocator, args[option_start..]) catch |err| {
+        usage(args[0]);
+        return err;
+    };
+    defer parsed.windows_args.deinit(allocator);
+
+    // `--media` is both an authority and a convenience for the common Xenia
+    // case: when no explicit target was supplied, launch the image under the
+    // confined C:\\xenia virtual root using the same leaf name.
+    if (parsed.media_path != null and parsed.windows_args.items.len == 0) {
+        const media_name = std.fs.path.basename(parsed.media_path.?);
+        if (media_name.len == 0) {
+            std.debug.print("--media path has no file name\n", .{});
+            usage(args[0]);
+            return error.InvalidArgument;
         }
+        const target = try std.fmt.allocPrint(allocator, "C:\\xenia\\{s}", .{media_name});
+        try parsed.windows_args.append(allocator, target);
     }
 
     const log_path = if (trace_arg) |path|
@@ -86,7 +130,7 @@ pub fn main(init: std.process.Init) !void {
     else
         try defaultTraceLogPath(allocator, exe_path);
 
-    try core.run(init, exe_path, log_path, launch_allowed);
+    try core.runWithArguments(init, exe_path, log_path, parsed.launch_allowed, parsed.windows_args.items, parsed.media_path);
 }
 
 test "default trace path follows executable path" {

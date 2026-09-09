@@ -458,6 +458,21 @@ fn bootLog(stage: []const u8) void {
 }
 
 pub fn run(init: std.process.Init, exe_path: []const u8, log_path: [:0]const u8, launch_allowed: bool) !void {
+    return runWithArguments(init, exe_path, log_path, launch_allowed, &.{}, null);
+}
+
+/// Run a PE with an explicit Windows command line and optional media
+/// authority. The ordinary `run` entry point remains argument-free for app
+/// bundling callers; the standalone runner uses this form so a target image
+/// reaches Xenia's real `wmain`/GUI startup contract.
+pub fn runWithArguments(
+    init: std.process.Init,
+    exe_path: []const u8,
+    log_path: [:0]const u8,
+    launch_allowed: bool,
+    windows_args: []const []const u8,
+    windows_media_path: ?[]const u8,
+) !void {
     bootLog("0_enter_run: launch exe_runner_core");
     bootLog("  exe_path: starting PE intake");
 
@@ -665,14 +680,15 @@ pub fn run(init: std.process.Init, exe_path: []const u8, log_path: [:0]const u8,
         bootLog("7_pe64_preflight: proving the reachable x86-64 entry path");
         var pe64_report = try pe64_runtime.preflight(allocator, exe_bytes, &image);
         defer pe64_report.deinit(allocator);
-        var pe64_report_buf: [2048]u8 = undefined;
+        var pe64_report_buf: [4096]u8 = undefined;
         trace.logText(pe64_runtime.formatPreflight(&pe64_report_buf, pe64_report));
-        std.debug.print("  PE64 preflight: {s} reachable={d} decoded={d} invalid={d} imports={d} unsupported_imports={d} indirect={d}\n", .{
-            if (pe64_report.ready()) "ready" else "blocked",
+        std.debug.print("  PE64 preflight: {s} reachable={d} decoded={d} invalid={d} imports={d} degraded_imports={d} unsupported_imports={d} indirect={d}\n", .{
+            if (!pe64_report.ready()) "blocked" else if (pe64_report.complete()) "ready" else "ready_with_degraded_imports",
             pe64_report.reachable_instructions,
             pe64_report.decoded_instructions,
             pe64_report.invalid_instructions,
             pe64_report.imports,
+            pe64_report.degraded_imports,
             pe64_report.unsupported_imports,
             pe64_report.indirect_control_transfers,
         });
@@ -686,23 +702,52 @@ pub fn run(init: std.process.Init, exe_path: []const u8, log_path: [:0]const u8,
         }
 
         const previous_cwd = try currentWorkingDirectory(allocator);
-        try changeWorkingDirectory(allocator, profile.working_directory);
+        // launch_config keeps paths lexical so its profiles remain portable.
+        // The PE host I/O bridge is entered after chdir, however, and must
+        // receive the same absolute root that the process is actually using;
+        // passing the lexical `.rosette/...` form would otherwise resolve it
+        // a second time beneath the already-changed cwd.
+        const absolute_working_directory = try std.fs.path.resolve(allocator, &.{ previous_cwd, profile.working_directory });
+        const absolute_media_path = if (windows_media_path) |media_path| blk: {
+            const resolved = if (std.fs.path.isAbsolute(media_path))
+                try allocator.dupe(u8, media_path)
+            else
+                try std.fs.path.resolve(allocator, &.{ previous_cwd, media_path });
+            std.Io.Dir.cwd().access(init.io, resolved, .{}) catch {
+                trace.logText("pe64_media = unavailable\n");
+                return error.WindowsMediaUnavailable;
+            };
+            break :blk @as(?[]const u8, resolved);
+        } else null;
+        try changeWorkingDirectory(allocator, absolute_working_directory);
         defer changeWorkingDirectory(allocator, previous_cwd) catch {};
 
         bootLog("8_pe64_execute: starting bounded Windows x64 state");
-        const max_steps: u64 = if (std.c.getenv("ROSETTE_PE64_MAX_STEPS")) |value_ptr|
+        const max_steps_env = std.c.getenv("ROSETTA_PE64_MAX_STEPS");
+        const max_steps: u64 = if (max_steps_env) |value_ptr|
             std.fmt.parseInt(u64, std.mem.sliceTo(value_ptr, 0), 10) catch 20_000_000
         else
             20_000_000;
+        if (max_steps_env) |value_ptr| {
+            std.debug.print("  PE64 max-step environment: {s} -> {d}\n", .{ std.mem.sliceTo(value_ptr, 0), max_steps });
+        } else {
+            std.debug.print("  PE64 max-step environment: <unset> -> {d}\n", .{max_steps});
+        }
         var policy_buf: [256]u8 = undefined;
-        const policy = try std.fmt.bufPrint(&policy_buf, "pe64_execution = true\npe64_max_steps = {d}\n", .{max_steps});
+        const policy = try std.fmt.bufPrint(&policy_buf, "pe64_execution = true\npe64_max_steps = {d}\npe64_windows_argc = {d}\npe64_windows_media = {s}\n", .{
+            max_steps,
+            windows_args.len + 1,
+            absolute_media_path orelse "<none>",
+        });
         trace.logText(policy);
         var native_graphics = native_windows_graphics.NativeWindowsGraphics{};
         defer native_graphics.shutdown();
         const result = pe64_runtime.loadAndRun(allocator, exe_bytes, &image, .{
             .max_steps = max_steps,
             .host_io = init.io,
-            .host_working_directory = profile.working_directory,
+            .host_working_directory = absolute_working_directory,
+            .windows_arguments = windows_args,
+            .windows_media_path = absolute_media_path,
             .graphics_hooks = windowsGraphicsHooks(&native_graphics),
         }) catch |err| {
             var error_buf: [256]u8 = undefined;
@@ -710,18 +755,23 @@ pub fn run(init: std.process.Init, exe_path: []const u8, log_path: [:0]const u8,
             trace.logText(error_line);
             return err;
         };
-        var result_buf: [768]u8 = undefined;
+        var result_buf: [1024]u8 = undefined;
         const graphics = result.graphics;
-        const result_line = try std.fmt.bufPrint(&result_buf, "pe64_execution_result = terminated={}; faulted={}; steps={d}; exit_code=0x{X}; rip=0x{X}; file_opens={d}; file_reads={d}; file_writes={d}; file_failures={d}\n", .{
+        const result_line = try std.fmt.bufPrint(&result_buf, "pe64_execution_result = terminated={}; faulted={}; steps={d}; exit_code=0x{X}; rip=0x{X}; import_calls={d}; degraded_import_calls={d}; unknown_import_calls={d}; file_opens={d}; file_reads={d}; file_writes={d}; file_failures={d}; rtl_capture_calls={d}; rtl_unwind_calls={d}\n", .{
             result.terminated,
             result.faulted,
             result.executed_steps,
             result.exit_code,
             result.rip,
+            result.windows_import_calls,
+            result.windows_degraded_import_calls,
+            result.windows_unknown_import_calls,
             result.windows_file_open_calls,
             result.windows_file_read_calls,
             result.windows_file_write_calls,
             result.windows_file_failures,
+            result.windows_rtl_capture_calls,
+            result.windows_rtl_unwind_calls,
         });
         trace.logText(result_line);
 
