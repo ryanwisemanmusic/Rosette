@@ -237,6 +237,26 @@ pub fn logPerformanceAccelerationSummary(self: anytype) void {
             .{ attempts, effective_hits, effective_percent, self.import_route_cache_slow_hits, self.import_route_cache_fallbacks },
         );
     }
+    // Name the symbols behind that count. Removing a re-entry means giving the
+    // symbol its own `ImportRoute`, and choosing which to add first requires
+    // knowing which symbols they are — a total names nobody.
+    if (comptime @hasField(@TypeOf(self.*), "import_route_slow_witness")) {
+        const witness = &self.import_route_slow_witness;
+        if (witness.used != 0) {
+            machoCapturePrint(
+                "  import route slow-path witnesses: distinct={d}/{d} unattributed={d} census={s}; each of these is a symbol whose route is `.legacy` or `.strtoul`, so a cache hit still walks the whole compare chain. Giving the hottest one a dedicated ImportRoute is what removes it\n",
+                .{
+                    witness.used,
+                    @TypeOf(witness.*).capacity,
+                    witness.unattributed,
+                    if (witness.unattributed == 0) "complete" else "PARTIAL",
+                },
+            );
+            for (witness.names[0..witness.used], witness.counts[0..witness.used]) |name, count| {
+                machoCapturePrint("    slow-route symbol {s: <64} re_entries={d}\n", .{ name, count });
+            }
+        }
+    }
     if (comptime @hasField(@TypeOf(self.*), "import_route_fallbacks")) {
         if (self.import_route_cache_fallbacks != 0) {
             const RouteEnum = @import("macho_core").types.ImportRoute;

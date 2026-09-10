@@ -68,7 +68,7 @@ pub fn runOneInitializer(self: anytype, launch_regs: Regs, index: usize, is_retr
     if (self.consumeHostTerminationRequest()) return .failed;
     const address = self.metadata.initializer_addresses[index];
     const nearest_symbol = self.metadata.nearestSymbol(address);
-    const symbol_name = if (nearest_symbol) |symbol| symbol.name else "<unknown>";
+    const symbol_name = self.metadata.symbolLabelFor(nearest_symbol, address);
     self.regs = launch_regs;
     self.initializer_abort_requested = false;
     self.initializer_abort_reason = .none;
@@ -235,7 +235,7 @@ pub fn runOneInitializer(self: anytype, launch_regs: Regs, index: usize, is_retr
                 index + 1,
                 self.metadata.initializer_addresses.len,
                 self.regs.rip,
-                if (crash_symbol) |s| s.name else "<unknown>",
+                self.metadata.symbolLabelFor(crash_symbol, self.regs.rip),
                 if (crash_symbol) |s| s.offset else @as(i64, 0),
                 @tagName(exit_diagnostics.reasonFromValue(self.termination_reason)),
                 self.exit_code,

@@ -441,6 +441,24 @@ pub const Runtime = struct {
     /// the notifier's program counter to a name. Reported from there rather
     /// than here because "last signalled from 0x48b150" is an address and
     /// "last signalled from CommandProcessor::WorkerThreadMain" is an answer.
+    /// The routine a thread was started on.
+    ///
+    /// A never-notified wait names the waiting thread and the host PC it is
+    /// parked at, and that PC is often inside an inlined condition-variable
+    /// wait with no symbol of its own — the 2026-09-08 run reported
+    /// `pc=0x139fc1e symbol=<unknown>` fifty-eight times. The start routine is
+    /// the same thread's identity and almost always carries a symbol, which is
+    /// what turns "some thread is parked" into "the GPU command processor's
+    /// worker is parked" — the fact that decides whether an idle worker or a
+    /// missing producer is being looked at.
+    pub fn startRoutineFor(self: *const Runtime, handle: u64) u64 {
+        for (&self.threads) |*thread| {
+            if (!thread.active or thread.handle != handle) continue;
+            return thread.start_routine;
+        }
+        return 0;
+    }
+
     pub fn worstWaitObject(self: *Runtime, current_step: u64) ?scheduler.notifier_liveness.Object {
         const object = self.waits.worstObject(current_step, scheduler.notifier_liveness.default_stall_steps) orelse return null;
         return object.*;

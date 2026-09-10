@@ -82,7 +82,7 @@ pub fn handleLibcppBasicStringSubstr(self: anytype) bool {
     if (self.libcxx_string_substr_fast_paths <= 16 or vfs_resolution or profile_device) {
         machoCapturePrint(
             "macho-processor: libc++ basic_string::substr fast path #{d}: source_object=0x{x} destination=0x{x} source_length={d} pos={d} count={d} result_length={d} caller=0x{x} {s}+0x{x} source='{s}'\n",
-            .{ self.libcxx_string_substr_fast_paths, source_object, destination, source_view.length, position, count, result_length, return_address, if (caller) |symbol| symbol.name else "<unknown>", if (caller) |symbol| symbol.offset else 0, preview },
+            .{ self.libcxx_string_substr_fast_paths, source_object, destination, source_view.length, position, count, result_length, return_address, self.metadata.symbolLabelFor(caller, return_address), if (caller) |symbol| symbol.offset else 0, preview },
         );
     }
     if (vfs_resolution) {
@@ -367,7 +367,7 @@ pub fn handlePageEntryBulkInitialization(self: anytype) bool {
     const caller = self.metadata.nearestSymbol(return_address);
     machoCapturePrint(
         "macho-processor: bulk default construction: PageEntry count={d} bytes={d} range=0x{x}-0x{x} return={s}+0x{x}\n",
-        .{ count, range.byte_count, end, range.new_end, if (caller) |resolved| resolved.name else "<unknown>", if (caller) |resolved| resolved.offset else 0 },
+        .{ count, range.byte_count, end, range.new_end, self.metadata.symbolLabelFor(caller, return_address), if (caller) |resolved| resolved.offset else 0 },
     );
     self.regs.rip = self.pop();
     return !self.terminated;
@@ -663,7 +663,7 @@ pub fn logStalledInstructionDetails(self: anytype) void {
         .{
             self.stalled_instruction_reports,
             self.regs.rip,
-            if (symbol) |entry| entry.name else "<unknown>",
+            self.metadata.symbolLabelFor(symbol, self.regs.rip),
             if (symbol) |entry| entry.offset else 0,
             @tagName(decoded.op),
             decoded.len,

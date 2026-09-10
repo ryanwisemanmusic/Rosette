@@ -614,7 +614,7 @@ pub fn finishActiveGuestThread(self: anytype) void {
                     "macho-processor: cooperative guest thread returned AFTER AN UNMATCHED C++ EXCEPTION: handle=0x{x} type={s} main_thread={}; phase one found no compatible handler, so this thread unwound to a catch-all and ended. A thread that ends this way did not finish its work — read this as a termination, not a clean exit\n",
                     .{
                         self.active_guest_thread,
-                        if (type_symbol) |symbol| symbol.name else "<unknown>",
+                        self.metadata.symbolLabelFor(type_symbol, self.unhandled_cxx_type_info),
                         self.active_guest_thread == self.pthreads.main_thread_handle,
                     },
                 );
@@ -1080,14 +1080,14 @@ pub fn logThreadTable(self: anytype, reason: []const u8) void {
         const symbol = self.metadata.nearestSymbol(self.regs.rip);
         machoCapturePrint(
             "scheduler: CTX  run  0x{x:0>16} {d: >3} {s: <12} running    {d: >9} 0x{x:0>16} {s}\n",
-            .{ self.active_guest_thread, self.threadNumericId(self.active_guest_thread), self.threadRole(self.active_guest_thread, self.regs.rip), 0, self.regs.rip, if (symbol) |resolved| resolved.name else "<unknown>" },
+            .{ self.active_guest_thread, self.threadNumericId(self.active_guest_thread), self.threadRole(self.active_guest_thread, self.regs.rip), 0, self.regs.rip, self.metadata.symbolLabelFor(symbol, self.regs.rip) },
         );
     }
     for (self.suspended_guest_threads[0..self.suspended_guest_thread_count], 0..) |context, index| {
         const symbol = self.metadata.nearestSymbol(context.regs.rip);
         machoCapturePrint(
             "scheduler: CTX  q{d:0>2}  0x{x:0>16} {d: >3} {s: <12} suspended  {d: >9} 0x{x:0>16} {s} | {s}\n",
-            .{ index, context.handle, self.threadNumericId(context.handle), self.threadRole(context.handle, context.regs.rip), self.executed_steps -| context.suspended_step, context.regs.rip, if (symbol) |resolved| resolved.name else "<unknown>", context.reason },
+            .{ index, context.handle, self.threadNumericId(context.handle), self.threadRole(context.handle, context.regs.rip), self.executed_steps -| context.suspended_step, context.regs.rip, self.metadata.symbolLabelFor(symbol, context.regs.rip), context.reason },
         );
     }
     machoCapturePrint("scheduler: REG  slot handle             tid role         pthread_state context stored start              blocked_for wait\n", .{});
@@ -1106,7 +1106,7 @@ pub fn logThreadTable(self: anytype, reason: []const u8) void {
                 if (snapshot.started) "yes" else "no",
                 snapshot.start_routine,
                 if (snapshot.state == .runnable or snapshot.blocked_since_step == 0) 0 else self.executed_steps -| snapshot.blocked_since_step,
-                if (snapshot.blocked_reason.len != 0) snapshot.blocked_reason else if (start_symbol) |resolved| resolved.name else "<unknown>",
+                if (snapshot.blocked_reason.len != 0) snapshot.blocked_reason else self.metadata.symbolLabelFor(start_symbol, snapshot.start_routine),
             },
         );
     }
@@ -1256,7 +1256,7 @@ pub fn logCooperativeHeartbeat(self: anytype) void {
         const oldest_symbol = self.metadata.nearestSymbol(suspended.oldest_rip);
         machoCapturePrint(
             "scheduler: RUNNABLE CONTEXT STARVATION: warning={d} handle=0x{x} rip=0x{x} {s}+0x{x} observed_runnable_for={d} context_suspended_for={d} observations={d} reason={s} active=0x{x} runnable/blocked={d}/{d}; round-robin quantum rotation should cap continuous eligibility near {d} steps\n",
-            .{ self.cooperative_starvation_warnings, suspended.oldest_handle, suspended.oldest_rip, if (oldest_symbol) |resolved| resolved.name else "<unknown>", if (oldest_symbol) |resolved| resolved.offset else 0, observed_runnable_age, suspended_age, self.runnable_candidate_observations, suspended.oldest_reason, self.active_guest_thread, suspended.runnable, suspended.blocked, COOPERATIVE_THREAD_QUANTUM_STEPS * @as(u64, @intCast(suspended.runnable + 1)) },
+            .{ self.cooperative_starvation_warnings, suspended.oldest_handle, suspended.oldest_rip, self.metadata.symbolLabelFor(oldest_symbol, suspended.oldest_rip), if (oldest_symbol) |resolved| resolved.offset else 0, observed_runnable_age, suspended_age, self.runnable_candidate_observations, suspended.oldest_reason, self.active_guest_thread, suspended.runnable, suspended.blocked, COOPERATIVE_THREAD_QUANTUM_STEPS * @as(u64, @intCast(suspended.runnable + 1)) },
         );
         self.logThreadTable("runnable context starvation");
     }
@@ -1297,7 +1297,7 @@ pub fn dumpCoopHeartbeatTrace(self: anytype) void {
             "  [{d}] step={d} rip=0x{x} {s}+0x{x} thread=0x{x} deferred={d} suspended={d}/{d}/{d} switches={d} yields(wait/quantum/rot)={d}/{d}/{d} idle={d} dispatch={s}\n",
             .{
                 i,                                       e.step,                          e.rip,
-                if (symbol) |s| s.name else "<unknown>", if (symbol) |s| s.offset else 0, e.thread,
+                self.metadata.symbolLabelFor(symbol, e.rip), if (symbol) |s| s.offset else 0, e.thread,
                 e.deferred,                              e.suspended_total,               e.suspended_runnable,
                 e.suspended_blocked,                     e.switches,                      e.wait_yields,
                 e.quantum_yields,                        e.rotation_yields,               e.idle_pending,

@@ -34,6 +34,12 @@ fn elementBytes(d: DecodedInsn) usize {
     };
 }
 
+fn traceVectorState() bool {
+    const raw = std.c.getenv("ROSETTE_ELF_TRACE_VECTOR") orelse return false;
+    const value = std.mem.sliceTo(raw, 0);
+    return value.len != 0 and value[0] != '0';
+}
+
 fn readVectorRegister(self: anytype, index: u8) [64]u8 {
     var result = [_]u8{0} ** 64;
     @memcpy(result[0..16], self.xmm[index][0..16]);
@@ -49,15 +55,32 @@ fn writeVectorRegister(self: anytype, index: u8, value: [64]u8, count: usize) vo
     @memset(&self.xmm[index], 0);
     @memset(&self.ymm_hi[index], 0);
     @memset(&self.zmm_hi[index], 0);
-    const low = @min(count, 16);
+    if (count > value.len) {
+        std.log.err("vector register write width exceeds architectural storage: rip=0x{x} index={d} count={d} storage={d}", .{
+            self.regs.rip,
+            index,
+            count,
+            value.len,
+        });
+        self.faulted = true;
+        self.exit_code = 127;
+        self.terminated = true;
+        if (comptime @TypeOf(self.termination_reason) == exit_diagnostics.TerminationReason) {
+            self.termination_reason = exit_diagnostics.TerminationReason.unimplemented_instruction;
+        } else {
+            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unimplemented_instruction);
+        }
+        return;
+    }
+    const low = @min(count, @as(usize, 16));
     @memcpy(self.xmm[index][0..low], value[0..low]);
     if (count > 16) {
-        const high = @min(count - 16, 16);
-        @memcpy(self.ymm_hi[index][0..high], value[16 .. 16 + high]);
+        const high = @min(count - 16, @as(usize, 16));
+        @memcpy(self.ymm_hi[index][0..high], value[16..][0..high]);
     }
     if (count > 32) {
-        const top = @min(count - 32, 32);
-        @memcpy(self.zmm_hi[index][0..top], value[32 .. 32 + top]);
+        const top = @min(count - 32, @as(usize, 32));
+        @memcpy(self.zmm_hi[index][0..top], value[32..][0..top]);
     }
 }
 
@@ -207,6 +230,22 @@ fn isMoveStore(op: Op) bool {
 
 fn executeMove(self: anytype, d: DecodedInsn) void {
     const count = vectorBytes(d);
+    if (traceVectorState()) {
+        std.log.info("EVEX vector move rip=0x{x} op={s} len={d} count={d} vector256={} vector512={} evex={} dst={d} src={d} src2={d} reg_form={} addr=0x{x}", .{
+            self.regs.rip,
+            @tagName(d.op),
+            d.len,
+            count,
+            d.vector_256,
+            d.vector_512,
+            d.is_evex,
+            d.xmm_dst,
+            d.xmm_src,
+            d.xmm_src2,
+            d.is_reg_form,
+            d.addr,
+        });
+    }
     const bytes_per_element = elementBytes(d);
     if (isMoveLoad(d.op)) {
         const loaded = if (d.opmask == 0)
@@ -219,13 +258,23 @@ fn executeMove(self: anytype, d: DecodedInsn) void {
         return;
     }
     if (d.is_reg_form) {
-        const source = readVectorRegister(self, d.xmm_src2);
+        // VEX move decodes normalize ModRM.r/m into xmm_src, while EVEX
+        // keeps that operand in xmm_src2 because the latter also has a
+        // meaningful VEX.vvvv field.  The shared executor handles both
+        // encodings, so do not read the reserved EVEX field for a VEX move.
+        const source_index = if (d.is_evex) d.xmm_src2 else d.xmm_src;
+        const source = readVectorRegister(self, source_index);
         const old = readVectorRegister(self, d.xmm_dst);
         writeVectorRegister(self, d.xmm_dst, maskedVector(self, d, source, old, count, bytes_per_element), count);
         return;
     }
     if (isMoveStore(d.op)) {
-        const source = readVectorRegister(self, d.xmm_dst);
+        // EVEX memory stores retain ModRM.reg in xmm_dst, whereas VEX
+        // memory stores expose the same source register as xmm_src.  Using
+        // xmm_dst for both silently stores VEX register zero and corrupts
+        // structures copied with VMOVUPS/VMOVDQU during startup.
+        const source_index = if (d.is_evex) d.xmm_dst else d.xmm_src;
+        const source = readVectorRegister(self, source_index);
         writeVectorMemory(self, d, source, count, bytes_per_element);
     }
 }
@@ -552,6 +601,94 @@ fn executeVpbroadcast(self: anytype, d: DecodedInsn) void {
     writeVectorRegister(self, d.xmm_dst, maskedVector(self, d, computed, old, count, width), count);
 }
 
+fn executeVbroadcast(self: anytype, d: DecodedInsn) void {
+    const count: usize = switch (d.op) {
+        .vbroadcastf128, .vbroadcasti128 => 32,
+        else => vectorBytes(d),
+    };
+    const source_width: usize = switch (d.op) {
+        .vbroadcastss => 4,
+        .vbroadcastsd => 8,
+        .vbroadcastf128, .vbroadcasti128 => 16,
+        else => unreachable,
+    };
+
+    var computed = [_]u8{0} ** 64;
+    if (source_width == 16) {
+        var source = [_]u8{0} ** 16;
+        if (d.is_reg_form) {
+            const register_source = readVectorRegister(self, d.xmm_src);
+            @memcpy(source[0..], register_source[0..16]);
+        } else {
+            source = self.readMem128(d.addr);
+        }
+        @memcpy(computed[0..16], source[0..16]);
+        @memcpy(computed[16..32], source[0..16]);
+    } else {
+        var scalar = [_]u8{0} ** 8;
+        if (d.is_reg_form) {
+            const source = readVectorRegister(self, d.xmm_src);
+            @memcpy(scalar[0..source_width], source[0..source_width]);
+        } else {
+            const value = self.readMemVal(d.addr, scalarSize(source_width));
+            std.mem.writeInt(u64, @ptrCast(&scalar[0]), value, .little);
+        }
+        for (0..count / source_width) |lane| {
+            const offset = lane * source_width;
+            @memcpy(computed[offset..][0..source_width], scalar[0..source_width]);
+        }
+    }
+
+    // VEX broadcasts are non-destructive and clear the architectural upper
+    // state through the common vector write path. EVEX broadcast forms are
+    // likewise routed here if a future decoder exposes them.
+    writeVectorRegister(self, d.xmm_dst, computed, count);
+}
+
+fn executeVduplicate(self: anytype, d: DecodedInsn) void {
+    const count = vectorBytes(d);
+    const source = if (d.is_reg_form)
+        readVectorRegister(self, d.xmm_src)
+    else
+        readVectorMemory(self, d, count);
+    if (self.terminated) return;
+
+    // These instructions operate independently on each 128-bit lane.  The
+    // VEX.256 forms therefore duplicate within each half rather than
+    // selecting values from across the 256-bit boundary.
+    var computed = [_]u8{0} ** 64;
+    var lane_offset: usize = 0;
+    while (lane_offset < count) : (lane_offset += 16) {
+        switch (d.op) {
+            .vmovddup => {
+                @memcpy(computed[lane_offset..][0..8], source[lane_offset..][0..8]);
+                @memcpy(computed[lane_offset + 8 ..][0..8], source[lane_offset..][0..8]);
+            },
+            .vmovsldup => {
+                @memcpy(computed[lane_offset..][0..4], source[lane_offset..][0..4]);
+                @memcpy(computed[lane_offset + 4 ..][0..4], source[lane_offset..][0..4]);
+                @memcpy(computed[lane_offset + 8 ..][0..4], source[lane_offset + 8 ..][0..4]);
+                @memcpy(computed[lane_offset + 12 ..][0..4], source[lane_offset + 8 ..][0..4]);
+            },
+            .vmovshdup => {
+                @memcpy(computed[lane_offset..][0..4], source[lane_offset + 4 ..][0..4]);
+                @memcpy(computed[lane_offset + 4 ..][0..4], source[lane_offset + 4 ..][0..4]);
+                @memcpy(computed[lane_offset + 8 ..][0..4], source[lane_offset + 12 ..][0..4]);
+                @memcpy(computed[lane_offset + 12 ..][0..4], source[lane_offset + 12 ..][0..4]);
+            },
+            else => unreachable,
+        }
+    }
+
+    if (d.legacy_sse) {
+        // Legacy MOVDDUP/MOVSLDUP/MOVSHDUP write XMM only.  Unlike VEX.128,
+        // they leave the destination's architectural YMM upper half intact.
+        @memcpy(self.xmm[d.xmm_dst][0..16], computed[0..16]);
+    } else {
+        writeVectorRegister(self, d.xmm_dst, computed, count);
+    }
+}
+
 fn executeVextractPs(self: anytype, d: DecodedInsn) void {
     const source = readVectorRegister(self, d.xmm_src);
     const offset = (@as(usize, @intCast(d.imm)) & 3) * 4;
@@ -778,6 +915,13 @@ pub fn handles(op: Op) bool {
         .vpbroadcastw,
         .vpbroadcastd,
         .vpbroadcastq,
+        .vbroadcastss,
+        .vbroadcastsd,
+        .vbroadcastf128,
+        .vbroadcasti128,
+        .vmovshdup,
+        .vmovsldup,
+        .vmovddup,
         .vextractps,
         .vmovntdq,
         .vmovntps,
@@ -1212,6 +1356,8 @@ pub fn execute(self: anytype, d: DecodedInsn) void {
         .vshufpd => executeVshufpd(self, d),
         .vpermilps => executeVpermilps(self, d),
         .vpbroadcastw, .vpbroadcastd, .vpbroadcastq => executeVpbroadcast(self, d),
+        .vbroadcastss, .vbroadcastsd, .vbroadcastf128, .vbroadcasti128 => executeVbroadcast(self, d),
+        .vmovshdup, .vmovsldup, .vmovddup => executeVduplicate(self, d),
         .vextractps => executeVextractPs(self, d),
         .vmovntdq, .vmovntps => executeVmovnt(self, d),
         .vmovntdqa => executeVmovntdqa(self, d),

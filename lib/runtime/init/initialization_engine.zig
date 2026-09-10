@@ -223,10 +223,11 @@ pub const Engine = struct {
             "macho-processor: initialization resolution summary: expected={d} healthy={d} recovered={d} degraded={d} deferred={d} failed={d} steps={d}\n",
             .{ self.expected_count, self.healthy, self.recovered, self.degraded, self.deferred, self.failed, self.total_steps },
         );
+        var mismatch_names: [40]u8 = undefined;
         for (self.records.items) |record| {
             if (record.status == .completed) continue;
             machoCapturePrint(
-                "  initializer [{d}/{d}] {s} status={s} attempts={d} steps={d} rsp=0x{x}/0x{x} unresolved_observed={d} assertions_observed={d} abi_mismatch=0x{x} last_deferral={s}\n",
+                "  initializer [{d}/{d}] {s} status={s} attempts={d} steps={d} rsp=0x{x}/0x{x} unresolved_observed={d} assertions_observed={d} abi_mismatch=0x{x}({s}) last_deferral={s}\n",
                 .{
                     record.index + 1,
                     self.expected_count,
@@ -239,12 +240,39 @@ pub const Engine = struct {
                     record.unresolved_observed,
                     record.assertions_observed,
                     record.abi_mismatch,
+                    describeAbiMismatch(record.abi_mismatch, &mismatch_names),
                     @tagName(record.last_deferral_reason),
                 },
             );
         }
     }
 };
+
+/// Name the registers a mismatch mask stands for.
+///
+/// The mask is printed on a line a reader reaches while diagnosing a failed
+/// initializer, and `abi_mismatch=0x5` says nothing until they have gone and
+/// found the bit constants. Naming it also keeps a consequence from reading
+/// as a cause: an initializer that terminated inside its prologue has moved
+/// RSP and RBP by definition, and that is the same mask as a callee-saved
+/// register a completed initializer genuinely failed to restore.
+pub fn describeAbiMismatch(mask: u8, buffer: []u8) []const u8 {
+    if (mask == 0) return "none";
+    const names = [_][]const u8{ "rsp", "rbx", "rbp", "r12", "r13", "r14", "r15" };
+    var written: usize = 0;
+    for (names, 0..) |name, bit| {
+        if (mask & (@as(u8, 1) << @intCast(bit)) == 0) continue;
+        if (written != 0 and written < buffer.len) {
+            buffer[written] = '|';
+            written += 1;
+        }
+        const room = buffer.len -| written;
+        const take = @min(name.len, room);
+        @memcpy(buffer[written..][0..take], name[0..take]);
+        written += take;
+    }
+    return buffer[0..written];
+}
 
 fn abiMismatch(expected: AbiSnapshot, actual: AbiSnapshot) u8 {
     var mismatch: u8 = 0;
@@ -297,4 +325,27 @@ test "initializer engine records a clean deferred retry as recovered" {
     try std.testing.expectEqual(Status.recovered, engine.records.items[0].status);
     try std.testing.expectEqual(@as(u64, 1), engine.records.items[0].assertions_observed);
     try std.testing.expectEqual(DeferralReason.assertion, engine.records.items[0].last_deferral_reason);
+}
+
+// `abi_mismatch=0x5` on the 2026-09-08 run. Two bits, and the reader had to go
+// find the constants to learn which. It was RSP and RBP, which is exactly what
+// a `push rbp; mov rbp, rsp` prologue moves — the initializer had terminated
+// two instructions in, so the mask was a consequence of the stop rather than a
+// callee-saved register anyone failed to restore.
+test "an ABI mismatch mask names its registers" {
+    var buffer: [40]u8 = undefined;
+    try std.testing.expectEqualStrings("none", describeAbiMismatch(0, &buffer));
+    try std.testing.expectEqualStrings("rsp|rbp", describeAbiMismatch(0x5, &buffer));
+    try std.testing.expectEqualStrings("rsp", describeAbiMismatch(ABI_RSP, &buffer));
+    try std.testing.expectEqualStrings("r15", describeAbiMismatch(ABI_R15, &buffer));
+    try std.testing.expectEqualStrings(
+        "rsp|rbx|rbp|r12|r13|r14|r15",
+        describeAbiMismatch(0x7F, &buffer),
+    );
+    // Every bit the mask can carry has a name, so no reader ever sees a
+    // number with nothing beside it.
+    var mask: u8 = 1;
+    while (mask < 0x80) : (mask <<= 1) {
+        try std.testing.expect(describeAbiMismatch(mask, &buffer).len != 0);
+    }
 }

@@ -2311,16 +2311,19 @@ fn observeSignalExpectation(self: anytype, message: []const u8) void {
 
 /// Creation lines carry a handle and no object address, and waits carry both.
 /// Matching on the handle is what joins them.
+///
+/// The join has to survive arriving first. A creation line necessarily
+/// precedes every wait and signal on the object it creates, so scanning the
+/// ledger for a record that does not exist yet and returning was a guaranteed
+/// miss: in the 2026-09-08 run all 181 creation lines were discarded and every
+/// object reported `provenance=unknown`. `observeCreation` retains the fact
+/// until the object appears.
 fn markProvenanceByHandle(
     ledger: *signal_expectation.Ledger,
     handle: u32,
     provenance: signal_expectation.Provenance,
 ) void {
-    for (ledger.records[0..ledger.count]) |record| {
-        if (record.handle != handle) continue;
-        ledger.observeProvenance(record.object, provenance);
-        return;
-    }
+    ledger.observeCreation(handle, provenance);
 }
 
 /// Relate a guest deadline to the time it actually consumed.
@@ -4618,7 +4621,7 @@ pub fn observeProfileAccountFlow(self: anytype) void {
         const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
         machoCapturePrint(
             "macho-processor: profile Account flow #{d} started: manager=0x{x} xuid={x:0>16} return=0x{x} {s}+0x{x} step={d}\n",
-            .{ self.profile_account_flow.attempts, self.regs.rdi, self.regs.rsi, return_address, if (caller) |symbol| symbol.name else "<unknown>", if (caller) |symbol| symbol.offset else 0, self.executed_steps },
+            .{ self.profile_account_flow.attempts, self.regs.rdi, self.regs.rsi, return_address, self.metadata.symbolLabelFor(caller, return_address), if (caller) |symbol| symbol.offset else 0, self.executed_steps },
         );
         return;
     }
@@ -4634,7 +4637,7 @@ pub fn observeProfileAccountFlow(self: anytype) void {
         }
         machoCapturePrint(
             "macho-processor: profile temporary dismount: xuid={x:0>16} stage={s} caller=0x{x} {s}+0x{x} bytes_read={d} minimum_account_bytes={d} interpretation={s}\n",
-            .{ self.profile_account_flow.xuid, @tagName(self.profile_account_flow.stage), return_address, if (caller) |symbol| symbol.name else "<unknown>", if (caller) |symbol| symbol.offset else 0, self.profile_account_flow.bytes_read, PROFILE_ACCOUNT_INFO_BYTES, if (self.profile_account_flow.stage == .decrypted) "expected success-path cleanup before accounts_ insertion" else "early LoadAccount cleanup" },
+            .{ self.profile_account_flow.xuid, @tagName(self.profile_account_flow.stage), return_address, self.metadata.symbolLabelFor(caller, return_address), if (caller) |symbol| symbol.offset else 0, self.profile_account_flow.bytes_read, PROFILE_ACCOUNT_INFO_BYTES, if (self.profile_account_flow.stage == .decrypted) "expected success-path cleanup before accounts_ insertion" else "early LoadAccount cleanup" },
         );
         return;
     }
@@ -4712,7 +4715,7 @@ pub fn observeBackendGuestLog(self: anytype, message: []const u8) void {
             observation.delta_steps,
             self.active_guest_thread,
             return_address,
-            if (caller) |symbol| symbol.name else "<unknown>",
+            self.metadata.symbolLabelFor(caller, return_address),
             if (caller) |symbol| symbol.offset else 0,
         },
     );
@@ -4755,7 +4758,7 @@ pub fn noteBackendMmapAttempt(self: anytype, route: []const u8, address: u64, le
     const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
     machoCapturePrint(
         "macho-processor: x64 backend mmap attempt #{d}: route={s} phase={s} step={d} address=0x{x} length={d} prot=0x{x} flags=0x{x} fixed={} anonymous={} caller=0x{x} {s}+0x{x}\n",
-        .{ self.backend_diagnostics.mmap_attempts_during_backend, route, @tagName(self.backend_diagnostics.phase), self.executed_steps, address, length, prot, flags, fixed, anonymous, return_address, if (caller) |symbol| symbol.name else "<unknown>", if (caller) |symbol| symbol.offset else 0 },
+        .{ self.backend_diagnostics.mmap_attempts_during_backend, route, @tagName(self.backend_diagnostics.phase), self.executed_steps, address, length, prot, flags, fixed, anonymous, return_address, self.metadata.symbolLabelFor(caller, return_address), if (caller) |symbol| symbol.offset else 0 },
     );
 }
 

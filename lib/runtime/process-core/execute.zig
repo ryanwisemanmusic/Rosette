@@ -84,6 +84,27 @@ const signExtend = execution_helpers.signExtend;
 
 const log = std.log.scoped(.macho);
 
+fn imulImmediateSize(op: Op) Size {
+    return switch (op) {
+        .imul_reg16_mem16_imm8,
+        .imul_reg16_reg16_imm8,
+        .imul_reg16_mem16_imm16,
+        .imul_reg16_reg16_imm16,
+        => .bits16,
+        .imul_reg32_mem32_imm8,
+        .imul_reg32_reg32_imm8,
+        .imul_reg32_mem32_imm32,
+        .imul_reg32_reg32_imm32,
+        => .bits32,
+        .imul_reg64_mem64_imm8,
+        .imul_reg64_reg64_imm8,
+        .imul_reg64_mem64_imm32,
+        .imul_reg64_reg64_imm32,
+        => .bits64,
+        else => unreachable,
+    };
+}
+
 fn releaseBarrier() void {
     proc_diag.releaseBarrier();
 }
@@ -495,6 +516,28 @@ inline fn cleoHandles(op: Op) bool {
     return (cleo_supported_bits[index / 64] >> @truncate(index % 64)) & 1 != 0;
 }
 
+fn x87MemoryValue(self: anytype, d: DecodedInsn, integer: bool) f64 {
+    const bits = self.readMemVal(d.addr, d.size);
+    if (integer) {
+        return switch (d.size) {
+            .bits16 => @floatFromInt(@as(i16, @bitCast(@as(u16, @truncate(bits))))),
+            .bits32 => @floatFromInt(@as(i32, @bitCast(@as(u32, @truncate(bits))))),
+            .bits64 => @floatFromInt(@as(i64, @bitCast(bits))),
+            .bits8 => 0.0,
+        };
+    }
+    return switch (d.size) {
+        .bits32 => @floatCast(@as(f32, @bitCast(@as(u32, @truncate(bits))))),
+        .bits64 => @bitCast(bits),
+        .bits16, .bits8 => 0.0,
+    };
+}
+
+fn executeX87Memory(self: anytype, d: DecodedInsn) void {
+    const integer = (d.imm & (@as(u64, 1) << 3)) != 0;
+    self.x87.memoryBinary(x87MemoryValue(self, d, integer), @truncate(d.imm & 7));
+}
+
 pub fn execute(self: anytype, initial_d: DecodedInsn) void {
     // EVEX uses a distinct 32-register vector file and mask semantics. Route
     // it before CLEO and the legacy VEX switch so high ZMM operands cannot be
@@ -602,6 +645,15 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
     // from an arm here is equivalent to falling out of it — that equivalence
     // is what makes copying an arm up safe, and it is the thing to re-check
     // before adding one.
+    //
+    // Every arm here MUST `return`. An arm that does not still runs, and then
+    // control reaches the general switch with the same opcode: either the
+    // instruction executes a second time, or — if the general switch has no
+    // arm for it — the run terminates reporting an instruction it had in fact
+    // just executed. Five group-1 imm32 arms were added without one, and the
+    // 2026-09-08 run died on `cmp_reg64_imm32` inside
+    // `xe::CpuFeatures::DetectFeatures` with the comparison already performed.
+    // `make isa-execution-audit` enforces this.
     switch (d.op) {
         .nop => {
             return;
@@ -755,6 +807,26 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             self.executeAddRegImm(d, .bits64);
             return;
         },
+        .or_reg16_imm32, .or_reg32_imm32, .or_reg64_imm32 => {
+            self.executeHighwayImmediate(d, .bit_or, d.size, false);
+            return;
+        },
+        .adc_reg16_imm32, .adc_reg32_imm32, .adc_reg64_imm32 => {
+            self.executeHighwayImmediate(d, .adc, d.size, false);
+            return;
+        },
+        .sbb_reg16_imm32, .sbb_reg32_imm32, .sbb_reg64_imm32 => {
+            self.executeHighwayImmediate(d, .sbb, d.size, false);
+            return;
+        },
+        .xor_reg16_imm32, .xor_reg32_imm32, .xor_reg64_imm32 => {
+            self.executeHighwayImmediate(d, .bit_xor, d.size, false);
+            return;
+        },
+        .cmp_reg16_imm32, .cmp_reg32_imm32, .cmp_reg64_imm32 => {
+            self.executeHighwayImmediate(d, .cmp, d.size, false);
+            return;
+        },
         .sub_reg8_reg8, .sub_reg16_reg16, .sub_reg32_reg32, .sub_reg64_reg64 => {
             const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sub_reg8_reg8) + @intFromEnum(Size.bits8));
             self.executeHighwayRegisterBinary(d, .sub, sz);
@@ -763,6 +835,18 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         .sub_reg8_imm8, .sub_reg16_imm8, .sub_reg32_imm8, .sub_reg64_imm8 => {
             const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sub_reg8_imm8) + @intFromEnum(Size.bits8));
             self.executeSubRegImm(d, sz);
+            return;
+        },
+        .sub_mem8_imm8, .sub_mem16_imm8, .sub_mem32_imm8, .sub_mem64_imm8 => {
+            self.executeHighwayImmediate(d, .sub, d.size, true);
+            return;
+        },
+        // 0x81 /5. `sub rsp, imm32` is the second instruction of a standard
+        // C++ prologue, so this omission stopped the first pre-main
+        // initializer of every Mach-O image: `___cxx_global_var_init.2+0x4`,
+        // two steps in. Its seven sibling group-1 operations were all here.
+        .sub_reg16_imm32, .sub_reg32_imm32, .sub_reg64_imm32 => {
+            self.executeSubRegImm(d, d.size);
             return;
         },
         .cmp_reg8_reg8, .cmp_reg16_reg16, .cmp_reg32_reg32, .cmp_reg64_reg64 => {
@@ -797,6 +881,49 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         },
         .nop => {},
         .cmc => self.regs.rflags ^= RFL_CF,
+        // The string operations already consult `RFL_DF` for their stride;
+        // until these existed the guest was subject to a flag it had no
+        // encoding to change, and a `cld` in a memcpy prologue was an invalid
+        // instruction that stopped the run.
+        .cld => self.regs.rflags &= ~RFL_DF,
+        .std => self.regs.rflags |= RFL_DF,
+        // XCHG rAX, r64. Flags are untouched, and the exchange is defined even
+        // when both operands name the same register.
+        .xchg_accum_reg => {
+            const sz = d.size;
+            const left = self.regVal(.al_ax_eax_rax, sz);
+            const right = self.regVal(d.src_reg, sz);
+            self.setReg(.al_ax_eax_rax, sz, right);
+            self.setReg(d.src_reg, sz, left);
+        },
+        // Counted loops. The counter is RCX, or ECX under an address-size
+        // override, and it is decremented before the condition is tested.
+        // JRCXZ is the exception: it tests without decrementing.
+        .loopne, .loope, .loop, .jrcxz => {
+            const counter_size: Size = if (d.has_0x67) .bits32 else .bits64;
+            var taken = false;
+            if (d.op == .jrcxz) {
+                taken = self.regVal(.cl_cx_ecx_rcx, counter_size) == 0;
+            } else {
+                const next = self.regVal(.cl_cx_ecx_rcx, counter_size) -% 1;
+                self.setReg(.cl_cx_ecx_rcx, counter_size, next);
+                const zero = (self.regs.rflags & RFL_ZF) != 0;
+                taken = next != 0 and switch (d.op) {
+                    .loope => zero,
+                    .loopne => !zero,
+                    else => true,
+                };
+            }
+            if (taken) self.regs.rip = self.regs.rip +% d.len +% d.imm else self.regs.rip +%= d.len;
+            return;
+        },
+        // XLAT: AL = [rBX + AL], zero-extending the index.
+        .xlat => {
+            const table = self.regVal(.bl_bx_ebx_rbx, .bits64);
+            const index = self.regVal(.al_ax_eax_rax, .bits8) & 0xFF;
+            const value = self.readMemVal(table +% index, .bits8);
+            self.setReg(.al_ax_eax_rax, .bits8, value & 0xFF);
+        },
         .clc => self.regs.rflags &= ~RFL_CF,
         .stc => self.regs.rflags |= RFL_CF,
         .lahf => {
@@ -877,6 +1004,28 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         .fxch_st => _ = self.x87.exchange(@truncate(d.imm)),
         .ffree_st => self.x87.free(@truncate(d.imm)),
         .fninit => self.x87.reset(),
+        .fchs => self.x87.fchs(),
+        .fabs => self.x87.fabs(),
+        .ftst => self.x87.testValue(),
+        .fxam => self.x87.examine(),
+        .f2xm1 => self.x87.f2xm1(),
+        .fyl2x => self.x87.fyl2x(false),
+        .fptan => self.x87.fptan(),
+        .fpatan => self.x87.fpatan(),
+        .fxtract => self.x87.fxtract(),
+        .fdecstp => self.x87.decrementTop(),
+        .fincstp => self.x87.incrementTop(),
+        .fsin => self.x87.sin(),
+        .fcos => self.x87.cos(),
+        .fprem1 => self.x87.partialRemainderNearest(),
+        .fprem => self.x87.partialRemainderTrunc(),
+        .fyl2xp1 => self.x87.fyl2x(true),
+        .fsqrt => self.x87.sqrt(),
+        .fsincos => self.x87.fsincos(),
+        .frndint => self.x87.frndint(),
+        .fscale => self.x87.fscale(),
+        .fnop => {},
+        .fclex => self.x87.clearExceptions(),
         .fnstsw_ax => self.setReg(.al_ax_eax_rax, .bits16, self.x87.statusWord()),
         .fnstcw_mem16 => self.writeMemVal(d.addr, .bits16, self.x87.control),
         .fldcw_mem16 => self.x87.control = @truncate(self.readMemVal(d.addr, .bits16)),
@@ -887,6 +1036,13 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             (d.imm & (1 << 9)) != 0,
         ),
         .fldz => _ = self.x87.push(0.0),
+        .fld1 => self.x87.pushConstant(.one),
+        .fldl2t => self.x87.pushConstant(.log2_ten),
+        .fldl2e => self.x87.pushConstant(.log2_e),
+        .fldpi => self.x87.pushConstant(.pi),
+        .fldlg2 => self.x87.pushConstant(.log10_two),
+        .fldln2 => self.x87.pushConstant(.log_e_two),
+        .x87_memory => executeX87Memory(self, d),
         .fucomi_st => self.executeFucomi(@truncate(d.imm)),
         .fcomi_st => self.executeFcomi(@truncate(d.imm)),
         .fucomip_st => self.executeFucomip(@truncate(d.imm)),
@@ -1048,6 +1204,9 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sub_reg8_imm8) + @intFromEnum(Size.bits8));
             self.executeSubRegImm(d, sz);
         },
+        .sub_reg16_imm32, .sub_reg32_imm32, .sub_reg64_imm32 => {
+            self.executeSubRegImm(d, d.size);
+        },
         .sbb_reg8_imm8 => {
             const a = self.regOperandVal(d.dst_reg, .bits8, d.dst_high8);
             const b = d.imm;
@@ -1065,6 +1224,10 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             self.setFlagsAdd(a, b + @as(u8, @intFromBool(cf)), r, .bits8);
         },
         .adc_reg16_imm8, .adc_reg32_imm8, .adc_reg64_imm8 => self.executeHighwayImmediate(d, .adc, d.size, false),
+        // `sbb` had only its 8-bit member, so 16/32/64 were resolving
+        // through enum arithmetic into `add_reg*_imm32` and running as
+        // additions. They are their own opcodes now and need their own arm.
+        .sbb_reg16_imm8, .sbb_reg32_imm8, .sbb_reg64_imm8 => self.executeHighwayImmediate(d, .sbb, d.size, false),
         .adc_reg8_mem8 => {
             const a = self.regOperandVal(d.dst_reg, .bits8, d.dst_high8);
             const b = self.readMemVal(d.addr, .bits8);
@@ -1134,6 +1297,69 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         .or_mem64_imm32,
         => {
             self.executeHighwayImmediate(d, .bit_or, d.size, true);
+        },
+        // The rest of group 1's memory forms. `or` had the complete set and
+        // the other seven had between none and four cells, so
+        // `adc qword ptr [rax+8], 0` — the 0x83 /2 encoding at guest
+        // 0x750562 — decoded as `invalid`. Both immediate widths route to the
+        // same highway operation; only `d.size` differs.
+        .add_mem16_imm32,
+        .add_mem32_imm32,
+        .add_mem64_imm32,
+        => {
+            self.executeHighwayImmediate(d, .add, d.size, true);
+        },
+        .adc_mem8_imm8,
+        .adc_mem16_imm8,
+        .adc_mem32_imm8,
+        .adc_mem64_imm8,
+        .adc_mem16_imm32,
+        .adc_mem32_imm32,
+        .adc_mem64_imm32,
+        => {
+            self.executeHighwayImmediate(d, .adc, d.size, true);
+        },
+        .sbb_mem8_imm8,
+        .sbb_mem16_imm8,
+        .sbb_mem32_imm8,
+        .sbb_mem64_imm8,
+        .sbb_mem16_imm32,
+        .sbb_mem32_imm32,
+        .sbb_mem64_imm32,
+        => {
+            self.executeHighwayImmediate(d, .sbb, d.size, true);
+        },
+        .and_mem8_imm8,
+        .and_mem16_imm8,
+        .and_mem32_imm8,
+        .and_mem64_imm8,
+        .and_mem16_imm32,
+        .and_mem32_imm32,
+        .and_mem64_imm32,
+        => {
+            self.executeHighwayImmediate(d, .bit_and, d.size, true);
+        },
+        .sub_mem16_imm32,
+        .sub_mem32_imm32,
+        .sub_mem64_imm32,
+        => {
+            self.executeHighwayImmediate(d, .sub, d.size, true);
+        },
+        .xor_mem8_imm8,
+        .xor_mem16_imm8,
+        .xor_mem32_imm8,
+        .xor_mem64_imm8,
+        .xor_mem16_imm32,
+        .xor_mem32_imm32,
+        .xor_mem64_imm32,
+        => {
+            self.executeHighwayImmediate(d, .bit_xor, d.size, true);
+        },
+        .cmp_mem16_imm32,
+        .cmp_mem32_imm32,
+        .cmp_mem64_imm32,
+        => {
+            self.executeHighwayImmediate(d, .cmp, d.size, true);
         },
 
         .xor_reg8_reg8, .xor_reg16_reg16, .xor_reg32_reg32, .xor_reg64_reg64 => {
@@ -1724,6 +1950,47 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         .ror_mem_imm,
         => self.executeRotate(d),
 
+        // SHLD/SHRD. The vacated end is filled from a second register rather
+        // than with zeros, which is why these cannot reuse the shift arms
+        // below. `48 0F A4 D0 20` (`shld rax, rdx, 32`) at guest 0x744871
+        // decoded as invalid because the family was absent entirely.
+        .shld_reg_imm8,
+        .shld_mem_imm8,
+        .shld_reg_cl,
+        .shld_mem_cl,
+        .shrd_reg_imm8,
+        .shrd_mem_imm8,
+        .shrd_reg_cl,
+        .shrd_mem_cl,
+        => {
+            const sz = d.size;
+            const is_mem = switch (d.op) {
+                .shld_mem_imm8, .shld_mem_cl, .shrd_mem_imm8, .shrd_mem_cl => true,
+                else => false,
+            };
+            const from_cl = switch (d.op) {
+                .shld_reg_cl, .shld_mem_cl, .shrd_reg_cl, .shrd_mem_cl => true,
+                else => false,
+            };
+            const left = switch (d.op) {
+                .shld_reg_imm8, .shld_mem_imm8, .shld_reg_cl, .shld_mem_cl => true,
+                else => false,
+            };
+            const raw = if (from_cl) self.regVal(.cl_cx_ecx_rcx, .bits8) else d.imm;
+            const count: u6 = @intCast(raw & @as(u64, if (sz == .bits64) 0x3F else 0x1F));
+            // A masked count of zero writes nothing and leaves every flag
+            // alone. Treating it as a shift of zero would still recompute
+            // SF/ZF/PF and clear CF, which is a different instruction.
+            if (count == 0) return;
+            const destination = if (is_mem) self.readMemVal(d.addr, sz) else self.regVal(d.dst_reg, sz);
+            const source = self.regVal(d.src_reg, sz);
+            const shifted = x64_decoder.doubleShift(destination, source, count, sz, left);
+            if (is_mem) self.writeMemVal(d.addr, sz, shifted.value) else self.setReg(d.dst_reg, sz, shifted.value);
+            self.setFlagsLogic(shifted.value, sz);
+            self.setFlag(RFL_CF, shifted.carry);
+            // OF is architecturally defined only for a count of one.
+            if (count == 1) self.setFlag(RFL_OF, shifted.sign_changed);
+        },
         .shl_reg_cl, .shl_mem_cl => {
             const sz = d.size;
             const is_mem = d.op == .shl_mem_cl;
@@ -1780,6 +2047,53 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             self.setReg(.al_ax_eax_rax, .bits16, r);
             self.setFlag(RFL_CF, r >> 8 != 0);
             self.setFlag(RFL_OF, r >> 8 != 0);
+        },
+        // The 8-bit forms are the exception in this family: the operand pair
+        // is AH:AL inside AX, not DX:AX, so they cannot share the wider
+        // implementations and were absent while 16/32/64 were complete.
+        .mul_mem8 => {
+            const a = self.regVal(.al_ax_eax_rax, .bits8);
+            const b = self.readMemVal(d.addr, .bits8) & 0xFF;
+            const r = a * b;
+            self.setReg(.al_ax_eax_rax, .bits16, r);
+            self.setFlag(RFL_CF, r >> 8 != 0);
+            self.setFlag(RFL_OF, r >> 8 != 0);
+        },
+        .imul_reg8, .imul_mem8 => {
+            const a: i8 = @bitCast(@as(u8, @truncate(self.regVal(.al_ax_eax_rax, .bits8))));
+            const raw = if (d.op == .imul_mem8) self.readMemVal(d.addr, .bits8) else self.regVal(d.dst_reg, .bits8);
+            const b: i8 = @bitCast(@as(u8, @truncate(raw)));
+            const r: i16 = @as(i16, a) * @as(i16, b);
+            self.setReg(.al_ax_eax_rax, .bits16, @as(u16, @bitCast(r)));
+            // CF and OF are set when the sign-extended low byte does not
+            // reproduce the full 16-bit product.
+            const truncated: i16 = @as(i8, @truncate(r));
+            self.setFlag(RFL_CF, truncated != r);
+            self.setFlag(RFL_OF, truncated != r);
+        },
+        .div_reg8, .div_mem8 => {
+            const raw = if (d.op == .div_mem8) self.readMemVal(d.addr, .bits8) else self.regVal(d.dst_reg, .bits8);
+            const divisor: u8 = @truncate(raw);
+            if (divisor == 0) return self.raiseDivideError();
+            const dividend: u16 = @truncate(self.regVal(.al_ax_eax_rax, .bits16));
+            const quotient = dividend / divisor;
+            if (quotient > std.math.maxInt(u8)) return self.raiseDivideError();
+            // AL takes the quotient and AH the remainder, so the pair is one
+            // 16-bit store rather than two register writes.
+            const remainder: u8 = @truncate(dividend % divisor);
+            self.setReg(.al_ax_eax_rax, .bits16, (@as(u16, remainder) << 8) | @as(u8, @truncate(quotient)));
+        },
+        .idiv_reg8, .idiv_mem8 => {
+            const raw = if (d.op == .idiv_mem8) self.readMemVal(d.addr, .bits8) else self.regVal(d.dst_reg, .bits8);
+            const divisor: i8 = @bitCast(@as(u8, @truncate(raw)));
+            if (divisor == 0) return self.raiseDivideError();
+            const dividend: i16 = @bitCast(@as(u16, @truncate(self.regVal(.al_ax_eax_rax, .bits16))));
+            const quotient = @divTrunc(dividend, @as(i16, divisor));
+            if (quotient < std.math.minInt(i8) or quotient > std.math.maxInt(i8)) return self.raiseDivideError();
+            const remainder = @rem(dividend, @as(i16, divisor));
+            const low: u8 = @bitCast(@as(i8, @intCast(quotient)));
+            const high: u8 = @bitCast(@as(i8, @intCast(remainder)));
+            self.setReg(.al_ax_eax_rax, .bits16, (@as(u16, high) << 8) | low);
         },
         .mul_reg16 => {
             const a = self.regVal(.al_ax_eax_rax, .bits16);
@@ -1887,16 +2201,28 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             const r = a *% b;
             self.setReg(d.dst_reg, sz, r);
         },
-        .imul_reg64_reg64_imm8, .imul_reg32_reg32_imm8 => {
-            const sz = if (d.op == .imul_reg64_reg64_imm8) Size.bits64 else Size.bits32;
+        .imul_reg16_reg16_imm8,
+        .imul_reg16_reg16_imm16,
+        .imul_reg32_reg32_imm8,
+        .imul_reg32_reg32_imm32,
+        .imul_reg64_reg64_imm8,
+        .imul_reg64_reg64_imm32,
+        => {
+            const sz = imulImmediateSize(d.op);
             // Three-operand IMUL reads r/m as its source and does not use
             // the old destination value. Using dst here corrupts pointer
             // and index scaling whenever source and destination differ.
             const r = threeOperandImulResult(&self.regs, d, sz);
             self.setReg(d.dst_reg, sz, r);
         },
-        .imul_reg64_mem64_imm8, .imul_reg32_mem32_imm8 => {
-            const sz = if (d.op == .imul_reg64_mem64_imm8) Size.bits64 else Size.bits32;
+        .imul_reg16_mem16_imm8,
+        .imul_reg16_mem16_imm16,
+        .imul_reg32_mem32_imm8,
+        .imul_reg32_mem32_imm32,
+        .imul_reg64_mem64_imm8,
+        .imul_reg64_mem64_imm32,
+        => {
+            const sz = imulImmediateSize(d.op);
             const a = self.readMemVal(d.addr, sz);
             const r = a *% d.imm;
             self.setReg(d.dst_reg, sz, r);
@@ -2121,9 +2447,11 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         },
         .movups_xmm_xmm, .movaps_xmm_xmm => {
             self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
+            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
         },
         .movups_xmm_mem, .movaps_xmm_mem => {
             self.xmm[d.xmm_dst] = self.readMem128(d.addr);
+            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
         },
         .movups_mem_xmm, .movaps_mem_xmm => {
             self.writeMem128(d.addr, self.xmm[d.xmm_src]);
@@ -2154,6 +2482,12 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             @memset(&self.xmm[d.xmm_dst], 0);
             if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
             std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], value, .little);
+        },
+        .vmovq_xmm_xmm => {
+            var result = self.xmm[d.xmm_src];
+            @memset(result[8..16], 0);
+            self.xmm[d.xmm_dst] = result;
+            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
         },
         .vmovq_reg64_xmm, .vmovq_mem64_xmm => {
             const value = std.mem.readInt(u64, self.xmm[d.xmm_src][0..8], .little);
@@ -2239,7 +2573,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             if (d.vector_256) {
                 const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
                 self.ymm_hi[d.xmm_dst] = unpackLowDwords(self.ymm_hi[d.xmm_src], rhs_high);
-            } else {
+            } else if (!d.legacy_sse) {
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }
         },
@@ -2249,7 +2583,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             if (d.vector_256) {
                 const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
                 self.ymm_hi[d.xmm_dst] = unpackLowQwords(self.ymm_hi[d.xmm_src], rhs_high);
-            } else {
+            } else if (!d.legacy_sse) {
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }
         },
@@ -2288,7 +2622,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         },
         .vmovss_xmm_mem => {
             @memset(&self.xmm[d.xmm_dst], 0);
-            @memset(&self.ymm_hi[d.xmm_dst], 0);
+            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
             std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], @truncate(self.readMemVal(d.addr, .bits32)), .little);
         },
         .vmovss_mem_xmm => {
@@ -2296,16 +2630,28 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         },
         .vmovsd_xmm_mem => {
             @memset(&self.xmm[d.xmm_dst], 0);
-            @memset(&self.ymm_hi[d.xmm_dst], 0);
+            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
             std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], self.readMemVal(d.addr, .bits64), .little);
         },
         .vmovsd_mem_xmm => {
             self.writeMemVal(d.addr, .bits64, std.mem.readInt(u64, self.xmm[d.xmm_src][0..8], .little));
         },
+        .vmovss_xmm_xmm => {
+            const source = std.mem.readInt(u32, self.xmm[d.xmm_src][0..4], .little);
+            if (!d.legacy_sse) @memset(&self.xmm[d.xmm_dst], 0);
+            std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], source, .little);
+            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
+        },
+        .vmovsd_xmm_xmm => {
+            const source = std.mem.readInt(u64, self.xmm[d.xmm_src][0..8], .little);
+            if (!d.legacy_sse) @memset(&self.xmm[d.xmm_dst], 0);
+            std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], source, .little);
+            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
+        },
         .vmovlps_xmm_xmm_mem64, .vmovlpd_xmm_xmm_mem64 => {
             self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
             std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], self.readMemVal(d.addr, .bits64), .little);
-            @memset(&self.ymm_hi[d.xmm_dst], 0);
+            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
         },
         .vmovlps_mem64_xmm, .vmovlpd_mem64_xmm => {
             self.writeMemVal(d.addr, .bits64, std.mem.readInt(u64, self.xmm[d.xmm_src][0..8], .little));
@@ -2313,10 +2659,18 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         .vmovhps_xmm_xmm_mem64, .vmovhpd_xmm_xmm_mem64 => {
             self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
             std.mem.writeInt(u64, self.xmm[d.xmm_dst][8..16], self.readMemVal(d.addr, .bits64), .little);
-            @memset(&self.ymm_hi[d.xmm_dst], 0);
+            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
         },
         .vmovhps_mem64_xmm, .vmovhpd_mem64_xmm => {
             self.writeMemVal(d.addr, .bits64, std.mem.readInt(u64, self.xmm[d.xmm_src][8..16], .little));
+        },
+        .vmovhlps => {
+            @memcpy(self.xmm[d.xmm_dst][0..8], self.xmm[d.xmm_src][8..16]);
+            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
+        },
+        .vmovlhps => {
+            @memcpy(self.xmm[d.xmm_dst][8..16], self.xmm[d.xmm_src][0..8]);
+            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
         },
         .vmovshdup, .vmovsldup, .vmovddup => {
             const source_low = if (d.is_reg_form) self.xmm[d.xmm_src] else self.readMem128(d.addr);
@@ -2333,7 +2687,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         },
         .vcvtsi2ss_xmm_reg, .vcvtsi2ss_xmm_mem => {
             self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
-            @memset(&self.ymm_hi[d.xmm_dst], 0);
+            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
             const integer: i64 = if (d.size == .bits64)
                 @bitCast(if (d.op == .vcvtsi2ss_xmm_reg) self.regVal(d.src_reg, .bits64) else self.readMemVal(d.addr, .bits64))
             else
@@ -2343,7 +2697,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         },
         .vcvtsi2sd_xmm_reg, .vcvtsi2sd_xmm_mem => {
             self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
-            @memset(&self.ymm_hi[d.xmm_dst], 0);
+            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
             const integer: i64 = if (d.size == .bits64)
                 @bitCast(if (d.op == .vcvtsi2sd_xmm_reg) self.regVal(d.src_reg, .bits64) else self.readMemVal(d.addr, .bits64))
             else
@@ -2353,7 +2707,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         },
         .vcvtss2sd => {
             self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
-            @memset(&self.ymm_hi[d.xmm_dst], 0);
+            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
             const source_bits = if (d.is_reg_form)
                 std.mem.readInt(u32, self.xmm[d.xmm_src2][0..4], .little)
             else
@@ -2363,7 +2717,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         },
         .vcvtsd2ss => {
             self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
-            @memset(&self.ymm_hi[d.xmm_dst], 0);
+            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
             const source_bits = if (d.is_reg_form)
                 std.mem.readInt(u64, self.xmm[d.xmm_src2][0..8], .little)
             else
@@ -2405,6 +2759,8 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         .vcvtdq2ps => self.executeVexConvertPacked(d, .dword_to_float),
         .vcvtps2dq => self.executeVexConvertPacked(d, .float_to_dword_round),
         .vcvttps2dq => self.executeVexConvertPacked(d, .float_to_dword_truncate),
+        .vcvtps2pd => execution_helpers.executeVexConvertFloatPacked(self, d, .single_to_double),
+        .vcvtpd2ps => execution_helpers.executeVexConvertFloatPacked(self, d, .double_to_single),
         .vsqrtps => {
             self.executeVexSqrtPackedF32(d);
         },
@@ -2549,6 +2905,9 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }
         },
+        .vunpcklps, .vunpckhps, .vunpcklpd, .vunpckhpd => {
+            execution_helpers.executeVexPackedUnpack(self, d);
+        },
         .vpmuludq => {
             const source1_low = self.xmm[d.xmm_src];
             const source2_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
@@ -2664,7 +3023,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                     .vpunpckhqdq => unpackHighQwords(self.ymm_hi[d.xmm_src], rhs_high),
                     else => unreachable,
                 };
-            } else {
+            } else if (!d.legacy_sse) {
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }
         },
@@ -2772,7 +3131,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 0;
             machoCapturePrint(
                 "macho-processor: UD2 encounter: rip=0x{x} {s}+0x{x} active=0x{x} signal_depth={d} assertion={s} assertion_thread=0x{x} assertion_age={d} assertion_return=0x{x} bytes=0f0b\n",
-                .{ self.regs.rip, if (symbol) |entry| entry.name else "<unknown>", if (symbol) |entry| entry.offset else 0, self.active_guest_thread, self.signal_frame_count, @tagName(assertion_context.class), assertion_context.thread, assertion_age, assertion_context.return_address },
+                .{ self.regs.rip, self.metadata.symbolLabelFor(symbol, self.regs.rip), if (symbol) |entry| entry.offset else 0, self.active_guest_thread, self.signal_frame_count, @tagName(assertion_context.class), assertion_context.thread, assertion_age, assertion_context.return_address },
             );
             if (self.deliverGuestSignal(GUEST_SIGILL, self.regs.rip, d.len, self.regs.rip, null, 0, "ud2")) return;
             machoCapturePrint("macho-processor: UD2 instruction at rip=0x{x} — unhandled guest SIGILL\n", .{self.regs.rip});
@@ -2851,7 +3210,18 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         },
 
         else => {
-            log.warn("unimplemented instruction: {s} at rip=0x{x}", .{ @tagName(d.op), self.regs.rip });
+            // Name the encoding, not just the opcode. A reader who has this
+            // line should not have to run the guest again to learn how wide
+            // the operand was or how many bytes the decoder consumed, and the
+            // owner is always Rosette: the decoder proved it understood the
+            // instruction well enough to name it.
+            log.warn(
+                "unimplemented instruction: {s} size={s} len={d} at rip=0x{x}; " ++
+                    "the decoder produced this opcode and no execution arm accepts it, " ++
+                    "which is a Rosette coverage gap rather than a guest defect. " ++
+                    "`make isa-execution-audit` lists every opcode in this state",
+                .{ @tagName(d.op), @tagName(d.size), d.len, self.regs.rip },
+            );
             self.faulted = true;
             self.exit_code = 127;
             self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unimplemented_instruction);

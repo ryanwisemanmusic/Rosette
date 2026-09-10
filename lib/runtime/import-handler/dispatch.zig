@@ -244,7 +244,10 @@ pub fn handleImportImpl(self: anytype, imported: macho_metadata.ImportedSymbol) 
         const skips_slow_path = entry.route != .legacy and entry.route != .strtoul;
         if (dispatchImportRoute(self, entry.route, imported)) |result| {
             self.import_route_cache_hits +|= 1;
-            if (!skips_slow_path) self.import_route_cache_slow_hits +|= 1;
+            if (!skips_slow_path) {
+                self.import_route_cache_slow_hits +|= 1;
+                self.import_route_slow_witness.note(imported.name);
+            }
             return result;
         }
         // The cached route declined the symbol it was cached for. That is a
@@ -277,6 +280,15 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
     // cost one extra compare on the matched name, never select the wrong
     // branch, so the chain's semantics are byte-for-byte unchanged.
     const name_hash = importNameHash(name);
+    // The libc++ `std::string` method block below is fifteen naive substring
+    // searches whose needles are 60-70 mangled bytes each — 948 needle bytes
+    // per dispatch that reaches them, on a chain re-walked by every
+    // `.legacy` route-cache hit. Every one of those needles contains
+    // `basic_string`, so a name without it cannot match any of them and one
+    // twelve-byte search stands in for all fifteen. Exact rather than
+    // heuristic: the guard is implied by each needle, not an approximation
+    // of it.
+    const may_be_basic_string = std.mem.indexOf(u8, name, "basic_string") != null;
     if (((name_hash == importNameHash("_exit") and std.mem.eql(u8, name, "_exit")) or
         (name_hash == importNameHash("exit") and std.mem.eql(u8, name, "exit"))) and
         self.foreign_objects.main_loop_bypasses != 0)
@@ -665,7 +677,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
             );
             machoCapturePrint(
                 "  assertion context: step={d} phase={s} active=0x{x} return=0x{x} caller={s}+0x{x} rsp=0x{x} rbp=0x{x}\n",
-                .{ self.executed_steps, @tagName(self.startup.phase), self.active_guest_thread, return_address, if (caller) |symbol| symbol.name else "<unknown>", if (caller) |symbol| symbol.offset else 0, self.regs.rsp, self.regs.rbp },
+                .{ self.executed_steps, @tagName(self.startup.phase), self.active_guest_thread, return_address, self.metadata.symbolLabelFor(caller, return_address), if (caller) |symbol| symbol.offset else 0, self.regs.rsp, self.regs.rbp },
             );
             if (backend_binding != .none) {
                 machoCapturePrint(
@@ -1001,7 +1013,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         return .{ .handled = self.guest_errno_address };
     }
 
-    if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEPKcm") != null) {
+    if (may_be_basic_string and std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEPKcm") != null) {
         const ok = compat_runtime.initLibcppString(self, self.regs.rdi, self.regs.rsi, self.regs.rdx);
         if (self.verbose_trace) machoCapturePrint(
             "    [libc++] basic_string::__init(this=0x{x}, source=0x{x}, length={d}) -> {}\n",
@@ -1009,7 +1021,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         );
         return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
     }
-    if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6assignEPKc") != null) {
+    if (may_be_basic_string and std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6assignEPKc") != null) {
         const source = self.guestCString(self.regs.rsi, 1 << 20) orelse return .{ .unsupported = 0 };
         const ok = compat_runtime.assignLibcppStringFromBytes(self, self.regs.rdi, self.regs.rsi, source.len);
         if (self.verbose_trace) machoCapturePrint(
@@ -1018,30 +1030,30 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         );
         return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
     }
-    if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6resizeEmc") != null) {
+    if (may_be_basic_string and std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6resizeEmc") != null) {
         const ok = compat_runtime.resizeLibcppString(self, self.regs.rdi, self.regs.rsi, @truncate(self.regs.rdx));
         return if (ok) .handled_void else .{ .unsupported = 0 };
     }
-    if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSEc") != null) {
+    if (may_be_basic_string and std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSEc") != null) {
         const value = [_]u8{@truncate(self.regs.rsi)};
         const ok = compat_runtime.assignLibcppStringLiteral(self, self.regs.rdi, &value);
         return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
     }
-    if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm") != null) {
+    if (may_be_basic_string and std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm") != null) {
         const ok = compat_runtime.appendLibcppString(self, self.regs.rdi, self.regs.rsi, self.regs.rdx);
         return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
     }
-    if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKc") != null) {
+    if (may_be_basic_string and std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKc") != null) {
         const source = self.guestCString(self.regs.rsi, 1 << 20) orelse return .{ .unsupported = 0 };
         const ok = compat_runtime.appendLibcppString(self, self.regs.rdi, self.regs.rsi, source.len);
         return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
     }
-    if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKc") != null) {
+    if (may_be_basic_string and std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKc") != null) {
         const source = self.guestCString(self.regs.rdx, 1 << 20) orelse return .{ .unsupported = 0 };
         const ok = compat_runtime.insertLibcppString(self, self.regs.rdi, self.regs.rsi, self.regs.rdx, source.len);
         return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
     }
-    if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9__grow_byEmmmmmm") != null) {
+    if (may_be_basic_string and std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9__grow_byEmmmmmm") != null) {
         const inserted_size = self.read64(self.regs.rsp + 8);
         const ok = compat_runtime.growLibcppString(
             self,
@@ -1055,8 +1067,9 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         );
         return if (ok) .{ .handled = 0 } else .{ .unsupported = 0 };
     }
-    if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC1ERKS5_") != null or
-        std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC2ERKS5_") != null)
+    if (may_be_basic_string and
+        (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC1ERKS5_") != null or
+            std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC2ERKS5_") != null))
     {
         const ok = compat_runtime.copyLibcppString(self, self.regs.rdi, self.regs.rsi);
         if (!ok) {
@@ -1091,22 +1104,23 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         }
         return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
     }
-    if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSERKS5_") != null) {
+    if (may_be_basic_string and std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSERKS5_") != null) {
         const ok = compat_runtime.assignLibcppString(self, self.regs.rdi, self.regs.rsi);
         return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
     }
-    if (std.mem.indexOf(u8, name, "__ZNSt3__1plIcNS_11char_traitsIcEENS_9allocatorIcEEEENS_12basic_stringIT_T0_T1_EEPKS6_RKS9_") != null) {
+    if (may_be_basic_string and std.mem.indexOf(u8, name, "__ZNSt3__1plIcNS_11char_traitsIcEENS_9allocatorIcEEEENS_12basic_stringIT_T0_T1_EEPKS6_RKS9_") != null) {
         const left = self.guestCString(self.regs.rsi, 1 << 20) orelse return .{ .unsupported = 0 };
         const ok = compat_runtime.concatCStringAndLibcppString(self, self.regs.rdi, self.regs.rsi, left.len, self.regs.rdx);
         return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
     }
-    if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev") != null or
-        std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED2Ev") != null)
+    if (may_be_basic_string and
+        (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev") != null or
+            std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED2Ev") != null))
     {
         const ok = compat_runtime.destroyLibcppString(self, self.regs.rdi);
         return if (ok) .{ .handled = 0 } else .{ .unsupported = 0 };
     }
-    if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEcm") != null) {
+    if (may_be_basic_string and std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEcm") != null) {
         const string = compat_runtime.libcppStringView(self, self.regs.rdi) orelse return .{ .unsupported = 0 };
         const bytes = self.guestMemoryConst(string.address, string.length) orelse return .{ .unsupported = 0 };
         const start: usize = @intCast(@min(self.regs.rdx, string.length));
