@@ -1,0 +1,13 @@
+name = "dll-win32-library-inventory"
+version = "0.1.0-local"
+kind = "windows-library-subsystem-map"
+role = "build-time"
+# Route-independent: a library's identity does not change with the
+# architecture Rosette was compiled for.
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
+# The package answers "is this the Windows surface" and "which capability is
+# it". Whether the host has the library, and whether Rosette implements any of
+# its exports, are runtime facts and live with the runtime.
