@@ -116,6 +116,23 @@ test "three-byte VEX decodes the reported VPMAXSD instruction" {
     try std.testing.expectEqual(types.Op.vpmaxsd, dispatched.op);
 }
 
+test "three-byte VEX decodes long-form VMOVQ XMM loads" {
+    // Xenia emits this high-register form while preparing Vulkan state:
+    // vmovq xmm8, qword ptr [r12+4]. The encoding has VEX.L=1, but VMOVQ
+    // still writes only the low 64 bits and clears the rest of the XMM value.
+    const bytes = [_]u8{ 0xC4, 0x41, 0x7A, 0x7E, 0x44, 0x24, 0x04 };
+    const decoded = vex.decodeVex3(&bytes, 0);
+    try std.testing.expectEqual(types.Op.vmovq_xmm_mem64, decoded.op);
+    try std.testing.expectEqual(@as(u8, 8), decoded.xmm_dst);
+    try std.testing.expectEqual(types.RegId.r12b_r12w_r12d_r12, decoded.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 4), decoded.addr);
+    try std.testing.expectEqual(@as(u8, 7), decoded.len);
+    try std.testing.expect(!decoded.vector_256);
+
+    const dispatched = legacy.decodeLegacyInstruction(&bytes, .long64);
+    try std.testing.expectEqual(types.Op.vmovq_xmm_mem64, dispatched.op);
+}
+
 test "VEX packed arithmetic shifts decode in both the C5 and C4 forms" {
     // Regression: `C5 F1 E2 CC` (VPSRAD xmm1, xmm1, xmm4) raised SIGILL inside
     // Xenia's shader translator. E1/E2 were absent from *both* VEX opcode
@@ -150,6 +167,67 @@ test "VEX2 VSHUFPD decodes its mandatory 66 packed-double form" {
     try std.testing.expectEqual(types.Op.vshufpd, dispatched.op);
 }
 
+test "VEX move-mask decodes through the production legacy dispatch" {
+    // VMOVMSKPD eax, ymm0 — this is the exact instruction that stopped the
+    // Xenia graphics bootstrap after Vulkan shader-module creation began.
+    const bytes = [_]u8{ 0xC5, 0xFD, 0x50, 0xC0 };
+    const decoded = vex.decodeVex2(&bytes, 0);
+    try std.testing.expectEqual(types.Op.vmovmskpd, decoded.op);
+    try std.testing.expectEqual(@as(u8, 0), decoded.xmm_src);
+    try std.testing.expectEqual(types.RegId.al_ax_eax_rax, decoded.dst_reg);
+    try std.testing.expect(decoded.vector_256);
+    try std.testing.expect(decoded.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 4), decoded.len);
+
+    const dispatched = legacy.decodeLegacyInstruction(&bytes, .long64);
+    try std.testing.expectEqual(types.Op.vmovmskpd, dispatched.op);
+    try std.testing.expectEqual(@as(u8, 4), dispatched.len);
+}
+
+test "VEX register half-move decodes through the production legacy dispatch" {
+    // VMOVLHPS xmm1, xmm1 — C5 E8 16 C9. The register form is distinct from
+    // the memory VMOVHPS form that shares opcode 0x16.
+    const bytes = [_]u8{ 0xC5, 0xE8, 0x16, 0xC9 };
+    const decoded = vex.decodeVex2(&bytes, 0);
+    try std.testing.expectEqual(types.Op.vmovlhps, decoded.op);
+    try std.testing.expectEqual(@as(u8, 1), decoded.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 1), decoded.xmm_src);
+    try std.testing.expect(decoded.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 4), decoded.len);
+
+    const dispatched = legacy.decodeLegacyInstruction(&bytes, .long64);
+    try std.testing.expectEqual(types.Op.vmovlhps, dispatched.op);
+    try std.testing.expectEqual(@as(u8, 4), dispatched.len);
+}
+
+test "VEX packed single/double conversions decode through both production forms" {
+    // VCVTPD2PS xmm0, xmm0 — the exact register-form instruction that stopped
+    // the latest Xenia graphics bootstrap. The F9 control byte carries the
+    // mandatory 66 prefix; it is not the reverse conversion.
+    const pd2ps = [_]u8{ 0xC5, 0xF9, 0x5A, 0xC0 };
+    const pd2ps_decoded = vex.decodeVex2(&pd2ps, 0);
+    try std.testing.expectEqual(types.Op.vcvtpd2ps, pd2ps_decoded.op);
+    try std.testing.expectEqual(@as(u8, 0), pd2ps_decoded.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), pd2ps_decoded.xmm_src2);
+    try std.testing.expect(pd2ps_decoded.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 4), pd2ps_decoded.len);
+    try std.testing.expectEqual(types.Op.vcvtpd2ps, legacy.decodeLegacyInstruction(&pd2ps, .long64).op);
+
+    // Keep the unprefixed reverse direction covered as well.
+    const ps2pd = [_]u8{ 0xC5, 0xF8, 0x5A, 0xC0 };
+    const ps2pd_decoded = vex.decodeVex2(&ps2pd, 0);
+    try std.testing.expectEqual(types.Op.vcvtps2pd, ps2pd_decoded.op);
+    try std.testing.expectEqual(types.Op.vcvtps2pd, legacy.decodeLegacyInstruction(&ps2pd, .long64).op);
+
+    // The C4 path is the form used when register allocation selects xmm8+ or
+    // when the instruction requests a 256-bit source/destination shape.
+    const wide_pd2ps = [_]u8{ 0xC4, 0xE1, 0x7D, 0x5A, 0xC1 };
+    const wide_decoded = vex.decodeVex3(&wide_pd2ps, 0);
+    try std.testing.expectEqual(types.Op.vcvtpd2ps, wide_decoded.op);
+    try std.testing.expect(wide_decoded.vector_256);
+    try std.testing.expectEqual(types.Op.vcvtpd2ps, legacy.decodeLegacyInstruction(&wide_pd2ps, .long64).op);
+}
+
 test "VEX immediate shift group 4 is arithmetic, not a left shift" {
     // The immediate form was worse than missing: group 4 fell into an `else`
     // that produced the *left* logical shift, so `vpsraw $3, xmm, xmm` executed
@@ -168,6 +246,62 @@ test "VEX immediate shift group 4 is arithmetic, not a left shift" {
     // There is no packed arithmetic quadword shift below AVX-512; group 4 of
     // 0x73 must stay refused rather than aliasing onto vpsllq.
     try std.testing.expectEqual(types.Op.invalid, vex.decodeVex2(&[_]u8{ 0xC5, 0xE9, 0x73, 0xE2, 0x03 }, 0).op);
+}
+
+test "VEX short-form PEXTRW decodes the 0F C5 encoding" {
+    // VEX.128.66.0F.W0 C5 /r ib: vpextrw ecx, xmm13, 1.
+    const decoded = vex.decodeVex2(&[_]u8{ 0xC5, 0x79, 0xC5, 0xE9, 0x01 }, 0);
+    try std.testing.expectEqual(types.Op.vpextrw, decoded.op);
+    try std.testing.expectEqual(@as(u8, 5), decoded.len);
+    try std.testing.expectEqual(@as(u8, 13), decoded.xmm_src);
+    try std.testing.expectEqual(types.RegId.cl_cx_ecx_rcx, decoded.dst_reg);
+    try std.testing.expect(decoded.is_reg_form);
+    try std.testing.expectEqual(@as(u64, 1), decoded.imm);
+}
+
+test "VEX packed floating-point unpack decodes both VEX widths" {
+    // C5 D8 14 C2: VUNPCKLPS xmm0, xmm4, xmm2.
+    const short = vex.decodeVex2(&[_]u8{ 0xC5, 0xD8, 0x14, 0xC2 }, 0);
+    try std.testing.expectEqual(types.Op.vunpcklps, short.op);
+    try std.testing.expectEqual(@as(u8, 4), short.xmm_src);
+    try std.testing.expectEqual(@as(u8, 2), short.xmm_src2);
+    try std.testing.expectEqual(@as(u8, 4), short.len);
+    try std.testing.expect(short.is_reg_form);
+
+    // C4 E1 75 15 C2: VUNPCKHPD xmm0, xmm1, xmm2.
+    const long = vex.decodeVex3(&[_]u8{ 0xC4, 0xE1, 0x75, 0x15, 0xC2 }, 0);
+    try std.testing.expectEqual(types.Op.vunpckhpd, long.op);
+    try std.testing.expectEqual(@as(u8, 1), long.xmm_src);
+    try std.testing.expectEqual(@as(u8, 2), long.xmm_src2);
+    try std.testing.expectEqual(@as(u8, 5), long.len);
+    try std.testing.expect(long.is_reg_form);
+}
+
+test "VEX VPMADDWD decodes through both production forms" {
+    // C5 A1 F5 DA: VPMADDWD xmm3, xmm11, xmm2. This is the exact short-form
+    // instruction that stopped the Xenia graphics setup path after Vulkan
+    // frame resources had been created.
+    const short = [_]u8{ 0xC5, 0xA1, 0xF5, 0xDA };
+    const short_decoded = vex.decodeVex2(&short, 0);
+    try std.testing.expectEqual(types.Op.vpmaddwd, short_decoded.op);
+    try std.testing.expectEqual(@as(u8, 3), short_decoded.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 11), short_decoded.xmm_src);
+    try std.testing.expectEqual(@as(u8, 2), short_decoded.xmm_src2);
+    try std.testing.expect(short_decoded.is_reg_form);
+    try std.testing.expect(!short_decoded.vector_256);
+    try std.testing.expectEqual(@as(u8, 4), short_decoded.len);
+    try std.testing.expectEqual(types.Op.vpmaddwd, legacy.decodeLegacyInstruction(&short, .long64).op);
+
+    // C4 E1 7D F5 DA: the corresponding 256-bit three-byte spelling.
+    const long = [_]u8{ 0xC4, 0xE1, 0x7D, 0xF5, 0xDA };
+    const long_decoded = vex.decodeVex3(&long, 0);
+    try std.testing.expectEqual(types.Op.vpmaddwd, long_decoded.op);
+    try std.testing.expectEqual(@as(u8, 3), long_decoded.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), long_decoded.xmm_src);
+    try std.testing.expectEqual(@as(u8, 2), long_decoded.xmm_src2);
+    try std.testing.expect(long_decoded.vector_256);
+    try std.testing.expectEqual(@as(u8, 5), long_decoded.len);
+    try std.testing.expectEqual(types.Op.vpmaddwd, legacy.decodeLegacyInstruction(&long, .long64).op);
 }
 
 test "VEX packed min/max decodes through the production three-byte path" {
@@ -367,6 +501,24 @@ test "VPUNPCK unpack family decodes in both VEX forms with correct opcodes" {
     try std.testing.expectEqual(types.Op.vpcmpgtb, vex.decodeVex2(&[_]u8{ 0xC5, 0xF9, 0x64, 0xC1 }, 0).op);
     try std.testing.expectEqual(types.Op.vpcmpgtw, vex.decodeVex2(&[_]u8{ 0xC5, 0xF9, 0x65, 0xC1 }, 0).op);
     try std.testing.expectEqual(types.Op.vpcmpgtd, vex.decodeVex2(&[_]u8{ 0xC5, 0xF9, 0x66, 0xC1 }, 0).op);
+}
+
+test "VEX packed narrowing family decodes in the two-byte form" {
+    const cases = [_]struct { opcode: u8, want: types.Op }{
+        .{ .opcode = 0x63, .want = .vpacksswb },
+        .{ .opcode = 0x67, .want = .vpackuswb },
+        .{ .opcode = 0x6B, .want = .vpackssdw },
+    };
+    for (cases) |case| {
+        const bytes = [_]u8{ 0xC5, 0xF9, case.opcode, 0xC1 };
+        const decoded = vex.decodeVex2(&bytes, 0);
+        try std.testing.expectEqual(case.want, decoded.op);
+        try std.testing.expectEqual(@as(u8, 0), decoded.xmm_dst);
+        try std.testing.expectEqual(@as(u8, 0), decoded.xmm_src);
+        try std.testing.expectEqual(@as(u8, 1), decoded.xmm_src2);
+        try std.testing.expect(decoded.is_reg_form);
+        try std.testing.expectEqual(@as(u8, 4), decoded.len);
+    }
 }
 
 test "VEX operand roles cover arithmetic moves and scalar lane forms" {

@@ -694,12 +694,95 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         return decodeLegacySseBinary(bytes, &pos.*, rex_r, rex_x, rex_b, has_66, has_f2, has_f3, opcode2);
     }
 
+    if (opcode2 == 0xDB or opcode2 == 0xDF or opcode2 == 0xEB) {
+        // PAND (DB), PANDN (DF), and POR (EB) are the integer packed-XMM
+        // counterparts to the AND/ANDN/OR floating-point encodings.  All
+        // three require 66 in the legacy SSE2 form; the unprefixed bytes are
+        // MMX instructions and must not enter the XMM executor.
+        if (!has_66 or has_f2 or has_f3) return .{};
+        return decodeLegacySseBinary(bytes, &pos.*, rex_r, rex_x, rex_b, has_66, has_f2, has_f3, opcode2);
+    }
+
     if (opcode2 == 0x58 or opcode2 == 0x59 or opcode2 == 0x5C or opcode2 == 0x5D or opcode2 == 0x5E or opcode2 == 0x5F) {
         return decodeLegacySseArithmetic(bytes, &pos.*, rex_r, rex_x, rex_b, has_66, has_f2, has_f3, opcode2);
     }
 
     if (opcode2 == 0xC2) {
         return decodeLegacySseCompare(bytes, &pos.*, rex_r, rex_x, rex_b, has_66, has_f2, has_f3);
+    }
+
+    if (opcode2 == 0xC6) {
+        // SHUFPS (0F C6 /r ib) and SHUFPD (66 0F C6 /r ib) are legacy
+        // two-operand shuffle instructions.  Normalize the destination as
+        // source1 so CLEO's immediate binary path can execute both forms;
+        // legacy_sse preserves the destination's upper YMM half.
+        if (has_f2 or has_f3 or pos.* >= bytes.len) return .{};
+        var decoded = DecodedInsn{ .legacy_sse = true };
+        const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, if (has_66) .bits64 else .bits32);
+        decoded.op = if (has_66) .vshufpd else .vshufps;
+        decoded.size = if (has_66) .bits64 else .bits32;
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = decoded.xmm_dst;
+        if (decoded.is_reg_form) {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        } else {
+            decoded.addr = rm.addr;
+        }
+        if (pos.* >= bytes.len) return .{};
+        decoded.imm = bytes[pos.*];
+        pos.* += 1;
+        decoded.uses_imm = true;
+        decoded.len = @intCast(pos.*);
+        return decoded;
+    }
+
+    if (opcode2 == 0x63 or opcode2 == 0x67 or opcode2 == 0x6B) {
+        // PACKSSWB, PACKUSWB, and PACKSSDW are legacy SSE2 two-operand
+        // narrowing operations.  Their packed source width is the full XMM
+        // register, so use the existing CLEO binary pack implementation and
+        // retain legacy_sse for the upper-YMM preservation rule.
+        if (!has_66 or has_f2 or has_f3 or pos.* >= bytes.len) return .{};
+        var decoded = DecodedInsn{ .legacy_sse = true, .size = .bits64 };
+        const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.op = switch (opcode2) {
+            0x63 => .vpacksswb,
+            0x67 => .vpackuswb,
+            0x6B => .vpackssdw,
+            else => unreachable,
+        };
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = decoded.xmm_dst;
+        if (decoded.is_reg_form) {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        } else {
+            decoded.addr = rm.addr;
+        }
+        decoded.len = @intCast(pos.*);
+        return decoded;
+    }
+
+    if (opcode2 == 0xD4) {
+        // 66 0F D4 /r is the legacy SSE2 PADDQ form.  The shared vector
+        // executor already implements the operation as VPADDQ, but the
+        // legacy encoding is a two-operand instruction: ModRM.reg is both
+        // the destination and the first source, while ModRM.r/m is the
+        // second source.  Keep the legacy marker so the destination's upper
+        // YMM half remains untouched, as required by a legacy SSE operation.
+        // The unprefixed form is the MMX PADDQ encoding and is not decoded by
+        // this XMM path; F2/F3 are reserved for this opcode.
+        if (!has_66 or has_f2 or has_f3 or pos.* >= bytes.len) return .{};
+        var decoded = DecodedInsn{ .legacy_sse = true, .size = .bits64 };
+        const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.op = .vpaddq;
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = decoded.xmm_dst;
+        if (decoded.is_reg_form) {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        } else {
+            decoded.addr = rm.addr;
+        }
+        decoded.len = @intCast(pos.*);
+        return decoded;
     }
 
     if (opcode2 == 0x70) {
@@ -937,8 +1020,10 @@ fn decodeLegacySseBinary(
     opcode: u8,
 ) DecodedInsn {
     // AND/ANDN/OR/XOR packed single/double accept no mandatory prefix or
-    // 66. F2/F3 are different scalar instruction families and must not be
-    // accidentally reinterpreted as a bitwise operation.
+    // 66. The integer PAND/PANDN/POR forms are routed here too after the
+    // caller has verified their required 66 prefix. F2/F3 are different
+    // scalar instruction families and must not be accidentally reinterpreted
+    // as a bitwise operation.
     if (has_f2 or has_f3 or pos.* >= bytes.len) return .{};
     var decoded = DecodedInsn{ .legacy_sse = true };
     const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, .bits64);
@@ -960,6 +1045,9 @@ fn decodeLegacySseBinary(
         0x55 => if (has_66) .vandnpd else .vandnps,
         0x56 => if (has_66) .vorpd else .vorps,
         0x57 => if (has_66) .vxorpd else .vxorps,
+        0xDB => .vandpd,
+        0xDF => .vandnpd,
+        0xEB => .vorpd,
         0xEF => .vpxor,
         else => return .{},
     };

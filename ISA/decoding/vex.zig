@@ -497,6 +497,13 @@ pub fn decodeVexInstruction(bytes: []const u8) ?DecodedInsn {
             };
             return decodeVexPackedBinaryReturn(vex, pos, op, modrm_decoded);
         },
+        0xF5 => {
+            // VPMADDWD (VEX.128/256.66.0F F5 /r) is an NDS packed-integer
+            // operation: VEX.vvvv supplies the first source and ModRM.r/m
+            // supplies the second.
+            if (!vex.has_66_prefix) return null;
+            return decodeVexPackedBinaryReturn(vex, pos, .vpmaddwd, modrm_decoded);
+        },
         0x10 => {
             // VMOVUPS (VEX.0F 10), VMOVUPD (VEX.66.0F 10)
             // VMOVSS (VEX.F3.0F 10), VMOVSD (VEX.F2.0F 10) — load forms
@@ -1759,6 +1766,61 @@ fn decodeVexMaskMove(
     return decoded;
 }
 
+/// Decode VMOVMSKPS/VMOVMSKPD, whose ModR/M.reg field names the GPR
+/// destination and whose ModR/M.r/m field names the XMM/YMM source. The
+/// VEX.vvvv field is reserved and must carry the encoded all-ones value.
+/// Keeping this in a shared helper prevents the production C5 and C4 paths
+/// from drifting apart again.
+fn decodeVexFloatMoveMask(
+    bytes: []const u8,
+    modrm_pos: usize,
+    vex: VexPrefix,
+    opcode: u8,
+) ?DecodedInsn {
+    if (vex.m != 1 or vex.w or vex.vvvv != 0 or opcode != 0x50) return null;
+    if (vex.has_f2_prefix or vex.has_f3_prefix) return null;
+    if (modrm_pos >= bytes.len or (bytes[modrm_pos] >> 6) != 3) return null;
+
+    var decoded = DecodedInsn{
+        .op = if (vex.has_66_prefix) .vmovmskpd else .vmovmskps,
+        .size = .bits32,
+        .vector_256 = vex.l,
+    };
+    var pos = modrm_pos;
+    const rm = readModRM(&decoded, bytes, &pos, vex.r, vex.x, vex.b, .bits64);
+    decoded.dst_reg = rm.reg;
+    decoded.xmm_src = @intCast(rm.addr);
+    decoded.len = @intCast(pos);
+    return decoded;
+}
+
+/// Decode the packed single/double conversion family at 0x5A. These are
+/// unary VEX forms: VEX.vvvv is reserved, ModR/M.reg is the destination, and
+/// ModR/M.r/m is the sole source. The source and destination widths differ
+/// for the L=1 encodings, so keep the vector-length bit on the decoded
+/// instruction instead of routing these through the ordinary NDS helper.
+fn decodeVexPackedFloatConvert(
+    bytes: []const u8,
+    modrm_pos: usize,
+    vex: VexPrefix,
+    op: Op,
+) ?DecodedInsn {
+    if (vex.m != 1 or vex.w or vex.vvvv != 0 or (op != .vcvtps2pd and op != .vcvtpd2ps)) return null;
+    if (modrm_pos >= bytes.len) return null;
+
+    var decoded = DecodedInsn{ .op = op, .vector_256 = vex.l };
+    var pos = modrm_pos;
+    const rm = readModRM(&decoded, bytes, &pos, vex.r, vex.x, vex.b, .bits64);
+    decoded.xmm_dst = @intFromEnum(rm.reg);
+    if (!decoded.is_reg_form) {
+        decoded.addr = rm.addr;
+    } else {
+        decoded.xmm_src2 = @intCast(rm.addr);
+    }
+    decoded.len = @intCast(pos);
+    return decoded;
+}
+
 /// Decode the VEX-encoded BMI1/BMI2 GPR family. VEX.R/X/B are inverted in
 /// the encoding but are already represented in `VexPrefix` as the effective
 /// extension bits. VEX.vvvv is likewise already complemented back to the
@@ -2047,6 +2109,15 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
     };
 
     if (decodeVexMaskMove(bytes, start_pos + 3, mask_vex, opcode)) |decoded| return decoded;
+    if (decodeVexFloatMoveMask(bytes, start_pos + 3, mask_vex, opcode)) |decoded| return decoded;
+    if (opcode == 0x5A and (prefix == 0 or prefix == 1) and mask_vex.vvvv == 0) {
+        return decodeVexPackedFloatConvert(
+            bytes,
+            start_pos + 3,
+            mask_vex,
+            if (prefix == 1) .vcvtpd2ps else .vcvtps2pd,
+        ) orelse .{};
+    }
 
     if (opcode == 0x77 and (vex & 0x78) == 0x78 and !vector_256 and prefix == 0) {
         return .{ .op = .vzeroupper, .len = @intCast(start_pos + 3) };
@@ -2120,6 +2191,40 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
+    // VUNPCKLPS/VUNPCKHPS and VUNPCKLPD/VUNPCKHPD are NDS forms:
+    // VEX.vvvv supplies the first source and ModRM.r/m supplies the second.
+    // Keep these explicit in the production C5 path; the shared table decoder
+    // already knows the family, but legacy.zig reaches this entry point for
+    // guest execution.
+    if ((opcode == 0x14 or opcode == 0x15) and (prefix == 0 or prefix == 1)) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 3;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.op = if (opcode == 0x14)
+            (if (prefix == 1) .vunpcklpd else .vunpcklps)
+        else
+            (if (prefix == 1) .vunpckhpd else .vunpckhps);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VPMADDWD: VEX.NDS.128/256.66.0F F5 /r. Keep the production short-form
+    // path in agreement with the shared VEX map decoder.
+    if (opcode == 0xF5 and prefix == 1) {
+        var pos = start_pos + 3;
+        const modrm = decodeVexModRm(bytes, &pos, mask_vex) orelse return .{};
+        return decodeVexPackedBinaryReturn(mask_vex, pos, .vpmaddwd, modrm) orelse .{};
+    }
+
     // VMOVQ xmm/m64, xmm: VEX.128.66.0F.W0 D6 /r. This is a store-only
     // encoding; the register-to-register spelling uses opcode 7E instead.
     if (opcode == 0xD6 and (vex & 0x78) == 0x78 and !vector_256 and prefix == 1) {
@@ -2172,6 +2277,34 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         } else {
             decoded.xmm_src2 = @intCast(rm.addr);
         }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VPACKSSWB/VPACKUSWB/VPACKSSDW: VEX.NDS.128/256.66.0F
+    // 63/67/6B /r. These are three-operand packed narrowing operations;
+    // VEX.vvvv supplies the first source and ModR/M.r/m the second. Keep the
+    // whole family together so the short C5 form stays symmetric with the
+    // production C4 decoder below.
+    if ((opcode == 0x63 or opcode == 0x67 or opcode == 0x6B) and prefix == 1) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 3;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (opcode) {
+            0x63 => .vpacksswb,
+            0x67 => .vpackuswb,
+            0x6B => .vpackssdw,
+            else => unreachable,
+        };
         decoded.len = @intCast(pos);
         return decoded;
     }
@@ -2470,6 +2603,29 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         }
         if (pos >= bytes.len) return .{};
         decoded.imm = bytes[pos];
+        pos += 1;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VPEXTRW: VEX.128.66.0F.W0 C5 /r ib. This is the short two-byte-VEX
+    // form of word extraction; unlike the byte/dword/qword forms, which use
+    // the 0F3A map, the legacy PEXTRW opcode remains in the 0F map. ModRM.reg
+    // names the source XMM and ModRM.r/m names the zero-extended GPR or the
+    // 16-bit memory destination.
+    if (opcode == 0xC5 and !vector_256 and prefix == 1 and mask_vex.vvvv == 0) {
+        var decoded = DecodedInsn{ .op = .vpextrw, .size = .bits16 };
+        var pos = start_pos + 3;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits16);
+        decoded.xmm_src = @intFromEnum(rm.reg);
+        if (decoded.is_reg_form) {
+            decoded.dst_reg = @enumFromInt(rm.addr);
+        } else {
+            decoded.addr = rm.addr;
+        }
+        if (pos >= bytes.len) return .{};
+        decoded.imm = bytes[pos];
+        decoded.uses_imm = true;
         pos += 1;
         decoded.len = @intCast(pos);
         return decoded;
@@ -3063,6 +3219,17 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
     };
     if (decodeVexGprInstruction(bytes, start_pos + 4, vex, opcode)) |decoded| return decoded;
     if (decodeVexMaskMove(bytes, start_pos + 4, vex, opcode)) |decoded| return decoded;
+    if (decodeVexFloatMoveMask(bytes, start_pos + 4, vex, opcode)) |decoded| return decoded;
+    if (opcode_map == 1 and opcode == 0x5A and !rex_w and vex.vvvv == 0 and
+        (prefix == 0 or prefix == 1))
+    {
+        return decodeVexPackedFloatConvert(
+            bytes,
+            start_pos + 4,
+            vex,
+            if (prefix == 1) .vcvtpd2ps else .vcvtps2pd,
+        ) orelse .{};
+    }
 
     // AVX/AVX2 vector forms that have their own architectural operand order
     // or were previously absent from this production C4 path. Keeping these
@@ -3082,6 +3249,9 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
     }
     if (opcode_map == 1 and prefix == 0 and !rex_w and vector_256 and opcode == 0x2B) {
         return decodeVex3Store(bytes, start_pos, vex, .vmovntps) orelse .{};
+    }
+    if (opcode_map == 1 and prefix == 1 and !rex_w and opcode == 0xF5) {
+        return decodeVex3Nds(bytes, start_pos, vex, .vpmaddwd, false) orelse .{};
     }
     if (opcode_map == 1 and prefix == 1 and !rex_w and !vector_256 and
         vex.vvvv == 0 and opcode == 0xD6)
@@ -3393,6 +3563,56 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (pos >= bytes.len) return .{};
         decoded.imm = bytes[pos];
         pos += 1;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VPEXTRW: VEX.128.66.0F.W0 C5 /r ib. The long VEX spelling is needed
+    // when the source XMM or destination GPR uses one of the VEX extension
+    // bits, while the architectural operand roles remain the same as in the
+    // short form above.
+    if (opcode_map == 1 and opcode == 0xC5 and prefix == 1 and !rex_w and
+        !vector_256 and vex.vvvv == 0)
+    {
+        var decoded = DecodedInsn{ .op = .vpextrw, .size = .bits16 };
+        var pos = start_pos + 4;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits16);
+        decoded.xmm_src = @intFromEnum(rm.reg);
+        if (decoded.is_reg_form) {
+            decoded.dst_reg = @enumFromInt(rm.addr);
+        } else {
+            decoded.addr = rm.addr;
+        }
+        if (pos >= bytes.len) return .{};
+        decoded.imm = bytes[pos];
+        decoded.uses_imm = true;
+        pos += 1;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VUNPCKLPS/VUNPCKHPS and VUNPCKLPD/VUNPCKHPD are NDS forms. The C4
+    // spelling is selected when X/B extension bits are needed, so preserve
+    // those bits through the full ModR/M decoder here.
+    if (opcode_map == 1 and (opcode == 0x14 or opcode == 0x15) and
+        (prefix == 0 or prefix == 1))
+    {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.op = if (opcode == 0x14)
+            (if (prefix == 1) .vunpcklpd else .vunpcklps)
+        else
+            (if (prefix == 1) .vunpckhpd else .vunpckhps);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
         decoded.len = @intCast(pos);
         return decoded;
     }
@@ -3954,6 +4174,31 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         decoded.uses_imm = true;
         decoded.imm = bytes[pos];
         pos += 1;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VMOVQ xmm, xmm/m64 uses the F3 form of opcode 7E. Some Xenia-generated
+    // code emits the long VEX spelling with L=1 even though the architectural
+    // result is still a 128-bit XMM value. Treat the vector-length bit as
+    // irrelevant for this scalar move rather than rejecting an otherwise
+    // valid load at a high-register/SIB boundary.
+    if (opcode_map == 1 and opcode == 0x7E and prefix == 2 and
+        !rex_w and vex.vvvv == 0)
+    {
+        var decoded = DecodedInsn{ .size = .bits64 };
+        var pos = start_pos + 4;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.is_reg_form = !is_mem;
+        if (is_mem) {
+            decoded.op = .vmovq_xmm_mem64;
+            decoded.addr = rm.addr;
+        } else {
+            decoded.op = .vmovq_xmm_xmm;
+            decoded.xmm_src = @intCast(rm.addr);
+        }
         decoded.len = @intCast(pos);
         return decoded;
     }
@@ -4520,7 +4765,7 @@ pub fn decodeVexHalfMove(
     rex_x: bool,
     rex_b: bool,
 ) DecodedInsn {
-    if (modrm_pos >= bytes.len or bytes[modrm_pos] >= 0xC0) return .{};
+    if (modrm_pos >= bytes.len) return .{};
 
     const is_load = opcode == 0x12 or opcode == 0x16;
     if (!is_load and (vex_control & 0x78) != 0x78) return .{};
@@ -4528,6 +4773,18 @@ pub fn decodeVexHalfMove(
     var decoded = DecodedInsn{};
     var pos = modrm_pos;
     const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+    if (decoded.is_reg_form) {
+        // The register forms of 0x12/0x16 are VMOVHLPS/VMOVLHPS. Unlike the
+        // memory half-moves, ModR/M.r/m supplies the vector source and the
+        // VEX.vvvv field is not an additional executor operand.
+        if (opcode != 0x12 and opcode != 0x16) return .{};
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @intCast(rm.addr);
+        decoded.is_reg_form = true;
+        decoded.op = if (opcode == 0x12 and prefix == 0) .vmovhlps else .vmovlhps;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
     decoded.addr = rm.addr;
     if (is_load) {
         decoded.xmm_dst = @intFromEnum(rm.reg);
