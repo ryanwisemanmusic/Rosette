@@ -2844,6 +2844,12 @@ const compiler_launcher_script =
     \\  esac
     \\  return 1
     \\}
+    \\__rosette_compiler_arg_is_windows() {
+    \\  case "$1" in
+    \\    *-w64-windows-*|*-windows-*|mingw*|*-mingw*) return 0 ;;
+    \\  esac
+    \\  return 1
+    \\}
     \\
     \\__rosette_path_has_x86_intrinsic_shadow() {
     \\  local dir="$1"
@@ -2856,11 +2862,15 @@ const compiler_launcher_script =
     \\}
     \\
     \\target_x86=0
+    \\target_windows=0
     \\prev=""
     \\for arg in "$@"; do
     \\  if [ -n "$prev" ]; then
     \\    if __rosette_compiler_arg_is_x86 "$arg"; then
     \\      target_x86=1
+    \\    fi
+    \\    if __rosette_compiler_arg_is_windows "$arg"; then
+    \\      target_windows=1
     \\    fi
     \\    prev=""
     \\    continue
@@ -2873,6 +2883,9 @@ const compiler_launcher_script =
     \\      value="${arg#*=}"
     \\      if __rosette_compiler_arg_is_x86 "$value"; then
     \\        target_x86=1
+    \\      fi
+    \\      if __rosette_compiler_arg_is_windows "$value"; then
+    \\        target_windows=1
     \\      fi
     \\      ;;
     \\  esac
@@ -2892,7 +2905,7 @@ const compiler_launcher_script =
     \\  filtered+=("-Wno-error=constant-conversion")
     \\}
     \\
-    \\if [ "$(uname -s 2>/dev/null)" = "Darwin" ] && [ "${ROSETTE_MACOS_COMPAT_ENABLE:-auto}" != "0" ]; then
+    \\if [ "$(uname -s 2>/dev/null)" = "Darwin" ] && [ "$target_windows" = "0" ] && [ "${ROSETTE_MACOS_COMPAT_ENABLE:-auto}" != "0" ]; then
     \\  __rosette_add_macos_compat_header "$macos_shim_root/shims/macos/compiler_compat.h"
     \\  __rosette_add_macos_compat_header "$macos_shim_root/shims/macos/posix_compat.h"
     \\  __rosette_add_macos_compat_header "$macos_shim_root/shims/macos/endian.h"
@@ -2941,11 +2954,13 @@ const compiler_launcher_script =
     \\      ;;
     \\  esac
     \\done
-    \\__rosette_add_macos_warning_compat_flags
+    \\if [ "$target_windows" = "0" ]; then
+    \\  __rosette_add_macos_warning_compat_flags
+    \\fi
     \\
     \\# rosette-c-fix pass: pre-apply narrowing casts to C/C++/ObjC source files
     \\rosette_fix_bin="${ROSETTE_C_FIX_BIN:-$HOME/.rosette/bin/rosette-c-fix}"
-    \\if [ "${ROSETTE_C_FIX_ENABLE:-auto}" != "0" ] && [ -x "$rosette_fix_bin" ]; then
+    \\if [ "$target_windows" = "0" ] && [ "${ROSETTE_C_FIX_ENABLE:-auto}" != "0" ] && [ -x "$rosette_fix_bin" ]; then
     \\  for src_file in "${filtered[@]}"; do
     \\    case "$src_file" in
     \\      *.cc|*.cpp|*.cxx|*.mm)
