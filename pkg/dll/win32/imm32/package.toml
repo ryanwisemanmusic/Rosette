@@ -1,0 +1,9 @@
+name = "dll-win32-imm32"
+version = "0.1.0-local"
+kind = "windows-dll-surface"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+
+# This package contains immutable import facts only. Runtime handlers, guest
+# memory effects, and host library calls remain in src/x64-ASM/windows_runtime.zig.
