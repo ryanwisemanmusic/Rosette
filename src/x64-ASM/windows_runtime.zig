@@ -9,7 +9,17 @@
 
 const std = @import("std");
 
+const import_contract = @import("windows_import_contract.zig");
+
 const log = std.log.scoped(.windows_runtime);
+
+/// Re-exported so the PE state can hold the ledger and the preflight report
+/// can describe a name's contract without depending on this module's internals.
+pub const ImportReturnConvention = import_contract.ReturnConvention;
+pub const ImportFallback = import_contract.Fallback;
+pub const ImportFallbackLedger = import_contract.Ledger;
+pub const importFallbackFor = import_contract.fallbackFor;
+pub const importFallbackAdvice = import_contract.advice;
 
 // Win32's HWND_MESSAGE is the parent used for message-only helper windows.
 // It is not a real drawable window and must never be forwarded to AppKit.
@@ -19,6 +29,12 @@ const default_window_width: u64 = 1280;
 const default_window_height: u64 = 720;
 const max_window_dimension: u64 = 16 * 1024;
 const windows_guest_thread_service_slice: u64 = 10_000;
+
+// RedrawWindow request bits.  Only the two that decide whether the update
+// region grows or is cleared are modelled; the erase/frame/child bits need a
+// GDI surface Rosetta does not own.
+const rdw_invalidate: u32 = 0x0001;
+const rdw_validate: u32 = 0x0008;
 
 // MinGW's Windows CRT exposes wctype_t as the same bit-mask space used by
 // _pctype, rather than as an arbitrary host pointer. Keep those ABI values
@@ -150,11 +166,18 @@ pub fn tryGuestCompatibility(state: anytype) bool {
     state.regs.rsp +|= 8;
     state.regs.rip = return_rip;
     state.windows_guest_compatibility_events +|= 1;
-    log.info("Windows guest compatibility: empty UTF-8 character set -> npos entry=0x{x} return=0x{x} events={d}", .{
-        entry,
-        return_rip,
-        state.windows_guest_compatibility_events,
-    });
+    // This is a recognized, deterministic compatibility repair. Keep the
+    // first few observations and then emit only powers of two so a title
+    // repeatedly taking the same path cannot drown out graphics milestones or
+    // the eventual fault in either the terminal or the detailed run log.
+    const event = state.windows_guest_compatibility_events;
+    if (event <= 3 or (event & (event - 1)) == 0) {
+        log.info("Windows guest compatibility: empty UTF-8 character set -> npos entry=0x{x} return=0x{x} events={d}", .{
+            entry,
+            return_rip,
+            event,
+        });
+    }
     return true;
 }
 
@@ -477,7 +500,11 @@ fn isKnownCoreImport(name: []const u8) bool {
         "GetKeyState",
         "VkKeyScanW",
         "InvalidateRect",
+        "InvalidateRgn",
+        "RedrawWindow",
         "ValidateRect",
+        "ValidateRgn",
+        "GetUpdateRect",
         "SendMessageA",
         "SendMessageW",
         "AttachConsole",
@@ -651,6 +678,11 @@ const degraded_import_names = [_][]const u8{
     "ChoosePixelFormat",
     "ClipCursor",
     "CloseClipboard",
+    "CloseServiceHandle",
+    // These are optional capability probes in the Xenia bootstrap. A zero
+    // return means the optional WinUSB, WinRT, or RenderDoc backend is absent;
+    // it is not an unresolved mandatory graphics import.
+    "CoIncrementMTAUsage",
     "CoCreateInstance",
     "CombineRgn",
     "CompareStringA",
@@ -740,7 +772,6 @@ const degraded_import_names = [_][]const u8{
     "GetThreadId",
     "GetThreadPriority",
     "GetTimeZoneInformation",
-    "GetUpdateRect",
     "GetVolumeInformationW",
     "GetWindowTextLengthW",
     "GetWindowTextW",
@@ -768,6 +799,8 @@ const degraded_import_names = [_][]const u8{
     "K32GetModuleBaseNameA",
     "K32GetModuleInformation",
     "KillTimer",
+    "LibK_GetProcAddress",
+    "LibK_GetVersion",
     "LookupPrivilegeValueW",
     "MapVirtualKeyW",
     "MonitorFromPoint",
@@ -777,6 +810,10 @@ const degraded_import_names = [_][]const u8{
     "MsgWaitForMultipleObjects",
     "MulDiv",
     "OpenClipboard",
+    "OpenSCManagerA",
+    "OpenSCManagerW",
+    "OpenServiceA",
+    "OpenServiceW",
     "OpenProcess",
     "OpenProcessToken",
     "OutputDebugStringA",
@@ -803,6 +840,7 @@ const degraded_import_names = [_][]const u8{
     "RegSetValueExW",
     "RegisterRawInputDevices",
     "RegisterWindowMessageA",
+    "RENDERDOC_GetAPI",
     "ReleaseSRWLockExclusive",
     "RemoveDirectoryW",
     "RemoveVectoredContinueHandler",
@@ -815,6 +853,8 @@ const degraded_import_names = [_][]const u8{
     "RtlLookupFunctionEntry",
     "RtlUnwindEx",
     "RtlVirtualUnwind",
+    "RoGetActivationFactory",
+    "RoInitialize",
     "SHGetFolderPathW",
     "SHGetKnownFolderPath",
     "SelectObject",
@@ -868,6 +908,7 @@ const degraded_import_names = [_][]const u8{
     "WaitNamedPipeW",
     "WakeAllConditionVariable",
     "WakeConditionVariable",
+    "WindowsCreateStringReference",
     "WriteConsoleW",
     "__WSAFDIsSet",
     "___mb_cur_max_func",
@@ -1102,25 +1143,54 @@ const degraded_import_names = [_][]const u8{
 };
 
 fn isKnownDegradedImport(dll_name: []const u8, function_name: []const u8) bool {
+    // GetProcAddress does not always retain the originating DLL in the
+    // synthetic thunk.  Dynamic Windows imports still carry a real API name,
+    // so classify a name-only lookup against the same bounded ABI inventory
+    // instead of turning every dynamically requested SRW/Win32 routine into
+    // an unrelated "unknown import".
+    if (dll_name.len == 0) {
+        for (degraded_import_names) |known| {
+            if (std.mem.eql(u8, function_name, known)) return true;
+        }
+        return false;
+    }
     const known_dll =
         std.ascii.eqlIgnoreCase(dll_name, "advapi32.dll") or
+        std.ascii.eqlIgnoreCase(dll_name, "cfgmgr32.dll") or
+        std.ascii.eqlIgnoreCase(dll_name, "combase.dll") or
+        std.ascii.eqlIgnoreCase(dll_name, "comdlg32.dll") or
+        std.ascii.eqlIgnoreCase(dll_name, "dbghelp.dll") or
+        std.ascii.eqlIgnoreCase(dll_name, "dwmapi.dll") or
         std.ascii.eqlIgnoreCase(dll_name, "gdi32.dll") or
+        std.ascii.eqlIgnoreCase(dll_name, "hid.dll") or
         std.ascii.eqlIgnoreCase(dll_name, "imm32.dll") or
         std.ascii.eqlIgnoreCase(dll_name, "kernel32.dll") or
+        std.ascii.eqlIgnoreCase(dll_name, "ntdll.dll") or
         std.ascii.eqlIgnoreCase(dll_name, "oleaut32.dll") or
         std.ascii.eqlIgnoreCase(dll_name, "ole32.dll") or
+        std.ascii.eqlIgnoreCase(dll_name, "powrprof.dll") or
         std.ascii.eqlIgnoreCase(dll_name, "setupapi.dll") or
+        std.ascii.eqlIgnoreCase(dll_name, "shcore.dll") or
         std.ascii.eqlIgnoreCase(dll_name, "shell32.dll") or
         std.ascii.eqlIgnoreCase(dll_name, "shlwapi.dll") or
         std.ascii.eqlIgnoreCase(dll_name, "user32.dll") or
+        std.ascii.eqlIgnoreCase(dll_name, "uxtheme.dll") or
         std.ascii.eqlIgnoreCase(dll_name, "version.dll") or
         std.ascii.eqlIgnoreCase(dll_name, "winmm.dll") or
+        std.ascii.eqlIgnoreCase(dll_name, "ws2_32.dll") or
         std.ascii.eqlIgnoreCase(dll_name, "wsock32.dll") or
         std.ascii.eqlIgnoreCase(dll_name, "msvcrt.dll") or
         std.ascii.eqlIgnoreCase(dll_name, "ucrtbase.dll") or
         std.ascii.eqlIgnoreCase(dll_name, "vcruntime140.dll") or
         std.ascii.eqlIgnoreCase(dll_name, "libwinpthread-1.dll") or
-        std.mem.startsWith(u8, dll_name, "api-ms-win-crt-");
+        // The Windows API sets are forwarders for the same Win32/UCRT
+        // surface, not third-party libraries: `api-ms-win-core-*`,
+        // `api-ms-win-crt-*` and their siblings all resolve to names this
+        // inventory already vets.  Accepting only the CRT subset made a PE
+        // that imports through the core API sets look like it was calling
+        // unknown symbols.
+        std.ascii.startsWithIgnoreCase(dll_name, "api-ms-win-") or
+        std.ascii.startsWithIgnoreCase(dll_name, "ext-ms-win-");
     if (!known_dll) return false;
     for (degraded_import_names) |known| {
         if (std.mem.eql(u8, function_name, known)) return true;
@@ -1145,6 +1215,37 @@ fn arg(state: anytype, index: usize, direct_return_rip: ?u64) u64 {
     };
 }
 
+/// Keep Vulkan bring-up diagnostics separate from the full Windows ABI trace.
+/// The latter is intentionally exhaustive and can drown the one graphics
+/// failure that matters in millions of allocator/thread calls. This opt-in
+/// switch records only the graphics import boundary, including whether the
+/// native Rosetta bridge owned the call or the modelled fallback did.
+fn graphicsTraceEnabled() bool {
+    const raw = std.c.getenv("ROSETTE_ELF_GRAPHICS_TRACE") orelse return false;
+    const value = std.mem.span(raw);
+    return std.mem.eql(u8, value, "1") or
+        std.ascii.eqlIgnoreCase(value, "true") or
+        std.ascii.eqlIgnoreCase(value, "yes");
+}
+
+fn traceGraphicsDispatch(state: anytype, name: []const u8, route: []const u8) void {
+    if (!graphicsTraceEnabled()) return;
+    log.info(
+        "Windows graphics import: {s} route={s} result=0x{x} rcx=0x{x} rdx=0x{x} r8=0x{x} r9=0x{x} rip=0x{x} step={d}",
+        .{
+            name,
+            route,
+            state.regs.rax,
+            state.regs.rcx,
+            state.regs.rdx,
+            state.regs.r8,
+            state.regs.r9,
+            state.regs.rip,
+            state.executed_steps,
+        },
+    );
+}
+
 fn finish(state: anytype, direct_return_rip: ?u64) void {
     if (direct_return_rip) |rip| {
         state.regs.rip = rip;
@@ -1164,6 +1265,15 @@ fn finish(state: anytype, direct_return_rip: ?u64) void {
         }
         state.regs.rip = state.pop();
     }
+}
+
+/// The single virtual display Rosetta presents, allocated once and then
+/// stable for the life of the process.
+fn primaryMonitorHandle(state: anytype) u64 {
+    const State = @TypeOf(state.*);
+    if (comptime !@hasField(State, "windows_primary_monitor")) return nextHandle(state);
+    if (state.windows_primary_monitor == 0) state.windows_primary_monitor = nextHandle(state);
+    return state.windows_primary_monitor;
 }
 
 fn returnZero(state: anytype, direct_return_rip: ?u64) void {
@@ -3606,6 +3716,18 @@ fn handleGraphics(state: anytype, name: []const u8, direct_return_rip: ?u64) boo
         return true;
     }
 
+    // A graphics import is not necessarily a Vulkan entry point: the class
+    // also covers whole DLLs (dxgi, and anything else the classifier routes
+    // here by library).  Zero is VK_SUCCESS for a `vk` name and S_OK for a
+    // DXGI/D3D one, so the two cannot share a fallback -- claiming S_OK
+    // while leaving the caller's interface pointer unwritten is the same
+    // false-success this module's contract exists to stop.
+    if (!std.mem.startsWith(u8, name, "vk")) {
+        state.windows_graphics.noteUnmodeledCall(name);
+        completeWithImportFallback(state, "", name, direct_return_rip);
+        return true;
+    }
+
     // The name is a known Vulkan entry point but has no stateful output in the
     // bootstrap model yet. Returning VK_SUCCESS is intentionally accompanied
     // by a deterministic handle-free path; the preflight report still records
@@ -4689,6 +4811,32 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
     if (std.mem.eql(u8, name, "WaitForSingleObject") or std.mem.eql(u8, name, "WaitForSingleObjectEx") or
         std.mem.eql(u8, name, "WaitForMultipleObjects") or std.mem.eql(u8, name, "WaitForMultipleObjectsEx"))
     {
+        var serviced_steps: u64 = 0;
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "serviceWindowsGuestThreads")) {
+            // A PE wait is a cooperative scheduling boundary. The prior
+            // model returned immediately but never gave a queued worker a
+            // chance to release the mutex/event being waited on, which could
+            // strand the main guest thread after Vulkan bootstrap.
+            serviced_steps = state.serviceWindowsGuestThreads(windows_guest_thread_service_slice);
+        }
+        if (serviced_steps != 0 and state.trace_windows_waits and
+            (state.windows_thread_service_calls <= 8 or state.windows_thread_service_calls % 1024 == 0))
+        {
+            log.info("Windows wait boundary serviced guest worker: api={s} handle_or_count=0x{x} timeout_or_handles=0x{x} steps={d} service_calls={d} yields={d} completions={d} graphics_phase={s} vk_calls={d} submits={d} presents={d}", .{
+                name,
+                arg(state, 0, direct_return_rip),
+                arg(state, 1, direct_return_rip),
+                serviced_steps,
+                state.windows_thread_service_calls,
+                state.windows_thread_yields,
+                state.windows_thread_completions,
+                @tagName(state.windows_graphics.phase),
+                state.windows_graphics.vulkan_calls,
+                state.windows_graphics.queue_submits,
+                state.windows_graphics.presents,
+            });
+        }
         state.regs.rax = 0; // WAIT_OBJECT_0 for the deterministic bootstrap handle
         finish(state, direct_return_rip);
         return true;
@@ -4945,10 +5093,121 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         finish(state, direct_return_rip);
         return true;
     }
-    if (std.mem.eql(u8, name, "UpdateWindow") or std.mem.eql(u8, name, "SetWindowPos") or
+    if (std.mem.eql(u8, name, "SetWindowPos") or
         std.mem.eql(u8, name, "SetFocus") or std.mem.eql(u8, name, "ReleaseDC"))
     {
         state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    // The Win32 painting contract, modelled as an update region rather than
+    // as a queued message.  A guest that repaints through
+    // `InvalidateRect` + `WM_PAINT` -- which is what a plain Win32 window
+    // does -- produces no frames at all when these are answered with a bare
+    // TRUE, because nothing then ever generates WM_PAINT.  See
+    // `pendingWindowsPaintMessage` in the PE state for the generation side.
+    if (std.mem.eql(u8, name, "InvalidateRect") or std.mem.eql(u8, name, "InvalidateRgn") or
+        std.mem.eql(u8, name, "RedrawWindow"))
+    {
+        const hwnd = arg(state, 0, direct_return_rip);
+        const State = @TypeOf(state.*);
+        // RedrawWindow carries the request in its flags word; the other two
+        // always invalidate.  RDW_VALIDATE takes precedence over
+        // RDW_INVALIDATE in Win32, and a call with neither only affects the
+        // erase/frame bits that Rosetta has no GDI surface for.
+        const redraw = std.mem.eql(u8, name, "RedrawWindow");
+        const flags: u32 = if (redraw) @truncate(arg(state, 3, direct_return_rip)) else rdw_invalidate;
+        const validating = (flags & rdw_validate) != 0;
+        const invalidating = !validating and (flags & rdw_invalidate) != 0;
+        var accepted = false;
+        if (validating) {
+            if (comptime @hasDecl(State, "validateWindowsWindow")) accepted = state.validateWindowsWindow(hwnd);
+        } else if (invalidating) {
+            if (comptime @hasDecl(State, "invalidateWindowsWindow")) accepted = state.invalidateWindowsWindow(hwnd);
+        }
+        // `InvalidateRect(hwnd, rect, TRUE)` also requests an erase.  Rosetta
+        // has no GDI background brush to run, and a guest that owns its own
+        // surface suppresses the erase anyway, so the erase flag is evidence
+        // only.
+        state.regs.rax = 1;
+        state.windows_last_error = if (accepted or !invalidating) 0 else 1400; // ERROR_INVALID_WINDOW_HANDLE
+        if (state.diagnose_abi or state.trace_windows_messages) {
+            log.info("Windows paint request: api={s} hwnd=0x{x} invalidate={} accepted={} pending={d}", .{
+                name,
+                hwnd,
+                invalidating,
+                accepted,
+                if (comptime @hasDecl(State, "windowsPendingPaintCount")) state.windowsPendingPaintCount() else 0,
+            });
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "UpdateWindow")) {
+        // Win32 delivers WM_PAINT synchronously here when the update region
+        // is non-empty.  Rosetta cannot run a nested WndProc from inside an
+        // import completion, so the region is left set and the next pump call
+        // paints it.  That defers the paint by one pump iteration and never
+        // drops it.
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "ValidateRect") or std.mem.eql(u8, name, "ValidateRgn")) {
+        const hwnd = arg(state, 0, direct_return_rip);
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "validateWindowsWindow")) _ = state.validateWindowsWindow(hwnd);
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "BeginPaint")) {
+        // BeginPaint validates the update region and fills a PAINTSTRUCT.
+        // The structure is 72 bytes on x86-64: hdc, fErase, rcPaint, and the
+        // reserved tail.  Clearing it and writing the client rectangle keeps
+        // a guest painter from reading uninitialized guest memory.
+        const hwnd = arg(state, 0, direct_return_rip);
+        const paint_struct = arg(state, 1, direct_return_rip);
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "validateWindowsWindow")) _ = state.validateWindowsWindow(hwnd);
+        const hdc = nextHandle(state);
+        if (paint_struct != 0 and clearGuestMemory(state, paint_struct, 72)) {
+            state.write64(paint_struct + 0, hdc);
+            state.write32(paint_struct + 8, 0); // fErase
+            state.write32(paint_struct + 12, 0); // rcPaint.left
+            state.write32(paint_struct + 16, 0); // rcPaint.top
+            state.write32(paint_struct + 20, state.windows_graphics.window_width);
+            state.write32(paint_struct + 24, state.windows_graphics.window_height);
+        }
+        state.regs.rax = hdc;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "EndPaint")) {
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetUpdateRect")) {
+        const hwnd = arg(state, 0, direct_return_rip);
+        const rect = arg(state, 1, direct_return_rip);
+        const State = @TypeOf(state.*);
+        const pending = if (comptime @hasDecl(State, "windowsWindowHasPendingPaint"))
+            state.windowsWindowHasPendingPaint(hwnd)
+        else
+            false;
+        if (rect != 0) {
+            state.write32(rect + 0, 0);
+            state.write32(rect + 4, 0);
+            state.write32(rect + 8, if (pending) state.windows_graphics.window_width else 0);
+            state.write32(rect + 12, if (pending) state.windows_graphics.window_height else 0);
+        }
+        // The third argument asks for an erase; there is no background brush
+        // to run, but the update region is still consumed when it is set.
+        if (pending and (arg(state, 2, direct_return_rip) & 1) != 0) {
+            if (comptime @hasDecl(State, "validateWindowsWindow")) _ = state.validateWindowsWindow(hwnd);
+        }
+        state.regs.rax = @intFromBool(pending);
         finish(state, direct_return_rip);
         return true;
     }
@@ -4980,6 +5239,16 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         }
         const queued_message = if (comptime @hasDecl(State, "dequeueWindowsMessage"))
             state.dequeueWindowsMessage(filter_hwnd, minimum_message, maximum_message, remove)
+        else
+            null;
+        // WM_PAINT ranks below posted messages and below WM_QUIT, matching
+        // the Win32 pump: it is only observed once the queue has nothing
+        // else to deliver.
+        const paint_message = if (queued_message == null and !state.windows_ui_quit_requested)
+            (if (comptime @hasDecl(State, "pendingWindowsPaintMessage"))
+                state.pendingWindowsPaintMessage(filter_hwnd, minimum_message, maximum_message)
+            else
+                null)
         else
             null;
         var result: u64 = 0;
@@ -5015,6 +5284,27 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
             result = if (is_get_message) 0 else 1;
             if (state.diagnose_abi or state.trace_windows_messages) {
                 log.info("Windows message pump synthetic quit: api={s} exit_code=0x{x} result={d} remove={}", .{ name, state.windows_ui_quit_code, result, remove });
+            }
+        } else if (paint_message) |paint| {
+            // Win32 generates WM_PAINT here rather than dequeuing it: the
+            // update region stays set until the guest validates it, so a
+            // GetMessage/DispatchMessage loop keeps painting for as long as
+            // the guest keeps requesting paints.  This is the only path by
+            // which an ordinary Win32 program reaches its renderer.
+            if (!writeWindowsMessage(state, message, paint)) {
+                state.windows_last_error = 87;
+                state.regs.rax = if (is_get_message) std.math.maxInt(u64) else 0;
+                finish(state, direct_return_rip);
+                return true;
+            }
+            result = 1;
+            if (state.diagnose_abi or state.trace_windows_messages) {
+                log.info("Windows message pump synthesized WM_PAINT: api={s} hwnd=0x{x} remove={} serviced_steps={d}", .{
+                    name,
+                    paint.hwnd,
+                    remove,
+                    serviced_steps,
+                });
             }
         } else if (is_get_message) {
             // A real GetMessage blocks. The cooperative PE executor cannot
@@ -5116,8 +5406,16 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         finish(state, direct_return_rip);
         return true;
     }
-    if (std.mem.eql(u8, name, "MonitorFromWindow")) {
-        state.regs.rax = nextHandle(state);
+    if (std.mem.eql(u8, name, "MonitorFromWindow") or std.mem.eql(u8, name, "MonitorFromPoint") or
+        std.mem.eql(u8, name, "MonitorFromRect"))
+    {
+        // Win32 returns the *same* HMONITOR for the same display every time.
+        // Minting a fresh handle per call makes a guest that compares the
+        // current monitor against the previous one believe the window moved
+        // to a new display on every check, and a guest that caches
+        // per-monitor state rebuild it forever.  Rosetta presents one virtual
+        // display, so there is exactly one handle.
+        state.regs.rax = primaryMonitorHandle(state);
         finish(state, direct_return_rip);
         return true;
     }
@@ -5299,7 +5597,6 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         std.mem.eql(u8, name, "AppendMenuA") or std.mem.eql(u8, name, "AppendMenuW") or
         std.mem.eql(u8, name, "EnableMenuItem") or std.mem.eql(u8, name, "DrawMenuBar") or
         std.mem.eql(u8, name, "SetMenuInfo") or std.mem.eql(u8, name, "GetMenuInfo") or
-        std.mem.eql(u8, name, "InvalidateRect") or std.mem.eql(u8, name, "ValidateRect") or
         std.mem.eql(u8, name, "DragAcceptFiles") or std.mem.eql(u8, name, "DragFinish") or
         std.mem.eql(u8, name, "SendMessageA") or std.mem.eql(u8, name, "SendMessageW") or
         std.mem.eql(u8, name, "AttachConsole"))
@@ -5467,6 +5764,66 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         // S_OK. COM apartment ownership is represented by the Rosetta host
         // boundary, not by a native Windows thread-local pointer.
         returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "CoCreateInstance")) {
+        // Returning S_OK without materializing `ppv` is worse than reporting
+        // the unavailable COM class: callers immediately dereference the
+        // interface vtable and turn a missing optional subsystem into a null
+        // indirect call.  Preserve the output-pointer contract and return
+        // the standard "interface not supported" HRESULT so the guest takes
+        // its normal optional-device failure path.
+        const output = arg(state, 4, direct_return_rip);
+        if (output != 0 and state.guestMemory(output, 8) != null) state.write64(output, 0);
+        state.regs.rax = 0x8000_4002; // E_NOINTERFACE
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "OpenSCManagerA") or std.mem.eql(u8, name, "OpenSCManagerW") or
+        std.mem.eql(u8, name, "OpenServiceA") or std.mem.eql(u8, name, "OpenServiceW"))
+    {
+        // Rosetta does not expose the host service-control database to the
+        // guest. Report the ordinary Windows "service does not exist" result
+        // instead of claiming success with a null service handle.
+        state.windows_last_error = 1060; // ERROR_SERVICE_DOES_NOT_EXIST
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "CloseServiceHandle")) {
+        state.windows_last_error = 0;
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "InitializeSRWLock")) {
+        const lock = arg(state, 0, direct_return_rip);
+        if (lock != 0 and state.guestMemory(lock, 8) != null) state.write64(lock, 0);
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "AcquireSRWLockExclusive")) {
+        const lock = arg(state, 0, direct_return_rip);
+        if (lock != 0 and state.guestMemory(lock, 8) != null) state.write64(lock, 1);
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "ReleaseSRWLockExclusive")) {
+        const lock = arg(state, 0, direct_return_rip);
+        if (lock != 0 and state.guestMemory(lock, 8) != null) state.write64(lock, 0);
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "TryAcquireSRWLockExclusive")) {
+        const lock = arg(state, 0, direct_return_rip);
+        if (lock == 0 or state.guestMemory(lock, 8) == null) {
+            state.regs.rax = 0;
+        } else if (state.read64(lock) == 0) {
+            state.write64(lock, 1);
+            state.regs.rax = 1;
+        } else {
+            state.regs.rax = 0;
+        }
+        finish(state, direct_return_rip);
         return true;
     }
     if (std.mem.eql(u8, name, "DwmEnableMMCSS") or std.mem.eql(u8, name, "DwmSetWindowAttribute")) {
@@ -5726,13 +6083,38 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
     // been needed by the current bootstrap yet.  Complete the call boundary
     // deterministically and retain evidence for the next preflight/run rather
     // than letting it look like an unresolved symbol.
+    //
+    // "Deterministically" is not the same as "with zero".  The value has to
+    // be the one this import's ABI defines for "this did not happen", or a
+    // guest asking an LSTATUS/HRESULT/NTSTATUS question is told the call
+    // succeeded and then reads an output Rosetta never wrote.  See
+    // windows_import_contract.zig.
     if (isKnownCoreImport(name) or isKnownDegradedImport(dll_name, name)) {
-        state.windows_degraded_import_calls +|= 1;
-        returnZero(state, direct_return_rip);
+        completeWithImportFallback(state, dll_name, name, direct_return_rip);
         return true;
     }
 
     return false;
+}
+
+/// Complete a recognized-but-unimplemented import with the value its ABI
+/// defines for a refusal, and record the fact so a run can report which
+/// fallbacks it actually leaned on.
+fn completeWithImportFallback(
+    state: anytype,
+    dll_name: []const u8,
+    name: []const u8,
+    direct_return_rip: ?u64,
+) void {
+    const fallback = import_contract.fallbackFor(dll_name, name);
+    state.windows_degraded_import_calls +|= 1;
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "noteWindowsImportFallback")) {
+        state.noteWindowsImportFallback(dll_name, name, fallback);
+    }
+    if (fallback.last_error) |last_error| state.windows_last_error = last_error;
+    state.regs.rax = fallback.value;
+    finish(state, direct_return_rip);
 }
 
 /// Execute one Microsoft x64 import. The caller invokes this only for a PE
@@ -5765,9 +6147,14 @@ pub fn tryFunction(state: anytype, dll_name: []const u8, function_name: []const 
         .graphics => {
             const State = @TypeOf(state.*);
             if (comptime @hasDecl(State, "tryNativeWindowsVulkan")) {
-                if (state.tryNativeWindowsVulkan(function_name, direct_return_rip)) return true;
+                if (state.tryNativeWindowsVulkan(function_name, direct_return_rip)) {
+                    traceGraphicsDispatch(state, function_name, "native");
+                    return true;
+                }
             }
-            return handleGraphics(state, function_name, direct_return_rip);
+            const handled = handleGraphics(state, function_name, direct_return_rip);
+            if (handled) traceGraphicsDispatch(state, function_name, "modelled");
+            return handled;
         },
         .core, .degraded => return handleCore(state, dll_name, function_name, direct_return_rip),
         .unsupported => {
@@ -5786,10 +6173,29 @@ test "Windows import classification separates Vulkan from unknown APIs" {
     try std.testing.expectEqual(ImportClass.unsupported, classifyImport("kernel32.dll", "RosetteMissingEntry"));
 }
 
+test "dynamic Windows API names use the degraded inventory without accepting arbitrary symbols" {
+    try std.testing.expectEqual(ImportClass.degraded, classifyImport("", "AcquireSRWLockExclusive"));
+    try std.testing.expectEqual(ImportClass.degraded, classifyImport("", "OpenSCManagerA"));
+    try std.testing.expectEqual(ImportClass.degraded, classifyImport("", "LibK_GetVersion"));
+    try std.testing.expectEqual(ImportClass.degraded, classifyImport("", "LibK_GetProcAddress"));
+    try std.testing.expectEqual(ImportClass.degraded, classifyImport("", "RoInitialize"));
+    try std.testing.expectEqual(ImportClass.degraded, classifyImport("", "CoIncrementMTAUsage"));
+    try std.testing.expectEqual(ImportClass.degraded, classifyImport("", "WindowsCreateStringReference"));
+    try std.testing.expectEqual(ImportClass.degraded, classifyImport("", "RoGetActivationFactory"));
+    try std.testing.expectEqual(ImportClass.degraded, classifyImport("", "RENDERDOC_GetAPI"));
+    try std.testing.expectEqual(ImportClass.unsupported, classifyImport("", "RosetteMissingOptionalProbe"));
+}
+
 test "Win32 default geometry is normalized before native window creation" {
     try std.testing.expectEqual(@as(u64, 1280), normalizeWindowDimension(cw_use_default, default_window_width));
     try std.testing.expectEqual(@as(u64, 720), normalizeWindowDimension(cw_use_default, default_window_height));
     try std.testing.expectEqual(@as(u64, 1280), normalizeWindowDimension(0, default_window_width));
     try std.testing.expectEqual(@as(u64, 720), normalizeWindowDimension(max_window_dimension + 1, default_window_height));
     try std.testing.expectEqual(@as(u64, std.math.maxInt(u64) - 2), hwnd_message);
+}
+
+test {
+    // `pub const` re-exports do not root a file's tests; reference the module
+    // explicitly so the import-contract tests run with this one.
+    _ = import_contract;
 }

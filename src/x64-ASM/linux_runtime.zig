@@ -6,6 +6,16 @@ const windows_runtime = @import("windows_runtime");
 pub const SYNTHETIC_PTHREAD_ONCE_RETURN = windows_runtime.SYNTHETIC_PTHREAD_ONCE_RETURN;
 pub const SYNTHETIC_INITTERM_RETURN = windows_runtime.SYNTHETIC_INITTERM_RETURN;
 
+// The Windows import fallback contract, re-exported for the PE state that
+// owns the ledger.  Routing it through this module keeps the executor's
+// module graph unchanged: it already depends on the Linux/Windows runtime
+// seam and does not need a direct edge to the Win32 ABI surface.
+pub const ImportReturnConvention = windows_runtime.ImportReturnConvention;
+pub const ImportFallback = windows_runtime.ImportFallback;
+pub const ImportFallbackLedger = windows_runtime.ImportFallbackLedger;
+pub const importFallbackFor = windows_runtime.importFallbackFor;
+pub const importFallbackAdvice = windows_runtime.importFallbackAdvice;
+
 pub fn setupInitialStack(state: anytype, argv: []const []const u8) !void {
     const default_argv = [_][]const u8{"program"};
     const actual_argv = if (argv.len == 0) default_argv[0..] else argv;
@@ -66,8 +76,18 @@ pub fn tryLibcStartMainTrampoline(state: anytype, d: anytype, return_rip: u64) b
 }
 
 pub fn tryDynamicFunctionShim(state: anytype, got_addr: u64, direct_return_rip: ?u64) bool {
+    // PE32+ indirect jumps include ordinary C++ vtable dispatch.  They do
+    // not carry the ELF PLT resolver's relocation index on the guest stack;
+    // letting the fallback below inspect rsp+8 would reinterpret an
+    // unrelated vtable call as a random lazy import (for example, turning a
+    // shared_ptr release jump into CreateFileMappingW).  A Windows IAT miss
+    // must continue through the normal target read instead.
+    const windows_mode = if (comptime @hasField(@TypeOf(state.*), "windows_runtime_enabled"))
+        state.windows_runtime_enabled
+    else
+        false;
     const relocation = dynamicRelocation(state, got_addr) orelse {
-        if (direct_return_rip != null) return false;
+        if (windows_mode or direct_return_rip != null) return false;
         const resolver_name = dynamicPltResolverRelocationName(state) orelse return false;
         const old_rsp = state.regs.rsp;
         state.regs.rsp +%= 16;
@@ -85,10 +105,6 @@ pub fn tryDynamicFunctionShim(state: anytype, got_addr: u64, direct_return_rip: 
     // small allocation into a bogus multi-gigabyte request before the
     // Windows bridge gets a chance to handle it. Once the PE state enables
     // the Windows runtime, route the import directly to that bridge.
-    const windows_mode = if (comptime @hasField(@TypeOf(state.*), "windows_runtime_enabled"))
-        state.windows_runtime_enabled
-    else
-        false;
     if (!windows_mode and tryNamedFunctionShim(state, name, direct_return_rip)) return true;
     if (tryWindowsFunction(state, relocation.dll_name, name, direct_return_rip)) return true;
     if (symbolNameEql(name, "__libc_start_main")) return false;
