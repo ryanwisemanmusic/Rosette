@@ -89,6 +89,9 @@ pub const DynamicRelocation = struct {
     name: []const u8,
     offset: u64,
     rel_type: u32,
+    /// Empty for ELF relocations. PE imports retain their DLL so the Windows
+    /// runtime can distinguish kernel/UI/Vulkan entry points in diagnostics.
+    dll_name: []const u8 = "",
 };
 
 pub const LoadPlan = struct {
