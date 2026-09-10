@@ -1072,6 +1072,7 @@ pub const Op = enum(u16) {
     // identities above remain stable.
     vpackssdw,
     vblendps,
+    vblendpd,
     vshufpd,
     vpermilps,
     vpbroadcastw,

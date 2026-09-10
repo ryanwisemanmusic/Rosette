@@ -370,6 +370,35 @@ pub fn mapReg(reg_num: u8, rex_b: bool) RegId {
     return @enumFromInt(r);
 }
 
+/// Read a ModRM r/m operand as a register id.
+///
+/// `readModRM` returns one field for both r/m forms: in the register form it
+/// holds `@intFromEnum(RegId)`, and in the memory form it holds the computed
+/// effective address.  A decoder that converts that field without checking
+/// the form turns an ordinary memory-operand instruction into a host panic,
+/// because an address is not a valid 4-bit register id -- which is exactly
+/// what `vextractps dword ptr [mem], xmm, imm8` did.
+///
+/// The register file has all sixteen encodings, so masking to four bits is
+/// total: a register-form operand round-trips unchanged, and a memory-form
+/// operand yields a defined value that the executor never reads (it takes the
+/// `is_reg_form` branch instead).  Decoders that need the distinction still
+/// test `is_reg_form`; this only removes the crash from getting it wrong.
+pub fn rmRegister(rm_addr: u64) RegId {
+    return @enumFromInt(@as(u4, @truncate(rm_addr)));
+}
+
+/// The same field read as a vector-register index.
+///
+/// `@intCast` of a memory-form r/m field is the same crash as `rmRegister`
+/// guarded against, just spelled with a different builtin: an effective
+/// address does not fit in the eight bits a vector index is stored in.  VEX
+/// and legacy encodings only ever name registers 0-15, so masking is exact
+/// for a register-form operand and merely defined for a memory-form one.
+pub fn rmVectorIndex(rm_addr: u64) u8 {
+    return @as(u8, @truncate(rm_addr)) & 0x0F;
+}
+
 pub fn mapJccCond8(opcode: u8) Cond {
     const conditions: [16]Cond = .{
         .o, .no, .b, .ae, .e, .ne, .be, .a, .s, .ns, .p, .np, .l, .ge, .le, .g,

@@ -191,7 +191,7 @@ pub fn decodeMovRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: b
                 .bits64 => .mov_reg64_reg64,
             };
             d.dst_reg = rm.reg;
-            d.src_reg = @enumFromInt(rm.addr);
+            d.src_reg = addressing.rmRegister(rm.addr);
         } else {
             d.op = switch (actual_sz) {
                 .bits8 => .mov_reg8_mem8,
@@ -210,7 +210,7 @@ pub fn decodeMovRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: b
                 .bits32 => .mov_reg32_reg32,
                 .bits64 => .mov_reg64_reg64,
             };
-            d.dst_reg = @enumFromInt(rm.addr);
+            d.dst_reg = addressing.rmRegister(rm.addr);
             d.src_reg = rm.reg;
         } else {
             d.op = switch (actual_sz) {
@@ -259,7 +259,7 @@ pub fn decodePopRm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
     if (modrm >= 0xC0) {
         const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
         d.op = .pop_reg;
-        d.dst_reg = @enumFromInt(rm.addr);
+        d.dst_reg = addressing.rmRegister(rm.addr);
     } else {
         d.op = .pop_mem64;
         d.addr = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, .bits64).addr;
@@ -444,7 +444,7 @@ pub fn decodeGroup2Shift(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x
     if (is_mem) {
         d.addr = rm.addr;
     } else {
-        d.dst_reg = @enumFromInt(rm.addr);
+        d.dst_reg = addressing.rmRegister(rm.addr);
     }
     d.len = @intCast(pos);
     return d;
@@ -467,7 +467,7 @@ pub fn decodeMovMemImm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: 
             d.addr = rm.addr;
         } else {
             d.op = .mov_reg_imm;
-            d.dst_reg = @enumFromInt(rm.addr);
+            d.dst_reg = addressing.rmRegister(rm.addr);
         }
         d.imm = bytes[pos];
         pos += 1;
@@ -496,7 +496,7 @@ pub fn decodeMovMemImm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: 
             d.addr = rm.addr;
         } else {
             d.op = .mov_reg_imm;
-            d.dst_reg = @enumFromInt(rm.addr);
+            d.dst_reg = addressing.rmRegister(rm.addr);
         }
     }
 
@@ -522,7 +522,7 @@ pub fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
         if (is_mem) {
             d.addr = rm.addr;
         } else {
-            d.dst_reg = @enumFromInt(rm.addr);
+            d.dst_reg = addressing.rmRegister(rm.addr);
         }
         d.len = @intCast(pos);
         return d;
@@ -535,7 +535,7 @@ pub fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
         if (is_mem) {
             d.addr = rm.addr;
         } else {
-            d.dst_reg = @enumFromInt(rm.addr);
+            d.dst_reg = addressing.rmRegister(rm.addr);
         }
         d.len = @intCast(pos);
         return d;
@@ -551,8 +551,8 @@ pub fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
         }
         d.op = @enumFromInt(@intFromEnum(Op.mul_reg8) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
         d.size = sz;
-        d.dst_reg = @enumFromInt(rm.addr);
-        d.src_reg = @enumFromInt(rm.addr);
+        d.dst_reg = addressing.rmRegister(rm.addr);
+        d.src_reg = addressing.rmRegister(rm.addr);
         d.len = @intCast(pos);
         return d;
     }
@@ -567,8 +567,8 @@ pub fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
         }
         d.op = @enumFromInt(@intFromEnum(Op.imul_reg8) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
         d.size = sz;
-        d.dst_reg = @enumFromInt(rm.addr);
-        d.src_reg = @enumFromInt(rm.addr);
+        d.dst_reg = addressing.rmRegister(rm.addr);
+        d.src_reg = addressing.rmRegister(rm.addr);
         d.len = @intCast(pos);
         return d;
     }
@@ -577,8 +577,8 @@ pub fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
         const base_op: Op = if (is_mem) .div_mem8 else .div_reg8;
         d.op = @enumFromInt(@intFromEnum(base_op) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
         d.size = sz;
-        if (is_mem) d.addr = rm.addr else d.dst_reg = @enumFromInt(rm.addr);
-        if (!is_mem) d.src_reg = @enumFromInt(rm.addr);
+        if (is_mem) d.addr = rm.addr else d.dst_reg = addressing.rmRegister(rm.addr);
+        if (!is_mem) d.src_reg = addressing.rmRegister(rm.addr);
         d.len = @intCast(pos);
         return d;
     }
@@ -586,8 +586,8 @@ pub fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
         const base_op: Op = if (is_mem) .idiv_mem8 else .idiv_reg8;
         d.op = @enumFromInt(@intFromEnum(base_op) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
         d.size = sz;
-        if (is_mem) d.addr = rm.addr else d.dst_reg = @enumFromInt(rm.addr);
-        if (!is_mem) d.src_reg = @enumFromInt(rm.addr);
+        if (is_mem) d.addr = rm.addr else d.dst_reg = addressing.rmRegister(rm.addr);
+        if (!is_mem) d.src_reg = addressing.rmRegister(rm.addr);
         d.len = @intCast(pos);
         return d;
     }
@@ -617,7 +617,7 @@ pub fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
     if (is_mem) {
         d.addr = rm.addr;
     } else {
-        d.dst_reg = @enumFromInt(rm.addr);
+        d.dst_reg = addressing.rmRegister(rm.addr);
         d.is_reg_form = true;
     }
     d.len = @intCast(pos);
@@ -642,7 +642,7 @@ pub fn decodeGroup4_5(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: b
                 d.addr = rm.addr;
             } else {
                 d.op = @enumFromInt(@intFromEnum(Op.inc_reg8) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
-                d.dst_reg = @enumFromInt(rm.addr);
+                d.dst_reg = addressing.rmRegister(rm.addr);
             }
         } else if (group == 1) {
             if (is_mem) {
@@ -650,7 +650,7 @@ pub fn decodeGroup4_5(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: b
                 d.addr = rm.addr;
             } else {
                 d.op = @enumFromInt(@intFromEnum(Op.dec_reg8) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
-                d.dst_reg = @enumFromInt(rm.addr);
+                d.dst_reg = addressing.rmRegister(rm.addr);
             }
         } else {
             d.op = .invalid;
@@ -668,7 +668,7 @@ pub fn decodeGroup4_5(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: b
                     d.addr = rm.addr;
                 } else {
                     d.op = @enumFromInt(@intFromEnum(Op.inc_reg8) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
-                    d.dst_reg = @enumFromInt(rm.addr);
+                    d.dst_reg = addressing.rmRegister(rm.addr);
                 }
             },
             1 => {
@@ -677,7 +677,7 @@ pub fn decodeGroup4_5(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: b
                     d.addr = rm.addr;
                 } else {
                     d.op = @enumFromInt(@intFromEnum(Op.dec_reg8) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
-                    d.dst_reg = @enumFromInt(rm.addr);
+                    d.dst_reg = addressing.rmRegister(rm.addr);
                 }
             },
             2 => {
@@ -686,7 +686,7 @@ pub fn decodeGroup4_5(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: b
                     d.addr = rm.addr;
                 } else {
                     d.op = .call_reg64;
-                    d.dst_reg = @enumFromInt(rm.addr);
+                    d.dst_reg = addressing.rmRegister(rm.addr);
                 }
             },
             3 => {
@@ -695,7 +695,7 @@ pub fn decodeGroup4_5(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: b
                     d.addr = rm.addr;
                 } else {
                     d.op = .call_reg64;
-                    d.dst_reg = @enumFromInt(rm.addr);
+                    d.dst_reg = addressing.rmRegister(rm.addr);
                 }
             },
             4 => {
@@ -704,7 +704,7 @@ pub fn decodeGroup4_5(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: b
                     d.addr = rm.addr;
                 } else {
                     d.op = .jmp_reg64;
-                    d.dst_reg = @enumFromInt(rm.addr);
+                    d.dst_reg = addressing.rmRegister(rm.addr);
                     d.addr = 0;
                 }
             },
@@ -714,7 +714,7 @@ pub fn decodeGroup4_5(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: b
                     d.addr = rm.addr;
                 } else {
                     d.op = .jmp_reg64;
-                    d.dst_reg = @enumFromInt(rm.addr);
+                    d.dst_reg = addressing.rmRegister(rm.addr);
                     d.addr = 0;
                 }
             },
@@ -725,7 +725,7 @@ pub fn decodeGroup4_5(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: b
                 } else {
                     d.op = .push_reg;
                     // PUSH reads a register: src_reg is the single canonical field.
-                    d.src_reg = @enumFromInt(rm.addr);
+                    d.src_reg = addressing.rmRegister(rm.addr);
                 }
             },
             else => {
@@ -768,7 +768,7 @@ pub fn decodeTestRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: 
             .bits64 => .test_reg64_reg64,
         };
         d.dst_reg = rm.reg;
-        d.src_reg = @enumFromInt(rm.addr);
+        d.src_reg = addressing.rmRegister(rm.addr);
     }
 
     d.len = @as(u8, @intCast(pos));
@@ -799,7 +799,7 @@ pub fn decodeXchgRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: 
             .bits64 => .xchg_reg64_reg64,
             else => .invalid,
         };
-        d.dst_reg = @enumFromInt(rm.addr);
+        d.dst_reg = addressing.rmRegister(rm.addr);
         d.src_reg = rm.reg;
         d.is_reg_form = true;
     }
@@ -851,7 +851,7 @@ pub fn decodeImulImm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bo
             .bits8 => .invalid,
         };
         d.dst_reg = rm.reg;
-        d.src_reg = @enumFromInt(rm.addr);
+        d.src_reg = addressing.rmRegister(rm.addr);
     }
 
     d.imm = imm;
@@ -885,7 +885,7 @@ pub fn decodeImulTwoOp(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: 
             else => .imul_reg32_reg32,
         };
         d.dst_reg = rm.reg;
-        d.src_reg = @enumFromInt(rm.addr);
+        d.src_reg = addressing.rmRegister(rm.addr);
     }
 
     d.len = @as(u8, @intCast(pos));
@@ -934,7 +934,7 @@ pub fn decodeCmpxchg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bo
             .bits32 => .cmpxchg_reg32_reg32,
             .bits64 => .cmpxchg_reg64_reg64,
         };
-        d.dst_reg = @enumFromInt(rm.addr);
+        d.dst_reg = addressing.rmRegister(rm.addr);
         d.src_reg = rm.reg;
         d.is_reg_form = true;
     }
@@ -960,7 +960,7 @@ pub fn decodeMovzx(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
     } else {
         d.op = if (is_byte) .movzx_reg32_mem8 else .movzx_reg32_mem16;
         d.dst_reg = rm.reg;
-        d.src_reg = @enumFromInt(rm.addr);
+        d.src_reg = addressing.rmRegister(rm.addr);
         d.is_reg_form = true;
     }
     d.size = sz;
@@ -986,7 +986,7 @@ pub fn decodeMovsx(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
     } else {
         d.op = if (is_byte) .movsx_reg32_mem8 else .movsx_reg32_mem16;
         d.dst_reg = rm.reg;
-        d.src_reg = @enumFromInt(rm.addr);
+        d.src_reg = addressing.rmRegister(rm.addr);
         d.is_reg_form = true;
     }
     d.size = sz;
@@ -1075,7 +1075,7 @@ pub fn decodeMovupsMovss(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x
     if (to_reg) {
         d.xmm_dst = @intFromEnum(rm.reg);
         if (d.is_reg_form) {
-            d.xmm_src = @intCast(rm.addr);
+            d.xmm_src = addressing.rmVectorIndex(rm.addr);
             d.op = if (has_f2) .vmovsd_xmm_xmm else if (has_f3) .vmovss_xmm_xmm else if (has_66) .vmovupd_xmm_xmm else .movups_xmm_xmm;
         } else {
             d.addr = rm.addr;
@@ -1084,7 +1084,7 @@ pub fn decodeMovupsMovss(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x
     } else {
         d.xmm_src = @intFromEnum(rm.reg);
         if (d.is_reg_form) {
-            d.xmm_dst = @intCast(rm.addr);
+            d.xmm_dst = addressing.rmVectorIndex(rm.addr);
             d.op = if (has_f2) .vmovsd_xmm_xmm else if (has_f3) .vmovss_xmm_xmm else if (has_66) .vmovupd_xmm_xmm else .movups_xmm_xmm;
         } else {
             d.addr = rm.addr;
@@ -1115,7 +1115,7 @@ pub fn decodeMovaps(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
             d.addr = rm.addr;
         } else {
             d.op = .movaps_xmm_xmm;
-            d.xmm_src = @intCast(rm.addr);
+            d.xmm_src = addressing.rmVectorIndex(rm.addr);
         }
     } else {
         d.xmm_src = @intFromEnum(rm.reg);
@@ -1124,7 +1124,7 @@ pub fn decodeMovaps(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
             d.addr = rm.addr;
         } else {
             d.op = .movaps_xmm_xmm;
-            d.xmm_dst = @intCast(rm.addr);
+            d.xmm_dst = addressing.rmVectorIndex(rm.addr);
         }
     }
 

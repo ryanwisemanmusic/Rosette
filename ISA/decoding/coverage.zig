@@ -377,6 +377,362 @@ test "the census never overstates what the decoder accepts" {
     try std.testing.expect(checked != 0);
 }
 
+// -------------------------------------------------------------------------
+// The VEX space
+// -------------------------------------------------------------------------
+//
+// The legacy census above says nothing about AVX, and that is where the
+// decoder has actually been losing runs: `vblendpd` (VEX.66.0F3A.W0 0D) had
+// no entry while its single-precision neighbour at 0x0C did, so an ordinary
+// double-precision blend stopped a run that had already presented a frame.
+// One missing slot between two present ones is invisible without a census.
+//
+// The same honesty rule applies here: the probe is a register-form encoding
+// with a trailing immediate, which is the real shape for most of the space
+// but not all of it, so a `refused` slot is a lead and never a proven hole.
+
+/// A VEX opcode map, selected by the `mmmmm` field of the three-byte prefix.
+pub const VexMap = enum(u8) {
+    /// `VEX.0F`
+    zero_f = 1,
+    /// `VEX.0F38`
+    zero_f38 = 2,
+    /// `VEX.0F3A`
+    zero_f3a = 3,
+
+    pub fn label(self: VexMap) []const u8 {
+        return switch (self) {
+            .zero_f => "VEX.0F",
+            .zero_f38 => "VEX.0F38",
+            .zero_f3a => "VEX.0F3A",
+        };
+    }
+};
+
+/// The mandatory-prefix field of a VEX prefix.
+pub const VexPrefixBits = enum(u2) {
+    none = 0,
+    p66 = 1,
+    pf3 = 2,
+    pf2 = 3,
+
+    pub fn label(self: VexPrefixBits) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .p66 => "66",
+            .pf3 => "F3",
+            .pf2 => "F2",
+        };
+    }
+};
+
+pub const vex_map_count: usize = @typeInfo(VexMap).@"enum".fields.len;
+pub const vex_prefix_count: usize = @typeInfo(VexPrefixBits).@"enum".fields.len;
+
+/// Whether any (prefix, W) combination of this map/opcode decodes.
+///
+/// A VEX opcode is defined for a particular mandatory prefix and operand
+/// width, and the other combinations are genuinely undefined -- scoring them
+/// as gaps would report conformance as failure. So a slot counts as covered
+/// when the decoder accepts *some* legal spelling of it.
+pub fn vexProbe(map: VexMap, opcode: u8) SlotState {
+    var buffer: [16]u8 = undefined;
+    for ([_]VexPrefixBits{ .none, .p66, .pf3, .pf2 }) |prefix| {
+        for ([_]bool{ false, true }) |wide| {
+            for ([_]bool{ false, true }) |long_vector| {
+                // Both ModRM forms, because a store-only encoding
+                // (VMOVLPS, VMOVNTPS) has no register form and a
+                // register-only one (the shift groups) has no memory form --
+                // probing just one of them reports the decoder's correct
+                // refusal of the illegal spelling as a coverage gap.
+                //
+                // The reg field is walked too: 0F 71/72/73 and 0F AE are
+                // groups where it selects the instruction, so a fixed reg of
+                // zero names a member that does not exist.
+                for ([_]u8{ 0xC1, 0x01 }) |modrm_base| {
+                    for (0..8) |reg_field| {
+                        const modrm = modrm_base | (@as(u8, @intCast(reg_field)) << 3);
+                        const bytes = vexProbeInto(&buffer, map, opcode, prefix, wide, long_vector, modrm);
+                        const decoded = legacy.decodeLegacyInstruction(bytes, .long64);
+                        if (decoded.op != .invalid) return .decoded;
+                    }
+                }
+            }
+        }
+    }
+    return .refused;
+}
+
+fn vexProbeInto(
+    buffer: []u8,
+    map: VexMap,
+    opcode: u8,
+    prefix: VexPrefixBits,
+    wide: bool,
+    long_vector: bool,
+    modrm: u8,
+) []const u8 {
+    // Three-byte VEX: C4, then R/X/B inverted with the map selector, then W,
+    // vvvv inverted, L and pp.  vvvv is left at its "unused" encoding so a
+    // non-NDS form is not rejected for naming a source it does not have.
+    buffer[0] = 0xC4;
+    buffer[1] = 0xE0 | @intFromEnum(map);
+    buffer[2] = (if (wide) @as(u8, 0x80) else 0) | 0x78 |
+        (if (long_vector) @as(u8, 0x04) else 0) | @intFromEnum(prefix);
+    buffer[3] = opcode;
+    buffer[4] = modrm;
+    // Zeroes for any displacement, immediate, or is4 byte the opcode
+    // consumes.
+    @memset(buffer[5..16], 0);
+    return buffer[0..16];
+}
+
+pub const VexMapCoverage = struct {
+    map: VexMap,
+    decoded: u16 = 0,
+    refused: u16 = 0,
+    first_refused: ?u8 = null,
+
+    pub fn scored(self: VexMapCoverage) u16 {
+        return self.decoded + self.refused;
+    }
+
+    pub fn percent(self: VexMapCoverage) u16 {
+        const total = self.scored();
+        if (total == 0) return 0;
+        return @intCast((@as(u32, self.decoded) * 100) / total);
+    }
+};
+
+pub const VexCensus = struct {
+    maps: [vex_map_count]VexMapCoverage,
+
+    pub fn decoded(self: VexCensus) u32 {
+        var total: u32 = 0;
+        for (self.maps) |entry| total += entry.decoded;
+        return total;
+    }
+
+    pub fn scored(self: VexCensus) u32 {
+        var total: u32 = 0;
+        for (self.maps) |entry| total += entry.scored();
+        return total;
+    }
+
+    pub fn percent(self: VexCensus) u32 {
+        const total = self.scored();
+        if (total == 0) return 0;
+        return (self.decoded() * 100) / total;
+    }
+
+    /// The weakest VEX map, which is where the next decode gap most likely
+    /// waits. Ties resolve to the earlier map so the answer is stable.
+    pub fn weakest(self: VexCensus) VexMapCoverage {
+        var worst = self.maps[0];
+        for (self.maps[1..]) |entry| {
+            if (entry.percent() < worst.percent()) worst = entry;
+        }
+        return worst;
+    }
+};
+
+pub fn vexCensus() VexCensus {
+    var result = VexCensus{ .maps = undefined };
+    for ([_]VexMap{ .zero_f, .zero_f38, .zero_f3a }, 0..) |map, index| {
+        var entry = VexMapCoverage{ .map = map };
+        var opcode: u16 = 0;
+        while (opcode <= 0xFF) : (opcode += 1) {
+            switch (vexProbe(map, @intCast(opcode))) {
+                .decoded => entry.decoded += 1,
+                .refused => {
+                    entry.refused += 1;
+                    if (entry.first_refused == null) entry.first_refused = @intCast(opcode);
+                },
+                else => {},
+            }
+        }
+        result.maps[index] = entry;
+    }
+    return result;
+}
+
+/// A human-readable name for the opcode slot a byte sequence selects.
+///
+/// When the decoder refuses an encoding, the byte array alone does not say
+/// what is missing -- somebody has to hand-decode a VEX prefix to find out
+/// that `C4 E3 71 0D` is `VEX.128.66.0F3A.W0 0D`. Naming the slot at the
+/// fault site turns "implement the recorded instruction" from a research task
+/// into a table lookup, and it names the same coordinates the census above
+/// reports, so a gap can be checked against it directly.
+///
+/// Writes into `buffer` and returns the populated slice; a buffer of 96 bytes
+/// is always enough.
+pub fn describeEncoding(buffer: []u8, bytes: []const u8) []const u8 {
+    if (bytes.len == 0) return std.fmt.bufPrint(buffer, "<no bytes>", .{}) catch "<no bytes>";
+
+    // Walk the legacy prefixes so the opcode, not a prefix, is named.
+    var index: usize = 0;
+    var mandatory: []const u8 = "";
+    var rex_w = false;
+    while (index < bytes.len) : (index += 1) {
+        switch (bytes[index]) {
+            0x66 => mandatory = "66",
+            0xF2 => mandatory = "F2",
+            0xF3 => mandatory = "F3",
+            0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65, 0x67, 0xF0 => {},
+            0x40...0x4F => rex_w = (bytes[index] & 0x08) != 0,
+            else => break,
+        }
+    }
+    if (index >= bytes.len) return std.fmt.bufPrint(buffer, "<prefixes only>", .{}) catch "<prefixes only>";
+
+    const lead = bytes[index];
+    if ((lead == 0xC4 or lead == 0x62) and index + 3 < bytes.len) {
+        // Three-byte VEX and EVEX share the layout this needs: the map lives
+        // in the low bits of the first payload byte and W/L/pp in the second.
+        const payload1 = bytes[index + 1];
+        const payload2 = bytes[index + 2];
+        const map: u8 = payload1 & if (lead == 0xC4) @as(u8, 0x1F) else @as(u8, 0x07);
+        const opcode = bytes[index + if (lead == 0xC4) @as(usize, 3) else @as(usize, 4)];
+        const map_name = switch (map) {
+            1 => "0F",
+            2 => "0F38",
+            3 => "0F3A",
+            else => "?",
+        };
+        const pp_name = switch (payload2 & 3) {
+            0 => "",
+            1 => ".66",
+            2 => ".F3",
+            else => ".F2",
+        };
+        return std.fmt.bufPrint(buffer, "{s}.{s}{s}.{s}.W{d} {x:0>2}", .{
+            if (lead == 0xC4) "VEX" else "EVEX",
+            if ((payload2 & 0x04) != 0) "256" else "128",
+            pp_name,
+            map_name,
+            @intFromBool((payload2 & 0x80) != 0),
+            opcode,
+        }) catch "<encoding>";
+    }
+    if (lead == 0xC5 and index + 2 < bytes.len) {
+        const payload = bytes[index + 1];
+        const opcode = bytes[index + 2];
+        const pp_name = switch (payload & 3) {
+            0 => "",
+            1 => ".66",
+            2 => ".F3",
+            else => ".F2",
+        };
+        return std.fmt.bufPrint(buffer, "VEX.{s}{s}.0F.WIG {x:0>2}", .{
+            if ((payload & 0x04) != 0) "256" else "128",
+            pp_name,
+            opcode,
+        }) catch "<encoding>";
+    }
+    if (lead == 0x0F) {
+        if (index + 1 >= bytes.len) return std.fmt.bufPrint(buffer, "0F <truncated>", .{}) catch "0F";
+        const second = bytes[index + 1];
+        if ((second == 0x38 or second == 0x3A) and index + 2 < bytes.len) {
+            return std.fmt.bufPrint(buffer, "{s}0F{x:0>2} {x:0>2}{s}", .{
+                if (mandatory.len == 0) "" else mandatory,
+                second,
+                bytes[index + 2],
+                if (rex_w) " REX.W" else "",
+            }) catch "<encoding>";
+        }
+        return std.fmt.bufPrint(buffer, "{s}0F {x:0>2}{s}", .{
+            if (mandatory.len == 0) "" else mandatory,
+            second,
+            if (rex_w) " REX.W" else "",
+        }) catch "<encoding>";
+    }
+    return std.fmt.bufPrint(buffer, "{s}one-byte {x:0>2}{s}", .{
+        if (mandatory.len == 0) "" else mandatory,
+        lead,
+        if (rex_w) " REX.W" else "",
+    }) catch "<encoding>";
+}
+
+test "an unsupported encoding is named by its opcode-map coordinates" {
+    var buffer: [96]u8 = undefined;
+    // The encoding that stopped a run on 2026-09-09.
+    try std.testing.expectEqualStrings(
+        "VEX.128.66.0F3A.W0 0d",
+        describeEncoding(&buffer, &[_]u8{ 0xC4, 0xE3, 0x71, 0x0D, 0xCA, 0x01 }),
+    );
+    try std.testing.expectEqualStrings(
+        "VEX.256.66.0F.WIG 58",
+        describeEncoding(&buffer, &[_]u8{ 0xC5, 0xFD, 0x58, 0xC1 }),
+    );
+    try std.testing.expectEqualStrings(
+        "660F38 17",
+        describeEncoding(&buffer, &[_]u8{ 0x66, 0x0F, 0x38, 0x17, 0xC1 }),
+    );
+    try std.testing.expectEqualStrings(
+        "one-byte 90",
+        describeEncoding(&buffer, &[_]u8{0x90}),
+    );
+    try std.testing.expectEqualStrings("<no bytes>", describeEncoding(&buffer, &.{}));
+}
+
+/// The floor each VEX map has to hold, measured on 2026-09-09 at 40% / 22% /
+/// 11% (103, 57 and 29 slots).
+///
+/// These are low by the standards of the one-byte map and are meant to be:
+/// a large share of every VEX map is genuinely undefined rather than
+/// unimplemented, and the denominator here is all 256 slots, so the absolute
+/// number says less than the ratchet does. What the ratchet buys is that
+/// removing or shadowing an entry fails a test instead of a run.
+///
+/// The named gaps as of that measurement, in the order a compiler is likely
+/// to reach them: VEX.0F38 96-BF (the whole FMA block), 45-47 (AVX2 variable
+/// shifts), 0D (VPERMILPD), 78/79 (byte and word broadcast), 8C/8E
+/// (VPMASKMOV), 90-93 (gathers); VEX.0F3A 00-02 (VPERMQ, VPERMPD, VPBLENDD),
+/// 40/41 (VDPPS, VDPPD), 46 (VPERM2I128), 1D (VCVTPS2PH).
+pub const vex_0f_floor: u16 = 40;
+pub const vex_0f38_floor: u16 = 22;
+pub const vex_0f3a_floor: u16 = 11;
+
+test "the VEX opcode maps hold their coverage floors" {
+    const result = vexCensus();
+    const floors = [_]u16{ vex_0f_floor, vex_0f38_floor, vex_0f3a_floor };
+    for (result.maps, floors) |entry, floor| {
+        if (entry.percent() >= floor) continue;
+        std.debug.print(
+            "{s} coverage fell to {d}% (floor {d}%). Refused slots:\n",
+            .{ entry.map.label(), entry.percent(), floor },
+        );
+        var opcode: u16 = 0;
+        while (opcode <= 0xFF) : (opcode += 1) {
+            if (vexProbe(entry.map, @intCast(opcode)) == .refused) {
+                std.debug.print("  {x:0>2}\n", .{opcode});
+            }
+        }
+        return error.VexOpcodeCoverageRegressed;
+    }
+    // A census that measured nothing would clear every floor.
+    try std.testing.expectEqual(@as(u32, 3 * 256), result.scored());
+    try std.testing.expect(result.decoded() > 150);
+}
+
+test "the VEX blend and select family has no hole between its members" {
+    // This is the shape that cost a run: 0x0C and 0x0E present, 0x0D absent.
+    // A family with one member missing decodes as an invalid instruction on
+    // whichever operand width the guest happens to use.
+    for ([_]u8{ 0x0C, 0x0D, 0x0E, 0x0F }) |opcode| {
+        try std.testing.expectEqual(SlotState.decoded, vexProbe(.zero_f3a, opcode));
+    }
+    // The variable-select forms sit together at 4A/4B/4C.
+    for ([_]u8{ 0x4A, 0x4B, 0x4C }) |opcode| {
+        try std.testing.expectEqual(SlotState.decoded, vexProbe(.zero_f3a, opcode));
+    }
+    // The arithmetic block in the 0F map is contiguous and complete.
+    for ([_]u8{ 0x58, 0x59, 0x5C, 0x5D, 0x5E, 0x5F }) |opcode| {
+        try std.testing.expectEqual(SlotState.decoded, vexProbe(.zero_f, opcode));
+    }
+}
+
 /// The floor the one-byte map has to hold.
 ///
 /// Measured at 94% on 2026-09-08 with ten refusals left: `8E` (MOV Sreg),
@@ -438,8 +794,6 @@ test "the direction flag and the counted loops decode" {
         try std.testing.expectEqual(SlotState.decoded, probe(.one_byte, opcode));
     }
 }
-
-
 
 // The distinction the fault site depends on. `0F 0B` is UD2 and is a genuine
 // #UD; `48 0F A4 D0 20` is `shld rax, rdx, 32`, a real instruction that was

@@ -103,7 +103,7 @@ fn decodeLegacySseCompare(
     decoded.xmm_dst = @intFromEnum(rm.reg);
     decoded.xmm_src = decoded.xmm_dst;
     if (decoded.is_reg_form) {
-        decoded.xmm_src2 = @intCast(rm.addr);
+        decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
     } else {
         decoded.addr = rm.addr;
     }
@@ -193,7 +193,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         d.cond = @enumFromInt(@as(u4, @truncate(opcode2 & 0x0F)));
         if (d.is_reg_form) {
             d.op = .cmovcc_reg_reg;
-            d.src_reg = @enumFromInt(rm.addr);
+            d.src_reg = addressing.rmRegister(rm.addr);
         } else {
             d.op = .cmovcc_reg_mem;
             d.addr = rm.addr;
@@ -253,7 +253,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
                 else => unreachable,
             };
         } else {
-            d.dst_reg = @enumFromInt(rm.addr);
+            d.dst_reg = addressing.rmRegister(rm.addr);
             d.op = switch (opcode2) {
                 0xA3 => .bt_reg_reg,
                 0xAB => .bts_reg_reg,
@@ -289,7 +289,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
             else
                 (if (uses_cl) Op.shrd_mem_cl else Op.shrd_mem_imm8);
         } else {
-            d.dst_reg = @enumFromInt(rm.addr);
+            d.dst_reg = addressing.rmRegister(rm.addr);
             d.op = if (left)
                 (if (uses_cl) Op.shld_reg_cl else Op.shld_reg_imm8)
             else
@@ -322,7 +322,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
                 else => unreachable,
             };
         } else {
-            d.dst_reg = @enumFromInt(rm.addr);
+            d.dst_reg = addressing.rmRegister(rm.addr);
             d.op = switch (group_op) {
                 4 => .bt_reg_imm,
                 5 => .bts_reg_imm,
@@ -342,7 +342,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         d.dst_reg = rm.reg;
         if (d.is_reg_form) {
             d.op = .popcnt_reg_reg;
-            d.src_reg = @enumFromInt(rm.addr);
+            d.src_reg = addressing.rmRegister(rm.addr);
         } else {
             d.op = .popcnt_reg_mem;
             d.addr = rm.addr;
@@ -360,7 +360,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         const rm = readModRM(&d, bytes, pos, rex_r, rex_x, rex_b, d.size);
         d.dst_reg = rm.reg;
         if (d.is_reg_form) {
-            d.src_reg = @enumFromInt(rm.addr);
+            d.src_reg = addressing.rmRegister(rm.addr);
             d.op = if (has_f3)
                 if (opcode2 == 0xBC) .tzcnt_reg_reg else .lzcnt_reg_reg
             else if (opcode2 == 0xBC)
@@ -416,7 +416,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         decoded.xmm_src = @intFromEnum(rm.reg);
         decoded.op = if (has_66) .vucomisd else .vucomiss;
         if (decoded.is_reg_form) {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         } else {
             decoded.addr = rm.addr;
         }
@@ -442,7 +442,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
             decoded.op = if (decoded.is_reg_form) .vcvtsi2sd_xmm_reg else .vcvtsi2sd_xmm_mem;
         }
         if (decoded.is_reg_form) {
-            decoded.src_reg = @enumFromInt(rm.addr);
+            decoded.src_reg = addressing.rmRegister(rm.addr);
         } else {
             decoded.addr = rm.addr;
         }
@@ -467,7 +467,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         else
             .vcvtsd2si;
         if (decoded.is_reg_form) {
-            decoded.xmm_src = @intCast(rm.addr);
+            decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
         } else {
             decoded.addr = rm.addr;
         }
@@ -501,7 +501,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         if (!decoded.is_reg_form) return .{};
         decoded.op = if (has_66) .vmovmskpd else .vmovmskps;
         decoded.dst_reg = rm.reg;
-        decoded.xmm_src = @intCast(rm.addr);
+        decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
         decoded.len = @intCast(pos.*);
         return decoded;
     }
@@ -524,7 +524,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         else
             .vsqrtps;
         if (decoded.is_reg_form) {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         } else {
             decoded.addr = rm.addr;
         }
@@ -547,7 +547,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         decoded.op = if (decoded.is_reg_form) .vmovq_xmm_xmm else .vmovq_mem64_xmm;
         decoded.xmm_src = @intFromEnum(rm.reg);
         if (decoded.is_reg_form) {
-            decoded.xmm_dst = @intCast(rm.addr);
+            decoded.xmm_dst = addressing.rmVectorIndex(rm.addr);
         } else {
             decoded.addr = rm.addr;
         }
@@ -565,7 +565,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         decoded.op = if (decoded.is_reg_form) .vmovq_xmm_xmm else .vmovq_xmm_mem64;
         decoded.xmm_dst = @intFromEnum(rm.reg);
         if (decoded.is_reg_form) {
-            decoded.xmm_src = @intCast(rm.addr);
+            decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
         } else {
             decoded.addr = rm.addr;
         }
@@ -590,7 +590,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
                 (if (decoded.is_reg_form) .vmovd_xmm_reg32 else .vmovd_xmm_mem32);
             decoded.xmm_dst = @intFromEnum(rm.reg);
             if (decoded.is_reg_form) {
-                decoded.src_reg = @enumFromInt(rm.addr);
+                decoded.src_reg = addressing.rmRegister(rm.addr);
             } else {
                 decoded.addr = rm.addr;
             }
@@ -601,7 +601,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
                 (if (decoded.is_reg_form) .vmovd_reg32_xmm else .vmovd_mem32_xmm);
             decoded.xmm_src = @intFromEnum(rm.reg);
             if (decoded.is_reg_form) {
-                decoded.dst_reg = @enumFromInt(rm.addr);
+                decoded.dst_reg = addressing.rmRegister(rm.addr);
             } else {
                 decoded.addr = rm.addr;
             }
@@ -636,7 +636,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         decoded.xmm_dst = @intFromEnum(rm.reg);
         decoded.xmm_src = decoded.xmm_dst;
         if (decoded.is_reg_form) {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         } else {
             decoded.addr = rm.addr;
         }
@@ -661,7 +661,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
                 (if (decoded.is_reg_form) .vmovdqu_xmm_xmm else .vmovdqu_xmm_mem);
             decoded.xmm_dst = @intFromEnum(rm.reg);
             if (decoded.is_reg_form) {
-                decoded.xmm_src = @intCast(rm.addr);
+                decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
             } else {
                 decoded.addr = rm.addr;
             }
@@ -671,7 +671,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
             else
                 (if (decoded.is_reg_form) .vmovdqu_xmm_xmm else .vmovdqu_mem_xmm);
             if (decoded.is_reg_form) {
-                decoded.xmm_dst = @intCast(rm.addr);
+                decoded.xmm_dst = addressing.rmVectorIndex(rm.addr);
                 decoded.xmm_src = @intFromEnum(rm.reg);
             } else {
                 decoded.xmm_src = @intFromEnum(rm.reg);
@@ -724,7 +724,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         decoded.xmm_dst = @intFromEnum(rm.reg);
         decoded.xmm_src = decoded.xmm_dst;
         if (decoded.is_reg_form) {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         } else {
             decoded.addr = rm.addr;
         }
@@ -753,7 +753,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         decoded.xmm_dst = @intFromEnum(rm.reg);
         decoded.xmm_src = decoded.xmm_dst;
         if (decoded.is_reg_form) {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         } else {
             decoded.addr = rm.addr;
         }
@@ -777,7 +777,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         decoded.xmm_dst = @intFromEnum(rm.reg);
         decoded.xmm_src = decoded.xmm_dst;
         if (decoded.is_reg_form) {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         } else {
             decoded.addr = rm.addr;
         }
@@ -810,7 +810,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
             d.len = @as(u8, @intCast(pos.*));
             return d;
         }
-        d.xmm_src = @intFromEnum(@as(RegId, @enumFromInt(@as(u8, @intCast(rm.addr)))));
+        d.xmm_src = @intFromEnum(@as(RegId, addressing.rmRegister(rm.addr)));
         d.dst_reg = rm.reg;
         d.op = .pmovmskb;
         d.len = @as(u8, @intCast(pos.*));
@@ -904,7 +904,7 @@ pub fn decodeThreeByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool,
             if (is_memory) {
                 decoded.addr = rm.addr;
             } else {
-                decoded.src_reg = @enumFromInt(rm.addr);
+                decoded.src_reg = addressing.rmRegister(rm.addr);
             }
             decoded.len = @intCast(pos.*);
             return decoded;
@@ -992,7 +992,7 @@ pub fn decodeSseBytes(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, 
     if (is_reg) {
         const rm = readModRM(&d, bytes, pos, rex_r, rex_x, rex_b, .bits64);
         d.xmm_dst = @intFromEnum(rm.reg);
-        d.xmm_src = @intFromEnum(@as(RegId, @enumFromInt(@as(u8, @intCast(rm.addr)))));
+        d.xmm_src = @intFromEnum(@as(RegId, addressing.rmRegister(rm.addr)));
         if (comptime std.mem.eql(u8, @tagName(sse_op), "xor")) {
             d.op = .xorps_xmm_xmm;
         } else {
@@ -1036,7 +1036,7 @@ fn decodeLegacySseBinary(
     // contract regress.
     if (!has_66 and opcode == 0x57 and decoded.is_reg_form) {
         decoded.op = .xorps_xmm_xmm;
-        decoded.xmm_src = @intCast(rm.addr);
+        decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
         decoded.len = @intCast(pos.*);
         return decoded;
     }
@@ -1052,7 +1052,7 @@ fn decodeLegacySseBinary(
         else => return .{},
     };
     if (decoded.is_reg_form) {
-        decoded.xmm_src2 = @intCast(rm.addr);
+        decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
     } else {
         decoded.addr = rm.addr;
     }
@@ -1085,7 +1085,7 @@ fn decodeLegacySseHalfMove(
         if (has_66 or (opcode != 0x12 and opcode != 0x16)) return .{};
         decoded.op = if (opcode == 0x12) .vmovhlps else .vmovlhps;
         decoded.xmm_dst = @intFromEnum(rm.reg);
-        decoded.xmm_src = @intCast(rm.addr);
+        decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
     } else {
         decoded.op = switch (opcode) {
             0x12 => if (has_66) .vmovlpd_xmm_xmm_mem64 else .vmovlps_xmm_xmm_mem64,
@@ -1136,7 +1136,7 @@ fn decodeLegacySseArithmetic(
         else => return .{},
     };
     if (decoded.is_reg_form) {
-        decoded.xmm_src2 = @intCast(rm.addr);
+        decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
     } else {
         decoded.addr = rm.addr;
     }
@@ -1192,7 +1192,7 @@ fn decodeLegacySseConversion(
     }
 
     if (decoded.is_reg_form) {
-        decoded.xmm_src2 = @intCast(rm.addr);
+        decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
     } else {
         decoded.addr = rm.addr;
     }

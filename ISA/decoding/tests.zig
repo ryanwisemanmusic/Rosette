@@ -755,6 +755,65 @@ test "double-precision shifts decode with the fill register as the source" {
     }
 }
 
+test "the VEX blend family is complete across both lane widths" {
+    // VEX.128.66.0F3A.W0 0D /r ib -- vblendpd xmm1, xmm1, xmm2, 1.  This is
+    // what an ordinary AVX double-precision blend compiles to; it had no
+    // decoder entry while its single-precision neighbour at 0x0C did, so a
+    // run that had already presented a frame stopped on it as an invalid
+    // instruction.
+    const blend_pd = [_]u8{ 0xC4, 0xE3, 0x71, 0x0D, 0xCA, 0x01 };
+    const decoded_pd = legacy.decodeLegacyInstruction(&blend_pd, .long64);
+    try std.testing.expectEqual(types.Op.vblendpd, decoded_pd.op);
+    try std.testing.expectEqual(@as(u8, 1), decoded_pd.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 1), decoded_pd.xmm_src);
+    try std.testing.expectEqual(@as(u8, 2), decoded_pd.xmm_src2);
+    try std.testing.expect(decoded_pd.is_reg_form);
+    try std.testing.expectEqual(@as(u64, 1), decoded_pd.imm);
+    try std.testing.expectEqual(@as(u8, 6), decoded_pd.len);
+
+    // The 256-bit form and the single-precision neighbour still decode.
+    const blend_pd_256 = [_]u8{ 0xC4, 0xE3, 0x75, 0x0D, 0xCA, 0x03 };
+    const decoded_256 = legacy.decodeLegacyInstruction(&blend_pd_256, .long64);
+    try std.testing.expectEqual(types.Op.vblendpd, decoded_256.op);
+    try std.testing.expect(decoded_256.vector_256);
+
+    const blend_ps = [_]u8{ 0xC4, 0xE3, 0x71, 0x0C, 0xCA, 0x01 };
+    try std.testing.expectEqual(
+        types.Op.vblendps,
+        legacy.decodeLegacyInstruction(&blend_ps, .long64).op,
+    );
+}
+
+test "a ModRM r/m memory operand never reaches a register conversion" {
+    // VEX.128.66.0F3A.W0 17 /r ib -- vextractps.  The memory form writes a
+    // 32-bit destination in memory, so `readModRM` returns an effective
+    // address in the same field the register form uses for a register id.
+    // Converting that unconditionally aborted the process on an ordinary
+    // instruction: `vextractps dword ptr [rax], xmm0, 1` was enough to kill a
+    // run that had already presented its first frame.
+    const memory_form = [_]u8{ 0xC4, 0xE3, 0x79, 0x17, 0x00, 0x01 };
+    const decoded_memory = legacy.decodeLegacyInstruction(&memory_form, .long64);
+    try std.testing.expectEqual(types.Op.vextractps, decoded_memory.op);
+    try std.testing.expect(!decoded_memory.is_reg_form);
+    try std.testing.expectEqual(@as(u64, 1), decoded_memory.imm);
+    try std.testing.expectEqual(@as(u8, 6), decoded_memory.len);
+
+    // The register form still names its GPR destination.
+    const register_form = [_]u8{ 0xC4, 0xE3, 0x79, 0x17, 0xC1, 0x02 };
+    const decoded_register = legacy.decodeLegacyInstruction(&register_form, .long64);
+    try std.testing.expectEqual(types.Op.vextractps, decoded_register.op);
+    try std.testing.expect(decoded_register.is_reg_form);
+    try std.testing.expectEqual(types.RegId.cl_cx_ecx_rcx, decoded_register.dst_reg);
+    try std.testing.expectEqual(@as(u64, 2), decoded_register.imm);
+
+    // The conversion helpers themselves are total: a register-form field
+    // round-trips, and an address cannot escape the register file.
+    try std.testing.expectEqual(types.RegId.r15b_r15w_r15d_r15, addressing.rmRegister(15));
+    try std.testing.expectEqual(types.RegId.al_ax_eax_rax, addressing.rmRegister(0x1_4000_0000));
+    try std.testing.expectEqual(@as(u8, 9), addressing.rmVectorIndex(9));
+    try std.testing.expect(addressing.rmVectorIndex(0xFFFF_FFFF_FFFF_FFFF) <= 15);
+}
+
 // The opcode-space census lives beside the decoder it measures, so its tests
 // run wherever the decoder's do.
 test {

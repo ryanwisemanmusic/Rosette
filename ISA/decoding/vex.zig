@@ -332,13 +332,18 @@ pub fn decodeVexInstruction(bytes: []const u8) ?DecodedInsn {
                     if (!evex.has_66_prefix or evex.w or evex.vector_length != 0 or evex.vvvv != 0 or evex.v_prime) return null;
                     decoded.op = if (evex_modrm.mod == 3) .vmovd_xmm_reg32 else .vmovd_xmm_mem32;
                     decoded.xmm_dst = dst;
-                    decoded.src_reg = @enumFromInt(rm);
+                    // `evexRmIndex` folds EVEX.X in, so it spans 0-31 for a
+                    // vector operand.  This r/m is a GPR, where only EVEX.B
+                    // extends the encoding -- converting the wider value
+                    // would abort on a byte sequence the guest is allowed to
+                    // contain.
+                    decoded.src_reg = addressing.rmRegister(rm);
                 },
                 0x7E => {
                     if (!evex.has_66_prefix or evex.w or evex.vector_length != 0 or evex.vvvv != 0 or evex.v_prime) return null;
                     decoded.op = if (evex_modrm.mod == 3) .vmovd_reg32_xmm else .vmovd_mem32_xmm;
                     decoded.xmm_src = dst;
-                    decoded.dst_reg = @enumFromInt(rm);
+                    decoded.dst_reg = addressing.rmRegister(rm);
                 },
                 else => return null,
             },
@@ -1392,7 +1397,7 @@ fn decodeVex3Nds(bytes: []const u8, start_pos: usize, vex: VexPrefix, op: Op, wi
     decoded.xmm_dst = @intFromEnum(rm.reg);
     decoded.xmm_src = vex.vvvv;
     if (decoded.is_reg_form) {
-        decoded.xmm_src2 = @intCast(rm.addr);
+        decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
     } else {
         decoded.addr = rm.addr;
     }
@@ -1438,7 +1443,7 @@ fn decodeVex3Unary(bytes: []const u8, start_pos: usize, vex: VexPrefix, op: Op, 
     var pos = start_pos + 4;
     const rm = readModRM(&decoded, bytes, &pos, vex.r, vex.x, vex.b, .bits64);
     decoded.xmm_dst = @intFromEnum(rm.reg);
-    decoded.xmm_src = if (decoded.is_reg_form) @intCast(rm.addr) else 0;
+    decoded.xmm_src = if (decoded.is_reg_form) addressing.rmVectorIndex(rm.addr) else 0;
     decoded.addr = rm.addr;
     if (with_imm) {
         if (pos >= bytes.len) return null;
@@ -1456,7 +1461,7 @@ fn decodeVex3Broadcast(bytes: []const u8, start_pos: usize, vex: VexPrefix, op: 
     var pos = start_pos + 4;
     const rm = readModRM(&decoded, bytes, &pos, vex.r, vex.x, vex.b, .bits64);
     decoded.xmm_dst = @intFromEnum(rm.reg);
-    decoded.xmm_src = if (decoded.is_reg_form) @intCast(rm.addr) else 0;
+    decoded.xmm_src = if (decoded.is_reg_form) addressing.rmVectorIndex(rm.addr) else 0;
     decoded.addr = rm.addr;
     decoded.len = @intCast(pos);
     return decoded;
@@ -1486,13 +1491,19 @@ fn decodeVex3Load(bytes: []const u8, start_pos: usize, vex: VexPrefix, op: Op) ?
     return decoded;
 }
 
+/// VEX.128.66.0F3A.W0 17 /r ib -- `vextractps r/m32, xmm, imm8`.
+///
+/// The destination is the r/m operand and may be either a GPR or a 32-bit
+/// memory location; the executor picks between `dst_reg` and `addr` on
+/// `is_reg_form`.  Only the register form names a register, so only the
+/// register form may read one out of the r/m field.
 fn decodeVex3ExtractPs(bytes: []const u8, start_pos: usize, vex: VexPrefix) ?DecodedInsn {
     if (start_pos + 4 > bytes.len or vex.l or vex.w or !vex.has_66_prefix or vex.vvvv != 0) return null;
     var decoded = DecodedInsn{ .op = .vextractps, .size = .bits32 };
     var pos = start_pos + 4;
     const rm = readModRM(&decoded, bytes, &pos, vex.r, vex.x, vex.b, .bits32);
     decoded.xmm_src = @intFromEnum(rm.reg);
-    decoded.dst_reg = @enumFromInt(@as(u8, @truncate(rm.addr)));
+    if (decoded.is_reg_form) decoded.dst_reg = addressing.rmRegister(rm.addr);
     decoded.addr = rm.addr;
     if (pos >= bytes.len) return null;
     decoded.imm = bytes[pos];
@@ -1517,7 +1528,7 @@ fn decodeVex3InsertElement(
     decoded.xmm_dst = @intFromEnum(rm.reg);
     decoded.xmm_src = vex.vvvv;
     if (decoded.is_reg_form) {
-        decoded.src_reg = @enumFromInt(rm.addr);
+        decoded.src_reg = addressing.rmRegister(rm.addr);
     } else {
         decoded.addr = rm.addr;
     }
@@ -1542,7 +1553,7 @@ fn decodeVex3ExtractElement(
     var pos = start_pos + 4;
     const rm = readModRM(&decoded, bytes, &pos, vex.r, vex.x, vex.b, size);
     decoded.xmm_src = @intFromEnum(rm.reg);
-    if (decoded.is_reg_form) decoded.dst_reg = @enumFromInt(rm.addr);
+    if (decoded.is_reg_form) decoded.dst_reg = addressing.rmRegister(rm.addr);
     decoded.addr = rm.addr;
     if (pos >= bytes.len) return null;
     decoded.imm = bytes[pos];
@@ -1560,7 +1571,7 @@ fn decodeVex3InsertPs(bytes: []const u8, start_pos: usize, vex: VexPrefix) ?Deco
     decoded.xmm_dst = @intFromEnum(rm.reg);
     decoded.xmm_src = vex.vvvv;
     if (decoded.is_reg_form) {
-        decoded.xmm_src2 = @intCast(rm.addr);
+        decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
     } else {
         decoded.addr = rm.addr;
     }
@@ -1578,7 +1589,7 @@ fn decodeVex3String(bytes: []const u8, start_pos: usize, vex: VexPrefix) ?Decode
     var pos = start_pos + 4;
     const rm = readModRM(&decoded, bytes, &pos, vex.r, vex.x, vex.b, .bits64);
     decoded.xmm_src = @intFromEnum(rm.reg);
-    decoded.xmm_src2 = if (decoded.is_reg_form) @intCast(rm.addr) else 0;
+    decoded.xmm_src2 = if (decoded.is_reg_form) addressing.rmVectorIndex(rm.addr) else 0;
     decoded.addr = rm.addr;
     if (pos >= bytes.len) return null;
     decoded.imm = bytes[pos];
@@ -1746,7 +1757,7 @@ fn decodeVexMaskMove(
         // KMOV{k} k1, r/m{16,32,64}.
         decoded.dst_k = reg_code;
         if (decoded.is_reg_form) {
-            decoded.src_reg = if (opcode == 0x92) @enumFromInt(rm.addr) else unreachable;
+            decoded.src_reg = if (opcode == 0x92) addressing.rmRegister(rm.addr) else unreachable;
         } else {
             decoded.addr = rm.addr;
         }
@@ -1789,7 +1800,7 @@ fn decodeVexFloatMoveMask(
     var pos = modrm_pos;
     const rm = readModRM(&decoded, bytes, &pos, vex.r, vex.x, vex.b, .bits64);
     decoded.dst_reg = rm.reg;
-    decoded.xmm_src = @intCast(rm.addr);
+    decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
     decoded.len = @intCast(pos);
     return decoded;
 }
@@ -1815,7 +1826,7 @@ fn decodeVexPackedFloatConvert(
     if (!decoded.is_reg_form) {
         decoded.addr = rm.addr;
     } else {
-        decoded.xmm_src2 = @intCast(rm.addr);
+        decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
     }
     decoded.len = @intCast(pos);
     return decoded;
@@ -1874,7 +1885,7 @@ fn decodeVexGprInstruction(
     decoded.dst_reg = rm.reg;
 
     if (decoded.is_reg_form) {
-        decoded.src_reg = @enumFromInt(@as(u4, @truncate(rm.addr)));
+        decoded.src_reg = addressing.rmRegister(rm.addr);
     } else {
         decoded.addr = rm.addr;
     }
@@ -2054,6 +2065,7 @@ fn decodeVexMap3A(vex: VexPrefix, pos: usize, opcode: u8, modrm: anytype, imm: u
         0x0A => decodeVexNdsImm(vex, pos, .vroundss, modrm, imm), // VROUNDSS (VEX.128.66.0F3A.W0 0A)
         0x0B => decodeVexNdsImm(vex, pos, .vroundsd, modrm, imm), // VROUNDSD (VEX.128.66.0F3A.W0 0B)
         0x0C => if (vex.has_66_prefix and !vex.w) decodeVexNdsImm(vex, pos, .vblendps, modrm, imm) else null, // VBLENDPS
+        0x0D => if (vex.has_66_prefix and !vex.w) decodeVexNdsImm(vex, pos, .vblendpd, modrm, imm) else null, // VBLENDPD
         0x0E => decodeVexNdsImm(vex, pos, .vpblendw, modrm, imm), // VPBLENDW
         // VPALIGNR is NDS: VEX.vvvv is the first source and ModR/M.r/m is
         // the second. Using decodeVexReturnImm here would silently swap them.
@@ -2152,7 +2164,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
             decoded.addr = rm.addr;
         } else {
             decoded.op = .vmovd_xmm_reg32;
-            decoded.src_reg = @enumFromInt(rm.addr);
+            decoded.src_reg = addressing.rmRegister(rm.addr);
         }
         decoded.len = @intCast(pos);
         return decoded;
@@ -2169,7 +2181,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
             decoded.addr = rm.addr;
         } else {
             decoded.op = .vmovd_reg32_xmm;
-            decoded.dst_reg = @enumFromInt(rm.addr);
+            decoded.dst_reg = addressing.rmRegister(rm.addr);
         }
         decoded.len = @intCast(pos);
         return decoded;
@@ -2211,7 +2223,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.len = @intCast(pos);
         return decoded;
@@ -2249,7 +2261,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (opcode) {
             0x64 => .vpcmpgtb,
@@ -2275,7 +2287,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.len = @intCast(pos);
         return decoded;
@@ -2297,7 +2309,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (opcode) {
             0x63 => .vpacksswb,
@@ -2320,7 +2332,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.len = @intCast(pos);
         return decoded;
@@ -2339,7 +2351,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         const is_memory = bytes[pos] < 0xC0;
         const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
         decoded.xmm_dst = @intFromEnum(rm.reg);
-        decoded.xmm_src = @intCast(rm.addr);
+        decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
         decoded.is_reg_form = !is_memory;
         if (is_memory) {
             decoded.addr = rm.addr;
@@ -2366,7 +2378,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         if (pos >= bytes.len) return .{};
         decoded.imm = bytes[pos];
@@ -2390,7 +2402,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         if (pos >= bytes.len) return .{};
         decoded.imm = bytes[pos];
@@ -2421,7 +2433,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
             decoded.addr = rm.addr;
             decoded.op = if (prefix == 2) .vcvtsi2ss_xmm_mem else .vcvtsi2sd_xmm_mem;
         } else {
-            decoded.src_reg = @enumFromInt(rm.addr);
+            decoded.src_reg = addressing.rmRegister(rm.addr);
             decoded.op = if (prefix == 2) .vcvtsi2ss_xmm_reg else .vcvtsi2sd_xmm_reg;
         }
         decoded.len = @intCast(pos);
@@ -2439,7 +2451,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.len = @intCast(pos);
         return decoded;
@@ -2457,7 +2469,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.len = @intCast(pos);
         return decoded;
@@ -2495,7 +2507,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = if (opcode == 0x53)
             (if (scalar) .vrcpss else .vrcpps)
@@ -2515,7 +2527,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (prefix) {
             0 => .vcvtdq2ps,
@@ -2540,7 +2552,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         if (pos >= bytes.len) return .{};
         decoded.imm = bytes[pos];
@@ -2571,7 +2583,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (prefix) {
             0 => .vsqrtps,
@@ -2599,7 +2611,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr; // memory address
         } else {
-            decoded.src_reg = @enumFromInt(rm.addr); // ModRM.r/m = GPR source
+            decoded.src_reg = addressing.rmRegister(rm.addr); // ModRM.r/m = GPR source
         }
         if (pos >= bytes.len) return .{};
         decoded.imm = bytes[pos];
@@ -2619,7 +2631,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits16);
         decoded.xmm_src = @intFromEnum(rm.reg);
         if (decoded.is_reg_form) {
-            decoded.dst_reg = @enumFromInt(rm.addr);
+            decoded.dst_reg = addressing.rmRegister(rm.addr);
         } else {
             decoded.addr = rm.addr;
         }
@@ -2641,7 +2653,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src = @intCast(rm.addr);
+            decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = if (opcode == 0x2C)
             if (prefix == 2) .vcvttss2si else .vcvttsd2si
@@ -2667,7 +2679,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (opcode) {
             0x58 => switch (prefix) {
@@ -2728,7 +2740,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (opcode) {
             0x54 => if (prefix == 0) .vandps else .vandpd,
@@ -2758,7 +2770,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (opcode) {
             0xD9 => .vpsubusw,
@@ -2786,7 +2798,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (opcode) {
             0xDB => .vpand,
@@ -2808,7 +2820,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = if (prefix == 0) .vucomiss else .vucomisd;
         decoded.len = @intCast(compare_pos);
@@ -2820,7 +2832,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         var pos = start_pos + 3;
         const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
         decoded.dst_reg = rm.reg;
-        decoded.xmm_src = @intCast(rm.addr);
+        decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
         decoded.op = if (vector_256) .vpmovmskb_ymm else .vpmovmskb;
         decoded.len = @intCast(pos);
         return decoded;
@@ -2838,7 +2850,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = .vpmuludq;
         decoded.len = @intCast(pos);
@@ -2861,7 +2873,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (opcode) {
             0xD1 => .vpsrlw,
@@ -2890,7 +2902,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (opcode) {
             0x68 => .vpunpckhbw,
@@ -2915,7 +2927,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (opcode) {
             0x60 => .vpunpcklbw,
@@ -2957,7 +2969,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src = @intCast(rm.addr);
+            decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
         }
         if (pos >= bytes.len) return .{};
         decoded.imm = bytes[pos];
@@ -2999,7 +3011,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (opcode) {
             0xF8 => .vpsubb,
@@ -3024,7 +3036,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (opcode) {
             0xFC => .vpaddb,
@@ -3049,7 +3061,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = .vpmullw;
         decoded.len = @intCast(pos);
@@ -3117,7 +3129,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
                 .sd => .vmovsd_xmm_mem,
             };
         } else {
-            d.xmm_src = @intCast(rm.addr);
+            d.xmm_src = addressing.rmVectorIndex(rm.addr);
             d.op = if (vector_256) switch (family) {
                 .dqu => .vmovdqu_ymm_ymm,
                 .dqa => .vmovdqa_ymm_ymm,
@@ -3159,7 +3171,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
                 .sd => .vmovsd_mem_xmm,
             };
         } else {
-            d.xmm_dst = @intCast(rm.addr);
+            d.xmm_dst = addressing.rmVectorIndex(rm.addr);
             d.op = if (vector_256) switch (family) {
                 .dqu => .vmovdqu_ymm_ymm,
                 .dqa => .vmovdqa_ymm_ymm,
@@ -3330,6 +3342,10 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
             0x0B => if (!vector_256) return decodeVex3Nds(bytes, start_pos, vex, .vroundsd, true) orelse .{},
             0x04 => if (vex.vvvv == 0) return decodeVex3Unary(bytes, start_pos, vex, .vpermilps, true) orelse .{},
             0x0C => return decodeVex3Nds(bytes, start_pos, vex, .vblendps, true) orelse .{},
+            // VBLENDPD sits between VBLENDPS and VPBLENDW and was the one
+            // member of the family with no entry, so an ordinary
+            // double-precision blend decoded as an invalid instruction.
+            0x0D => return decodeVex3Nds(bytes, start_pos, vex, .vblendpd, true) orelse .{},
             0x0E => return decodeVex3Nds(bytes, start_pos, vex, .vpblendw, true) orelse .{},
             0x14 => return decodeVex3ExtractElement(bytes, start_pos, vex, .vpextrb, .bits8) orelse .{},
             0x15 => return decodeVex3ExtractElement(bytes, start_pos, vex, .vpextrw, .bits16) orelse .{},
@@ -3366,7 +3382,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.vector_256 = vector_256;
         decoded.len = @intCast(pos);
@@ -3389,7 +3405,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.len = @intCast(pos);
         return decoded;
@@ -3422,7 +3438,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = if (prefix == 0) .vucomiss else .vucomisd;
         decoded.len = @intCast(pos);
@@ -3453,7 +3469,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (opcode) {
             0x60 => .vpunpcklbw,
@@ -3484,7 +3500,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         const is_memory = bytes[pos] < 0xC0;
         const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
         decoded.xmm_dst = @intFromEnum(rm.reg);
-        decoded.xmm_src = @intCast(rm.addr);
+        decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
         decoded.is_reg_form = !is_memory;
         if (is_memory) decoded.addr = rm.addr;
         if (pos >= bytes.len) return .{};
@@ -3508,7 +3524,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         if (pos >= bytes.len) return .{};
         decoded.imm = bytes[pos];
@@ -3534,7 +3550,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         if (pos >= bytes.len) return .{};
         decoded.imm = bytes[pos];
@@ -3558,7 +3574,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.src_reg = @enumFromInt(rm.addr);
+            decoded.src_reg = addressing.rmRegister(rm.addr);
         }
         if (pos >= bytes.len) return .{};
         decoded.imm = bytes[pos];
@@ -3579,7 +3595,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits16);
         decoded.xmm_src = @intFromEnum(rm.reg);
         if (decoded.is_reg_form) {
-            decoded.dst_reg = @enumFromInt(rm.addr);
+            decoded.dst_reg = addressing.rmRegister(rm.addr);
         } else {
             decoded.addr = rm.addr;
         }
@@ -3611,7 +3627,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.len = @intCast(pos);
         return decoded;
@@ -3624,7 +3640,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         var pos = start_pos + 4;
         const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
         decoded.dst_reg = rm.reg;
-        decoded.xmm_src = @intCast(rm.addr);
+        decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
         decoded.op = if (vector_256) .vpmovmskb_ymm else .vpmovmskb;
         decoded.len = @intCast(pos);
         return decoded;
@@ -3657,7 +3673,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src = @intCast(rm.addr);
+            decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
         }
         if (pos >= bytes.len) return .{};
         decoded.imm = bytes[pos];
@@ -3705,7 +3721,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = if (opcode == 0x53)
             (if (scalar) .vrcpss else .vrcpps)
@@ -3725,7 +3741,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (prefix) {
             0 => .vcvtdq2ps,
@@ -3750,7 +3766,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         if (pos >= bytes.len) return .{};
         decoded.imm = bytes[pos];
@@ -3781,7 +3797,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (prefix) {
             0 => .vsqrtps,
@@ -3812,7 +3828,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (opcode) {
             0x58 => switch (prefix) {
@@ -3875,7 +3891,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (opcode) {
             0x54 => if (prefix == 0) .vandps else .vandpd,
@@ -3913,7 +3929,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.len = @intCast(pos);
         return decoded;
@@ -3930,7 +3946,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.len = @intCast(pos);
         return decoded;
@@ -3947,7 +3963,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.len = @intCast(pos);
         return decoded;
@@ -3965,7 +3981,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.len = @intCast(pos);
         return decoded;
@@ -3988,7 +4004,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src = @intCast(rm.addr);
+            decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
         }
         decoded.len = @intCast(pos);
         return decoded;
@@ -4009,7 +4025,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (opcode) {
             0xD1 => .vpsrlw,
@@ -4040,7 +4056,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (opcode) {
             0xF8 => .vpsubb,
@@ -4077,7 +4093,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (opcode) {
             0xD9 => .vpsubusw,
@@ -4107,7 +4123,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.imm = bytes[pos];
         decoded.uses_imm = true;
@@ -4128,7 +4144,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (pos >= bytes.len) return .{};
         const modrm = .{
             .dst_xmm = @intFromEnum(rm.reg),
-            .src_xmm = if (decoded.is_reg_form) @as(u8, @intCast(rm.addr)) else 0,
+            .src_xmm = if (decoded.is_reg_form) @as(u8, addressing.rmVectorIndex(rm.addr)) else 0,
             .is_reg_form = decoded.is_reg_form,
             .addr = rm.addr,
         };
@@ -4148,7 +4164,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
             0x39 => .vextractf128, // VEXTRACTI128, bitwise alias
             else => unreachable,
         };
-        const src_xmm: u8 = if (decoded.is_reg_form) @intCast(rm.addr) else 0;
+        const src_xmm: u8 = if (decoded.is_reg_form) addressing.rmVectorIndex(rm.addr) else 0;
         const modrm = .{
             .dst_xmm = @intFromEnum(rm.reg),
             .src_xmm = src_xmm,
@@ -4169,7 +4185,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.uses_imm = true;
         decoded.imm = bytes[pos];
@@ -4197,7 +4213,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
             decoded.addr = rm.addr;
         } else {
             decoded.op = .vmovq_xmm_xmm;
-            decoded.xmm_src = @intCast(rm.addr);
+            decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
         }
         decoded.len = @intCast(pos);
         return decoded;
@@ -4217,7 +4233,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
                 decoded.addr = rm.addr;
             } else {
                 decoded.op = if (rex_w) .vmovq_xmm_reg64 else .vmovd_xmm_reg32;
-                decoded.src_reg = @enumFromInt(rm.addr);
+                decoded.src_reg = addressing.rmRegister(rm.addr);
             }
         } else {
             decoded.xmm_src = @intFromEnum(rm.reg);
@@ -4226,7 +4242,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
                 decoded.addr = rm.addr;
             } else {
                 decoded.op = if (rex_w) .vmovq_reg64_xmm else .vmovd_reg32_xmm;
-                decoded.dst_reg = @enumFromInt(rm.addr);
+                decoded.dst_reg = addressing.rmRegister(rm.addr);
             }
         }
         decoded.len = @intCast(pos);
@@ -4246,7 +4262,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
             decoded.addr = rm.addr;
             decoded.op = if (prefix == 2) .vcvtsi2ss_xmm_mem else .vcvtsi2sd_xmm_mem;
         } else {
-            decoded.src_reg = @enumFromInt(rm.addr);
+            decoded.src_reg = addressing.rmRegister(rm.addr);
             decoded.op = if (prefix == 2) .vcvtsi2ss_xmm_reg else .vcvtsi2sd_xmm_reg;
         }
         decoded.len = @intCast(pos);
@@ -4266,7 +4282,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
             if (is_memory) {
                 decoded.addr = rm.addr;
             } else {
-                decoded.xmm_src2 = @intCast(rm.addr);
+                decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
             }
             decoded.len = @intCast(pos);
             return decoded;
@@ -4282,7 +4298,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
             if (is_memory) {
                 decoded.addr = rm.addr;
             } else {
-                decoded.xmm_src2 = @intCast(rm.addr);
+                decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
             }
             decoded.len = @intCast(pos);
             return decoded;
@@ -4300,7 +4316,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src = @intCast(rm.addr);
+            decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = if (opcode == 0x2C)
             if (prefix == 2) .vcvttss2si else .vcvttsd2si
@@ -4323,7 +4339,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.len = @intCast(pos);
         return decoded;
@@ -4340,7 +4356,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.len = @intCast(pos);
         return decoded;
@@ -4357,7 +4373,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (opcode) {
             0x29 => .vpcmpeqq,
@@ -4390,7 +4406,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (opcode) {
             0x38 => .vpminsb,
@@ -4435,7 +4451,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.dst_reg = @enumFromInt(rm.addr);
+            decoded.dst_reg = addressing.rmRegister(rm.addr);
         }
         if (pos >= bytes.len) return .{};
         decoded.imm = bytes[pos];
@@ -4466,7 +4482,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.imm = bytes[pos];
         pos += 1;
@@ -4499,7 +4515,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         if (pos >= bytes.len) return .{};
         decoded.imm = bytes[pos];
@@ -4535,8 +4551,8 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
-            decoded.src_reg = @enumFromInt(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
+            decoded.src_reg = addressing.rmRegister(rm.addr);
         }
         // Immediate byte for index
         if (pos >= bytes.len) return .{};
@@ -4567,7 +4583,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
             decoded.addr = rm.addr;
         } else {
             decoded.op = .vpinsrb_xmm_xmm_reg32;
-            decoded.src_reg = @enumFromInt(rm.addr);
+            decoded.src_reg = addressing.rmRegister(rm.addr);
         }
         decoded.imm = bytes[pos];
         pos += 1;
@@ -4586,7 +4602,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (opcode) {
             0x64 => .vpcmpgtb,
@@ -4611,7 +4627,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (is_mem) {
             decoded.addr = rm.addr;
         } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         }
         decoded.op = switch (opcode) {
             0xDB => .vpand,
@@ -4686,7 +4702,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
                     .sd => .vmovsd_xmm_mem,
                 };
             } else {
-                decoded.xmm_src = @intCast(rm.addr);
+                decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
                 decoded.op = if (vector_256) switch (family) {
                     .dqu => .vmovdqu_ymm_ymm,
                     .dqa => .vmovdqa_ymm_ymm,
@@ -4728,7 +4744,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
                     .sd => .vmovsd_mem_xmm,
                 };
             } else {
-                decoded.xmm_dst = @intCast(rm.addr);
+                decoded.xmm_dst = addressing.rmVectorIndex(rm.addr);
                 decoded.op = if (vector_256) switch (family) {
                     .dqu => .vmovdqu_ymm_ymm,
                     .dqa => .vmovdqa_ymm_ymm,
@@ -4779,7 +4795,7 @@ pub fn decodeVexHalfMove(
         // VEX.vvvv field is not an additional executor operand.
         if (opcode != 0x12 and opcode != 0x16) return .{};
         decoded.xmm_dst = @intFromEnum(rm.reg);
-        decoded.xmm_src = @intCast(rm.addr);
+        decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
         decoded.is_reg_form = true;
         decoded.op = if (opcode == 0x12 and prefix == 0) .vmovhlps else .vmovlhps;
         decoded.len = @intCast(pos);
@@ -4825,7 +4841,7 @@ pub fn decodeVexDuplicateMove(
     if (is_mem) {
         decoded.addr = rm.addr;
     } else {
-        decoded.xmm_src = @intCast(rm.addr);
+        decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
     }
     decoded.op = if (opcode == 0x16) .vmovshdup else if (prefix == 2) .vmovsldup else .vmovddup;
     decoded.len = @intCast(pos);

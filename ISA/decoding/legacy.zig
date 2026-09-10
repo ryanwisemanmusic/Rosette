@@ -1562,7 +1562,7 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
                 movsxd.addr = rm.addr;
             } else {
                 movsxd.op = .movsxd_reg64_reg32;
-                movsxd.src_reg = @enumFromInt(rm.addr);
+                movsxd.src_reg = addressing.rmRegister(rm.addr);
             }
             movsxd.len = @intCast(modrm_pos);
             return movsxd;
