@@ -24,6 +24,61 @@ typedef struct RosetteMachONativeWindowStatus {
   uint8_t reserved[3];
 } RosetteMachONativeWindowStatus;
 
+// Everything about the on-screen chain that decides whether a presented
+// swapchain image can actually be seen: the window's placement and visibility,
+// the view's geometry and hidden state, and the layer's size, scale and
+// attachment. A black window with a healthy present count is almost always one
+// of these fields, and reading them from the host is the only way to tell
+// which -- the Vulkan side reports success either way.
+typedef struct RosetteMachONativeWindowGeometry {
+  uintptr_t window;
+  uintptr_t view;
+  uintptr_t metal_layer;
+  uintptr_t view_layer;
+  uintptr_t layer_superlayer;
+  uintptr_t layer_device;
+  uintptr_t screen;
+
+  double window_x;
+  double window_y;
+  double window_width;
+  double window_height;
+  double view_width;
+  double view_height;
+  double layer_width;
+  double layer_height;
+  double drawable_width;
+  double drawable_height;
+  double contents_scale;
+  double backing_scale;
+  double window_alpha;
+
+  uint32_t layer_pixel_format;
+  uint32_t maximum_drawable_count;
+  uint32_t occlusion_state;
+
+  uint8_t window_exists;
+  uint8_t window_visible;
+  uint8_t window_miniaturized;
+  uint8_t window_on_screen;
+  uint8_t window_key;
+  uint8_t view_hidden;
+  uint8_t view_hidden_or_ancestor;
+  uint8_t view_wants_layer;
+  uint8_t layer_is_view_layer;
+  uint8_t layer_hidden;
+  uint8_t layer_opaque;
+  uint8_t layer_framebuffer_only;
+  uint8_t layer_presents_with_transaction;
+  uint8_t on_main_thread;
+  uint8_t reserved[2];
+} RosetteMachONativeWindowGeometry;
+
+// Fills `out` with the current chain. Returns 1 when a window exists, 0 when
+// there is nothing to describe. Safe to call from any thread: the AppKit reads
+// are dispatched to the main thread when necessary.
+int rosette_macho_native_window_describe(RosetteMachONativeWindowGeometry *out);
+
 int rosette_macho_native_application_ensure(void);
 int rosette_macho_native_window_ensure(uint32_t width, uint32_t height,
                                       const char *title);

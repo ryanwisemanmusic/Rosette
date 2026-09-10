@@ -604,6 +604,78 @@ RosetteMachONativeWindowStatus rosette_macho_native_window_status(void) {
   return status;
 }
 
+int rosette_macho_native_window_describe(
+    RosetteMachONativeWindowGeometry *out) {
+  if (out == NULL) {
+    return 0;
+  }
+  memset(out, 0, sizeof(*out));
+  __block int described = 0;
+  @autoreleasepool {
+    RosetteMachORunOnMainThreadSync(^{
+      out->on_main_thread = [NSThread isMainThread];
+      if (g_window == nil) {
+        return;
+      }
+      described = 1;
+      out->window_exists = 1;
+      out->window = (uintptr_t)(__bridge void *)g_window;
+      out->view = (uintptr_t)(__bridge void *)g_view;
+      out->metal_layer = (uintptr_t)(__bridge void *)g_metal_layer;
+      out->screen = (uintptr_t)(__bridge void *)g_window.screen;
+
+      const NSRect window_frame = g_window.frame;
+      out->window_x = (double)NSMinX(window_frame);
+      out->window_y = (double)NSMinY(window_frame);
+      out->window_width = (double)NSWidth(window_frame);
+      out->window_height = (double)NSHeight(window_frame);
+      out->window_alpha = (double)g_window.alphaValue;
+      out->window_visible = g_window.isVisible ? 1 : 0;
+      out->window_miniaturized = g_window.isMiniaturized ? 1 : 0;
+      out->window_on_screen = g_window.screen != nil ? 1 : 0;
+      out->window_key = g_window.isKeyWindow ? 1 : 0;
+      // NSWindowOcclusionStateVisible is bit 1. A window that is on screen but
+      // fully occluded still presents happily and shows nothing.
+      out->occlusion_state = (uint32_t)g_window.occlusionState;
+      out->backing_scale = (double)g_window.backingScaleFactor;
+
+      if (g_view != nil) {
+        const NSRect view_frame = g_view.frame;
+        out->view_width = (double)NSWidth(view_frame);
+        out->view_height = (double)NSHeight(view_frame);
+        out->view_hidden = g_view.isHidden ? 1 : 0;
+        out->view_hidden_or_ancestor = g_view.isHiddenOrHasHiddenAncestor ? 1 : 0;
+        out->view_wants_layer = g_view.wantsLayer ? 1 : 0;
+        out->view_layer = (uintptr_t)(__bridge void *)g_view.layer;
+        out->layer_is_view_layer =
+            (g_metal_layer != nil && g_view.layer == g_metal_layer) ? 1 : 0;
+      }
+
+      if (g_metal_layer != nil) {
+        const CGRect layer_bounds = g_metal_layer.bounds;
+        out->layer_width = (double)CGRectGetWidth(layer_bounds);
+        out->layer_height = (double)CGRectGetHeight(layer_bounds);
+        const CGSize drawable = g_metal_layer.drawableSize;
+        out->drawable_width = (double)drawable.width;
+        out->drawable_height = (double)drawable.height;
+        out->contents_scale = (double)g_metal_layer.contentsScale;
+        out->layer_pixel_format = (uint32_t)g_metal_layer.pixelFormat;
+        out->maximum_drawable_count =
+            (uint32_t)g_metal_layer.maximumDrawableCount;
+        out->layer_hidden = g_metal_layer.hidden ? 1 : 0;
+        out->layer_opaque = g_metal_layer.opaque ? 1 : 0;
+        out->layer_framebuffer_only = g_metal_layer.framebufferOnly ? 1 : 0;
+        out->layer_presents_with_transaction =
+            g_metal_layer.presentsWithTransaction ? 1 : 0;
+        out->layer_superlayer =
+            (uintptr_t)(__bridge void *)g_metal_layer.superlayer;
+        out->layer_device = (uintptr_t)(__bridge void *)g_metal_layer.device;
+      }
+    });
+  }
+  return described;
+}
+
 void rosette_macho_native_window_shutdown(void) {
   @autoreleasepool {
     RosetteMachORunOnMainThreadSync(^{
