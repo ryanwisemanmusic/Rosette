@@ -100,6 +100,9 @@ pub const Ledger = struct {
     allowed_observations: u32 = 0,
     first: ?Condition = null,
     first_allowed: ?Condition = null,
+    /// Occurrences of each condition, so one that is only decisive after
+    /// repeating can count without a second ledger.
+    seen: [map.conditions.len]u32 = [_]u32{0} ** map.conditions.len,
 
     pub fn configure(self: *Ledger, new_policy: Policy, allow: ?[]const u8) void {
         self.policy = new_policy;
@@ -132,16 +135,30 @@ pub const Ledger = struct {
 
     /// Classify one line. Returns the condition when the run should stop for
     /// it, and null otherwise — including when it matched but was allowed.
+    /// Occurrences of one condition so far, by label.
+    pub fn seenFor(self: *const Ledger, label: []const u8) u32 {
+        for (map.conditions, 0..) |condition, index| {
+            if (std.mem.eql(u8, condition.label, label)) return self.seen[index];
+        }
+        return 0;
+    }
+
     pub fn observe(self: *Ledger, line: []const u8) ?Condition {
         if (self.policy == .observe) return null;
-        const condition = map.match(line) orelse return null;
+        const matched = map.matchIndex(line) orelse return null;
+        const condition = map.conditions[matched];
         self.observed +|= 1;
+        self.seen[matched] +|= 1;
         if (self.first == null) self.first = condition;
         if (self.allows(condition.label)) {
             self.allowed_observations +|= 1;
             if (self.first_allowed == null) self.first_allowed = condition;
             return null;
         }
+        // A condition that is only decisive after repeating stays a warning
+        // until its threshold. Counting still happens, so the eventual stop
+        // can say how many it took.
+        if (self.seen[matched] < condition.repeats) return null;
         return if (self.policy == .fault) condition else null;
     }
 };
@@ -197,12 +214,15 @@ pub fn arm() void {
     // reading the source to find out what it is called.
     for (map.conditions) |condition| {
         machoCapturePrint(
-            "  condition {s} owner={s} allowed={s} watches=\"{s}\"\n",
+            "  condition {s} owner={s} allowed={s} fatal_after={d} watches=\"{s}\"{s}{s}\n",
             .{
                 condition.label,
                 condition.owner.label(),
                 if (ledger.allows(condition.label)) "YES" else "NO",
+                condition.repeats,
                 condition.text,
+                if (condition.also.len != 0) " and " else "",
+                condition.also,
             },
         );
         machoCapturePrint("    remedy: {s}\n", .{condition.remedy});
@@ -221,8 +241,15 @@ fn observeLine(line: []const u8) void {
 fn terminate(condition: Condition) void {
     stopped = true;
     machoCapturePrint(
-        "macho-processor: FATAL CONDITION: label={s} owner={s} policy={s} observed={d}; the run stops here because no later line can change this outcome\n",
-        .{ condition.label, condition.owner.label(), ledger.policy.label(), ledger.observed },
+        "macho-processor: FATAL CONDITION: label={s} owner={s} policy={s} observed={d} occurrences={d}/{d}; the run stops here because no later line can change this outcome\n",
+        .{
+            condition.label,
+            condition.owner.label(),
+            ledger.policy.label(),
+            ledger.observed,
+            ledger.seenFor(condition.label),
+            condition.repeats,
+        },
     );
     machoCapturePrint("macho-processor: FATAL CONDITION: {s}\n", .{condition.remedy});
     if (context_provider) |provide| {
@@ -363,4 +390,53 @@ test "a fault context is reported only when the provider says it is valid" {
     try std.testing.expect(!empty.valid);
     try std.testing.expectEqual(@as(u64, 0), empty.rip);
     try std.testing.expectEqualStrings("", empty.symbol);
+}
+
+// A repeating condition counts before it convicts.
+//
+// The zero-refresh watchdog fired 42 times in the 2026-09-08 run. Stopping on
+// the first would have ended healthy bootstraps, which is why nothing stopped
+// on it at all; the threshold is what makes the fortieth mean something the
+// first did not.
+test "a repeating condition stops only once its threshold is reached" {
+    var counting = Ledger{};
+    counting.configure(.fault, null);
+    const watchdog = map.conditionForLabel("output-never-refreshed").?;
+    const firing = "[xenia] w> DEBUG: ZERO-REFRESH WATCHDOG: vblank_id=7 " ++
+        "refresh_attempt_count=0 refresh_success_count=0";
+
+    var fired: u32 = 1;
+    while (fired < watchdog.repeats) : (fired += 1) {
+        try std.testing.expectEqual(@as(?Condition, null), counting.observe(firing));
+    }
+    // Every one of those was still recorded, so the stop can say what it took.
+    try std.testing.expectEqual(watchdog.repeats - 1, counting.seenFor("output-never-refreshed"));
+
+    const stop = counting.observe(firing) orelse return error.ThresholdShouldConvict;
+    try std.testing.expectEqualStrings("output-never-refreshed", stop.label);
+    try std.testing.expectEqual(watchdog.repeats, counting.seenFor("output-never-refreshed"));
+
+    // A one-shot condition is unaffected: it convicts on its first line.
+    var refusal = Ledger{};
+    refusal.configure(.fault, null);
+    const refused = refusal.observe("ROSETTE ADMISSION: refusing authentic guest start") orelse
+        return error.RefusalShouldConvict;
+    try std.testing.expectEqualStrings("guest-admission-refused", refused.label);
+
+    // The allow-list still short-circuits before the threshold is consulted,
+    // so stepping past a repeating condition does not require waiting for it.
+    var allowed = Ledger{};
+    allowed.configure(.fault, "output-never-refreshed");
+    var index: u32 = 0;
+    while (index < watchdog.repeats + 4) : (index += 1) {
+        try std.testing.expectEqual(@as(?Condition, null), allowed.observe(firing));
+    }
+    try std.testing.expect(allowed.allowed_observations > watchdog.repeats);
+
+    // Counts are per condition: one condition's repetitions never advance
+    // another's threshold.
+    var mixed = Ledger{};
+    mixed.configure(.fault, null);
+    _ = mixed.observe(firing);
+    try std.testing.expectEqual(@as(u32, 0), mixed.seenFor("graphics-setup-failed"));
 }

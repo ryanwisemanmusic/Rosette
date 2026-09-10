@@ -80,6 +80,11 @@ pub const Summary = struct {
     command_register_writes: u64 = 0,
     command_unclassified_register_writes: u64 = 0,
     command_out_of_range_register_writes: u64 = 0,
+    /// Writes to an exact Xenia-table register that no functional block owns.
+    /// Retained separately because it is a gap in Rosette's block map, not a
+    /// defect in the title's command stream, and folding it into either one
+    /// loses a fact a reader needs.
+    command_known_hardware_register_writes: u64 = 0,
     /// Ordered fingerprint of every readable root and nested dword, including
     /// packet bodies. Two publications with the same opcode counts but
     /// different register values or draw parameters are not the same work.
@@ -410,11 +415,17 @@ pub const Walker = struct {
 
     fn noteCommandRegister(self: *Walker, register: u32) void {
         self.result.command_register_writes +|= 1;
-        const block = register_map.blockForIndex(register) orelse {
-            self.result.command_out_of_range_register_writes +|= 1;
-            return;
-        };
-        if (block == .unclassified) self.result.command_unclassified_register_writes +|= 1;
+        // One rule, owned by the register map. This walker and the stateful
+        // executor each composed their own out of `blockForIndex` and
+        // `isKnownHardwareRegister`, and the two rules differed by a single
+        // clause — enough to make the decoders disagree 20-vs-0 on defects
+        // over a batch they otherwise described identically.
+        switch (register_map.classifyCommandRegister(register)) {
+            .out_of_range => self.result.command_out_of_range_register_writes +|= 1,
+            .unclassified => self.result.command_unclassified_register_writes +|= 1,
+            .known_hardware => self.result.command_known_hardware_register_writes +|= 1,
+            .owned => {},
+        }
     }
 
     fn noteCommandRegisterRange(self: *Walker, start: u32, count: u32, one_register: bool) void {

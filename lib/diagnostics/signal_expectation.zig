@@ -187,6 +187,25 @@ pub const Summary = struct {
     dropped: u64 = 0,
 };
 
+/// Creation provenance that arrived before the object had been waited on or
+/// signalled.
+///
+/// Creation lines name a handle and no object address, and they necessarily
+/// come *first* — an object is created before anything can wait on it. The
+/// join was a scan of existing records for that handle, so at creation time it
+/// matched nothing and returned, discarding the fact permanently. Every one of
+/// the 181 creation lines in the 2026-09-08 run was dropped that way, which is
+/// why every object reported `provenance=unknown` and no "nothing signals it"
+/// finding could be attributed to an owner.
+const PendingProvenance = struct {
+    handle: u32 = 0,
+    provenance: Provenance = .unknown,
+};
+
+/// Bounded like everything else here. A title creates a modest number of
+/// kernel objects before touching them; overflow is counted, never grown into.
+pub const pending_capacity: usize = 64;
+
 pub const Ledger = struct {
     records: [capacity]Record = [_]Record{.{}} ** capacity,
     count: usize = 0,
@@ -194,6 +213,12 @@ pub const Ledger = struct {
     /// finding that was dropped for space reads exactly like one that did not
     /// happen.
     dropped: u64 = 0,
+    /// Provenance learned before its object existed here.
+    pending: [pending_capacity]PendingProvenance = [_]PendingProvenance{.{}} ** pending_capacity,
+    pending_count: usize = 0,
+    /// Creation lines whose provenance could not be retained. Counted so the
+    /// report can never present a partial attribution as a complete one.
+    pending_dropped: u64 = 0,
 
     fn slot(self: *Ledger, object: u64) ?*Record {
         for (self.records[0..self.count]) |*record| {
@@ -224,6 +249,7 @@ pub const Ledger = struct {
         record.waits +|= 1;
         if (timed_out) record.timeouts +|= 1;
         record.waiter_thread = thread;
+        self.applyPending(object, handle);
     }
 
     /// Where in the title's own code the waiter is.
@@ -259,11 +285,63 @@ pub const Ledger = struct {
         record.signals +|= 1;
         record.signaller_thread = thread;
         record.signaller_pc = pc;
+        self.applyPending(object, handle);
     }
 
     pub fn observeProvenance(self: *Ledger, object: u64, provenance: Provenance) void {
         const record = self.slot(object) orelse return;
         if (record.provenance == .unknown) record.provenance = provenance;
+    }
+
+    /// Record how an object was created, keyed by the only identifier a
+    /// creation line carries.
+    ///
+    /// If the object is already known, this is immediate. If it is not — the
+    /// ordinary case, because creation precedes use — the fact is retained
+    /// until the object first appears. Dropping it instead is what made every
+    /// object read `provenance=unknown`.
+    pub fn observeCreation(self: *Ledger, handle: u32, provenance: Provenance) void {
+        if (handle == 0 or provenance == .unknown) return;
+        for (self.records[0..self.count]) |*record| {
+            if (record.handle != handle) continue;
+            if (record.provenance == .unknown) record.provenance = provenance;
+            return;
+        }
+        for (self.pending[0..self.pending_count]) |*entry| {
+            if (entry.handle != handle) continue;
+            // A handle can be created, closed and reissued. The most recent
+            // creation is the one that describes the object now using it.
+            entry.provenance = provenance;
+            return;
+        }
+        if (self.pending_count == pending_capacity) {
+            self.pending_dropped +|= 1;
+            return;
+        }
+        self.pending[self.pending_count] = .{ .handle = handle, .provenance = provenance };
+        self.pending_count += 1;
+    }
+
+    /// Attach a retained creation fact once the object it describes exists.
+    fn applyPending(self: *Ledger, object: u64, handle: u32) void {
+        if (handle == 0 or self.pending_count == 0) return;
+        for (self.pending[0..self.pending_count]) |entry| {
+            if (entry.handle != handle) continue;
+            const record = self.slot(object) orelse return;
+            if (record.provenance == .unknown) record.provenance = entry.provenance;
+            return;
+        }
+    }
+
+    /// Objects still carrying no creation attribution. The point of the
+    /// provenance field is to say who owns a "nothing signals it" finding, and
+    /// a count of how often it cannot is the honest companion to that claim.
+    pub fn unattributed(self: *const Ledger) usize {
+        var total: usize = 0;
+        for (self.records[0..self.count]) |record| {
+            if (record.provenance == .unknown) total += 1;
+        }
+        return total;
     }
 
     pub fn summary(self: *const Ledger) Summary {
@@ -625,4 +703,64 @@ test "an exact address match outranks a biased one" {
     ledger.observeSignal(0x8267ec48, 0xf8000174, 0x7fff2080, 0x1bd4b0, 210);
     const split = ledger.findSplitIdentity().?;
     try std.testing.expect(split.bias < 0xd1c5ec38 - 0x827cec38);
+}
+
+// Creation provenance arrives before the object it describes.
+//
+// `Added handle:F8000158` sits at line 25300 of the 2026-09-08 run and the
+// first wait on that object at line 25304. The join used to scan the ledger
+// for a record carrying that handle, find nothing, and return — so every one
+// of the run's 181 creation lines was discarded and every object reported
+// `provenance=unknown`. That field exists to say who owns a "nothing signals
+// it" finding, and it could never answer.
+test "creation provenance survives arriving before the object" {
+    var ledger = Ledger{};
+
+    // The ordinary order: created, then waited on.
+    ledger.observeCreation(0xF8000158, .bare_handle);
+    try std.testing.expectEqual(@as(usize, 0), ledger.count);
+    ledger.observeWait(0x40004BF4, 0xF8000158, 0x7FFF2140, 100, true);
+    try std.testing.expectEqual(Provenance.bare_handle, ledger.records[0].provenance);
+
+    // A signal is equally able to be the first appearance.
+    ledger.observeCreation(0xF800016C, .kernel_export);
+    ledger.observeSignal(0x827CEC28, 0xF800016C, 0x7FFF2160, 0x1BC490, 200);
+    const signalled = ledger.records[1];
+    try std.testing.expectEqual(Provenance.kernel_export, signalled.provenance);
+    try std.testing.expectEqual(Role.orphan_signal, signalled.role());
+
+    // The already-known path still works, and never downgrades a stronger fact.
+    ledger.observeCreation(0xF8000158, .kernel_export);
+    try std.testing.expectEqual(Provenance.bare_handle, ledger.records[0].provenance);
+
+    // Objects with no creation line remain honestly unattributed, and the
+    // ledger says how many rather than implying full coverage.
+    ledger.observeWait(0xDEADBEEF, 0xF8000199, 0x7FFF2000, 300, false);
+    try std.testing.expectEqual(@as(usize, 1), ledger.unattributed());
+}
+
+test "the pending creation table is bounded and counts what it drops" {
+    var ledger = Ledger{};
+    var handle: u32 = 1;
+    while (handle <= pending_capacity) : (handle += 1) {
+        ledger.observeCreation(handle, .kernel_export);
+    }
+    try std.testing.expectEqual(pending_capacity, ledger.pending_count);
+    try std.testing.expectEqual(@as(u64, 0), ledger.pending_dropped);
+
+    ledger.observeCreation(0xFFFF, .kernel_export);
+    try std.testing.expectEqual(pending_capacity, ledger.pending_count);
+    try std.testing.expectEqual(@as(u64, 1), ledger.pending_dropped);
+
+    // A repeat of a handle already pending updates it rather than consuming a
+    // second slot: a handle can be closed and reissued.
+    ledger.observeCreation(1, .bare_handle);
+    try std.testing.expectEqual(pending_capacity, ledger.pending_count);
+    ledger.observeWait(0x1000, 1, 0x7FFF2000, 10, false);
+    try std.testing.expectEqual(Provenance.bare_handle, ledger.records[0].provenance);
+
+    // An unknown provenance is not a fact and never occupies a slot.
+    var fresh = Ledger{};
+    fresh.observeCreation(0x1234, .unknown);
+    try std.testing.expectEqual(@as(usize, 0), fresh.pending_count);
 }

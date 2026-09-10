@@ -392,6 +392,7 @@ pub fn traceCause(invariant: Invariant, observation: Observation) []const u8 {
         .no_contested_claim => "two live observers of one claim disagree about the present and the contradicted source is still repeating its value",
         .no_settled_unknown_mapping => "a classifier repeatedly declined a raw value a conclusion needed; the answer is a missing table entry, not more runtime",
         .frontier_boundary_corroborated => "the frontier blames a boundary that was reached on none of its armed addresses and that nothing else has spoken about",
+        .no_stalled_run_horizon => "half the run elapsed with no new contract milestone while the producer's publication axis stayed frozen",
     };
 }
 
@@ -437,6 +438,7 @@ pub fn traceGate(invariant: Invariant) []const u8 {
         .no_contested_claim => "claim_reconciliation_multi_source > 0 && claim_reconciliation_contested == 0",
         .no_settled_unknown_mapping => "settled_unknown_mappings == 0",
         .frontier_boundary_corroborated => "frontier_armed && crossed_elsewhere > 0 && settled >= threshold && !external_progress_fresh && (addresses_reached > 0 || corroborating_observers > 0)",
+        .no_stalled_run_horizon => "run_horizon_milestones > 0 && the horizon verdict is `stalled` (quiet tail >= half the run && producer axis frozen)",
     };
 }
 
