@@ -1929,6 +1929,28 @@ pub fn build(b: *std.Build) void {
     evex_runtime_mod.addImport("x64_decoder", x64_decoder_mod);
     evex_runtime_mod.addImport("exit_diagnostics", exit_diagnostics_module);
 
+    // Shared scalar/packed VEX helpers are backend-agnostic and are also
+    // used by the PE64/ELF executor. Keeping this as a separate module avoids
+    // making the Windows path depend on the Mach-O processor itself.
+    const x86_vector_helpers_mod = b.createModule(.{
+        .root_source_file = b.path("../lib/Mach-O/execution_helpers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    x86_vector_helpers_mod.addImport("x64_decoder", x64_decoder_mod);
+
+    const windows_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("../src/x64-ASM/windows_runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // The Win32 ABI surface owns the import classification and the fallback
+    // return contract.  It was previously only compiled as a dependency of
+    // other modules, so its own tests never ran and a wrong classification
+    // could reach a run unchallenged.
+    const windows_runtime_test = b.addTest(.{ .root_module = windows_runtime_mod });
+    check_step.dependOn(&b.addRunArtifact(windows_runtime_test).step);
+
     // ELF processor (x86-64 ELF binary loader/emulator)
     {
         const x64_linux_runtime_mod = b.createModule(.{
@@ -1947,6 +1969,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         x64_linux_runtime_mod.addImport("x64_syscalls", x64_syscalls_mod);
+        x64_linux_runtime_mod.addImport("windows_runtime", windows_runtime_mod);
         const elf_processor_mod = b.createModule(.{
             .root_source_file = b.path("../lib/processor/ELF_processor/main.zig"),
             .target = target,
@@ -1961,6 +1984,7 @@ pub fn build(b: *std.Build) void {
         elf_processor_mod.addImport("cleo_routing", cleo_routing_mod);
         elf_processor_mod.addImport("execution_history", execution_history_mod);
         elf_processor_mod.addImport("evex_runtime", evex_runtime_mod);
+        elf_processor_mod.addImport("x86_vector_helpers", x86_vector_helpers_mod);
         const elf_processor = b.addExecutable(.{
             .name = "elf_processor",
             .root_module = elf_processor_mod,
@@ -1981,8 +2005,23 @@ pub fn build(b: *std.Build) void {
         elf_processor_test_mod.addImport("cleo_routing", cleo_routing_mod);
         elf_processor_test_mod.addImport("execution_history", execution_history_mod);
         elf_processor_test_mod.addImport("evex_runtime", evex_runtime_mod);
+        elf_processor_test_mod.addImport("x86_vector_helpers", x86_vector_helpers_mod);
         const elf_processor_test = b.addTest(.{ .root_module = elf_processor_test_mod });
         check_step.dependOn(&b.addRunArtifact(elf_processor_test).step);
+
+        const pe64_runtime_test_mod = b.createModule(.{
+            .root_source_file = b.path("../src/tooling/exe_parser/pe64_runtime.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        pe64_runtime_test_mod.addImport("x64_decoder", x64_decoder_mod);
+        pe64_runtime_test_mod.addImport("elf_processor_state", elf_processor_test_mod);
+        pe64_runtime_test_mod.addImport("windows_runtime", windows_runtime_mod);
+        pe64_runtime_test_mod.addImport("evex_runtime", evex_runtime_mod);
+        pe64_runtime_test_mod.addImport("cleo_routing", cleo_routing_mod);
+        pe64_runtime_test_mod.addImport("x86_vector_helpers", x86_vector_helpers_mod);
+        const pe64_runtime_test = b.addTest(.{ .root_module = pe64_runtime_test_mod });
+        check_step.dependOn(&b.addRunArtifact(pe64_runtime_test).step);
 
         const x64_guest_abi_test = b.addTest(.{ .root_module = x64_guest_abi_mod });
         check_step.dependOn(&b.addRunArtifact(x64_guest_abi_test).step);
@@ -2177,6 +2216,7 @@ pub fn build(b: *std.Build) void {
         });
         preflight_mod.addImport("xenia_prelaunch_audit_contract", xenia_prelaunch_audit_contract_mod);
         preflight_mod.addImport("xenia_gpu_bringup_contract", xenia_gpu_bringup_contract_mod);
+        preflight_mod.addImport("xenia_graphics_health_contract", xenia_graphics_health_contract_mod);
         preflight_mod.addImport("rosette_host_capability_contract", rosette_host_capability_contract_mod);
         preflight_mod.addImport("rosette_component_readiness_contract", rosette_component_readiness_contract_mod);
         const preflight_test = b.addTest(.{ .root_module = preflight_mod });
@@ -2458,6 +2498,7 @@ pub fn build(b: *std.Build) void {
         dyld_mod.addImport("application_framework", application_framework_mod);
         dyld_mod.addImport("xenia_launch_assist_contract", xenia_launch_assist_contract_mod);
         dyld_mod.addImport("xenia_host_gpu_callback_contract", xenia_host_gpu_callback_contract_mod);
+        dyld_mod.addImport("rosette_macos_host_contract", rosette_macos_host_contract_mod);
         const scheduler_mod = b.createModule(.{
             .root_source_file = b.path("../lib/scheduler/root.zig"),
             .target = target,
@@ -2488,6 +2529,13 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         init_mod.addImport("event_log", event_log_mod);
+        // The initializer pipeline was only ever built as someone else's
+        // dependency, so it had no test artifact and its tests had never run
+        // once — including the ABI-mismatch case, on the very engine that
+        // reports a failed pre-main initializer. Rooted so its rules are
+        // executed rather than merely compiled.
+        const init_test = b.addTest(.{ .root_module = init_mod });
+        check_step.dependOn(&b.addRunArtifact(init_test).step);
 
         // Rooted here rather than beside its creation because it needs
         // `event_log`, which the unwinder imports directly. That dependency was
