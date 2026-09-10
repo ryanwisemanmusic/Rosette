@@ -1,0 +1,14 @@
+name = "dll-win32-return-contract"
+version = "0.1.0-local"
+kind = "windows-import-return-contract"
+role = "build-time"
+# Route-independent: the Microsoft x64 ABI's failure values do not change with
+# the architecture Rosette was compiled for. Both routes compile the same file
+# and verify.sh checks both targets rather than a mirrored copy existing.
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
+# The package maps a name to the value its ABI defines for "this did not
+# happen". Whether a name actually took that path is runtime evidence and is
+# recorded by the ledger in src/x64-ASM, not here.
