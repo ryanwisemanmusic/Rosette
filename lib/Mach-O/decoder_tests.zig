@@ -1131,8 +1131,8 @@ test "decode VPEXTRB/W/D/Q (VEX.128.66.0F3A 14-17)" {
     try std.testing.expectEqual(Op.vpextrd, extract_d.op);
     try std.testing.expectEqual(@as(u64, 1), extract_d.imm);
 
-    // VPEXTRQ is the W1 encoding (byte3 bit 7 set): C4 E3 F9 17 ...
-    const extract_q = decodeInsn(&[_]u8{ 0xC4, 0xE3, 0xF9, 0x17, 0xC3, 0x00 });
+    // VPEXTRQ reuses opcode 16 with W1 (byte3 bit 7 set): C4 E3 F9 16 ...
+    const extract_q = decodeInsn(&[_]u8{ 0xC4, 0xE3, 0xF9, 0x16, 0xC3, 0x00 });
     try std.testing.expectEqual(Op.vpextrq, extract_q.op);
     try std.testing.expectEqual(@as(u8, 6), extract_q.len);
     try std.testing.expectEqual(@as(u8, 0), extract_q.xmm_src);

@@ -4,6 +4,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <dispatch/dispatch.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -31,6 +32,50 @@ static BOOL g_fullscreen;
 static BOOL g_reported_off_main_thread;
 static uint64_t g_diagnostic_frames_presented;
 static uint64_t g_guest_frames_presented;
+
+static const uint32_t kRosetteDefaultWindowWidth = 1280u;
+static const uint32_t kRosetteDefaultWindowHeight = 720u;
+static const uint32_t kRosetteMaxWindowDimension = 16u * 1024u;
+
+static uint32_t RosetteMachONormalizeWindowDimension(uint32_t requested,
+                                                     uint32_t fallback) {
+  // CW_USEDEFAULT is 0x80000000. It is a placement sentinel in Win32, not a
+  // dimension. The upper bound keeps malformed guest values from becoming an
+  // enormous NSWindow frame and gives the caller a stable, visible fallback.
+  if (requested == 0u || requested == 0x80000000u ||
+      requested > kRosetteMaxWindowDimension) {
+    return fallback;
+  }
+  return requested;
+}
+
+static BOOL RosetteMachOHasFinitePositiveRect(NSRect rect) {
+  return isfinite((double)NSMinX(rect)) && isfinite((double)NSMinY(rect)) &&
+         isfinite((double)NSWidth(rect)) && isfinite((double)NSHeight(rect)) &&
+         NSWidth(rect) > 0.0 && NSHeight(rect) > 0.0;
+}
+
+static void RosetteMachOPlaceWindowSafely(void) {
+  if (!g_window) {
+    return;
+  }
+  const NSRect frame = g_window.frame;
+  NSScreen *screen = g_window.screen ?: [NSScreen mainScreen];
+  if (screen && RosetteMachOHasFinitePositiveRect(screen.visibleFrame) &&
+      RosetteMachOHasFinitePositiveRect(frame)) {
+    const NSRect visible = screen.visibleFrame;
+    const CGFloat x = NSMidX(visible) - NSWidth(frame) * 0.5;
+    const CGFloat y = NSMidY(visible) - NSHeight(frame) * 0.5;
+    if (isfinite((double)x) && isfinite((double)y)) {
+      [g_window setFrameOrigin:NSMakePoint(x, y)];
+      return;
+    }
+  }
+  // A headless or not-yet-attached WindowServer may not expose a screen. A
+  // finite origin is still valid and avoids NSWindow's internal centered-frame
+  // sentinel (`INT_MIN`) while the application is becoming visible.
+  [g_window setFrameOrigin:NSMakePoint(0.0, 0.0)];
+}
 
 static void RosetteMachORunOnMainThreadSync(dispatch_block_t block) {
   if (![NSThread isMainThread]) {
@@ -92,8 +137,10 @@ static BOOL RosetteMachOEnsureWindowOnMainThread(uint32_t width,
     return YES;
   }
 
-  g_width = MAX(width, 1u);
-  g_height = MAX(height, 1u);
+  g_width = RosetteMachONormalizeWindowDimension(width,
+                                                  kRosetteDefaultWindowWidth);
+  g_height = RosetteMachONormalizeWindowDimension(
+      height, kRosetteDefaultWindowHeight);
   const NSRect content_rect = NSMakeRect(0.0, 0.0, g_width, g_height);
   const NSWindowStyleMask style = NSWindowStyleMaskTitled |
                                   NSWindowStyleMaskClosable |
@@ -149,7 +196,7 @@ static BOOL RosetteMachOEnsureWindowOnMainThread(uint32_t width,
   g_metal_layer.allowsNextDrawableTimeout = YES;
   g_metal_layer.maximumDrawableCount = 3;
   g_window.contentView = g_view;
-  [g_window center];
+  RosetteMachOPlaceWindowSafely();
   RosetteMachOUpdateMetalDrawable();
   return YES;
 }
@@ -199,11 +246,16 @@ int rosette_macho_native_window_set_size(uint32_t width, uint32_t height) {
   if (!width || !height) {
     return 0;
   }
+  const uint32_t safe_width = RosetteMachONormalizeWindowDimension(
+      width, kRosetteDefaultWindowWidth);
+  const uint32_t safe_height = RosetteMachONormalizeWindowDimension(
+      height, kRosetteDefaultWindowHeight);
   __block BOOL result = NO;
   @autoreleasepool {
     RosetteMachORunOnMainThreadSync(^{
-      if (RosetteMachOEnsureWindowOnMainThread(width, height, nil)) {
-        [g_window setContentSize:NSMakeSize(width, height)];
+      if (RosetteMachOEnsureWindowOnMainThread(safe_width, safe_height, nil)) {
+        [g_window setContentSize:NSMakeSize(safe_width, safe_height)];
+        RosetteMachOPlaceWindowSafely();
         RosetteMachOUpdateMetalDrawable();
         result = YES;
       }

@@ -19,6 +19,7 @@ const packed_ops = @import("packed_ops.zig");
 pub const VexArithmetic = @import("decoder.zig").VexArithmetic;
 pub const VexBitwise = @import("decoder.zig").VexBitwise;
 pub const PackedIntegerOperation = packed_ops.PackedIntegerOperation;
+pub const PackedPackOperation = packed_ops.PackedPackOperation;
 pub const MinMaxKind = packed_ops.MinMaxKind;
 const applyVexArithmetic = @import("decoder.zig").applyVexArithmetic;
 const applyVexPackedF32 = @import("decoder.zig").applyVexPackedF32;
@@ -260,6 +261,48 @@ pub fn executeVexPackedF64(self: anytype, d: DecodedInsn, operation: VexArithmet
     }
 }
 
+fn unpackPackedFloat128(
+    lhs: [16]u8,
+    rhs: [16]u8,
+    comptime element_bytes: usize,
+    high: bool,
+) [16]u8 {
+    var result = [_]u8{0} ** 16;
+    const lanes_per_half = 8 / element_bytes;
+    const source_lane_base = if (high) lanes_per_half else 0;
+    for (0..lanes_per_half) |lane| {
+        const source_offset = (source_lane_base + lane) * element_bytes;
+        const destination_offset = lane * 2 * element_bytes;
+        @memcpy(result[destination_offset..][0..element_bytes], lhs[source_offset..][0..element_bytes]);
+        @memcpy(result[destination_offset + element_bytes ..][0..element_bytes], rhs[source_offset..][0..element_bytes]);
+    }
+    return result;
+}
+
+/// Execute the AVX packed floating-point unpack family. Each 128-bit lane is
+/// interleaved independently; VEX.128 also clears the destination's upper YMM
+/// half, while VEX.256 computes the second lane from the upper inputs.
+pub fn executeVexPackedUnpack(self: anytype, d: DecodedInsn) void {
+    const high = d.op == .vunpckhps or d.op == .vunpckhpd;
+    const double = d.op == .vunpcklpd or d.op == .vunpckhpd;
+
+    const source2_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+    self.xmm[d.xmm_dst] = if (double)
+        unpackPackedFloat128(self.xmm[d.xmm_src], source2_low, 8, high)
+    else
+        unpackPackedFloat128(self.xmm[d.xmm_src], source2_low, 4, high);
+
+    if (d.vector_256) {
+        const source2_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+        self.ymm_hi[d.xmm_dst] = if (double)
+            unpackPackedFloat128(self.ymm_hi[d.xmm_src], source2_high, 8, high)
+        else
+            unpackPackedFloat128(self.ymm_hi[d.xmm_src], source2_high, 4, high);
+    } else if (!d.legacy_sse) {
+        @memset(&self.ymm_hi[d.xmm_dst], 0);
+    }
+}
+
 pub fn executeVexSqrtScalarF32(self: anytype, d: DecodedInsn) void {
     const source_bits = if (d.is_reg_form)
         std.mem.readInt(u32, self.xmm[d.xmm_src2][0..4], .little)
@@ -369,9 +412,10 @@ pub fn executeVexCompareScalar(self: anytype, d: DecodedInsn, comptime double: b
     const right: Float = @bitCast(right_bits);
 
     self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
+    if (d.legacy_sse) @memset(self.xmm[d.xmm_dst][width..16], 0);
     const mask: Lane = if (predicate.evaluate(left, right)) ~@as(Lane, 0) else 0;
     std.mem.writeInt(Lane, self.xmm[d.xmm_dst][0..width], mask, .little);
-    @memset(&self.ymm_hi[d.xmm_dst], 0);
+    if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
     return true;
 }
 
@@ -400,6 +444,66 @@ pub fn executeVexConvertPacked(
         self.ymm_hi[d.xmm_dst] = convert(source_high);
     } else {
         @memset(&self.ymm_hi[d.xmm_dst], 0);
+    }
+}
+
+/// VCVTPS2PD/VCVTPD2PS have a different source and destination width from
+/// the ordinary same-width packed conversions above. VEX.L selects the
+/// source width for VCVTPD2PS and the destination width for VCVTPS2PD:
+///
+///   VCVTPD2PS xmm, xmm/m128   (L=0)
+///   VCVTPD2PS xmm, ymm/m256   (L=1)
+///   VCVTPS2PD xmm, xmm/m64    (L=0)
+///   VCVTPS2PD ymm, xmm/m128   (L=1)
+///
+/// Keep the narrow/wide halves explicit so a register alias cannot overwrite
+/// an input before all source lanes have been read.
+pub fn executeVexConvertFloatPacked(
+    self: anytype,
+    d: DecodedInsn,
+    comptime direction: enum { single_to_double, double_to_single },
+) void {
+    switch (direction) {
+        .double_to_single => {
+            const source_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+            const source_high = if (d.vector_256)
+                (if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16))
+            else
+                [_]u8{0} ** 16;
+            const lane_count: usize = if (d.vector_256) 4 else 2;
+            var result = [_]u8{0} ** 16;
+            for (0..lane_count) |lane| {
+                const source = if (lane < 2) source_low else source_high;
+                const source_offset = (lane % 2) * 8;
+                const source_bits = std.mem.readInt(u64, source[source_offset..][0..8], .little);
+                const converted: f32 = @floatCast(@as(f64, @bitCast(source_bits)));
+                std.mem.writeInt(u32, result[lane * 4 ..][0..4], @bitCast(converted), .little);
+            }
+            self.xmm[d.xmm_dst] = result;
+            // All VEX forms zero the destination YMM upper half. In the L=1
+            // form the result is still an XMM register, despite the wider
+            // source operand.
+            @memset(&self.ymm_hi[d.xmm_dst], 0);
+        },
+        .single_to_double => {
+            const source = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+            const lane_count: usize = if (d.vector_256) 4 else 2;
+            var result_low = [_]u8{0} ** 16;
+            var result_high = [_]u8{0} ** 16;
+            for (0..lane_count) |lane| {
+                const source_bits = std.mem.readInt(u32, source[lane * 4 ..][0..4], .little);
+                const converted: f64 = @floatCast(@as(f32, @bitCast(source_bits)));
+                const destination = if (lane < 2) &result_low else &result_high;
+                const destination_offset = (lane % 2) * 8;
+                std.mem.writeInt(u64, destination[destination_offset..][0..8], @bitCast(converted), .little);
+            }
+            self.xmm[d.xmm_dst] = result_low;
+            if (d.vector_256) {
+                self.ymm_hi[d.xmm_dst] = result_high;
+            } else {
+                @memset(&self.ymm_hi[d.xmm_dst], 0);
+            }
+        },
     }
 }
 
@@ -555,6 +659,24 @@ pub fn executeVexPackedInteger(self: anytype, d: DecodedInsn, lane_bits: u8, ope
             vexSource128(self, d, d.xmm_src, false, true),
             vexSource128(self, d, d.xmm_src2, right_is_memory, true),
             lane_bits,
+            operation,
+        );
+    } else {
+        @memset(&self.ymm_hi[d.xmm_dst], 0);
+    }
+}
+
+pub fn executeVexPackedPack(self: anytype, d: DecodedInsn, operation: PackedPackOperation) void {
+    const right_is_memory = !d.is_reg_form;
+    self.xmm[d.xmm_dst] = packed_ops.packedIntegerPack(
+        vexSource128(self, d, d.xmm_src, false, false),
+        vexSource128(self, d, d.xmm_src2, right_is_memory, false),
+        operation,
+    );
+    if (d.vector_256) {
+        self.ymm_hi[d.xmm_dst] = packed_ops.packedIntegerPack(
+            vexSource128(self, d, d.xmm_src, false, true),
+            vexSource128(self, d, d.xmm_src2, right_is_memory, true),
             operation,
         );
     } else {

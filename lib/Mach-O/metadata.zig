@@ -417,6 +417,20 @@ pub const Metadata = struct {
         return self.addressKind(address).label();
     }
 
+    /// The same answer for a caller that already holds the resolved match.
+    ///
+    /// Reports usually need the offset as well, so they resolve once and keep
+    /// the `?SymbolMatch`. Routing those through `symbolLabel` would search the
+    /// symbol table a second time; a null match already establishes that no
+    /// symbol covers the address, leaving only the section question.
+    pub fn symbolLabelFor(self: *const Metadata, symbol: ?SymbolMatch, address: u64) []const u8 {
+        if (symbol) |resolved| return resolved.name;
+        return if (self.sectionAtAddress(address) == null)
+            AddressKind.outside_image.label()
+        else
+            AddressKind.image_unsymbolized.label();
+    }
+
     pub fn symbolAddressWithPrefix(self: *const Metadata, prefix: []const u8) ?u64 {
         const table = self.symtab orelse return null;
         var index: u32 = 0;

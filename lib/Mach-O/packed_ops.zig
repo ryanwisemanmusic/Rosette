@@ -14,6 +14,16 @@ pub const PackedIntegerOperation = enum {
     sub_unsigned_saturate,
 };
 
+/// Packed narrowing operations that combine two source vectors into one
+/// destination vector. Each 128-bit lane is packed independently by the VEX
+/// executor; the operation here only describes the scalar saturation rule.
+pub const PackedPackOperation = enum {
+    signed_words_to_bytes,
+    unsigned_words_to_bytes,
+    signed_dwords_to_words,
+    unsigned_dwords_to_words,
+};
+
 /// Multiplies unsigned even-indexed dword lanes from two 16-byte vectors,
 /// producing 64-bit results in the corresponding qword lanes.
 pub fn multiplyUnsignedEvenDwords(lhs: [16]u8, rhs: [16]u8) [16]u8 {
@@ -100,6 +110,70 @@ fn signedSaturate16(value: i32) u16 {
     else
         @intCast(value);
     return @bitCast(clamped);
+}
+
+fn unsignedSaturate8(value: i32) u8 {
+    if (value < 0) return 0;
+    if (value > 255) return 255;
+    return @intCast(value);
+}
+
+fn unsignedSaturate16(value: i64) u16 {
+    if (value < 0) return 0;
+    if (value > 65535) return 65535;
+    return @intCast(value);
+}
+
+/// Packs the low-width signed or unsigned results from two source vectors.
+/// The first source occupies the low half of the result and the second source
+/// occupies the high half, matching PACK* and VPACK* lane ordering.
+pub fn packedIntegerPack(lhs: [16]u8, rhs: [16]u8, operation: PackedPackOperation) [16]u8 {
+    var result = [_]u8{0} ** 16;
+    switch (operation) {
+        .signed_words_to_bytes => {
+            for (0..8) |lane| {
+                const offset = lane * 2;
+                result[lane] = signedSaturate8(@as(i16, @bitCast(std.mem.readInt(u16, lhs[offset..][0..2], .little))));
+                result[8 + lane] = signedSaturate8(@as(i16, @bitCast(std.mem.readInt(u16, rhs[offset..][0..2], .little))));
+            }
+        },
+        .unsigned_words_to_bytes => {
+            for (0..8) |lane| {
+                const offset = lane * 2;
+                result[lane] = unsignedSaturate8(@as(i32, @as(i16, @bitCast(std.mem.readInt(u16, lhs[offset..][0..2], .little)))));
+                result[8 + lane] = unsignedSaturate8(@as(i32, @as(i16, @bitCast(std.mem.readInt(u16, rhs[offset..][0..2], .little)))));
+            }
+        },
+        .signed_dwords_to_words => {
+            for (0..4) |lane| {
+                const offset = lane * 4;
+                std.mem.writeInt(u16, result[lane * 2 ..][0..2], signedSaturate16(@bitCast(std.mem.readInt(u32, lhs[offset..][0..4], .little))), .little);
+                std.mem.writeInt(u16, result[(4 + lane) * 2 ..][0..2], signedSaturate16(@bitCast(std.mem.readInt(u32, rhs[offset..][0..4], .little))), .little);
+            }
+        },
+        .unsigned_dwords_to_words => {
+            for (0..4) |lane| {
+                const offset = lane * 4;
+                std.mem.writeInt(u16, result[lane * 2 ..][0..2], unsignedSaturate16(@as(i64, @as(i32, @bitCast(std.mem.readInt(u32, lhs[offset..][0..4], .little))))), .little);
+                std.mem.writeInt(u16, result[(4 + lane) * 2 ..][0..2], unsignedSaturate16(@as(i64, @as(i32, @bitCast(std.mem.readInt(u32, rhs[offset..][0..4], .little))))), .little);
+            }
+        },
+    }
+    return result;
+}
+
+test "packed integer narrowing saturates and preserves source ordering" {
+    var lhs = [_]u8{0} ** 16;
+    var rhs = [_]u8{0} ** 16;
+    std.mem.writeInt(u32, lhs[0..4], @bitCast(@as(i32, -40000)), .little);
+    std.mem.writeInt(u32, lhs[4..8], @bitCast(@as(i32, 40000)), .little);
+    std.mem.writeInt(u32, rhs[0..4], @bitCast(@as(i32, -1)), .little);
+    std.mem.writeInt(u32, rhs[4..8], @bitCast(@as(i32, 1)), .little);
+    const packed_result = packedIntegerPack(lhs, rhs, .signed_dwords_to_words);
+    try std.testing.expectEqual(@as(i16, -32768), @as(i16, @bitCast(std.mem.readInt(u16, packed_result[0..2], .little))));
+    try std.testing.expectEqual(@as(i16, 32767), @as(i16, @bitCast(std.mem.readInt(u16, packed_result[2..4], .little))));
+    try std.testing.expectEqual(@as(i16, -1), @as(i16, @bitCast(std.mem.readInt(u16, packed_result[8..10], .little))));
+    try std.testing.expectEqual(@as(i16, 1), @as(i16, @bitCast(std.mem.readInt(u16, packed_result[10..12], .little))));
 }
 
 /// Computes the high 16 bits of each signed or unsigned 16x16 multiplication.

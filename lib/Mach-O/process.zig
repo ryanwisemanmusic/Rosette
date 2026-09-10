@@ -1614,6 +1614,8 @@ pub const MachOState = struct {
     /// (`.legacy`, `.strtoul`). Counted apart so the reported hit rate measures
     /// work avoided rather than lookups matched.
     import_route_cache_slow_hits: u64 = 0,
+    /// The symbols behind that count. See `SlowRouteWitness`.
+    import_route_slow_witness: types.SlowRouteWitness = .{},
     /// Fallbacks attributed to the route that declined the symbol it was cached
     /// for. A bare total names nothing; this names the route to fix.
     import_route_fallbacks: [@typeInfo(ImportRoute).@"enum".fields.len]u64 =
@@ -2995,8 +2997,8 @@ pub const MachOState = struct {
             machoCapturePrint(
                 "  [{d}] active=0x{x} rip=0x{x} {s}+0x{x} op={s} len={d}\n",
                 .{
-                    i,                                       e.thread,                        e.rip,
-                    if (symbol) |s| s.name else "<unknown>", if (symbol) |s| s.offset else 0, op_str,
+                    i,                                           e.thread,                        e.rip,
+                    self.metadata.symbolLabelFor(symbol, e.rip), if (symbol) |s| s.offset else 0, op_str,
                     e.len,
                 },
             );
@@ -3018,9 +3020,9 @@ pub const MachOState = struct {
             machoCapturePrint(
                 "  [{d}] step={d} rip=0x{x} {s}+0x{x} heap=0x{x} sparse(mappings/activations)={d}/{d} deferred={d} suspended={d}\n",
                 .{
-                    i,                                       e.step,                          e.rip,
-                    if (symbol) |s| s.name else "<unknown>", if (symbol) |s| s.offset else 0, e.heap,
-                    e.sparse_mappings,                       e.sparse_activations,            e.deferred_count,
+                    i,                                           e.step,                          e.rip,
+                    self.metadata.symbolLabelFor(symbol, e.rip), if (symbol) |s| s.offset else 0, e.heap,
+                    e.sparse_mappings,                           e.sparse_activations,            e.deferred_count,
                     e.suspended_count,
                 },
             );
@@ -3508,7 +3510,7 @@ pub const MachOState = struct {
                 identity.guest_step,
                 identity.guest_thread,
                 caller,
-                if (caller_symbol) |resolved| resolved.name else "<unknown>",
+                self.metadata.symbolLabelFor(caller_symbol, caller),
                 if (caller_symbol) |resolved| resolved.offset else 0,
             },
         );
@@ -4071,7 +4073,7 @@ pub const MachOState = struct {
                     at_step -| self.ready.last_milestone_step,
                     if (self.ready.contract) |active| active.quiet_budget_steps else 0,
                     self.regs.rip,
-                    if (symbol) |resolved| resolved.name else "<unknown>",
+                    self.metadata.symbolLabelFor(symbol, self.regs.rip),
                     if (symbol) |resolved| resolved.offset else 0,
                     self.ready.slow_progress_reports,
                 },
@@ -4218,7 +4220,7 @@ pub const MachOState = struct {
             "macho-processor: READY COMPILER: DIAGNOSIS hot_site=0x{x} {s}+0x{x} samples={d}/{d} distinct_sites={d} evictions={d} confidence={s} longest_same_site_run={d} steps=[{d}..{d}]\n",
             .{
                 diagnosis.hot_site.rip,
-                if (hot_symbol) |resolved| resolved.name else "<unknown>",
+                self.metadata.symbolLabelFor(hot_symbol, diagnosis.hot_site.rip),
                 if (hot_symbol) |resolved| resolved.offset else 0,
                 diagnosis.hot_site.samples,
                 diagnosis.stall_samples,
@@ -4258,7 +4260,7 @@ pub const MachOState = struct {
                     entry.mobilityPercent(),
                     entry.parked(),
                     entry.last_rip,
-                    if (thread_symbol) |resolved| resolved.name else "<unknown>",
+                    self.metadata.symbolLabelFor(thread_symbol, entry.last_rip),
                     if (thread_symbol) |resolved| resolved.offset else 0,
                     entry.first_step,
                     entry.last_step,
@@ -4274,7 +4276,7 @@ pub const MachOState = struct {
                     parked.thread,
                     parked.samples,
                     parked.last_rip,
-                    if (parked_symbol) |resolved| resolved.name else "<unknown>",
+                    self.metadata.symbolLabelFor(parked_symbol, parked.last_rip),
                     if (parked_symbol) |resolved| resolved.offset else 0,
                 },
             );
@@ -4425,7 +4427,7 @@ pub const MachOState = struct {
                 .{
                     site_rank,
                     site.rip,
-                    if (symbol) |resolved| resolved.name else "<unknown>",
+                    self.metadata.symbolLabelFor(symbol, site.rip),
                     if (symbol) |resolved| resolved.offset else 0,
                     site.samples,
                     self.ready.stall_samples,
@@ -5028,6 +5030,13 @@ pub const MachOState = struct {
         );
         const notifier_symbol = self.metadata.nearestSymbol(object.last_notify_pc);
         const waiter_symbol = self.metadata.nearestSymbol(object.last_waiter_pc);
+        // The parked PC is frequently inside an inlined condition-variable
+        // wait with no symbol of its own, which leaves the report naming an
+        // address nobody can act on. The thread's start routine is the same
+        // thread's identity and does carry a symbol, and it is the fact that
+        // separates an intentionally idle worker from a missing producer.
+        const waiter_origin = self.pthreads.startRoutineFor(object.last_waiter_thread);
+        const origin_symbol = self.metadata.nearestSymbol(waiter_origin);
         // A granted repair that ended in a re-park is a stronger statement
         // than "nobody ever signalled it": the waiter's predicate was checked
         // and found false, so this is a guest-side deadlock, not a lost wake.
@@ -5046,12 +5055,21 @@ pub const MachOState = struct {
                 object.last_notify_step,
                 object.last_notify_thread,
                 object.last_notify_pc,
-                if (notifier_symbol) |resolved| resolved.name else "<unknown>",
+                self.metadata.symbolLabelFor(notifier_symbol, object.last_notify_pc),
                 if (notifier_symbol) |resolved| resolved.offset else 0,
                 object.last_waiter_thread,
                 object.last_waiter_pc,
-                if (waiter_symbol) |resolved| resolved.name else "<unknown>",
+                self.metadata.symbolLabelFor(waiter_symbol, object.last_waiter_pc),
                 if (waiter_symbol) |resolved| resolved.offset else 0,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: NOTIFIER LIVENESS WAITER ORIGIN: thread=0x{x} start_routine=0x{x} symbol={s}+0x{x}; the parked program counter is often inside an inlined wait with no symbol of its own, so the routine the thread was started on is what names which subsystem is waiting — and therefore whether this is a worker with nothing to do or a producer that never arrived\n",
+            .{
+                object.last_waiter_thread,
+                waiter_origin,
+                self.metadata.symbolLabelFor(origin_symbol, waiter_origin),
+                if (origin_symbol) |resolved| resolved.offset else 0,
             },
         );
         if (repaired) {
@@ -5082,7 +5100,7 @@ pub const MachOState = struct {
                         repair.thread,
                         repair.object,
                         repair.waited_steps,
-                        if (woken_symbol) |resolved| resolved.name else "<unknown>",
+                        self.metadata.symbolLabelFor(woken_symbol, repair.thread),
                     },
                 );
                 // The wake happened here; what it proved is judged elsewhere.
@@ -5536,10 +5554,10 @@ pub const MachOState = struct {
         if (self.dynamic_forwarder.native_vulkan_loader_attempts != 0)
             self.recordGraphicsHealth(
                 .vulkan_loader_resolved,
-                if (self.dynamic_forwarder.native_vulkan_loader_failures == 0) .satisfied else .blocked,
+                if (self.dynamic_forwarder.native_vulkan_loader_successes != 0) .satisfied else .blocked,
                 .vulkan_forwarder,
                 self.dynamic_forwarder.native_vulkan_loader_attempts,
-                if (self.dynamic_forwarder.native_vulkan_loader_failures == 0) "native Vulkan loader attempts resolved" else "native Vulkan loader resolution failed",
+                if (self.dynamic_forwarder.native_vulkan_loader_successes != 0) "native Vulkan loader resolved after candidate search" else "native Vulkan loader resolution failed",
             );
         self.refreshNativePresenterHealth();
 
@@ -7003,6 +7021,12 @@ pub const MachOState = struct {
             .actionable_waiters_without_a_notifier = actionable_waiters_without_notifier,
             .liveness_obligation_proven = liveness_obligation_proven,
             .run_execution_frozen = run_execution_frozen,
+            // The horizon's own verdict, computed from the producer's
+            // publication axis rather than from instruction retirement. This
+            // is the one progress reading here that a spinning main loop
+            // cannot forge, which is why it is the one that can end a run.
+            .run_horizon_stalled = self.runHorizonStalled(),
+            .run_horizon_milestones = self.run_horizon.milestones_reached,
             .progress_since_never_notified_park = progress_since_park,
             .reinterpreted_texture_formats = self.texture_format_summary.reinterpreted,
             .texture_formats_probed = self.texture_format_summary.probed != 0,
@@ -10355,7 +10379,7 @@ pub const MachOState = struct {
         const pm4_authority_verdict = self.audit_pm4.verdict();
         const pm4_comparison = self.audit_pm4.comparison();
         machoCapturePrint(
-            "macho-processor: PM4 AUTHORITY: verdict={s} batch=0x{x} accounts={d} dropped={d} comparable={s} disagreements={d} first_field={s} left={d} right={d}; {s}\n",
+            "macho-processor: PM4 AUTHORITY: verdict={s} batch=0x{x} accounts={d} dropped={d} comparable={s} disagreements={d} first_field={s} defect_class={s} left={d} right={d}; {s}\n",
             .{
                 pm4_authority_verdict.label(),
                 self.audit_pm4.batch_id,
@@ -10364,11 +10388,41 @@ pub const MachOState = struct {
                 if (pm4_comparison.comparable) "YES" else "NO",
                 pm4_comparison.disagreements,
                 if (pm4_comparison.first_field) |field| field.label() else "-",
+                // A defect total names nobody. Which class disagreed is the
+                // difference between a truncated ring and an unrecognised
+                // register, and those go to different people.
+                if (pm4_comparison.first_defect_kind) |kind| kind.label() else "-",
                 pm4_comparison.first_left,
                 pm4_comparison.first_right,
                 pm4_authority_verdict.describe(),
             },
         );
+        // Per-class defect rows for every account, so a disagreement is read
+        // from the classes rather than inferred from two totals.
+        if (pm4_comparison.comparable and !pm4_comparison.agrees()) {
+            inline for (@typeInfo(gpu.pm4_authority.DefectKind).@"enum".fields) |field| {
+                const kind: gpu.pm4_authority.DefectKind = @enumFromInt(field.value);
+                var differs = false;
+                var previous: ?u64 = null;
+                for (self.audit_pm4.retained()) |account| {
+                    const value = account.defects[field.value];
+                    if (previous) |seen| {
+                        if (seen != value) differs = true;
+                    }
+                    previous = value;
+                }
+                if (differs) {
+                    machoCapturePrint("  PM4 DEFECT CLASS {s: <22} semantic={s}", .{
+                        kind.label(),
+                        if (kind.continuationChangesSemantics()) "YES" else "NO",
+                    });
+                    for (self.audit_pm4.retained()) |account| {
+                        machoCapturePrint(" {s}={d}", .{ account.decoder.label(), account.defects[field.value] });
+                    }
+                    machoCapturePrint("\n", .{});
+                }
+            }
+        }
         for (self.audit_pm4.retained(), 0..) |account, account_index| {
             machoCapturePrint(
                 "  PM4 ACCOUNT #{d}: decoder={s} domain={s} source={s} batch=0x{x} dwords={d} packets(root/nested/total)={d}/{d}/{d} indirect_refs={d} register_intents={d} draws={d} event_writes={d} swaps={d} defects={d}\n",
@@ -10472,13 +10526,24 @@ pub const MachOState = struct {
         // handler was not doing what the waiter needed.
         if (interrupts.deliveries != 0) {
             machoCapturePrint(
-                "  INTERRUPT CAUSES: raised={d}/{d} sole={s} permits_handler_conclusion={s}; {s}\n",
+                "  INTERRUPT CAUSES: raised={d}/{d} sole={s} attributed={d}/{d} unattributed={d} census={s} permits_handler_conclusion={s}; {s}\n",
                 .{
                     self.audit_interrupts.causesRaised(),
                     gpu.interrupt_effect.cause_count,
                     if (self.audit_interrupts.soleCause()) |cause| cause.label() else "-",
+                    // The histogram's own coverage. `deliveries` is reconciled
+                    // to the emulator's reported total and this table is not,
+                    // so the two are different observers and the gap between
+                    // them belongs on the line rather than in the reader's
+                    // head.
+                    interrupts.attributed(),
+                    interrupts.deliveries,
+                    interrupts.unattributed(),
+                    if (interrupts.causeCensusComplete()) "complete" else "PARTIAL",
                     if (self.audit_interrupts.permitsHandlerConclusion()) "YES" else "NO",
-                    if (self.audit_interrupts.permitsHandlerConclusion())
+                    if (!interrupts.causeCensusComplete())
+                        "the cause histogram below covers only the deliveries Rosette classified; the rest were reported by the emulator and never assigned a cause. That is a hole in this observer, not extra interrupts, and no cause-diversity conclusion may be drawn from a partial census"
+                    else if (self.audit_interrupts.permitsHandlerConclusion())
                         "a returned callback has a named expected object and a complete effect observation"
                     else
                         "cause diversity alone proves no defect. Identify the expected guest object and observe its state through a real callback; do not synthesize interrupts to obtain coverage",
@@ -11626,12 +11691,12 @@ pub const MachOState = struct {
         machoCapturePrint(
             "  translation bank occupancy: static={d}%({d}/{d}) dynamic={d}%({d}/{d}) thunk={d}%({d}/{d}) unknown={d}%({d}/{d}) sampled_sets={d}/{d}/{d}/{d}; banks are sized by measured demand, so an uneven row is the routing working rather than an unfair split — read it against the fill census above, because fills never come back down and occupancy does\n",
             .{
-                occupancy[0].percent(),        occupancy[0].estimated(),    occupancy[0].capacity,
-                occupancy[1].percent(),        occupancy[1].estimated(),    occupancy[1].capacity,
-                occupancy[2].percent(),        occupancy[2].estimated(),    occupancy[2].capacity,
-                occupancy[3].percent(),        occupancy[3].estimated(),    occupancy[3].capacity,
-                occupancy[0].sampled_sets,     occupancy[1].sampled_sets,
-                occupancy[2].sampled_sets,     occupancy[3].sampled_sets,
+                occupancy[0].percent(),    occupancy[0].estimated(),  occupancy[0].capacity,
+                occupancy[1].percent(),    occupancy[1].estimated(),  occupancy[1].capacity,
+                occupancy[2].percent(),    occupancy[2].estimated(),  occupancy[2].capacity,
+                occupancy[3].percent(),    occupancy[3].estimated(),  occupancy[3].capacity,
+                occupancy[0].sampled_sets, occupancy[1].sampled_sets, occupancy[2].sampled_sets,
+                occupancy[3].sampled_sets,
             },
         );
 
@@ -11722,6 +11787,25 @@ pub const MachOState = struct {
     /// covered. A title that reached its newest milestone at 93% of the way
     /// through a run has not stalled; it ran out of wall clock, and a longer
     /// run is the entire fix. Reading that as a stall costs weeks.
+    /// The producer's own publication axis, frozen.
+    ///
+    /// Deliberately not "the guest stopped executing": an emulator's main loop
+    /// retires instructions forever while its pipeline is dead, which is what
+    /// let the 2026-09-08 run hold every armed invariant at satisfied for 7.5
+    /// billion steps. This asks whether the *producer* advanced, which a spin
+    /// cannot fake.
+    fn runHorizonAxisFrozen(self: *const MachOState) bool {
+        return self.gpu_ring_publication.advances != 0 and
+            self.gpu_vd_swap_contract.observed(.draw_consumed) and
+            !self.gpu_vd_swap_contract.observed(.guest_producer_progressed_after_draw);
+    }
+
+    /// Whether the horizon has reached the verdict that says a longer run will
+    /// not help. One computation, read by both the report and the gate.
+    pub fn runHorizonStalled(self: *const MachOState) bool {
+        return self.run_horizon.verdict(self.runHorizonAxisFrozen()) == .stalled;
+    }
+
     pub fn logRunHorizon(self: *MachOState) void {
         const ledger = &self.run_horizon;
         ledger.observe(.{
@@ -11734,9 +11818,7 @@ pub const MachOState = struct {
         // The independent axis: the producer's own publication counter. A
         // frozen axis alone never convicts — the verdict requires a long quiet
         // tail as well — but without one a quiet run cannot be called dead.
-        const axis_frozen = self.gpu_ring_publication.advances != 0 and
-            self.gpu_vd_swap_contract.observed(.draw_consumed) and
-            !self.gpu_vd_swap_contract.observed(.guest_producer_progressed_after_draw);
+        const axis_frozen = self.runHorizonAxisFrozen();
         const verdict = ledger.verdict(axis_frozen);
 
         machoCapturePrint(
@@ -17655,7 +17737,7 @@ pub const MachOState = struct {
         const totals = ledger.summary();
         if (verdict == .quiet) return;
         machoCapturePrint(
-            "macho-processor: SIGNAL EXPECTATION: verdict={s} tracked={d} matched={d} orphan_waits(total/blocking/polling)={d}/{d}/{d} orphan_signals={d} dropped={d} split_identity_suspected={s} step={d}; {s}\n",
+            "macho-processor: SIGNAL EXPECTATION: verdict={s} tracked={d} matched={d} orphan_waits(total/blocking/polling)={d}/{d}/{d} orphan_signals={d} dropped={d} split_identity_suspected={s} attributed={d}/{d} creation_facts_dropped={d} step={d}; {s}\n",
             .{
                 verdict.label(),
                 totals.tracked,
@@ -17666,10 +17748,23 @@ pub const MachOState = struct {
                 totals.orphan_signals,
                 totals.dropped,
                 if (ledger.looksLikeSplitIdentity()) "YES" else "NO",
+                // How many tracked objects Rosette can say were created. The
+                // provenance field exists so a "nothing signals it" finding can
+                // name an owner; a count of how often it cannot is the honest
+                // companion to that claim rather than a silent `unknown` per row.
+                totals.tracked -| ledger.unattributed(),
+                totals.tracked,
+                ledger.pending_dropped,
                 self.executed_steps,
                 verdict.describe(),
             },
         );
+        if (ledger.unattributed() != 0) {
+            machoCapturePrint(
+                "  SIGNAL EXPECTATION ATTRIBUTION: {d} tracked object(s) have no observed creation, so a finding against them names no owner. An object created through a kernel export and one that only ever appeared as a handle registration carry different weight when nothing signals them, and an object with neither was never seen entering the emulator at all\n",
+                .{ledger.unattributed()},
+            );
+        }
         // Which pair, and how far apart. A `YES` with no addresses beside it
         // leaves the reader to find the pair by eye across a table, which is
         // the work the exhaustive comparison was added to do.
@@ -21668,8 +21763,8 @@ pub const MachOState = struct {
         machoCapturePrint(
             "macho-processor: GTK worker bootstrapping successful: thread=0x{x} first_rip=0x{x} last_rip=0x{x} first_symbol={s}\n",
             .{
-                first.thread,                            first.rip, last.rip,
-                if (symbol) |s| s.name else "<unknown>",
+                first.thread,                                    first.rip, last.rip,
+                self.metadata.symbolLabelFor(symbol, first.rip),
             },
         );
     }
@@ -21746,13 +21841,39 @@ pub const MachOState = struct {
         } else {
             machoCapturePrint("macho-processor: invalid instruction source-map: rip=0x{x} file_off=<unmapped>\n", .{rip});
         }
+        // Whose defect is this? The decoder returns `invalid` both for bytes
+        // that are not an x86-64 instruction and for a real instruction it has
+        // not implemented, and the two call for opposite handling.
+        //
+        // A genuine bad encoding earns a guest #UD: that is what the hardware
+        // would raise, and the title's own handler is entitled to it. A real
+        // instruction Rosette merely lacks must never be delivered that way —
+        // real hardware would have executed it, so handing the guest a #UD
+        // tells it its own code is invalid, and a handler that swallows the
+        // signal carries on with the instruction's effect silently missing.
+        // That is the run continuing on a lie, which is worse than stopping.
+        const encoding_class = x64_decoder.coverage.classifyEncoding(mem_bytes);
+        const rosette_gap = encoding_class == .refused;
+        machoCapturePrint(
+            "macho-processor: invalid instruction class={s} owner={s}; {s}\n",
+            .{
+                encoding_class.label(),
+                if (rosette_gap) "rosette:decoder" else "guest:code",
+                if (rosette_gap)
+                    "the opcode census recognises this slot as a real user-mode-reachable instruction, so this is a decoder coverage gap and the run stops here. Delivering #UD would tell the title its own instruction is invalid and let a handler carry on without its effect"
+                else
+                    "this encoding is not a user-mode-reachable x86-64 instruction, so a guest #UD is the architecturally correct answer rather than a Rosette gap",
+            },
+        );
         self.dumpStepTraceBuffer();
         self.dumpCoopBootstrapTrace();
         self.dumpMemInitTrace();
         self.dumpCoopHeartbeatTrace();
         self.dumpUiHandoffTrace();
         self.dumpRecentTrace();
-        if (self.deliverGuestSignal(GUEST_SIGILL, self.regs.rip, 1, self.regs.rip, null, 0, mem_bytes)) {
+        if (!rosette_gap and
+            self.deliverGuestSignal(GUEST_SIGILL, self.regs.rip, 1, self.regs.rip, null, 0, mem_bytes))
+        {
             return true;
         }
         self.faulted = true;
@@ -22211,7 +22332,7 @@ pub const MachOState = struct {
         const snapshot: startup_observer.Snapshot = .{
             .step = steps,
             .rip = self.regs.rip,
-            .symbol = if (symbol) |resolved| resolved.name else "<unknown>",
+            .symbol = self.metadata.symbolLabelFor(symbol, self.regs.rip),
             .symbol_offset = if (symbol) |resolved| resolved.offset else 0,
             .heap_next = self.heap_next,
             .import_calls = self.import_resolver.total_calls,
@@ -23781,7 +23902,65 @@ fn fatalConditionContext() fatal_conditions.FaultContext {
 /// Returns false when the build cannot reach a frame at all. This runs ahead of
 /// the media hash on purpose: refusing a build that never linked its command
 /// processor should not cost six gigabytes of reads first.
+/// What fraction of the x86-64 opcode space this decoder accepts.
+///
+/// Rosette translates x86-64, and "does it handle all of x86-64?" used to have
+/// no answer: the evidence was anecdotal, one guest-reached encoding at a
+/// time, with the distance between them invisible. This asks the production
+/// decoder about every slot of every opcode map before the first guest
+/// instruction, so the claim is a number with its gaps named.
+///
+/// The three excluded classes are excluded because a decoder that accepted
+/// them would be wrong: encodings x86-64 removed, ring-0 instructions a
+/// user-mode guest cannot execute, and the prefixes and map escapes that are
+/// not instructions at all. Scoring those as gaps would send a reader to
+/// implement instructions that must not exist.
+fn reportDecodeCoverage(state: *MachOState) void {
+    _ = state;
+    const result = x64_decoder.coverage.census();
+    const weakest = result.weakest();
+    machoCapturePrint(
+        "macho-processor: DECODE COVERAGE: {d}% decoded={d} refused={d} of {d} scorable slot(s); excluded(not-an-opcode/not-in-long-mode/privileged)={d}/{d}/{d}; weakest map is {s} at {d}%. A refused slot is a lead rather than a verdict — the census probes each opcode with a synthesized encoding, so it can understate coverage and never overstate it\n",
+        .{
+            result.percent(),
+            result.decoded(),
+            result.refused(),
+            result.scored(),
+            blk: {
+                var total: u32 = 0;
+                for (result.maps) |entry| total += entry.not_an_opcode;
+                break :blk total;
+            },
+            blk: {
+                var total: u32 = 0;
+                for (result.maps) |entry| total += entry.not_in_long_mode;
+                break :blk total;
+            },
+            blk: {
+                var total: u32 = 0;
+                for (result.maps) |entry| total += entry.privileged;
+                break :blk total;
+            },
+            weakest.map.label(),
+            weakest.percent(),
+        },
+    );
+    for (result.maps) |entry| {
+        machoCapturePrint(
+            "  decode map {s: <12} {d: >3}% decoded={d: >3} refused={d: >3} first_refused=0x{x:0>2}\n",
+            .{
+                entry.map.label(),
+                entry.percent(),
+                entry.decoded,
+                entry.refused,
+                entry.first_refused orelse 0,
+            },
+        );
+    }
+}
+
 fn reportPrelaunchAudit(state: *MachOState) bool {
+    reportDecodeCoverage(state);
     const audit = preflight_lib.prelaunch_audit;
     const summary = audit.auditImage(&state.metadata);
     state.prelaunch_audit_summary = summary;

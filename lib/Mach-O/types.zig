@@ -122,7 +122,11 @@ pub const X87State = struct {
     pub const status_invalid: u16 = 1 << 0;
     pub const status_zero_divide: u16 = 1 << 2;
     pub const status_stack_fault: u16 = 1 << 6;
+    pub const status_c0: u16 = 1 << 8;
     pub const status_c1: u16 = 1 << 9;
+    pub const status_c2: u16 = 1 << 10;
+    pub const status_c3: u16 = 1 << 14;
+    pub const status_condition_mask: u16 = status_c0 | status_c1 | status_c2 | status_c3;
     pub const status_top_mask: u16 = 0x3800;
 
     pub fn physical(self: *const X87State, logical: u3) u3 {
@@ -211,6 +215,265 @@ pub const X87State = struct {
 
     pub fn free(self: *X87State, logical: u3) void {
         self.tags[self.physical(logical)] = .empty;
+    }
+
+    pub fn fchs(self: *X87State) void {
+        const value = self.get(0) orelse return;
+        _ = self.set(0, -value);
+    }
+
+    pub fn fabs(self: *X87State) void {
+        const value = self.get(0) orelse return;
+        _ = self.set(0, @abs(value));
+    }
+
+    pub fn testValue(self: *X87State) void {
+        const value = self.get(0) orelse return;
+        self.status &= ~@as(u16, status_c0 | status_c2 | status_c3);
+        if (std.math.isNan(value)) {
+            self.status |= status_c0 | status_c2 | status_c3;
+        } else if (value == 0.0) {
+            self.status |= status_c3;
+        } else if (value < 0.0) {
+            self.status |= status_c0;
+        }
+    }
+
+    /// FXAM classifies ST(0) through the x87 condition flags.  The value
+    /// representation is intentionally f64 in this state, so NaN, infinity,
+    /// zero, and ordinary finite values are the useful classifications here.
+    pub fn examine(self: *X87State) void {
+        const value = self.get(0) orelse return;
+        self.status &= ~status_condition_mask;
+        if ((@as(u64, @bitCast(value)) & (@as(u64, 1) << 63)) != 0) {
+            self.status |= status_c1;
+        }
+        if (std.math.isNan(value)) {
+            self.status |= status_c0;
+        } else if (!std.math.isFinite(value)) {
+            self.status |= status_c0 | status_c2;
+        } else if (value == 0.0) {
+            self.status |= status_c3;
+        } else {
+            self.status |= status_c2;
+        }
+    }
+
+    pub const Constant = enum {
+        one,
+        log2_ten,
+        log2_e,
+        pi,
+        log10_two,
+        log_e_two,
+    };
+
+    pub fn pushConstant(self: *X87State, constant: Constant) void {
+        const value: f64 = switch (constant) {
+            .one => 1.0,
+            .log2_ten => 3.32192809488736234787,
+            .log2_e => 1.44269504088896340736,
+            .pi => 3.14159265358979323846,
+            .log10_two => 0.30102999566398119521,
+            .log_e_two => 0.69314718055994530942,
+        };
+        _ = self.push(value);
+    }
+
+    pub fn f2xm1(self: *X87State) void {
+        const value = self.get(0) orelse return;
+        if (!std.math.isFinite(value) or value < -1.0 or value > 1.0) {
+            self.status |= status_c2;
+            return;
+        }
+        self.status &= ~status_c2;
+        _ = self.set(0, std.math.exp2(value) - 1.0);
+    }
+
+    pub fn fyl2x(self: *X87State, add_one: bool) void {
+        const x = self.get(0) orelse return;
+        const y = self.get(1) orelse return;
+        const argument = if (add_one) x + 1.0 else x;
+        if (!std.math.isFinite(argument) or argument <= 0.0) {
+            self.status |= status_invalid;
+            return;
+        }
+        if (!self.set(1, y * std.math.log2(argument))) return;
+        _ = self.pop();
+    }
+
+    pub fn fptan(self: *X87State) void {
+        const value = self.get(0) orelse return;
+        if (!std.math.isFinite(value)) {
+            self.status |= status_invalid;
+            return;
+        }
+        if (!self.set(0, @tan(value))) return;
+        _ = self.push(1.0);
+    }
+
+    pub fn fpatan(self: *X87State) void {
+        const x = self.get(0) orelse return;
+        const y = self.get(1) orelse return;
+        if (!self.set(1, std.math.atan2(y, x))) return;
+        _ = self.pop();
+    }
+
+    pub fn fxtract(self: *X87State) void {
+        const value = self.get(0) orelse return;
+        const parts = std.math.frexp(value);
+        if (!self.set(0, parts.significand * 2.0)) return;
+        _ = self.push(@floatFromInt(parts.exponent - 1));
+    }
+
+    pub fn decrementTop(self: *X87State) void {
+        self.top -%= 1;
+    }
+
+    pub fn incrementTop(self: *X87State) void {
+        self.top +%= 1;
+    }
+
+    /// FSIN, FCOS, and FPREM1 are kept on the x87 stack rather than being lowered
+    /// through the host scalar ABI.  The shared PE and Mach-O interpreters
+    /// both use this state type, so the architectural status bits stay in the
+    /// same place for either loader.
+    pub fn sin(self: *X87State) void {
+        const value = self.get(0) orelse return;
+        if (!std.math.isFinite(value) or @abs(value) > 0x1p63) {
+            self.status |= 1 << 10;
+            return;
+        }
+        self.status &= ~@as(u16, (1 << 9) | (1 << 10));
+        _ = self.set(0, @sin(value));
+    }
+
+    pub fn cos(self: *X87State) void {
+        const value = self.get(0) orelse return;
+        if (!std.math.isFinite(value) or @abs(value) > 0x1p63) {
+            self.status |= 1 << 10;
+            return;
+        }
+        self.status &= ~@as(u16, (1 << 9) | (1 << 10));
+        _ = self.set(0, @cos(value));
+    }
+
+    pub fn partialRemainderNearest(self: *X87State) void {
+        const numerator = self.get(0) orelse return;
+        const denominator = self.get(1) orelse return;
+        if (!std.math.isFinite(numerator) or !std.math.isFinite(denominator) or denominator == 0.0) {
+            self.status |= 1 << 10;
+            return;
+        }
+
+        const quotient = std.math.round(numerator / denominator);
+        const remainder = numerator - quotient * denominator;
+        self.status &= ~@as(u16, (1 << 8) | (1 << 9) | (1 << 10) | (1 << 14));
+        const quotient_bits: u64 = @bitCast(@as(i64, @intFromFloat(quotient)));
+        if ((quotient_bits & 0x4) != 0) self.status |= 1 << 8;
+        if ((quotient_bits & 0x2) != 0) self.status |= 1 << 9;
+        if ((quotient_bits & 0x1) != 0) self.status |= 1 << 14;
+        _ = self.set(0, remainder);
+    }
+
+    pub fn partialRemainderTrunc(self: *X87State) void {
+        const numerator = self.get(0) orelse return;
+        const denominator = self.get(1) orelse return;
+        if (!std.math.isFinite(numerator) or !std.math.isFinite(denominator) or denominator == 0.0) {
+            self.status |= status_c2;
+            return;
+        }
+
+        const quotient = @trunc(numerator / denominator);
+        const remainder = numerator - quotient * denominator;
+        self.status &= ~status_condition_mask;
+        const quotient_bits: u64 = @bitCast(@as(i64, @intFromFloat(quotient)));
+        if ((quotient_bits & 0x4) != 0) self.status |= status_c0;
+        if ((quotient_bits & 0x2) != 0) self.status |= status_c1;
+        if ((quotient_bits & 0x1) != 0) self.status |= status_c3;
+        _ = self.set(0, remainder);
+    }
+
+    pub fn sqrt(self: *X87State) void {
+        const value = self.get(0) orelse return;
+        if (value < 0.0) self.status |= status_invalid;
+        _ = self.set(0, @sqrt(value));
+    }
+
+    pub fn fsincos(self: *X87State) void {
+        const value = self.get(0) orelse return;
+        if (!std.math.isFinite(value)) {
+            self.status |= status_invalid;
+            return;
+        }
+        if (!self.set(0, @sin(value))) return;
+        _ = self.push(@cos(value));
+    }
+
+    pub fn frndint(self: *X87State) void {
+        const value = self.get(0) orelse return;
+        const rounded = switch ((self.control >> 10) & 3) {
+            0 => std.math.round(value),
+            1 => @floor(value),
+            2 => @ceil(value),
+            else => @trunc(value),
+        };
+        _ = self.set(0, rounded);
+    }
+
+    pub fn fscale(self: *X87State) void {
+        const value = self.get(0) orelse return;
+        const scale = self.get(1) orelse return;
+        if (!std.math.isFinite(value) or !std.math.isFinite(scale)) return;
+        const exponent: i32 = if (scale >= 2147483647.0)
+            std.math.maxInt(i32)
+        else if (scale <= -2147483648.0)
+            std.math.minInt(i32)
+        else
+            @intFromFloat(@trunc(scale));
+        _ = self.set(0, std.math.ldexp(value, exponent));
+    }
+
+    pub fn clearExceptions(self: *X87State) void {
+        self.status &= ~@as(u16, 0x00BF);
+    }
+
+    pub fn compare(self: *X87State, lhs: f64, rhs: f64, pop_result: bool) void {
+        self.status &= ~@as(u16, status_c0 | status_c2 | status_c3);
+        if (std.math.isNan(lhs) or std.math.isNan(rhs)) {
+            self.status |= status_c0 | status_c2 | status_c3;
+        } else if (lhs == rhs) {
+            self.status |= status_c3;
+        } else if (lhs < rhs) {
+            self.status |= status_c0;
+        }
+        if (pop_result) _ = self.pop();
+    }
+
+    pub fn memoryBinary(self: *X87State, rhs: f64, operation: u3) void {
+        const lhs = self.get(0) orelse return;
+        if (operation == 6 or operation == 7) {
+            self.compare(lhs, rhs, operation == 7);
+            return;
+        }
+        const result = switch (operation) {
+            0 => lhs + rhs,
+            1 => lhs * rhs,
+            2 => lhs - rhs,
+            3 => rhs - lhs,
+            4 => self.divide(lhs, rhs),
+            5 => self.divide(rhs, lhs),
+            else => unreachable,
+        };
+        _ = self.set(0, result);
+    }
+
+    fn divide(self: *X87State, numerator: f64, denominator: f64) f64 {
+        if (denominator != 0.0) return numerator / denominator;
+        if (numerator == 0.0 or std.math.isNan(numerator)) return std.math.nan(f64);
+        self.status |= status_zero_divide;
+        const sign = (@as(u64, @bitCast(numerator)) ^ @as(u64, @bitCast(denominator))) & (@as(u64, 1) << 63);
+        return @bitCast(sign | 0x7FF0_0000_0000_0000);
     }
 
     // `operation` uses the architectural operand order already selected by
@@ -544,6 +807,51 @@ pub fn isGtkMainIterationImport(name: []const u8) bool {
         std.mem.eql(u8, name, "_gtk_main_iteration_do") or
         std.mem.eql(u8, name, "_g_main_context_iteration");
 }
+
+/// Which symbols keep re-entering the slow path on a route-cache hit.
+///
+/// The effectiveness line reported one number —
+/// `hits_that_re_entered_the_slow_path=84015` — and a total names nobody. The
+/// work needed to remove those hits is a dedicated `ImportRoute` per symbol,
+/// and choosing which to add first requires knowing which symbols they are.
+/// Bounded and fixed-size: this is on the import-dispatch path, so it may not
+/// grow with the run.
+pub const SlowRouteWitness = struct {
+    pub const capacity: usize = 16;
+
+    names: [capacity][]const u8 = [_][]const u8{&.{}} ** capacity,
+    counts: [capacity]u64 = [_]u64{0} ** capacity,
+    used: usize = 0,
+    /// Re-entries past the witness capacity. Counted so the table can never
+    /// present a partial census as a complete one.
+    unattributed: u64 = 0,
+
+    pub fn note(self: *SlowRouteWitness, name: []const u8) void {
+        for (self.names[0..self.used], 0..) |held, index| {
+            if (held.len == name.len and std.mem.eql(u8, held, name)) {
+                self.counts[index] +|= 1;
+                return;
+            }
+        }
+        if (self.used == capacity) {
+            self.unattributed +|= 1;
+            return;
+        }
+        self.names[self.used] = name;
+        self.counts[self.used] = 1;
+        self.used += 1;
+    }
+
+    /// The witness with the most re-entries, for a report that names one thing.
+    pub fn worst(self: *const SlowRouteWitness) ?struct { name: []const u8, count: u64 } {
+        var best: ?usize = null;
+        for (self.counts[0..self.used], 0..) |count, index| {
+            if (best == null or count > self.counts[best.?]) best = index;
+        }
+        const chosen = best orelse return null;
+        return .{ .name = self.names[chosen], .count = self.counts[chosen] };
+    }
+};
 
 pub const ImportRouteCacheEntry = struct {
     stub_address: u64 = 0,
@@ -1035,4 +1343,36 @@ test "demand-sized banks cost less than the equal split they replaced" {
     );
     // Every tier together stays under 350 MiB, down from 430.
     try std.testing.expect(total * entry < 350 * 1024 * 1024);
+}
+
+// The witness table behind `hits_that_re_entered_the_slow_path`. It runs on the
+// import-dispatch path, so it is fixed-size by construction and reports its own
+// coverage rather than presenting a partial census as a complete one.
+test "the slow-route witness is bounded and states its own coverage" {
+    var witness = SlowRouteWitness{};
+    try std.testing.expectEqual(@as(?u8, null), if (witness.worst()) |_| @as(?u8, 0) else null);
+
+    witness.note("_getenv");
+    witness.note("_getenv");
+    witness.note("___cxa_guard_acquire");
+    try std.testing.expectEqual(@as(usize, 2), witness.used);
+    try std.testing.expectEqual(@as(u64, 0), witness.unattributed);
+    const worst = witness.worst().?;
+    try std.testing.expectEqualStrings("_getenv", worst.name);
+    try std.testing.expectEqual(@as(u64, 2), worst.count);
+
+    // Fill to capacity with distinct names, then prove the overflow is counted
+    // rather than dropped or grown into.
+    var buffer: [SlowRouteWitness.capacity][8]u8 = undefined;
+    for (&buffer, 0..) |*slot, index| {
+        _ = std.fmt.bufPrint(slot, "_sym{d:0>3}", .{index}) catch unreachable;
+        witness.note(slot);
+    }
+    try std.testing.expectEqual(SlowRouteWitness.capacity, witness.used);
+    try std.testing.expect(witness.unattributed != 0);
+
+    // A name already held still counts, even once the table is full.
+    const before = witness.unattributed;
+    witness.note(witness.names[0]);
+    try std.testing.expectEqual(before, witness.unattributed);
 }
