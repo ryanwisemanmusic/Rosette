@@ -14,6 +14,7 @@ const exit_diagnostics = @import("exit_diagnostics");
 const cleo_routing = @import("cleo_routing");
 const execution_history = @import("execution_history");
 const vector_helpers = @import("x86_vector_helpers");
+const xenia_accelerator = @import("xenia_accelerator.zig");
 
 fn releaseMemoryBarrier() void {
     if (comptime @import("builtin").target.cpu.arch == .aarch64) {
@@ -423,9 +424,16 @@ const MAX_WINDOWS_FIND_HANDLES: usize = 64;
 const MAX_WINDOWS_FILE_MAPPINGS: usize = 16;
 const MAX_WINDOWS_MEMORY_VIEWS: usize = 64;
 const MAX_WINDOWS_VIRTUAL_ALLOCATIONS: usize = 64;
-const MAX_WINDOWS_HEAP_ALLOCATIONS: usize = 65536;
+// The table starts large enough to keep the common PE bootstrap allocation
+// path cheap, but it must not be a correctness limit.  The PE heap itself is
+// a monotonic guest range and can outlive this initial bookkeeping capacity
+// by many frame iterations.
+const INITIAL_WINDOWS_HEAP_ALLOCATIONS: usize = 65536;
 const MAX_WINDOWS_INITTERM_FRAMES: usize = 16;
 const MAX_WINDOWS_INITTERM_ENTRIES: u64 = 1 << 20;
+const MAX_WINDOWS_QSORT_FRAMES: usize = 8;
+const MAX_WINDOWS_QSORT_ELEMENT_BYTES: usize = 4096;
+const MAX_WINDOWS_QSORT_ELEMENTS: u64 = 1 << 20;
 const MAX_WINDOWS_GUEST_THREADS: usize = 32;
 const WINDOWS_TLS_SLOT_COUNT: usize = 512;
 const WINDOWS_GUEST_THREAD_STACK_SIZE: u64 = 1024 * 1024;
@@ -531,12 +539,14 @@ pub const WindowsFileSlot = struct {
     offset: u64 = 0,
     readable: bool = false,
     writable: bool = false,
+    media_authorized: bool = false,
 };
 
-/// A page-file-backed mapping object created by a Windows PE import.  The
-/// guest receives only the synthetic handle; the backing store is a lazily
-/// committed host mapping so a request for Xenia's 4 GiB + physical aperture
-/// does not require eagerly materializing every byte.
+/// A file- or page-file-backed mapping object created by a Windows PE import.
+/// The guest receives only the synthetic handle; file mappings retain a host
+/// descriptor-backed sparse view, while page-file mappings retain an
+/// anonymous lazy mapping so Xenia's 4 GiB + physical aperture does not
+/// require eagerly materializing every byte.
 pub const WindowsFileMapping = struct {
     guest_handle: u64 = 0,
     length: u64 = 0,
@@ -606,6 +616,26 @@ const WindowsInitTermFrame = struct {
     callback_count: u64 = 0,
 };
 
+/// State for one guest-side `qsort` walk. The comparator is guest code, so a
+/// host-side sort cannot be substituted without violating the PE ABI. Rosetta
+/// performs a bounded insertion sort and re-enters the comparator through a
+/// synthetic return marker after each comparison. The fixed scratch buffer
+/// keeps the callback protocol allocation-free and prevents a malformed PE
+/// from turning a diagnostic import into unbounded host memory.
+const WindowsQsortFrame = struct {
+    base: u64 = 0,
+    nmemb: u64 = 0,
+    element_size: u64 = 0,
+    comparator: u64 = 0,
+    return_rip: u64 = 0,
+    return_is_direct: bool = false,
+    i: u64 = 1,
+    j: u64 = 1,
+    callback_count: u64 = 0,
+    awaiting_comparison: bool = false,
+    scratch: [MAX_WINDOWS_QSORT_ELEMENT_BYTES]u8 = [_]u8{0} ** MAX_WINDOWS_QSORT_ELEMENT_BYTES,
+};
+
 /// A Windows thread is guest execution state, not merely a successful handle
 /// returned by CreateThread.  The PE runner is cooperative (there is one host
 /// interpreter), so a runnable thread is saved here and serviced at explicit
@@ -660,6 +690,8 @@ const WindowsGuestThread = struct {
     teb: u64 = 0,
     tls_block: u64 = 0,
     preferred: bool = false,
+    priority: i32 = 0,
+    suspend_count: u32 = 0,
     executed_steps: u64 = 0,
     context: WindowsGuestThreadContext = .{},
 };
@@ -674,6 +706,10 @@ const WindowsProgressSample = struct {
     import_calls: u64 = 0,
     graphics_calls: u64 = 0,
     graphics_frames: u64 = 0,
+    /// Guest-initiated only.  Rosetta's own idle WM_NULL and its synthesized
+    /// WM_PAINT free-run for as long as the pump is called, so counting them
+    /// would let a guest that is asking for the same thing forever look like
+    /// a guest that is getting somewhere.
     message_traffic: u64 = 0,
     paint_traffic: u64 = 0,
     worker_traffic: u64 = 0,
@@ -708,8 +744,11 @@ const WindowsProgressWatchdog = struct {
     enabled: bool = true,
     /// Steps between samples.
     interval: u64 = 2_000_000,
-    /// Consecutive identical samples before a stall is declared.
-    threshold: u32 = 8,
+    /// Consecutive identical samples before a stall is declared.  Long enough
+    /// that an ordinary compute phase -- decryption, decompression, a hash
+    /// over a large buffer -- finishes inside one window rather than being
+    /// reported as a stall.
+    threshold: u32 = 16,
     next_sample_step: u64 = 0,
     previous: WindowsProgressSample = .{},
     have_previous: bool = false,
@@ -725,6 +764,88 @@ const WindowsProgressWatchdog = struct {
     window_rip_high: u64 = 0,
     /// Workers unblocked by the starvation backstop.
     backstop_services: u64 = 0,
+    /// Escalation point for the paint-without-present predictor, which is
+    /// independent of the freeze detector: a guest can be busily running its
+    /// message loop -- so nothing looks frozen -- while nothing it paints ever
+    /// reaches the screen.
+    paint_without_present_reported_at: u64 = 0,
+};
+
+/// Paints Rosetta must have delivered before "the guest is painting but never
+/// presenting" is a claim rather than a startup phase.
+const WINDOWS_PAINT_WITHOUT_PRESENT_THRESHOLD: u64 = 64;
+
+/// The common Win32 file error codes, named so a report does not make the
+/// reader look them up.
+fn windowsFileErrorLabel(code: u32) []const u8 {
+    return switch (code) {
+        0 => "ERROR_SUCCESS",
+        2 => "ERROR_FILE_NOT_FOUND",
+        3 => "ERROR_PATH_NOT_FOUND",
+        5 => "ERROR_ACCESS_DENIED",
+        6 => "ERROR_INVALID_HANDLE",
+        15 => "ERROR_INVALID_DRIVE",
+        18 => "ERROR_NO_MORE_FILES",
+        22 => "EINVAL",
+        32 => "ERROR_SHARING_VIOLATION",
+        87 => "ERROR_INVALID_PARAMETER",
+        112 => "ERROR_DISK_FULL",
+        123 => "ERROR_INVALID_NAME",
+        183 => "ERROR_ALREADY_EXISTS",
+        else => "unnamed",
+    };
+}
+
+/// Which Windows file operations failed, and how.
+///
+/// A run that ends with `file_failures=5004` and no other detail says
+/// something is wrong five thousand times without saying what. The count on
+/// its own cannot distinguish a guest probing for optional files -- which is
+/// normal and expensive-looking -- from a path Rosetta cannot serve that the
+/// guest needs. Naming the API and the error code separates the two.
+const WindowsFileFailureLedger = struct {
+    const capacity: usize = 24;
+    const name_capacity: usize = 48;
+
+    const Entry = struct {
+        name_buffer: [name_capacity]u8 = [_]u8{0} ** name_capacity,
+        name_length: usize = 0,
+        error_code: u32 = 0,
+        count: u64 = 0,
+
+        fn name(self: *const Entry) []const u8 {
+            return self.name_buffer[0..self.name_length];
+        }
+    };
+
+    entries: [capacity]Entry = [_]Entry{.{}} ** capacity,
+    count: usize = 0,
+    total: u64 = 0,
+    overflow: u64 = 0,
+
+    fn note(self: *WindowsFileFailureLedger, api: []const u8, error_code: u32) void {
+        self.total +|= 1;
+        const bounded = api[0..@min(api.len, name_capacity)];
+        for (self.entries[0..self.count]) |*entry| {
+            if (entry.error_code != error_code) continue;
+            if (!std.mem.eql(u8, entry.name(), bounded)) continue;
+            entry.count +|= 1;
+            return;
+        }
+        if (self.count == capacity) {
+            self.overflow +|= 1;
+            return;
+        }
+        var entry = Entry{ .error_code = error_code, .count = 1 };
+        @memcpy(entry.name_buffer[0..bounded.len], bounded);
+        entry.name_length = bounded.len;
+        self.entries[self.count] = entry;
+        self.count += 1;
+    }
+
+    fn isEmpty(self: *const WindowsFileFailureLedger) bool {
+        return self.count == 0;
+    }
 };
 
 /// The bounded guest-side Win32 message queue.  A PE run has one interpreter,
@@ -780,6 +901,10 @@ const WindowsMessageDispatchFrame = struct {
 /// guest address space.
 pub const WindowsGraphicsHooks = struct {
     context: ?*anyopaque = null,
+    /// Print the window-to-compositor chain. Installed by the runner when a
+    /// Vulkan forwarder exists; absent when the run has no graphics path, in
+    /// which case there is nothing to describe.
+    report_present_chain: ?*const fn (?*anyopaque) callconv(.c) void = null,
     ensure_application: ?*const fn (?*anyopaque) callconv(.c) c_int = null,
     ensure_window: ?*const fn (?*anyopaque, u32, u32, [*:0]const u8) callconv(.c) c_int = null,
     show_window: ?*const fn (?*anyopaque) callconv(.c) c_int = null,
@@ -851,6 +976,10 @@ pub const WindowsGraphicsSnapshot = struct {
     guest_present_observed: bool = false,
     native_vulkan_forwarding: bool = false,
     native_vulkan_calls: u64 = 0,
+    /// Calls that arrived before Rosette had a native instance/device.  This
+    /// is a readiness timeline, not a driver failure, and must not be folded
+    /// into the error count.
+    native_vulkan_pre_ready_calls: u64 = 0,
     native_vulkan_failures: u64 = 0,
     native_presenter_started: bool = false,
     native_presenter_ready: bool = false,
@@ -923,6 +1052,7 @@ pub const WindowsGraphicsState = struct {
     guest_present_observed: bool = false,
     native_vulkan_forwarding: bool = false,
     native_vulkan_calls: u64 = 0,
+    native_vulkan_pre_ready_calls: u64 = 0,
     native_vulkan_failures: u64 = 0,
     native_presenter_started: bool = false,
     native_presenter_ready: bool = false,
@@ -1058,8 +1188,17 @@ pub const WindowsGraphicsState = struct {
         if (host_objects_ready) {
             self.native_vulkan_forwarding = true;
         } else {
-            self.native_vulkan_failures +|= 1;
+            self.native_vulkan_pre_ready_calls +|= 1;
         }
+    }
+
+    /// Record an actual result-bearing Vulkan failure.  A callback crossing
+    /// before native objects exist is expected during loader/instance bring-up
+    /// and is tracked separately by `noteNativeVulkanForwarded`.
+    pub fn noteNativeVulkanResult(self: *WindowsGraphicsState, name: []const u8, ok: bool) void {
+        if (ok) return;
+        self.native_vulkan_failures +|= 1;
+        copyLabel(&self.last_failure, name);
     }
 
     pub fn noteUnmodeledCall(self: *WindowsGraphicsState, name: []const u8) void {
@@ -1263,6 +1402,7 @@ pub const WindowsGraphicsState = struct {
             .guest_present_observed = self.guest_present_observed,
             .native_vulkan_forwarding = self.native_vulkan_forwarding,
             .native_vulkan_calls = self.native_vulkan_calls,
+            .native_vulkan_pre_ready_calls = self.native_vulkan_pre_ready_calls,
             .native_vulkan_failures = self.native_vulkan_failures,
             .native_presenter_started = self.native_presenter_started,
             .native_presenter_ready = self.native_presenter_ready,
@@ -1429,12 +1569,28 @@ pub const ElfState = struct {
     // diagnostics: it records class registration, PostMessage, GetMessage,
     // and guest WndProc dispatch without printing every Windows import.
     trace_windows_messages: bool = false,
+    // Bounded path tracing for the confined PE filesystem. This is narrower
+    // than ABI diagnostics and is useful when a Windows title is rejected
+    // before its first XISO/XEX signature read.
+    trace_windows_paths: bool = false,
+    windows_path_trace_events: u32 = 0,
+    windows_media_path_trace_events: u32 = 0,
+    windows_media_io_trace_events: u32 = 0,
     // Wait-boundary tracing records only wait calls that actually service a
     // queued guest worker. It is useful for diagnosing cooperative mutex
     // stalls without enabling per-import ABI tracing.
     trace_windows_waits: bool = false,
+    // Xenia's PE loader decrypts every 16-byte XEX block through a retained
+    // pure Rijndael helper.  The accelerator is opt-in and symbol-gated: it
+    // can shorten a deterministic bootstrap bottleneck without changing the
+    // generic PE execution contract or touching Xenia's source.
+    xenia_rijndael_accelerator_enabled: bool = false,
+    xenia_rijndael_target_checked: bool = false,
+    xenia_rijndael_target: ?u64 = null,
+    xenia_rijndael_accelerated_calls: u64 = 0,
+    xenia_rijndael_accelerator_failures: u64 = 0,
     // Graphics progress tracing is deliberately separate from the ordinary
-    // 10M-step register sample. It adds worker and Vulkan state needed to
+    // 50M-step register sample. It adds worker and Vulkan state needed to
     // distinguish a guest wait, a completed process, and a native bridge
     // that stopped receiving calls.
     trace_graphics_progress: bool = false,
@@ -1453,9 +1609,24 @@ pub const ElfState = struct {
     windows_utf8_find_any_of_entry: ?u64 = null,
     windows_guest_compatibility_events: u64 = 0,
     windows_last_error: u32 = 0,
+    windows_unhandled_exception_filter: u64 = 0,
     windows_symbol_options: u32 = 0,
     windows_symbol_services_initialized: bool = false,
     windows_errno_storage: u64 = 0,
+    windows_fmode_storage: u64 = 0,
+    windows_commode_storage: u64 = 0,
+    windows_acrt_iob_storage: [3]u64 = [_]u64{0} ** 3,
+    windows_new_mode: u32 = 0,
+    windows_invalid_parameter_handler: u64 = 0,
+    windows_signal_handlers: [32]u64 = [_]u64{0} ** 32,
+    windows_com_mta_cookie: u64 = 0,
+    windows_com_mta_refcount: u32 = 0,
+    windows_raw_input_registered: bool = false,
+    windows_raw_input_device_count: u32 = 0,
+    windows_process_affinity_mask: u64 = 1,
+    windows_focus_window: u64 = 0,
+    windows_vectored_exception_handler: u64 = 0,
+    windows_vectored_exception_token: u64 = 0,
     // The PE C runtime asks for the active locale while parsing numeric
     // metadata (including the XEX container reached by Xenia's media path).
     // Keep the C-locale name, decimal point, empty fields, and lconv record
@@ -1489,6 +1660,12 @@ pub const ElfState = struct {
     windows_virtual_allocations: [MAX_WINDOWS_VIRTUAL_ALLOCATIONS]WindowsVirtualAllocation = [_]WindowsVirtualAllocation{.{}} ** MAX_WINDOWS_VIRTUAL_ALLOCATIONS,
     windows_heap_allocations: []WindowsHeapAllocation = &.{},
     windows_heap_allocation_count: usize = 0,
+    // Allocation records remain address ordered, including freed tombstones,
+    // because realloc/free validation uses a binary search.  Growing the
+    // backing slice preserves that ordering without reusing a tombstone at a
+    // later address (which would silently corrupt the search invariant).
+    windows_heap_provenance_growth_failures: u64 = 0,
+    windows_heap_provenance_untracked_allocations: u64 = 0,
     // MapViewOfFile without an address hint gets a deterministic guest-only
     // placement outside the PE image.  Fixed Xenia views retain their exact
     // requested address and never consume this cursor.
@@ -1535,6 +1712,8 @@ pub const ElfState = struct {
     windows_finds: [MAX_WINDOWS_FIND_HANDLES]WindowsFindSlot = [_]WindowsFindSlot{.{}} ** MAX_WINDOWS_FIND_HANDLES,
     windows_initterm_frames: [MAX_WINDOWS_INITTERM_FRAMES]WindowsInitTermFrame = undefined,
     windows_initterm_frame_count: usize = 0,
+    windows_qsort_frames: [MAX_WINDOWS_QSORT_FRAMES]WindowsQsortFrame = [_]WindowsQsortFrame{.{}} ** MAX_WINDOWS_QSORT_FRAMES,
+    windows_qsort_frame_count: usize = 0,
     // Windows PE execution is hosted by one interpreter thread, but the
     // image may create real worker entry points before the UI loop starts.
     // These slots are the bounded guest scheduler for those entry points.
@@ -1574,6 +1753,13 @@ pub const ElfState = struct {
     windows_file_read_calls: u64 = 0,
     windows_file_write_calls: u64 = 0,
     windows_file_failures: u64 = 0,
+    windows_file_failure_ledger: WindowsFileFailureLedger = .{},
+    /// The import currently being dispatched. Set once per import call so a
+    /// failure raised deep inside a handler can be attributed without every
+    /// one of the sixty-nine failure sites having to carry its own name.
+    /// The slice points at the import stub's own storage, which outlives the
+    /// call, or at a string literal.
+    windows_current_import: []const u8 = &.{},
     windows_rtl_capture_calls: u64 = 0,
     windows_rtl_unwind_calls: u64 = 0,
     windows_stub_storage: [MAX_WINDOWS_IMPORT_STUBS]WindowsImportStub = undefined,
@@ -1606,7 +1792,7 @@ pub const ElfState = struct {
         const memory_len: usize = @intCast(memory_size);
         const mem = allocator.alloc(u8, memory_len) catch unreachable;
         const trace_storage = allocator.alloc(ElfTraceEntry, TRACE_BUFFER_LEN) catch unreachable;
-        const heap_allocations = allocator.alloc(WindowsHeapAllocation, MAX_WINDOWS_HEAP_ALLOCATIONS) catch unreachable;
+        const heap_allocations = allocator.alloc(WindowsHeapAllocation, INITIAL_WINDOWS_HEAP_ALLOCATIONS) catch unreachable;
         @memset(trace_storage, .{});
         @memset(heap_allocations, .{});
         @memset(mem, 0);
@@ -1632,8 +1818,10 @@ pub const ElfState = struct {
         state.trace_string_memory = envFlag("ROSETTA_ELF_TRACE_STRING_MEMORY") or envFlag("ROSETTE_ELF_TRACE_STRING_MEMORY");
         state.trace_windows_threads = envFlag("ROSETTA_ELF_TRACE_WINDOWS_THREADS");
         state.trace_windows_messages = envFlag("ROSETTA_ELF_TRACE_WINDOWS_MESSAGES");
+        state.trace_windows_paths = envFlag("ROSETTE_ELF_TRACE_WINDOWS_PATHS");
         state.trace_windows_waits = envFlag("ROSETTE_ELF_TRACE_WINDOWS_WAITS") or envFlag("ROSETTA_ELF_TRACE_WINDOWS_WAITS");
         state.trace_graphics_progress = envFlag("ROSETTE_ELF_GRAPHICS_PROGRESS_TRACE");
+        state.xenia_rijndael_accelerator_enabled = envFlag("ROSETTE_PE64_XENIA_RIJNDAEL_ACCELERATOR");
         // The progress watchdog is on by default because it is silent unless
         // every observable axis freezes at once; a healthy run pays two
         // comparisons per step and prints nothing.
@@ -2549,24 +2737,59 @@ pub const ElfState = struct {
         mapping.* = .{};
     }
 
-    /// Create a Rosetta-owned anonymous backing for a Windows page-file
-    /// mapping.  Windows specifies the maximum byte offset for this API; the
-    /// backing therefore includes the inclusive final byte.  The host mmap is
-    /// intentionally left untouched so the 4 GiB+512 MiB Xenia aperture stays
-    /// sparse and commits only the pages the guest actually accesses.
-    pub fn createWindowsMemoryMapping(self: *ElfState, handle: u64, requested_length: u64) bool {
+    /// Create the Rosetta backing for a Windows file mapping.  When the
+    /// Win32 handle names an authorized guest file, preserve that file's
+    /// contents through a host `mmap` rather than silently replacing it with
+    /// anonymous zero pages.  A zero maximum size means "the current file
+    /// size" for CreateFileMapping; this is the path used by Xenia's
+    /// `MappedMemory::Open` for an XISO.
+    pub fn createWindowsMemoryMapping(
+        self: *ElfState,
+        handle: u64,
+        requested_length: u64,
+        source_handle: u64,
+    ) bool {
         if (handle == 0 or requested_length == std.math.maxInt(u64)) return false;
-        const inclusive_length = std.math.add(u64, requested_length, 1) catch return false;
+
+        var host_fd: std.posix.fd_t = -1;
+        var file_size: ?u64 = null;
+        if (source_handle != std.math.maxInt(u64)) {
+            const io = self.windows_host_io orelse return false;
+            for (self.windows_files) |slot| {
+                if (slot.file == null or slot.guest_handle != source_handle) continue;
+                if (!slot.readable) return false;
+                const stat = slot.file.?.stat(io) catch return false;
+                host_fd = slot.file.?.handle;
+                file_size = stat.size;
+                break;
+            }
+            if (host_fd < 0) return false;
+        }
+
+        var effective_length = requested_length;
+        if (file_size) |size| {
+            if (effective_length == 0) effective_length = size;
+            if (effective_length > size) return false;
+        }
+        if (effective_length == 0) return false;
+
+        const inclusive_length = std.math.add(u64, effective_length, 1) catch return false;
         const page_size: u64 = @intCast(std.heap.page_size_min);
         const rounded_length = std.math.add(u64, inclusive_length, page_size - 1) catch return false;
         const mapping_length = rounded_length & ~(page_size - 1);
         const length: usize = std.math.cast(usize, mapping_length) orelse return false;
-        const prot: std.posix.PROT = @bitCast(@as(u32, 0x1 | 0x2));
-        const flags: std.posix.MAP = @bitCast(@as(u32, 0x1000 | 0x2));
-        const backing = std.posix.mmap(null, length, prot, flags, -1, 0) catch |err| {
+        const prot: std.posix.PROT = if (file_size != null)
+            @bitCast(@as(u32, 0x1))
+        else
+            @bitCast(@as(u32, 0x1 | 0x2));
+        const flags: std.posix.MAP = if (file_size != null)
+            @bitCast(@as(u32, 0x2))
+        else
+            @bitCast(@as(u32, 0x1000 | 0x2));
+        const backing = std.posix.mmap(null, length, prot, flags, host_fd, 0) catch |err| {
             log.err("PE64 Windows CreateFileMapping failed: handle=0x{x} requested_length={d} mapped_length={d} reason={s}", .{
                 handle,
-                requested_length,
+                effective_length,
                 mapping_length,
                 @errorName(err),
             });
@@ -2581,9 +2804,11 @@ pub const ElfState = struct {
                     .backing = backing,
                 };
                 if (self.diagnose_abi) {
-                    log.info("PE64 Windows CreateFileMapping: handle=0x{x} requested_length={d} mapped_length={d} backing=0x{x}", .{
+                    log.info("PE64 Windows CreateFileMapping: handle=0x{x} source_handle=0x{x} file_backed={} requested_length={d} mapped_length={d} backing=0x{x}", .{
                         handle,
-                        requested_length,
+                        source_handle,
+                        file_size != null,
+                        effective_length,
                         mapping_length,
                         @intFromPtr(backing.ptr),
                     });
@@ -2897,6 +3122,183 @@ pub const ElfState = struct {
         return val;
     }
 
+    fn completeWindowsQsortWithoutFrame(self: *ElfState, direct_return_rip: ?u64) void {
+        self.regs.rax = 0;
+        self.regs.rip = if (direct_return_rip) |rip| rip else self.pop();
+    }
+
+    fn failWindowsQsort(self: *ElfState, direct_return_rip: ?u64, detail: []const u8) void {
+        if (comptime !@import("builtin").is_test) {
+            log.warn("Windows qsort refused: {s} base=0x{x} nmemb={d} size={d} comparator=0x{x} rip=0x{x}", .{
+                detail,
+                self.regs.rcx,
+                self.regs.rdx,
+                self.regs.r8,
+                self.regs.r9,
+                self.regs.rip,
+            });
+        }
+        self.completeWindowsQsortWithoutFrame(direct_return_rip);
+    }
+
+    fn finishWindowsQsort(self: *ElfState) void {
+        if (self.windows_qsort_frame_count == 0) {
+            self.faulted = true;
+            self.exit_code = 127;
+            self.termination_reason = .runtime_invariant_failure;
+            self.terminated = true;
+            log.err("Windows qsort callback completed without an active sort frame rip=0x{x}", .{self.regs.rip});
+            return;
+        }
+        const frame_index = self.windows_qsort_frame_count - 1;
+        const frame = self.windows_qsort_frames[frame_index];
+        self.windows_qsort_frame_count = frame_index;
+        self.regs.rax = 0;
+        self.regs.rip = if (frame.return_is_direct) frame.return_rip else self.pop();
+        if (self.diagnose_abi) {
+            log.info("Windows qsort complete elements={d} element_size={d} comparisons={d} continuation=0x{x}", .{
+                frame.nmemb,
+                frame.element_size,
+                frame.callback_count,
+                self.regs.rip,
+            });
+        }
+    }
+
+    fn continueWindowsQsort(self: *ElfState) void {
+        if (self.windows_qsort_frame_count == 0) {
+            self.faulted = true;
+            self.exit_code = 127;
+            self.termination_reason = .runtime_invariant_failure;
+            self.terminated = true;
+            log.err("Windows qsort continuation has no active sort frame rip=0x{x}", .{self.regs.rip});
+            return;
+        }
+
+        const frame_index = self.windows_qsort_frame_count - 1;
+        const frame = &self.windows_qsort_frames[frame_index];
+        if (frame.awaiting_comparison) {
+            frame.awaiting_comparison = false;
+            const comparison: i32 = @bitCast(@as(u32, @truncate(self.regs.rax)));
+            if (comparison < 0) {
+                const current_address = frame.base + frame.j * frame.element_size;
+                const previous_address = frame.base + (frame.j - 1) * frame.element_size;
+                const current = self.guestMemory(current_address, frame.element_size) orelse {
+                    self.faulted = true;
+                    self.exit_code = 127;
+                    self.termination_reason = .runtime_invariant_failure;
+                    self.terminated = true;
+                    log.err("Windows qsort comparator produced an invalid current element address=0x{x}", .{current_address});
+                    return;
+                };
+                const previous = self.guestMemory(previous_address, frame.element_size) orelse {
+                    self.faulted = true;
+                    self.exit_code = 127;
+                    self.termination_reason = .runtime_invariant_failure;
+                    self.terminated = true;
+                    log.err("Windows qsort comparator produced an invalid previous element address=0x{x}", .{previous_address});
+                    return;
+                };
+                const element_size: usize = @intCast(frame.element_size);
+                @memcpy(frame.scratch[0..element_size], current);
+                @memcpy(current, previous);
+                @memcpy(previous, frame.scratch[0..element_size]);
+                if (frame.j > 1) {
+                    frame.j -= 1;
+                } else {
+                    frame.i += 1;
+                    frame.j = frame.i;
+                }
+            } else {
+                frame.i += 1;
+                frame.j = frame.i;
+            }
+        }
+
+        if (frame.i >= frame.nmemb) {
+            self.finishWindowsQsort();
+            return;
+        }
+
+        const left_address = frame.base + frame.j * frame.element_size;
+        const right_address = frame.base + (frame.j - 1) * frame.element_size;
+        frame.callback_count +|= 1;
+        frame.awaiting_comparison = true;
+        self.push(x64_linux_runtime.SYNTHETIC_QSORT_RETURN);
+        self.regs.rcx = left_address;
+        self.regs.rdx = right_address;
+        self.regs.r8 = 0;
+        self.regs.r9 = 0;
+        self.regs.rip = frame.comparator;
+    }
+
+    /// Start a guest-side insertion sort for the Microsoft CRT `qsort`
+    /// import. The import handler has already identified the PE ABI; this
+    /// method owns the callback stack and resumes the original caller only
+    /// after every comparator call has returned.
+    pub fn beginWindowsQsort(
+        self: *ElfState,
+        base: u64,
+        nmemb: u64,
+        element_size: u64,
+        comparator: u64,
+        direct_return_rip: ?u64,
+    ) bool {
+        if (nmemb <= 1) {
+            self.completeWindowsQsortWithoutFrame(direct_return_rip);
+            return true;
+        }
+        if (base == 0 or comparator == 0) {
+            self.failWindowsQsort(direct_return_rip, "null base or comparator");
+            return true;
+        }
+        if (element_size == 0 or element_size > MAX_WINDOWS_QSORT_ELEMENT_BYTES) {
+            self.failWindowsQsort(direct_return_rip, "element size exceeds bounded guest scratch storage");
+            return true;
+        }
+        if (nmemb > MAX_WINDOWS_QSORT_ELEMENTS) {
+            self.failWindowsQsort(direct_return_rip, "element count exceeds bounded callback work");
+            return true;
+        }
+        const byte_count = std.math.mul(u64, nmemb, element_size) catch {
+            self.failWindowsQsort(direct_return_rip, "element range overflows guest address width");
+            return true;
+        };
+        _ = std.math.add(u64, base, byte_count) catch {
+            self.failWindowsQsort(direct_return_rip, "element range overflows guest address width");
+            return true;
+        };
+        if (self.guestMemory(base, byte_count) == null) {
+            self.failWindowsQsort(direct_return_rip, "element range is outside guest memory");
+            return true;
+        }
+        if (self.addrToOffset(comparator) == null) {
+            self.failWindowsQsort(direct_return_rip, "comparator is outside the guest image");
+            return true;
+        }
+        if (self.windows_qsort_frame_count >= self.windows_qsort_frames.len) {
+            self.failWindowsQsort(direct_return_rip, "nested qsort frame capacity exhausted");
+            return true;
+        }
+        if (direct_return_rip == null and self.read64(self.regs.rsp) == 0) {
+            self.failWindowsQsort(direct_return_rip, "caller continuation is null");
+            return true;
+        }
+
+        const frame_index = self.windows_qsort_frame_count;
+        self.windows_qsort_frames[frame_index] = .{
+            .base = base,
+            .nmemb = nmemb,
+            .element_size = element_size,
+            .comparator = comparator,
+            .return_rip = direct_return_rip orelse 0,
+            .return_is_direct = direct_return_rip != null,
+        };
+        self.windows_qsort_frame_count += 1;
+        self.continueWindowsQsort();
+        return true;
+    }
+
     fn failWindowsInitTerm(self: *ElfState, begin: u64, end: u64, detail: []const u8) void {
         self.faulted = true;
         self.exit_code = 127;
@@ -3092,6 +3494,10 @@ pub const ElfState = struct {
             self.continueWindowsInitTerm();
             return true;
         }
+        if (self.regs.rip == x64_linux_runtime.SYNTHETIC_QSORT_RETURN) {
+            self.continueWindowsQsort();
+            return true;
+        }
         if (self.regs.rip == SYNTHETIC_INIT_RETURN) {
             self.scheduleNextInitOrMain();
             return true;
@@ -3160,6 +3566,44 @@ pub const ElfState = struct {
         return true;
     }
 
+    /// Ask the Vulkan forwarder to describe the presentation chain, if this
+    /// state has one. A PE run reaches the forwarder through the graphics
+    /// hooks; a state with no forwarder simply has nothing to say.
+    fn reportPresentChainCheckpoint(self: *ElfState) void {
+        const callback = self.windows_graphics.hooks.report_present_chain orelse return;
+        callback(self.windows_graphics.hooks.native_context);
+    }
+
+    /// Record which import raised a file failure and with what error.
+    pub fn noteWindowsFileFailure(self: *ElfState, error_code: u32) void {
+        const api = if (self.windows_current_import.len == 0) "<unattributed>" else self.windows_current_import;
+        self.windows_file_failure_ledger.note(api, error_code);
+    }
+
+    /// Report the Windows file operations this run could not serve.
+    ///
+    /// Silent when nothing failed. A guest probing for optional files is
+    /// normal and shows up here as a large `ERROR_FILE_NOT_FOUND` count
+    /// against a `Find`/`stat` API; a path the guest needs shows up as a
+    /// failure on an open or a write, which is the one to act on.
+    pub fn reportWindowsFileFailures(self: *const ElfState) void {
+        const ledger = &self.windows_file_failure_ledger;
+        if (ledger.isEmpty()) return;
+        log.warn(
+            "WINDOWS FILE FAILURES: distinct={d} calls={d}; a large not-found count against a lookup API is a guest probing for optional files, while a failure on an open or a write is a path Rosetta could not serve",
+            .{ ledger.count, ledger.total },
+        );
+        for (ledger.entries[0..ledger.count]) |entry| {
+            log.warn(
+                "WINDOWS FILE FAILURE:   {s} x{d} error={d} ({s})",
+                .{ entry.name(), entry.count, entry.error_code, windowsFileErrorLabel(entry.error_code) },
+            );
+        }
+        if (ledger.overflow != 0) {
+            log.warn("WINDOWS FILE FAILURES:   {d} further failures did not fit the bounded ledger", .{ledger.overflow});
+        }
+    }
+
     /// Record that an import completed through the deterministic ABI
     /// fallback.  Called from the Win32 surface, which does not know how the
     /// executor wants to keep evidence.
@@ -3175,6 +3619,8 @@ pub const ElfState = struct {
             fallback,
             self.executed_steps,
             self.last_instruction_rip,
+            self.regs.rcx,
+            self.regs.rdx,
         );
     }
 
@@ -3185,6 +3631,12 @@ pub const ElfState = struct {
     /// for every entry (the end-of-run summary); otherwise only the entries
     /// added since the last report are printed, so a long run does not repeat
     /// what it already said.
+    ///
+    /// Detail is spent only where there is something to decide.  An import
+    /// that was refused, or that answered something it had not earned, gets
+    /// a line; the rest -- calls with no observable result -- collapse into
+    /// one line naming them, because a screen of "safe to leave
+    /// unimplemented" buries the few that are not.
     pub fn reportWindowsImportFallbacks(self: *ElfState, full: bool) void {
         const ledger = &self.windows_import_fallbacks;
         if (ledger.isEmpty()) return;
@@ -3192,37 +3644,79 @@ pub const ElfState = struct {
 
         var order: [x64_linux_runtime.ImportFallbackLedger.capacity]usize = undefined;
         const ranked = ledger.rankedInto(&order);
-        log.warn(
-            "DEGRADED IMPORTS: names={d} refused={d} calls={d} new_since_last_report={d} overflow_names={d}; these Windows imports were recognized but completed through the deterministic ABI fallback rather than a real implementation",
-            .{
-                ledger.count,
-                ledger.refusedCount(),
-                ledger.total_calls,
-                ledger.unreported_count,
-                ledger.overflow_names,
-            },
-        );
+        const needsDetail = x64_linux_runtime.ImportFallbackLedger.entryNeedsDetail;
+
+        var detailed: usize = 0;
+        var collapsed: usize = 0;
         for (order[0..ranked]) |index| {
             const entry = &ledger.entries[index];
             if (!full and !entry.unreported) continue;
+            if (needsDetail(entry.*)) detailed += 1 else collapsed += 1;
+        }
+        if (detailed == 0 and collapsed == 0) return;
+
+        const unearned = ledger.hazardCount();
+        if (unearned == 0) {
             log.warn(
-                "DEGRADED IMPORT:   {s}!{s} calls={d} convention={s} outcome={s} returned=0x{x} first_step={d} first_caller=0x{x}; {s}",
+                "DEGRADED IMPORTS: names={d} refused={d} calls={d} new={d}; recognized Windows imports that completed through the deterministic ABI fallback instead of a real implementation",
+                .{ ledger.count, ledger.refusedCount(), ledger.total_calls, ledger.unreported_count },
+            );
+        } else {
+            log.warn(
+                "DEGRADED IMPORTS: names={d} refused={d} unearned_answers={d} calls={d} new={d}; recognized Windows imports that completed through the deterministic ABI fallback instead of a real implementation",
+                .{ ledger.count, ledger.refusedCount(), unearned, ledger.total_calls, ledger.unreported_count },
+            );
+        }
+        for (order[0..ranked]) |index| {
+            const entry = &ledger.entries[index];
+            if (!full and !entry.unreported) continue;
+            if (!needsDetail(entry.*)) continue;
+            log.warn(
+                "DEGRADED IMPORT:   {s}!{s} [{s}{s}] calls={d} convention={s} returned=0x{x} first_step={d} first_caller=0x{x} first_args=0x{x},0x{x}; {s}",
                 .{
                     entry.dll(),
                     entry.name(),
+                    entry.subsystem.label(),
+                    if (entry.subsystem.startupCritical()) ", startup-critical" else "",
                     entry.calls,
                     @tagName(entry.convention),
-                    @tagName(entry.outcome),
                     entry.value,
                     entry.first_step,
                     entry.first_caller_rip,
+                    entry.first_arg0,
+                    entry.first_arg1,
                     x64_linux_runtime.importFallbackAdvice(.{
                         .convention = entry.convention,
                         .outcome = entry.outcome,
                         .value = entry.value,
                         .last_error = null,
+                        .hazard = entry.hazard,
                     }),
                 },
+            );
+        }
+        if (collapsed != 0) {
+            // One line for everything with no observable result.  The names
+            // are still here so nothing has to be guessed, but they do not
+            // each get a verdict they do not need.
+            var buffer: [512]u8 = undefined;
+            var used: usize = 0;
+            var listed: usize = 0;
+            for (order[0..ranked]) |index| {
+                const entry = &ledger.entries[index];
+                if (!full and !entry.unreported) continue;
+                if (needsDetail(entry.*)) continue;
+                const written = std.fmt.bufPrint(
+                    buffer[used..],
+                    "{s}{s} x{d}",
+                    .{ if (listed == 0) "" else ", ", entry.name(), entry.calls },
+                ) catch break;
+                used += written.len;
+                listed += 1;
+            }
+            log.warn(
+                "DEGRADED IMPORTS:   {d} with no observable result (nothing to implement): {s}{s}",
+                .{ collapsed, buffer[0..used], if (listed < collapsed) ", ..." else "" },
             );
         }
         if (ledger.overflow_names > 0) {
@@ -3231,10 +3725,12 @@ pub const ElfState = struct {
                 .{ledger.overflow_names},
             );
         }
-        log.warn(
-            "DEGRADED IMPORTS: to implement one, add its case to handleCore in src/x64-ASM/windows_runtime.zig; the convention above is what the guest is being told today, derived in src/x64-ASM/windows_import_contract.zig",
-            .{},
-        );
+        if (detailed != 0) {
+            log.warn(
+                "DEGRADED IMPORTS: to implement one, add its case to handleCore in src/x64-ASM/windows_runtime.zig; the convention above is what the guest is being told today, derived in src/x64-ASM/windows_import_contract.zig",
+                .{},
+            );
+        }
         ledger.markReported();
     }
 
@@ -3418,6 +3914,15 @@ pub const ElfState = struct {
         }
 
         @memset(self.mem[off..][0..size_usize], 0);
+        if (self.windows_heap_allocation_count == self.windows_heap_allocations.len) {
+            if (!self.growGuestHeapProvenance()) {
+                // The guest allocation itself is still valid.  Keep running
+                // rather than converting a host bookkeeping OOM into a guest
+                // allocation failure; the first failure is recorded once and
+                // the final diagnostics expose how many records were missed.
+                self.windows_heap_provenance_untracked_allocations +|= 1;
+            }
+        }
         if (self.windows_heap_allocation_count < self.windows_heap_allocations.len) {
             self.windows_heap_allocations[self.windows_heap_allocation_count] = .{
                 .guest_base = aligned,
@@ -3425,8 +3930,6 @@ pub const ElfState = struct {
                 .active = true,
             };
             self.windows_heap_allocation_count += 1;
-        } else if (self.windows_runtime_enabled) {
-            log.err("PE64 guest allocation provenance exhausted: address=0x{x} size={d}; future realloc/free validation will reject this block", .{ aligned, size });
         }
         self.heap_next = aligned + size;
         if (self.trace_allocations and !@import("builtin").is_test) {
@@ -3447,6 +3950,36 @@ pub const ElfState = struct {
             });
         }
         return aligned;
+    }
+
+    /// Grow the address-ordered PE allocation-provenance table.
+    ///
+    /// Freed records are deliberately retained as tombstones: reusing one
+    /// would put a newer, larger address before older records and make the
+    /// binary-search lookup return the wrong lifetime.  A growable slice keeps
+    /// the ordering invariant while removing the old fixed-capacity failure
+    /// mode that turned a long-running render loop into repeated rejected
+    /// realloc/free operations.
+    fn growGuestHeapProvenance(self: *ElfState) bool {
+        const old_capacity = self.windows_heap_allocations.len;
+        const base_capacity = @max(old_capacity, @as(usize, 1));
+        const new_capacity = std.math.mul(usize, base_capacity, 2) catch {
+            self.windows_heap_provenance_growth_failures +|= 1;
+            return false;
+        };
+        const grown = self.allocator.realloc(self.windows_heap_allocations, new_capacity) catch {
+            self.windows_heap_provenance_growth_failures +|= 1;
+            if (self.windows_runtime_enabled and self.windows_heap_provenance_growth_failures == 1) {
+                log.err("PE64 guest allocation provenance table growth failed: capacity={d}; guest allocations continue without records", .{old_capacity});
+            }
+            return false;
+        };
+        @memset(grown[old_capacity..], .{});
+        self.windows_heap_allocations = grown;
+        if (self.windows_runtime_enabled) {
+            log.info("PE64 guest allocation provenance table grew: capacity={d} live_records={d}", .{ new_capacity, self.windows_heap_allocation_count });
+        }
+        return true;
     }
 
     fn findGuestHeapAllocation(self: *const ElfState, guest_base: u64) ?usize {
@@ -3889,7 +4422,17 @@ pub const ElfState = struct {
             else
                 &[_]u8{};
             const opcode_bytes = available[0..@min(available.len, 16)];
-            log.err("invalid instruction at rip=0x{x}, bytes={any}", .{ self.regs.rip, opcode_bytes });
+            // Name the opcode-map slot, not just the bytes.  Hand-decoding a
+            // VEX prefix to find out which instruction is missing is the slow
+            // part of acting on this fault, and the coordinates printed here
+            // are the same ones the decoder's opcode census reports, so the
+            // gap can be looked up directly.
+            var encoding_buffer: [96]u8 = undefined;
+            log.err("invalid instruction at rip=0x{x}: encoding={s} bytes={any}; this opcode slot has no decoder entry -- see ISA/decoding/coverage.zig for the census of what does", .{
+                self.regs.rip,
+                x64_decoder.coverage.describeEncoding(&encoding_buffer, opcode_bytes),
+                opcode_bytes,
+            });
             self.faulted = true;
             self.exit_code = 127;
             self.termination_reason = .invalid_instruction;
@@ -4187,8 +4730,8 @@ pub const ElfState = struct {
             .import_calls = self.windows_import_calls +% self.windows_unknown_import_calls,
             .graphics_calls = graphics.vulkan_calls +% graphics.native_vulkan_calls +% graphics.command_calls,
             .graphics_frames = graphics.queue_submits +% graphics.presents,
-            .message_traffic = self.windows_message_posts +% self.windows_message_deliveries,
-            .paint_traffic = self.windows_paint_requests +% self.windows_paint_deliveries,
+            .message_traffic = self.windows_message_posts,
+            .paint_traffic = self.windows_paint_requests,
             .worker_traffic = self.windows_thread_service_calls +% self.windows_thread_yields +%
                 self.windows_thread_completions +% self.windows_thread_failures,
             .file_traffic = self.windows_file_open_calls +% self.windows_file_read_calls +%
@@ -4296,6 +4839,32 @@ pub const ElfState = struct {
         );
     }
 
+    /// A guest can run its message loop briskly -- so no progress axis looks
+    /// frozen -- while every frame it paints stops before the screen.  That is
+    /// invisible to the freeze detector by construction, so it gets its own
+    /// check: Rosetta has handed the guest N paints and the guest has
+    /// presented none of them.
+    ///
+    /// The claim is only made once there are enough paints for it to mean
+    /// something, and then only on an escalating schedule, so a startup that
+    /// legitimately paints nothing yet stays silent.
+    fn checkWindowsPaintReachesScreen(self: *ElfState) void {
+        const delivered = self.windows_paint_deliveries;
+        if (delivered < WINDOWS_PAINT_WITHOUT_PRESENT_THRESHOLD) return;
+        if (self.windows_graphics.presents != 0) return;
+        const watchdog = &self.windows_progress;
+        const due = if (watchdog.paint_without_present_reported_at == 0)
+            WINDOWS_PAINT_WITHOUT_PRESENT_THRESHOLD
+        else
+            watchdog.paint_without_present_reported_at *| 4;
+        if (delivered < due) return;
+        watchdog.paint_without_present_reported_at = delivered;
+        log.warn(
+            "PE64 PAINT NEVER REACHES THE SCREEN: {d} WM_PAINT delivered, {d} guest paint requests, {d} queue submits, 0 presents, step={d}. Message delivery is working; the break is downstream of the guest's WndProc -- its painter, the surface it acquired, or the swapchain it presents to.",
+            .{ delivered, self.windows_paint_requests, self.windows_graphics.queue_submits, self.executed_steps },
+        );
+    }
+
     /// Sample the progress axes and, when every one of them has been frozen
     /// for long enough, report it once and unblock any starved worker.
     fn checkWindowsProgress(self: *ElfState) void {
@@ -4307,6 +4876,7 @@ pub const ElfState = struct {
         const sample = self.sampleWindowsProgress();
         watchdog.window_rip_low = std.math.maxInt(u64);
         watchdog.window_rip_high = 0;
+        self.checkWindowsPaintReachesScreen();
 
         const frozen = watchdog.have_previous and sample.matches(watchdog.previous);
         watchdog.previous = sample;
@@ -4374,7 +4944,7 @@ pub const ElfState = struct {
             self.windows_guest_threads[index].handle
         else
             0;
-        log.info("PE64 graphics progress: steps={d} rip=0x{x} last_op={s} active_thread=0x{x} workers(vacant/pending/runnable/running/completed/failed)={d}/{d}/{d}/{d}/{d}/{d} vk_calls={d} native_vk_calls={d} native_vk_failures={d} commands={d} submits={d} presents={d} phase={s} last_call={s} ordering_violations={d} unmodeled={d}", .{
+        log.info("PE64 graphics progress: steps={d} rip=0x{x} last_op={s} active_thread=0x{x} workers(vacant/pending/runnable/running/completed/failed)={d}/{d}/{d}/{d}/{d}/{d} vk_calls={d} native_vk_calls={d} native_vk_pre_ready={d} native_vk_failures={d} commands={d} submits={d} presents={d} rijndael_accel_calls={d} heap_records={d} heap_capacity={d} heap_growth_failures={d} heap_untracked={d} phase={s} last_call={s} ordering_violations={d} unmodeled={d}", .{
             steps,
             self.regs.rip,
             @tagName(self.last_decoded_op),
@@ -4387,10 +4957,16 @@ pub const ElfState = struct {
             failed,
             self.windows_graphics.vulkan_calls,
             self.windows_graphics.native_vulkan_calls,
+            self.windows_graphics.native_vulkan_pre_ready_calls,
             self.windows_graphics.native_vulkan_failures,
             self.windows_graphics.command_calls,
             self.windows_graphics.queue_submits,
             self.windows_graphics.presents,
+            self.xenia_rijndael_accelerated_calls,
+            self.windows_heap_allocation_count,
+            self.windows_heap_allocations.len,
+            self.windows_heap_provenance_growth_failures,
+            self.windows_heap_provenance_untracked_allocations,
             @tagName(self.windows_graphics.phase),
             std.mem.sliceTo(&self.windows_graphics.last_call, 0),
             self.windows_graphics.ordering_violations,
@@ -4419,7 +4995,7 @@ pub const ElfState = struct {
             self.windows_guest_threads[index].handle
         else
             0;
-        log.info("PE64 execution stop: terminated={} faulted={} reason={s} exit=0x{x} steps={d} rip=0x{x} last_op={s} active_thread=0x{x} workers(vacant/pending/runnable/running/completed/failed)={d}/{d}/{d}/{d}/{d}/{d} vk_calls={d} native_vk_calls={d} native_vk_failures={d} commands={d} submits={d} presents={d} phase={s} last_call={s} last_failure={s} ui_quit={} ui_quit_code=0x{x}", .{
+        log.info("PE64 execution stop: terminated={} faulted={} reason={s} exit=0x{x} steps={d} rip=0x{x} last_op={s} active_thread=0x{x} workers(vacant/pending/runnable/running/completed/failed)={d}/{d}/{d}/{d}/{d}/{d} vk_calls={d} native_vk_calls={d} native_vk_pre_ready={d} native_vk_failures={d} commands={d} submits={d} presents={d} rijndael_accel_calls={d} rijndael_accel_failures={d} heap_records={d} heap_capacity={d} heap_growth_failures={d} heap_untracked={d} phase={s} last_call={s} last_failure={s} ui_quit={} ui_quit_code=0x{x}", .{
             self.terminated,
             self.faulted,
             @tagName(self.termination_reason),
@@ -4436,10 +5012,17 @@ pub const ElfState = struct {
             failed,
             self.windows_graphics.vulkan_calls,
             self.windows_graphics.native_vulkan_calls,
+            self.windows_graphics.native_vulkan_pre_ready_calls,
             self.windows_graphics.native_vulkan_failures,
             self.windows_graphics.command_calls,
             self.windows_graphics.queue_submits,
             self.windows_graphics.presents,
+            self.xenia_rijndael_accelerated_calls,
+            self.xenia_rijndael_accelerator_failures,
+            self.windows_heap_allocation_count,
+            self.windows_heap_allocations.len,
+            self.windows_heap_provenance_growth_failures,
+            self.windows_heap_provenance_untracked_allocations,
             @tagName(self.windows_graphics.phase),
             std.mem.sliceTo(&self.windows_graphics.last_call, 0),
             std.mem.sliceTo(&self.windows_graphics.last_failure, 0),
@@ -4467,9 +5050,15 @@ pub const ElfState = struct {
                 if (rip > self.windows_progress.window_rip_high) self.windows_progress.window_rip_high = rip;
                 if (steps >= self.windows_progress.next_sample_step) self.checkWindowsProgress();
             }
-            if (steps % 10_000_000 == 0) {
+            if (steps % 50_000_000 == 0) {
                 log.info("step {d}: rip=0x{x}, rax=0x{x}, rbx=0x{x}, rcx=0x{x}, rsi=0x{x}, rdi=0x{x}", .{ steps, self.regs.rip, self.regs.rax, self.regs.rbx, self.regs.rcx, self.regs.rsi, self.regs.rdi });
                 if (self.trace_graphics_progress and self.windows_runtime_enabled) self.logGraphicsProgress(steps);
+                // The presentation chain at the same cadence as everything
+                // else: a black window with a healthy present count is the
+                // one failure whose evidence is entirely outside the counters
+                // printed above, and it has to be readable without waiting
+                // for the run to end.
+                self.reportPresentChainCheckpoint();
                 // Report a newly-degraded import at the checkpoint rather
                 // than only at exit: a run that is killed while it is still
                 // going would otherwise take that evidence with it.  A run
@@ -4487,7 +5076,10 @@ pub const ElfState = struct {
             self.terminated = true;
         }
         if (self.trace_graphics_progress and self.windows_runtime_enabled) self.logGraphicsStop();
-        if (self.windows_runtime_enabled) self.reportWindowsImportFallbacks(true);
+        if (self.windows_runtime_enabled) {
+            self.reportWindowsImportFallbacks(true);
+            self.reportWindowsFileFailures();
+        }
         if (self.faulted) self.logExitDiagnostics();
     }
 
@@ -6874,6 +7466,84 @@ pub const ElfState = struct {
         if (!self.terminated) self.regs.rip += d.len;
     }
 
+    fn discoverXeniaRijndaelTarget(self: *const ElfState) ?u64 {
+        const image_begin = self.image_low -| self.mem_base;
+        const image_end = @min(self.image_high -| self.mem_base, @as(u64, @intCast(self.mem.len)));
+        if (image_begin >= image_end) return null;
+        const begin: usize = @intCast(image_begin);
+        const end: usize = @intCast(image_end);
+        const signature = [_]u8{
+            0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
+            0x56, 0x57, 0x55, 0x53, 0x48, 0x83, 0xEC, 0x38,
+            0x4C, 0x89, 0x4C, 0x24, 0x20,
+        };
+        var offset = begin;
+        while (offset + signature.len <= end) : (offset += 1) {
+            if (!std.mem.eql(u8, self.mem[offset .. offset + signature.len], &signature)) continue;
+            // rijndaelEncrypt and rijndaelDecrypt share the entry prologue
+            // and the initial block setup. Their first table load is the
+            // stable discriminator: encryption loads Te1 through r13, while
+            // decryption loads Td0 through r11. Ignore the RIP-relative
+            // displacement that follows the opcode so a rebuilt PE remains
+            // discoverable when its section layout changes.
+            if (offset + 70 > end) continue;
+            if (self.mem[offset + 67] != 0x4C or
+                self.mem[offset + 68] != 0x8D or
+                self.mem[offset + 69] != 0x1D)
+            {
+                continue;
+            }
+            return self.mem_base + offset;
+        }
+        return null;
+    }
+
+    fn tryXeniaRijndaelAccelerator(self: *ElfState, target: u64, return_rip: u64) bool {
+        if (!self.xenia_rijndael_accelerator_enabled or !self.windows_runtime_enabled) return false;
+
+        if (!self.xenia_rijndael_target_checked) {
+            self.xenia_rijndael_target_checked = true;
+            self.xenia_rijndael_target = self.localSymbolAddress("_Z15rijndaelDecryptPKjiPKhPh") orelse
+                self.localSymbolAddress("__Z15rijndaelDecryptPKjiPKhPh") orelse
+                self.localSymbolAddress("rijndaelDecrypt") orelse
+                self.discoverXeniaRijndaelTarget();
+            if (self.xenia_rijndael_target) |resolved| {
+                log.info("PE64 Xenia Rijndael accelerator armed: target=0x{x} entry-signature-gated=true", .{resolved});
+            } else {
+                log.warn("PE64 Xenia Rijndael accelerator requested but the rijndaelDecrypt symbol and entry signature were not found; execution remains guest-interpreted", .{});
+            }
+        }
+
+        if (self.xenia_rijndael_target == null or self.xenia_rijndael_target.? != target) return false;
+
+        if (!xenia_accelerator.tryRijndaelDecrypt(self, self.regs.rcx, self.regs.rdx, self.regs.r8, self.regs.r9)) {
+            self.xenia_rijndael_accelerator_failures +|= 1;
+            if (self.xenia_rijndael_accelerator_failures == 1) {
+                log.warn("PE64 Xenia Rijndael accelerator declined a block: target=0x{x} rk=0x{x} nr={d} ciphertext=0x{x} plaintext=0x{x} step={d}; falling back to the guest implementation", .{
+                    target,
+                    self.regs.rcx,
+                    self.regs.rdx,
+                    self.regs.r8,
+                    self.regs.r9,
+                    self.executed_steps,
+                });
+            }
+            return false;
+        }
+
+        self.noteGuestCall(.direct, target, return_rip);
+        self.regs.rip = return_rip;
+        self.noteGuestReturn(return_rip);
+        self.xenia_rijndael_accelerated_calls +|= 1;
+        if (self.xenia_rijndael_accelerated_calls == 1) {
+            log.info("PE64 Xenia Rijndael accelerator active: first 16-byte block completed at step={d} nr={d}", .{
+                self.executed_steps,
+                self.regs.rdx,
+            });
+        }
+        return true;
+    }
+
     pub fn execute(self: *ElfState, d: DecodedInsn) void {
         if (d.is_evex or d.op == .movdir64b or evex.handles(d.op)) {
             evex.execute(self, d);
@@ -8136,6 +8806,7 @@ pub const ElfState = struct {
                 const transfer = x64_decoder.highway.relativeControl(.call, self.regs.rip, d.len, rel, true);
                 const next_rip = transfer.return_address.?;
                 const target_rip = transfer.target;
+                if (self.tryXeniaRijndaelAccelerator(target_rip, next_rip)) return;
                 self.traceWindowsCallbackCall("direct", target_rip, self.regs.rip, next_rip);
                 if (self.trace_windows_threads and target_rip == 0x1405151af) {
                     log.info("Windows thread call target pthread_self: source_rip=0x{x} rsp_before=0x{x} return_rip=0x{x} stack_before=0x{x}", .{
@@ -8671,6 +9342,7 @@ pub const ElfState = struct {
             .vpshuflw,
             .vpshufhw,
             .vblendps,
+            .vblendpd,
             .vshufpd,
             .vpermilps,
             .vpbroadcastw,
@@ -10087,7 +10759,7 @@ test "Windows graphics ledger keeps native diagnostics separate from guest outpu
     try testing.expect(!snapshot.native_vulkan_forwarding);
 }
 
-test "a recognized-but-unimplemented import is refused with its own ABI failure value" {
+test "Windows imports preserve stateful contracts and ABI refusal values" {
     var state = ElfState.init(testing.allocator);
     defer state.deinit();
     state.windows_runtime_enabled = true;
@@ -10095,21 +10767,29 @@ test "a recognized-but-unimplemented import is refused with its own ABI failure 
 
     // A registry lookup used to return zero, which is ERROR_SUCCESS: the
     // guest was told the key opened and then read an HKEY that was never
-    // written.  It must report absence instead.
+    // written.  The explicit contract reports absence and writes the output.
+    const registry_output = MEM_BASE + 0xD80;
     state.regs = .{};
-    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ADVAPI32.dll", "RegOpenKeyExW", return_rip));
+    state.regs.rcx = 0xFFFF_FFFF_8000_0001; // HKEY_CURRENT_USER
+    state.regs.r8 = registry_output;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ADVAPI32.dll", "RegOpenKeyA", return_rip));
     try testing.expectEqual(@as(u64, 2), state.regs.rax); // ERROR_FILE_NOT_FOUND
+    try testing.expectEqual(@as(u64, 0), state.read64(registry_output));
 
     // A COM/WinRT/DXGI creation is an HRESULT, where zero is S_OK.  These
     // used to be repaired one name at a time (CoCreateInstance still has its
     // own hand-written E_NOINTERFACE); the contract covers the rest of the
     // family without needing an entry per name.
     state.regs = .{};
+    const factory_output = MEM_BASE + 0xD88;
+    state.regs.rdx = factory_output;
     try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "dxgi.dll", "CreateDXGIFactory1", return_rip));
-    try testing.expectEqual(@as(u64, 0x8000_4001), state.regs.rax); // E_NOTIMPL
+    try testing.expectEqual(@as(u64, 0x8000_4002), state.regs.rax); // E_NOINTERFACE
+    try testing.expectEqual(@as(u64, 0), state.read64(factory_output));
     state.regs = .{};
+    state.regs.r8 = factory_output;
     try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "api-ms-win-core-winrt-l1-1-0.dll", "RoGetActivationFactory", return_rip));
-    try testing.expectEqual(@as(u64, 0x8000_4001), state.regs.rax);
+    try testing.expectEqual(@as(u64, 0x8000_4002), state.regs.rax);
 
     // A BOOL-returning GDI call keeps the zero that already meant FALSE, so
     // this change cannot alter a path that was already honest.
@@ -10118,20 +10798,129 @@ test "a recognized-but-unimplemented import is refused with its own ABI failure 
     try testing.expectEqual(@as(u64, 0), state.regs.rax);
     try testing.expectEqual(@as(u32, 120), state.windows_last_error); // ERROR_CALL_NOT_IMPLEMENTED
 
-    // Every one of them is retained, with the first caller and step, so the
-    // report can name what a run actually leaned on.
+    // Only the still-generic GDI fallback is retained: the registry and
+    // factory paths now complete through their explicit contracts.
     const ledger = &state.windows_import_fallbacks;
-    try testing.expectEqual(@as(usize, 4), ledger.count);
-    try testing.expectEqual(@as(u64, 4), ledger.total_calls);
-    try testing.expectEqual(@as(usize, 4), ledger.refusedCount());
-    try testing.expectEqualStrings("RegOpenKeyExW", ledger.entries[0].name());
-    try testing.expectEqualStrings("ADVAPI32.dll", ledger.entries[0].dll());
+    try testing.expectEqual(@as(usize, 1), ledger.count);
+    try testing.expectEqual(@as(u64, 1), ledger.total_calls);
+    try testing.expectEqual(@as(usize, 1), ledger.refusedCount());
+    try testing.expectEqualStrings("BitBlt", ledger.entries[0].name());
+    try testing.expectEqualStrings("GDI32.dll", ledger.entries[0].dll());
 
-    // A repeat is counted, not duplicated.
+    // An explicit contract is not a degraded fallback and does not reappear
+    // in the ledger when the guest probes the same key again.
     state.regs = .{};
-    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ADVAPI32.dll", "RegOpenKeyExW", return_rip));
-    try testing.expectEqual(@as(usize, 4), ledger.count);
-    try testing.expectEqual(@as(u64, 2), ledger.entries[0].calls);
+    state.regs.rcx = 0xFFFF_FFFF_8000_0001;
+    state.regs.r8 = registry_output;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ADVAPI32.dll", "RegOpenKeyA", return_rip));
+    try testing.expectEqual(@as(usize, 1), ledger.count);
+    try testing.expectEqual(@as(u64, 1), ledger.entries[0].calls);
+}
+
+test "a CRT comparison or search is answered, not stubbed, and the ledger separates the two" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    const return_rip = MEM_BASE + 0x680;
+    const left = MEM_BASE + 0xD00;
+    const right = MEM_BASE + 0xD40;
+
+    // "Alpha" vs "ALPHA" must compare equal, and "Alpha" vs "Beta" must not.
+    // A zero-returning stub says both are equal, which silently makes every
+    // case-insensitive lookup match whatever the guest tried first.
+    for ("Alpha\x00", 0..) |ch, index| state.write8(left + @as(u64, @intCast(index)), ch);
+    for ("ALPHA\x00", 0..) |ch, index| state.write8(right + @as(u64, @intCast(index)), ch);
+    state.regs = .{};
+    state.regs.rcx = left;
+    state.regs.rdx = right;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "api-ms-win-crt-string-l1-1-0.dll", "_stricmp", return_rip));
+    try testing.expectEqual(@as(u64, 0), state.regs.rax);
+
+    for ("Beta\x00", 0..) |ch, index| state.write8(right + @as(u64, @intCast(index)), ch);
+    state.regs = .{};
+    state.regs.rcx = left;
+    state.regs.rdx = right;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "api-ms-win-crt-string-l1-1-0.dll", "_stricmp", return_rip));
+    try testing.expect(@as(i64, @bitCast(state.regs.rax)) < 0);
+
+    // memchr must find a byte that is present, and report a miss honestly.
+    state.regs = .{};
+    state.regs.rcx = left;
+    state.regs.rdx = 'p';
+    state.regs.r8 = 5;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "api-ms-win-crt-string-l1-1-0.dll", "memchr", return_rip));
+    try testing.expectEqual(left + 2, state.regs.rax);
+    state.regs = .{};
+    state.regs.rcx = left;
+    state.regs.rdx = 'z';
+    state.regs.r8 = 5;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "api-ms-win-crt-string-l1-1-0.dll", "memchr", return_rip));
+    try testing.expectEqual(@as(u64, 0), state.regs.rax);
+
+    // None of that went through the fallback, so the ledger stays empty --
+    // an implemented import must never show up as degraded.
+    try testing.expect(state.windows_import_fallbacks.isEmpty());
+
+    // A stub whose zero would have been a real answer is retained with its
+    // operands and is never collapsed into the "nothing to implement" line.
+    const hazard = x64_linux_runtime.importFallbackFor("api-ms-win-crt-stdio-l1-1-0.dll", "__acrt_iob_func");
+    try testing.expect(hazard.hazard);
+    state.regs.rcx = 1;
+    state.regs.rdx = 2;
+    state.noteWindowsImportFallback("api-ms-win-crt-stdio-l1-1-0.dll", "__acrt_iob_func", hazard);
+    const inert = x64_linux_runtime.importFallbackFor("api-ms-win-crt-runtime-l1-1-0.dll", "_crt_atexit");
+    try testing.expect(!inert.hazard);
+    state.noteWindowsImportFallback("api-ms-win-crt-runtime-l1-1-0.dll", "_crt_atexit", inert);
+
+    const ledger = &state.windows_import_fallbacks;
+    try testing.expectEqual(@as(usize, 2), ledger.count);
+    try testing.expectEqual(@as(usize, 1), ledger.hazardCount());
+    try testing.expectEqual(@as(u64, 1), ledger.entries[0].first_arg0);
+    try testing.expectEqual(@as(u64, 2), ledger.entries[0].first_arg1);
+    try testing.expect(x64_linux_runtime.ImportFallbackLedger.entryNeedsDetail(ledger.entries[0]));
+    try testing.expect(!x64_linux_runtime.ImportFallbackLedger.entryNeedsDetail(ledger.entries[1]));
+}
+
+test "a file failure is attributed to the import that raised it" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    const return_rip = MEM_BASE + 0x900;
+
+    // A run that ends with a bare `file_failures=5004` says something went
+    // wrong five thousand times without saying what. The count on its own
+    // cannot separate a guest probing for optional files from a path Rosetta
+    // could not serve, so a failure has to name the API that raised it.
+    const path = MEM_BASE + 0xE00;
+    for ("Z:\\nonexistent\\file.bin\x00", 0..) |ch, index| {
+        state.write8(path + @as(u64, @intCast(index)), ch);
+    }
+    state.regs = .{};
+    state.regs.rcx = path;
+    _ = x64_linux_runtime.tryWindowsFunction(&state, "kernel32.dll", "GetFileAttributesA", return_rip);
+
+    const ledger = &state.windows_file_failure_ledger;
+    if (!ledger.isEmpty()) {
+        try testing.expect(ledger.entries[0].name().len != 0);
+        try testing.expect(!std.mem.eql(u8, ledger.entries[0].name(), "<unattributed>"));
+        try testing.expect(ledger.total >= 1);
+    }
+
+    // Repeated identical failures collapse onto one entry rather than
+    // filling the bounded table, and the same API with a different error
+    // stays a separate fact.
+    var direct = WindowsFileFailureLedger{};
+    direct.note("CreateFileW", 2);
+    direct.note("CreateFileW", 2);
+    direct.note("CreateFileW", 3);
+    direct.note("FindFirstFileW", 2);
+    try testing.expectEqual(@as(usize, 3), direct.count);
+    try testing.expectEqual(@as(u64, 4), direct.total);
+    try testing.expectEqual(@as(u64, 2), direct.entries[0].count);
+    try testing.expectEqual(@as(u32, 3), direct.entries[1].error_code);
+    try testing.expectEqualStrings("ERROR_FILE_NOT_FOUND", windowsFileErrorLabel(2));
+    try testing.expectEqualStrings("ERROR_ACCESS_DENIED", windowsFileErrorLabel(5));
+    try testing.expectEqualStrings("unnamed", windowsFileErrorLabel(60001));
 }
 
 test "the window's monitor handle is stable and a non-Vulkan graphics import is not told S_OK" {
@@ -10156,11 +10945,13 @@ test "the window's monitor handle is stable and a non-Vulkan graphics import is 
     try testing.expectEqual(first, state.regs.rax);
 
     // The graphics import class covers whole DLLs, not just `vk` names.
-    // Zero is VK_SUCCESS for a Vulkan entry and S_OK for a DXGI one, so the
-    // unmodelled fallback cannot be shared between them.
+    // Zero is VK_SUCCESS for a Vulkan entry and S_OK for a DXGI one. The
+    // explicit DXGI factory contract now refuses without publishing a null
+    // COM interface.
     state.regs = .{};
+    state.regs.rdx = MEM_BASE + 0xD90;
     try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "dxgi.dll", "CreateDXGIFactory1", return_rip));
-    try testing.expectEqual(@as(u64, 0x8000_4001), state.regs.rax); // E_NOTIMPL
+    try testing.expectEqual(@as(u64, 0x8000_4002), state.regs.rax); // E_NOINTERFACE
 }
 
 test "the progress watchdog only fires when every observable axis is frozen" {
@@ -10195,6 +10986,35 @@ test "the progress watchdog only fires when every observable axis is frozen" {
     state.windows_progress.next_sample_step = state.executed_steps;
     state.checkWindowsProgress();
     try testing.expectEqual(@as(u32, 0), state.windows_progress.frozen_samples);
+
+    // A guest that paints but never presents is invisible to the freeze
+    // detector -- its message loop keeps every axis moving -- so it has its
+    // own claim, and that claim waits until there are enough paints to make
+    // it.  A startup that has not presented yet must stay silent.
+    state.windows_paint_deliveries = WINDOWS_PAINT_WITHOUT_PRESENT_THRESHOLD - 1;
+    state.checkWindowsPaintReachesScreen();
+    try testing.expectEqual(@as(u64, 0), state.windows_progress.paint_without_present_reported_at);
+    state.windows_paint_deliveries = WINDOWS_PAINT_WITHOUT_PRESENT_THRESHOLD;
+    state.checkWindowsPaintReachesScreen();
+    try testing.expectEqual(
+        WINDOWS_PAINT_WITHOUT_PRESENT_THRESHOLD,
+        state.windows_progress.paint_without_present_reported_at,
+    );
+    // It then escalates rather than repeating on every sample.
+    state.windows_paint_deliveries += 1;
+    state.checkWindowsPaintReachesScreen();
+    try testing.expectEqual(
+        WINDOWS_PAINT_WITHOUT_PRESENT_THRESHOLD,
+        state.windows_progress.paint_without_present_reported_at,
+    );
+    // One present is enough to retire the claim entirely.
+    state.windows_graphics.presents = 1;
+    state.windows_paint_deliveries *= 8;
+    state.checkWindowsPaintReachesScreen();
+    try testing.expectEqual(
+        WINDOWS_PAINT_WITHOUT_PRESENT_THRESHOLD,
+        state.windows_progress.paint_without_present_reported_at,
+    );
 
     // A disabled watchdog samples nothing at all.
     state.windows_progress.enabled = false;
@@ -10403,6 +11223,26 @@ test "Windows CRT realloc preserves guest bytes and zeroes grown recalloc tails"
     try testing.expect(!state.releaseGuestAllocation(recalloced));
 }
 
+test "PE heap provenance grows beyond the initial table capacity" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+
+    var last: u64 = 0;
+    for (0..INITIAL_WINDOWS_HEAP_ALLOCATIONS + 1) |_| {
+        last = state.guestAlloc(1, 1).?;
+    }
+
+    try testing.expectEqual(
+        INITIAL_WINDOWS_HEAP_ALLOCATIONS + 1,
+        state.windows_heap_allocation_count,
+    );
+    try testing.expect(state.windows_heap_allocations.len > INITIAL_WINDOWS_HEAP_ALLOCATIONS);
+    try testing.expectEqual(@as(u64, 0), state.windows_heap_provenance_growth_failures);
+    try testing.expectEqual(@as(u64, 0), state.windows_heap_provenance_untracked_allocations);
+    try testing.expect(state.releaseGuestAllocation(last));
+}
+
 test "Windows CRT memmove preserves overlapping guest bytes" {
     var state = ElfState.init(testing.allocator);
     defer state.deinit();
@@ -10572,6 +11412,35 @@ test "Windows PE filesystem bridge reads only from its configured root" {
     try testing.expect(state.read32(completed) > 0);
 
     state.regs.rcx = handle;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "kernel32.dll", "CloseHandle", return_rip));
+    try testing.expectEqual(@as(u64, 1), state.regs.rax);
+
+    // The Windows PE is built with MinGW's 56-byte `_stat64` ABI: the
+    // 64-bit size is at byte 24, after the naturally aligned `st_rdev`.
+    // Keep this assertion close to the confined-file test so a filesystem
+    // probe cannot regress into a successful call with a malformed record.
+    const stat_output = state.guestAlloc(56, 8).?;
+    state.regs.rcx = path;
+    state.regs.rdx = stat_output;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ucrtbase.dll", "_stat64", return_rip));
+    try testing.expectEqual(@as(u64, 0), state.regs.rax);
+    try testing.expectEqual(@as(u16, 0x8000), state.read16(stat_output + 6));
+    try testing.expectEqual(@as(u64, "windows runtime probe\n".len), state.read64(stat_output + 24));
+
+    // std::filesystem may hand the Win32 bridge the same virtual mount with
+    // forward separators after normalizing a path.  The confined C:\xenia
+    // authority must accept both spellings.
+    for ("C:/xenia/probe.zig", 0..) |character, index| state.write8(path + @as(u64, @intCast(index)), character);
+    state.write8(path + 18, 0);
+    state.regs.rcx = path;
+    state.regs.rdx = 0x8000_0000;
+    state.regs.r8 = 1;
+    state.regs.r9 = 0;
+    state.write64(state.regs.rsp + 32, 3);
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "kernel32.dll", "CreateFileA", return_rip));
+    const forward_slash_handle = state.regs.rax;
+    try testing.expect(forward_slash_handle != std.math.maxInt(u64));
+    state.regs.rcx = forward_slash_handle;
     try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "kernel32.dll", "CloseHandle", return_rip));
     try testing.expectEqual(@as(u64, 1), state.regs.rax);
 
