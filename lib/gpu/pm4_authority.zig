@@ -190,6 +190,11 @@ pub const Comparison = struct {
     first_field: ?Field = null,
     first_left: u64 = 0,
     first_right: u64 = 0,
+    /// Which defect class the first disagreement was in, when the field is
+    /// `.defects`. A total names nobody: a truncated ring and an unknown
+    /// opcode need different people, which is why `DefectKind` is an enum and
+    /// not a counter.
+    first_defect_kind: ?DefectKind = null,
 
     pub fn agrees(self: Comparison) bool {
         return self.comparable and self.disagreements == 0;
@@ -206,6 +211,27 @@ pub fn compare(left: Account, right: Account) Comparison {
     out.comparable = true;
     inline for (@typeInfo(Field).@"enum".fields) |field| {
         const which: Field = @enumFromInt(field.value);
+        if (which == .defects) {
+            // Per class, never as a total. Two decoders that find three
+            // unknown opcodes and three unreadable indirects respectively
+            // both total three, and summing them reports corroboration on the
+            // one field where they completely disagree. The class is also
+            // what names who has to fix it.
+            var index: usize = 0;
+            while (index < defect_count) : (index += 1) {
+                const a = left.defects[index];
+                const b = right.defects[index];
+                if (a == b) continue;
+                out.disagreements += 1;
+                if (out.first_field == null) {
+                    out.first_field = .defects;
+                    out.first_left = a;
+                    out.first_right = b;
+                    out.first_defect_kind = @enumFromInt(index);
+                }
+            }
+            continue;
+        }
         const a = which.valueOf(left);
         const b = which.valueOf(right);
         if (a != b) {
@@ -513,4 +539,83 @@ test "replay decoder agreement cannot satisfy the live execution gate" {
     try std.testing.expect(ledger.record(replayed));
     try std.testing.expectEqual(Verdict.corroborated, ledger.verdict());
     try std.testing.expect(!ledger.provesLiveExecution());
+}
+
+// Defects compare per class, never as a total.
+//
+// The 2026-09-07 G3 failure printed `first_field=defects left=20 right=0` and
+// stopped there. A reader could not tell whether twenty packets were truncated
+// or twenty registers were unrecognised — which are different defects with
+// different owners — and the field that carried the answer had been summed
+// away before the comparison ran.
+test "a defect total cannot hide two decoders disagreeing in opposite directions" {
+    var walk = Account{ .decoder = .structural_walk, .batch_id = 7, .stated = true };
+    var executor = Account{ .decoder = .stateful_executor, .batch_id = 7, .stated = true };
+
+    // Equal totals, completely different findings. Summed, this reads as
+    // agreement on the one field where the decoders share no conclusion.
+    walk.noteDefect(.unknown_opcode);
+    walk.noteDefect(.unknown_opcode);
+    walk.noteDefect(.unknown_opcode);
+    executor.noteDefect(.indirect_unreadable);
+    executor.noteDefect(.indirect_unreadable);
+    executor.noteDefect(.indirect_unreadable);
+    try std.testing.expectEqual(walk.totalDefects(), executor.totalDefects());
+
+    const result = compare(walk, executor);
+    try std.testing.expect(result.comparable);
+    try std.testing.expect(!result.agrees());
+    // Both classes disagree, and the first one named is the one to act on.
+    try std.testing.expectEqual(@as(u32, 2), result.disagreements);
+    try std.testing.expectEqual(Field.defects, result.first_field.?);
+    try std.testing.expectEqual(DefectKind.unknown_opcode, result.first_defect_kind.?);
+    try std.testing.expectEqual(@as(u64, 3), result.first_left);
+    try std.testing.expectEqual(@as(u64, 0), result.first_right);
+}
+
+// The G3 batch itself: 235 dwords, 72 packets, 5 indirect references, 57
+// register intents, 24 draws, 2 event writes, and one register-classification
+// rule applied by one decoder and not the other. With the rule owned by
+// `register_map.classifyCommandRegister`, the accounts agree.
+test "the observed G3 batch corroborates once both decoders share one rule" {
+    var ledger = Ledger{};
+    ledger.open(0xb99f9e4c4fdba888);
+    const shape = Account{
+        .domain = .rosette_gpu,
+        .batch_id = 0xb99f9e4c4fdba888,
+        .dwords_examined = 235,
+        .root_packets = 3,
+        .nested_packets = 69,
+        .indirect_references = 5,
+        .register_writes = 57,
+        .draws = 24,
+        .event_writes = 2,
+        .swaps = 0,
+    };
+    var walk = shape;
+    walk.decoder = .structural_walk;
+    walk.source = .guest_authentic;
+    var executor = shape;
+    executor.decoder = .stateful_executor;
+    executor.source = .replay;
+
+    try std.testing.expect(ledger.record(walk));
+    try std.testing.expect(ledger.record(executor));
+    try std.testing.expectEqual(Verdict.corroborated, ledger.verdict());
+    try std.testing.expect(ledger.verdict().absenceIsQuotable());
+
+    // A replayed executor still cannot prove the guest ran the batch. The gate
+    // above this one is entitled to the decoding, not to live execution.
+    try std.testing.expect(!ledger.provesLiveExecution());
+
+    // Restore the old asymmetry and the disagreement comes back, named.
+    var drifted = Ledger{};
+    drifted.open(0xb99f9e4c4fdba888);
+    var mismatched = walk;
+    mismatched.defects[@intFromEnum(DefectKind.register_unclassified)] = 20;
+    try std.testing.expect(drifted.record(mismatched));
+    try std.testing.expect(drifted.record(executor));
+    try std.testing.expectEqual(Verdict.decoder_disagreement, drifted.verdict());
+    const drift = drifted.comparison();
+    try std.testing.expectEqual(DefectKind.register_unclassified, drift.first_defect_kind.?);
 }

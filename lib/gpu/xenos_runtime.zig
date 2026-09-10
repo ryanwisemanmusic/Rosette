@@ -132,6 +132,9 @@ pub const Report = struct {
     command_register_writes: u64 = 0,
     command_unclassified_register_writes: u64 = 0,
     command_out_of_range_register_writes: u64 = 0,
+    /// Exact Xenia-table registers with no functional block owner. Not a
+    /// defect; carried so the block-map gap stays countable.
+    command_known_hardware_register_writes: u64 = 0,
     packet_summary: packet_trace.Summary = .{},
 };
 
@@ -394,6 +397,7 @@ pub const Runtime = struct {
         const command_register_writes_before = self.executor.command_register_writes;
         const command_unclassified_register_writes_before = self.executor.command_unclassified_register_writes;
         const command_out_of_range_register_writes_before = self.executor.command_out_of_range_register_writes;
+        const command_known_hardware_register_writes_before = self.executor.command_known_hardware_register_writes;
         self.indirect_last_status = .not_attempted;
         self.indirect_last_address = 0;
         self.indirect_last_missing_address = null;
@@ -456,6 +460,7 @@ pub const Runtime = struct {
         report.command_register_writes = self.executor.command_register_writes -| command_register_writes_before;
         report.command_unclassified_register_writes = self.executor.command_unclassified_register_writes -| command_unclassified_register_writes_before;
         report.command_out_of_range_register_writes = self.executor.command_out_of_range_register_writes -| command_out_of_range_register_writes_before;
+        report.command_known_hardware_register_writes = self.executor.command_known_hardware_register_writes -| command_known_hardware_register_writes_before;
         report.packet_summary = self.packet_timeline.snapshot().delta(packet_before);
         if (report.truncated) self.truncated_rings +|= 1;
         if (self.execution_disposition.publishesEffects()) {

@@ -313,6 +313,34 @@ pub const Summary = struct {
     outstanding: u64 = 0,
     by_cause: [cause_count]u64 = [_]u64{0} ** cause_count,
     refused_by_filter: u64 = 0,
+
+    /// Deliveries the cause histogram actually accounts for.
+    ///
+    /// `deliveries` is reconciled to the larger of Rosette's own `begin()`
+    /// count and the emulator's reported entered total, because the emulator
+    /// sees deliveries Rosette never classified. `by_cause` is only ever the
+    /// first of those. The 2026-09-07 run printed `deliveries=240` beside
+    /// `interrupt-cause vblank raised=5` with nothing saying they were two
+    /// observers, which reads as a broken histogram rather than as the
+    /// coverage gap it is.
+    pub fn attributed(self: Summary) u64 {
+        var total: u64 = 0;
+        for (self.by_cause) |count| total +|= count;
+        return total;
+    }
+
+    /// Deliveries the emulator reported that Rosette never assigned a cause.
+    /// This is a hole in Rosette's observer, not extra interrupts, and no
+    /// conclusion about cause diversity may be drawn while it is non-zero.
+    pub fn unattributed(self: Summary) u64 {
+        return self.deliveries -| self.attributed();
+    }
+
+    /// Whether the cause histogram covers every delivery the run observed.
+    /// Cause diversity is only a statement about the emulator when it does.
+    pub fn causeCensusComplete(self: Summary) bool {
+        return self.deliveries != 0 and self.unattributed() == 0;
+    }
 };
 
 pub const Ledger = struct {
@@ -772,4 +800,35 @@ test "negative callback effect requires a named object and complete watch" {
     delivery.effect_observed = true;
     try std.testing.expectEqual(Verdict.entered_without_effect, ledger.verdict());
     try std.testing.expect(ledger.permitsHandlerConclusion());
+}
+
+// Two observers of one delivery stream, reconciled for the headline and not
+// for the histogram. The 2026-09-07 run printed `deliveries=240` next to
+// `interrupt-cause vblank raised=5`; both numbers were right and their
+// relationship was nowhere.
+test "the cause histogram states its own coverage against the reconciled total" {
+    var ledger = Ledger{};
+    var index: usize = 0;
+    while (index < 5) : (index += 1) {
+        _ = ledger.begin(.vblank, 100 + index);
+    }
+    // Rosette's own count is the whole census until the emulator reports more.
+    var totals = ledger.summary();
+    try std.testing.expectEqual(@as(u64, 5), totals.deliveries);
+    try std.testing.expectEqual(@as(u64, 5), totals.attributed());
+    try std.testing.expectEqual(@as(u64, 0), totals.unattributed());
+    try std.testing.expect(totals.causeCensusComplete());
+
+    // The emulator reports deliveries Rosette never classified. The headline
+    // adopts the larger number; the histogram cannot, and says so.
+    ledger.observeTotals(240, 240, 5000);
+    totals = ledger.summary();
+    try std.testing.expectEqual(@as(u64, 240), totals.deliveries);
+    try std.testing.expectEqual(@as(u64, 5), totals.attributed());
+    try std.testing.expectEqual(@as(u64, 235), totals.unattributed());
+    try std.testing.expect(!totals.causeCensusComplete());
+
+    // An empty ledger is not a complete census of nothing.
+    const cold = Ledger{};
+    try std.testing.expect(!cold.summary().causeCensusComplete());
 }

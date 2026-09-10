@@ -107,6 +107,9 @@ pub const Executor = struct {
     command_register_writes: u64 = 0,
     command_unclassified_register_writes: u64 = 0,
     command_out_of_range_register_writes: u64 = 0,
+    /// Writes to an exact Xenia-table register with no functional block owner:
+    /// a gap in Rosette's block map rather than a defect in the stream.
+    command_known_hardware_register_writes: u64 = 0,
     predicated_skip_count: u64 = 0,
     bin_mask_updates: u64 = 0,
     bin_select_updates: u64 = 0,
@@ -356,12 +359,15 @@ pub const Executor = struct {
 
     fn noteCommandRegister(self: *Executor, register: u32) void {
         self.command_register_writes +|= 1;
-        const block = register_map.blockForIndex(register) orelse {
-            self.command_out_of_range_register_writes +|= 1;
-            return;
-        };
-        if (block == .unclassified and !register_map.isKnownHardwareRegister(register)) {
-            self.command_unclassified_register_writes +|= 1;
+        // The same one rule the structural walker uses. See
+        // `register_map.classifyCommandRegister`: this exemption for an exact
+        // Xenia-table entry was correct and the walker's omission of it was
+        // the whole of the G3 decoder disagreement.
+        switch (register_map.classifyCommandRegister(register)) {
+            .out_of_range => self.command_out_of_range_register_writes +|= 1,
+            .unclassified => self.command_unclassified_register_writes +|= 1,
+            .known_hardware => self.command_known_hardware_register_writes +|= 1,
+            .owned => {},
         }
     }
 
