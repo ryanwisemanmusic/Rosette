@@ -132,7 +132,11 @@ BUILD_IDENTITY_SCRIPT := $(ROOT_DIR)/tools/build_identity_manifest.py
 BUILD_IDENTITY_OUT := $(ROOT_DIR)/.rosette/build-identity.json
 XENIA_FORK_MANIFEST_SCRIPT := $(ROOT_DIR)/tools/build_xenia_fork_manifest.py
 XENIA_FORK_MANIFEST_OUT := $(ROOT_DIR)/.rosette/xenia-fork-manifest.json
-XENIA_ROOT ?= /Volumes/2023 Drive/xenia/xenia
+# Prefer the checkout on the volume used by the Rosette/Xenia run when it is
+# present. The user-facing volume path is the parent directory; the Git
+# checkout itself is its xenia/ child. Keep the older local path as an
+# override-compatible fallback for machines that have that checkout instead.
+XENIA_ROOT ?= $(if $(wildcard /Volumes/2023\ Drive/xenia/xenia/.git),/Volumes/2023 Drive/xenia/xenia,/Users/ryanwiseman/Documents/xenia-canary-canary_experimental)
 XENIA_WINDOWS_BUILD_SCRIPT := $(ROOT_DIR)/tools/xenia/scripts/rosette-xenia-windows.sh
 XENIA_WINDOWS_SOURCE_ROOT ?= $(XENIA_ROOT)
 XENIA_WINDOWS_BUILD_DIR ?= $(ROOT_DIR)/.rosette/xenia-windows
@@ -252,7 +256,7 @@ ISO_BIN := $(ZIG_OUT_DIR)/bin/rosette-iso
 ISO_SRC := $(ROOT_DIR)/src/tooling/iso/main.zig
 XBOX360_MEDIA_TOOL := $(ROOT_DIR)/tools/xbox360_media.py
 
-.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build link-audit-build pkg-boundary-audit vendor-library-audit vendor-audit shell-helper-build test-census xenia-fork-manifest xenia-windows-prepare xenia-windows-build build-identity replay-evidence shell shell-update shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse iso-build iso-run app-wrapper installer uninstaller app-all release notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
+.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build link-audit-build pkg-boundary-audit isa-execution-audit vendor-library-audit vendor-audit shell-helper-build test-census xenia-fork-manifest xenia-windows-prepare xenia-windows-build build-identity replay-evidence shell shell-update shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse iso-build iso-run app-wrapper installer uninstaller app-all release notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
 
 all: headers-check zig-build test-run
 
@@ -361,7 +365,7 @@ clean: exe-runner-cleanup
 
 elf-processor-build:
 	@mkdir -p "$(ZIG_CACHE_DIR)/global"
-	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build-exe -O "$(ROSETTE_RUNTIME_OPTIMIZE)" --dep x64_decoder --dep x64_interpreter --dep x64_linux_runtime --dep x64_syscalls --dep x64_guest_abi --dep exit_diagnostics --dep cleo_routing --dep guard_rollback --dep execution_history --dep evex_runtime -Mroot="$(ELF_PROCESSOR_SRC)" --dep isa_highway --dep isa_registry --dep isa_decode --dep runtime_abi_handshake --dep flags --dep cpu_state --dep bit_test --dep capabilities -Mx64_decoder=ISA/decoding/root.zig --dep flags -Mcpu_state=src/x64-ASM/cpu_state.zig --dep flags -Mbit_test=src/x64-ASM/bit_test.zig -Mflags=src/x64-ASM/flags.zig -Mcapabilities=src/x64-ASM/capabilities.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig --dep x64_syscalls -Mx64_linux_runtime=src/x64-ASM/linux_runtime.zig -Mx64_syscalls=src/x64-ASM/syscalls.zig -Mx64_guest_abi=src/x64-ASM/guest_abi.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -Misa_highway=ISA/highway.zig -Misa_registry=ISA/root.zig -Misa_decode=ISA/decode/root.zig -Mruntime_abi_handshake=src/tooling/runtime-abi-handshake/runtime.zig -Mguard_rollback=lib/runtime/guard-rollback/root.zig -Mcleo_routing=lib/CLEO/cleo_routing.zig -Mexecution_history=lib/runtime/execution-history/root.zig --dep x64_decoder --dep exit_diagnostics -Mevex_runtime=lib/runtime/process-core/evex.zig -femit-bin="$(ELF_PROCESSOR_BIN)"
+	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build-exe -O "$(ROSETTE_RUNTIME_OPTIMIZE)" --dep x64_decoder --dep x64_interpreter --dep x64_linux_runtime --dep x64_syscalls --dep x64_guest_abi --dep exit_diagnostics --dep cleo_routing --dep guard_rollback --dep execution_history --dep evex_runtime --dep x86_vector_helpers -Mroot="$(ELF_PROCESSOR_SRC)" --dep isa_highway --dep isa_registry --dep isa_decode --dep runtime_abi_handshake --dep flags --dep cpu_state --dep bit_test --dep capabilities -Mx64_decoder=ISA/decoding/root.zig --dep flags -Mcpu_state=src/x64-ASM/cpu_state.zig --dep flags -Mbit_test=src/x64-ASM/bit_test.zig -Mflags=src/x64-ASM/flags.zig -Mcapabilities=src/x64-ASM/capabilities.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig --dep windows_runtime --dep x64_syscalls -Mx64_linux_runtime=src/x64-ASM/linux_runtime.zig -Mx64_syscalls=src/x64-ASM/syscalls.zig -Mwindows_runtime=src/x64-ASM/windows_runtime.zig -Mx64_guest_abi=src/x64-ASM/guest_abi.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -Misa_highway=ISA/highway.zig -Misa_registry=ISA/root.zig -Misa_decode=ISA/decode/root.zig -Mruntime_abi_handshake=src/tooling/runtime-abi-handshake/runtime.zig -Mguard_rollback=lib/runtime/guard-rollback/root.zig -Mcleo_routing=lib/CLEO/cleo_routing.zig -Mexecution_history=lib/runtime/execution-history/root.zig --dep x64_decoder --dep exit_diagnostics -Mevex_runtime=lib/runtime/process-core/evex.zig --dep x64_decoder -Mx86_vector_helpers=lib/Mach-O/execution_helpers.zig -femit-bin="$(ELF_PROCESSOR_BIN)"
 
 macho-processor-build:
 	@mkdir -p "$(ZIG_CACHE_DIR)/global"
@@ -407,12 +411,18 @@ compat-router-build:
 pkg-boundary-audit:
 	@cd "$(ROOT_DIR)" && python3 tools/audit_pkg_boundary.py
 
+# A decoder that can name an instruction the interpreter cannot run compiles
+# cleanly and passes every test; it is only visible by running a guest. The
+# 2026-09-08 `sub rsp, imm32` gap stopped initializer 1 of 724 that way.
+isa-execution-audit:
+	@cd "$(ROOT_DIR)" && python3 tools/audit_isa_execution.py --root "$(ROOT_DIR)"
+
 vendor-library-audit:
 	@cd "$(ROOT_DIR)" && python3 tools/check_vendor_libraries.py $(if $(XENIA_ROOT),--xenia-root "$(XENIA_ROOT)",)
 
 vendor-audit: vendor-library-audit
 
-shell-helper-build: pkg-boundary-audit vendor-library-audit c-fix-build assembler-runner-build elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build compat-router-build
+shell-helper-build: pkg-boundary-audit isa-execution-audit vendor-library-audit c-fix-build assembler-runner-build elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build compat-router-build
 	@mkdir -p "$(ZIG_CACHE_DIR)/global"
 	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build-exe -lc --dep entrypoint_alignment --dep entrypoint_kernel_process_guard --dep compat_source_include_compat --dep compat_third_party_include_compat -Mroot="$(SHELL_HELPER_SRC)" -Mentrypoint_alignment=src/entrypoint/alignment/root.zig -Mentrypoint_kernel_process_guard=src/entrypoint/kernel/process_guard.zig -Mcompat_source_include_compat=src/compat/source/include_compat.zig -Mcompat_third_party_include_compat=src/compat/third_party/include_compat.zig -femit-bin="$(SHELL_HELPER_BIN)"
 
