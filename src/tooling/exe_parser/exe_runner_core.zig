@@ -680,7 +680,10 @@ pub fn runWithArguments(
         bootLog("7_pe64_preflight: proving the reachable x86-64 entry path");
         var pe64_report = try pe64_runtime.preflight(allocator, exe_bytes, &image);
         defer pe64_report.deinit(allocator);
-        var pe64_report_buf: [4096]u8 = undefined;
+        // Keep the preflight report large enough for the bounded degraded
+        // import sample. The sample is intentionally detailed in the trace
+        // file but remains a single startup block rather than per-call noise.
+        var pe64_report_buf: [16 * 1024]u8 = undefined;
         trace.logText(pe64_runtime.formatPreflight(&pe64_report_buf, pe64_report));
         std.debug.print("  PE64 preflight: {s} reachable={d} decoded={d} invalid={d} imports={d} degraded_imports={d} unsupported_imports={d} indirect={d}\n", .{
             if (!pe64_report.ready()) "blocked" else if (pe64_report.complete()) "ready" else "ready_with_degraded_imports",
@@ -692,6 +695,19 @@ pub fn runWithArguments(
             pe64_report.unsupported_imports,
             pe64_report.indirect_control_transfers,
         });
+        // The count alone reads as "416 broken imports".  Say which DLLs
+        // they belong to and how many of them a bare zero return would have
+        // told the guest had succeeded, so the number is actionable at a
+        // glance instead of alarming.
+        if (pe64_report.degraded_imports != 0) {
+            std.debug.print("  PE64 degraded-import inventory: dlls={d} zero_would_have_claimed_success={d} (static eligibility, not failures; the run log's DEGRADED IMPORTS block lists what was actually called)\n", .{
+                pe64_report.degraded_import_dll_count,
+                pe64_report.degraded_zero_means_success,
+            });
+            for (pe64_report.degraded_import_dlls[0..pe64_report.degraded_import_dll_count]) |record| {
+                std.debug.print("    {s}: {d} (zero-means-success: {d})\n", .{ record.dllName(), record.count, record.zero_means_success });
+            }
+        }
         if (!launch_allowed) {
             trace.logText("launch_skipped = parse_only\n");
             return;
@@ -722,16 +738,20 @@ pub fn runWithArguments(
         try changeWorkingDirectory(allocator, absolute_working_directory);
         defer changeWorkingDirectory(allocator, previous_cwd) catch {};
 
-        bootLog("8_pe64_execute: starting bounded Windows x64 state");
-        const max_steps_env = std.c.getenv("ROSETTA_PE64_MAX_STEPS");
+        bootLog("8_pe64_execute: starting Windows x64 state (unlimited unless explicitly bounded)");
+        const max_steps_env = std.c.getenv("ROSETTE_PE64_MAX_STEPS");
         const max_steps: u64 = if (max_steps_env) |value_ptr|
-            std.fmt.parseInt(u64, std.mem.sliceTo(value_ptr, 0), 10) catch 20_000_000
+            std.fmt.parseInt(u64, std.mem.sliceTo(value_ptr, 0), 10) catch 0
         else
-            20_000_000;
+            0;
         if (max_steps_env) |value_ptr| {
-            std.debug.print("  PE64 max-step environment: {s} -> {d}\n", .{ std.mem.sliceTo(value_ptr, 0), max_steps });
+            if (max_steps == 0) {
+                std.debug.print("  PE64 max-step environment: {s} -> unlimited\n", .{std.mem.sliceTo(value_ptr, 0)});
+            } else {
+                std.debug.print("  PE64 max-step environment: {s} -> {d}\n", .{ std.mem.sliceTo(value_ptr, 0), max_steps });
+            }
         } else {
-            std.debug.print("  PE64 max-step environment: <unset> -> {d}\n", .{max_steps});
+            std.debug.print("  PE64 max-step environment: <unset> -> unlimited\n", .{});
         }
         var policy_buf: [256]u8 = undefined;
         const policy = try std.fmt.bufPrint(&policy_buf, "pe64_execution = true\npe64_max_steps = {d}\npe64_windows_argc = {d}\npe64_windows_media = {s}\n", .{
@@ -757,7 +777,7 @@ pub fn runWithArguments(
         };
         var result_buf: [1024]u8 = undefined;
         const graphics = result.graphics;
-        const result_line = try std.fmt.bufPrint(&result_buf, "pe64_execution_result = terminated={}; faulted={}; steps={d}; exit_code=0x{X}; rip=0x{X}; import_calls={d}; degraded_import_calls={d}; unknown_import_calls={d}; file_opens={d}; file_reads={d}; file_writes={d}; file_failures={d}; rtl_capture_calls={d}; rtl_unwind_calls={d}\n", .{
+        const result_line = try std.fmt.bufPrint(&result_buf, "pe64_execution_result = terminated={}; faulted={}; steps={d}; exit_code=0x{X}; rip=0x{X}; import_calls={d}; degraded_import_calls={d}; unknown_import_calls={d}; unknown_import_policy={s}; unique_unknown_imports={d}; file_opens={d}; file_reads={d}; file_writes={d}; file_failures={d}; rtl_capture_calls={d}; rtl_unwind_calls={d}\n", .{
             result.terminated,
             result.faulted,
             result.executed_steps,
@@ -766,6 +786,8 @@ pub fn runWithArguments(
             result.windows_import_calls,
             result.windows_degraded_import_calls,
             result.windows_unknown_import_calls,
+            pe64_runtime.unknownImportPolicyName(result.windows_unknown_imports_fatal),
+            result.windows_unresolved_import_count,
             result.windows_file_open_calls,
             result.windows_file_read_calls,
             result.windows_file_write_calls,
@@ -774,6 +796,35 @@ pub fn runWithArguments(
             result.windows_rtl_unwind_calls,
         });
         trace.logText(result_line);
+
+        if (result.windows_unresolved_import_count != 0) {
+            trace.logText("pe64_unresolved_imports = bounded_unique_inventory\n");
+            const unresolved_count = @min(result.windows_unresolved_import_count, result.windows_unresolved_imports.len);
+            for (result.windows_unresolved_imports[0..unresolved_count], 0..) |*unresolved, index| {
+                var unresolved_buf: [2048]u8 = undefined;
+                const dll_name = if (unresolved.dllName().len == 0) "<dynamic/unknown-dll>" else unresolved.dllName();
+                const unresolved_line = try std.fmt.bufPrint(&unresolved_buf, "pe64_unresolved_import[{d}] = dll={s}; function={s}; dynamic={}; stub=0x{X}; first_step={d}; first_return=0x{X}; first_caller=0x{X}; first_rsp=0x{X}; first_args=rcx:0x{X},rdx:0x{X},r8:0x{X},r9:0x{X}; last_step={d}; last_return=0x{X}; last_caller=0x{X}; occurrences={d}\n", .{
+                    index,
+                    dll_name,
+                    unresolved.functionName(),
+                    unresolved.is_dynamic,
+                    unresolved.stub_address,
+                    unresolved.first_step,
+                    unresolved.first_return_rip,
+                    unresolved.first_caller_rip,
+                    unresolved.first_rsp,
+                    unresolved.first_rcx,
+                    unresolved.first_rdx,
+                    unresolved.first_r8,
+                    unresolved.first_r9,
+                    unresolved.last_step,
+                    unresolved.last_return_rip,
+                    unresolved.last_caller_rip,
+                    unresolved.occurrences,
+                });
+                trace.logText(unresolved_line);
+            }
+        }
 
         var graphics_buf: [2048]u8 = undefined;
         const graphics_line = try std.fmt.bufPrint(&graphics_buf, "pe64_graphics = phase={s}; contract_ready={}; window_ready={}; native_window_ready={}; native_window_visible={}; instance_ready={}; surface_ready={}; device_ready={}; queue_ready={}; swapchain_ready={}; frame_resources_ready={}; guest_present_observed={}; native_vulkan_forwarding={}; native_vulkan_calls={d}; native_vulkan_failures={d}; window={d}x{d}; calls={d}; proc_queries={d}; commands={d}; submits={d}; presents={d}; ordering_violations={d}; unmodeled_calls={d}; last_call={s}; last_failure={s}\n", .{

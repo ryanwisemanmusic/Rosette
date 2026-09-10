@@ -24,8 +24,12 @@ const page_size: u64 = 0x1000;
 const max_instruction_length: usize = 15;
 const minimum_stack_reserve: u64 = 16 * 1024 * 1024;
 const maximum_stack_reserve: u64 = 128 * 1024 * 1024;
-const minimum_heap_reserve: u64 = 64 * 1024 * 1024;
-const maximum_heap_reserve: u64 = 256 * 1024 * 1024;
+// Xenia's Windows startup allocates substantially more than the PE header's
+// nominal heap reserve before it reaches swapchain creation. Keep the guest
+// heap separate from the main stack and give it enough bounded room for the
+// graphics bootstrap without making the runtime an unbounded allocator.
+const minimum_heap_reserve: u64 = 512 * 1024 * 1024;
+const maximum_heap_reserve: u64 = 512 * 1024 * 1024;
 const maximum_runtime_memory: u64 = 1024 * 1024 * 1024;
 const synthetic_thunk_stride: u64 = 16;
 const tls_directory_index: usize = 9;
@@ -171,6 +175,60 @@ pub const ImportStatus = enum {
     malformed,
 };
 
+pub const degraded_import_sample_capacity: usize = 25;
+
+/// A bounded copy of one degraded import.  The parsed import directory owns
+/// its strings only until preflight returns, so the report keeps fixed-size
+/// names for the detailed run log instead of retaining borrowed slices.
+pub const DegradedImportSample = struct {
+    dll_name: [64]u8 = [_]u8{0} ** 64,
+    dll_name_len: u8 = 0,
+    function_name: [128]u8 = [_]u8{0} ** 128,
+    function_name_len: u8 = 0,
+    iat_rva: u32 = 0,
+
+    pub fn dllName(self: *const DegradedImportSample) []const u8 {
+        return self.dll_name[0..self.dll_name_len];
+    }
+
+    pub fn functionName(self: *const DegradedImportSample) []const u8 {
+        return self.function_name[0..self.function_name_len];
+    }
+
+    fn copy(destination: []u8, source: []const u8) u8 {
+        const count = @min(destination.len, source.len);
+        if (count != 0) @memcpy(destination[0..count], source[0..count]);
+        return @intCast(count);
+    }
+
+    pub fn set(self: *DegradedImportSample, descriptor: imports_mod.ImportDescriptor) void {
+        @memset(&self.dll_name, 0);
+        @memset(&self.function_name, 0);
+        self.dll_name_len = copy(&self.dll_name, descriptor.dll_name);
+        self.function_name_len = copy(&self.function_name, descriptor.function_name);
+        self.iat_rva = descriptor.iat_rva;
+    }
+};
+
+pub const degraded_import_dll_capacity: usize = 32;
+
+/// How many of a DLL's imports fall back rather than being implemented, and
+/// how many of those would have been told "success" by a bare zero return.
+/// A histogram is far more actionable than 25 alphabetical samples: it says
+/// which subsystem is thin, not which name happens to sort first.
+pub const DegradedImportDll = struct {
+    name: [64]u8 = [_]u8{0} ** 64,
+    name_len: u8 = 0,
+    count: u32 = 0,
+    /// Imports whose ABI spells success with zero -- the ones a bare
+    /// zero-return would have lied to.
+    zero_means_success: u32 = 0,
+
+    pub fn dllName(self: *const DegradedImportDll) []const u8 {
+        return self.name[0..self.name_len];
+    }
+};
+
 pub const PreflightReport = struct {
     entry_rva: u32,
     entry_is_executable: bool = false,
@@ -205,6 +263,37 @@ pub const PreflightReport = struct {
 
     first_unsupported_dll: ?[]const u8 = null,
     first_unsupported_import: ?[]const u8 = null,
+    degraded_import_sample_count: usize = 0,
+    degraded_import_samples: [degraded_import_sample_capacity]DegradedImportSample =
+        [_]DegradedImportSample{.{}} ** degraded_import_sample_capacity,
+    degraded_import_dll_count: usize = 0,
+    degraded_import_dlls: [degraded_import_dll_capacity]DegradedImportDll =
+        [_]DegradedImportDll{.{}} ** degraded_import_dll_capacity,
+    degraded_import_dll_overflow: u32 = 0,
+    /// Degraded imports whose ABI spells success with zero.  Before the
+    /// return contract these were the dangerous ones: the guest was told the
+    /// call worked and then read an output that was never written.
+    degraded_zero_means_success: u64 = 0,
+
+    fn noteDegradedDll(self: *PreflightReport, dll_name: []const u8, zero_means_success: bool) void {
+        for (self.degraded_import_dlls[0..self.degraded_import_dll_count]) |*record| {
+            if (!std.ascii.eqlIgnoreCase(record.dllName(), dll_name)) continue;
+            record.count +|= 1;
+            if (zero_means_success) record.zero_means_success +|= 1;
+            return;
+        }
+        if (self.degraded_import_dll_count == degraded_import_dll_capacity) {
+            self.degraded_import_dll_overflow +|= 1;
+            return;
+        }
+        var record = DegradedImportDll{ .count = 1 };
+        const length = @min(record.name.len, dll_name.len);
+        if (length != 0) @memcpy(record.name[0..length], dll_name[0..length]);
+        record.name_len = @intCast(length);
+        if (zero_means_success) record.zero_means_success = 1;
+        self.degraded_import_dlls[self.degraded_import_dll_count] = record;
+        self.degraded_import_dll_count += 1;
+    }
 
     pub fn deinit(self: *PreflightReport, allocator: std.mem.Allocator) void {
         if (self.first_unsupported_dll) |value| allocator.free(value);
@@ -228,7 +317,9 @@ pub const PreflightReport = struct {
 };
 
 pub const RunOptions = struct {
-    max_steps: u64 = 20_000_000,
+    /// Zero means no instruction budget. A non-zero value is an explicit
+    /// diagnostic bound, not a normal launch policy.
+    max_steps: u64 = 0,
     load_base: ?u64 = null,
     graphics_hooks: elf.WindowsGraphicsHooks = .{},
     /// Optional host I/O authority for the Windows ABI bridge. Paths are
@@ -257,6 +348,9 @@ pub const RunResult = struct {
     windows_import_calls: u64,
     windows_degraded_import_calls: u64,
     windows_unknown_import_calls: u64,
+    windows_unknown_imports_fatal: bool,
+    windows_unresolved_import_count: usize,
+    windows_unresolved_imports: [elf.WINDOWS_UNRESOLVED_IMPORT_CAPACITY]elf.WindowsUnresolvedImport,
     windows_file_open_calls: u64,
     windows_file_read_calls: u64,
     windows_file_write_calls: u64,
@@ -264,6 +358,27 @@ pub const RunResult = struct {
     windows_rtl_capture_calls: u64,
     windows_rtl_unwind_calls: u64,
 };
+
+/// PE launches default to an exploratory zero-return policy for imports that
+/// are not yet modeled.  This is intentionally generic: it covers direct IAT
+/// imports and dynamic GetProcAddress results alike, records every distinct
+/// symbol with context, and lets the run reach the next observable contract.
+/// Set `ROSETTE_PE64_UNKNOWN_IMPORT_POLICY=fatal` (or the legacy boolean) to
+/// restore strict termination for a focused ABI audit.
+fn unknownImportsFatal() bool {
+    if (std.c.getenv("ROSETTE_PE64_UNKNOWN_IMPORTS_FATAL")) |raw| {
+        const value = std.mem.trim(u8, std.mem.sliceTo(raw, 0), " \t\r\n");
+        if (std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or
+            std.ascii.eqlIgnoreCase(value, "yes")) return true;
+    }
+    const raw = std.c.getenv("ROSETTE_PE64_UNKNOWN_IMPORT_POLICY") orelse return false;
+    const value = std.mem.trim(u8, std.mem.sliceTo(raw, 0), " \t\r\n");
+    return std.ascii.eqlIgnoreCase(value, "fatal") or std.ascii.eqlIgnoreCase(value, "strict");
+}
+
+pub fn unknownImportPolicyName(fatal: bool) []const u8 {
+    return if (fatal) "fatal" else "zero_return";
+}
 
 fn alignUp(value: u64, alignment: u64) !u64 {
     if (alignment == 0) return error.InvalidAlignment;
@@ -515,6 +630,14 @@ pub fn preflight(allocator: std.mem.Allocator, bytes: []const u8, image: *const 
                     },
                     .degraded => {
                         report.degraded_imports += 1;
+                        const fallback = windows_runtime.importFallbackFor(descriptor.dll_name, descriptor.function_name);
+                        const zero_lies = fallback.convention.zeroMeansSuccess() and fallback.outcome == .refused;
+                        if (zero_lies) report.degraded_zero_means_success += 1;
+                        report.noteDegradedDll(descriptor.dll_name, zero_lies);
+                        if (report.degraded_import_sample_count < degraded_import_sample_capacity) {
+                            report.degraded_import_samples[report.degraded_import_sample_count].set(descriptor);
+                            report.degraded_import_sample_count += 1;
+                        }
                     },
                     .unsupported => {
                         report.unsupported_imports += 1;
@@ -653,7 +776,53 @@ pub fn formatPreflight(buffer: []u8, report: PreflightReport) []const u8 {
             report.uses_fma,
         },
     ) catch return "pe64_preflight = formatting_failed\n";
-    return buffer[0 .. first.len + second.len];
+    var used = first.len + second.len;
+    const note = std.fmt.bufPrint(
+        buffer[used..],
+        "degraded_import_meaning = a name in Rosette's Win32/UCRT inventory that has no stateful implementation yet; it completes through the ABI return contract. This is a static eligibility count, not a count of failures -- most are never called. The run log's DEGRADED IMPORTS block lists the ones a run actually took.\ndegraded_imports_zero_would_have_claimed_success = {d}\ndegraded_import_dlls = {d}\n",
+        .{ report.degraded_zero_means_success, report.degraded_import_dll_count },
+    ) catch return "pe64_preflight = formatting_failed\n";
+    used += note.len;
+    for (report.degraded_import_dlls[0..report.degraded_import_dll_count], 0..) |record, index| {
+        const line = std.fmt.bufPrint(
+            buffer[used..],
+            "degraded_import_dll[{d}] = {s} count={d} zero_would_have_claimed_success={d}\n",
+            .{ index, record.dllName(), record.count, record.zero_means_success },
+        ) catch return "pe64_preflight = formatting_failed\n";
+        used += line.len;
+    }
+    if (report.degraded_import_dll_overflow != 0) {
+        const line = std.fmt.bufPrint(
+            buffer[used..],
+            "degraded_import_dll_overflow = {d}\n",
+            .{report.degraded_import_dll_overflow},
+        ) catch return "pe64_preflight = formatting_failed\n";
+        used += line.len;
+    }
+    const sample_header = std.fmt.bufPrint(
+        buffer[used..],
+        "degraded_import_samples_first_25 = {d}\n",
+        .{report.degraded_import_sample_count},
+    ) catch return "pe64_preflight = formatting_failed\n";
+    used += sample_header.len;
+    for (report.degraded_import_samples[0..report.degraded_import_sample_count], 0..) |sample, index| {
+        const fallback = windows_runtime.importFallbackFor(sample.dllName(), sample.functionName());
+        const line = std.fmt.bufPrint(
+            buffer[used..],
+            "degraded_import[{d}] = {s}!{s} iat_rva=0x{X:0>8} convention={s} returns=0x{X} outcome={s}\n",
+            .{
+                index,
+                sample.dllName(),
+                sample.functionName(),
+                sample.iat_rva,
+                @tagName(fallback.convention),
+                fallback.value,
+                @tagName(fallback.outcome),
+            },
+        ) catch return "pe64_preflight = formatting_failed\n";
+        used += line.len;
+    }
+    return buffer[0..used];
 }
 
 fn writeBytes(state: *elf.ElfState, address: u64, source: []const u8) !void {
@@ -684,7 +853,13 @@ fn copyImage(state: *elf.ElfState, bytes: []const u8, image: *const parser.Image
     }
 }
 
-fn runtimeMemorySize(image: *const parser.Image, import_count: usize) !struct { total: u64, image_span: u64, thunk_span: u64 } {
+fn runtimeMemorySize(image: *const parser.Image, import_count: usize) !struct {
+    total: u64,
+    image_span: u64,
+    thunk_span: u64,
+    stack_reserve: u64,
+    heap_reserve: u64,
+} {
     const image_span = try alignUp(image.size_of_image, page_size);
     const thunk_bytes = std.math.mul(u64, @intCast(import_count), synthetic_thunk_stride) catch return error.ImageTooLarge;
     const thunk_span = try alignUp(@max(page_size, thunk_bytes), page_size);
@@ -694,7 +869,13 @@ fn runtimeMemorySize(image: *const parser.Image, import_count: usize) !struct { 
     const with_stack = std.math.add(u64, total, stack_reserve) catch return error.ImageTooLarge;
     const with_heap = std.math.add(u64, with_stack, heap_reserve) catch return error.ImageTooLarge;
     if (with_heap > maximum_runtime_memory) return error.ImageTooLarge;
-    return .{ .total = with_heap, .image_span = image_span, .thunk_span = thunk_span };
+    return .{
+        .total = with_heap,
+        .image_span = image_span,
+        .thunk_span = thunk_span,
+        .stack_reserve = stack_reserve,
+        .heap_reserve = heap_reserve,
+    };
 }
 
 /// Load a PE32+ image into Rosetta's x86-64 execution state and run it under a
@@ -725,6 +906,20 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
     state.image_low = load_base;
     state.image_high = std.math.add(u64, load_base, sizes.image_span) catch return error.AddressOverflow;
     state.heap_next = std.math.add(u64, state.image_high, sizes.thunk_span) catch return error.AddressOverflow;
+    const stack_base = image_end;
+    const stack_limit = std.math.sub(u64, stack_base, sizes.stack_reserve) catch return error.AddressOverflow;
+    state.guest_heap_limit = stack_limit;
+    log.info("PE64 memory layout: image=[0x{x},0x{x}) thunks=[0x{x},0x{x}) heap=[0x{x},0x{x}) stack=[0x{x},0x{x}) total={d}", .{
+        state.image_low,
+        state.image_high,
+        state.image_high,
+        state.heap_next,
+        state.heap_next,
+        state.guest_heap_limit,
+        state.guest_heap_limit,
+        stack_base,
+        sizes.total,
+    });
     state.windows_entry_point = image_entry;
     try copyImage(&state, bytes, image, load_base);
 
@@ -755,7 +950,7 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
     }
     state.dynamic_relocations = dynamic_relocations;
     state.windows_runtime_enabled = true;
-    state.windows_unknown_imports_fatal = true;
+    state.windows_unknown_imports_fatal = unknownImportsFatal();
     state.windows_host_io = options.host_io;
     state.windows_host_working_directory = options.host_working_directory;
     state.windows_launch_arguments = options.windows_arguments;
@@ -769,8 +964,6 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
     const sentinel = std.math.sub(u64, image_end, 0x1000) catch return error.AddressOverflow;
     try writeByte(&state, sentinel, 0xF4);
     state.write64(sentinel - 8, sentinel);
-    const stack_base = image_end;
-    const stack_limit = std.math.sub(u64, sentinel, minimum_stack_reserve) catch load_base;
     try initializeWindowsThreadEnvironment(&state, image, load_base, stack_base, stack_limit);
     state.regs.rsp = sentinel - 8;
     state.regs.rip = image_entry;
@@ -787,6 +980,9 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
         .windows_import_calls = state.windows_import_calls,
         .windows_degraded_import_calls = state.windows_degraded_import_calls,
         .windows_unknown_import_calls = state.windows_unknown_import_calls,
+        .windows_unknown_imports_fatal = state.windows_unknown_imports_fatal,
+        .windows_unresolved_import_count = state.windows_unresolved_import_count,
+        .windows_unresolved_imports = state.windows_unresolved_imports,
         .windows_file_open_calls = state.windows_file_open_calls,
         .windows_file_read_calls = state.windows_file_read_calls,
         .windows_file_write_calls = state.windows_file_write_calls,
@@ -864,6 +1060,11 @@ test "PE64 preflight decodes a real PE32+ text section" {
     try std.testing.expectEqual(@as(u64, 2), report.decoded_instructions);
     try std.testing.expectEqual(@as(u64, 0), report.invalid_instructions);
     try std.testing.expect(report.ready());
+}
+
+test "PE64 execution has no default instruction budget" {
+    const options = RunOptions{};
+    try std.testing.expectEqual(@as(u64, 0), options.max_steps);
 }
 
 test "PE64 bounded execution reaches the synthetic return sentinel" {
