@@ -5,6 +5,7 @@ const windows_runtime = @import("windows_runtime");
 
 pub const SYNTHETIC_PTHREAD_ONCE_RETURN = windows_runtime.SYNTHETIC_PTHREAD_ONCE_RETURN;
 pub const SYNTHETIC_INITTERM_RETURN = windows_runtime.SYNTHETIC_INITTERM_RETURN;
+pub const SYNTHETIC_QSORT_RETURN = windows_runtime.SYNTHETIC_QSORT_RETURN;
 
 // The Windows import fallback contract, re-exported for the PE state that
 // owns the ledger.  Routing it through this module keeps the executor's
@@ -15,6 +16,9 @@ pub const ImportFallback = windows_runtime.ImportFallback;
 pub const ImportFallbackLedger = windows_runtime.ImportFallbackLedger;
 pub const importFallbackFor = windows_runtime.importFallbackFor;
 pub const importFallbackAdvice = windows_runtime.importFallbackAdvice;
+pub const ImportSubsystem = windows_runtime.ImportSubsystem;
+pub const importSubsystemFor = windows_runtime.importSubsystemFor;
+pub const importSubsystemForImport = windows_runtime.importSubsystemForImport;
 
 pub fn setupInitialStack(state: anytype, argv: []const []const u8) !void {
     const default_argv = [_][]const u8{"program"};

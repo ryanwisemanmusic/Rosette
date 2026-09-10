@@ -20,6 +20,9 @@ pub const ImportFallback = import_contract.Fallback;
 pub const ImportFallbackLedger = import_contract.Ledger;
 pub const importFallbackFor = import_contract.fallbackFor;
 pub const importFallbackAdvice = import_contract.advice;
+pub const ImportSubsystem = import_contract.Subsystem;
+pub const importSubsystemFor = import_contract.subsystemFor;
+pub const importSubsystemForImport = import_contract.subsystemForImport;
 
 // Win32's HWND_MESSAGE is the parent used for message-only helper windows.
 // It is not a real drawable window and must never be forwarded to AppKit.
@@ -113,6 +116,19 @@ pub const SYNTHETIC_PTHREAD_ONCE_RETURN: u64 = 0xFFFF_FFFF_FFFF_FF18;
 /// advances the table cursor, and restores the original import continuation
 /// only after the entire table has been visited.
 pub const SYNTHETIC_INITTERM_RETURN: u64 = 0xFFFF_FFFF_FFFF_FF20;
+
+/// A guest return address used while Rosetta performs one comparison in the
+/// bounded Windows `qsort` model. The ELF executor consumes it and resumes
+/// the next comparison without exposing a host callback pointer to the PE.
+pub const SYNTHETIC_QSORT_RETURN: u64 = 0xFFFF_FFFF_FFFF_FF38;
+
+// Rosette's PE executor owns the setjmp/longjmp boundary rather than calling a
+// host libc implementation. Only the non-volatile integer context and the
+// continuation are needed by the Windows SDL/Xenia bootstrap path; keeping a
+// private marker makes an accidental longjmp into an arbitrary guest buffer a
+// visible runtime error instead of a guessed control transfer.
+const windows_setjmp_magic: u64 = 0x5253_544A_4D50_0001;
+const windows_setjmp_bytes: u64 = 96;
 
 pub const ImportClass = enum {
     core,
@@ -331,6 +347,7 @@ fn isKnownCoreImport(name: []const u8) bool {
         "FlsFree",
         "GetQueuedCompletionStatus",
         "PostQueuedCompletionStatus",
+        "SetThreadContext",
 
         // File and path APIs. The model reports absence until a real Rosetta
         // filesystem binding is installed; it never fabricates file contents.
@@ -597,6 +614,7 @@ fn isKnownCoreImport(name: []const u8) bool {
         "strcat",
         "strchr",
         "strrchr",
+        "qsort",
         "tolower",
         "toupper",
         "wcslen",
@@ -613,6 +631,8 @@ fn isKnownCoreImport(name: []const u8) bool {
         "_aligned_malloc",
         "_aligned_free",
         "_ultoa",
+        "_setjmp",
+        "longjmp",
         "_beginthread",
         "_beginthreadex",
         "_endthread",
@@ -658,544 +678,15 @@ fn isKnownCoreImport(name: []const u8) bool {
 // allow-list means a misspelled symbol or an import from an unrelated DLL
 // remains fatal; the degraded state is visible in preflight and runtime
 // counters instead of being silently treated as implemented.
-const degraded_import_names = [_][]const u8{
-    "AcquireSRWLockExclusive",
-    "AddVectoredExceptionHandler",
-    "AdjustTokenPrivileges",
-    "AllocConsole",
-    "AttachThreadInput",
-    "BitBlt",
-    "CLSIDFromString",
-    "CM_Get_Device_IDA",
-    "CM_Get_Parent",
-    "CM_Locate_DevNodeA",
-    "CallNextHookEx",
-    "CallWindowProcW",
-    "CancelIo",
-    "CancelIoEx",
-    "CancelWaitableTimer",
-    "ChangeDisplaySettingsExW",
-    "ChoosePixelFormat",
-    "ClipCursor",
-    "CloseClipboard",
-    "CloseServiceHandle",
-    // These are optional capability probes in the Xenia bootstrap. A zero
-    // return means the optional WinUSB, WinRT, or RenderDoc backend is absent;
-    // it is not an unresolved mandatory graphics import.
-    "CoIncrementMTAUsage",
-    "CoCreateInstance",
-    "CombineRgn",
-    "CompareStringA",
-    "CopyImage",
-    "CreateBitmap",
-    "CreateCompatibleBitmap",
-    "CreateCompatibleDC",
-    "CreateDCW",
-    "CreateDIBSection",
-    "CreateDXGIFactory1",
-    "CreateDirectoryW",
-    "CreateFontIndirectW",
-    "CreateFontW",
-    "CreateHardLinkW",
-    "CreateIconFromResource",
-    "CreateIconIndirect",
-    "CreateIoCompletionPort",
-    "CreatePen",
-    "CreateRectRgn",
-    "CreateSolidBrush",
-    "CreateWaitableTimerA",
-    "CreateWaitableTimerW",
-    "DeleteDC",
-    "DeleteObject",
-    "DescribePixelFormat",
-    "DeviceIoControl",
-    "DialogBoxIndirectParamW",
-    "DrawTextW",
-    "DuplicateHandle",
-    "EmptyClipboard",
-    "EndDialog",
-    "EnumDisplayDevicesW",
-    "EnumDisplayMonitors",
-    "EnumDisplaySettingsW",
-    "EnumResourceNamesW",
-    "ExitProcess",
-    "ExtTextOutW",
-    "FillRect",
-    "FindFirstVolumeW",
-    "FindNextVolumeW",
-    "FindVolumeClose",
-    "FlashWindowEx",
-    "FlushInstructionCache",
-    "FlushViewOfFile",
-    "GetAsyncKeyState",
-    "GetClassInfoExW",
-    "GetClipCursor",
-    "GetClipboardData",
-    "GetClipboardSequenceNumber",
-    "GetConsoleMode",
-    "GetConsoleScreenBufferInfo",
-    "GetDIBits",
-    "GetDesktopWindow",
-    "GetDeviceGammaRamp",
-    "GetDiskFreeSpaceExW",
-    "GetDlgItem",
-    "GetDoubleClickTime",
-    "GetFileInformationByHandle",
-    "GetFileTime",
-    "GetFileType",
-    "GetFileVersionInfoA",
-    "GetFileVersionInfoSizeA",
-    "GetForegroundWindow",
-    "GetICMProfileW",
-    "GetKeyboardLayout",
-    "GetKeyboardState",
-    "GetLocaleInfoA",
-    "GetMenu",
-    "GetMessageExtraInfo",
-    "GetMessageTime",
-    "GetModuleHandleExW",
-    "GetOverlappedResult",
-    "GetParent",
-    "GetPixelFormat",
-    "GetProcessAffinityMask",
-    "GetRawInputData",
-    "GetRawInputDeviceInfoA",
-    "GetRawInputDeviceList",
-    "GetStartupInfoW",
-    "GetStdHandle",
-    "GetSystemPowerStatus",
-    "GetTextExtentPoint32A",
-    "GetTextExtentPoint32W",
-    "GetTextMetricsW",
-    "GetThreadContext",
-    "SetThreadContext",
-    "GetThreadId",
-    "GetThreadPriority",
-    "GetTimeZoneInformation",
-    "GetVolumeInformationW",
-    "GetWindowTextLengthW",
-    "GetWindowTextW",
-    "GetWindowThreadProcessId",
-    "GlobalLock",
-    "GlobalMemoryStatusEx",
-    "GlobalUnlock",
-    "ImmAssociateContext",
-    "ImmGetCandidateListW",
-    "ImmGetCompositionStringW",
-    "ImmGetContext",
-    "ImmGetIMEFileNameA",
-    "ImmNotifyIME",
-    "ImmReleaseContext",
-    "ImmSetCandidateWindow",
-    "ImmSetCompositionStringW",
-    "ImmSetCompositionWindow",
-    "InitOnceBeginInitialize",
-    "InitOnceComplete",
-    "InitializeConditionVariable",
-    "InitializeSRWLock",
-    "IntersectRect",
-    "IsClipboardFormatAvailable",
-    "IsIconic",
-    "K32GetModuleBaseNameA",
-    "K32GetModuleInformation",
-    "KillTimer",
-    "LibK_GetProcAddress",
-    "LibK_GetVersion",
-    "LookupPrivilegeValueW",
-    "MapVirtualKeyW",
-    "MonitorFromPoint",
-    "MonitorFromRect",
-    "MoveFileExA",
-    "MoveFileExW",
-    "MsgWaitForMultipleObjects",
-    "MulDiv",
-    "OpenClipboard",
-    "OpenSCManagerA",
-    "OpenSCManagerW",
-    "OpenServiceA",
-    "OpenServiceW",
-    "OpenProcess",
-    "OpenProcessToken",
-    "OutputDebugStringA",
-    "OutputDebugStringW",
-    "PeekNamedPipe",
-    "PlaySoundW",
-    "PostThreadMessageW",
-    "PropVariantClear",
-    "PtInRect",
-    "QISearch",
-    "QueueUserAPC",
-    "RaiseException",
-    "Rectangle",
-    "RegCloseKey",
-    "RegCreateKeyA",
-    "RegCreateKeyExW",
-    "RegFlushKey",
-    "RegGetValueW",
-    "RegOpenKeyA",
-    "RegOpenKeyExW",
-    "RegQueryValueExA",
-    "RegQueryValueExW",
-    "RegSetValueExA",
-    "RegSetValueExW",
-    "RegisterRawInputDevices",
-    "RegisterWindowMessageA",
-    "RENDERDOC_GetAPI",
-    "ReleaseSRWLockExclusive",
-    "RemoveDirectoryW",
-    "RemoveVectoredContinueHandler",
-    "RemoveVectoredExceptionHandler",
-    "ResumeThread",
-    "RtlCaptureContext",
-    "RtlCaptureStackBackTrace",
-    "RtlDeleteFunctionTable",
-    "RtlInstallFunctionTableCallback",
-    "RtlLookupFunctionEntry",
-    "RtlUnwindEx",
-    "RtlVirtualUnwind",
-    "RoGetActivationFactory",
-    "RoInitialize",
-    "SHGetFolderPathW",
-    "SHGetKnownFolderPath",
-    "SelectObject",
-    "SetActiveWindow",
-    "SetBkMode",
-    "SetClipboardData",
-    "SetConsoleTextAttribute",
-    "SetCursorPos",
-    "SetDeviceGammaRamp",
-    "SetErrorMode",
-    "SetFileAttributesW",
-    "SetForegroundWindow",
-    "SetLayeredWindowAttributes",
-    "SetPixelFormat",
-    "SetPriorityClass",
-    "SetProcessAffinityMask",
-    "SetTextColor",
-    "SetThreadAffinityMask",
-    "SetThreadExecutionState",
-    "SetThreadPriority",
-    "SetTimer",
-    "SetWaitableTimer",
-    "SetWindowRgn",
-    "SetWindowsHookExW",
-    "SetupDiDestroyDeviceInfoList",
-    "SetupDiEnumDeviceInfo",
-    "SetupDiEnumDeviceInterfaces",
-    "SetupDiGetClassDevsA",
-    "SetupDiGetDeviceInterfaceDetailA",
-    "SetupDiGetDeviceRegistryPropertyA",
-    "ShellExecuteW",
-    "SignalObjectAndWait",
-    "SleepConditionVariableCS",
-    "SleepConditionVariableSRW",
-    "SuspendThread",
-    "SwapBuffers",
-    "SysFreeString",
-    "SystemParametersInfoA",
-    "SystemParametersInfoW",
-    "TerminateProcess",
-    "TerminateThread",
-    "ToUnicode",
-    "TrackMouseEvent",
-    "TryAcquireSRWLockExclusive",
-    "UnhookWindowsHookEx",
-    "VerQueryValueA",
-    "VerSetConditionMask",
-    "VerifyVersionInfoA",
-    "VerifyVersionInfoW",
-    "WSAGetLastError",
-    "WaitNamedPipeW",
-    "WakeAllConditionVariable",
-    "WakeConditionVariable",
-    "WindowsCreateStringReference",
-    "WriteConsoleW",
-    "__WSAFDIsSet",
-    "___mb_cur_max_func",
-    "__acrt_iob_func",
-    "__daylight",
-    "__p___argc",
-    "__p___argv",
-    "__p__commode",
-    "__p__environ",
-    "__p__fmode",
-    "__p__wcmdln",
-    "__p__wenviron",
-    "__setusermatherr",
-    "__stdio_common_vfprintf",
-    "__stdio_common_vfwprintf",
-    "__stdio_common_vsprintf",
-    "__stdio_common_vswprintf",
-    "__timezone",
-    "__tzname",
-    "_access",
-    "_aligned_realloc",
-    "_assert",
-    "_cexit",
-    "_close",
-    "_configure_narrow_argv",
-    "_configure_wide_argv",
-    "_copysign",
-    "_crt_at_quick_exit",
-    "_crt_atexit",
-    "_ecvt_s",
-    "_errno",
-    "_exit",
-    "_fdopen",
-    "_filelengthi64",
-    "_findclose",
-    "_finite",
-    "_fstat64",
-    "_get_errno",
-    "_get_osfhandle",
-    "_get_wpgmptr",
-    "_gmtime64",
-    "_initialize_narrow_environment",
-    "_initialize_wide_environment",
-    "_isatty",
-    "_isnan",
-    "_localtime64",
-    "_lock_file",
-    "_lseeki64",
-    "_mkgmtime64",
-    "_mktime64",
-    "_open_osfhandle",
-    "_read",
-    "_register_thread_local_exe_atexit_callback",
-    "_set_app_type",
-    "_set_errno",
-    "_set_invalid_parameter_handler",
-    "_set_new_mode",
-    "_setjmp",
-    "_snprintf",
-    "_sopen",
-    "_strdup",
-    "_stricmp",
-    "_strnicmp",
-    "_strrev",
-    "_telli64",
-    "_time64",
-    "_tzset",
-    "_unlock_file",
-    "_waccess",
-    "_wchdir",
-    "_wchmod",
-    "_wcsicmp",
-    "_wcsnicmp",
-    "_wfindfirst64i32",
-    "_wfindnext64i32",
-    "_wfopen_s",
-    "_wfullpath",
-    "_wgetcwd",
-    "_wmkdir",
-    "_wopen",
-    "_write",
-    "_wsopen",
-    "_wstat64",
-    "_wutime64",
-    "abort",
-    "accept",
-    "acos",
-    "asctime",
-    "asin",
-    "atan",
-    "atof",
-    "atoi",
-    "bind",
-    "bsearch",
-    "btowc",
-    "cbrt",
-    "clock",
-    "cosh",
-    "exit",
-    "exp2",
-    "exp2f",
-    "feof",
-    "ferror",
-    "fgetc",
-    "fgetpos",
-    "fgets",
-    "fopen_s",
-    "fputc",
-    "fputs",
-    "fputwc",
-    "freopen_s",
-    "frexp",
-    "fsetpos",
-    "getc",
-    "getenv",
-    "getsockname",
-    "getwc",
-    "htonl",
-    "hypot",
-    "inet_addr",
-    "isalnum",
-    "isalpha",
-    "isblank",
-    "iscntrl",
-    "isgraph",
-    "islower",
-    "isprint",
-    "ispunct",
-    "isspace",
-    "isupper",
-    "iswctype",
-    "isxdigit",
-    "listen",
-    "llrint",
-    "llrintf",
-    "localeconv",
-    "log10",
-    "log2f",
-    "longjmp",
-    "lrintf",
-    "lstrlenW",
-    "mbrlen",
-    "mbrtowc",
-    "memchr",
-    "nanf",
-    "nextafter",
-    "ntohl",
-    "pthread_cond_broadcast",
-    "pthread_cond_destroy",
-    "pthread_cond_signal",
-    "pthread_cond_timedwait",
-    "pthread_cond_wait",
-    "pthread_create",
-    "pthread_detach",
-    "pthread_getspecific",
-    "pthread_join",
-    "pthread_key_create",
-    "pthread_key_delete",
-    "pthread_mutex_destroy",
-    "pthread_mutex_init",
-    "pthread_mutex_lock",
-    "pthread_mutex_trylock",
-    "pthread_mutex_unlock",
-    "pthread_num_processors_np",
-    "pthread_rwlock_rdlock",
-    "pthread_rwlock_unlock",
-    "pthread_rwlock_wrlock",
-    "pthread_self",
-    "pthread_setspecific",
-    "putc",
-    "puts",
-    "putwc",
-    "qsort",
-    "rand_s",
-    "recvfrom",
-    "scalbn",
-    "sched_yield",
-    "sendto",
-    "setlocale",
-    "setvbuf",
-    "shutdown",
-    "signal",
-    "sinh",
-    "strcoll",
-    "strcspn",
-    "strerror",
-    "strftime",
-    "strncat",
-    "strspn",
-    "strstr",
-    "strtok",
-    "strtol",
-    "strtoll",
-    "strtoul",
-    "strtoull",
-    "strxfrm",
-    "tan",
-    "tanh",
-    "timeBeginPeriod",
-    "timeEndPeriod",
-    "towlower",
-    "towupper",
-    "ungetc",
-    "ungetwc",
-    "waveInAddBuffer",
-    "waveInClose",
-    "waveInGetDevCapsW",
-    "waveInGetNumDevs",
-    "waveInOpen",
-    "waveInPrepareHeader",
-    "waveInReset",
-    "waveInStart",
-    "waveInUnprepareHeader",
-    "waveOutClose",
-    "waveOutGetDevCapsW",
-    "waveOutGetErrorTextW",
-    "waveOutGetNumDevs",
-    "waveOutOpen",
-    "waveOutPrepareHeader",
-    "waveOutReset",
-    "waveOutUnprepareHeader",
-    "waveOutWrite",
-    "wcrtomb",
-    "wcscat",
-    "wcscmp",
-    "wcscoll",
-    "wcscpy",
-    "wcsftime",
-    "wcsxfrm",
-    "wctob",
-    "wctype",
-};
+// Static degraded-import ownership lives in pkg/dll/win32/<dll>/
+// and is aggregated by the catalogue package. Keep runtime behavior below
+// separate from those immutable facts.
 
 fn isKnownDegradedImport(dll_name: []const u8, function_name: []const u8) bool {
-    // GetProcAddress does not always retain the originating DLL in the
-    // synthetic thunk.  Dynamic Windows imports still carry a real API name,
-    // so classify a name-only lookup against the same bounded ABI inventory
-    // instead of turning every dynamically requested SRW/Win32 routine into
-    // an unrelated "unknown import".
-    if (dll_name.len == 0) {
-        for (degraded_import_names) |known| {
-            if (std.mem.eql(u8, function_name, known)) return true;
-        }
-        return false;
-    }
-    const known_dll =
-        std.ascii.eqlIgnoreCase(dll_name, "advapi32.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "cfgmgr32.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "combase.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "comdlg32.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "dbghelp.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "dwmapi.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "gdi32.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "hid.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "imm32.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "kernel32.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "ntdll.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "oleaut32.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "ole32.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "powrprof.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "setupapi.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "shcore.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "shell32.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "shlwapi.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "user32.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "uxtheme.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "version.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "winmm.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "ws2_32.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "wsock32.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "msvcrt.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "ucrtbase.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "vcruntime140.dll") or
-        std.ascii.eqlIgnoreCase(dll_name, "libwinpthread-1.dll") or
-        // The Windows API sets are forwarders for the same Win32/UCRT
-        // surface, not third-party libraries: `api-ms-win-core-*`,
-        // `api-ms-win-crt-*` and their siblings all resolve to names this
-        // inventory already vets.  Accepting only the CRT subset made a PE
-        // that imports through the core API sets look like it was calling
-        // unknown symbols.
-        std.ascii.startsWithIgnoreCase(dll_name, "api-ms-win-") or
-        std.ascii.startsWithIgnoreCase(dll_name, "ext-ms-win-");
-    if (!known_dll) return false;
-    for (degraded_import_names) |known| {
-        if (std.mem.eql(u8, function_name, known)) return true;
-    }
-    return false;
+    // The static name inventory is split into one package per DLL. The
+    // runtime keeps only this bridge; handler behavior and mutable run state
+    // remain here in the executable-side module.
+    return import_contract.isDegradedImport(dll_name, function_name);
 }
 
 fn arg(state: anytype, index: usize, direct_return_rip: ?u64) u64 {
@@ -1284,6 +775,60 @@ fn returnZero(state: anytype, direct_return_rip: ?u64) void {
 fn returnVulkan(state: anytype, result: i64, direct_return_rip: ?u64) void {
     state.regs.rax = @bitCast(result);
     finish(state, direct_return_rip);
+}
+
+fn handleWindowsSetjmp(state: anytype, direct_return_rip: ?u64) bool {
+    const environment = arg(state, 0, direct_return_rip);
+    const return_rip = direct_return_rip orelse state.read64(state.regs.rsp);
+    const return_rsp = if (direct_return_rip != null) state.regs.rsp else state.regs.rsp +| 8;
+    if (environment == 0 or return_rip == 0 or state.guestMemory(environment, windows_setjmp_bytes) == null) {
+        log.warn("Windows _setjmp rejected environment=0x{x} return=0x{x} rsp=0x{x}", .{ environment, return_rip, state.regs.rsp });
+        state.regs.rax = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+
+    state.write64(environment + 0, windows_setjmp_magic);
+    state.write64(environment + 8, return_rsp);
+    state.write64(environment + 16, state.regs.rbp);
+    state.write64(environment + 24, state.regs.rbx);
+    state.write64(environment + 32, state.regs.rsi);
+    state.write64(environment + 40, state.regs.rdi);
+    state.write64(environment + 48, state.regs.r12);
+    state.write64(environment + 56, state.regs.r13);
+    state.write64(environment + 64, state.regs.r14);
+    state.write64(environment + 72, state.regs.r15);
+    state.write64(environment + 80, return_rip);
+    state.write64(environment + 88, state.regs.rflags);
+    state.regs.rax = 0;
+    finish(state, direct_return_rip);
+    return true;
+}
+
+fn handleWindowsLongjmp(state: anytype, direct_return_rip: ?u64) bool {
+    const environment = arg(state, 0, direct_return_rip);
+    const value = arg(state, 1, direct_return_rip);
+    const saved = state.guestMemoryConst(environment, windows_setjmp_bytes) orelse {
+        terminateWindowsCall(state, .runtime_invariant_failure, 127, "longjmp(environment)");
+        return true;
+    };
+    if (std.mem.readInt(u64, saved[0..8], .little) != windows_setjmp_magic) {
+        terminateWindowsCall(state, .runtime_invariant_failure, 127, "longjmp(unrecognized environment)");
+        return true;
+    }
+    state.regs.rsp = std.mem.readInt(u64, saved[8..16], .little);
+    state.regs.rbp = std.mem.readInt(u64, saved[16..24], .little);
+    state.regs.rbx = std.mem.readInt(u64, saved[24..32], .little);
+    state.regs.rsi = std.mem.readInt(u64, saved[32..40], .little);
+    state.regs.rdi = std.mem.readInt(u64, saved[40..48], .little);
+    state.regs.r12 = std.mem.readInt(u64, saved[48..56], .little);
+    state.regs.r13 = std.mem.readInt(u64, saved[56..64], .little);
+    state.regs.r14 = std.mem.readInt(u64, saved[64..72], .little);
+    state.regs.r15 = std.mem.readInt(u64, saved[72..80], .little);
+    state.regs.rip = std.mem.readInt(u64, saved[80..88], .little);
+    state.regs.rflags = @truncate(std.mem.readInt(u64, saved[88..96], .little));
+    state.regs.rax = if (value == 0) 1 else value;
+    return true;
 }
 
 fn writeWindowsContext(state: anytype, context: u64, captured_rip: u64, captured_rsp: u64) bool {
@@ -1424,6 +969,31 @@ fn isSyntheticWindowsHandle(state: anytype, handle: u64) bool {
     return handle >= first_handle and handle < state.windows_next_handle;
 }
 
+fn isWindowsRegistryRoot(handle: u64) bool {
+    const low = @as(u32, @truncate(handle));
+    return low == 0x8000_0000 or
+        low == 0x8000_0001 or
+        low == 0x8000_0002 or
+        low == 0x8000_0003 or
+        low == 0x8000_0005;
+}
+
+fn isWindowsRegistryHandle(state: anytype, handle: u64) bool {
+    return isWindowsRegistryRoot(handle) or isSyntheticWindowsHandle(state, handle);
+}
+
+fn versionCondition(value: u64, requested: u64, condition: u64) bool {
+    return switch (condition) {
+        2 => value > requested, // VER_GREATER
+        3 => value >= requested, // VER_GREATER_EQUAL
+        4 => value < requested, // VER_LESS
+        5 => value <= requested, // VER_LESS_EQUAL
+        6 => (value & requested) != 0, // VER_AND
+        7 => (value | requested) != 0, // VER_OR
+        else => value == requested, // VER_EQUAL and the unset default
+    };
+}
+
 fn clearGuestMemory(state: anytype, address: u64, length: u64) bool {
     const destination = state.guestMemory(address, length) orelse return false;
     @memset(destination, 0);
@@ -1535,6 +1105,20 @@ fn windowsTlsSlot(state: anytype, index: u64) ?u64 {
     const slot = vector +| index * 8;
     if (state.guestMemory(slot, 8) == null) return null;
     return slot;
+}
+
+/// ASCII case-insensitive comparison with the C ordering contract: negative,
+/// zero, or positive, comparing at most `limit` characters.
+fn caseInsensitiveCompare(lhs: []const u8, rhs: []const u8, limit: usize) i32 {
+    const count = @min(limit, @min(lhs.len, rhs.len));
+    for (lhs[0..count], rhs[0..count]) |left, right| {
+        const a = std.ascii.toLower(left);
+        const b = std.ascii.toLower(right);
+        if (a != b) return @as(i32, a) - @as(i32, b);
+    }
+    if (count == limit) return 0;
+    if (lhs.len == rhs.len) return 0;
+    return if (lhs.len < rhs.len) -1 else 1;
 }
 
 fn guestCString(state: anytype, address: u64) ?[]const u8 {
@@ -1754,6 +1338,60 @@ fn cachedGuestString(state: anytype, storage: *u64, wide: bool, source: []const 
     return storage.*;
 }
 
+fn guestStrstr(state: anytype, haystack_address: u64, needle_address: u64) ?u64 {
+    const haystack = guestCString(state, haystack_address) orelse return null;
+    const needle = guestCString(state, needle_address) orelse return null;
+    const offset = std.mem.indexOf(u8, haystack, needle) orelse return 0;
+    return haystack_address +| @as(u64, @intCast(offset));
+}
+
+fn guestStrtol(state: anytype, source_address: u64, end_address: u64, requested_base: u64) ?i64 {
+    const source = guestCString(state, source_address) orelse return null;
+    var index: usize = 0;
+    while (index < source.len and (source[index] == ' ' or source[index] == '\t' or source[index] == '\n' or source[index] == '\r')) : (index += 1) {}
+    const negative = index < source.len and source[index] == '-';
+    if (index < source.len and (source[index] == '+' or negative)) index += 1;
+
+    if (requested_base > std.math.maxInt(u32)) return null;
+    var base: u32 = @intCast(requested_base);
+    if (base == 0) {
+        base = 10;
+        if (index + 1 < source.len and source[index] == '0' and (source[index + 1] == 'x' or source[index + 1] == 'X')) {
+            base = 16;
+            index += 2;
+        } else if (index < source.len and source[index] == '0') {
+            base = 8;
+        }
+    }
+    if (base < 2 or base > 36) return null;
+    const digits_start = index;
+    var value: u64 = 0;
+    while (index < source.len) : (index += 1) {
+        const character = source[index];
+        const digit: ?u32 = if (character >= '0' and character <= '9')
+            character - '0'
+        else if (character >= 'a' and character <= 'z')
+            character - 'a' + 10
+        else if (character >= 'A' and character <= 'Z')
+            character - 'A' + 10
+        else
+            null;
+        if (digit == null or digit.? >= base) break;
+        value = value * base + digit.?;
+    }
+    if (index == digits_start) {
+        if (end_address != 0 and state.guestMemory(end_address, 8) != null) {
+            state.write64(end_address, source_address);
+        }
+        return 0;
+    }
+    if (end_address != 0 and state.guestMemory(end_address, 8) != null) {
+        state.write64(end_address, source_address +| @as(u64, @intCast(index)));
+    }
+    const signed_value: i64 = @intCast(@min(value, std.math.maxInt(i64)));
+    return if (negative) -signed_value else signed_value;
+}
+
 /// Materialize the classic C locale's `struct lconv` in guest memory.  The
 /// Windows PE route cannot return the host libc's lconv pointer: the guest
 /// immediately dereferences `decimal_point`, and later locale users expect
@@ -1761,6 +1399,34 @@ fn cachedGuestString(state: anytype, storage: *u64, wide: bool, source: []const 
 /// uses the standard ten pointer fields followed by zeroed single-byte
 /// currency/sign metadata; that is sufficient for both strtodg and the
 /// libstdc++ locale traits used by Xenia.
+fn roundNearestEven(value: f64) f64 {
+    const lower = @floor(value);
+    const fraction = value - lower;
+    if (fraction < 0.5) return lower;
+    if (fraction > 0.5) return lower + 1.0;
+    const lower_integer: i64 = @intFromFloat(lower);
+    return if (@rem(lower_integer, 2) == 0) lower else lower + 1.0;
+}
+
+fn guestRoundToI64(state: anytype, value: f64) i64 {
+    // MXCSR.RC is bits 13:14: nearest-even, down, up, or toward zero.
+    // Keep the conversion defined for exceptional values a CRT helper may
+    // receive while parsing malformed metadata.
+    if (value != value) return 0;
+    const limit: f64 = 9223372036854775808.0;
+    if (value >= limit) return std.math.maxInt(i64);
+    if (value <= -limit) return std.math.minInt(i64);
+    const rounding_mode: u32 = @truncate((state.regs.mxcsr >> 13) & 0x3);
+    const rounded = switch (rounding_mode) {
+        0 => roundNearestEven(value),
+        1 => @floor(value),
+        2 => @ceil(value),
+        3 => @trunc(value),
+        else => unreachable,
+    };
+    return @intFromFloat(rounded);
+}
+
 fn cachedGuestCLocaleConv(state: anytype) u64 {
     const decimal_point = cachedGuestString(state, &state.windows_locale_decimal_point, false, ".");
     const empty_string = cachedGuestString(state, &state.windows_locale_empty_string, false, "");
@@ -2036,6 +1702,24 @@ fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
     return value.len >= prefix.len and std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
 }
 
+fn traceWindowsPath(state: anytype, guest: []const u8, outcome: []const u8) void {
+    const media_match = if (state.windows_host_media_path) |media_path| blk: {
+        const media_name = std.fs.path.basename(media_path);
+        break :blk media_name.len != 0 and guest.len >= media_name.len and
+            std.ascii.eqlIgnoreCase(guest[guest.len - media_name.len ..], media_name) and
+            (guest.len == media_name.len or guest[guest.len - media_name.len - 1] == '\\' or
+                guest[guest.len - media_name.len - 1] == '/');
+    } else false;
+    if (media_match) {
+        if (state.windows_media_path_trace_events >= 16) return;
+        state.windows_media_path_trace_events += 1;
+    } else {
+        if (!state.trace_windows_paths or state.windows_path_trace_events >= 64) return;
+        state.windows_path_trace_events += 1;
+    }
+    log.info("Windows path resolution: guest='{s}' outcome={s}", .{ guest, outcome });
+}
+
 /// Translate a guest Windows path into the run's explicitly-authorized host
 /// root. This is intentionally lexical and bounded: drive letters, UNC paths,
 /// and parent traversal are rejected rather than accidentally exposing the
@@ -2049,20 +1733,28 @@ fn guestPathToHost(state: anytype, address: u64, wide: bool, destination: []u8) 
         guestCString(state, address);
     const value = guest orelse return null;
     if (value.len == 0) return null;
+    traceWindowsPath(state, value, "input");
 
     var path = value;
     if (startsWithIgnoreCase(path, "\\\\?\\")) path = path[4..];
 
     var relative = path;
-    if (startsWithIgnoreCase(path, "C:\\xenia")) {
-        if (path.len == 8) {
-            relative = "";
-        } else if (path[8] == '\\' or path[8] == '/') {
-            relative = path[9..];
-        } else return null;
+    // Windows APIs and the C++ filesystem layer are allowed to normalize a
+    // drive path with either separator.  Keep the confined virtual mount
+    // independent of that spelling: rejecting C:/xenia while accepting
+    // C:\xenia makes a title appear to be unsupported even though the
+    // explicitly-authorized media file is present.
+    const is_xenia_root = path.len >= 8 and
+        std.ascii.eqlIgnoreCase(path[0..2], "C:") and
+        (path[2] == '\\' or path[2] == '/') and
+        std.ascii.eqlIgnoreCase(path[3..8], "xenia") and
+        (path.len == 8 or path[8] == '\\' or path[8] == '/');
+    if (is_xenia_root) {
+        relative = if (path.len == 8) "" else path[9..];
     } else if (path.len >= 2 and path[1] == ':') {
         // Only the virtual C:\xenia tree is mounted. Other drive roots are
         // not host paths and must remain visible as a normal Win32 miss.
+        traceWindowsPath(state, value, "rejected_drive");
         return null;
     } else if (startsWithIgnoreCase(path, "\\\\")) {
         return null;
@@ -2088,6 +1780,7 @@ fn guestPathToHost(state: anytype, address: u64, wide: bool, destination: []u8) 
         if (media_name.len != 0 and std.ascii.eqlIgnoreCase(relative, media_name)) {
             if (media_path.len > destination.len) return null;
             @memcpy(destination[0..media_path.len], media_path);
+            traceWindowsPath(state, value, "authorized_media");
             return destination[0..media_path.len];
         }
     }
@@ -2128,22 +1821,39 @@ fn guestPathToHost(state: anytype, address: u64, wide: bool, destination: []u8) 
         @memcpy(destination[written..][0..normalized_len], normalized_relative[0..normalized_len]);
         written += normalized_len;
     }
+    traceWindowsPath(state, value, "confined_root");
     return destination[0..written];
 }
 
 fn hostOpenFile(state: anytype, path: []const u8, mode: std.Io.Dir.OpenFileOptions.Mode) ?std.Io.File {
     const io = state.windows_host_io orelse return null;
     const options: std.Io.Dir.OpenFileOptions = .{ .mode = mode, .allow_directory = false };
+    const is_media = if (state.windows_host_media_path) |media_path|
+        std.mem.eql(u8, path, media_path)
+    else
+        false;
+    if (is_media and state.windows_media_io_trace_events < 16) {
+        state.windows_media_io_trace_events += 1;
+        log.info("Windows media host open: path={s} mode={s}", .{ path, @tagName(mode) });
+    }
     if (state.diagnose_abi) {
         log.info("Windows host open: path={s} mode={s}", .{ path, @tagName(mode) });
     }
     if (std.fs.path.isAbsolute(path)) {
         return std.Io.Dir.openFileAbsolute(io, path, options) catch |err| {
+            if (is_media and state.windows_media_io_trace_events < 16) {
+                state.windows_media_io_trace_events += 1;
+                log.info("Windows media host open failed: path={s} error={s}", .{ path, @errorName(err) });
+            }
             if (state.diagnose_abi) log.info("Windows host open failed: path={s} error={s}", .{ path, @errorName(err) });
             return null;
         };
     }
     return std.Io.Dir.cwd().openFile(io, path, options) catch |err| {
+        if (is_media and state.windows_media_io_trace_events < 16) {
+            state.windows_media_io_trace_events += 1;
+            log.info("Windows media host open failed: path={s} error={s}", .{ path, @errorName(err) });
+        }
         if (state.diagnose_abi) log.info("Windows host open failed: path={s} error={s}", .{ path, @errorName(err) });
         return null;
     };
@@ -2173,16 +1883,32 @@ fn hostCreateFile(state: anytype, path: []const u8, read: bool, truncate: bool, 
 
 fn hostStat(state: anytype, path: []const u8) ?std.Io.File.Stat {
     const io = state.windows_host_io orelse return null;
+    const is_media = if (state.windows_host_media_path) |media_path|
+        std.mem.eql(u8, path, media_path)
+    else
+        false;
     const result = if (std.fs.path.isAbsolute(path))
         std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| {
+            if (is_media and state.windows_media_io_trace_events < 16) {
+                state.windows_media_io_trace_events += 1;
+                log.info("Windows media host stat failed: path={s} error={s}", .{ path, @errorName(err) });
+            }
             if (state.diagnose_abi) log.info("Windows host stat failed: path={s} error={s}", .{ path, @errorName(err) });
             return null;
         }
     else
         std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| {
+            if (is_media and state.windows_media_io_trace_events < 16) {
+                state.windows_media_io_trace_events += 1;
+                log.info("Windows media host stat failed: path={s} error={s}", .{ path, @errorName(err) });
+            }
             if (state.diagnose_abi) log.info("Windows host stat failed: path={s} error={s}", .{ path, @errorName(err) });
             return null;
         };
+    if (is_media and state.windows_media_io_trace_events < 16) {
+        state.windows_media_io_trace_events += 1;
+        log.info("Windows media host stat: path={s} kind={s} size={d}", .{ path, @tagName(result.kind), result.size });
+    }
     if (state.diagnose_abi) log.info("Windows host stat: path={s} kind={s} size={d}", .{ path, @tagName(result.kind), result.size });
     return result;
 }
@@ -2196,7 +1922,13 @@ fn hostOpenDirectory(state: anytype, path: []const u8) ?std.Io.Dir {
         std.Io.Dir.cwd().openDir(io, path, options) catch null;
 }
 
-fn installWindowsFile(state: anytype, file: std.Io.File, readable: bool, writable: bool) ?u64 {
+fn installWindowsFile(
+    state: anytype,
+    file: std.Io.File,
+    readable: bool,
+    writable: bool,
+    media_authorized: bool,
+) ?u64 {
     for (&state.windows_files) |*slot| {
         if (slot.file == null) {
             const handle = nextHandle(state);
@@ -2208,6 +1940,7 @@ fn installWindowsFile(state: anytype, file: std.Io.File, readable: bool, writabl
                 .file = file,
                 .readable = readable,
                 .writable = writable,
+                .media_authorized = media_authorized,
             };
             return handle;
         }
@@ -2279,11 +2012,17 @@ fn wildcardMatch(pattern: []const u8, value: []const u8) bool {
 }
 
 fn noteWindowsFileFailure(state: anytype) void {
+    noteWindowsFileFailureCode(state, state.windows_last_error);
+}
+
+fn noteWindowsFileFailureCode(state: anytype, error_code: u32) void {
     state.windows_file_failures +|= 1;
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "noteWindowsFileFailure")) state.noteWindowsFileFailure(error_code);
 }
 
 fn failWindowsFileCall(state: anytype, direct_return_rip: ?u64, error_code: u32) void {
-    noteWindowsFileFailure(state);
+    noteWindowsFileFailureCode(state, error_code);
     state.windows_last_error = error_code;
     state.regs.rax = 0;
     if (state.diagnose_abi) {
@@ -2292,11 +2031,26 @@ fn failWindowsFileCall(state: anytype, direct_return_rip: ?u64, error_code: u32)
     finish(state, direct_return_rip);
 }
 
-/// Fill the Microsoft CRT `_stat64` record used by libstdc++'s filesystem
-/// implementation. The UCRT layout is intentionally not POSIX-compatible:
-/// `st_mode` is at byte 6 and the 64-bit size is at byte 18. Returning zero
-/// without populating this record makes `std::filesystem::exists` report a
-/// false positive and causes Xenia to parse a nonexistent TOML file.
+/// Fill the MinGW/UCRT `_stat64` record used by the PE's filesystem layer.
+///
+/// The Xenia Windows capsule is built for x86_64-w64-mingw32. Its `_stat64`
+/// record is 56 bytes with the four-byte `_dev_t` aligned at byte 16 and the
+/// 64-bit size at byte 24. This is not the POSIX layout, nor is it the
+/// unaligned byte-18 layout used by some hand-written MSVC descriptions.
+/// Keeping this in one writer is important: `std::filesystem` may reach the
+/// path form or the descriptor form depending on the libstdc++ version.
+fn writeWindowsStat64(state: anytype, output: u64, output_bytes: []u8, stat: std.Io.File.Stat) void {
+    @memset(output_bytes, 0);
+    state.write32(output + 0, 0); // st_dev
+    state.write16(output + 4, 0); // st_ino
+    state.write16(output + 6, if (stat.kind == .directory) 0x4000 else 0x8000);
+    state.write16(output + 8, 1); // st_nlink
+    state.write16(output + 10, 0); // st_uid
+    state.write16(output + 12, 0); // st_gid
+    state.write32(output + 16, 0); // st_rdev
+    state.write64(output + 24, stat.size); // st_size
+}
+
 fn statWindowsPath(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
     const wide = std.mem.startsWith(u8, name, "_w");
     const output = arg(state, 1, direct_return_rip);
@@ -2322,13 +2076,7 @@ fn statWindowsPath(state: anytype, name: []const u8, direct_return_rip: ?u64) bo
         finish(state, direct_return_rip);
         return true;
     };
-    @memset(output_bytes, 0);
-    state.write32(output + 0, 0); // st_dev
-    state.write16(output + 4, 0); // st_ino
-    state.write16(output + 6, if (stat.kind == .directory) 0x4000 else 0x8000);
-    state.write16(output + 8, 1); // st_nlink
-    state.write32(output + 18, @truncate(stat.size));
-    state.write32(output + 22, @truncate(stat.size >> 32));
+    writeWindowsStat64(state, output, output_bytes, stat);
     state.windows_last_error = 0;
     state.regs.rax = 0;
     if (state.diagnose_abi) {
@@ -2336,6 +2084,49 @@ fn statWindowsPath(state: anytype, name: []const u8, direct_return_rip: ?u64) bo
             name,
             path,
             @tagName(stat.kind),
+            stat.size,
+            output,
+        });
+    }
+    finish(state, direct_return_rip);
+    return true;
+}
+
+/// Descriptor counterpart of `_stat64`. MinGW's `std::filesystem` and
+/// file-stream implementations are allowed to use `_fstat64` after opening a
+/// path, so a successful `_wfopen` must not be the end of the virtual file
+/// contract. The descriptor is Rosetta's synthetic CRT fd, not a host fd.
+fn statWindowsDescriptor(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    const fd: u32 = @truncate(arg(state, 0, direct_return_rip));
+    const output = arg(state, 1, direct_return_rip);
+    const output_bytes = state.guestMemory(output, 56) orelse {
+        state.windows_last_error = 22; // EINVAL
+        state.regs.rax = std.math.maxInt(u64);
+        noteWindowsFileFailure(state);
+        finish(state, direct_return_rip);
+        return true;
+    };
+    const slot = windowsStdioSlot(state, fd) orelse {
+        failWindowsDescriptorCall(state, direct_return_rip, 9); // EBADF
+        return true;
+    };
+    const io = state.windows_host_io orelse {
+        failWindowsDescriptorCall(state, direct_return_rip, 9);
+        return true;
+    };
+    const stat = slot.file.?.stat(io) catch {
+        failWindowsDescriptorCall(state, direct_return_rip, 5); // EIO
+        return true;
+    };
+
+    writeWindowsStat64(state, output, output_bytes, stat);
+    state.windows_last_error = 0;
+    state.regs.rax = 0;
+    if (slot.media_authorized and state.windows_media_io_trace_events < 16) {
+        state.windows_media_io_trace_events += 1;
+        log.info("Windows media CRT descriptor stat: api={s} fd={d} size={d} output=0x{x}", .{
+            name,
+            fd,
             stat.size,
             output,
         });
@@ -2469,11 +2260,24 @@ fn openWindowsFile(state: anytype, name: []const u8, direct_return_rip: ?u64) bo
         state.regs.rax = std.math.maxInt(u64);
         return true;
     };
-    const handle = installWindowsFile(state, opened, can_read, can_write) orelse {
+    const media_authorized = if (state.windows_host_media_path) |media_path|
+        std.mem.eql(u8, path, media_path)
+    else
+        false;
+    const handle = installWindowsFile(state, opened, can_read, can_write, media_authorized) orelse {
         failWindowsFileCall(state, direct_return_rip, 4); // ERROR_TOO_MANY_OPEN_FILES
         state.regs.rax = std.math.maxInt(u64);
         return true;
     };
+    if (media_authorized and state.windows_media_io_trace_events < 16) {
+        state.windows_media_io_trace_events += 1;
+        log.info("Windows media file handle: api={s} handle=0x{x} readable={} writable={}", .{
+            name,
+            handle,
+            can_read,
+            can_write,
+        });
+    }
     state.windows_file_open_calls +|= 1;
     state.windows_last_error = 0;
     state.regs.rax = handle;
@@ -2513,10 +2317,24 @@ fn openWindowsStdio(state: anytype, name: []const u8, direct_return_rip: ?u64) b
         failWindowsFileCall(state, direct_return_rip, 2); // ERROR_FILE_NOT_FOUND
         return true;
     };
-    const handle = installWindowsFile(state, opened, read, write) orelse {
+    const media_authorized = if (state.windows_host_media_path) |media_path|
+        std.mem.eql(u8, path, media_path)
+    else
+        false;
+    const handle = installWindowsFile(state, opened, read, write, media_authorized) orelse {
         failWindowsFileCall(state, direct_return_rip, 4); // ERROR_TOO_MANY_OPEN_FILES
         return true;
     };
+    if (media_authorized and state.windows_media_io_trace_events < 16) {
+        state.windows_media_io_trace_events += 1;
+        log.info("Windows media stdio handle: api={s} handle=0x{x} mode={s} readable={} writable={}", .{
+            name,
+            handle,
+            mode,
+            read,
+            write,
+        });
+    }
     if (mode[0] == 'a') {
         const slot = windowsFileSlot(state, handle).?;
         const io = state.windows_host_io orelse unreachable;
@@ -2560,6 +2378,15 @@ fn transferWindowsDescriptor(state: anytype, name: []const u8, direct_return_rip
         failWindowsDescriptorCall(state, direct_return_rip, 9); // EBADF
         return true;
     };
+    if (slot.media_authorized and state.windows_media_io_trace_events < 16) {
+        state.windows_media_io_trace_events += 1;
+        log.info("Windows media descriptor transfer: name={s} fd={d} requested={d} offset={d}", .{
+            name,
+            fd,
+            requested,
+            slot.offset,
+        });
+    }
     const is_read = std.mem.eql(u8, name, "read") or std.mem.eql(u8, name, "_read");
     if ((is_read and !slot.readable) or (!is_read and !slot.writable)) {
         failWindowsDescriptorCall(state, direct_return_rip, 9);
@@ -2603,6 +2430,17 @@ fn transferWindowsDescriptor(state: anytype, name: []const u8, direct_return_rip
         state.windows_file_write_calls +|= 1;
     state.windows_last_error = 0;
     state.regs.rax = completed;
+    if (slot.media_authorized and state.windows_media_io_trace_events < 16) {
+        state.windows_media_io_trace_events += 1;
+        const preview = state.guestMemoryConst(arg(state, 1, direct_return_rip), @min(completed, @as(usize, 16))) orelse &.{};
+        log.info("Windows media descriptor transfer complete: name={s} fd={d} completed={d} offset={d} preview={any}", .{
+            name,
+            fd,
+            completed,
+            slot.offset,
+            preview,
+        });
+    }
     if (state.diagnose_abi) {
         log.info("Windows descriptor I/O: name={s} fd={d} requested={d} completed={d} offset={d}", .{
             name,
@@ -2864,6 +2702,19 @@ fn transferWindowsStdio(state: anytype, name: []const u8, direct_return_rip: ?u6
     state.windows_file_write_calls +|= if (is_read) 0 else 1;
     state.windows_last_error = 0;
     state.regs.rax = completed / @as(usize, @intCast(size));
+    if (slot.media_authorized and state.windows_media_io_trace_events < 16) {
+        state.windows_media_io_trace_events += 1;
+        const preview = state.guestMemoryConst(buffer_address, @min(completed, @as(usize, 16))) orelse &.{};
+        log.info("Windows media stdio transfer: name={s} file=0x{x} size={d} count={d} completed={d} offset={d} preview={any}", .{
+            name,
+            file_handle,
+            size,
+            count,
+            completed,
+            slot.offset,
+            preview,
+        });
+    }
     if (state.diagnose_abi) {
         log.info("Windows stdio transfer complete: name={s} file=0x{x} completed={d} elements={d} offset={d}", .{
             name,
@@ -3282,6 +3133,54 @@ fn convertUnsignedLongToGuestString(state: anytype, direct_return_rip: ?u64) boo
 }
 
 fn handleStringAndMemory(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    if (std.mem.eql(u8, name, "_strrev")) {
+        const address = arg(state, 0, direct_return_rip);
+        const source = guestCString(state, address) orelse {
+            state.regs.rax = 0;
+            state.windows_last_error = 87; // ERROR_INVALID_PARAMETER
+            finish(state, direct_return_rip);
+            return true;
+        };
+        if (state.guestMemory(address, @intCast(source.len))) |bytes| {
+            std.mem.reverse(u8, bytes);
+            state.regs.rax = address;
+            state.windows_last_error = 0;
+        } else {
+            state.regs.rax = 0;
+            state.windows_last_error = 998; // ERROR_NOACCESS
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "atoi")) {
+        const result = guestStrtol(state, arg(state, 0, direct_return_rip), 0, 10);
+        state.regs.rax = if (result) |value| @bitCast(value) else 0;
+        state.windows_last_error = if (result == null) 87 else 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "qsort")) {
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "beginWindowsQsort")) {
+            return state.beginWindowsQsort(
+                arg(state, 0, direct_return_rip),
+                arg(state, 1, direct_return_rip),
+                arg(state, 2, direct_return_rip),
+                arg(state, 3, direct_return_rip),
+                direct_return_rip,
+            );
+        }
+    }
+    if (std.mem.eql(u8, name, "llrint") or std.mem.eql(u8, name, "llrintf")) {
+        const value: f64 = if (std.mem.eql(u8, name, "llrint"))
+            @bitCast(std.mem.readInt(u64, state.xmm[0][0..8], .little))
+        else
+            @as(f64, @floatCast(@as(f32, @bitCast(std.mem.readInt(u32, state.xmm[0][0..4], .little)))));
+        state.regs.rax = @bitCast(guestRoundToI64(state, value));
+        state.windows_last_error = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
     if (std.mem.eql(u8, name, "_ultoa")) return convertUnsignedLongToGuestString(state, direct_return_rip);
 
     if (std.mem.eql(u8, name, "strxfrm")) {
@@ -3485,6 +3384,70 @@ fn handleStringAndMemory(state: anytype, name: []const u8, direct_return_rip: ?u
         finish(state, direct_return_rip);
         return true;
     }
+    if (std.mem.eql(u8, name, "_stricmp") or std.mem.eql(u8, name, "_strcmpi") or
+        std.mem.eql(u8, name, "stricmp") or std.mem.eql(u8, name, "_strnicmp") or
+        std.mem.eql(u8, name, "strnicmp") or std.mem.eql(u8, name, "_memicmp"))
+    {
+        // A comparison has no safe stub.  Zero is not "unimplemented" here,
+        // it is "these are equal" -- so an unimplemented case-insensitive
+        // compare silently makes every path, extension, and configuration
+        // key match the first candidate the guest tries.
+        const bounded = std.mem.eql(u8, name, "_strnicmp") or std.mem.eql(u8, name, "strnicmp") or
+            std.mem.eql(u8, name, "_memicmp");
+        const limit: usize = if (bounded)
+            @intCast(@min(arg(state, 2, direct_return_rip), 64 * 1024))
+        else
+            std.math.maxInt(usize);
+        const lhs = guestCString(state, arg(state, 0, direct_return_rip)) orelse &.{};
+        const rhs = guestCString(state, arg(state, 1, direct_return_rip)) orelse &.{};
+        state.regs.rax = @bitCast(@as(i64, caseInsensitiveCompare(lhs, rhs, limit)));
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_wcsicmp") or std.mem.eql(u8, name, "wcsicmp") or
+        std.mem.eql(u8, name, "_wcsnicmp") or std.mem.eql(u8, name, "wcsnicmp"))
+    {
+        const bounded = std.mem.eql(u8, name, "_wcsnicmp") or std.mem.eql(u8, name, "wcsnicmp");
+        const limit: usize = if (bounded)
+            @intCast(@min(arg(state, 2, direct_return_rip), 64 * 1024))
+        else
+            std.math.maxInt(usize);
+        const left_address = arg(state, 0, direct_return_rip);
+        const right_address = arg(state, 1, direct_return_rip);
+        var result: i32 = 0;
+        var index: usize = 0;
+        while (index < limit and index < 64 * 1024) : (index += 1) {
+            const left = guestWideUnit(state, left_address, index) orelse break;
+            const right = guestWideUnit(state, right_address, index) orelse break;
+            const a = if (left < 128) std.ascii.toLower(@intCast(left)) else left;
+            const b = if (right < 128) std.ascii.toLower(@intCast(right)) else right;
+            if (a != b) {
+                result = @as(i32, @intCast(a)) - @as(i32, @intCast(b));
+                break;
+            }
+            if (left == 0) break;
+        }
+        state.regs.rax = @bitCast(@as(i64, result));
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "memchr")) {
+        // Zero means "the byte is not in this buffer".  Answering that
+        // without looking makes a parser skip content it should have found.
+        const address = arg(state, 0, direct_return_rip);
+        const needle: u8 = @truncate(arg(state, 1, direct_return_rip));
+        const count: usize = @intCast(@min(arg(state, 2, direct_return_rip), 64 * 1024 * 1024));
+        const bytes = if (address == 0) null else state.guestMemoryConst(address, count);
+        var found: u64 = 0;
+        if (bytes) |haystack| {
+            if (std.mem.indexOfScalar(u8, haystack, needle)) |index| {
+                found = address +| @as(u64, @intCast(index));
+            }
+        }
+        state.regs.rax = found;
+        finish(state, direct_return_rip);
+        return true;
+    }
     if (std.mem.eql(u8, name, "strcpy") or std.mem.eql(u8, name, "strncpy")) {
         const source = guestCString(state, arg(state, 1, direct_return_rip)) orelse &.{};
         const capacity = if (std.mem.eql(u8, name, "strncpy")) arg(state, 2, direct_return_rip) else source.len + 1;
@@ -3511,6 +3474,13 @@ fn handleStringAndMemory(state: anytype, name: []const u8, direct_return_rip: ?u
 }
 
 fn handleGraphics(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    if (std.mem.eql(u8, name, "CreateDXGIFactory1") or std.mem.eql(u8, name, "CreateDXGIFactory2")) {
+        const output = if (std.mem.eql(u8, name, "CreateDXGIFactory1")) arg(state, 1, direct_return_rip) else arg(state, 2, direct_return_rip);
+        if (output != 0 and state.guestMemory(output, 8) != null) state.write64(output, 0);
+        state.regs.rax = if (output == 0) 0x8000_4003 else 0x8000_4002; // E_POINTER / E_NOINTERFACE
+        finish(state, direct_return_rip);
+        return true;
+    }
     // Vulkan's proc-address functions are the important bridge point: every
     // returned function receives a Rosetta-owned guest address and is routed
     // through the same dispatch table on its eventual indirect call.
@@ -3740,6 +3710,136 @@ fn handleGraphics(state: anytype, name: []const u8, direct_return_rip: ?u64) boo
 fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_return_rip: ?u64) bool {
     if (handleStringAndMemory(state, name, direct_return_rip)) return true;
 
+    if (std.mem.eql(u8, name, "strstr")) {
+        const result = guestStrstr(state, arg(state, 0, direct_return_rip), arg(state, 1, direct_return_rip));
+        state.regs.rax = result orelse 0;
+        state.windows_last_error = if (result == null) 87 else 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "strtol")) {
+        const result = guestStrtol(state, arg(state, 0, direct_return_rip), arg(state, 1, direct_return_rip), arg(state, 2, direct_return_rip));
+        if (result) |value| {
+            state.regs.rax = @bitCast(value);
+            state.windows_last_error = 0;
+        } else {
+            state.regs.rax = 0;
+            state.windows_last_error = 87; // ERROR_INVALID_PARAMETER
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+
+    if (std.mem.eql(u8, name, "_setjmp")) return handleWindowsSetjmp(state, direct_return_rip);
+    if (std.mem.eql(u8, name, "longjmp")) return handleWindowsLongjmp(state, direct_return_rip);
+
+    if (std.mem.eql(u8, name, "_crt_atexit") or
+        std.mem.eql(u8, name, "_register_thread_local_exe_atexit_callback"))
+    {
+        // Rosetta owns process teardown; the callback registration itself is
+        // successful and has no guest-visible work during the run.
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_set_app_type")) {
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_set_new_mode")) {
+        const previous = state.windows_new_mode;
+        state.windows_new_mode = @truncate(arg(state, 0, direct_return_rip));
+        state.regs.rax = previous;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_set_invalid_parameter_handler")) {
+        const previous = state.windows_invalid_parameter_handler;
+        state.windows_invalid_parameter_handler = arg(state, 0, direct_return_rip);
+        state.regs.rax = previous;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_time64")) {
+        var timespec: std.posix.timespec = undefined;
+        const now: i64 = switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &timespec))) {
+            .SUCCESS => @intCast(timespec.sec),
+            else => @intCast(state.executed_steps / 1_000_000),
+        };
+        const output = arg(state, 0, direct_return_rip);
+        if (output != 0 and state.guestMemory(output, 8) != null) state.write64(output, @bitCast(now));
+        state.regs.rax = @bitCast(now);
+        state.windows_last_error = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "getenv")) {
+        const requested = guestCString(state, arg(state, 0, direct_return_rip)) orelse &.{};
+        state.regs.rax = if (environmentValue(requested)) |value|
+            materializeGuestAnsi(state, value) orelse 0
+        else
+            0;
+        state.windows_last_error = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "signal")) {
+        const signal_number = arg(state, 0, direct_return_rip);
+        if (signal_number >= state.windows_signal_handlers.len) {
+            state.regs.rax = std.math.maxInt(u64);
+            state.windows_last_error = 22; // EINVAL
+        } else {
+            const slot = &state.windows_signal_handlers[@as(usize, @intCast(signal_number))];
+            state.regs.rax = slot.*;
+            slot.* = arg(state, 1, direct_return_rip);
+            state.windows_last_error = 0;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "LibK_GetVersion") or
+        std.mem.eql(u8, name, "LibK_GetProcAddress") or
+        std.mem.eql(u8, name, "RENDERDOC_GetAPI"))
+    {
+        // These are optional instrumentation/compatibility probes. A null
+        // result is the honest answer when the optional host component is not
+        // present, and avoids reporting a false successful interface.
+        if (std.mem.eql(u8, name, "RENDERDOC_GetAPI")) {
+            const output = arg(state, 1, direct_return_rip);
+            if (output != 0 and state.guestMemory(output, 8) != null) state.write64(output, 0);
+        }
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "WindowsCreateStringReference")) {
+        const source = arg(state, 0, direct_return_rip);
+        const length = arg(state, 1, direct_return_rip);
+        const header = arg(state, 2, direct_return_rip);
+        const output = arg(state, 3, direct_return_rip);
+        const byte_count = std.math.mul(u64, length, 2) catch std.math.maxInt(u64);
+        const valid_source = source != 0 and state.guestMemoryConst(source, byte_count) != null;
+        if (output == 0 or state.guestMemory(output, 8) == null) {
+            state.regs.rax = 0x8000_4003; // E_POINTER
+        } else if (!valid_source or (header != 0 and state.guestMemory(header, 24) == null)) {
+            state.write64(output, 0);
+            state.regs.rax = 0x8007_0057; // E_INVALIDARG
+        } else {
+            // WinRT string activation is intentionally unavailable in this
+            // Rosetta session. Preserve the documented refusal and clear the
+            // output handle so a caller cannot dereference a false HSTRING.
+            state.write64(output, 0);
+            state.regs.rax = 0x8000_4001; // E_NOTIMPL
+            if (state.diagnose_abi) {
+                log.info("Windows WinRT string reference unavailable: source=0x{x} length={d} header=0x{x}; optional activation path refused explicitly", .{
+                    source,
+                    length,
+                    header,
+                });
+            }
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+
     if (std.mem.eql(u8, name, "localeconv")) {
         // `localeconv` returns a process-lifetime pointer.  A generic
         // zero-returning degraded import makes the CRT's strtodg path load
@@ -3818,6 +3918,31 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         return true;
     }
 
+    if (std.mem.eql(u8, name, "__p__fmode") or std.mem.eql(u8, name, "__p__commode")) {
+        const storage = if (std.mem.eql(u8, name, "__p__fmode"))
+            &state.windows_fmode_storage
+        else
+            &state.windows_commode_storage;
+        if (storage.* == 0) storage.* = state.guestAlloc(4, 4) orelse 0;
+        if (storage.* != 0) state.write32(storage.*, 0);
+        state.regs.rax = storage.*;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "__acrt_iob_func")) {
+        const index = arg(state, 0, direct_return_rip);
+        if (index < state.windows_acrt_iob_storage.len) {
+            const slot = &state.windows_acrt_iob_storage[@as(usize, @intCast(index))];
+            if (slot.* == 0) slot.* = state.guestAlloc(64, 8) orelse 0;
+            if (slot.* != 0 and state.guestMemory(slot.*, 64) != null) state.write64(slot.*, 0);
+            state.regs.rax = slot.*;
+        } else {
+            state.regs.rax = 0;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+
     if (std.mem.eql(u8, name, "_get_wpgmptr")) {
         // MinGW's filesystem helpers use this CRT accessor to obtain the
         // executable path before Xenia chooses its storage root.  A generic
@@ -3891,10 +4016,46 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         return true;
     }
 
+    if (std.mem.eql(u8, name, "_wmkdir")) {
+        const path_argument = arg(state, 0, direct_return_rip);
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const path = guestPathToHost(state, path_argument, true, &path_buffer) orelse {
+            state.windows_last_error = 3; // ERROR_PATH_NOT_FOUND
+            state.regs.rax = @bitCast(@as(i64, -1));
+            finish(state, direct_return_rip);
+            return true;
+        };
+        if (hostStat(state, path)) |_| {
+            state.windows_last_error = 17; // EEXIST
+            state.regs.rax = @bitCast(@as(i64, -1));
+            finish(state, direct_return_rip);
+            return true;
+        }
+        const io = state.windows_host_io orelse {
+            state.windows_last_error = 3; // ERROR_PATH_NOT_FOUND
+            state.regs.rax = @bitCast(@as(i64, -1));
+            finish(state, direct_return_rip);
+            return true;
+        };
+        std.Io.Dir.cwd().createDirPath(io, path) catch {
+            state.windows_last_error = 3; // ERROR_PATH_NOT_FOUND
+            state.regs.rax = @bitCast(@as(i64, -1));
+            finish(state, direct_return_rip);
+            return true;
+        };
+        state.windows_last_error = 0;
+        state.regs.rax = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+
     if (std.mem.eql(u8, name, "_wstat64") or std.mem.eql(u8, name, "_stat64") or
         std.mem.eql(u8, name, "__stat64"))
     {
         return statWindowsPath(state, name, direct_return_rip);
+    }
+    if (std.mem.eql(u8, name, "_fstat64") or std.mem.eql(u8, name, "fstat64")) {
+        return statWindowsDescriptor(state, name, direct_return_rip);
     }
 
     if (std.mem.eql(u8, name, "_initterm") or std.mem.eql(u8, name, "_initterm_e")) {
@@ -4121,8 +4282,130 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         finish(state, direct_return_rip);
         return true;
     }
+    if (std.mem.eql(u8, name, "GetThreadId")) {
+        const handle = arg(state, 0, direct_return_rip);
+        const current = std.math.maxInt(u64) - 1;
+        if (handle == current) {
+            state.regs.rax = 1;
+        } else {
+            state.regs.rax = 0;
+            for (state.windows_guest_threads) |thread| {
+                if (thread.status != .vacant and thread.handle == handle) {
+                    state.regs.rax = thread.thread_id;
+                    break;
+                }
+            }
+            if (state.regs.rax == 0) state.windows_last_error = 6; // ERROR_INVALID_HANDLE
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetThreadPriority") or std.mem.eql(u8, name, "SetThreadPriority")) {
+        const handle = arg(state, 0, direct_return_rip);
+        const current = std.math.maxInt(u64) - 1;
+        var valid = handle == current;
+        var found_index: ?usize = null;
+        for (state.windows_guest_threads, 0..) |thread, index| {
+            if (thread.status != .vacant and thread.handle == handle) {
+                valid = true;
+                found_index = index;
+                break;
+            }
+        }
+        if (!valid) {
+            state.windows_last_error = 6; // ERROR_INVALID_HANDLE
+            state.regs.rax = if (std.mem.eql(u8, name, "GetThreadPriority")) @bitCast(@as(i64, -15)) else 0;
+        } else if (std.mem.eql(u8, name, "GetThreadPriority")) {
+            state.regs.rax = if (found_index) |index| @bitCast(@as(i64, state.windows_guest_threads[index].priority)) else 0;
+        } else {
+            const priority: i32 = @bitCast(@as(u32, @truncate(arg(state, 1, direct_return_rip))));
+            if (found_index) |index| state.windows_guest_threads[index].priority = priority;
+            state.windows_last_error = 0;
+            state.regs.rax = 1;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "ResumeThread")) {
+        const handle = arg(state, 0, direct_return_rip);
+        var result: u64 = std.math.maxInt(u32);
+        for (&state.windows_guest_threads) |*thread| {
+            if (thread.status != .vacant and thread.handle == handle) {
+                result = thread.suspend_count;
+                if (thread.suspend_count != 0) thread.suspend_count -= 1;
+                state.windows_last_error = 0;
+                break;
+            }
+        }
+        state.regs.rax = result;
+        finish(state, direct_return_rip);
+        return true;
+    }
     if (std.mem.eql(u8, name, "GetProcessHeap")) {
         state.regs.rax = 0xFFFF_F000_0000_0100;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetProcessAffinityMask")) {
+        const process_mask = arg(state, 1, direct_return_rip);
+        const system_mask = arg(state, 2, direct_return_rip);
+        if (process_mask == 0 or system_mask == 0 or
+            state.guestMemory(process_mask, 8) == null or state.guestMemory(system_mask, 8) == null)
+        {
+            state.windows_last_error = 87; // ERROR_INVALID_PARAMETER
+            state.regs.rax = 0;
+        } else {
+            state.write64(process_mask, state.windows_process_affinity_mask);
+            state.write64(system_mask, state.windows_process_affinity_mask);
+            state.windows_last_error = 0;
+            state.regs.rax = 1;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SetProcessAffinityMask")) {
+        const mask = arg(state, 1, direct_return_rip);
+        if (mask == 0) {
+            state.windows_last_error = 87; // ERROR_INVALID_PARAMETER
+            state.regs.rax = 0;
+        } else {
+            state.windows_process_affinity_mask = mask;
+            state.windows_last_error = 0;
+            state.regs.rax = 1;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "FlushInstructionCache")) {
+        state.windows_last_error = 0;
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetModuleHandleExW")) {
+        const output = arg(state, 2, direct_return_rip);
+        if (output == 0 or state.guestMemory(output, 8) == null) {
+            state.windows_last_error = 87; // ERROR_INVALID_PARAMETER
+            state.regs.rax = 0;
+        } else {
+            state.write64(output, state.image_low);
+            state.windows_last_error = 0;
+            state.regs.rax = 1;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "VerSetConditionMask")) {
+        var mask = arg(state, 0, direct_return_rip);
+        const type_mask: u32 = @truncate(arg(state, 1, direct_return_rip));
+        const condition: u64 = arg(state, 2, direct_return_rip) & 0x7;
+        var bit: u6 = 0;
+        var remaining = type_mask;
+        while (remaining != 0) : (bit += 1) {
+            if ((remaining & 1) != 0) mask = (mask & ~(@as(u64, 0x7) << (bit * 3))) | (condition << (bit * 3));
+            remaining >>= 1;
+        }
+        state.regs.rax = mask;
         finish(state, direct_return_rip);
         return true;
     }
@@ -4246,7 +4529,7 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         finish(state, direct_return_rip);
         return true;
     }
-    if (std.mem.eql(u8, name, "GetModuleInformation")) {
+    if (std.mem.eql(u8, name, "GetModuleInformation") or std.mem.eql(u8, name, "K32GetModuleInformation")) {
         const information = arg(state, 2, direct_return_rip);
         const capacity = arg(state, 3, direct_return_rip);
         const image_size = if (state.image_high >= state.image_low)
@@ -4262,6 +4545,59 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
             state.write64(information + 16, state.windows_entry_point);
             state.regs.rax = 1;
         }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SetUnhandledExceptionFilter")) {
+        const previous = state.windows_unhandled_exception_filter;
+        state.windows_unhandled_exception_filter = arg(state, 0, direct_return_rip);
+        state.regs.rax = previous;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "AddVectoredExceptionHandler") or
+        std.mem.eql(u8, name, "AddVectoredContinueHandler"))
+    {
+        const handler = arg(state, 1, direct_return_rip);
+        if (handler == 0 or state.addrToOffset(handler) == null) {
+            state.windows_last_error = 87; // ERROR_INVALID_PARAMETER
+            state.regs.rax = 0;
+        } else {
+            const token = nextHandle(state);
+            state.windows_vectored_exception_handler = handler;
+            state.windows_vectored_exception_token = token;
+            state.windows_last_error = 0;
+            state.regs.rax = token;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "RemoveVectoredExceptionHandler") or
+        std.mem.eql(u8, name, "RemoveVectoredContinueHandler"))
+    {
+        const token = arg(state, 0, direct_return_rip);
+        const removed = token != 0 and token == state.windows_vectored_exception_token;
+        if (removed) {
+            state.windows_vectored_exception_token = 0;
+            state.windows_vectored_exception_handler = 0;
+        }
+        state.windows_last_error = if (removed) 0 else 87;
+        state.regs.rax = @intFromBool(removed);
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetStartupInfoW")) {
+        const startup_info = arg(state, 0, direct_return_rip);
+        if (startup_info == 0 or state.guestMemory(startup_info, 104) == null) {
+            state.windows_last_error = 87; // ERROR_INVALID_PARAMETER
+        } else {
+            const bytes = state.guestMemory(startup_info, 104).?;
+            @memset(bytes, 0);
+            state.write32(startup_info, 104);
+            state.windows_last_error = 0;
+        }
+        // GetStartupInfoW is void; the return register is intentionally not
+        // used as a success signal.
         finish(state, direct_return_rip);
         return true;
     }
@@ -4293,8 +4629,9 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
             // The PE runner has one cooperative guest context rather than a
             // native Windows thread handle. Validate the caller's CONTEXT
             // storage and acknowledge the contract, while retaining the
-            // degraded counter so this no-op is visible in diagnostics.
-            state.windows_degraded_import_calls +|= 1;
+            // The cooperative executor has no second native register context
+            // to install, but the validated guest CONTEXT contract is fully
+            // modeled for the current thread.
             state.windows_last_error = 0;
             state.regs.rax = 1;
         }
@@ -4492,6 +4829,127 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         finish(state, direct_return_rip);
         return true;
     }
+    if (std.mem.eql(u8, name, "RegOpenKeyA") or std.mem.eql(u8, name, "RegOpenKeyW") or
+        std.mem.eql(u8, name, "RegOpenKeyExA") or std.mem.eql(u8, name, "RegOpenKeyExW"))
+    {
+        const root = arg(state, 0, direct_return_rip);
+        const output = if (std.mem.startsWith(u8, name, "RegOpenKeyEx"))
+            arg(state, 4, direct_return_rip)
+        else
+            arg(state, 2, direct_return_rip);
+        if (!isWindowsRegistryRoot(root) or output == 0 or state.guestMemory(output, 8) == null) {
+            state.windows_last_error = 87; // ERROR_INVALID_PARAMETER
+        } else {
+            // A missing key is an ordinary result for the settings probe. Do
+            // not turn it into a fabricated readable key: the caller's
+            // following RegCreateKey path is the durable branch Rosetta can
+            // model safely.
+            state.write64(output, 0);
+            state.windows_last_error = 2; // ERROR_FILE_NOT_FOUND
+        }
+        state.regs.rax = state.windows_last_error;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "RegCreateKeyA") or std.mem.eql(u8, name, "RegCreateKeyW") or
+        std.mem.eql(u8, name, "RegCreateKeyExA") or std.mem.eql(u8, name, "RegCreateKeyExW"))
+    {
+        const root = arg(state, 0, direct_return_rip);
+        const extended = std.mem.startsWith(u8, name, "RegCreateKeyEx");
+        const output = if (extended) arg(state, 7, direct_return_rip) else arg(state, 2, direct_return_rip);
+        if (!isWindowsRegistryRoot(root) or output == 0 or state.guestMemory(output, 8) == null) {
+            state.windows_last_error = 87; // ERROR_INVALID_PARAMETER
+            state.regs.rax = state.windows_last_error;
+        } else {
+            state.write64(output, nextHandle(state));
+            if (extended) {
+                const disposition = arg(state, 8, direct_return_rip);
+                if (disposition != 0 and state.guestMemory(disposition, 4) != null) state.write32(disposition, 1); // REG_CREATED_NEW_KEY
+            }
+            state.windows_last_error = 0; // ERROR_SUCCESS
+            state.regs.rax = 0;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "RegSetValueExA") or std.mem.eql(u8, name, "RegSetValueExW")) {
+        const key = arg(state, 0, direct_return_rip);
+        const data = arg(state, 4, direct_return_rip);
+        const data_size = arg(state, 5, direct_return_rip);
+        const valid_data = data_size == 0 or (data != 0 and state.guestMemory(data, data_size) != null);
+        state.windows_last_error = if (isWindowsRegistryHandle(state, key) and valid_data) 0 else if (!valid_data) 87 else 6;
+        state.regs.rax = state.windows_last_error;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "RegGetValueA") or std.mem.eql(u8, name, "RegGetValueW") or
+        std.mem.eql(u8, name, "RegQueryValueExA") or std.mem.eql(u8, name, "RegQueryValueExW"))
+    {
+        const key = arg(state, 0, direct_return_rip);
+        if (!isWindowsRegistryHandle(state, key)) {
+            state.windows_last_error = 6; // ERROR_INVALID_HANDLE
+        } else {
+            const extended = std.mem.startsWith(u8, name, "RegGetValue");
+            const type_output = if (extended) arg(state, 4, direct_return_rip) else arg(state, 4, direct_return_rip);
+            const data_output = if (extended) arg(state, 5, direct_return_rip) else arg(state, 5, direct_return_rip);
+            const size_output = if (extended) arg(state, 6, direct_return_rip) else arg(state, 6, direct_return_rip);
+            if (type_output != 0 and state.guestMemory(type_output, 4) != null) state.write32(type_output, 1); // REG_SZ
+            if (size_output != 0 and state.guestMemory(size_output, 4) != null) state.write32(size_output, 0);
+            if (data_output != 0 and size_output != 0 and state.guestMemory(size_output, 4) != null) {
+                const capacity = @min(@as(u64, state.read32(size_output)), 64 * 1024);
+                if (capacity != 0 and state.guestMemory(data_output, capacity) != null) @memset(state.guestMemory(data_output, capacity).?, 0);
+            }
+            state.windows_last_error = 2; // ERROR_FILE_NOT_FOUND: no persisted value
+        }
+        state.regs.rax = state.windows_last_error;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "RegFlushKey") or std.mem.eql(u8, name, "RegCloseKey")) {
+        const key = arg(state, 0, direct_return_rip);
+        state.windows_last_error = if (isWindowsRegistryHandle(state, key)) 0 else 6;
+        state.regs.rax = state.windows_last_error;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "VerifyVersionInfoA") or std.mem.eql(u8, name, "VerifyVersionInfoW")) {
+        const info = arg(state, 0, direct_return_rip);
+        const type_mask: u32 = @truncate(arg(state, 1, direct_return_rip));
+        const condition_mask = arg(state, 2, direct_return_rip);
+        if (info == 0 or state.guestMemory(info, 20) == null) {
+            state.windows_last_error = 87; // ERROR_INVALID_PARAMETER
+            state.regs.rax = 0;
+        } else {
+            var matches = true;
+            var bit_index: u6 = 0;
+            var remaining = type_mask;
+            while (remaining != 0) : (bit_index += 1) {
+                if ((remaining & 1) != 0) {
+                    const requested: u64 = switch (bit_index) {
+                        1 => state.read32(info + 4), // VER_MAJORVERSION
+                        0 => state.read32(info + 8), // VER_MINORVERSION
+                        2 => state.read32(info + 12), // VER_BUILDNUMBER
+                        3 => state.read32(info + 16), // VER_PLATFORMID
+                        else => 0,
+                    };
+                    const actual: u64 = switch (bit_index) {
+                        1 => 10,
+                        0 => 0,
+                        2 => 22621,
+                        3 => 2,
+                        else => 0,
+                    };
+                    const condition = (condition_mask >> (bit_index * 3)) & 0x7;
+                    if (!versionCondition(actual, requested, condition)) matches = false;
+                }
+                remaining >>= 1;
+            }
+            state.windows_last_error = if (matches) 0 else 1150; // ERROR_OLD_WIN_VERSION
+            state.regs.rax = @intFromBool(matches);
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
     if (std.mem.eql(u8, name, "IsDebuggerPresent")) {
         returnZero(state, direct_return_rip);
         return true;
@@ -4566,7 +5024,11 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         const file_size_low = @as(u64, @truncate(arg(state, 4, direct_return_rip)));
         const requested_length = (file_size_high << 32) | file_size_low;
         const handle = nextHandle(state);
-        if (state.createWindowsMemoryMapping(handle, requested_length)) {
+        if (state.createWindowsMemoryMapping(
+            handle,
+            requested_length,
+            arg(state, 0, direct_return_rip),
+        )) {
             state.windows_last_error = 0;
             state.regs.rax = handle;
         } else {
@@ -4713,6 +5175,131 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         finish(state, direct_return_rip);
         return true;
     }
+    if (std.mem.eql(u8, name, "InitOnceBeginInitialize")) {
+        const once = arg(state, 0, direct_return_rip);
+        const pending = arg(state, 2, direct_return_rip);
+        const context = arg(state, 3, direct_return_rip);
+        if (once == 0 or state.guestMemory(once, 8) == null) {
+            state.windows_last_error = 87; // ERROR_INVALID_PARAMETER
+            state.regs.rax = 0;
+        } else {
+            const value = state.read64(once);
+            if (value == 0) {
+                // INIT_ONCE_IN_INIT is the low-bit in-progress state. The
+                // caller owns the callback and will publish the completed
+                // state through InitOnceComplete below.
+                state.write64(once, 1);
+                if (pending != 0 and state.guestMemory(pending, 4) != null) state.write32(pending, 1);
+                if (context != 0 and state.guestMemory(context, 8) != null) state.write64(context, 0);
+            } else {
+                // A completed control word stores the optional context with
+                // the low two tag bits reserved. No host wait is possible in
+                // the cooperative executor, so an already-running control
+                // is observed as complete rather than spinning forever.
+                if (pending != 0 and state.guestMemory(pending, 4) != null) state.write32(pending, 0);
+                if (context != 0 and state.guestMemory(context, 8) != null) state.write64(context, value & ~@as(u64, 0x3));
+            }
+            state.windows_last_error = 0;
+            state.regs.rax = 1;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "InitOnceComplete")) {
+        const once = arg(state, 0, direct_return_rip);
+        const flags = arg(state, 1, direct_return_rip);
+        const context = arg(state, 2, direct_return_rip);
+        if (once == 0 or state.guestMemory(once, 8) == null) {
+            state.windows_last_error = 87; // ERROR_INVALID_PARAMETER
+            state.regs.rax = 0;
+        } else if ((flags & 0x4) != 0) {
+            // INIT_ONCE_INIT_FAILED returns the control to the uninitialized
+            // state so a later attempt can retry the callback.
+            state.write64(once, 0);
+            state.windows_last_error = 0;
+            state.regs.rax = 1;
+        } else {
+            state.write64(once, if (context == 0) 2 else context | 2);
+            state.windows_last_error = 0;
+            state.regs.rax = 1;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "InitializeConditionVariable")) {
+        const condition = arg(state, 0, direct_return_rip);
+        if (condition != 0 and state.guestMemory(condition, 8) != null) state.write64(condition, 0);
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "WakeConditionVariable") or
+        std.mem.eql(u8, name, "WakeAllConditionVariable"))
+    {
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SleepConditionVariableCS") or
+        std.mem.eql(u8, name, "SleepConditionVariableSRW"))
+    {
+        // A condition variable has no independent host waiter in this
+        // executor. A timeout-style FALSE lets the caller re-check its
+        // predicate without introducing an unbounded guest spin.
+        state.windows_last_error = 258; // WAIT_TIMEOUT
+        state.regs.rax = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "CreateWaitableTimerA") or std.mem.eql(u8, name, "CreateWaitableTimerW")) {
+        state.windows_last_error = 0;
+        state.regs.rax = nextHandle(state);
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SetWaitableTimer") or std.mem.eql(u8, name, "CancelWaitableTimer")) {
+        state.windows_last_error = 0;
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetQueuedCompletionStatus")) {
+        const port = arg(state, 0, direct_return_rip);
+        const bytes_transferred = arg(state, 1, direct_return_rip);
+        const completion_key = arg(state, 2, direct_return_rip);
+        const overlapped = arg(state, 3, direct_return_rip);
+        const valid_outputs = (bytes_transferred == 0 or state.guestMemory(bytes_transferred, 4) != null) and
+            (completion_key == 0 or state.guestMemory(completion_key, 8) != null) and
+            (overlapped == 0 or state.guestMemory(overlapped, 8) != null);
+        if (port == 0 or !isSyntheticWindowsHandle(state, port)) {
+            state.windows_last_error = 6; // ERROR_INVALID_HANDLE
+            state.regs.rax = 0;
+        } else if (!valid_outputs) {
+            state.windows_last_error = 87; // ERROR_INVALID_PARAMETER
+            state.regs.rax = 0;
+        } else {
+            // The bounded Rosetta executor has no completion packet queued at
+            // this boundary. Report an empty queue as WAIT_TIMEOUT and keep
+            // all optional output fields deterministic.
+            if (bytes_transferred != 0) state.write32(bytes_transferred, 0);
+            if (completion_key != 0) state.write64(completion_key, 0);
+            if (overlapped != 0) state.write64(overlapped, 0);
+            state.windows_last_error = 258; // WAIT_TIMEOUT
+            state.regs.rax = 0;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "CreateIoCompletionPort")) {
+        const existing = arg(state, 1, direct_return_rip);
+        if (existing != 0 and !isSyntheticWindowsHandle(state, existing)) {
+            state.windows_last_error = 6; // ERROR_INVALID_HANDLE
+            state.regs.rax = 0;
+        } else {
+            state.windows_last_error = 0;
+            state.regs.rax = if (existing != 0) existing else nextHandle(state);
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
     if (std.mem.eql(u8, name, "CreateThread") or std.mem.eql(u8, name, "CreateRemoteThread")) {
         // The Win32 handle is only the observable result of creation.  The
         // important side effect is that the start routine becomes runnable;
@@ -4783,7 +5370,6 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         }
         state.regs.rax = handle;
         state.windows_last_error = 0;
-        state.windows_degraded_import_calls +|= 1;
         if (state.diagnose_abi) {
             log.info(
                 "Windows guest thread queued: api={s} handle=0x{x} start=0x{x} argument=0x{x} stack_size={d}",
@@ -5039,6 +5625,15 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         finish(state, direct_return_rip);
         return true;
     }
+    if (std.mem.eql(u8, name, "MessageBoxA") or std.mem.eql(u8, name, "MessageBoxW")) {
+        // Rosetta is headless during bring-up. Returning IDOK preserves the
+        // modal API's nonzero decision without blocking the cooperative
+        // executor on an AppKit alert that cannot be observed by the guest.
+        state.windows_last_error = 0;
+        state.regs.rax = 1; // IDOK
+        finish(state, direct_return_rip);
+        return true;
+    }
     if (std.mem.eql(u8, name, "GetWindowLongA") or std.mem.eql(u8, name, "GetWindowLongW") or
         std.mem.eql(u8, name, "GetWindowLongPtrA") or std.mem.eql(u8, name, "GetWindowLongPtrW"))
     {
@@ -5093,9 +5688,20 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         finish(state, direct_return_rip);
         return true;
     }
-    if (std.mem.eql(u8, name, "SetWindowPos") or
-        std.mem.eql(u8, name, "SetFocus") or std.mem.eql(u8, name, "ReleaseDC"))
-    {
+    if (std.mem.eql(u8, name, "GetFocus")) {
+        state.regs.rax = state.windows_focus_window;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SetFocus")) {
+        const previous = state.windows_focus_window;
+        state.windows_focus_window = arg(state, 0, direct_return_rip);
+        state.windows_last_error = 0;
+        state.regs.rax = previous;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SetWindowPos") or std.mem.eql(u8, name, "ReleaseDC")) {
         state.regs.rax = 1;
         finish(state, direct_return_rip);
         return true;
@@ -5758,6 +6364,30 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         return true;
     }
 
+    if (std.mem.eql(u8, name, "CoIncrementMTAUsage")) {
+        const output = arg(state, 0, direct_return_rip);
+        if (output == 0 or state.guestMemory(output, 8) == null) {
+            state.regs.rax = 0x8000_4003; // E_POINTER
+        } else {
+            if (state.windows_com_mta_cookie == 0) state.windows_com_mta_cookie = nextHandle(state);
+            state.windows_com_mta_refcount +|= 1;
+            state.write64(output, state.windows_com_mta_cookie);
+            state.regs.rax = 0; // S_OK
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "CoDecrementMTAUsage")) {
+        const cookie = arg(state, 0, direct_return_rip);
+        if (cookie == 0 or cookie != state.windows_com_mta_cookie or state.windows_com_mta_refcount == 0) {
+            state.regs.rax = 0x8007_0057; // E_INVALIDARG
+        } else {
+            state.windows_com_mta_refcount -= 1;
+            state.regs.rax = 0; // S_OK
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
     if (std.mem.eql(u8, name, "CoInitializeEx") or std.mem.eql(u8, name, "CoInitializeSecurity") or
         std.mem.eql(u8, name, "CoUninitialize"))
     {
@@ -5776,6 +6406,108 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         const output = arg(state, 4, direct_return_rip);
         if (output != 0 and state.guestMemory(output, 8) != null) state.write64(output, 0);
         state.regs.rax = 0x8000_4002; // E_NOINTERFACE
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "RoInitialize")) {
+        // The PE path has no WinRT apartment object to publish, but a
+        // successful initialization is the documented non-error result and
+        // is enough for callers that only probe optional WinRT services.
+        state.windows_last_error = 0;
+        state.regs.rax = 0; // S_OK
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "RoUninitialize")) {
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "RoGetActivationFactory") or
+        std.mem.eql(u8, name, "RoActivateInstance"))
+    {
+        const output = if (std.mem.eql(u8, name, "RoGetActivationFactory")) arg(state, 2, direct_return_rip) else arg(state, 1, direct_return_rip);
+        if (output != 0 and state.guestMemory(output, 8) != null) state.write64(output, 0);
+        state.regs.rax = 0x8000_4002; // E_NOINTERFACE
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "CreateDXGIFactory1") or std.mem.eql(u8, name, "CreateDXGIFactory2")) {
+        const output = if (std.mem.eql(u8, name, "CreateDXGIFactory1")) arg(state, 1, direct_return_rip) else arg(state, 2, direct_return_rip);
+        if (output != 0 and state.guestMemory(output, 8) != null) state.write64(output, 0);
+        state.regs.rax = if (output == 0) 0x8000_4003 else 0x8000_4002; // E_POINTER / E_NOINTERFACE
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "HidD_GetHidGuid")) {
+        const output = arg(state, 0, direct_return_rip);
+        if (output == 0 or state.guestMemory(output, 16) == null) {
+            state.windows_last_error = 87; // ERROR_INVALID_PARAMETER
+            state.regs.rax = 0;
+        } else {
+            // GUID_DEVINTERFACE_HID, serialized in Windows GUID byte order.
+            const hid_guid = [_]u8{ 0xB2, 0x55, 0x1E, 0x4D, 0x6F, 0xF1, 0xCF, 0x11, 0x88, 0xCB, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30 };
+            @memcpy(state.guestMemory(output, 16).?, hid_guid[0..]);
+            state.windows_last_error = 0;
+            state.regs.rax = 1;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetRawInputDeviceList")) {
+        const devices = arg(state, 0, direct_return_rip);
+        const count = arg(state, 1, direct_return_rip);
+        const element_size = arg(state, 2, direct_return_rip);
+        if (count == 0 or state.guestMemory(count, 4) == null or (element_size != 0 and element_size < 16)) {
+            state.windows_last_error = 87; // ERROR_INVALID_PARAMETER
+            state.regs.rax = std.math.maxInt(u32);
+        } else {
+            state.write32(count, 0);
+            state.windows_last_error = 0;
+            state.regs.rax = 0;
+            _ = devices;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "RegisterRawInputDevices")) {
+        const devices = arg(state, 0, direct_return_rip);
+        const count = arg(state, 1, direct_return_rip);
+        const element_size = arg(state, 2, direct_return_rip);
+        const byte_count = std.math.mul(u64, count, 16) catch std.math.maxInt(u64);
+        if ((count != 0 and devices == 0) or
+            (count != 0 and state.guestMemory(devices, byte_count) == null) or
+            (count != 0 and element_size < 16))
+        {
+            state.windows_last_error = 87; // ERROR_INVALID_PARAMETER
+            state.regs.rax = 0;
+        } else {
+            state.windows_raw_input_registered = count != 0;
+            state.windows_raw_input_device_count = @truncate(count);
+            state.windows_last_error = 0;
+            state.regs.rax = 1;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SetupDiGetClassDevsA") or std.mem.eql(u8, name, "SetupDiGetClassDevsW")) {
+        // Device enumeration is optional for the Vulkan path. Return the
+        // documented invalid set handle and a specific absence error instead
+        // of a generic FALSE, so Xenia can take its no-device branch without
+        // treating the setup API itself as an unresolved import.
+        state.windows_last_error = 433; // ERROR_NO_SUCH_DEVICE
+        state.regs.rax = std.math.maxInt(u64); // INVALID_HANDLE_VALUE
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SetupDiEnumDeviceInterfaces")) {
+        state.windows_last_error = 259; // ERROR_NO_MORE_ITEMS
+        state.regs.rax = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SetupDiDestroyDeviceInfoList")) {
+        state.windows_last_error = 0;
+        state.regs.rax = 1;
         finish(state, direct_return_rip);
         return true;
     }
@@ -6123,6 +6855,10 @@ fn completeWithImportFallback(
 pub fn tryFunction(state: anytype, dll_name: []const u8, function_name: []const u8, direct_return_rip: ?u64) bool {
     if (!state.windows_runtime_enabled) return false;
     state.windows_import_calls +|= 1;
+    // Two stores so a file failure raised inside a handler can name the
+    // import that raised it. The names outlive the call: they come from the
+    // import stub's own storage or from a literal.
+    if (comptime @hasField(@TypeOf(state.*), "windows_current_import")) state.windows_current_import = function_name;
     if (state.diagnose_abi) {
         log.info("Windows import dispatch: {s}!{s} direct_return={s} rip=0x{x} return=0x{x} caller=0x{x} last_op={s} rcx=0x{x} rdx=0x{x} r8=0x{x} r9=0x{x} rsp=0x{x}", .{
             dll_name,
@@ -6170,6 +6906,10 @@ pub fn tryFunction(state: anytype, dll_name: []const u8, function_name: []const 
 test "Windows import classification separates Vulkan from unknown APIs" {
     try std.testing.expectEqual(ImportClass.graphics, classifyImport("vulkan-1.dll", "vkCreateInstance"));
     try std.testing.expectEqual(ImportClass.core, classifyImport("kernel32.dll", "VirtualAlloc"));
+    try std.testing.expectEqual(ImportClass.core, classifyImport("msvcrt.dll", "_setjmp"));
+    try std.testing.expectEqual(ImportClass.core, classifyImport("api-ms-win-crt-private-l1-1-0.dll", "longjmp"));
+    try std.testing.expectEqual(ImportClass.core, classifyImport("api-ms-win-crt-utility-l1-1-0.dll", "qsort"));
+    try std.testing.expectEqual(ImportClass.core, classifyImport("kernel32.dll", "SetThreadContext"));
     try std.testing.expectEqual(ImportClass.unsupported, classifyImport("kernel32.dll", "RosetteMissingEntry"));
 }
 
