@@ -1939,11 +1939,86 @@ pub fn build(b: *std.Build) void {
     });
     x86_vector_helpers_mod.addImport("x64_decoder", x64_decoder_mod);
 
+    // The Windows import boundary's static facts. The return contract says
+    // what a name's ABI defines for a refusal; the library inventory says
+    // which DLLs are the Windows surface; and one package per DLL owns the
+    // degraded names. The catalogue only links those facts for the runtime.
+    const dll_win32_catalogue_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/dll/win32/catalogue/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const dll_win32_package_specs = [_]struct {
+        import_name: []const u8,
+        root_source_file: []const u8,
+    }{
+        .{ .import_name = "dll_win32_advapi32", .root_source_file = "../pkg/dll/win32/advapi32/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_convert_l1_1_0", .root_source_file = "../pkg/dll/win32/api-ms-win-crt-convert-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_environment_l1_1_0", .root_source_file = "../pkg/dll/win32/api-ms-win-crt-environment-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_filesystem_l1_1_0", .root_source_file = "../pkg/dll/win32/api-ms-win-crt-filesystem-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_heap_l1_1_0", .root_source_file = "../pkg/dll/win32/api-ms-win-crt-heap-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_locale_l1_1_0", .root_source_file = "../pkg/dll/win32/api-ms-win-crt-locale-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_math_l1_1_0", .root_source_file = "../pkg/dll/win32/api-ms-win-crt-math-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_private_l1_1_0", .root_source_file = "../pkg/dll/win32/api-ms-win-crt-private-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_runtime_l1_1_0", .root_source_file = "../pkg/dll/win32/api-ms-win-crt-runtime-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_stdio_l1_1_0", .root_source_file = "../pkg/dll/win32/api-ms-win-crt-stdio-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_string_l1_1_0", .root_source_file = "../pkg/dll/win32/api-ms-win-crt-string-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_time_l1_1_0", .root_source_file = "../pkg/dll/win32/api-ms-win-crt-time-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_utility_l1_1_0", .root_source_file = "../pkg/dll/win32/api-ms-win-crt-utility-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_bcrypt", .root_source_file = "../pkg/dll/win32/bcrypt/src/root.zig" },
+        .{ .import_name = "dll_win32_dwmapi", .root_source_file = "../pkg/dll/win32/dwmapi/src/root.zig" },
+        .{ .import_name = "dll_win32_dxgi", .root_source_file = "../pkg/dll/win32/dxgi/src/root.zig" },
+        .{ .import_name = "dll_win32_dynamic", .root_source_file = "../pkg/dll/win32/dynamic/src/root.zig" },
+        .{ .import_name = "dll_win32_gdi32", .root_source_file = "../pkg/dll/win32/gdi32/src/root.zig" },
+        .{ .import_name = "dll_win32_imm32", .root_source_file = "../pkg/dll/win32/imm32/src/root.zig" },
+        .{ .import_name = "dll_win32_kernel32", .root_source_file = "../pkg/dll/win32/kernel32/src/root.zig" },
+        .{ .import_name = "dll_win32_msvcrt", .root_source_file = "../pkg/dll/win32/msvcrt/src/root.zig" },
+        .{ .import_name = "dll_win32_ole32", .root_source_file = "../pkg/dll/win32/ole32/src/root.zig" },
+        .{ .import_name = "dll_win32_oleaut32", .root_source_file = "../pkg/dll/win32/oleaut32/src/root.zig" },
+        .{ .import_name = "dll_win32_setupapi", .root_source_file = "../pkg/dll/win32/setupapi/src/root.zig" },
+        .{ .import_name = "dll_win32_shell32", .root_source_file = "../pkg/dll/win32/shell32/src/root.zig" },
+        .{ .import_name = "dll_win32_shlwapi", .root_source_file = "../pkg/dll/win32/shlwapi/src/root.zig" },
+        .{ .import_name = "dll_win32_user32", .root_source_file = "../pkg/dll/win32/user32/src/root.zig" },
+        .{ .import_name = "dll_win32_version", .root_source_file = "../pkg/dll/win32/version/src/root.zig" },
+        .{ .import_name = "dll_win32_winmm", .root_source_file = "../pkg/dll/win32/winmm/src/root.zig" },
+        .{ .import_name = "dll_win32_wsock32", .root_source_file = "../pkg/dll/win32/wsock32/src/root.zig" },
+    };
+    for (dll_win32_package_specs) |spec| {
+        const package_mod = b.createModule(.{
+            .root_source_file = b.path(spec.root_source_file),
+            .target = target,
+            .optimize = optimize,
+        });
+        dll_win32_catalogue_mod.addImport(spec.import_name, package_mod);
+        const package_test = b.addTest(.{ .root_module = package_mod });
+        check_step.dependOn(&b.addRunArtifact(package_test).step);
+    }
+    const dll_win32_catalogue_test = b.addTest(.{ .root_module = dll_win32_catalogue_mod });
+    check_step.dependOn(&b.addRunArtifact(dll_win32_catalogue_test).step);
+
+    const dll_win32_return_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/dll/win32/return-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const dll_win32_library_inventory_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/dll/win32/library-inventory/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    dll_win32_library_inventory_mod.addImport("dll_win32_catalogue", dll_win32_catalogue_mod);
+    const dll_win32_return_contract_test = b.addTest(.{ .root_module = dll_win32_return_contract_mod });
+    check_step.dependOn(&b.addRunArtifact(dll_win32_return_contract_test).step);
+    const dll_win32_library_inventory_test = b.addTest(.{ .root_module = dll_win32_library_inventory_mod });
+    check_step.dependOn(&b.addRunArtifact(dll_win32_library_inventory_test).step);
+
     const windows_runtime_mod = b.createModule(.{
         .root_source_file = b.path("../src/x64-ASM/windows_runtime.zig"),
         .target = target,
         .optimize = optimize,
     });
+    windows_runtime_mod.addImport("dll_win32_return_contract", dll_win32_return_contract_mod);
+    windows_runtime_mod.addImport("dll_win32_library_inventory", dll_win32_library_inventory_mod);
     // The Win32 ABI surface owns the import classification and the fallback
     // return contract.  It was previously only compiled as a dependency of
     // other modules, so its own tests never ran and a wrong classification
