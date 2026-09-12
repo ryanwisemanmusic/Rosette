@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const parser = @import("pe_parser.zig");
+const pe_symbols = @import("pe_symbols.zig");
 const fmt = @import("pe_format.zig");
 const imports_mod = @import("imports/imports.zig");
 const x64_decoder = @import("x64_decoder");
@@ -67,6 +68,61 @@ fn loadedImageAddress(image: *const parser.Image, load_base: u64, preferred_addr
     const rva = preferred_address - preferred_base;
     if (rva > image.size_of_image) return error.InvalidTlsDirectory;
     return std.math.add(u64, load_base, rva) catch error.InvalidTlsDirectory;
+}
+
+/// Find a stable function-entry signature in an executable PE section.  This
+/// is intentionally byte-based rather than tied to one Xenia link address:
+/// MinGW's pthread condition routines are commonly linked into the image, so
+/// they are not available through the import table even though Rosetta needs
+/// to intercept their host-blocking implementation.
+fn locateExecutableSignature(
+    image: *const parser.Image,
+    bytes: []const u8,
+    load_base: u64,
+    signature: []const u8,
+) ?u64 {
+    if (signature.len == 0) return null;
+    for (image.sections) |section| {
+        if (!section.isExecutable()) continue;
+        const raw_start: usize = @intCast(section.raw_offset);
+        if (raw_start >= bytes.len) continue;
+        const raw_length = @min(@as(usize, section.raw_size), bytes.len - raw_start);
+        if (raw_length < signature.len) continue;
+        const section_bytes = bytes[raw_start .. raw_start + raw_length];
+        if (std.mem.indexOf(u8, section_bytes, signature)) |offset| {
+            const rva = std.math.add(u32, section.virtual_address, @as(u32, @intCast(offset))) catch continue;
+            return std.math.add(u64, load_base, rva) catch null;
+        }
+    }
+    return null;
+}
+
+fn discoverWindowsConditionEntries(
+    image: *const parser.Image,
+    bytes: []const u8,
+    load_base: u64,
+) struct { wait: ?u64, signal: ?u64, broadcast: ?u64 } {
+    // These prefixes describe the MinGW pthread implementation's ABI entry,
+    // not an arbitrary interior instruction.  Include the stack frame size
+    // and first null/error check so nearby helper functions do not match.
+    const wait_signature = [_]u8{
+        0x41, 0x54, 0x55, 0x57, 0x56, 0x53, 0x48, 0x83,
+        0xEC, 0x70, 0xB8, 0x16, 0x00, 0x00, 0x00, 0x48,
+        0x89, 0xCE, 0x48, 0x89, 0xD7, 0x48, 0x85, 0xC9,
+    };
+    const signal_signature = [_]u8{
+        0x55, 0x57, 0x53, 0x48, 0x83, 0xEC, 0x40, 0x48,
+        0x85, 0xC9, 0x0F, 0x84,
+    };
+    const broadcast_signature = [_]u8{
+        0x55, 0x57, 0x56, 0x53, 0x48, 0x83, 0xEC, 0x48,
+        0x48, 0x85, 0xC9, 0x0F, 0x84,
+    };
+    return .{
+        .wait = locateExecutableSignature(image, bytes, load_base, &wait_signature),
+        .signal = locateExecutableSignature(image, bytes, load_base, &signal_signature),
+        .broadcast = locateExecutableSignature(image, bytes, load_base, &broadcast_signature),
+    };
 }
 
 fn configureWindowsStaticTls(state: *elf.ElfState, image: *const parser.Image, load_base: u64) !void {
@@ -175,9 +231,9 @@ pub const ImportStatus = enum {
     malformed,
 };
 
-pub const degraded_import_sample_capacity: usize = 25;
+pub const degraded_import_sample_capacity: usize = 50;
 
-/// A bounded copy of one degraded import.  The parsed import directory owns
+/// A bounded copy of one catalogued import contract.  The parsed import directory owns
 /// its strings only until preflight returns, so the report keeps fixed-size
 /// names for the detailed run log instead of retaining borrowed slices.
 pub const DegradedImportSample = struct {
@@ -212,10 +268,10 @@ pub const DegradedImportSample = struct {
 
 pub const degraded_import_dll_capacity: usize = 32;
 
-/// How many of a DLL's imports fall back rather than being implemented, and
-/// how many of those would have been told "success" by a bare zero return.
-/// A histogram is far more actionable than 25 alphabetical samples: it says
-/// which subsystem is thin, not which name happens to sort first.
+/// How many catalogued imports belong to a DLL, and how many of those would
+/// have been told "success" by a bare zero return. A histogram is far more
+/// actionable than 25 alphabetical samples: it says which subsystem needs
+/// stateful work, not which name happens to sort first.
 pub const DegradedImportDll = struct {
     name: [64]u8 = [_]u8{0} ** 64,
     name_len: u8 = 0,
@@ -246,6 +302,7 @@ pub const PreflightReport = struct {
     imports: u64 = 0,
     core_imports: u64 = 0,
     graphics_imports: u64 = 0,
+    contract_imports: u64 = 0,
     degraded_imports: u64 = 0,
     supported_imports: u64 = 0,
     unsupported_imports: u64 = 0,
@@ -270,9 +327,9 @@ pub const PreflightReport = struct {
     degraded_import_dlls: [degraded_import_dll_capacity]DegradedImportDll =
         [_]DegradedImportDll{.{}} ** degraded_import_dll_capacity,
     degraded_import_dll_overflow: u32 = 0,
-    /// Degraded imports whose ABI spells success with zero.  Before the
-    /// return contract these were the dangerous ones: the guest was told the
-    /// call worked and then read an output that was never written.
+    /// Contract imports whose ABI spells success with zero. Before the return
+    /// contract these were the dangerous ones: the guest was told the call
+    /// worked and then read an output that was never written.
     degraded_zero_means_success: u64 = 0,
 
     fn noteDegradedDll(self: *PreflightReport, dll_name: []const u8, zero_means_success: bool) void {
@@ -304,9 +361,8 @@ pub const PreflightReport = struct {
 
     pub fn ready(self: *const PreflightReport) bool {
         // `ready` means that every imported name has an explicit Rosetta ABI
-        // policy. Degraded imports are launchable but not yet semantically
-        // complete; the report exposes them separately so this cannot be
-        // mistaken for full Windows API coverage.
+        // policy. The reserved degraded class is not launchable: it means a
+        // name escaped the package/contract catalogue.
         return self.entry_is_executable and self.worklist_complete and self.invalid_instructions == 0 and
             self.unsupported_imports == 0 and self.unsupported_instructions == 0 and self.import_status != .malformed;
     }
@@ -322,6 +378,10 @@ pub const RunOptions = struct {
     max_steps: u64 = 0,
     load_base: ?u64 = null,
     graphics_hooks: elf.WindowsGraphicsHooks = .{},
+    /// Optional host audio device. Absent leaves the guest's wave device on
+    /// the clocked null sink, which is a working audio path that nobody can
+    /// hear rather than a broken one.
+    audio_hooks: elf.WindowsAudioHooks = .{},
     /// Optional host I/O authority for the Windows ABI bridge. Paths are
     /// resolved beneath `host_working_directory`; when absent, file imports
     /// remain explicit ERROR_FILE_NOT_FOUND results rather than touching the
@@ -346,6 +406,7 @@ pub const RunResult = struct {
     rip: u64,
     graphics: elf.WindowsGraphicsSnapshot,
     windows_import_calls: u64,
+    windows_import_contract_calls: u64,
     windows_degraded_import_calls: u64,
     windows_unknown_import_calls: u64,
     windows_unknown_imports_fatal: bool,
@@ -628,13 +689,34 @@ pub fn preflight(allocator: std.mem.Allocator, bytes: []const u8, image: *const 
                         report.graphics_imports += 1;
                         report.supported_imports += 1;
                     },
+                    .contract => {
+                        report.contract_imports += 1;
+                        const fallback = windows_runtime.importFallbackFor(descriptor.dll_name, descriptor.function_name);
+                        const zero_lies = fallback.convention.zeroMeansSuccess() and fallback.outcome == .refused;
+                        if (zero_lies) report.degraded_zero_means_success += 1;
+                        report.noteDegradedDll(descriptor.dll_name, zero_lies);
+                        // Only sample the names where zero would have been
+                        // read as success.  Sampling alphabetically filled
+                        // the window with imports whose contract was already
+                        // an honest refusal and pushed the interesting ones
+                        // out of it.
+                        if (zero_lies and report.degraded_import_sample_count < degraded_import_sample_capacity) {
+                            report.degraded_import_samples[report.degraded_import_sample_count].set(descriptor);
+                            report.degraded_import_sample_count += 1;
+                        }
+                    },
                     .degraded => {
                         report.degraded_imports += 1;
                         const fallback = windows_runtime.importFallbackFor(descriptor.dll_name, descriptor.function_name);
                         const zero_lies = fallback.convention.zeroMeansSuccess() and fallback.outcome == .refused;
                         if (zero_lies) report.degraded_zero_means_success += 1;
                         report.noteDegradedDll(descriptor.dll_name, zero_lies);
-                        if (report.degraded_import_sample_count < degraded_import_sample_capacity) {
+                        // Only sample the names where zero would have been
+                        // read as success.  Sampling alphabetically filled
+                        // the window with imports whose fallback was already
+                        // an honest failure and pushed the interesting ones
+                        // out of it.
+                        if (zero_lies and report.degraded_import_sample_count < degraded_import_sample_capacity) {
                             report.degraded_import_samples[report.degraded_import_sample_count].set(descriptor);
                             report.degraded_import_sample_count += 1;
                         }
@@ -758,12 +840,12 @@ pub fn formatPreflight(buffer: []u8, report: PreflightReport) []const u8 {
     ) catch return "pe64_preflight = formatting_failed\n";
     const second = std.fmt.bufPrint(
         buffer[first.len..],
-        "import_classes(core/graphics/degraded/supported/unsupported) = {}/{}/{}/{}/{}\npreflight_complete = {}\nfirst_unsupported_import = {s}!{s}\nfeatures(vex/evex/avx2/avx512/bmi/fma) = {}/{}/{}/{}/{}/{}\n",
+        "import_classes(core/graphics/contract/degraded/unsupported) = {}/{}/{}/{}/{}\npreflight_complete = {}\nfirst_unsupported_import = {s}!{s}\nfeatures(vex/evex/avx2/avx512/bmi/fma) = {}/{}/{}/{}/{}/{}\n",
         .{
             report.core_imports,
             report.graphics_imports,
+            report.contract_imports,
             report.degraded_imports,
-            report.supported_imports,
             report.unsupported_imports,
             report.complete(),
             report.first_unsupported_dll orelse "<none>",
@@ -777,50 +859,69 @@ pub fn formatPreflight(buffer: []u8, report: PreflightReport) []const u8 {
         },
     ) catch return "pe64_preflight = formatting_failed\n";
     var used = first.len + second.len;
+    // Everything below is collapsed to what a reader has to act on. Catalogued
+    // DLL names have an explicit ABI contract even when the host
+    // cannot provide an optional Windows service. The total remains visible,
+    // the run ledger names any contract refusal that was actually taken.
     const note = std.fmt.bufPrint(
         buffer[used..],
-        "degraded_import_meaning = a name in Rosette's Win32/UCRT inventory that has no stateful implementation yet; it completes through the ABI return contract. This is a static eligibility count, not a count of failures -- most are never called. The run log's DEGRADED IMPORTS block lists the ones a run actually took.\ndegraded_imports_zero_would_have_claimed_success = {d}\ndegraded_import_dlls = {d}\n",
-        .{ report.degraded_zero_means_success, report.degraded_import_dll_count },
+        "import_contract_inventory = every listed name has an explicit per-DLL Rosetta ABI contract; this is a static inventory, not a count of runtime failures.\nimport_contract_dlls = {d}\nimport_contracts_zero_would_have_claimed_success = {d}\n",
+        .{ report.degraded_import_dll_count, report.degraded_zero_means_success },
     ) catch return "pe64_preflight = formatting_failed\n";
     used += note.len;
-    for (report.degraded_import_dlls[0..report.degraded_import_dll_count], 0..) |record, index| {
-        const line = std.fmt.bufPrint(
-            buffer[used..],
-            "degraded_import_dll[{d}] = {s} count={d} zero_would_have_claimed_success={d}\n",
-            .{ index, record.dllName(), record.count, record.zero_means_success },
-        ) catch return "pe64_preflight = formatting_failed\n";
-        used += line.len;
+    if (report.degraded_zero_means_success != 0) {
+        for (report.degraded_import_dlls[0..report.degraded_import_dll_count]) |record| {
+            if (record.zero_means_success == 0) continue;
+            const line = std.fmt.bufPrint(
+                buffer[used..],
+                "contract_import_dll = {s} [{s}] count={d} zero_would_have_claimed_success={d}\n",
+                .{
+                    record.dllName(),
+                    windows_runtime.importSubsystemFor(record.dllName()).label(),
+                    record.count,
+                    record.zero_means_success,
+                },
+            ) catch return "pe64_preflight = formatting_failed\n";
+            used += line.len;
+        }
     }
     if (report.degraded_import_dll_overflow != 0) {
         const line = std.fmt.bufPrint(
             buffer[used..],
-            "degraded_import_dll_overflow = {d}\n",
+            "contract_import_dll_overflow = {d}\n",
             .{report.degraded_import_dll_overflow},
         ) catch return "pe64_preflight = formatting_failed\n";
         used += line.len;
     }
-    const sample_header = std.fmt.bufPrint(
-        buffer[used..],
-        "degraded_import_samples_first_25 = {d}\n",
-        .{report.degraded_import_sample_count},
-    ) catch return "pe64_preflight = formatting_failed\n";
-    used += sample_header.len;
-    for (report.degraded_import_samples[0..report.degraded_import_sample_count], 0..) |sample, index| {
+    // Samples exist to show what a name is actually told.  A refusal that a
+    // guest can read and act on is the interesting case; a name whose
+    // fallback is an accurate success is not a problem to solve.
+    var listed: usize = 0;
+    for (report.degraded_import_samples[0..report.degraded_import_sample_count]) |sample| {
         const fallback = windows_runtime.importFallbackFor(sample.dllName(), sample.functionName());
+        if (fallback.outcome != .refused or !fallback.convention.zeroMeansSuccess()) continue;
+        if (listed == 0) {
+            const header = std.fmt.bufPrint(
+                buffer[used..],
+                "contract_import_samples = names whose ABI spells success with zero, so the contract supplies the refusal value instead\n",
+                .{},
+            ) catch return "pe64_preflight = formatting_failed\n";
+            used += header.len;
+        }
         const line = std.fmt.bufPrint(
             buffer[used..],
-            "degraded_import[{d}] = {s}!{s} iat_rva=0x{X:0>8} convention={s} returns=0x{X} outcome={s}\n",
+            "contract_import = {s}!{s} [{s}] iat_rva=0x{X:0>8} convention={s} returns=0x{X}\n",
             .{
-                index,
                 sample.dllName(),
                 sample.functionName(),
+                windows_runtime.importSubsystemForImport(sample.dllName(), sample.functionName()).label(),
                 sample.iat_rva,
                 @tagName(fallback.convention),
                 fallback.value,
-                @tagName(fallback.outcome),
             },
         ) catch return "pe64_preflight = formatting_failed\n";
         used += line.len;
+        listed += 1;
     }
     return buffer[0..used];
 }
@@ -838,6 +939,71 @@ fn writeByte(state: *elf.ElfState, address: u64, value: u8) !void {
 
 fn imageAddress(load_base: u64, rva: u32) !u64 {
     return std.math.add(u64, load_base, rva) catch error.AddressOverflow;
+}
+
+/// The state whose end-of-run summary an exit handler should write.
+///
+/// A single pointer rather than a registry: one PE runs per process. It is
+/// cleared before the state is destroyed, so a handler that fires afterwards
+/// finds nothing and says nothing.
+var exit_summary_state: ?*elf.ElfState = null;
+var exit_summary_written: bool = false;
+
+extern fn atexit(function: *const fn () callconv(.c) void) c_int;
+
+fn installExitSummary(state: *elf.ElfState) void {
+    exit_summary_state = state;
+    exit_summary_written = false;
+    _ = atexit(exitSummaryHandler);
+}
+
+fn clearExitSummary() void {
+    exit_summary_state = null;
+}
+
+fn exitSummaryHandler() callconv(.c) void {
+    reportExitSummary();
+}
+
+/// Write the end-of-run chains once, from whichever path gets here first.
+fn reportExitSummary() void {
+    if (exit_summary_written) return;
+    const state = exit_summary_state orelse return;
+    if (!state.windows_runtime_enabled) return;
+    exit_summary_written = true;
+    log.info("PE64 EXIT SUMMARY: writing the final chains at process exit (steps={d})", .{state.executed_steps});
+    state.reportFirstFrameChain();
+    state.reportGuestOutputChain();
+    state.reportGuestMilestones();
+    state.reportGuestThreads();
+    state.reportAudioChain();
+    state.reportWindowsDynamicRefusals();
+    state.reportWindowsMemoryContract();
+}
+
+/// The execution state's view of the symbol index.
+///
+/// The index lives here, in the loader, and the state holds only this
+/// function pointer. That keeps the dependency pointing from `src/tooling`
+/// into `lib` and never the other way, and it means a state built without a
+/// PE image simply has no resolver rather than a half-initialized one.
+fn resolveGuestSymbol(context: *const anyopaque, address: u64, buffer: []u8) ?elf.GuestSymbol {
+    const index: *const pe_symbols.Index = @ptrCast(@alignCast(context));
+    const symbol = index.lookup(address) orelse return null;
+    const readable = pe_symbols.simplify(symbol.name, buffer);
+    // `simplify` returns either a slice of `buffer` or the original mangled
+    // name, which points into the image and outlives this call either way.
+    return .{ .name = readable, .offset = symbol.offset };
+}
+
+/// The inverse lookup, for arming a tracepoint on a Xenia function by name.
+///
+/// The key is the mangled COFF spelling rather than the simplified one: a
+/// simplified name cannot separate overloads, and `IssueSwap` has four in
+/// this image.
+fn guestSymbolAddress(context: *const anyopaque, name: []const u8) ?u64 {
+    const index: *const pe_symbols.Index = @ptrCast(@alignCast(context));
+    return index.addressOf(name);
 }
 
 fn copyImage(state: *elf.ElfState, bytes: []const u8, image: *const parser.Image, load_base: u64) !void {
@@ -921,7 +1087,48 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
         sizes.total,
     });
     state.windows_entry_point = image_entry;
+    // Name the image before anything runs, so the very first diagnostic can
+    // already say which function a guest address is in. A PE with no symbol
+    // table produces an empty index and every report says `<unnamed>`; that
+    // is a normal state for a stripped release build and must not stop a run.
+    var symbol_index = pe_symbols.build(allocator, bytes, image, load_base) catch |err| blk: {
+        log.warn("PE64 guest symbols unavailable: {s}; guest addresses will be reported unnamed", .{@errorName(err)});
+        break :blk pe_symbols.Index{
+            .image = bytes,
+            .image_base = load_base,
+            .image_end = load_base,
+            .entries = &.{},
+            .skipped = 0,
+            .named_executable_bytes = 0,
+            .executable_bytes = 0,
+        };
+    };
+    defer symbol_index.deinit(allocator);
+    if (symbol_index.count() != 0) {
+        log.info("PE64 guest symbols: named={d} skipped={d} executable_coverage={d}% source=coff-symbol-table", .{
+            symbol_index.count(),
+            symbol_index.skipped,
+            symbol_index.coveragePercent(),
+        });
+    } else {
+        log.info("PE64 guest symbols: none; the image carries no COFF symbol table, so every reported guest address stays unnamed", .{});
+    }
+    state.installGuestSymbolResolver(
+        .{
+            .context = @ptrCast(&symbol_index),
+            .resolve = resolveGuestSymbol,
+            .address_of = guestSymbolAddress,
+        },
+        @intCast(@min(symbol_index.count(), std.math.maxInt(u32))),
+        symbol_index.coveragePercent(),
+    );
     try copyImage(&state, bytes, image, load_base);
+    const condition_entries = discoverWindowsConditionEntries(image, bytes, load_base);
+    state.configureWindowsConditionEntries(
+        condition_entries.wait,
+        condition_entries.signal,
+        condition_entries.broadcast,
+    );
 
     const thunk_base = state.image_high;
     const dynamic_relocations = try allocator.alloc(elf.DynamicRelocation, parsed_imports.descriptors.len);
@@ -956,6 +1163,7 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
     state.windows_launch_arguments = options.windows_arguments;
     state.windows_host_media_path = options.windows_media_path;
     state.windows_graphics.hooks = options.graphics_hooks;
+    state.windows_audio_hooks = options.audio_hooks;
     state.windows_utf8_find_any_of_entry = locateUtf8FindAnyOfEntry(image, bytes, load_base);
     if (state.windows_utf8_find_any_of_entry) |entry| {
         log.info("PE64 guest compatibility: recognized UTF-8 find_any_of entry=0x{x}; empty character sets will return npos", .{entry});
@@ -968,7 +1176,16 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
     state.regs.rsp = sentinel - 8;
     state.regs.rip = image_entry;
     state.regs.rflags = 2;
+    // The last block a run writes is the one that says which precondition it
+    // stopped at, and it is the block every run so far has thrown away. The
+    // 2026-09-12 run ended at step 237,163,779 with status 0 and no summary
+    // at all: the host process left through a path that does not unwind back
+    // to here, which closing the window does. `atexit` catches every exit
+    // that runs handlers, so the summary now survives that.
+    installExitSummary(&state);
+    defer clearExitSummary();
     state.runWithLimit(options.max_steps);
+    reportExitSummary();
 
     return .{
         .exit_code = state.exit_code,
@@ -978,6 +1195,7 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
         .rip = state.regs.rip,
         .graphics = state.windows_graphics.snapshot(),
         .windows_import_calls = state.windows_import_calls,
+        .windows_import_contract_calls = state.windows_import_contract_calls,
         .windows_degraded_import_calls = state.windows_degraded_import_calls,
         .windows_unknown_import_calls = state.windows_unknown_import_calls,
         .windows_unknown_imports_fatal = state.windows_unknown_imports_fatal,

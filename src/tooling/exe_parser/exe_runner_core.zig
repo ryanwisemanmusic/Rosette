@@ -17,6 +17,7 @@ const clr_runtime = @import("clr_runtime");
 const pe64_runtime = @import("pe64_runtime.zig");
 const elf_processor_state = @import("elf_processor_state");
 const native_windows_graphics = @import("native_windows_graphics");
+const native_windows_audio = @import("native_windows_audio");
 
 const image_scn_mem_execute: u32 = 0x2000_0000;
 
@@ -27,6 +28,7 @@ extern fn rosette_macho_native_application_ensure() c_int;
 extern fn rosette_macho_native_window_ensure(width: u32, height: u32, title: [*:0]const u8) c_int;
 extern fn rosette_macho_native_window_show() c_int;
 extern fn rosette_macho_native_window_pump_events() u32;
+extern fn rosette_macho_native_window_set_drawable_owner(owned_by_swapchain: c_int) c_int;
 
 fn nativeEnsureApplication(_: ?*anyopaque) callconv(.c) c_int {
     if (comptime builtin.target.os.tag != .macos) return 0;
@@ -81,6 +83,12 @@ fn nativeMetalLayerHostPointer(context: ?*anyopaque) callconv(.c) usize {
     return bridge.metalLayerHostPointer();
 }
 
+fn nativeMetalDrawableOwner(context: ?*anyopaque, owned_by_swapchain: c_int) callconv(.c) c_int {
+    _ = context;
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    return rosette_macho_native_window_set_drawable_owner(owned_by_swapchain);
+}
+
 fn nativeVulkanDispatch(
     context: ?*anyopaque,
     state_pointer: *anyopaque,
@@ -97,6 +105,96 @@ fn nativeVulkanDispatch(
     return if (bridge.dispatchVulkan(state, name, return_rip)) 1 else 0;
 }
 
+fn nativeReportPresentChain(context: ?*anyopaque) callconv(.c) void {
+    if (comptime builtin.target.os.tag != .macos) return;
+    const bridge = nativeGraphics(context) orelse return;
+    bridge.reportPresentChain();
+}
+
+fn nativeReportPresentChainFull(context: ?*anyopaque) callconv(.c) void {
+    if (comptime builtin.target.os.tag != .macos) return;
+    const bridge = nativeGraphics(context) orelse return;
+    bridge.reportPresentChainFull();
+}
+
+fn nativeUpdatePresentDiagnostics(
+    context: ?*anyopaque,
+    steps: u64,
+    rip: u64,
+    thread: u64,
+    operation: [*]const u8,
+    operation_length: usize,
+    frontier_is_bounded: c_int,
+) callconv(.c) void {
+    if (comptime builtin.target.os.tag != .macos) return;
+    const bridge = nativeGraphics(context) orelse return;
+    bridge.updateGuestProgress(steps, rip, thread, operation[0..operation_length], frontier_is_bounded != 0);
+}
+
+fn nativeAudio(context: ?*anyopaque) ?*native_windows_audio.NativeWindowsAudio {
+    const value = context orelse return null;
+    return @ptrCast(@alignCast(value));
+}
+
+fn nativeAudioOpen(
+    context: ?*anyopaque,
+    sample_rate: u32,
+    channels: u32,
+    bits_per_sample: u32,
+    is_float: c_int,
+) callconv(.c) c_int {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    const bridge = nativeAudio(context) orelse return 0;
+    return if (bridge.open(sample_rate, channels, bits_per_sample, is_float != 0)) 1 else 0;
+}
+
+fn nativeAudioSubmit(context: ?*anyopaque, data: [*]const u8, length: u32) callconv(.c) u32 {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    const bridge = nativeAudio(context) orelse return 0;
+    return bridge.submit(data[0..length]);
+}
+
+fn nativeAudioClose(context: ?*anyopaque) callconv(.c) void {
+    if (comptime builtin.target.os.tag != .macos) return;
+    const bridge = nativeAudio(context) orelse return;
+    bridge.close();
+}
+
+fn nativeAudioCallbacksServed(context: ?*anyopaque) callconv(.c) u64 {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    const bridge = nativeAudio(context) orelse return 0;
+    return bridge.status().callbacks_served;
+}
+
+fn nativeAudioTransferCounters(
+    context: ?*anyopaque,
+    played: *u64,
+    dropped: *u64,
+    underruns: *u64,
+) callconv(.c) void {
+    played.* = 0;
+    dropped.* = 0;
+    underruns.* = 0;
+    if (comptime builtin.target.os.tag != .macos) return;
+    const bridge = nativeAudio(context) orelse return;
+    const snapshot = bridge.status();
+    played.* = snapshot.played_bytes;
+    dropped.* = snapshot.dropped_bytes;
+    underruns.* = snapshot.underruns;
+}
+
+fn windowsAudioHooks(audio_context: ?*anyopaque) elf_processor_state.WindowsAudioHooks {
+    if (comptime builtin.target.os.tag != .macos) return .{};
+    return .{
+        .context = audio_context,
+        .open = nativeAudioOpen,
+        .submit = nativeAudioSubmit,
+        .close = nativeAudioClose,
+        .callbacks_served = nativeAudioCallbacksServed,
+        .transfer_counters = nativeAudioTransferCounters,
+    };
+}
+
 fn windowsGraphicsHooks(native_context: ?*anyopaque) pe64_runtime.GraphicsHooks {
     if (comptime builtin.target.os.tag != .macos) return .{};
     return .{
@@ -111,6 +209,10 @@ fn windowsGraphicsHooks(native_context: ?*anyopaque) pe64_runtime.GraphicsHooks 
         .native_presenter_present_diagnostic = nativePresenterDiagnostic,
         .native_vulkan_dispatch = nativeVulkanDispatch,
         .native_metal_layer_host_pointer = nativeMetalLayerHostPointer,
+        .native_metal_drawable_owner = nativeMetalDrawableOwner,
+        .report_present_chain = nativeReportPresentChain,
+        .report_present_chain_full = nativeReportPresentChainFull,
+        .update_present_diagnostics = nativeUpdatePresentDiagnostics,
     };
 }
 
@@ -680,32 +782,36 @@ pub fn runWithArguments(
         bootLog("7_pe64_preflight: proving the reachable x86-64 entry path");
         var pe64_report = try pe64_runtime.preflight(allocator, exe_bytes, &image);
         defer pe64_report.deinit(allocator);
-        // Keep the preflight report large enough for the bounded degraded
-        // import sample. The sample is intentionally detailed in the trace
+        // Keep the preflight report large enough for the bounded contract
+        // sample. The sample is intentionally detailed in the trace
         // file but remains a single startup block rather than per-call noise.
         var pe64_report_buf: [16 * 1024]u8 = undefined;
         trace.logText(pe64_runtime.formatPreflight(&pe64_report_buf, pe64_report));
-        std.debug.print("  PE64 preflight: {s} reachable={d} decoded={d} invalid={d} imports={d} degraded_imports={d} unsupported_imports={d} indirect={d}\n", .{
+        std.debug.print("  PE64 preflight: {s} reachable={d} decoded={d} invalid={d} imports={d} contract_imports={d} degraded_imports={d} unsupported_imports={d} indirect={d}\n", .{
             if (!pe64_report.ready()) "blocked" else if (pe64_report.complete()) "ready" else "ready_with_degraded_imports",
             pe64_report.reachable_instructions,
             pe64_report.decoded_instructions,
             pe64_report.invalid_instructions,
             pe64_report.imports,
+            pe64_report.contract_imports,
             pe64_report.degraded_imports,
             pe64_report.unsupported_imports,
             pe64_report.indirect_control_transfers,
         });
-        // The count alone reads as "416 broken imports".  Say which DLLs
-        // they belong to and how many of them a bare zero return would have
-        // told the guest had succeeded, so the number is actionable at a
-        // glance instead of alarming.
-        if (pe64_report.degraded_imports != 0) {
-            std.debug.print("  PE64 degraded-import inventory: dlls={d} zero_would_have_claimed_success={d} (static eligibility, not failures; the run log's DEGRADED IMPORTS block lists what was actually called)\n", .{
+        // The count alone reads as "hundreds of broken imports". Say how
+        // many of them a bare zero return would have told the guest had
+        // succeeded, and name only those DLLs -- a row of zeroes for the
+        // other packages buries the handful that matter.
+        if (pe64_report.contract_imports != 0 or pe64_report.degraded_imports != 0) {
+            std.debug.print("  PE64 import-contract inventory: contracts={d} degraded={d} dlls={d} zero_would_have_claimed_success={d} (every contract name is explicitly bound; the run log lists only contract refusals actually called)\n", .{
+                pe64_report.contract_imports,
+                pe64_report.degraded_imports,
                 pe64_report.degraded_import_dll_count,
                 pe64_report.degraded_zero_means_success,
             });
             for (pe64_report.degraded_import_dlls[0..pe64_report.degraded_import_dll_count]) |record| {
-                std.debug.print("    {s}: {d} (zero-means-success: {d})\n", .{ record.dllName(), record.count, record.zero_means_success });
+                if (record.zero_means_success == 0) continue;
+                std.debug.print("    {s}: {d} of {d} would have read as success\n", .{ record.dllName(), record.zero_means_success, record.count });
             }
         }
         if (!launch_allowed) {
@@ -762,6 +868,8 @@ pub fn runWithArguments(
         trace.logText(policy);
         var native_graphics = native_windows_graphics.NativeWindowsGraphics{};
         defer native_graphics.shutdown();
+        var native_audio = native_windows_audio.NativeWindowsAudio{};
+        defer native_audio.close();
         const result = pe64_runtime.loadAndRun(allocator, exe_bytes, &image, .{
             .max_steps = max_steps,
             .host_io = init.io,
@@ -769,6 +877,7 @@ pub fn runWithArguments(
             .windows_arguments = windows_args,
             .windows_media_path = absolute_media_path,
             .graphics_hooks = windowsGraphicsHooks(&native_graphics),
+            .audio_hooks = windowsAudioHooks(&native_audio),
         }) catch |err| {
             var error_buf: [256]u8 = undefined;
             const error_line = std.fmt.bufPrint(&error_buf, "pe64_execution_error = {s}\n", .{@errorName(err)}) catch "";
@@ -777,13 +886,14 @@ pub fn runWithArguments(
         };
         var result_buf: [1024]u8 = undefined;
         const graphics = result.graphics;
-        const result_line = try std.fmt.bufPrint(&result_buf, "pe64_execution_result = terminated={}; faulted={}; steps={d}; exit_code=0x{X}; rip=0x{X}; import_calls={d}; degraded_import_calls={d}; unknown_import_calls={d}; unknown_import_policy={s}; unique_unknown_imports={d}; file_opens={d}; file_reads={d}; file_writes={d}; file_failures={d}; rtl_capture_calls={d}; rtl_unwind_calls={d}\n", .{
+        const result_line = try std.fmt.bufPrint(&result_buf, "pe64_execution_result = terminated={}; faulted={}; steps={d}; exit_code=0x{X}; rip=0x{X}; import_calls={d}; import_contract_refusals={d}; unknown_import_refusal_calls={d}; unknown_import_calls={d}; unknown_import_policy={s}; unique_unknown_imports={d}; file_opens={d}; file_reads={d}; file_writes={d}; file_failures={d}; rtl_capture_calls={d}; rtl_unwind_calls={d}\n", .{
             result.terminated,
             result.faulted,
             result.executed_steps,
             result.exit_code,
             result.rip,
             result.windows_import_calls,
+            result.windows_import_contract_calls,
             result.windows_degraded_import_calls,
             result.windows_unknown_import_calls,
             pe64_runtime.unknownImportPolicyName(result.windows_unknown_imports_fatal),
@@ -827,7 +937,7 @@ pub fn runWithArguments(
         }
 
         var graphics_buf: [2048]u8 = undefined;
-        const graphics_line = try std.fmt.bufPrint(&graphics_buf, "pe64_graphics = phase={s}; contract_ready={}; window_ready={}; native_window_ready={}; native_window_visible={}; instance_ready={}; surface_ready={}; device_ready={}; queue_ready={}; swapchain_ready={}; frame_resources_ready={}; guest_present_observed={}; native_vulkan_forwarding={}; native_vulkan_calls={d}; native_vulkan_failures={d}; window={d}x{d}; calls={d}; proc_queries={d}; commands={d}; submits={d}; presents={d}; ordering_violations={d}; unmodeled_calls={d}; last_call={s}; last_failure={s}\n", .{
+        const graphics_line = try std.fmt.bufPrint(&graphics_buf, "pe64_graphics = phase={s}; contract_ready={}; window_ready={}; native_window_ready={}; native_window_visible={}; instance_ready={}; surface_ready={}; device_ready={}; queue_ready={}; swapchain_ready={}; frame_resources_ready={}; guest_present_observed={}; native_vulkan_forwarding={}; native_vulkan_calls={d}; native_vulkan_pre_ready_calls={d}; native_vulkan_failures={d}; window={d}x{d}; calls={d}; proc_queries={d}; commands={d}; submits={d}; presents={d}; ordering_violations={d}; unmodeled_calls={d}; last_call={s}; last_failure={s}\n", .{
             @tagName(graphics.phase),
             graphics.contractReady(),
             graphics.window_ready,
@@ -842,6 +952,7 @@ pub fn runWithArguments(
             graphics.guest_present_observed,
             graphics.native_vulkan_forwarding,
             graphics.native_vulkan_calls,
+            graphics.native_vulkan_pre_ready_calls,
             graphics.native_vulkan_failures,
             graphics.window_width,
             graphics.window_height,
@@ -857,7 +968,8 @@ pub fn runWithArguments(
         });
         trace.logText(graphics_line);
         var native_graphics_buf: [1024]u8 = undefined;
-        const native_graphics_line = try std.fmt.bufPrint(&native_graphics_buf, "pe64_graphics_native = presenter_started={}; presenter_ready={}; presenter_stage={d}; presenter_attempts={d}; presenter_failures={d}; diagnostic_attempts={d}; diagnostic_frames={d}; diagnostic_failures={d}\n", .{
+        const native_graphics_line = try std.fmt.bufPrint(&native_graphics_buf, "pe64_graphics_diagnostic_presenter = ownership={s}; presenter_started={}; presenter_ready={}; presenter_stage={d}; presenter_attempts={d}; presenter_failures={d}; diagnostic_attempts={d}; diagnostic_frames={d}; diagnostic_failures={d}\n", .{
+            if (graphics.native_vulkan_forwarding) "real_vulkan_forwarding" else "diagnostic_presenter",
             graphics.native_presenter_started,
             graphics.native_presenter_ready,
             graphics.native_presenter_stage,

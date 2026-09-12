@@ -112,6 +112,25 @@ pub const NativeWindowsGraphics = struct {
         return window.metal_layer;
     }
 
+    pub fn reportPresentChain(self: *NativeWindowsGraphics) void {
+        self.guest_vulkan.reportPresentChain();
+    }
+
+    pub fn reportPresentChainFull(self: *NativeWindowsGraphics) void {
+        self.guest_vulkan.reportPresentChainFull();
+    }
+
+    pub fn updateGuestProgress(
+        self: *NativeWindowsGraphics,
+        steps: u64,
+        rip: u64,
+        thread: u64,
+        operation: []const u8,
+        frontier_is_bounded: bool,
+    ) void {
+        self.guest_vulkan.updateGuestProgress(steps, rip, thread, operation, frontier_is_bounded);
+    }
+
     pub fn dispatchVulkan(self: *NativeWindowsGraphics, state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
         return self.guest_vulkan.dispatch(state, name, direct_return_rip);
     }
