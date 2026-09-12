@@ -447,6 +447,22 @@ pub fn build(b: *std.Build) void {
     // The reusable comptime rejection structure the phrase-matching packages
     // and the guest-log gate share. Declared first: several modules below
     // import it, directly or through a package.
+    // The AppKit window geometry the Vulkan forwarder and the guest-ABI window
+    // runtime both describe. One module so the two cannot drift on layout.
+    const window_geometry_mod = b.createModule(.{
+        .root_source_file = b.path("../lib/gpu/window_geometry.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // What a Vulkan command can put into the image it targets. The
+    // presentation chain asks this before it calls a presented frame content,
+    // so a frame built only from clears cannot read as a frame with a
+    // picture in it.
+    const frame_content_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/rosette/frame-content-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const phrase_filter_mod = b.createModule(.{
         .root_source_file = b.path("../pkg/common/text/phrase-filter/src/root.zig"),
         .target = target,
@@ -541,6 +557,40 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     xenia_fatal_condition_map_mod.addImport("phrase_filter", phrase_filter_mod);
+
+    // What a Xenia symbol name means, so a report can say what the guest is
+    // doing at an address rather than only where it is.
+    const xenia_guest_frontier_map_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/guest-frontier-map/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // The Xenia functions whose first entry answers a question no counter of
+    // Rosette's own surface can: whether the title ever produced a frame,
+    // ever asked for a swap, ever registered an audio client.
+    const xenia_guest_milestone_map_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/guest-milestone-map/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Fixed-address allocations used by Xenia's CPU thread contexts have a
+    // documented candidate sequence. This package owns that address policy;
+    // the ELF runtime owns the live backing and collision ledger.
+    const xenia_guest_address_map_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/guest-address-map/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Whether a Xenia warning-level line is a finding at all.
+    const xenia_warning_severity_map_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/warning-severity-map/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    xenia_warning_severity_map_mod.addImport("phrase_filter", phrase_filter_mod);
 
     // The host operations the emulator's behaviour rests on, and the
     // cross-subsystem orderings that break under translation. Both are
@@ -1416,6 +1466,8 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&b.addRunArtifact(xenia_prelaunch_audit_contract_test).step);
     const xenia_fatal_condition_map_test = b.addTest(.{ .root_module = xenia_fatal_condition_map_mod });
     check_step.dependOn(&b.addRunArtifact(xenia_fatal_condition_map_test).step);
+    const xenia_guest_address_map_test = b.addTest(.{ .root_module = xenia_guest_address_map_mod });
+    check_step.dependOn(&b.addRunArtifact(xenia_guest_address_map_test).step);
     const rosette_graphics_bridge_test = b.addTest(.{ .root_module = rosette_graphics_bridge_mod });
     check_step.dependOn(&b.addRunArtifact(rosette_graphics_bridge_test).step);
     const rosette_component_readiness_contract_test = b.addTest(.{ .root_module = rosette_component_readiness_contract_mod });
@@ -1966,21 +2018,26 @@ pub fn build(b: *std.Build) void {
         .{ .import_name = "dll_win32_api_ms_win_crt_time_l1_1_0", .root_source_file = "../pkg/dll/win32/api-ms-win-crt-time-l1-1-0/src/root.zig" },
         .{ .import_name = "dll_win32_api_ms_win_crt_utility_l1_1_0", .root_source_file = "../pkg/dll/win32/api-ms-win-crt-utility-l1-1-0/src/root.zig" },
         .{ .import_name = "dll_win32_bcrypt", .root_source_file = "../pkg/dll/win32/bcrypt/src/root.zig" },
+        .{ .import_name = "dll_win32_cfgmgr32", .root_source_file = "../pkg/dll/win32/cfgmgr32/src/root.zig" },
         .{ .import_name = "dll_win32_dwmapi", .root_source_file = "../pkg/dll/win32/dwmapi/src/root.zig" },
         .{ .import_name = "dll_win32_dxgi", .root_source_file = "../pkg/dll/win32/dxgi/src/root.zig" },
         .{ .import_name = "dll_win32_dynamic", .root_source_file = "../pkg/dll/win32/dynamic/src/root.zig" },
         .{ .import_name = "dll_win32_gdi32", .root_source_file = "../pkg/dll/win32/gdi32/src/root.zig" },
+        .{ .import_name = "dll_win32_hid", .root_source_file = "../pkg/dll/win32/hid/src/root.zig" },
         .{ .import_name = "dll_win32_imm32", .root_source_file = "../pkg/dll/win32/imm32/src/root.zig" },
+        .{ .import_name = "dll_win32_libusbk", .root_source_file = "../pkg/dll/win32/libusbk/src/root.zig" },
         .{ .import_name = "dll_win32_kernel32", .root_source_file = "../pkg/dll/win32/kernel32/src/root.zig" },
         .{ .import_name = "dll_win32_msvcrt", .root_source_file = "../pkg/dll/win32/msvcrt/src/root.zig" },
         .{ .import_name = "dll_win32_ole32", .root_source_file = "../pkg/dll/win32/ole32/src/root.zig" },
         .{ .import_name = "dll_win32_oleaut32", .root_source_file = "../pkg/dll/win32/oleaut32/src/root.zig" },
         .{ .import_name = "dll_win32_setupapi", .root_source_file = "../pkg/dll/win32/setupapi/src/root.zig" },
+        .{ .import_name = "dll_win32_shcore", .root_source_file = "../pkg/dll/win32/shcore/src/root.zig" },
         .{ .import_name = "dll_win32_shell32", .root_source_file = "../pkg/dll/win32/shell32/src/root.zig" },
         .{ .import_name = "dll_win32_shlwapi", .root_source_file = "../pkg/dll/win32/shlwapi/src/root.zig" },
         .{ .import_name = "dll_win32_user32", .root_source_file = "../pkg/dll/win32/user32/src/root.zig" },
         .{ .import_name = "dll_win32_version", .root_source_file = "../pkg/dll/win32/version/src/root.zig" },
         .{ .import_name = "dll_win32_winmm", .root_source_file = "../pkg/dll/win32/winmm/src/root.zig" },
+        .{ .import_name = "dll_win32_winusb", .root_source_file = "../pkg/dll/win32/winusb/src/root.zig" },
         .{ .import_name = "dll_win32_wsock32", .root_source_file = "../pkg/dll/win32/wsock32/src/root.zig" },
     };
     for (dll_win32_package_specs) |spec| {
@@ -2060,6 +2117,12 @@ pub fn build(b: *std.Build) void {
         elf_processor_mod.addImport("execution_history", execution_history_mod);
         elf_processor_mod.addImport("evex_runtime", evex_runtime_mod);
         elf_processor_mod.addImport("x86_vector_helpers", x86_vector_helpers_mod);
+        elf_processor_mod.addImport("xenia_fatal_condition_map", xenia_fatal_condition_map_mod);
+        elf_processor_mod.addImport("xenia_guest_frontier_map", xenia_guest_frontier_map_mod);
+        elf_processor_mod.addImport("xenia_warning_severity_map", xenia_warning_severity_map_mod);
+        elf_processor_mod.addImport("xenia_guest_milestone_map", xenia_guest_milestone_map_mod);
+        elf_processor_mod.addImport("xenia_guest_address_map", xenia_guest_address_map_mod);
+        elf_processor_mod.addImport("frame_content_contract", frame_content_contract_mod);
         const elf_processor = b.addExecutable(.{
             .name = "elf_processor",
             .root_module = elf_processor_mod,
@@ -2081,6 +2144,21 @@ pub fn build(b: *std.Build) void {
         elf_processor_test_mod.addImport("execution_history", execution_history_mod);
         elf_processor_test_mod.addImport("evex_runtime", evex_runtime_mod);
         elf_processor_test_mod.addImport("x86_vector_helpers", x86_vector_helpers_mod);
+        elf_processor_test_mod.addImport("xenia_fatal_condition_map", xenia_fatal_condition_map_mod);
+        elf_processor_test_mod.addImport("xenia_guest_frontier_map", xenia_guest_frontier_map_mod);
+        elf_processor_test_mod.addImport("xenia_warning_severity_map", xenia_warning_severity_map_mod);
+        elf_processor_test_mod.addImport("xenia_guest_milestone_map", xenia_guest_milestone_map_mod);
+        elf_processor_test_mod.addImport("xenia_guest_address_map", xenia_guest_address_map_mod);
+        elf_processor_test_mod.addImport("frame_content_contract", frame_content_contract_mod);
+        // Rooted so the frontier classification rules execute rather than
+        // only compile as the ELF processor's dependency. A shadowed rule is
+        // invisible at runtime and only shows up as a workload nobody names.
+        const xenia_guest_frontier_map_test = b.addTest(.{ .root_module = xenia_guest_frontier_map_mod });
+        check_step.dependOn(&b.addRunArtifact(xenia_guest_frontier_map_test).step);
+        const xenia_warning_severity_map_test = b.addTest(.{ .root_module = xenia_warning_severity_map_mod });
+        check_step.dependOn(&b.addRunArtifact(xenia_warning_severity_map_test).step);
+        const xenia_guest_milestone_map_test = b.addTest(.{ .root_module = xenia_guest_milestone_map_mod });
+        check_step.dependOn(&b.addRunArtifact(xenia_guest_milestone_map_test).step);
         const elf_processor_test = b.addTest(.{ .root_module = elf_processor_test_mod });
         check_step.dependOn(&b.addRunArtifact(elf_processor_test).step);
 
@@ -2539,6 +2617,12 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        gpu_mod.addImport("window_geometry", window_geometry_mod);
+        gpu_mod.addImport("frame_content_contract", frame_content_contract_mod);
+        const window_geometry_test = b.addTest(.{ .root_module = window_geometry_mod });
+        check_step.dependOn(&b.addRunArtifact(window_geometry_test).step);
+        const frame_content_contract_test = b.addTest(.{ .root_module = frame_content_contract_mod });
+        check_step.dependOn(&b.addRunArtifact(frame_content_contract_test).step);
         gpu_mod.addImport("device_tree", device_tree_mod);
         gpu_mod.addImport("xenos_register_map", xenos_register_map_mod);
         gpu_mod.addImport("xenia_vd_swap_contract", xenia_vd_swap_contract_mod);
@@ -2819,6 +2903,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         guest_abi_mod.addImport("event_log", event_log_mod);
+        // The window-to-compositor chain type is shared with the Vulkan
+        // forwarder, so both describe the same layout rather than each
+        // declaring its own copy of the AppKit geometry struct.
+        guest_abi_mod.addImport("window_geometry", window_geometry_mod);
         guest_abi_mod.addImport("libcpp_thread_abi", libcpp_thread_abi_mod);
         // The native window runtime is the surface Xenia forwards into, so it
         // is the layer that has to be able to say which forwardings Rosette has
