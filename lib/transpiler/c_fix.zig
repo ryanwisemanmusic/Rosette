@@ -177,19 +177,19 @@ fn appendDepoisonFixes(
 
         const is_statement_assignment = std.mem.indexOfScalar(u8, after, '=') != null and
             (std.mem.indexOfScalar(u8, after, '[') != null or
-             std.mem.indexOfScalar(u8, after, '.') != null or
-             std.mem.indexOf(u8, after, "->") != null or
-             std.mem.indexOf(u8, after, "++") != null or
-             std.mem.indexOf(u8, after, "--") != null or
-             std.mem.indexOf(u8, after, "|=") != null or
-             std.mem.indexOf(u8, after, "+=") != null or
-             std.mem.indexOf(u8, after, "-=") != null or
-             std.mem.indexOf(u8, after, "*=") != null or
-             std.mem.indexOf(u8, after, "/=") != null or
-             std.mem.indexOf(u8, after, "%=") != null or
-             std.mem.indexOf(u8, after, "BITS(") != null or
-             std.mem.indexOf(u8, after, "NEEDBITS(") != null or
-             std.mem.indexOf(u8, after, "DROPBITS(") != null);
+                std.mem.indexOfScalar(u8, after, '.') != null or
+                std.mem.indexOf(u8, after, "->") != null or
+                std.mem.indexOf(u8, after, "++") != null or
+                std.mem.indexOf(u8, after, "--") != null or
+                std.mem.indexOf(u8, after, "|=") != null or
+                std.mem.indexOf(u8, after, "+=") != null or
+                std.mem.indexOf(u8, after, "-=") != null or
+                std.mem.indexOf(u8, after, "*=") != null or
+                std.mem.indexOf(u8, after, "/=") != null or
+                std.mem.indexOf(u8, after, "%=") != null or
+                std.mem.indexOf(u8, after, "BITS(") != null or
+                std.mem.indexOf(u8, after, "NEEDBITS(") != null or
+                std.mem.indexOf(u8, after, "DROPBITS(") != null);
         if (!is_statement_assignment) continue;
 
         const rel = std.mem.indexOf(u8, line.text, marker) orelse continue;
@@ -441,6 +441,21 @@ fn isWideExpressionStart(tok: Token, source: []const u8) bool {
     return false;
 }
 
+fn isLikelyPointerReturningFunction(tok: Token, source: []const u8) bool {
+    if (tok.kind != .identifier) return false;
+    const slice = source[tok.start..tok.end];
+    const allocation_markers = [_][]const u8{
+        "alloc",
+        "calloc",
+        "malloc",
+        "realloc",
+    };
+    for (allocation_markers) |marker| {
+        if (std.mem.indexOf(u8, slice, marker) != null) return true;
+    }
+    return false;
+}
+
 fn skipToSemicolon(tokens: []const Token, start: usize) usize {
     var i = start;
     var depth: u32 = 0;
@@ -601,7 +616,9 @@ pub fn fixSourceWithOptions(
             if (i + 1 < tokens.len) {
                 const next = tokens[i + 1];
                 if (next.kind == .keyword_sizeof or isWideFunctionName(next, source) or
-                    (next.kind == .identifier and isWideExpressionStart(next, source)))
+                    (next.kind == .identifier and
+                        isWideExpressionStart(next, source) and
+                        !isLikelyPointerReturningFunction(next, source)))
                 {
                     const wrap_start = next.start;
                     const semi = skipToSemicolon(tokens, i + 1);
@@ -1580,7 +1597,7 @@ fn hasMaybeUnusedInsertion(edits: []const Edit, offset: usize) bool {
     for (edits) |edit| {
         if (edit.start == offset and edit.end == offset and
             (std.mem.eql(u8, edit.replacement, "[[maybe_unused]] ") or
-             std.mem.indexOf(u8, edit.replacement, "/* rosette-c-fix:") != null))
+                std.mem.indexOf(u8, edit.replacement, "/* rosette-c-fix:") != null))
         {
             return true;
         }
@@ -3080,6 +3097,16 @@ test "fix return sizeof" {
     var result = try fixSource(std.testing.allocator, src);
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.edits.items.len > 0);
+}
+
+test "no false positive on pointer allocation with size in its name" {
+    const src =
+        "AVMasteringDisplayMetadata *f(void) { " ++
+        "return av_mastering_display_metadata_alloc_size(NULL); " ++
+        "}";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
 }
 
 test "no false positive on size_t assignment" {
