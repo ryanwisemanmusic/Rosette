@@ -395,6 +395,8 @@ fn looksLikeArm64Assembly(assembly: []const u8) bool {
         "ldr",
         "str",
         "bsl",
+        "ext",
+        "tbl",
         "msub",
         "msr",
         "mrs",
