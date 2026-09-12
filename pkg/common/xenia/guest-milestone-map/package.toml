@@ -1,0 +1,14 @@
+name = "common-xenia-guest-milestone-map"
+version = "0.1.0-local"
+kind = "xenia-guest-milestone-symbol-map"
+role = "build-time"
+# Route-independent: Xenia's own function names do not change with the
+# architecture Rosette was compiled for.
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
+# The package names the Xenia functions whose first entry answers a question
+# a counter cannot: whether the title ever produced a video frame, ever asked
+# for a swap, ever registered an audio client. Resolving those names to
+# addresses, arming them, and counting entries stay in lib and src.
