@@ -1,0 +1,13 @@
+name = "common-xenia-guest-frontier-map"
+version = "0.1.0-local"
+kind = "xenia-guest-frontier-workload-map"
+role = "build-time"
+# Route-independent: Xenia's function names do not change with the
+# architecture Rosette was compiled for.
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
+# The package maps a symbol name to the work it represents and to the Xenia
+# thread that normally runs it. Whether an address was reached, how long it
+# has been there, and what a predictor does about it stay in lib's observers.
