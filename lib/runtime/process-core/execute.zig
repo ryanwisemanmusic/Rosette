@@ -2234,28 +2234,28 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
 
         .movzx_reg32_mem8 => {
             const val = if (d.is_reg_form)
-                self.regVal(d.src_reg, .bits8)
+                self.regOperandVal(d.src_reg, .bits8, d.src_high8)
             else
                 self.readMemVal(d.addr, .bits8);
             self.setReg(d.dst_reg, d.size, val);
         },
         .movzx_reg32_mem16 => {
             const val = if (d.is_reg_form)
-                self.regVal(d.src_reg, .bits16)
+                self.regOperandVal(d.src_reg, .bits16, d.src_high8)
             else
                 self.readMemVal(d.addr, .bits16);
             self.setReg(d.dst_reg, d.size, val);
         },
         .movsx_reg32_mem8 => {
             const val = if (d.is_reg_form)
-                self.regVal(d.src_reg, .bits8)
+                self.regOperandVal(d.src_reg, .bits8, d.src_high8)
             else
                 self.readMemVal(d.addr, .bits8);
             self.setReg(d.dst_reg, d.size, signExtend(val, .bits8, d.size));
         },
         .movsx_reg32_mem16 => {
             const val = if (d.is_reg_form)
-                self.regVal(d.src_reg, .bits16)
+                self.regOperandVal(d.src_reg, .bits16, d.src_high8)
             else
                 self.readMemVal(d.addr, .bits16);
             self.setReg(d.dst_reg, d.size, signExtend(val, .bits16, d.size));

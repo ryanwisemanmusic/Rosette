@@ -531,6 +531,21 @@ fn executeVblendps(self: anytype, d: DecodedInsn) void {
     writeVectorRegister(self, d.xmm_dst, maskedVector(self, d, computed, old, count, 4), count);
 }
 
+/// VBLENDPD selects whole doubles rather than singles, so it shares
+/// VBLENDPS's structure with a different lane width.
+fn executeVblendpd(self: anytype, d: DecodedInsn) void {
+    const count = vectorBytes(d);
+    const lhs = readVectorRegister(self, d.xmm_src);
+    const rhs = readRmOperand(self, d, count, 8, 8);
+    var computed = [_]u8{0} ** 64;
+    for (0..count / 8) |lane| {
+        const source = if (((d.imm >> @as(u6, @intCast(lane))) & 1) != 0) rhs else lhs;
+        @memcpy(computed[lane * 8 ..][0..8], source[lane * 8 ..][0..8]);
+    }
+    const old = readVectorRegister(self, d.xmm_dst);
+    writeVectorRegister(self, d.xmm_dst, maskedVector(self, d, computed, old, count, 8), count);
+}
+
 fn executeVshufpd(self: anytype, d: DecodedInsn) void {
     const count = vectorBytes(d);
     const lhs = readVectorRegister(self, d.xmm_src);
@@ -910,6 +925,7 @@ pub fn handles(op: Op) bool {
         .vpmuldq,
         .vpermd,
         .vblendps,
+        .vblendpd,
         .vshufpd,
         .vpermilps,
         .vpbroadcastw,
@@ -1353,6 +1369,7 @@ pub fn execute(self: anytype, d: DecodedInsn) void {
         .vpmuldq => executeVpmuldq(self, d),
         .vpermd => executeVpermd(self, d),
         .vblendps => executeVblendps(self, d),
+        .vblendpd => executeVblendpd(self, d),
         .vshufpd => executeVshufpd(self, d),
         .vpermilps => executeVpermilps(self, d),
         .vpbroadcastw, .vpbroadcastd, .vpbroadcastq => executeVpbroadcast(self, d),
