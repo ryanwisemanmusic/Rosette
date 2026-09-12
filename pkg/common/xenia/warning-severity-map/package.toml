@@ -1,0 +1,12 @@
+name = "common-xenia-warning-severity-map"
+version = "0.1.0-local"
+kind = "xenia-warning-severity-map"
+role = "build-time"
+# Route-independent: Xenia's log text does not change with the architecture
+# Rosette was compiled for.
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
+# The package says whether a Xenia warning-level line is a finding. Whether a
+# run acts on one, and how it is recorded, stays in lib's guest-output ledger.
