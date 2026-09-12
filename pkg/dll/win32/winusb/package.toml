@@ -1,0 +1,11 @@
+name = "dll-win32-winusb"
+version = "0.1.0-local"
+kind = "windows-dll-surface"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+
+# This package contains immutable import facts only, including which names
+# libusb requires as a whole list and which probe Rosetta refuses on purpose.
+# Runtime handlers and guest memory effects remain in
+# src/x64-ASM/windows_runtime.zig.
