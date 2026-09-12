@@ -500,7 +500,7 @@ fn logLsdaCallSitesForFrame(
     const instruction_offset = instruction -| lp_start;
 
     const symbol = state.metadata.nearestSymbol(frame.function_start);
-    const func_name = if (symbol) |s| s.name else "<unknown>";
+    const func_name = state.metadata.symbolLabelFor(symbol, frame.function_start);
     machoCapturePrint(
         "macho-processor:   [LSDA] func={s} lsda=0x{x} lp_start=0x{x} ip_offset=0x{x} type_enc=0x{x} cs_enc=0x{x}\n",
         .{ func_name, frame.lsda_address, lp_start, instruction_offset, type_encoding, call_site_encoding },
@@ -567,7 +567,7 @@ fn logLsdaCallSites(
     thrown_type: u64,
 ) void {
     const symbol = state.metadata.nearestSymbol(frame.function_start);
-    const func_name = if (symbol) |s| s.name else "<unknown>";
+    const func_name = state.metadata.symbolLabelFor(symbol, frame.function_start);
     machoCapturePrint(
         "macho-processor:   [LSDA] func={s} lp_start=0x{x} lp_enc=0x{x} type_enc=0x{x} type_table=0x{x} cs_enc=0x{x} cs_end=0x{x} ip_offset=0x{x}\n",
         .{ func_name, lp_start, lp_encoding, type_encoding, type_table, call_site_encoding, call_site_end, instruction_offset },
@@ -938,6 +938,14 @@ test "LSDA inspection distinguishes cleanup and typed catch landing pads" {
 
             pub fn nearestSymbol(_: @This(), _: u64) ?Symbol {
                 return null;
+            }
+
+            /// The fake resolves nothing, so every address is unsymbolized.
+            /// The real metadata separates that from "not in the image at
+            /// all"; this stub only has to satisfy the same call shape.
+            pub fn symbolLabelFor(_: @This(), symbol: ?Symbol, _: u64) []const u8 {
+                if (symbol) |resolved| return resolved.name;
+                return "<image:unsymbolized>";
             }
         };
 
