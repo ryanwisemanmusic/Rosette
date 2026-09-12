@@ -1,4 +1,5 @@
 const std = @import("std");
+const window_geometry = @import("window_geometry");
 const machoCapturePrint = @import("event_log").machoCapturePrint;
 const admission = @import("cocoa_window_admission_contract");
 
@@ -49,6 +50,19 @@ pub const Status = extern struct {
     on_main_thread: u8,
     reserved: [3]u8,
 };
+
+/// The on-screen chain, defined once in `lib/gpu/present_chain.zig` so the
+/// Vulkan forwarder and this runtime cannot disagree about its layout.
+pub const Geometry = window_geometry.Geometry;
+
+extern fn rosette_macho_native_window_describe(out: *Geometry) c_int;
+
+/// Read the on-screen chain. Returns null when there is no window to describe.
+pub fn describeWindow() ?Geometry {
+    var geometry: Geometry = .{};
+    if (rosette_macho_native_window_describe(&geometry) == 0) return null;
+    return geometry;
+}
 
 const NativeStatus = Status;
 
@@ -411,29 +425,33 @@ pub const Runtime = struct {
             std.mem.eql(u8, selector, "sharedApplication"))
         {
             self.objc_messages +|= 1;
-            return .{ .handled = .{
-                .value = if (self.ensureApplication()) APPLICATION_TOKEN else 0,
-                .action = "native NSApplication",
-                // Acquisition, not creation. `sharedApplication` reads as a factory
-                // in Objective-C and is nothing of the kind: it returns the fixed
-                // token for the NSApplication Rosette stood up before the guest
-                // ran. Classifying it as creation made the admission gate
-                // terminate the run on the very call that hands the window over.
-                .binding = .{ .facility = .application, .operation = .acquire },
-            } };
+            return .{
+                .handled = .{
+                    .value = if (self.ensureApplication()) APPLICATION_TOKEN else 0,
+                    .action = "native NSApplication",
+                    // Acquisition, not creation. `sharedApplication` reads as a factory
+                    // in Objective-C and is nothing of the kind: it returns the fixed
+                    // token for the NSApplication Rosette stood up before the guest
+                    // ran. Classifying it as creation made the admission gate
+                    // terminate the run on the very call that hands the window over.
+                    .binding = .{ .facility = .application, .operation = .acquire },
+                },
+            };
         }
         if (std.mem.eql(u8, receiver_class, "CAMetalLayer") and
             std.mem.eql(u8, selector, "layer"))
         {
             self.objc_messages +|= 1;
-            return .{ .handled = .{
-                .value = self.layerToken(),
-                .action = "native CAMetalLayer",
-                // `+[CAMetalLayer layer]` reaches `layerToken`, which runs
-                // `ensureWindow` and hands back a fixed token. Nothing new comes
-                // into existence here either.
-                .binding = .{ .facility = .layer, .operation = .acquire },
-            } };
+            return .{
+                .handled = .{
+                    .value = self.layerToken(),
+                    .action = "native CAMetalLayer",
+                    // `+[CAMetalLayer layer]` reaches `layerToken`, which runs
+                    // `ensureWindow` and hands back a fixed token. Nothing new comes
+                    // into existence here either.
+                    .binding = .{ .facility = .layer, .operation = .acquire },
+                },
+            };
         }
         if (!isNativeToken(receiver)) return .foreign;
         self.objc_messages +|= 1;
