@@ -262,6 +262,26 @@ pub const GpuControlledProgram = controlled_vectors.Program;
 pub const GpuControlledProgramConfig = controlled_vectors.ProgramConfig;
 pub const NativePresenter = vulkan.Presenter;
 pub const NativePresenterStage = vulkan.Stage;
+
+/// The window-to-compositor chain a presented pixel has to travel, and which
+/// link of it is the first that cannot carry a frame.
+const present_chain = @import("present_chain.zig");
+pub const PresentChain = present_chain.Chain;
+pub const PresentChainVerdict = present_chain.Verdict;
+pub const PresentChainOwner = present_chain.Owner;
+pub const PresentSwapchainRecord = present_chain.SwapchainRecord;
+pub const PresentTargetKind = present_chain.TargetKind;
+pub const PresentPixelEvidence = present_chain.PixelEvidence;
+/// What a Vulkan command can put into the image it targets. The forwarder
+/// classifies each command it forwards so a frame built only from clears is
+/// never counted as a frame that carried a picture.
+pub const PresentWriteKind = present_chain.WriteKind;
+pub const frame_content = present_chain.frame_content;
+pub const WindowGeometry = present_chain.Geometry;
+
+test {
+    _ = present_chain;
+}
 pub const NativeFrameSource = vulkan.Source;
 pub const Runtime = runtime.Runtime;
 pub const BridgeHealth = runtime.BridgeHealth;

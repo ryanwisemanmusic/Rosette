@@ -69,6 +69,7 @@ pub const Bridge = struct {
     boundary_trace_initialized: bool = false,
     boundary_trace_enabled: bool = false,
     boundary_trace_events: u64 = 0,
+    boundary_failure_events: u64 = 0,
 
     pub fn deinit(self: *Bridge) void {
         if (graphicsStateDumpEnabled() and self.forwarder.guest_proc_queries != 0) {
@@ -122,13 +123,20 @@ pub const Bridge = struct {
 
     fn shouldTraceBoundary(self: *Bridge, name: []const u8) bool {
         if (!self.boundaryTraceEnabled() or !boundaryTraceCandidate(name)) return false;
-        // vkUnmapMemory is the boundary most likely to be mistaken for a
-        // native hang because its loader lookup is often the last visible
-        // line. Keep every unmap, while sampling repetitive resource setup.
-        if (std.mem.eql(u8, name, "vkUnmapMemory")) return true;
         self.boundary_trace_events +|= 1;
         const event = self.boundary_trace_events;
-        return event <= 16 or (event & (event - 1)) == 0;
+        // Successful boundary traffic is sampled globally. A long-running
+        // title can issue millions of map/unmap/submit calls, so a successful
+        // call must never become one log line per call. Failures use their
+        // own bounded path below and are still visible even when sampling is
+        // disabled.
+        return event <= 8 or (event & (event - 1)) == 0;
+    }
+
+    fn shouldLogBoundaryFailure(self: *Bridge) bool {
+        self.boundary_failure_events +|= 1;
+        const event = self.boundary_failure_events;
+        return event <= 4 or (event & (event - 1)) == 0;
     }
 
     fn stateStep(state: anytype) u64 {
@@ -161,7 +169,7 @@ pub const Bridge = struct {
     }
 
     fn logBoundaryExit(self: *const Bridge, state: anytype, name: []const u8, call_id: u64, outcome: []const u8) void {
-        log.info("Vulkan boundary exit: call={d} name={s} outcome={s} result=0x{x} step={d} thread=0x{x} next_rip=0x{x} dispatches={d} failures={d} forwarder_calls={d} native_device={} native_surface={}", .{
+        log.info("Vulkan boundary exit: call={d} name={s} outcome={s} result=0x{x} step={d} thread=0x{x} next_rip=0x{x} args(rcx/rdx/r8/r9/rsp)=0x{x}/0x{x}/0x{x}/0x{x}/0x{x} dispatches={d} failures={d} forwarder_calls={d} native_device={} native_surface={}", .{
             call_id,
             name,
             outcome,
@@ -169,6 +177,11 @@ pub const Bridge = struct {
             stateStep(state),
             stateThread(state),
             state.regs.rip,
+            state.regs.rcx,
+            state.regs.rdx,
+            state.regs.r8,
+            state.regs.r9,
+            state.regs.rsp,
             self.dispatches,
             self.dispatch_failures,
             self.forwarder.vulkan_call_count,
@@ -177,8 +190,33 @@ pub const Bridge = struct {
         });
     }
 
-    /// Dispatch a Windows Vulkan import through the real Rosetta Vulkan
-    /// forwarder.  `false` means this adapter does not own the name, so the
+    /// Describe the window-to-compositor chain. Called on the run's periodic
+    /// checkpoint so a black window's evidence does not have to wait for the
+    /// run to end.
+    pub fn reportPresentChain(self: *Bridge) void {
+        self.forwarder.reportPresentChain(false);
+    }
+
+    /// Force the complete window/Vulkan/pixel snapshot at run termination.
+    /// Keeping this separate from the periodic callback prevents a healthy
+    /// run from repeating the same topology at every step checkpoint.
+    pub fn reportPresentChainFull(self: *Bridge) void {
+        self.forwarder.reportPresentChain(true);
+    }
+
+    pub fn updateGuestProgress(
+        self: *Bridge,
+        steps: u64,
+        rip: u64,
+        thread: u64,
+        operation: []const u8,
+        frontier_is_bounded: bool,
+    ) void {
+        self.forwarder.noteGuestExecutionProgress(steps, rip, thread, operation, frontier_is_bounded);
+    }
+
+    /// Dispatch a Windows Vulkan import through the real Rosette Vulkan
+    /// forwarder. `false` means this adapter does not own the name, so the
     /// normal Windows runtime may apply its explicit modelled path.
     pub fn dispatch(self: *Bridge, state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
         if (!owns(name)) return false;
@@ -189,7 +227,12 @@ pub const Bridge = struct {
         if (trace_boundary) {
             self.logBoundaryEnter(state, name, call_id, direct_return_rip);
         }
-        defer if (trace_boundary) self.logBoundaryExit(state, name, call_id, trace_outcome);
+        defer {
+            const failed = !std.mem.eql(u8, trace_outcome, "forwarded");
+            if (trace_boundary or (failed and self.shouldLogBoundaryFailure())) {
+                self.logBoundaryExit(state, name, call_id, trace_outcome);
+            }
+        }
 
         const library_token = self.ensureLibrary() orelse {
             self.dispatch_failures +|= 1;
@@ -327,7 +370,24 @@ fn noteNativeForwarding(state: anytype, name: []const u8, host_objects_ready: bo
 fn noteLogicalContract(state: anytype, name: []const u8, result: u64) void {
     const State = @TypeOf(state.*);
     if (comptime !@hasField(State, "windows_graphics")) return;
-    const ok = @as(u32, @truncate(result)) == 0;
+    // VkResult reserves negative values for failures; positive values such as
+    // VK_SUBOPTIMAL_KHR, VK_TIMEOUT, and VK_NOT_READY are still valid driver
+    // outcomes and must not inflate the native-failure ledger.
+    const vk_result: i32 = @bitCast(@as(u32, @truncate(result)));
+    const ok = vk_result >= 0;
+    // Only these entry points return VkResult.  Void commands leave rax
+    // unspecified, so treating its stale value as an error turns ordinary
+    // command traffic into a false native-failure count.
+    const result_bearing = std.mem.eql(u8, name, "vkCreateInstance") or
+        std.mem.eql(u8, name, "vkCreateWin32SurfaceKHR") or
+        std.mem.eql(u8, name, "vkCreateDevice") or
+        std.mem.eql(u8, name, "vkCreateSwapchainKHR") or
+        std.mem.eql(u8, name, "vkGetSwapchainImagesKHR") or
+        std.mem.eql(u8, name, "vkAcquireNextImageKHR") or
+        std.mem.eql(u8, name, "vkQueueSubmit") or
+        std.mem.eql(u8, name, "vkQueueSubmit2") or
+        std.mem.eql(u8, name, "vkQueuePresentKHR");
+    if (result_bearing) state.windows_graphics.noteNativeVulkanResult(name, ok);
     if (std.mem.eql(u8, name, "vkCreateInstance")) {
         _ = state.windows_graphics.noteCreateInstance(ok);
     } else if (std.mem.eql(u8, name, "vkCreateWin32SurfaceKHR")) {

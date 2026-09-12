@@ -24,6 +24,24 @@ pub const FrameAbsence = frame_source.Absence;
 pub const FrameProvenance = provenance.Ledger;
 pub const FrameClassification = provenance.Classification;
 pub const NativePresenter = vulkan.Presenter;
+
+const present_chain = @import("present_chain.zig");
+pub const PresentChain = present_chain.Chain;
+pub const PresentChainVerdict = present_chain.Verdict;
+pub const PresentChainOwner = present_chain.Owner;
+pub const PresentSwapchainRecord = present_chain.SwapchainRecord;
+pub const PresentTargetKind = present_chain.TargetKind;
+pub const PresentPixelEvidence = present_chain.PixelEvidence;
+/// What a Vulkan command can put into the image it targets. The forwarder
+/// classifies each command it forwards so a frame built only from clears is
+/// never counted as a frame that carried a picture.
+pub const PresentWriteKind = present_chain.WriteKind;
+pub const frame_content = present_chain.frame_content;
+pub const WindowGeometry = present_chain.Geometry;
+
+test {
+    _ = present_chain;
+}
 pub const NativePresenterStage = vulkan.Stage;
 pub const Runtime = runtime.Runtime;
 pub const HandshakeRequest = api.HandshakeRequest;
