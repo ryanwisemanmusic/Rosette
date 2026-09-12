@@ -1,0 +1,14 @@
+name = "common-rosette-frame-content-contract"
+version = "0.1.0-local"
+kind = "presented-frame-content-classification"
+role = "build-time"
+# Route-independent: what makes a presented frame carry a picture is a
+# property of the Vulkan command, not of the host architecture.
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
+# The package decides, for one command and for one frame's accumulated
+# writes, whether what reached the acquired swapchain image is a picture or a
+# flat fill. Counting presents, holding swapchain records, and choosing a
+# verdict stay in lib/gpu/present_chain.zig.
