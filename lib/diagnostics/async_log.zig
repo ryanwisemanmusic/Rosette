@@ -270,6 +270,16 @@ pub fn priorityOf(text: []const u8) Priority {
     if (containsAny(text, &.{ "CONTRACT:", "FRONTIER", "BLOCKER", "VERDICT", "verdict=", "finding=" })) {
         return .finding;
     }
+    // A host-boundary refusal is the reason behind a downstream verdict, and
+    // it is written while the guest is still logging at full rate - which is
+    // exactly when the ring is full. Leaving these `routine` is how a run can
+    // report "no Vulkan failures" in every counter while the guest reports a
+    // failed create: the counter came from the aggregate, and the one line
+    // that named the call was dropped. The volume is bounded by the number of
+    // distinct boundaries that can refuse, not by the length of the run.
+    if (containsAny(text, &.{ " FAILED:", " refused:", "refusing", "VkResult=" })) {
+        return .finding;
+    }
     return .routine;
 }
 
@@ -468,6 +478,25 @@ test "a crash line is classified critical and bypasses the ring" {
     try std.testing.expect(!Priority.finding.requiresSynchronousWrite());
 
     try std.testing.expectEqual(Priority.routine, priorityOf("ring watch armed: base=0x1fc9b000"));
+}
+
+test "a host-boundary refusal outranks routine so the reason survives a full ring" {
+    // These are the lines that name *which* call failed. A downstream verdict
+    // reports the consequence; without these the reader has the consequence
+    // and no cause, which is what a `no Vulkan failures` counter next to a
+    // guest-reported failed create looks like.
+    try std.testing.expectEqual(
+        Priority.finding,
+        priorityOf("macho-processor: vkCreateShaderModule FAILED: VkResult=-1 info=0x1473ca1d0"),
+    );
+    try std.testing.expectEqual(
+        Priority.finding,
+        priorityOf("macho-processor: REAL vkCreateImage refused: Vulkan resource provenance table exhausted"),
+    );
+    // Still droppable: forcing them synchronous would put the report path back
+    // into the guest's timing for a class of line that can repeat.
+    try std.testing.expect(!Priority.finding.requiresSynchronousWrite());
+    try std.testing.expect(Priority.finding.droppable());
 }
 
 test "concurrent producers neither lose nor duplicate a line" {
