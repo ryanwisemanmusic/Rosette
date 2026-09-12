@@ -352,7 +352,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
     }
 
     if (opcode2 == 0xB6 or opcode2 == 0xB7) {
-        return decodeMovzx(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
+        return decodeMovzx(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2, rex != 0);
     }
 
     if (opcode2 == 0xBC or opcode2 == 0xBD) {
@@ -381,7 +381,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
     }
 
     if (opcode2 == 0xBE or opcode2 == 0xBF) {
-        return decodeMovsx(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
+        return decodeMovsx(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2, rex != 0);
     }
 
     if (opcode2 == 0xC0 or opcode2 == 0xC1) {

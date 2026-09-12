@@ -943,7 +943,7 @@ pub fn decodeCmpxchg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bo
     return d;
 }
 
-pub fn decodeMovzx(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode2: u8) DecodedInsn {
+pub fn decodeMovzx(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode2: u8, has_rex: bool) DecodedInsn {
     var d = DecodedInsn{};
     var pos = start_pos + 1;
     if (pos >= bytes.len) return .{};
@@ -960,7 +960,12 @@ pub fn decodeMovzx(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
     } else {
         d.op = if (is_byte) .movzx_reg32_mem8 else .movzx_reg32_mem16;
         d.dst_reg = rm.reg;
-        d.src_reg = addressing.rmRegister(rm.addr);
+        const source: RegisterOperand = if (is_byte)
+            decodeRegister(modrm & 7, rex_b, true, has_rex)
+        else
+            .{ .id = addressing.rmRegister(rm.addr) };
+        d.src_reg = source.id;
+        d.src_high8 = source.high8;
         d.is_reg_form = true;
     }
     d.size = sz;
@@ -969,7 +974,7 @@ pub fn decodeMovzx(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
     return d;
 }
 
-pub fn decodeMovsx(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode2: u8) DecodedInsn {
+pub fn decodeMovsx(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode2: u8, has_rex: bool) DecodedInsn {
     var d = DecodedInsn{};
     var pos = start_pos + 1;
     if (pos >= bytes.len) return .{};
@@ -986,7 +991,12 @@ pub fn decodeMovsx(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
     } else {
         d.op = if (is_byte) .movsx_reg32_mem8 else .movsx_reg32_mem16;
         d.dst_reg = rm.reg;
-        d.src_reg = addressing.rmRegister(rm.addr);
+        const source: RegisterOperand = if (is_byte)
+            decodeRegister(modrm & 7, rex_b, true, has_rex)
+        else
+            .{ .id = addressing.rmRegister(rm.addr) };
+        d.src_reg = source.id;
+        d.src_high8 = source.high8;
         d.is_reg_form = true;
     }
     d.size = sz;
