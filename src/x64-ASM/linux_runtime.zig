@@ -19,6 +19,13 @@ pub const importFallbackAdvice = windows_runtime.importFallbackAdvice;
 pub const ImportSubsystem = windows_runtime.ImportSubsystem;
 pub const importSubsystemFor = windows_runtime.importSubsystemFor;
 pub const importSubsystemForImport = windows_runtime.importSubsystemForImport;
+/// Re-exported so the execution state can assert the module-name and
+/// availability rules without importing the Windows dispatcher directly; the
+/// state already reaches this module for the import contract.
+pub const windowsModuleNameLooksReadable = windows_runtime.windowsModuleNameLooksReadable;
+pub const windowsModuleAvailability = windows_runtime.windowsModuleAvailability;
+pub const windowsModuleUnavailableOnHost = windows_runtime.windowsModuleUnavailableOnHost;
+pub const isRecognizedDynamicImport = windows_runtime.isRecognizedDynamicImport;
 
 pub fn setupInitialStack(state: anytype, argv: []const []const u8) !void {
     const default_argv = [_][]const u8{"program"};

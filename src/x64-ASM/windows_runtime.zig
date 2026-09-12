@@ -23,6 +23,8 @@ pub const importFallbackAdvice = import_contract.advice;
 pub const ImportSubsystem = import_contract.Subsystem;
 pub const importSubsystemFor = import_contract.subsystemFor;
 pub const importSubsystemForImport = import_contract.subsystemForImport;
+pub const ModuleAvailability = import_contract.ModuleAvailability;
+pub const moduleAvailability = import_contract.moduleAvailability;
 
 // Win32's HWND_MESSAGE is the parent used for message-only helper windows.
 // It is not a real drawable window and must never be forwarded to AppKit.
@@ -38,6 +40,13 @@ const windows_guest_thread_service_slice: u64 = 10_000;
 // GDI surface Rosetta does not own.
 const rdw_invalidate: u32 = 0x0001;
 const rdw_validate: u32 = 0x0008;
+
+// CONFIGRET values from cfgmgr32.h. Zero is CR_SUCCESS, so none of the
+// refusals below may be spelled with it.
+const cr_success: u64 = 0x00000000;
+const cr_failure: u64 = 0x00000013;
+const cr_no_such_devinst: u64 = 0x0000000D;
+const cr_no_such_devnode: u64 = 0x0000000C;
 
 // MinGW's Windows CRT exposes wctype_t as the same bit-mask space used by
 // _pctype, rather than as an arbitrary host pointer. Keep those ABI values
@@ -133,10 +142,15 @@ const windows_setjmp_bytes: u64 = 96;
 pub const ImportClass = enum {
     core,
     graphics,
-    /// The ABI name belongs to a known Windows/UCRT subsystem, but Rosetta
-    /// currently supplies only a deterministic guest-side fallback for it.
-    /// Keeping this separate from `core` makes preflight honest while still
-    /// permitting an exploratory run to reach the first stateful contract.
+    /// The name is owned by one of Rosetta's per-DLL packages and has an
+    /// explicit ABI contract.  Some of these contracts are stateful (file,
+    /// wait, graphics and CRT paths); optional Windows-only facilities may
+    /// instead return their documented refusal.  They are still complete
+    /// import bindings: no unresolved or untyped zero-return path is used.
+    contract,
+    /// Reserved for a future inventory entry that is recognized but has not
+    /// yet been given even a typed import contract.  The current catalogue
+    /// must keep this at zero.
     degraded,
     unsupported,
 };
@@ -144,7 +158,7 @@ pub const ImportClass = enum {
 pub fn classifyImport(dll_name: []const u8, function_name: []const u8) ImportClass {
     if (isGraphicsImport(dll_name, function_name)) return .graphics;
     if (isKnownCoreImport(function_name)) return .core;
-    if (isKnownDegradedImport(dll_name, function_name)) return .degraded;
+    if (isKnownContractImport(dll_name, function_name)) return .contract;
     return .unsupported;
 }
 
@@ -163,8 +177,114 @@ pub fn isSupportedImport(dll_name: []const u8, function_name: []const u8) bool {
 ///
 /// The PE loader arms this only after recognizing the guest helper's machine
 /// code. No arbitrary guest address or host pointer is accepted here.
+fn completeGuestConditionCall(state: anytype) void {
+    state.regs.rax = 0;
+    // The internal MinGW pthread routines are entered by an ordinary guest
+    // CALL, so their return address is still at [RSP].  Completing the call
+    // before the routine's host semaphore loop is what makes the policy
+    // cooperative rather than a fake import return.
+    state.regs.rip = state.pop();
+}
+
 pub fn tryGuestCompatibility(state: anytype) bool {
     if (!state.windows_runtime_enabled) return false;
+
+    // Xenia's Windows PE often links MinGW's pthread implementation into the
+    // image.  Those routines do not pass through the import dispatcher, and
+    // their semaphore loop cannot block the single Rosetta host thread.  The
+    // PE intake publishes signature-discovered entry points so this remains
+    // valid when a rebuilt image moves the routines.
+    const State = @TypeOf(state.*);
+    if (comptime @hasField(State, "windows_pthread_cond_wait_entry") and
+        @hasDecl(State, "waitWindowsGuestCondition"))
+    {
+        const use_native_condition = if (comptime @hasField(State, "windows_pthread_cond_native"))
+            state.windows_pthread_cond_native
+        else
+            false;
+        if (!use_native_condition) if (state.windows_pthread_cond_wait_entry) |entry| {
+            if (state.regs.rip == entry) {
+                const result = state.waitWindowsGuestCondition(state.regs.rcx, state.regs.rdx);
+                state.windows_condition_hook_events +|= 1;
+                if (state.trace_windows_conditions and
+                    (state.windows_condition_hook_events <= 8 or
+                        (state.windows_condition_hook_events & (state.windows_condition_hook_events - 1)) == 0))
+                {
+                    log.info("PE64 condition hook: wait condition=0x{x} mutex=0x{x} result={s} thread=0x{x} step={d} blocked={d} unblocked={d}", .{
+                        state.regs.rcx,
+                        state.regs.rdx,
+                        @tagName(result),
+                        state.active_guest_thread,
+                        state.executed_steps,
+                        state.windows_thread_blocks,
+                        state.windows_thread_unblocks,
+                    });
+                }
+                switch (result) {
+                    .blocked => return true,
+                    .resumed, .invalid => {
+                        completeGuestConditionCall(state);
+                        return true;
+                    },
+                }
+            }
+        };
+    }
+    if (comptime @hasField(State, "windows_pthread_cond_signal_entry") and
+        @hasDecl(State, "signalWindowsGuestCondition"))
+    {
+        const use_native_condition = if (comptime @hasField(State, "windows_pthread_cond_native"))
+            state.windows_pthread_cond_native
+        else
+            false;
+        if (!use_native_condition) if (state.windows_pthread_cond_signal_entry) |entry| {
+            if (state.regs.rip == entry) {
+                const woken = state.signalWindowsGuestCondition(state.regs.rcx, false);
+                state.windows_condition_hook_events +|= 1;
+                if (state.trace_windows_conditions and
+                    (state.windows_condition_hook_events <= 8 or
+                        (state.windows_condition_hook_events & (state.windows_condition_hook_events - 1)) == 0))
+                {
+                    log.info("PE64 condition hook: signal condition=0x{x} woken={d} thread=0x{x} step={d}", .{
+                        state.regs.rcx,
+                        woken,
+                        state.active_guest_thread,
+                        state.executed_steps,
+                    });
+                }
+                completeGuestConditionCall(state);
+                return true;
+            }
+        };
+    }
+    if (comptime @hasField(State, "windows_pthread_cond_broadcast_entry") and
+        @hasDecl(State, "signalWindowsGuestCondition"))
+    {
+        const use_native_condition = if (comptime @hasField(State, "windows_pthread_cond_native"))
+            state.windows_pthread_cond_native
+        else
+            false;
+        if (!use_native_condition) if (state.windows_pthread_cond_broadcast_entry) |entry| {
+            if (state.regs.rip == entry) {
+                const woken = state.signalWindowsGuestCondition(state.regs.rcx, true);
+                state.windows_condition_hook_events +|= 1;
+                if (state.trace_windows_conditions and
+                    (state.windows_condition_hook_events <= 8 or
+                        (state.windows_condition_hook_events & (state.windows_condition_hook_events - 1)) == 0))
+                {
+                    log.info("PE64 condition hook: broadcast condition=0x{x} woken={d} thread=0x{x} step={d}", .{
+                        state.regs.rcx,
+                        woken,
+                        state.active_guest_thread,
+                        state.executed_steps,
+                    });
+                }
+                completeGuestConditionCall(state);
+                return true;
+            }
+        };
+    }
+
     const entry = state.windows_utf8_find_any_of_entry orelse return false;
     if (state.regs.rip != entry) return false;
 
@@ -228,6 +348,14 @@ fn isKnownCoreImport(name: []const u8) bool {
         "GetProcessHeap",
         "GetModuleHandleA",
         "GetModuleHandleW",
+        "ExitProcess",
+        "TerminateProcess",
+        "exit",
+        "_exit",
+        "_Exit",
+        "quick_exit",
+        "_cexit",
+        "_c_exit",
         "LoadLibraryA",
         "LoadLibraryW",
         "LoadLibraryExA",
@@ -388,6 +516,7 @@ fn isKnownCoreImport(name: []const u8) bool {
         // UCRT/MSVC stdio calls used by Xenia's Windows filesystem facade.
         // These are backed by the same confined handle table as CreateFile,
         // so FILE* values never contain host pointers.
+        "__acrt_iob_func",
         "fopen",
         "fopen64",
         "_wfopen",
@@ -415,10 +544,20 @@ fn isKnownCoreImport(name: []const u8) bool {
         "ferror",
         "feof",
         "fgetc",
+        "fputc",
+        "fputs",
         "fgets",
+        "putc",
+        "puts",
+        "putchar",
         "_filelengthi64",
         "_chsize_s",
         "_fileno",
+        "_stat64",
+        "_wstat64",
+        "__stat64",
+        "_fstat64",
+        "fstat64",
 
         // Win32 window/message entry points used by Xenia's UI shell.
         "RegisterClassA",
@@ -543,6 +682,10 @@ fn isKnownCoreImport(name: []const u8) bool {
         "GetSystemTimePreciseAsFileTime",
         "GetLocalTime",
         "GetSystemTime",
+        "_localtime64",
+        "asctime",
+        "_lock_file",
+        "_unlock_file",
         "YieldProcessor",
         "PauseProcessor",
         "GetNativeSystemInfo",
@@ -673,20 +816,19 @@ fn isKnownCoreImport(name: []const u8) bool {
 
 // These are the remaining imports emitted by the untouched Windows Xenia
 // build after the GNU C++ runtime is linked into the PE. They are genuine
-// names from the Win32/UCRT/MinGW ABI surface, but many still use the
-// deterministic fallback at the bottom of handleCore. Keeping an explicit
-// allow-list means a misspelled symbol or an import from an unrelated DLL
-// remains fatal; the degraded state is visible in preflight and runtime
-// counters instead of being silently treated as implemented.
-// Static degraded-import ownership lives in pkg/dll/win32/<dll>/
-// and is aggregated by the catalogue package. Keep runtime behavior below
-// separate from those immutable facts.
+// names from the Win32/UCRT/MinGW ABI surface. Each name is owned by a
+// per-DLL package and has an explicit return contract; a call that still
+// needs stateful behavior is recorded as a contract refusal, not silently
+// treated as an unresolved import.
+// Static import-contract ownership lives in pkg/dll/win32/<dll>/ and is
+// aggregated by the catalogue package. Keep runtime behavior below separate
+// from those immutable facts.
 
-fn isKnownDegradedImport(dll_name: []const u8, function_name: []const u8) bool {
+fn isKnownContractImport(dll_name: []const u8, function_name: []const u8) bool {
     // The static name inventory is split into one package per DLL. The
     // runtime keeps only this bridge; handler behavior and mutable run state
     // remain here in the executable-side module.
-    return import_contract.isDegradedImport(dll_name, function_name);
+    return import_contract.isContractImport(dll_name, function_name);
 }
 
 fn arg(state: anytype, index: usize, direct_return_rip: ?u64) u64 {
@@ -704,6 +846,45 @@ fn arg(state: anytype, index: usize, direct_return_rip: ?u64) u64 {
             return state.read64(base + (index - 4) * 8);
         },
     };
+}
+
+/// The frequency Rosetta reports for its guest performance counter.
+fn windowsGuestClockHz(state: anytype) u64 {
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "windowsGuestClockHz")) {
+        return state.windowsGuestClockHz();
+    }
+    return 1_000_000;
+}
+
+/// A fixed, plausible wall-clock base for the guest, as a FILETIME.
+///
+/// 2026-01-01T00:00:00Z in 100-nanosecond intervals since 1601-01-01. Fixed
+/// rather than read from the host so a run is reproducible: the guest's sense
+/// of "now" advances with the guest clock and nothing else.
+const WINDOWS_GUEST_FILETIME_BASE: u64 = 134_116_992_000_000_000;
+
+/// The guest's wall clock as a Win32 FILETIME.
+fn windowsGuestFileTime(state: anytype) u64 {
+    const ticks = windowsGuestClockTicks(state);
+    const hz = windowsGuestClockHz(state);
+    if (hz == 0) return WINDOWS_GUEST_FILETIME_BASE;
+    // FILETIME counts 10,000,000 units a second; the guest clock counts `hz`.
+    const seconds = ticks / hz;
+    const remainder = ticks % hz;
+    return WINDOWS_GUEST_FILETIME_BASE +|
+        (seconds *| 10_000_000) +|
+        (remainder *| 10_000_000 / hz);
+}
+
+fn windowsGuestClockTicks(state: anytype) u64 {
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "windowsGuestClockTicks")) {
+        return state.windowsGuestClockTicks();
+    }
+    // Keep this module usable with the small test doubles used by the import
+    // contract tests. Real PE execution always supplies the shared clock.
+    return state.executed_steps;
 }
 
 /// Keep Vulkan bring-up diagnostics separate from the full Windows ABI trace.
@@ -770,6 +951,435 @@ fn primaryMonitorHandle(state: anytype) u64 {
 fn returnZero(state: anytype, direct_return_rip: ?u64) void {
     state.regs.rax = 0;
     finish(state, direct_return_rip);
+}
+
+const winmm_noerror: u64 = 0;
+const winmm_not_supported: u64 = 8; // MMSYSERR_NOTSUPPORTED
+const winmm_invalid_parameter: u64 = 11; // MMSYSERR_INVALPARAM
+const winmm_no_memory: u64 = 14; // MMSYSERR_NOMEM
+const winmm_wave_format_query: u64 = 1;
+const winmm_callback_function: u64 = 0x0003_0000;
+const winmm_whdr_done: u32 = 0x0000_0001;
+const winmm_whdr_prepared: u32 = 0x0000_0002;
+const winmm_whdr_inqueue: u32 = 0x0000_0010;
+const winmm_wom_done: u64 = 3;
+const winmm_wavehdr_bytes: u64 = 48;
+const winmm_waveformatex_bytes: u64 = 18;
+const winmm_waveoutcaps_bytes: u64 = 130; // WAVEOUTCAPS2W, including GUID fields
+
+fn traceWindowsAudioEvent(state: anytype, event: []const u8, handle: u64, address: u64, bytes: u64) void {
+    if (!state.trace_windows_audio) return;
+    const count = state.windows_audio_import_calls;
+    const power_of_two = count != 0 and (count & (count - 1)) == 0;
+    if (count <= 8 or power_of_two) {
+        log.info("Windows audio boundary: event={s} handle=0x{x} address=0x{x} bytes={d} step={d}", .{
+            event,
+            handle,
+            address,
+            bytes,
+            state.executed_steps,
+        });
+    }
+}
+
+fn windowsWaveOutDevice(state: anytype, handle: u64) ?*@TypeOf(state.windows_wave_out_devices[0]) {
+    for (&state.windows_wave_out_devices) |*device| {
+        if (device.opened and device.guest_handle == handle) return device;
+    }
+    return null;
+}
+
+fn windowsWaveFormatSupported(state: anytype, format: u64) bool {
+    if (format == 0 or state.guestMemoryConst(format, winmm_waveformatex_bytes) == null) return false;
+    const format_tag = state.read16(format + 0);
+    const channels = state.read16(format + 2);
+    const sample_rate = state.read32(format + 4);
+    const block_align = state.read16(format + 12);
+    const bits_per_sample = state.read16(format + 14);
+    if (format_tag != 1 and format_tag != 3) return false; // PCM or IEEE_FLOAT
+    if (channels == 0 or channels > 8) return false;
+    if (sample_rate < 8_000 or sample_rate > 192_000) return false;
+    if (bits_per_sample != 8 and bits_per_sample != 16 and bits_per_sample != 32) return false;
+    if (block_align == 0 or block_align != channels * @as(u16, @intCast(bits_per_sample / 8))) return false;
+    return state.read32(format + 8) >= sample_rate * block_align;
+}
+
+fn writeWindowsWaveOutCaps(state: anytype, caps: u64, size: u64) void {
+    if (caps == 0 or size == 0) return;
+    const bounded = @min(size, winmm_waveoutcaps_bytes);
+    const bounded_usize: usize = @intCast(bounded);
+    if (state.guestMemory(caps, bounded) == null) return;
+    if (bounded >= 4) state.write16(caps + 0, 0); // wMid
+    if (bounded >= 6) state.write16(caps + 2, 0); // wPid
+    if (bounded >= 8) state.write16(caps + 4, 1); // vDriverVersion
+    const product_name = "Rosetta Virtual Audio";
+    var index: usize = 0;
+    while (index < product_name.len and 6 + index * 2 + 2 <= bounded_usize) : (index += 1) {
+        state.write16(caps + @as(u64, @intCast(6 + index * 2)), product_name[index]);
+    }
+    if (6 + product_name.len * 2 + 2 <= bounded_usize) state.write16(caps + @as(u64, @intCast(6 + product_name.len * 2)), 0);
+    // dwFormats: every standard 11.025/22.05/44.1/48/96 kHz mono and stereo
+    // combination at 8 and 16 bits. Advertising only WAVE_FORMAT_1M08 said the
+    // device could do 11.025 kHz mono 8-bit and nothing else, while
+    // `windowsWaveFormatSupported` accepted 48 kHz stereo float - so a caller
+    // that consults the capabilities before opening was told the opposite of
+    // what an open would actually do.
+    if (bounded >= 74) state.write32(caps + 70, 0x000F_FFFF);
+    if (bounded >= 76) state.write16(caps + 74, 2); // wChannels
+    if (bounded >= 78) state.write16(caps + 76, 0); // wReserved1
+    if (bounded >= 82) state.write32(caps + 78, 0); // dwSupport
+}
+
+fn noteWindowsWaveBuffer(state: anytype, data: u64, length: u32) void {
+    state.windows_audio_last_data = data;
+    state.windows_audio_last_bytes = length;
+    state.windows_audio_bytes_submitted +|= length;
+    const inspect_length = @min(@as(u64, length), 1024 * 1024);
+    const bytes = if (data != 0 and inspect_length != 0) state.guestMemoryConst(data, inspect_length) else null;
+    if (length != 0 and bytes == null) return;
+    var checksum: u64 = 0xcbf2_9ce4_8422_2325;
+    var nonzero = false;
+    if (bytes) |sample| {
+        for (sample) |byte| {
+            checksum ^= byte;
+            checksum *%= 0x0000_0100_0000_01b3;
+            nonzero = nonzero or byte != 0;
+        }
+    }
+    state.windows_audio_last_checksum = checksum;
+    if (nonzero) state.windows_audio_nonzero_buffers +|= 1;
+}
+
+fn dispatchWindowsWaveOutCallback(state: anytype, device: anytype, header: u64, direct_return_rip: ?u64) bool {
+    if (device.callback == 0 or (device.open_flags & winmm_callback_function) != winmm_callback_function) return false;
+    if (state.addrToOffset(device.callback) == null) return false;
+    const return_rip = direct_return_rip orelse state.read64(state.regs.rsp);
+    if (return_rip == 0) return false;
+    if (!state.beginWindowsAudioCallback(return_rip, direct_return_rip != null)) return false;
+    state.regs.rcx = device.guest_handle;
+    state.regs.rdx = winmm_wom_done;
+    state.regs.r8 = device.instance;
+    state.regs.r9 = header;
+    state.regs.rip = device.callback;
+    state.windows_audio_callback_dispatches +|= 1;
+    return true;
+}
+
+fn handleWindowsMultimedia(state: anytype, dll_name: []const u8, name: []const u8, direct_return_rip: ?u64) bool {
+    if (!std.ascii.eqlIgnoreCase(dll_name, "WINMM.dll") and !std.ascii.eqlIgnoreCase(dll_name, "winmm")) return false;
+    state.windows_audio_import_calls +|= 1;
+
+    if (std.mem.eql(u8, name, "timeBeginPeriod") or std.mem.eql(u8, name, "timeEndPeriod")) {
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "PlaySoundW")) {
+        state.regs.rax = 0; // BOOL FALSE: no host sound-file player is claimed.
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "waveOutGetNumDevs")) {
+        state.regs.rax = 1; // One deterministic virtual output device.
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "waveInGetNumDevs")) {
+        state.regs.rax = 0; // Capture is not part of Xenia's output path.
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "waveOutGetDevCapsW")) {
+        writeWindowsWaveOutCaps(state, arg(state, 1, direct_return_rip), arg(state, 2, direct_return_rip));
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "waveOutGetErrorTextW")) {
+        const text = arg(state, 1, direct_return_rip);
+        const capacity = arg(state, 2, direct_return_rip);
+        if (text != 0 and capacity != 0 and state.guestMemory(text, 2) != null) state.write16(text, 0);
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "waveOutOpen")) {
+        const output_handle = arg(state, 0, direct_return_rip);
+        const format = arg(state, 2, direct_return_rip);
+        const callback = arg(state, 3, direct_return_rip);
+        const instance = arg(state, 4, direct_return_rip);
+        const flags = arg(state, 5, direct_return_rip);
+        const supported = windowsWaveFormatSupported(state, format);
+        if ((flags & winmm_wave_format_query) != 0) {
+            state.windows_audio_format_queries +|= 1;
+            if (!supported) state.windows_audio_format_rejections +|= 1;
+            state.regs.rax = if (supported) winmm_noerror else winmm_invalid_parameter;
+            traceWindowsAudioEvent(state, "waveOutFormatQuery", 0, format, winmm_waveformatex_bytes);
+            finish(state, direct_return_rip);
+            return true;
+        }
+        state.windows_audio_open_calls +|= 1;
+        if (!supported or output_handle == 0 or state.guestMemory(output_handle, 8) == null) {
+            state.windows_audio_format_rejections +|= @intFromBool(!supported);
+            state.regs.rax = if (!supported) winmm_invalid_parameter else winmm_no_memory;
+            finish(state, direct_return_rip);
+            return true;
+        }
+        var device: ?*@TypeOf(state.windows_wave_out_devices[0]) = null;
+        for (&state.windows_wave_out_devices) |*candidate| {
+            if (!candidate.opened) {
+                device = candidate;
+                break;
+            }
+        }
+        if (device == null) {
+            state.regs.rax = winmm_no_memory;
+            finish(state, direct_return_rip);
+            return true;
+        }
+        const handle = nextHandle(state);
+        const opened = device.?;
+        opened.* = .{
+            .guest_handle = handle,
+            .callback = callback,
+            .instance = instance,
+            .open_flags = flags,
+            .format_tag = state.read16(format + 0),
+            .channels = state.read16(format + 2),
+            .sample_rate = state.read32(format + 4),
+            .block_align = state.read16(format + 12),
+            .bits_per_sample = state.read16(format + 14),
+            .opened = true,
+            .paused = true,
+        };
+        state.write64(output_handle, handle);
+        state.windows_audio_open_successes +|= 1;
+        // Ask the host for a real device with the format the guest just
+        // negotiated. A refusal keeps the virtual sink; only the audio report
+        // changes, never the guest's view of the open.
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "openWindowsHostAudio")) {
+            // WAVE_FORMAT_IEEE_FLOAT is 3; WAVE_FORMAT_EXTENSIBLE (0xFFFE)
+            // carries the real sub-format, and SDL's WinMM backend only ever
+            // asks for plain PCM or float through this path.
+            const is_float = opened.format_tag == 3;
+            _ = state.openWindowsHostAudio(
+                opened.sample_rate,
+                opened.channels,
+                opened.bits_per_sample,
+                is_float,
+            );
+        }
+        traceWindowsAudioEvent(state, "waveOutOpen", handle, format, winmm_waveformatex_bytes);
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "waveOutPrepareHeader")) {
+        const handle = arg(state, 0, direct_return_rip);
+        const header = arg(state, 1, direct_return_rip);
+        const header_bytes = arg(state, 2, direct_return_rip);
+        const device = windowsWaveOutDevice(state, handle);
+        if (device == null or header_bytes < winmm_wavehdr_bytes or state.guestMemory(header, winmm_wavehdr_bytes) == null) {
+            state.regs.rax = winmm_invalid_parameter;
+            finish(state, direct_return_rip);
+            return true;
+        }
+        const flags = state.read32(header + 24);
+        if ((flags & winmm_whdr_prepared) == 0) {
+            state.write32(header + 24, (flags | winmm_whdr_prepared) & ~winmm_whdr_inqueue & ~winmm_whdr_done);
+            if (device.?.prepared_headers < std.math.maxInt(u32)) device.?.prepared_headers += 1;
+            for (&device.?.prepared_header_ptrs) |*slot| {
+                if (slot.* == 0) {
+                    slot.* = header;
+                    break;
+                }
+            }
+        }
+        state.windows_audio_prepare_calls +|= 1;
+        traceWindowsAudioEvent(state, "waveOutPrepareHeader", handle, header, header_bytes);
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "waveOutWrite")) {
+        const handle = arg(state, 0, direct_return_rip);
+        const header = arg(state, 1, direct_return_rip);
+        const header_bytes = arg(state, 2, direct_return_rip);
+        const device = windowsWaveOutDevice(state, handle);
+        if (device == null or header_bytes < winmm_wavehdr_bytes or state.guestMemory(header, winmm_wavehdr_bytes) == null) {
+            state.regs.rax = winmm_invalid_parameter;
+            finish(state, direct_return_rip);
+            return true;
+        }
+        const flags = state.read32(header + 24);
+        if ((flags & winmm_whdr_prepared) == 0) {
+            state.regs.rax = winmm_invalid_parameter;
+            finish(state, direct_return_rip);
+            return true;
+        }
+        const data = state.read64(header + 0);
+        const length = state.read32(header + 8);
+        state.write32(header + 24, (flags | winmm_whdr_inqueue) & ~winmm_whdr_done);
+        noteWindowsWaveBuffer(state, data, length);
+        {
+            const State = @TypeOf(state.*);
+            if (comptime @hasDecl(State, "submitWindowsHostAudio")) {
+                state.submitWindowsHostAudio(data, length);
+            }
+        }
+        state.windows_audio_write_calls +|= 1;
+        state.windows_audio_buffers_submitted +|= 1;
+        state.windows_audio_buffers_completed +|= 1;
+        device.?.submitted_buffers +|= 1;
+        // The virtual sink completes immediately.  This is deliberate: SDL's
+        // worker is waiting for WOM_DONE, and leaving the header queued would
+        // recreate the same scheduler deadlock we are trying to remove.
+        state.write32(header + 24, (flags | winmm_whdr_prepared | winmm_whdr_done) & ~winmm_whdr_inqueue);
+        traceWindowsAudioEvent(state, "waveOutWrite", handle, data, length);
+        if (dispatchWindowsWaveOutCallback(state, device.?, header, direct_return_rip)) return true;
+        if (device.?.callback != 0 and (device.?.open_flags & winmm_callback_function) == winmm_callback_function) {
+            state.windows_audio_callback_failures +|= 1;
+        }
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "waveOutReset")) {
+        const handle = arg(state, 0, direct_return_rip);
+        const device = windowsWaveOutDevice(state, handle);
+        if (device == null) {
+            state.regs.rax = winmm_invalid_parameter;
+            finish(state, direct_return_rip);
+            return true;
+        }
+        for (device.?.prepared_header_ptrs) |header| {
+            if (header != 0 and state.guestMemory(header, winmm_wavehdr_bytes) != null) {
+                const flags = state.read32(header + 24);
+                state.write32(header + 24, (flags | winmm_whdr_done) & ~winmm_whdr_inqueue);
+            }
+        }
+        device.?.paused = true;
+        state.windows_audio_reset_calls +|= 1;
+        traceWindowsAudioEvent(state, "waveOutReset", handle, 0, 0);
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "waveOutUnprepareHeader")) {
+        const handle = arg(state, 0, direct_return_rip);
+        const header = arg(state, 1, direct_return_rip);
+        const header_bytes = arg(state, 2, direct_return_rip);
+        const device = windowsWaveOutDevice(state, handle);
+        if (device == null or header_bytes < winmm_wavehdr_bytes or state.guestMemory(header, winmm_wavehdr_bytes) == null) {
+            state.regs.rax = winmm_invalid_parameter;
+            finish(state, direct_return_rip);
+            return true;
+        }
+        const flags = state.read32(header + 24);
+        if ((flags & winmm_whdr_inqueue) != 0) {
+            state.regs.rax = winmm_invalid_parameter;
+            finish(state, direct_return_rip);
+            return true;
+        }
+        state.write32(header + 24, flags & ~winmm_whdr_prepared & ~winmm_whdr_done);
+        if (device.?.prepared_headers != 0) device.?.prepared_headers -= 1;
+        for (&device.?.prepared_header_ptrs) |*slot| {
+            if (slot.* == header) slot.* = 0;
+        }
+        state.windows_audio_unprepare_calls +|= 1;
+        traceWindowsAudioEvent(state, "waveOutUnprepareHeader", handle, header, header_bytes);
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "waveOutClose")) {
+        const handle = arg(state, 0, direct_return_rip);
+        const device = windowsWaveOutDevice(state, handle);
+        if (device == null) {
+            state.regs.rax = winmm_invalid_parameter;
+            finish(state, direct_return_rip);
+            return true;
+        }
+        device.?.* = .{};
+        state.windows_audio_close_calls +|= 1;
+        {
+            const State = @TypeOf(state.*);
+            if (comptime @hasDecl(State, "closeWindowsHostAudio")) state.closeWindowsHostAudio();
+        }
+        traceWindowsAudioEvent(state, "waveOutClose", handle, 0, 0);
+        returnZero(state, direct_return_rip);
+    }
+
+    // Xenia's current output path does not use capture.  Fail those imports
+    // with the documented multimedia error instead of claiming an input
+    // device whose samples Rosetta cannot supply.
+    if (std.mem.startsWith(u8, name, "waveIn")) {
+        state.regs.rax = winmm_not_supported;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    return false;
+}
+
+const nt_status_success: u64 = 0x00000000;
+const nt_status_timeout: u64 = 0x00000102;
+const nt_status_invalid_handle: u64 = 0xC0000008;
+const nt_status_invalid_parameter: u64 = 0xC000000D;
+
+/// Convert the relative LARGE_INTEGER used by NtWaitForSingleObject into the
+/// millisecond form used by the shared synthetic wait policy. Xenia passes a
+/// null timeout for its ordinary infinite waits and a negative 100-ns
+/// interval for bounded waits. Absolute NT deadlines are not currently used
+/// by the Xenia startup path, so they are conservatively treated as a
+/// non-zero wait rather than being mistaken for an immediate timeout.
+fn ntWaitTimeoutMilliseconds(state: anytype, timeout_pointer: u64) ?u64 {
+    if (timeout_pointer == 0) return 0xFFFF_FFFF;
+    if (state.guestMemoryConst(timeout_pointer, 8) == null) return null;
+
+    const raw: i64 = @bitCast(state.read64(timeout_pointer));
+    if (raw == 0) return 0;
+    if (raw > 0) return 0xFFFF_FFFF;
+
+    const magnitude: u64 = @bitCast(raw);
+    const hundred_ns = (~magnitude) +| 1;
+    return @min((hundred_ns +| 9_999) / 10_000, @as(u64, 0xFFFF_FFFF));
+}
+
+fn finishNtWait(state: anytype, direct_return_rip: ?u64, handle: u64, timeout: u64) bool {
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "waitWindowsGuestObject")) {
+        switch (state.waitWindowsGuestObject(handle, timeout)) {
+            .blocked => return true,
+            .signaled, .yielded => {
+                state.regs.rax = nt_status_success;
+                finish(state, direct_return_rip);
+                return true;
+            },
+            .timeout => {
+                state.regs.rax = nt_status_timeout;
+                finish(state, direct_return_rip);
+                return true;
+            },
+            .invalid, .unknown => {
+                state.regs.rax = nt_status_invalid_handle;
+                finish(state, direct_return_rip);
+                return true;
+            },
+        }
+    }
+
+    // A non-PE state cannot expose the synthetic wait table, but the NT
+    // entry point is still a successful no-op for the shared import layer.
+    returnZero(state, direct_return_rip);
+    return true;
+}
+
+fn traceNtSynchronization(state: anytype, api: []const u8, handle: u64, known: bool, result: u64) void {
+    if (!state.trace_windows_waits) return;
+    state.windows_nt_sync_trace_events +|= 1;
+    const event = state.windows_nt_sync_trace_events;
+    if (event > 8 and (event & (event - 1)) != 0) return;
+    log.info("PE64 NT synchronization: api={s} handle=0x{x} known={} result=0x{x} step={d} event={d}", .{
+        api,
+        handle,
+        known,
+        result,
+        state.executed_steps,
+        event,
+    });
 }
 
 fn returnVulkan(state: anytype, result: i64, direct_return_rip: ?u64) void {
@@ -1133,14 +1743,145 @@ fn guestCString(state: anytype, address: u64) ?[]const u8 {
     return state.mem[start..end];
 }
 
-fn windowsModuleUnavailableOnHost(path: []const u8) bool {
+/// The file name of a module path, without its directory.
+pub fn windowsModuleBasename(path: []const u8) []const u8 {
     var basename_start: usize = 0;
     for (path, 0..) |character, index| {
         if (character == '\\' or character == '/') basename_start = index + 1;
     }
-    const basename = path[basename_start..];
-    return std.ascii.eqlIgnoreCase(basename, "D3D12.dll") or
-        std.ascii.eqlIgnoreCase(basename, "dxgi.dll");
+    return path[basename_start..];
+}
+
+/// Whether `LoadLibrary` must report this module as absent.
+///
+/// A successful `LoadLibrary` is a promise: the caller will immediately ask
+/// for exports and use whatever it gets. Rosetta models a bounded Win32
+/// surface, so the promise is only honest for libraries in that surface. The
+/// rule used to be a two-entry deny-list, which meant
+/// `LoadLibraryW(L"XAudio2_8.dll")` succeeded, `GetProcAddress` handed back a
+/// stub, and Xenia's XAudio2 driver then called `XAudio2Create` - whose
+/// unimplemented fallback returns zero, which is `S_OK` for an HRESULT. The
+/// driver read the interface pointer it had never been given and dereferenced
+/// a null vtable. Refusing the module up front is what Windows does for a DLL
+/// that is not installed, and every `LoadLibrary` caller already handles it.
+///
+/// `subsystemFor` is the allow-list: a library Rosetta's per-DLL packages do
+/// not own is not part of the modelled surface, whatever it is called.
+/// Whether a byte sequence read from guest memory plausibly *is* a module
+/// name.
+///
+/// A refusal decided from a misread name is the worst outcome available here:
+/// it takes a library the guest can legitimately load and reports it absent,
+/// and the log then blames a package that exists. The 2026-09-11 run recorded
+/// `module='0'D'` for a `LoadLibraryA`, which is not a module name in any
+/// spelling - so the read, not the library, is what failed.
+///
+/// Windows module names are printable, at least three characters, and made of
+/// path and identifier characters. Anything else means the pointer did not
+/// address a name, and Rosetta must not draw a conclusion from it.
+pub fn windowsModuleNameLooksReadable(name: []const u8) bool {
+    if (name.len < 3 or name.len > 260) return false;
+    var alphanumeric: usize = 0;
+    for (name) |character| {
+        if (character < 0x20 or character > 0x7E) return false;
+        switch (character) {
+            'A'...'Z', 'a'...'z', '0'...'9' => alphanumeric += 1,
+            '.', '_', '-', '+', ' ', '\\', '/', ':', '~' => {},
+            else => return false,
+        }
+    }
+    // A name that is almost all punctuation is not a name.
+    return alphanumeric * 2 >= name.len;
+}
+
+/// Whether a dynamic load of this module can be honoured, and if not, why.
+pub fn windowsModuleAvailability(path: []const u8) ModuleAvailability {
+    const basename = windowsModuleBasename(path);
+    return moduleAvailability(basename);
+}
+
+pub fn windowsModuleUnavailableOnHost(path: []const u8) bool {
+    const basename = windowsModuleBasename(path);
+    if (basename.len == 0) return false;
+    return moduleAvailability(basename) != .served;
+}
+
+/// Whether Rosetta can serve a name reached through `GetProcAddress`.
+///
+/// The two inventories below are the same ones the import dispatcher falls
+/// back through, so this predicate answers exactly "would a call to this name
+/// reach a handler or a typed contract refusal?" A name outside both would
+/// reach the permissive boundary, and the permissive boundary is the wrong
+/// answer to a question the guest asked explicitly.
+pub fn isRecognizedDynamicImport(dll_name: []const u8, function_name: []const u8) bool {
+    if (function_name.len == 0) return false;
+    // The graphics surface is the load-bearing case for this predicate.
+    // Xenia reaches its whole Vulkan path through
+    // `GetProcAddress(vulkan-1.dll, "vkGetInstanceProcAddr")` and then through
+    // that pointer for everything else; none of those names is in the Win32
+    // inventory, and answering NULL for them would end the run at
+    // "Failed to get Vulkan loader function pointers".
+    if (isGraphicsImport(dll_name, function_name)) return true;
+    if (isKnownCoreImport(function_name)) return true;
+    if (isKnownContractImport(dll_name, function_name)) return true;
+    // The catalogue keeps a name-only bucket for dynamic lookups whose module
+    // Rosetta could not attribute; consult it when the handle was not one
+    // this run recorded.
+    if (dll_name.len != 0 and isKnownContractImport("", function_name)) return true;
+    return false;
+}
+
+fn noteWindowsModuleHandle(state: anytype, handle: u64, module_name: []const u8) void {
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "noteWindowsLoadedModule")) {
+        state.noteWindowsLoadedModule(handle, module_name);
+    }
+}
+
+fn windowsModuleNameFor(state: anytype, handle: u64) []const u8 {
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "windowsLoadedModuleName")) {
+        return state.windowsLoadedModuleName(handle);
+    }
+    return "";
+}
+
+fn noteWindowsModuleRefusal(
+    state: anytype,
+    api: []const u8,
+    module_path: []const u8,
+    availability: ModuleAvailability,
+    caller_rip: u64,
+) void {
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "noteWindowsModuleRefusal")) {
+        state.noteWindowsModuleRefusal(api, module_path, availability.label(), availability.isGap(), caller_rip);
+    }
+}
+
+fn noteWindowsProcAddressRefusal(
+    state: anytype,
+    dll_name: []const u8,
+    function_name: []const u8,
+    caller_rip: u64,
+) void {
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "noteWindowsProcAddressRefusal")) {
+        state.noteWindowsProcAddressRefusal(dll_name, function_name, caller_rip);
+    }
+}
+
+fn noteWindowsUnreadableModuleName(
+    state: anytype,
+    api: []const u8,
+    raw: []const u8,
+    pointer: u64,
+    caller_rip: u64,
+) void {
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "noteWindowsUnreadableModuleName")) {
+        state.noteWindowsUnreadableModuleName(api, raw, pointer, caller_rip);
+    }
 }
 
 fn guestStdString(state: anytype, address: u64) ?[]const u8 {
@@ -1570,6 +2311,58 @@ fn cachedGuestEnvironmentStorage(state: anytype, wide: bool) u64 {
     return cachedGuestPointer(state, storage, cachedGuestEnvironment(state, wide));
 }
 
+/// Select the SDL audio backend that the confined Windows guest is allowed to
+/// see. SDL asks for `SDL_AUDIODRIVER` through its CRT `getenv` path before it
+/// tries the compiled-in Windows backends. Rosetta models WinMM and forwards
+/// it to CoreAudio; WASAPI and DirectSound are not equivalent host surfaces
+/// here, so letting SDL choose its normal Windows order would make a valid
+/// WinMM path look like an audio backend failure.
+///
+/// The launcher supplies `ROSETTE_PE64_SDL_AUDIO_DRIVER=winmm` explicitly,
+/// but keep the runtime default equally safe for callers that invoke the PE
+/// runner directly. `unset`, `default`, and `any` deliberately restore SDL's
+/// own driver selection for diagnostics.
+fn configuredSdlAudioDriver() ?[]const u8 {
+    const raw = std.c.getenv("ROSETTE_PE64_SDL_AUDIO_DRIVER") orelse
+        std.c.getenv("ROSETTA_PE64_SDL_AUDIO_DRIVER") orelse
+        return "winmm";
+    const value = std.mem.span(raw);
+    if (value.len == 0 or std.ascii.eqlIgnoreCase(value, "unset") or
+        std.ascii.eqlIgnoreCase(value, "default") or std.ascii.eqlIgnoreCase(value, "any"))
+    {
+        return null;
+    }
+    if (std.ascii.eqlIgnoreCase(value, "winmm")) return "winmm";
+    if (std.ascii.eqlIgnoreCase(value, "wasapi")) return "wasapi";
+    if (std.ascii.eqlIgnoreCase(value, "directsound") or std.ascii.eqlIgnoreCase(value, "dsound")) return "directsound";
+    // Do not expose an arbitrary host string to the guest. An unknown policy
+    // value falls back to SDL's normal selection, and the launcher header
+    // still preserves the exact operator-supplied value for diagnosis.
+    return null;
+}
+
+fn noteSdlAudioDriverQuery(state: anytype, value: ?[]const u8, source: []const u8) void {
+    const State = @TypeOf(state.*);
+    if (comptime @hasField(State, "windows_audio_environment_queries") and
+        @hasField(State, "windows_audio_environment_policy_reported") and
+        @hasField(State, "windows_audio_environment_driver") and
+        @hasField(State, "trace_windows_audio"))
+    {
+        state.windows_audio_environment_queries +|= 1;
+        if (!state.windows_audio_environment_policy_reported) {
+            state.windows_audio_environment_policy_reported = true;
+            state.windows_audio_environment_driver = value orelse "";
+            if (state.trace_windows_audio) {
+                log.info("PE64 audio policy: source={s} SDL_AUDIODRIVER={s} queries={d}", .{
+                    source,
+                    value orelse "<unset>",
+                    state.windows_audio_environment_queries,
+                });
+            }
+        }
+    }
+}
+
 fn environmentValue(name: []const u8) ?[]const u8 {
     if (std.ascii.eqlIgnoreCase(name, "TEMP") or std.ascii.eqlIgnoreCase(name, "TMP") or
         std.ascii.eqlIgnoreCase(name, "TMPDIR")) return "C:\\Temp";
@@ -1577,6 +2370,7 @@ fn environmentValue(name: []const u8) ?[]const u8 {
     if (std.ascii.eqlIgnoreCase(name, "HOME")) return "C:\\Users\\Rosetta";
     if (std.ascii.eqlIgnoreCase(name, "USERNAME")) return "Rosetta";
     if (std.ascii.eqlIgnoreCase(name, "PROCESSOR_ARCHITECTURE")) return "AMD64";
+    if (std.ascii.eqlIgnoreCase(name, "SDL_AUDIODRIVER")) return configuredSdlAudioDriver();
     return null;
 }
 
@@ -1609,9 +2403,13 @@ fn windowsErrorString(error_code: u64) []const u8 {
 }
 
 fn wideEnvironmentValue(state: anytype, address: u64) ?[]const u8 {
-    const names = [_][]const u8{ "TEMP", "TMP", "TMPDIR", "SystemRoot", "WINDIR", "HOME", "USERNAME", "PROCESSOR_ARCHITECTURE" };
+    const names = [_][]const u8{ "TEMP", "TMP", "TMPDIR", "SystemRoot", "WINDIR", "HOME", "USERNAME", "PROCESSOR_ARCHITECTURE", "SDL_AUDIODRIVER" };
     for (names) |name| {
-        if (guestWideEqualsLiteral(state, address, name)) return environmentValue(name);
+        if (guestWideEqualsLiteral(state, address, name)) {
+            const value = environmentValue(name);
+            if (std.mem.eql(u8, name, "SDL_AUDIODRIVER")) noteSdlAudioDriverQuery(state, value, "GetEnvironmentVariableW");
+            return value;
+        }
     }
     return null;
 }
@@ -1705,10 +2503,18 @@ fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
 fn traceWindowsPath(state: anytype, guest: []const u8, outcome: []const u8) void {
     const media_match = if (state.windows_host_media_path) |media_path| blk: {
         const media_name = std.fs.path.basename(media_path);
-        break :blk media_name.len != 0 and guest.len >= media_name.len and
+        const exact_match = media_name.len != 0 and guest.len >= media_name.len and
             std.ascii.eqlIgnoreCase(guest[guest.len - media_name.len ..], media_name) and
             (guest.len == media_name.len or guest[guest.len - media_name.len - 1] == '\\' or
                 guest[guest.len - media_name.len - 1] == '/');
+        const canonical_match = if (std.ascii.indexOfIgnoreCase(media_name, ".iso")) |iso_offset| blk2: {
+            const canonical_name = media_name[0 .. iso_offset + 4];
+            break :blk2 canonical_name.len != 0 and guest.len >= canonical_name.len and
+                std.ascii.eqlIgnoreCase(guest[guest.len - canonical_name.len ..], canonical_name) and
+                (guest.len == canonical_name.len or guest[guest.len - canonical_name.len - 1] == '\\' or
+                    guest[guest.len - canonical_name.len - 1] == '/');
+        } else false;
+        break :blk exact_match or canonical_match;
     } else false;
     if (media_match) {
         if (state.windows_media_path_trace_events >= 16) return;
@@ -1737,6 +2543,16 @@ fn guestPathToHost(state: anytype, address: u64, wide: bool, destination: []u8) 
 
     var path = value;
     if (startsWithIgnoreCase(path, "\\\\?\\")) path = path[4..];
+
+    // The Windows UI asks for FOLDERID_Fonts even though the PE is running
+    // on macOS.  Keep that path virtual and confined: the guest sees the
+    // ordinary Windows name, while file existence/open calls are redirected
+    // to a Japanese-capable font already installed on the host.  No Windows
+    // system directory is exposed to the guest by this exception.
+    if (windowsJapaneseFontHostPath(state, path, destination)) |mapped| {
+        traceWindowsPath(state, value, "authorized_host_font");
+        return mapped;
+    }
 
     var relative = path;
     // Windows APIs and the C++ filesystem layer are allowed to normalize a
@@ -1777,7 +2593,12 @@ fn guestPathToHost(state: anytype, address: u64, wide: bool, destination: []u8) 
     // access to the host volume containing it.
     if (state.windows_host_media_path) |media_path| {
         const media_name = std.fs.path.basename(media_path);
-        if (media_name.len != 0 and std.ascii.eqlIgnoreCase(relative, media_name)) {
+        const exact_match = media_name.len != 0 and std.ascii.eqlIgnoreCase(relative, media_name);
+        const canonical_match = if (std.ascii.indexOfIgnoreCase(media_name, ".iso")) |iso_offset| blk: {
+            const canonical_name = media_name[0 .. iso_offset + 4];
+            break :blk std.ascii.eqlIgnoreCase(relative, canonical_name);
+        } else false;
+        if (exact_match or canonical_match) {
             if (media_path.len > destination.len) return null;
             @memcpy(destination[0..media_path.len], media_path);
             traceWindowsPath(state, value, "authorized_media");
@@ -1823,6 +2644,69 @@ fn guestPathToHost(state: anytype, address: u64, wide: bool, destination: []u8) 
     }
     traceWindowsPath(state, value, "confined_root");
     return destination[0..written];
+}
+
+/// Whether the guest may see a CJK font at `C:\Windows\Fonts\msgothic.ttc`.
+///
+/// Handing Xenia a real CJK font is authentic - it is what a Windows machine
+/// with Japanese support does - but it is not free under translation. Xenia's
+/// ImGui drawer merges `GetGlyphRangesJapanese()` into the atlas and builds
+/// that atlas *twice*, at two font sizes, with 2x oversampling. The build runs
+/// on the UI thread, between the presenter acquiring a swapchain and the
+/// window's first paint, so nothing can be drawn until it finishes. On the
+/// 2026-09-11 run that put the guest inside `stbtt__run_charstring` for the
+/// entire remaining life of the process and produced a `no_presents` verdict
+/// against a presentation chain that was completely healthy.
+///
+/// So the mapping is opt-in. Off, Xenia takes the same path it takes on a
+/// Windows box without the font - it logs that Japanese characters will be
+/// boxes and builds an ASCII atlas in a fraction of the time. On, the run
+/// pays for the glyphs and the log says so up front.
+fn guestCjkFontEnabled() bool {
+    const raw = std.c.getenv("ROSETTE_XENIA_GUEST_CJK_FONT") orelse return false;
+    const value = std.mem.span(raw);
+    return std.mem.eql(u8, value, "1") or
+        std.ascii.eqlIgnoreCase(value, "true") or
+        std.ascii.eqlIgnoreCase(value, "yes");
+}
+
+fn windowsJapaneseFontHostPath(state: anytype, path: []const u8, destination: []u8) ?[]const u8 {
+    const prefix = "C:\\Windows\\Fonts\\";
+    if (!startsWithIgnoreCase(path, prefix)) return null;
+    if (!std.ascii.eqlIgnoreCase(path[prefix.len..], "msgothic.ttc")) return null;
+
+    const State = @TypeOf(state.*);
+    if (!guestCjkFontEnabled()) {
+        if (comptime @hasDecl(State, "noteGuestCjkFontDecision")) {
+            state.noteGuestCjkFontDecision(false, "");
+        }
+        return null;
+    }
+
+    // These are host-installed fonts with broad CJK coverage.  The first
+    // candidate is the normal macOS system font; the others cover machines
+    // whose system font names differ by macOS release or locale.  Only a
+    // successful stat is selected, so the PE never receives a path to a
+    // nonexistent file.
+    const candidates = [_][]const u8{
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+        "/Library/Fonts/Arial Unicode.ttf",
+    };
+    for (candidates) |candidate| {
+        if (hostStat(state, candidate) == null) continue;
+        if (candidate.len > destination.len) return null;
+        @memcpy(destination[0..candidate.len], candidate);
+        if (comptime @hasDecl(State, "noteGuestCjkFontDecision")) {
+            state.noteGuestCjkFontDecision(true, candidate);
+        }
+        return destination[0..candidate.len];
+    }
+    if (comptime @hasDecl(State, "noteGuestCjkFontDecision")) {
+        state.noteGuestCjkFontDecision(false, "no host CJK font matched");
+    }
+    return null;
 }
 
 fn hostOpenFile(state: anytype, path: []const u8, mode: std.Io.Dir.OpenFileOptions.Mode) ?std.Io.File {
@@ -1950,6 +2834,54 @@ fn installWindowsFile(
     return null;
 }
 
+/// Materialize one of the three CRT standard streams as an ordinary
+/// synthetic FILE* slot.  `__acrt_iob_func` returns a FILE pointer, not a
+/// Windows HANDLE, so allocating guest memory without registering the value
+/// in `windows_files` makes every subsequent fwrite/fflush report
+/// ERROR_INVALID_HANDLE.  The host descriptor is borrowed and remains owned
+/// by the Rosetta runner.
+fn installWindowsStandardStream(state: anytype, index: u64) ?u64 {
+    if (index >= 3) return null;
+    const stream_index: usize = @intCast(index);
+    if (state.windows_acrt_iob_storage[stream_index] != 0) {
+        return state.windows_acrt_iob_storage[stream_index];
+    }
+
+    var destination: ?*@TypeOf(state.windows_files[0]) = null;
+    for (&state.windows_files) |*candidate| {
+        if (candidate.file == null) {
+            destination = candidate;
+            break;
+        }
+    }
+    const slot = destination orelse return null;
+    const guest_file = state.guestAlloc(64, 8) orelse return null;
+    const host_file = switch (stream_index) {
+        0 => std.Io.File.stdin(),
+        1 => std.Io.File.stdout(),
+        2 => std.Io.File.stderr(),
+        else => unreachable,
+    };
+    slot.* = .{
+        .guest_handle = guest_file,
+        .stdio_fd = @intCast(stream_index),
+        .file = host_file,
+        .readable = stream_index == 0,
+        .writable = stream_index != 0,
+        .standard_stream = @intCast(stream_index),
+    };
+    // Keep the guest object non-null and deterministic if the CRT inspects
+    // the first word, without exposing the native stdio descriptor.
+    state.write64(guest_file, 0);
+    state.windows_acrt_iob_storage[stream_index] = guest_file;
+    log.info("Windows CRT stdio stream installed: index={d} FILE=0x{x} borrowed_fd={d}", .{
+        stream_index,
+        guest_file,
+        host_file.handle,
+    });
+    return guest_file;
+}
+
 fn windowsFileSlot(state: anytype, handle: u64) ?*@TypeOf(state.windows_files[0]) {
     for (&state.windows_files) |*slot| {
         if (slot.file != null and slot.guest_handle == handle) return slot;
@@ -1959,6 +2891,10 @@ fn windowsFileSlot(state: anytype, handle: u64) ?*@TypeOf(state.windows_files[0]
 
 fn closeWindowsFile(state: anytype, handle: u64) bool {
     const slot = windowsFileSlot(state, handle) orelse return false;
+    // CRT fclose invalidates the guest stream, but must not close Rosetta's
+    // own process descriptors.  Xenia only uses this at teardown; retaining
+    // the borrowed slot also keeps a later diagnostic flush harmless.
+    if (slot.standard_stream != null) return true;
     const io = state.windows_host_io orelse return false;
     if (slot.file) |file| file.close(io);
     slot.* = .{};
@@ -2428,6 +3364,12 @@ fn transferWindowsDescriptor(state: anytype, name: []const u8, direct_return_rip
         state.windows_file_read_calls +|= 1
     else
         state.windows_file_write_calls +|= 1;
+    if (!is_read and slot.standard_stream != null and (fd == 1 or fd == 2) and completed != 0) {
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "noteWindowsGuestOutput")) {
+            state.noteWindowsGuestOutput(buffer[0..completed]);
+        }
+    }
     state.windows_last_error = 0;
     state.regs.rax = completed;
     if (slot.media_authorized and state.windows_media_io_trace_events < 16) {
@@ -2638,6 +3580,114 @@ fn readWindowsStdioWide(state: anytype, direct_return_rip: ?u64) bool {
     return true;
 }
 
+/// Write a byte span through a FILE* slot, using streaming I/O for borrowed
+/// stdin/stdout/stderr and positional I/O for ordinary guest-opened files.
+/// The latter keeps the Windows current-file-pointer model deterministic;
+/// the former cannot use pwrite because console/piped descriptors are
+/// intentionally unseekable.
+fn writeWindowsStdioBytes(
+    state: anytype,
+    slot: *@TypeOf(state.windows_files[0]),
+    bytes: []const u8,
+) ?usize {
+    const io = state.windows_host_io orelse return null;
+    const completed = if (slot.standard_stream != null) blk: {
+        var written: usize = 0;
+        while (written < bytes.len) {
+            const result = std.c.write(slot.file.?.handle, bytes.ptr + written, bytes.len - written);
+            if (result < 0) return null;
+            if (result == 0) break;
+            written += @intCast(result);
+        }
+        break :blk written;
+    } else blk: {
+        const slices = [_][]const u8{bytes};
+        break :blk slot.file.?.writePositional(io, &slices, slot.offset) catch return null;
+    };
+    slot.offset +|= completed;
+    state.windows_file_write_calls +|= 1;
+    if (slot.standard_stream != null and (slot.stdio_fd == 1 or slot.stdio_fd == 2) and completed != 0) {
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "noteWindowsGuestOutput")) {
+            state.noteWindowsGuestOutput(bytes[0..completed]);
+        }
+    }
+    return completed;
+}
+
+/// Complete the small character/string output family that shares the UCRT
+/// FILE* contract.  These imports used to fall through to the generic
+/// degraded zero-return path, so Xenia could silently lose diagnostics even
+/// after its stream was valid.  Output is routed through the same borrowed
+/// stream slots as fwrite and remains sparse in the Rosetta log.
+fn writeWindowsStdio(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    const string_output = std.mem.eql(u8, name, "fputs") or std.mem.eql(u8, name, "puts");
+    const char_output = std.mem.eql(u8, name, "fputc") or
+        std.mem.eql(u8, name, "putc") or
+        std.mem.eql(u8, name, "putchar");
+    const file_handle = if (std.mem.eql(u8, name, "fputs") or std.mem.eql(u8, name, "fputc") or std.mem.eql(u8, name, "putc"))
+        arg(state, 1, direct_return_rip)
+    else
+        installWindowsStandardStream(state, 1) orelse 0;
+    const slot = windowsFileSlot(state, file_handle) orelse {
+        failWindowsFileCall(state, direct_return_rip, 6); // ERROR_INVALID_HANDLE
+        return true;
+    };
+    if (!slot.writable) {
+        failWindowsFileCall(state, direct_return_rip, 5); // ERROR_ACCESS_DENIED
+        return true;
+    }
+
+    var one: [2]u8 = undefined;
+    const bytes: []const u8 = if (string_output) blk: {
+        const text = guestCString(state, arg(state, 0, direct_return_rip)) orelse {
+            failWindowsFileCall(state, direct_return_rip, 998); // ERROR_NOACCESS
+            return true;
+        };
+        if (std.mem.eql(u8, name, "puts")) {
+            if (text.len + 1 > one.len) {
+                // `puts` output can be longer than the small stack scratch;
+                // its newline is emitted separately below.
+                const completed = writeWindowsStdioBytes(state, slot, text) orelse {
+                    failWindowsFileCall(state, direct_return_rip, 112);
+                    return true;
+                };
+                const newline = writeWindowsStdioBytes(state, slot, "\n") orelse {
+                    failWindowsFileCall(state, direct_return_rip, 112);
+                    return true;
+                };
+                if (completed != text.len or newline != 1) {
+                    failWindowsFileCall(state, direct_return_rip, 112);
+                    return true;
+                }
+                state.windows_last_error = 0;
+                state.regs.rax = 0;
+                finish(state, direct_return_rip);
+                return true;
+            }
+            @memcpy(one[0..text.len], text);
+            one[text.len] = '\n';
+            break :blk one[0 .. text.len + 1];
+        }
+        break :blk text;
+    } else blk: {
+        one[0] = @truncate(arg(state, 0, direct_return_rip));
+        break :blk one[0..1];
+    };
+    const completed = writeWindowsStdioBytes(state, slot, bytes) orelse {
+        failWindowsFileCall(state, direct_return_rip, 112); // write failure
+        return true;
+    };
+    if (completed != bytes.len) {
+        failWindowsFileCall(state, direct_return_rip, 112);
+        return true;
+    }
+    state.windows_last_error = 0;
+    state.regs.rax = if (char_output) @as(u64, one[0]) else 0;
+    finish(state, direct_return_rip);
+    return true;
+}
+
 fn transferWindowsStdio(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
     const size = arg(state, 1, direct_return_rip);
     const count = arg(state, 2, direct_return_rip);
@@ -2685,12 +3735,38 @@ fn transferWindowsStdio(state: anytype, name: []const u8, direct_return_rip: ?u6
     }
     const io = state.windows_host_io orelse unreachable;
     const completed: usize = if (is_read) blk: {
+        if (slot.standard_stream != null) {
+            var read: usize = 0;
+            while (read < buffer.len) {
+                const result = std.c.read(slot.file.?.handle, buffer.ptr + read, buffer.len - read);
+                if (result < 0) {
+                    failWindowsFileCall(state, direct_return_rip, 1117);
+                    return true;
+                }
+                if (result == 0) break;
+                read += @intCast(result);
+            }
+            break :blk read;
+        }
         const slices = [_][]u8{buffer};
         break :blk slot.file.?.readPositional(io, &slices, slot.offset) catch {
             failWindowsFileCall(state, direct_return_rip, 1117);
             return true;
         };
     } else blk: {
+        if (slot.standard_stream != null) {
+            var written: usize = 0;
+            while (written < buffer.len) {
+                const result = std.c.write(slot.file.?.handle, buffer.ptr + written, buffer.len - written);
+                if (result < 0) {
+                    failWindowsFileCall(state, direct_return_rip, 112);
+                    return true;
+                }
+                if (result == 0) break;
+                written += @intCast(result);
+            }
+            break :blk written;
+        }
         const slices = [_][]const u8{buffer};
         break :blk slot.file.?.writePositional(io, &slices, slot.offset) catch {
             failWindowsFileCall(state, direct_return_rip, 112);
@@ -2698,8 +3774,31 @@ fn transferWindowsStdio(state: anytype, name: []const u8, direct_return_rip: ?u6
         };
     };
     slot.offset +|= completed;
+    if (!is_read and completed != @as(usize, @intCast(total))) {
+        // A short standard-stream write is the exact condition that sends
+        // fmt::fwrite_all into its system_error reporter.  Keep it explicit
+        // even when the host write returned no OS error, because silently
+        // returning a short element count otherwise makes the later abort
+        // look like a formatter defect.
+        log.err("Windows stdio short write: name={s} FILE=0x{x} fd={d} requested={d} completed={d} standard={}", .{
+            name,
+            file_handle,
+            slot.file.?.handle,
+            total,
+            completed,
+            slot.standard_stream != null,
+        });
+    }
     state.windows_file_read_calls +|= if (is_read) 1 else 0;
     state.windows_file_write_calls +|= if (is_read) 0 else 1;
+    if (!is_read and slot.standard_stream != null and
+        (slot.stdio_fd == 1 or slot.stdio_fd == 2) and completed != 0)
+    {
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "noteWindowsGuestOutput")) {
+            state.noteWindowsGuestOutput(buffer[0..completed]);
+        }
+    }
     state.windows_last_error = 0;
     state.regs.rax = completed / @as(usize, @intCast(size));
     if (slot.media_authorized and state.windows_media_io_trace_events < 16) {
@@ -2787,6 +3886,7 @@ fn flushWindowsStdio(state: anytype, direct_return_rip: ?u64) bool {
     var ok = true;
     if (handle == 0) {
         for (&state.windows_files) |*slot| {
+            if (slot.standard_stream != null) continue;
             if (slot.file) |file| {
                 file.sync(io) catch {
                     ok = false;
@@ -2794,9 +3894,11 @@ fn flushWindowsStdio(state: anytype, direct_return_rip: ?u64) bool {
             }
         }
     } else if (windowsFileSlot(state, handle)) |slot| {
-        slot.file.?.sync(io) catch {
-            ok = false;
-        };
+        if (slot.standard_stream == null) {
+            slot.file.?.sync(io) catch {
+                ok = false;
+            };
+        }
     } else {
         ok = false;
     }
@@ -3255,6 +4357,33 @@ fn handleStringAndMemory(state: anytype, name: []const u8, direct_return_rip: ?u
         const source_address = arg(state, 1, direct_return_rip);
         const byte_count = arg(state, 2, direct_return_rip);
         const return_rip = direct_return_rip orelse state.read64(state.regs.rsp);
+        const code_cache_start: u64 = 0xA0000000;
+        const code_cache_end: u64 = 0xC0000000;
+        const trace_code_cache_copy = state.trace_windows_mappings and
+            (destination_address >= code_cache_start and destination_address < code_cache_end or
+                source_address >= code_cache_start and source_address < code_cache_end) and
+            state.windows_code_copy_trace_events < 32;
+        const code_cache_snapshot_count = @min(byte_count, @as(u64, 64));
+        const code_cache_source_before = if (trace_code_cache_copy)
+            state.guestMemoryConst(source_address, code_cache_snapshot_count) orelse &.{}
+        else
+            &.{};
+        const code_cache_destination_before = if (trace_code_cache_copy)
+            state.guestMemoryConst(destination_address, code_cache_snapshot_count) orelse &.{}
+        else
+            &.{};
+        if (trace_code_cache_copy) {
+            state.windows_code_copy_trace_events += 1;
+            log.info("PE64 Windows code-cache copy before: op={s} return=0x{x} destination=0x{x} source=0x{x} count={d} source_bytes={any} destination_bytes={any}", .{
+                name,
+                return_rip,
+                destination_address,
+                source_address,
+                byte_count,
+                code_cache_source_before,
+                code_cache_destination_before,
+            });
+        }
         const trace_string_copy = state.trace_string_memory and byte_count <= 256 and
             (return_rip == 0x140033701 or return_rip == 0x140033758 or
                 return_rip == 0x1401176fd or return_rip == 0x140117786 or
@@ -3295,6 +4424,17 @@ fn handleStringAndMemory(state: anytype, name: []const u8, direct_return_rip: ?u
             }
         } else {
             @memcpy(destination, source);
+        }
+        if (trace_code_cache_copy) {
+            log.info("PE64 Windows code-cache copy after: op={s} return=0x{x} destination=0x{x} source=0x{x} count={d} source_bytes={any} destination_bytes={any}", .{
+                name,
+                return_rip,
+                destination_address,
+                source_address,
+                byte_count,
+                state.guestMemoryConst(source_address, code_cache_snapshot_count) orelse &.{},
+                state.guestMemoryConst(destination_address, code_cache_snapshot_count) orelse &.{},
+            });
         }
         if (trace_string_copy) {
             log.info("PE StringBuffer memory after op={s} return=0x{x} destination=0x{x} source=0x{x} count={d} source_bytes={any} destination_bytes={any}", .{
@@ -3707,7 +4847,198 @@ fn handleGraphics(state: anytype, name: []const u8, direct_return_rip: ?u64) boo
     return true;
 }
 
+/// Complete the registry surface without pretending that macOS has a Windows
+/// registry.  Reads report the documented "value/key absent" status, writes
+/// are refused with an explicit access error, and teardown remains harmless.
+/// This is a real per-call ABI model: output pointers are cleared and the
+/// LSTATUS result is never confused with the generic zero-return fallback.
+fn handleWindowsRegistry(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    const is_registry_name = std.mem.startsWith(u8, name, "Reg");
+    if (!is_registry_name) return false;
+
+    if (std.mem.eql(u8, name, "RegCloseKey") or std.mem.eql(u8, name, "RegFlushKey")) {
+        state.regs.rax = 0; // ERROR_SUCCESS: closing/flushing absent state is harmless.
+        finish(state, direct_return_rip);
+        return true;
+    }
+
+    if (std.mem.eql(u8, name, "RegCreateKeyA") or std.mem.eql(u8, name, "RegCreateKeyW") or
+        std.mem.eql(u8, name, "RegCreateKeyExA") or std.mem.eql(u8, name, "RegCreateKeyExW"))
+    {
+        const extended = std.mem.startsWith(u8, name, "RegCreateKeyEx");
+        const output = if (extended) arg(state, 7, direct_return_rip) else arg(state, 2, direct_return_rip);
+        if (output == 0 or state.guestMemory(output, 8) == null) {
+            state.regs.rax = 87; // ERROR_INVALID_PARAMETER
+        } else {
+            // A synthetic key is usable for the lifetime of this call chain;
+            // its values are intentionally not persisted to the host.
+            state.write64(output, nextHandle(state));
+            state.regs.rax = 0;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+
+    if (std.mem.eql(u8, name, "RegOpenKeyA") or std.mem.eql(u8, name, "RegOpenKeyW") or
+        std.mem.eql(u8, name, "RegOpenKeyExA") or std.mem.eql(u8, name, "RegOpenKeyExW"))
+    {
+        const extended = std.mem.startsWith(u8, name, "RegOpenKeyEx");
+        const output = if (extended) arg(state, 4, direct_return_rip) else arg(state, 2, direct_return_rip);
+        if (output != 0 and state.guestMemory(output, 8) != null) state.write64(output, 0);
+        state.regs.rax = 2; // ERROR_FILE_NOT_FOUND: no host registry is mounted.
+        finish(state, direct_return_rip);
+        return true;
+    }
+
+    if (std.mem.eql(u8, name, "RegGetValueW")) {
+        const type_output = arg(state, 4, direct_return_rip);
+        const data_output = arg(state, 5, direct_return_rip);
+        const size_output = arg(state, 6, direct_return_rip);
+        if (type_output != 0 and state.guestMemory(type_output, 4) != null) state.write32(type_output, 0);
+        if (data_output != 0 and state.guestMemory(data_output, 1) != null) state.write8(data_output, 0);
+        if (size_output != 0 and state.guestMemory(size_output, 4) != null) state.write32(size_output, 0);
+        state.regs.rax = 2; // ERROR_FILE_NOT_FOUND
+        finish(state, direct_return_rip);
+        return true;
+    }
+
+    if (std.mem.eql(u8, name, "RegQueryValueExA") or std.mem.eql(u8, name, "RegQueryValueExW")) {
+        const type_output = arg(state, 3, direct_return_rip);
+        const data_output = arg(state, 4, direct_return_rip);
+        const size_output = arg(state, 5, direct_return_rip);
+        if (type_output != 0 and state.guestMemory(type_output, 4) != null) state.write32(type_output, 0);
+        if (data_output != 0 and state.guestMemory(data_output, 1) != null) state.write8(data_output, 0);
+        if (size_output != 0 and state.guestMemory(size_output, 4) != null) state.write32(size_output, 0);
+        state.regs.rax = 2; // ERROR_FILE_NOT_FOUND
+        finish(state, direct_return_rip);
+        return true;
+    }
+
+    if (std.mem.eql(u8, name, "RegSetValueExA") or std.mem.eql(u8, name, "RegSetValueExW")) {
+        state.regs.rax = 5; // ERROR_ACCESS_DENIED: writes are not persisted.
+        finish(state, direct_return_rip);
+        return true;
+    }
+
+    return false;
+}
+
+/// The networking package is present in some Windows builds even when a
+/// title never opens a socket.  Keep initialization and byte-order helpers
+/// state-free and make socket creation fail with Winsock's real refusal
+/// value, rather than letting the import fall through to a generic zero.
+fn handleWindowsSockets(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    if (std.mem.eql(u8, name, "WSAGetLastError")) {
+        state.regs.rax = state.windows_last_error;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "WSAStartup") or std.mem.eql(u8, name, "WSACleanup")) {
+        if (std.mem.eql(u8, name, "WSAStartup")) {
+            const data = arg(state, 1, direct_return_rip);
+            if (data != 0 and state.guestMemory(data, 4) != null) {
+                state.write16(data, 2); // wVersion = 2.0
+                state.write16(data +| 2, 2); // wHighVersion = 2.0
+            }
+        }
+        state.windows_last_error = 0;
+        state.regs.rax = 0; // WSANOERROR
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "htons") or std.mem.eql(u8, name, "ntohs")) {
+        const value: u16 = @truncate(arg(state, 0, direct_return_rip));
+        state.regs.rax = @byteSwap(value);
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "htonl") or std.mem.eql(u8, name, "ntohl")) {
+        const value: u32 = @truncate(arg(state, 0, direct_return_rip));
+        state.regs.rax = @byteSwap(value);
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "inet_addr")) {
+        // Xenia's startup never needs a socket address from the host.  The
+        // documented INADDR_NONE result is explicit and distinguishable from
+        // a successful address of 0.0.0.0.
+        state.windows_last_error = 0;
+        state.regs.rax = 0xFFFF_FFFF;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "__WSAFDIsSet")) {
+        state.regs.rax = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "socket") or std.mem.eql(u8, name, "accept") or
+        std.mem.eql(u8, name, "bind") or std.mem.eql(u8, name, "connect") or
+        std.mem.eql(u8, name, "listen") or std.mem.eql(u8, name, "recvfrom") or
+        std.mem.eql(u8, name, "sendto") or std.mem.eql(u8, name, "shutdown") or
+        std.mem.eql(u8, name, "getsockname"))
+    {
+        state.windows_last_error = 10093; // WSANOTINITIALISED
+        state.regs.rax = if (std.mem.eql(u8, name, "socket") or std.mem.eql(u8, name, "accept"))
+            std.math.maxInt(u64)
+        else
+            std.math.maxInt(u32);
+        finish(state, direct_return_rip);
+        return true;
+    }
+    return false;
+}
+
+/// Security APIs are deliberately non-escalating on macOS.  They still own
+/// their output parameters and return the documented refusal, so a caller
+/// cannot mistake an uninitialized token/LUID for a valid security object.
+fn handleWindowsSecurity(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    if (std.mem.eql(u8, name, "LookupPrivilegeValueW")) {
+        const luid = arg(state, 2, direct_return_rip);
+        if (luid != 0 and state.guestMemory(luid, 8) != null) state.write64(luid, 0);
+        state.windows_last_error = 2; // ERROR_FILE_NOT_FOUND
+        state.regs.rax = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "OpenProcessToken")) {
+        const token = arg(state, 2, direct_return_rip);
+        if (token != 0 and state.guestMemory(token, 8) != null) state.write64(token, 0);
+        state.windows_last_error = 5; // ERROR_ACCESS_DENIED
+        state.regs.rax = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "AdjustTokenPrivileges")) {
+        const return_length = arg(state, 5, direct_return_rip);
+        if (return_length != 0 and state.guestMemory(return_length, 4) != null) state.write32(return_length, 0);
+        state.windows_last_error = 1300; // ERROR_NOT_ALL_ASSIGNED
+        state.regs.rax = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "OpenSCManagerA") or std.mem.eql(u8, name, "OpenSCManagerW") or
+        std.mem.eql(u8, name, "OpenServiceA") or std.mem.eql(u8, name, "OpenServiceW"))
+    {
+        state.windows_last_error = 5; // ERROR_ACCESS_DENIED
+        state.regs.rax = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "CloseServiceHandle")) {
+        state.regs.rax = 1;
+        state.windows_last_error = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    return false;
+}
+
 fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_return_rip: ?u64) bool {
+    if (handleWindowsRegistry(state, name, direct_return_rip)) return true;
+    if (handleWindowsSockets(state, name, direct_return_rip)) return true;
+    if (handleWindowsSecurity(state, name, direct_return_rip)) return true;
+    if (handleWindowsMultimedia(state, dll_name, name, direct_return_rip)) return true;
     if (handleStringAndMemory(state, name, direct_return_rip)) return true;
 
     if (std.mem.eql(u8, name, "strstr")) {
@@ -3772,10 +5103,61 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         finish(state, direct_return_rip);
         return true;
     }
+    if (std.mem.eql(u8, name, "_localtime64")) {
+        // The UCRT returns a pointer to a static/thread-local `struct tm`.
+        // Rosetta cannot expose a host libc pointer to the PE guest, and a
+        // zero-returning fallback is especially harmful here: Xenia's error
+        // formatter passes the result through `asctime`, then fmt aborts on
+        // the resulting null string.  A deterministic Unix-epoch record is
+        // sufficient for the C-locale timestamp path and remains valid for
+        // the lifetime of this PE state.
+        if (state.windows_tm_storage == 0) {
+            state.windows_tm_storage = state.guestAlloc(36, 4) orelse 0;
+        }
+        if (state.windows_tm_storage != 0) {
+            const tm_fields = [_]u32{
+                0, // tm_sec
+                0, // tm_min
+                0, // tm_hour
+                1, // tm_mday
+                0, // tm_mon (January)
+                70, // tm_year (1970 - 1900)
+                4, // tm_wday (Thursday)
+                0, // tm_yday
+                0, // tm_isdst
+            };
+            for (tm_fields, 0..) |field, index| {
+                state.write32(state.windows_tm_storage +| @as(u64, @intCast(index * 4)), field);
+            }
+        }
+        state.regs.rax = state.windows_tm_storage;
+        state.windows_last_error = if (state.windows_tm_storage == 0) 12 else 0; // ERROR_NOT_ENOUGH_MEMORY
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "asctime")) {
+        // `asctime` returns a process-owned 26-byte buffer.  Keep it stable
+        // and guest-owned rather than formatting through a host pointer.
+        state.regs.rax = cachedGuestString(state, &state.windows_asctime_storage, false, "Thu Jan  1 00:00:00 1970\n");
+        state.windows_last_error = if (state.windows_asctime_storage == 0) 12 else 0; // ERROR_NOT_ENOUGH_MEMORY
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_lock_file") or std.mem.eql(u8, name, "_unlock_file")) {
+        // Rosetta's cooperative executor serializes the guest stream calls;
+        // these CRT bookkeeping hooks need no host mutex.  They are void
+        // functions, so completing the import without a degraded zero return
+        // keeps the runtime ledger honest.
+        state.windows_last_error = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
     if (std.mem.eql(u8, name, "getenv")) {
         const requested = guestCString(state, arg(state, 0, direct_return_rip)) orelse &.{};
-        state.regs.rax = if (environmentValue(requested)) |value|
-            materializeGuestAnsi(state, value) orelse 0
+        const value = environmentValue(requested);
+        if (std.ascii.eqlIgnoreCase(requested, "SDL_AUDIODRIVER")) noteSdlAudioDriverQuery(state, value, "getenv");
+        state.regs.rax = if (value) |selected|
+            materializeGuestAnsi(state, selected) orelse 0
         else
             0;
         state.windows_last_error = 0;
@@ -3931,14 +5313,7 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
     }
     if (std.mem.eql(u8, name, "__acrt_iob_func")) {
         const index = arg(state, 0, direct_return_rip);
-        if (index < state.windows_acrt_iob_storage.len) {
-            const slot = &state.windows_acrt_iob_storage[@as(usize, @intCast(index))];
-            if (slot.* == 0) slot.* = state.guestAlloc(64, 8) orelse 0;
-            if (slot.* != 0 and state.guestMemory(slot.*, 64) != null) state.write64(slot.*, 0);
-            state.regs.rax = slot.*;
-        } else {
-            state.regs.rax = 0;
-        }
+        state.regs.rax = installWindowsStandardStream(state, index) orelse 0;
         finish(state, direct_return_rip);
         return true;
     }
@@ -3964,20 +5339,54 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
     }
 
     if (std.mem.eql(u8, name, "SHGetKnownFolderPath")) {
-        // Xenia asks for FOLDERID_Documents when portable mode is absent.
-        // The Windows PE runner exposes C:\\xenia as its confined virtual
-        // root, so return a guest-owned Documents path under that root rather
-        // than the host user's real directory.  This preserves the Windows
-        // API's output-pointer contract while keeping all subsequent storage
-        // and cache creation inside the configured host working directory.
+        // Xenia asks for both FOLDERID_Documents and FOLDERID_Fonts.  The
+        // previous one-path answer made the Japanese font probe look like a
+        // missing import: the call returned S_OK, but the following
+        // `exists(C:\\Windows\\Fonts\\msgothic.ttc)` could never succeed.
+        // Preserve the two guest-visible Windows paths separately.  The
+        // confined path bridge above maps the font file to a real host font
+        // without granting the PE access to the host's Windows directory.
+        const folder_id = arg(state, 0, direct_return_rip);
+        const folder_guid = state.guestMemoryConst(folder_id, 16);
+        const fonts_guid = [_]u8{
+            0xB7, 0x8C, 0x22, 0xFD, 0x11, 0xAE, 0xE3, 0x4A,
+            0x86, 0x4C, 0x16, 0xF3, 0x91, 0x0A, 0xB8, 0xFE,
+        };
+        const wants_fonts = folder_guid != null and std.mem.eql(u8, folder_guid.?, &fonts_guid);
         const output = arg(state, 3, direct_return_rip); // PWSTR*
-        const path = cachedGuestString(state, &state.windows_user_folder_w, true, "C:\\xenia\\Documents");
+        const path = if (wants_fonts)
+            cachedGuestString(state, &state.windows_fonts_folder_w, true, "C:\\Windows\\Fonts")
+        else
+            cachedGuestString(state, &state.windows_user_folder_w, true, "C:\\xenia\\Documents");
         if (output == 0 or state.guestMemory(output, 8) == null or path == 0) {
             state.regs.rax = 0x8007_0057; // E_INVALIDARG / HRESULT_FROM_WIN32
         } else {
             state.write64(output, path);
             state.regs.rax = 0; // S_OK
         }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SHGetFolderPathW")) {
+        // The legacy shell entry point is still used by older SDL/Xenia
+        // paths.  It writes into caller-owned MAX_PATH storage rather than
+        // returning a PWSTR allocation, so use the same confined Documents
+        // root as FOLDERID_Documents.
+        const output = arg(state, 4, direct_return_rip);
+        const written = if (output != 0)
+            copyGuestWideString(state, output, 260, "C:\\xenia\\Documents")
+        else
+            0;
+        state.regs.rax = if (written == 0) 0x8000_4003 else 0; // E_POINTER/S_OK
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "ShellExecuteW")) {
+        // Rosetta does not launch host applications on behalf of the guest.
+        // ShellExecute's <=32 failure result is explicit and lets Xenia
+        // continue down its normal "no external helper" path.
+        state.windows_last_error = 2; // ERROR_FILE_NOT_FOUND
+        state.regs.rax = 0;
         finish(state, direct_return_rip);
         return true;
     }
@@ -4197,7 +5606,7 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         // Match the classic C-locale conversion contract in the opposite
         // direction: ASCII bytes widen losslessly, while EOF and bytes from
         // the high half of an unsigned char cannot be represented by the
-        // single-byte locale and return WEOF.  The generic degraded-import
+        // single-byte locale and return WEOF. The generic import-contract
         // fallback used to return zero for every byte, which corrupts the
         // locale classification table before libstdc++ constructs regexes.
         const byte = arg(state, 0, direct_return_rip);
@@ -4278,7 +5687,11 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         return true;
     }
     if (std.mem.eql(u8, name, "GetCurrentThreadId")) {
-        state.regs.rax = 1;
+        const State = @TypeOf(state.*);
+        state.regs.rax = if (comptime @hasDecl(State, "currentWindowsThreadId"))
+            state.currentWindowsThreadId()
+        else
+            1;
         finish(state, direct_return_rip);
         return true;
     }
@@ -4415,15 +5828,45 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
     {
         const is_load_library = std.mem.startsWith(u8, name, "LoadLibrary");
         var module_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const module_path = if (is_load_library and std.mem.endsWith(u8, name, "W"))
+        // The module name matters for `GetModuleHandle` too: a guest that
+        // resolves an export through `GetProcAddress(GetModuleHandleW(...))`
+        // is asking about a specific library, and answering as if the handle
+        // named nothing loses the only context the return contract has.
+        const module_path = if (std.mem.endsWith(u8, name, "W"))
             guestWideToUtf8Buffer(state, arg(state, 0, direct_return_rip), &module_path_buffer)
-        else if (is_load_library)
-            guestCString(state, arg(state, 0, direct_return_rip))
         else
-            null;
-        const unavailable = if (module_path) |path| windowsModuleUnavailableOnHost(path) else false;
+            guestCString(state, arg(state, 0, direct_return_rip));
+        // A name Rosetta could not read is not evidence about the library.
+        // Refusing on it would report a loadable library as absent and send a
+        // reader after a package that already exists, so an unreadable name
+        // keeps the permissive answer and is reported as a *read* failure.
+        const readable = if (module_path) |path| windowsModuleNameLooksReadable(path) else true;
+        const availability = if (module_path) |path|
+            (if (readable) windowsModuleAvailability(path) else ModuleAvailability.served)
+        else
+            ModuleAvailability.served;
+        const unavailable = availability != .served;
         state.regs.rax = if (unavailable) 0 else nextHandle(state);
         state.windows_last_error = if (unavailable) 126 else 0; // ERROR_MOD_NOT_FOUND
+        if (!unavailable and state.regs.rax != 0 and readable) {
+            if (module_path) |path| noteWindowsModuleHandle(state, state.regs.rax, windowsModuleBasename(path));
+        }
+        if (!readable) {
+            noteWindowsUnreadableModuleName(
+                state,
+                name,
+                module_path orelse "",
+                arg(state, 0, direct_return_rip),
+                direct_return_rip orelse state.read64(state.regs.rsp),
+            );
+        }
+        if (unavailable) noteWindowsModuleRefusal(
+            state,
+            name,
+            module_path orelse "<unreadable>",
+            availability,
+            direct_return_rip orelse state.read64(state.regs.rsp),
+        );
         if (state.diagnose_abi and is_load_library) {
             log.info("PE64 Windows {s}: module='{s}' result=0x{x}", .{ name, module_path orelse "<unreadable>", state.regs.rax });
         }
@@ -4436,7 +5879,9 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         return true;
     }
     if (std.mem.eql(u8, name, "GetProcAddress")) {
+        const module_handle = arg(state, 0, direct_return_rip);
         const requested_address = arg(state, 1, direct_return_rip);
+        const module_name = windowsModuleNameFor(state, module_handle);
         // Xenia obtains XInputGetStateEx by ordinal 100.  An ordinal is
         // passed through LPCSTR without being a guest string, so attempting
         // guestCString on it would incorrectly turn a valid lookup into a
@@ -4446,10 +5891,31 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
                 state.registerWindowsImportStub("xinput1_4.dll", "XInputGetStateEx") orelse 0
             else
                 0;
+            if (state.regs.rax == 0) state.windows_last_error = 127; // ERROR_PROC_NOT_FOUND
         } else if (guestCString(state, requested_address)) |requested| {
-            state.regs.rax = state.registerWindowsImportStub("", requested) orelse 0;
+            // A dynamic lookup is a *question*, and "no" is a valid answer
+            // every caller already handles - that is why the caller used
+            // GetProcAddress instead of an import. Handing back a stub for a
+            // name Rosetta does not implement converts that question into a
+            // promise, and the promise is broken later, inside whatever the
+            // guest does with the pointer. Xenia's per-monitor DPI probe and
+            // its XAudio2 entry point both take this path.
+            if (isRecognizedDynamicImport(module_name, requested)) {
+                state.regs.rax = state.registerWindowsImportStub(module_name, requested) orelse 0;
+                state.windows_last_error = if (state.regs.rax == 0) 127 else 0;
+            } else {
+                state.regs.rax = 0;
+                state.windows_last_error = 127; // ERROR_PROC_NOT_FOUND
+                noteWindowsProcAddressRefusal(
+                    state,
+                    module_name,
+                    requested,
+                    direct_return_rip orelse state.read64(state.regs.rsp),
+                );
+            }
         } else {
             state.regs.rax = 0;
+            state.windows_last_error = 127; // ERROR_PROC_NOT_FOUND
         }
         finish(state, direct_return_rip);
         return true;
@@ -4640,10 +6106,16 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
     }
     if (std.mem.eql(u8, name, "GetEnvironmentVariableA") or std.mem.eql(u8, name, "GetEnvironmentVariableW")) {
         const wide = std.mem.endsWith(u8, name, "W");
+        const requested = if (wide) null else guestCString(state, arg(state, 0, direct_return_rip));
         const value = if (wide)
             wideEnvironmentValue(state, arg(state, 0, direct_return_rip))
         else
-            environmentValue(guestCString(state, arg(state, 0, direct_return_rip)) orelse "");
+            environmentValue(requested orelse "");
+        if (!wide) {
+            if (requested) |requested_name| {
+                if (std.ascii.eqlIgnoreCase(requested_name, "SDL_AUDIODRIVER")) noteSdlAudioDriverQuery(state, value, name);
+            }
+        }
         const destination = arg(state, 1, direct_return_rip);
         const capacity = arg(state, 2, direct_return_rip);
         const selected = value orelse {
@@ -4682,8 +6154,24 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
             "C:\\Temp\\"
         else
             "C:\\xenia";
-        const capacity = arg(state, 0, direct_return_rip);
-        const destination = arg(state, 1, direct_return_rip);
+        // These four families do NOT share an argument order, and treating
+        // them as if they did is how libusb ended up calling
+        // `LoadLibraryA` on an uninitialized stack buffer:
+        //
+        //   UINT  GetSystemDirectoryA (LPSTR buffer, UINT size);   // buffer first
+        //   UINT  GetWindowsDirectoryA(LPSTR buffer, UINT size);   // buffer first
+        //   DWORD GetCurrentDirectoryA(DWORD size, LPSTR buffer);  // size first
+        //   DWORD GetTempPathA        (DWORD size, LPSTR buffer);  // size first
+        //
+        // Reading them all size-first made `GetSystemDirectoryA` write
+        // nothing and still return a plausible length, so
+        // `load_system_library` appended "\\WinUSB.dll" at that offset into a
+        // buffer nobody had filled and loaded whatever was on the stack. The
+        // 2026-09-12 run recorded that as `module name unreadable: bytes='0\x03'D\x01'`.
+        const buffer_first = std.mem.startsWith(u8, name, "GetSystemDirectory") or
+            std.mem.startsWith(u8, name, "GetWindowsDirectory");
+        const destination = arg(state, if (buffer_first) 0 else 1, direct_return_rip);
+        const capacity = arg(state, if (buffer_first) 1 else 0, direct_return_rip);
         const copied = if (wide)
             copyGuestWideString(state, destination, capacity, source)
         else
@@ -5002,13 +6490,95 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         const extended = std.mem.eql(u8, name, "VirtualAllocEx");
         const requested_base = if (extended) arg(state, 1, direct_return_rip) else arg(state, 0, direct_return_rip);
         const size = if (std.mem.eql(u8, name, "VirtualAlloc")) arg(state, 1, direct_return_rip) else arg(state, 2, direct_return_rip);
+        const allocation_type = if (extended) arg(state, 3, direct_return_rip) else arg(state, 2, direct_return_rip);
+        const mem_reserve: u64 = 0x2000;
+        const reserve_requested = (allocation_type & mem_reserve) != 0;
+        const commit_requested = (allocation_type & 0x1000) != 0;
+        const allocation_caller_rip = direct_return_rip orelse state.read64(state.regs.rsp);
+        var relocated_base: ?u64 = null;
         const address = if (requested_base != 0) blk: {
+            // Xenia's ThreadState allocator probes a sequence of fixed
+            // context slots with MEM_RESERVE|MEM_COMMIT.  Treating an
+            // already-backed range as another successful reservation aliases
+            // independent guest contexts and later makes generated dispatch
+            // read the wrong (often zeroed) context.  Windows permits a
+            // commit-only request against an existing reservation, but a new
+            // reserve over that range must fail so the caller can advance.
+            const already_fixed = if (comptime @hasDecl(@TypeOf(state.*), "windowsVirtualAllocationContains"))
+                state.windowsVirtualAllocationContains(requested_base, size)
+            else
+                false;
+            if (already_fixed and reserve_requested) {
+                if (commit_requested) {
+                    const State = @TypeOf(state.*);
+                    if (comptime @hasDecl(State, "relocateWindowsThreadContextAllocation")) {
+                        if (state.relocateWindowsThreadContextAllocation(requested_base, size, allocation_caller_rip)) |relocated| {
+                            relocated_base = relocated;
+                            break :blk relocated;
+                        }
+                    }
+                }
+                break :blk @as(u64, 0);
+            }
             if (state.windowsGuestRangeContains(requested_base, size) or state.createWindowsVirtualAllocation(requested_base, size)) {
                 break :blk requested_base;
             }
             break :blk @as(u64, 0);
         } else state.guestAlloc(size, 0x1000) orelse 0;
         state.regs.rax = address;
+        // Classify the request against what already backs the address, before
+        // the allocation record is created: afterwards every commit looks
+        // like it landed inside a reservation, which is exactly the
+        // distinction the `guest-heap-commit-unreserved` failure point
+        // says must not be lost.
+        const disposition: []const u8 = blk: {
+            const State = @TypeOf(state.*);
+            if (relocated_base) |relocated| {
+                if (comptime @hasDecl(State, "noteWindowsAllocationRelocation")) {
+                    break :blk state.noteWindowsAllocationRelocation(
+                        requested_base,
+                        relocated,
+                        size,
+                        allocation_caller_rip,
+                    ).label();
+                }
+            }
+            if (comptime @hasDecl(State, "noteWindowsAllocationDisposition")) {
+                break :blk state.noteWindowsAllocationDisposition(
+                    requested_base,
+                    size,
+                    reserve_requested,
+                    commit_requested,
+                    address != 0,
+                    allocation_caller_rip,
+                ).label();
+            }
+            break :blk "unclassified";
+        };
+        if (state.trace_windows_memory and state.windows_memory_trace_events < 64 and
+            (requested_base >= 0x1_0000_0000 or address >= 0x1_0000_0000))
+        {
+            state.windows_memory_trace_events += 1;
+            log.info("PE64 Windows fixed-address allocation request: api={s} requested_base=0x{x} size={d} result=0x{x} contains={} rip=0x{x} step={d}", .{
+                name,
+                requested_base,
+                size,
+                address,
+                address != 0 and state.windowsGuestRangeContains(address, @max(size, @as(u64, 1))),
+                state.regs.rip,
+                state.executed_steps,
+            });
+            log.info("PE64 Windows allocation contract: api={s} reserve={} commit={} requested_base=0x{x} result=0x{x} disposition={s} rip=0x{x} step={d}", .{
+                name,
+                reserve_requested,
+                commit_requested,
+                requested_base,
+                address,
+                disposition,
+                state.regs.rip,
+                state.executed_steps,
+            });
+        }
         if (state.diagnose_abi) {
             log.info("PE64 Windows {s}: requested_base=0x{x} size={d} result=0x{x}", .{ name, requested_base, size, address });
         }
@@ -5171,7 +6741,20 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         std.mem.eql(u8, name, "CreateMutexA") or std.mem.eql(u8, name, "CreateMutexW") or
         std.mem.eql(u8, name, "CreateSemaphoreA") or std.mem.eql(u8, name, "CreateSemaphoreW"))
     {
-        state.regs.rax = nextHandle(state);
+        const handle = nextHandle(state);
+        const State = @TypeOf(state.*);
+        if (std.mem.startsWith(u8, name, "CreateEvent")) {
+            if (comptime @hasDecl(State, "registerWindowsEvent")) {
+                state.registerWindowsEvent(handle, arg(state, 1, direct_return_rip) != 0, arg(state, 2, direct_return_rip) != 0);
+            }
+        } else if (std.mem.startsWith(u8, name, "CreateMutex")) {
+            if (comptime @hasDecl(State, "registerWindowsMutex")) {
+                state.registerWindowsMutex(handle, arg(state, 1, direct_return_rip) != 0);
+            }
+        } else if (comptime @hasDecl(State, "registerWindowsSemaphore")) {
+            state.registerWindowsSemaphore(handle, arg(state, 1, direct_return_rip), arg(state, 2, direct_return_rip));
+        }
+        state.regs.rax = handle;
         finish(state, direct_return_rip);
         return true;
     }
@@ -5385,18 +6968,96 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         finish(state, direct_return_rip);
         return true;
     }
-    if (std.mem.eql(u8, name, "SetEvent") or std.mem.eql(u8, name, "ResetEvent") or
-        std.mem.eql(u8, name, "PulseEvent") or std.mem.eql(u8, name, "ReleaseMutex") or
-        std.mem.eql(u8, name, "ReleaseSemaphore") or std.mem.eql(u8, name, "CloseHandle") or
-        std.mem.eql(u8, name, "SwitchToThread") or std.mem.eql(u8, name, "TryEnterCriticalSection"))
+    if (std.mem.eql(u8, name, "SetEvent") or std.mem.eql(u8, name, "PulseEvent")) {
+        const handle = arg(state, 0, direct_return_rip);
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "signalWindowsWaitObject")) {
+            _ = state.signalWindowsWaitObject(handle, std.mem.eql(u8, name, "PulseEvent"));
+        }
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "ResetEvent")) {
+        const handle = arg(state, 0, direct_return_rip);
+        const State = @TypeOf(state.*);
+        const reset = if (comptime @hasDecl(State, "resetWindowsWaitObject")) state.resetWindowsWaitObject(handle) else true;
+        state.regs.rax = @intFromBool(reset);
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "ReleaseMutex") or std.mem.eql(u8, name, "ReleaseSemaphore")) {
+        const handle = arg(state, 0, direct_return_rip);
+        const State = @TypeOf(state.*);
+        if (std.mem.eql(u8, name, "ReleaseSemaphore")) {
+            if (comptime @hasDecl(State, "releaseWindowsSemaphore")) {
+                _ = state.releaseWindowsSemaphore(handle, arg(state, 1, direct_return_rip));
+            }
+        } else if (comptime @hasDecl(State, "signalWindowsWaitObject")) {
+            _ = state.signalWindowsWaitObject(handle, false);
+        }
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "CloseHandle") or std.mem.eql(u8, name, "SwitchToThread") or
+        std.mem.eql(u8, name, "TryEnterCriticalSection"))
     {
         state.regs.rax = 1;
         finish(state, direct_return_rip);
+        // `SwitchToThread` is what MinGW's `sched_yield` - and therefore
+        // `std::this_thread::yield()` - becomes. It is the boundary a
+        // spin-wait strategy uses between spins, so it has to actually hand
+        // the interpreter over.
+        if (std.mem.eql(u8, name, "SwitchToThread")) {
+            const State = @TypeOf(state.*);
+            if (comptime @hasDecl(State, "requestWindowsGuestSliceYield")) {
+                state.requestWindowsGuestSliceYield();
+            }
+        }
         return true;
     }
     if (std.mem.eql(u8, name, "WaitForSingleObject") or std.mem.eql(u8, name, "WaitForSingleObjectEx") or
         std.mem.eql(u8, name, "WaitForMultipleObjects") or std.mem.eql(u8, name, "WaitForMultipleObjectsEx"))
     {
+        const is_multiple = std.mem.eql(u8, name, "WaitForMultipleObjects") or
+            std.mem.eql(u8, name, "WaitForMultipleObjectsEx");
+        if (!is_multiple) {
+            const wait_handle = arg(state, 0, direct_return_rip);
+            const timeout = arg(state, 1, direct_return_rip);
+            const State = @TypeOf(state.*);
+            if (comptime @hasDecl(State, "waitWindowsGuestObject")) {
+                switch (state.waitWindowsGuestObject(wait_handle, timeout)) {
+                    .blocked => return true,
+                    .signaled => {
+                        state.regs.rax = 0; // WAIT_OBJECT_0
+                        finish(state, direct_return_rip);
+                        return true;
+                    },
+                    .yielded => {
+                        // The owner context is the cooperative UI executor.
+                        // A bounded worker turn has already been serviced, so
+                        // complete this wait boundary and let the owner pump
+                        // its deferred UI work before retrying if necessary.
+                        state.regs.rax = 0; // WAIT_OBJECT_0
+                        finish(state, direct_return_rip);
+                        return true;
+                    },
+                    .timeout => {
+                        state.regs.rax = 0x102; // WAIT_TIMEOUT
+                        finish(state, direct_return_rip);
+                        return true;
+                    },
+                    .invalid => {
+                        state.windows_last_error = 6; // ERROR_INVALID_HANDLE
+                        state.regs.rax = std.math.maxInt(u64); // WAIT_FAILED
+                        finish(state, direct_return_rip);
+                        return true;
+                    },
+                    .unknown => {},
+                }
+            }
+        }
         var serviced_steps: u64 = 0;
         const State = @TypeOf(state.*);
         if (comptime @hasDecl(State, "serviceWindowsGuestThreads")) {
@@ -5404,7 +7065,14 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
             // model returned immediately but never gave a queued worker a
             // chance to release the mutex/event being waited on, which could
             // strand the main guest thread after Vulkan bootstrap.
-            serviced_steps = state.serviceWindowsGuestThreads(windows_guest_thread_service_slice);
+            const service_slice = if (comptime @hasDecl(State, "windowsGuestWaitServiceSlice"))
+                state.windowsGuestWaitServiceSlice()
+            else
+                windows_guest_thread_service_slice;
+            serviced_steps = if (comptime @hasDecl(State, "serviceWindowsGuestBoundary"))
+                state.serviceWindowsGuestBoundary(service_slice)
+            else
+                state.serviceWindowsGuestThreads(service_slice);
         }
         if (serviced_steps != 0 and state.trace_windows_waits and
             (state.windows_thread_service_calls <= 8 or state.windows_thread_service_calls % 1024 == 0))
@@ -5427,10 +7095,59 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         finish(state, direct_return_rip);
         return true;
     }
+    if (std.mem.eql(u8, name, "pthread_cond_wait") or std.mem.eql(u8, name, "pthread_cond_timedwait")) {
+        const condition = arg(state, 0, direct_return_rip);
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "waitWindowsGuestCondition")) {
+            switch (state.waitWindowsGuestCondition(condition, arg(state, 1, direct_return_rip))) {
+                .blocked => return true,
+                .resumed, .invalid => {},
+            }
+        }
+        // The ordinary fallback remains a successful no-op only for states
+        // without the cooperative PE scheduler.  In a PE run, a worker that
+        // reaches this branch must be resumed by signal/broadcast rather than
+        // being allowed to consume a condition-variable sentinel.
+        state.regs.rax = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "pthread_cond_signal") or std.mem.eql(u8, name, "pthread_cond_broadcast")) {
+        const condition = arg(state, 0, direct_return_rip);
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "signalWindowsGuestCondition")) {
+            _ = state.signalWindowsGuestCondition(condition, std.mem.eql(u8, name, "pthread_cond_broadcast"));
+        }
+        returnZero(state, direct_return_rip);
+        return true;
+    }
     if (std.mem.eql(u8, name, "Sleep") or std.mem.eql(u8, name, "SleepEx") or
         std.mem.eql(u8, name, "YieldProcessor") or std.mem.eql(u8, name, "PauseProcessor"))
     {
+        const State = @TypeOf(state.*);
+        const is_sleep = std.mem.eql(u8, name, "Sleep") or std.mem.eql(u8, name, "SleepEx");
+        const milliseconds: u64 = if (is_sleep) arg(state, 0, direct_return_rip) else 0;
+        // Return first: the worker resumes at the instruction after the call,
+        // so its saved context has to be the post-return one.
         returnZero(state, direct_return_rip);
+        // `YieldProcessor` and a zero-millisecond `Sleep` mean "run someone
+        // else"; a non-zero `Sleep` means "run someone else for this long".
+        // Answering either by returning turns a guest back-off into a
+        // busy-wait, and under one cooperative interpreter a busy-wait is not
+        // an idle core - it is the whole machine.
+        if (comptime @hasDecl(State, "parkWindowsGuestSleep")) {
+            if (is_sleep and milliseconds != 0) {
+                if (!state.parkWindowsGuestSleep(milliseconds)) {
+                    // The owner has no context to park. Give the workers the
+                    // interval instead of spinning through it.
+                    if (comptime @hasDecl(State, "serviceWindowsGuestThreads")) {
+                        _ = state.serviceWindowsGuestThreads(state.windowsGuestWaitServiceSlice());
+                    }
+                }
+            } else if (comptime @hasDecl(State, "requestWindowsGuestSliceYield")) {
+                state.requestWindowsGuestSliceYield();
+            }
+        }
         return true;
     }
     if (std.mem.eql(u8, name, "TlsAlloc") or std.mem.eql(u8, name, "FlsAlloc")) {
@@ -5837,11 +7554,26 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         const minimum_message = arg(state, 2, direct_return_rip);
         const maximum_message = arg(state, 3, direct_return_rip);
         const remove = is_get_message or (arg(state, 4, direct_return_rip) & 1) != 0;
-        _ = state.windows_graphics.pumpEvents();
+        // A paint that is already pending must not wait on the stride: that
+        // is the one case where a skipped pump is a skipped frame rather than
+        // a skipped millisecond.
+        const State2 = @TypeOf(state.*);
+        const paint_pending = if (comptime @hasDecl(State2, "windowsPendingPaintCount"))
+            state.windowsPendingPaintCount() != 0
+        else
+            true;
+        _ = state.windows_graphics.pumpEventsAtStep(state.executed_steps, paint_pending);
         var serviced_steps: u64 = 0;
         const State = @TypeOf(state.*);
         if (comptime @hasDecl(State, "serviceWindowsGuestThreads")) {
-            serviced_steps = state.serviceWindowsGuestThreads(windows_guest_thread_service_slice);
+            const service_slice = if (comptime @hasDecl(State, "windowsGuestWaitServiceSlice"))
+                state.windowsGuestWaitServiceSlice()
+            else
+                windows_guest_thread_service_slice;
+            serviced_steps = if (comptime @hasDecl(State, "serviceWindowsGuestBoundary"))
+                state.serviceWindowsGuestBoundary(service_slice)
+            else
+                state.serviceWindowsGuestThreads(service_slice);
         }
         const queued_message = if (comptime @hasDecl(State, "dequeueWindowsMessage"))
             state.dequeueWindowsMessage(filter_hwnd, minimum_message, maximum_message, remove)
@@ -6227,24 +7959,40 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         return true;
     }
 
-    if (std.mem.eql(u8, name, "QueryPerformanceCounter") or std.mem.eql(u8, name, "GetSystemTimeAsFileTime") or
+    if (std.mem.eql(u8, name, "QueryPerformanceCounter")) {
+        const output = arg(state, 0, direct_return_rip);
+        if (output != 0) state.write64(output, windowsGuestClockTicks(state));
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetSystemTimeAsFileTime") or
         std.mem.eql(u8, name, "GetSystemTimePreciseAsFileTime"))
     {
+        // A FILETIME is 100-nanosecond intervals since 1601-01-01, not a
+        // performance-counter reading. Both used to return the raw tick
+        // count, so `std::chrono::system_clock::now()` - which MinGW builds
+        // out of this call - reported a wall clock in the year 1601 and every
+        // duration computed against a real timestamp was nonsense.
         const output = arg(state, 0, direct_return_rip);
-        if (output != 0) state.write64(output, state.executed_steps);
+        if (output != 0) state.write64(output, windowsGuestFileTime(state));
         state.regs.rax = 1;
         finish(state, direct_return_rip);
         return true;
     }
     if (std.mem.eql(u8, name, "QueryPerformanceFrequency")) {
         const output = arg(state, 0, direct_return_rip);
-        if (output != 0) state.write64(output, 1_000_000);
+        // The one place this number is decided is the ELF state, because the
+        // cooperative wait deadlines are denominated in the same ticks. A
+        // guest that measures a millisecond and a guest that sleeps for one
+        // have to agree, and they only can if both read the same constant.
+        if (output != 0) state.write64(output, windowsGuestClockHz(state));
         state.regs.rax = 1;
         finish(state, direct_return_rip);
         return true;
     }
     if (std.mem.eql(u8, name, "GetTickCount") or std.mem.eql(u8, name, "GetTickCount64")) {
-        state.regs.rax = state.executed_steps / 1000;
+        state.regs.rax = windowsGuestClockTicks(state) / 1000;
         finish(state, direct_return_rip);
         return true;
     }
@@ -6409,6 +8157,35 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         finish(state, direct_return_rip);
         return true;
     }
+    if (std.mem.eql(u8, name, "CLSIDFromString")) {
+        // The PE title only uses this as a class-id probe.  Do not claim
+        // success with an all-zero GUID: CoCreateInstance would then follow
+        // a class path Rosetta never registered.  Validate the output
+        // pointer and return the documented class-string refusal directly at
+        // this import boundary.
+        const output = arg(state, 1, direct_return_rip);
+        if (output == 0 or state.guestMemory(output, 16) == null) {
+            state.regs.rax = 0x8000_4003; // E_POINTER
+        } else {
+            _ = clearGuestMemory(state, output, 16);
+            state.regs.rax = 0x8004_0170; // CO_E_CLASSSTRING
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "PropVariantClear")) {
+        // PROPVARIANT is 24 bytes on the PE's x64 ABI.  Clearing the guest
+        // record is enough for the teardown contract and avoids turning a
+        // harmless cleanup into an untyped HRESULT fallback.
+        const propvariant = arg(state, 0, direct_return_rip);
+        if (propvariant == 0 or !clearGuestMemory(state, propvariant, 24)) {
+            state.regs.rax = 0x8000_4003; // E_POINTER
+        } else {
+            state.regs.rax = 0; // S_OK
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
     if (std.mem.eql(u8, name, "RoInitialize")) {
         // The PE path has no WinRT apartment object to publish, but a
         // successful initialization is the documented non-error result and
@@ -6449,6 +8226,210 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
             @memcpy(state.guestMemory(output, 16).?, hid_guid[0..]);
             state.windows_last_error = 0;
             state.regs.rax = 1;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    // The process-exit family.
+    //
+    // A guest that asks to exit and is answered with a contract refusal
+    // *returns* and keeps running with state it has already torn down. Xenia
+    // leaves through `std::quick_exit` on purpose ("Cheap-skate exit!"), so
+    // this is a normal, expected path and not an error - the exit code is
+    // the guest's own, and the run ends where the guest said it does.
+    if (std.mem.eql(u8, name, "ExitProcess") or
+        std.mem.eql(u8, name, "exit") or
+        std.mem.eql(u8, name, "_exit") or
+        std.mem.eql(u8, name, "_Exit") or
+        std.mem.eql(u8, name, "quick_exit") or
+        std.mem.eql(u8, name, "_cexit") or
+        std.mem.eql(u8, name, "_c_exit"))
+    {
+        const code = arg(state, 0, direct_return_rip);
+        state.exit_code = code;
+        state.terminated = true;
+        log.info("PE64 Windows guest exit: api={s} code=0x{x} step={d}; the guest ended the process itself", .{
+            name,
+            code,
+            state.executed_steps,
+        });
+        return true;
+    }
+    if (std.mem.eql(u8, name, "TerminateProcess")) {
+        // (handle, exit_code). A guest terminating a handle that is not its
+        // own process is not modelled; Rosetta hosts one process.
+        state.exit_code = arg(state, 1, direct_return_rip);
+        state.terminated = true;
+        log.info("PE64 Windows guest exit: api=TerminateProcess code=0x{x} step={d}", .{
+            state.exit_code,
+            state.executed_steps,
+        });
+        return true;
+    }
+
+    // The Configuration Manager device tree.
+    //
+    // These exist for the same reason as the HID block below: libusb's
+    // `init_dlls` resolves `CM_Get_Parent` and `CM_Get_Child` with
+    // `ret_on_failure = true`, so one absent name costs the whole WinUSB
+    // backend. Its macro tries the bare name, then +A, then +W, which is why
+    // a single missing export appeared three times in the 2026-09-12 run.
+    //
+    // Rosetta enumerates no PnP devices, so every one of these answers with
+    // the CONFIGRET a Windows machine returns for a devnode that is not
+    // there. Zero would be CR_SUCCESS, and a caller that reads CR_SUCCESS
+    // then trusts a devinst handle nothing wrote.
+    if (std.mem.startsWith(u8, name, "CM_")) {
+        if (std.mem.eql(u8, name, "CM_MapCrToWin32Err")) {
+            // (CONFIGRET, default) -> Win32 error. Rosetta has no mapping
+            // table, so the caller's own default is the honest answer.
+            state.regs.rax = arg(state, 1, direct_return_rip);
+            finish(state, direct_return_rip);
+            return true;
+        }
+        if (std.mem.startsWith(u8, name, "CM_Locate_DevNode")) {
+            // Nothing to locate. Clear the out-parameter first: a caller that
+            // ignores the CONFIGRET must not read a devinst off its stack.
+            const devinst = arg(state, 0, direct_return_rip);
+            if (devinst != 0 and state.guestMemory(devinst, 4) != null) state.write32(devinst, 0);
+            state.regs.rax = cr_no_such_devnode;
+            finish(state, direct_return_rip);
+            return true;
+        }
+        if (std.mem.startsWith(u8, name, "CM_Get_Device_ID_List_Size") or
+            std.mem.startsWith(u8, name, "CM_Get_Device_Interface_List_Size") or
+            std.mem.eql(u8, name, "CM_Get_Device_ID_Size"))
+        {
+            // A size query with an empty list is a success returning zero,
+            // not a refusal: the caller allocates nothing and enumerates
+            // nothing, which is the correct outcome for no devices.
+            const size = arg(state, 0, direct_return_rip);
+            if (size != 0 and state.guestMemory(size, 4) != null) state.write32(size, 0);
+            state.regs.rax = cr_success;
+            finish(state, direct_return_rip);
+            return true;
+        }
+        if (std.mem.startsWith(u8, name, "CM_Register_Notification")) {
+            const handle_out = arg(state, 3, direct_return_rip);
+            if (handle_out != 0 and state.guestMemory(handle_out, 8) != null) state.write64(handle_out, 0);
+            state.regs.rax = cr_failure;
+            finish(state, direct_return_rip);
+            return true;
+        }
+        if (std.mem.eql(u8, name, "CM_Unregister_Notification")) {
+            state.regs.rax = cr_success;
+            finish(state, direct_return_rip);
+            return true;
+        }
+        // Everything else takes a devinst Rosetta never issued.
+        state.regs.rax = cr_no_such_devinst;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    // WinUSB is a real Windows surface package, but Rosetta does not expose
+    // a host USB kernel-device handle. Keep the dynamically resolved abort
+    // export callable so libusb's all-or-nothing probe does not become an
+    // import gap; an invalid interface handle then receives the documented
+    // FALSE/ERROR_INVALID_HANDLE result.
+    if (import_contract.isWinUsbRequiredImport(name)) {
+        // Every name in `winusbx_init`'s required list, answered the same
+        // way. libusb resolves the twelve as a unit and `FreeLibrary`s the
+        // module if any one is missing, so serving them one per run - which
+        // is what the 2026-09-12 runs did, reporting AbortPipe and then
+        // ControlTransfer - never converges. `WinUsb_Free` returns TRUE
+        // because freeing nothing succeeds; the rest report the documented
+        // invalid-handle failure, which is the truth about a Rosetta run:
+        // there is no USB device behind the handle.
+        const frees = std.mem.eql(u8, name, "WinUsb_Free");
+        state.windows_last_error = if (frees) 0 else 6; // ERROR_INVALID_HANDLE
+        state.regs.rax = if (frees) 1 else 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    // The rest of the HID surface.
+    //
+    // These exist so a controller stack's all-or-nothing probe succeeds.
+    // SDL's `WIN_LoadHIDDLL` resolves seven names and unloads the library if
+    // any one is absent, taking the whole raw-input joystick backend with it;
+    // hidapi's `lookup_functions` resolves twelve with the same rule. Refusing
+    // one name therefore does not disable one call, it disables a subsystem -
+    // and it disables it for the wrong reason, because the reason there is no
+    // controller here is that Rosetta enumerates no HID devices, not that the
+    // library is missing.
+    //
+    // What they do *not* do is claim a device. Every device handle they can
+    // be given is one Rosetta never issued, so each reports its documented
+    // invalid-handle answer, which is exactly what a Windows machine with
+    // nothing plugged in reports too.
+    if (std.mem.startsWith(u8, name, "HidD_")) {
+        // BOOLEAN. FALSE is the refusal, and the out-parameters stay
+        // untouched because there is no device to describe.
+        state.windows_last_error = 6; // ERROR_INVALID_HANDLE
+        state.regs.rax = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "HidP_MaxDataListLength") or
+        std.mem.eql(u8, name, "HidP_MaxUsageListLength"))
+    {
+        // ULONG count, and zero is the honest one: a report with no
+        // preparsed data has no data items in it.
+        state.regs.rax = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.startsWith(u8, name, "HidP_")) {
+        // NTSTATUS, where zero is HIDP_STATUS_SUCCESS. Returning it would
+        // tell the caller a capability structure had been filled in.
+        state.regs.rax = 0xC011_0001; // HIDP_STATUS_INVALID_PREPARSED_DATA
+        finish(state, direct_return_rip);
+        return true;
+    }
+    // SHCore's per-monitor DPI surface. Rosetta presents one virtual display
+    // at the system default scale, so these are answerable exactly rather
+    // than refused - and answering them is what keeps a caller from taking a
+    // "DPI unavailable" path over a question that has a correct answer.
+    if (std.mem.eql(u8, name, "GetDpiForMonitor")) {
+        const dpi_x = arg(state, 2, direct_return_rip);
+        const dpi_y = arg(state, 3, direct_return_rip);
+        if (dpi_x == 0 or dpi_y == 0 or
+            state.guestMemory(dpi_x, 4) == null or state.guestMemory(dpi_y, 4) == null)
+        {
+            state.regs.rax = 0x8007_0057; // E_INVALIDARG
+        } else {
+            state.write32(dpi_x, 96);
+            state.write32(dpi_y, 96);
+            state.regs.rax = 0; // S_OK
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetScaleFactorForMonitor")) {
+        const scale = arg(state, 1, direct_return_rip);
+        if (scale == 0 or state.guestMemory(scale, 4) == null) {
+            state.regs.rax = 0x8007_0057; // E_INVALIDARG
+        } else {
+            state.write32(scale, 100); // SCALE_100_PERCENT
+            state.regs.rax = 0; // S_OK
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SetProcessDpiAwareness")) {
+        // A guest that sets awareness and reads it back must see what it
+        // set, so the value is retained rather than acknowledged and lost.
+        state.windows_process_dpi_awareness = @truncate(arg(state, 0, direct_return_rip));
+        state.regs.rax = 0; // S_OK
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetProcessDpiAwareness")) {
+        const awareness = arg(state, 1, direct_return_rip);
+        if (awareness == 0 or state.guestMemory(awareness, 4) == null) {
+            state.regs.rax = 0x8007_0057; // E_INVALIDARG
+        } else {
+            state.write32(awareness, state.windows_process_dpi_awareness);
+            state.regs.rax = 0; // S_OK
         }
         finish(state, direct_return_rip);
         return true;
@@ -6529,31 +8510,91 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
     }
     if (std.mem.eql(u8, name, "InitializeSRWLock")) {
         const lock = arg(state, 0, direct_return_rip);
-        if (lock != 0 and state.guestMemory(lock, 8) != null) state.write64(lock, 0);
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "initializeWindowsSrwLock")) {
+            _ = state.initializeWindowsSrwLock(lock);
+        } else if (lock != 0 and state.guestMemory(lock, 8) != null) {
+            state.write64(lock, 0);
+        }
         returnZero(state, direct_return_rip);
         return true;
     }
     if (std.mem.eql(u8, name, "AcquireSRWLockExclusive")) {
         const lock = arg(state, 0, direct_return_rip);
-        if (lock != 0 and state.guestMemory(lock, 8) != null) state.write64(lock, 1);
-        returnZero(state, direct_return_rip);
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "acquireWindowsSrwLock")) {
+            var acquired = false;
+            var contended = false;
+            switch (state.acquireWindowsSrwLock(lock)) {
+                .invalid => {},
+                .acquired => acquired = true,
+                .contended => contended = true,
+            }
+            if (contended) {
+                // A worker cannot block a host thread, so leave the import
+                // call uncompleted and let the cooperative service loop save
+                // this context.  The next run retries Acquire naturally at
+                // the same guest call site after Release wakes it.
+                if (comptime @hasDecl(State, "blockWindowsGuestThreadOnSrwLock")) {
+                    if (state.blockWindowsGuestThreadOnSrwLock(lock)) return true;
+                }
+                // The owner context has no saved worker slot. Give queued
+                // workers a bounded chance to release the lock, then retry
+                // before allowing the owner to spin at the import boundary.
+                if (comptime @hasDecl(State, "serviceWindowsGuestThreads")) {
+                    const service_slice = if (comptime @hasDecl(State, "windowsGuestWaitServiceSlice"))
+                        state.windowsGuestWaitServiceSlice()
+                    else
+                        windows_guest_thread_service_slice;
+                    if (comptime @hasDecl(State, "serviceWindowsGuestBoundary")) {
+                        _ = state.serviceWindowsGuestBoundary(service_slice);
+                    } else {
+                        _ = state.serviceWindowsGuestThreads(service_slice);
+                    }
+                    switch (state.acquireWindowsSrwLock(lock)) {
+                        .acquired => acquired = true,
+                        .contended, .invalid => {},
+                    }
+                }
+                if (!acquired) return true;
+            }
+            if (!acquired) returnZero(state, direct_return_rip) else finish(state, direct_return_rip);
+        } else if (lock != 0 and state.guestMemory(lock, 8) != null) {
+            state.write64(lock, 1);
+            finish(state, direct_return_rip);
+        } else {
+            returnZero(state, direct_return_rip);
+        }
         return true;
     }
     if (std.mem.eql(u8, name, "ReleaseSRWLockExclusive")) {
         const lock = arg(state, 0, direct_return_rip);
-        if (lock != 0 and state.guestMemory(lock, 8) != null) state.write64(lock, 0);
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "releaseWindowsSrwLock")) {
+            state.releaseWindowsSrwLock(lock);
+        } else if (lock != 0 and state.guestMemory(lock, 8) != null) {
+            state.write64(lock, 0);
+        }
         returnZero(state, direct_return_rip);
         return true;
     }
     if (std.mem.eql(u8, name, "TryAcquireSRWLockExclusive")) {
         const lock = arg(state, 0, direct_return_rip);
-        if (lock == 0 or state.guestMemory(lock, 8) == null) {
-            state.regs.rax = 0;
-        } else if (state.read64(lock) == 0) {
-            state.write64(lock, 1);
-            state.regs.rax = 1;
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "acquireWindowsSrwLock")) {
+            state.regs.rax = switch (state.acquireWindowsSrwLock(lock)) {
+                .acquired => 1,
+                .invalid, .contended => 0,
+            };
         } else {
-            state.regs.rax = 0;
+            if (lock == 0 or state.guestMemory(lock, 8) == null) {
+                state.regs.rax = 0;
+            } else if (state.read64(lock) == 0) {
+                state.write64(lock, 1);
+                state.regs.rax = 1;
+            } else {
+                state.regs.rax = 0;
+            }
         }
         finish(state, direct_return_rip);
         return true;
@@ -6577,6 +8618,102 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         const current = arg(state, 2, direct_return_rip);
         if (current != 0) state.write32(current, desired);
         returnZero(state, direct_return_rip); // STATUS_SUCCESS
+        return true;
+    }
+
+    // Xenia's non-alertable Wait implementation intentionally calls the NT
+    // entry point rather than WaitForSingleObjectEx.  Keep the NT and Win32
+    // names on the same Rosetta wait-object state machine: a worker blocks at
+    // an unsignaled event, while the owner/UI context can continue servicing
+    // the deferred message callback that will signal it.
+    if (std.mem.eql(u8, name, "NtWaitForSingleObject")) {
+        const wait_handle = arg(state, 0, direct_return_rip);
+        const timeout_pointer = arg(state, 2, direct_return_rip);
+        const timeout = ntWaitTimeoutMilliseconds(state, timeout_pointer) orelse {
+            state.regs.rax = nt_status_invalid_parameter;
+            finish(state, direct_return_rip);
+            return true;
+        };
+        return finishNtWait(state, direct_return_rip, wait_handle, timeout);
+    }
+    if (std.mem.eql(u8, name, "NtSetEvent") or
+        std.mem.eql(u8, name, "NtPulseEvent") or
+        std.mem.eql(u8, name, "NtClearEvent"))
+    {
+        const handle = arg(state, 0, direct_return_rip);
+        const previous_state = arg(state, 1, direct_return_rip);
+        const State = @TypeOf(state.*);
+        const known = if (comptime @hasDecl(State, "windowsWaitObjectKnown"))
+            state.windowsWaitObjectKnown(handle)
+        else
+            false;
+        const was_signaled = if (known) state.windowsWaitObjectSignaled(handle) else false;
+        if (previous_state != 0 and state.guestMemory(previous_state, 4) != null) {
+            state.write32(previous_state, @intFromBool(was_signaled));
+        }
+        if (!known) {
+            state.regs.rax = nt_status_invalid_handle;
+        } else if (std.mem.eql(u8, name, "NtClearEvent")) {
+            _ = state.resetWindowsWaitObject(handle);
+            state.regs.rax = nt_status_success;
+        } else {
+            _ = state.signalWindowsWaitObject(handle, std.mem.eql(u8, name, "NtPulseEvent"));
+            state.regs.rax = nt_status_success;
+        }
+        traceNtSynchronization(state, name, handle, known, state.regs.rax);
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "NtReleaseSemaphore")) {
+        const handle = arg(state, 0, direct_return_rip);
+        const release_count = arg(state, 1, direct_return_rip);
+        const previous_count = arg(state, 2, direct_return_rip);
+        const State = @TypeOf(state.*);
+        const before = if (comptime @hasDecl(State, "windowsWaitObjectSemaphoreCount"))
+            state.windowsWaitObjectSemaphoreCount(handle)
+        else
+            null;
+        const released = if (comptime @hasDecl(State, "releaseWindowsSemaphore"))
+            state.releaseWindowsSemaphore(handle, release_count)
+        else
+            false;
+        if (released) {
+            if (previous_count != 0 and before != null and state.guestMemory(previous_count, 4) != null) {
+                state.write32(previous_count, before.?);
+            }
+            state.regs.rax = nt_status_success;
+        } else {
+            state.regs.rax = if (release_count == 0) nt_status_invalid_parameter else nt_status_invalid_handle;
+        }
+        traceNtSynchronization(state, name, handle, released, state.regs.rax);
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "NtReleaseMutant")) {
+        const handle = arg(state, 0, direct_return_rip);
+        const previous_count = arg(state, 1, direct_return_rip);
+        const State = @TypeOf(state.*);
+        const known = if (comptime @hasDecl(State, "windowsWaitObjectKnown"))
+            state.windowsWaitObjectKnown(handle)
+        else
+            false;
+        if (previous_count != 0 and state.guestMemory(previous_count, 4) != null) state.write32(previous_count, 1);
+        if (known) {
+            if (comptime @hasDecl(State, "signalWindowsWaitObject")) _ = state.signalWindowsWaitObject(handle, false);
+            state.regs.rax = nt_status_success;
+        } else {
+            state.regs.rax = nt_status_invalid_handle;
+        }
+        traceNtSynchronization(state, name, handle, known, state.regs.rax);
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "NtDelayExecution") or std.mem.eql(u8, name, "NtYieldExecution")) {
+        // NtDelayExecution(0, relative-zero) is Xenia's cooperative
+        // MaybeYield path.  The outer Rosetta scheduler owns the actual
+        // context switch; completing the boundary here preserves the NT
+        // status contract without sleeping the host process.
+        returnZero(state, direct_return_rip);
         return true;
     }
     if (std.mem.eql(u8, name, "FormatMessageA") or std.mem.eql(u8, name, "FormatMessageW")) {
@@ -6634,6 +8771,12 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
     }
     if (std.mem.eql(u8, name, "fread") or std.mem.eql(u8, name, "fwrite")) {
         return transferWindowsStdio(state, name, direct_return_rip);
+    }
+    if (std.mem.eql(u8, name, "fputc") or std.mem.eql(u8, name, "fputs") or
+        std.mem.eql(u8, name, "putc") or std.mem.eql(u8, name, "puts") or
+        std.mem.eql(u8, name, "putchar"))
+    {
+        return writeWindowsStdio(state, name, direct_return_rip);
     }
     if (std.mem.eql(u8, name, "fseek") or std.mem.eql(u8, name, "_fseeki64")) {
         return seekWindowsStdio(state, direct_return_rip);
@@ -6821,7 +8964,7 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
     // guest asking an LSTATUS/HRESULT/NTSTATUS question is told the call
     // succeeded and then reads an output Rosetta never wrote.  See
     // windows_import_contract.zig.
-    if (isKnownCoreImport(name) or isKnownDegradedImport(dll_name, name)) {
+    if (isKnownCoreImport(name) or isKnownContractImport(dll_name, name)) {
         completeWithImportFallback(state, dll_name, name, direct_return_rip);
         return true;
     }
@@ -6839,7 +8982,14 @@ fn completeWithImportFallback(
     direct_return_rip: ?u64,
 ) void {
     const fallback = import_contract.fallbackFor(dll_name, name);
-    state.windows_degraded_import_calls +|= 1;
+    // This path is reached only after the name has passed Rosetta's package
+    // inventory.  It is therefore an explicit ABI contract refusal, not an
+    // unresolved/degraded import.  Keep the refusal in the bounded ledger so
+    // a load-bearing call remains visible, but keep the degraded counter for
+    // genuinely unknown names handled by the permissive boundary.
+    if (comptime @hasField(@TypeOf(state.*), "windows_import_contract_calls")) {
+        state.windows_import_contract_calls +|= 1;
+    }
     const State = @TypeOf(state.*);
     if (comptime @hasDecl(State, "noteWindowsImportFallback")) {
         state.noteWindowsImportFallback(dll_name, name, fallback);
@@ -6892,7 +9042,7 @@ pub fn tryFunction(state: anytype, dll_name: []const u8, function_name: []const 
             if (handled) traceGraphicsDispatch(state, function_name, "modelled");
             return handled;
         },
-        .core, .degraded => return handleCore(state, dll_name, function_name, direct_return_rip),
+        .core, .contract, .degraded => return handleCore(state, dll_name, function_name, direct_return_rip),
         .unsupported => {
             if (state.windows_unknown_imports_fatal) {
                 state.terminateForUnresolvedWindowsImport(dll_name, function_name);
@@ -6913,17 +9063,88 @@ test "Windows import classification separates Vulkan from unknown APIs" {
     try std.testing.expectEqual(ImportClass.unsupported, classifyImport("kernel32.dll", "RosetteMissingEntry"));
 }
 
-test "dynamic Windows API names use the degraded inventory without accepting arbitrary symbols" {
-    try std.testing.expectEqual(ImportClass.degraded, classifyImport("", "AcquireSRWLockExclusive"));
-    try std.testing.expectEqual(ImportClass.degraded, classifyImport("", "OpenSCManagerA"));
-    try std.testing.expectEqual(ImportClass.degraded, classifyImport("", "LibK_GetVersion"));
-    try std.testing.expectEqual(ImportClass.degraded, classifyImport("", "LibK_GetProcAddress"));
-    try std.testing.expectEqual(ImportClass.degraded, classifyImport("", "RoInitialize"));
-    try std.testing.expectEqual(ImportClass.degraded, classifyImport("", "CoIncrementMTAUsage"));
-    try std.testing.expectEqual(ImportClass.degraded, classifyImport("", "WindowsCreateStringReference"));
-    try std.testing.expectEqual(ImportClass.degraded, classifyImport("", "RoGetActivationFactory"));
-    try std.testing.expectEqual(ImportClass.degraded, classifyImport("", "RENDERDOC_GetAPI"));
+test "dynamic Windows API names use the modeled inventory without accepting arbitrary symbols" {
+    try std.testing.expectEqual(ImportClass.contract, classifyImport("", "AcquireSRWLockExclusive"));
+    try std.testing.expectEqual(ImportClass.contract, classifyImport("", "OpenSCManagerA"));
+    try std.testing.expectEqual(ImportClass.contract, classifyImport("", "LibK_GetVersion"));
+    try std.testing.expectEqual(ImportClass.contract, classifyImport("", "LibK_GetProcAddress"));
+    try std.testing.expectEqual(ImportClass.contract, classifyImport("", "RoInitialize"));
+    try std.testing.expectEqual(ImportClass.contract, classifyImport("", "CoIncrementMTAUsage"));
+    try std.testing.expectEqual(ImportClass.contract, classifyImport("", "WindowsCreateStringReference"));
+    try std.testing.expectEqual(ImportClass.contract, classifyImport("", "RoGetActivationFactory"));
+    try std.testing.expectEqual(ImportClass.contract, classifyImport("", "RENDERDOC_GetAPI"));
     try std.testing.expectEqual(ImportClass.unsupported, classifyImport("", "RosetteMissingOptionalProbe"));
+}
+
+test "a module Rosetta cannot serve reports absent rather than handing out a handle" {
+    // XAudio2 is the case this rule exists for. Letting the load succeed made
+    // Xenia's audio driver reach `XAudio2Create`, whose unimplemented return
+    // is zero - S_OK for an HRESULT - and then dereference a null vtable.
+    try std.testing.expect(windowsModuleUnavailableOnHost("XAudio2_8.dll"));
+    try std.testing.expect(windowsModuleUnavailableOnHost("C:\\Windows\\System32\\XAudio2_9.dll"));
+    try std.testing.expect(windowsModuleUnavailableOnHost("dxcompiler.dll"));
+    // Pre-existing refusals: Rosetta has no Direct3D device to hand over.
+    try std.testing.expect(windowsModuleUnavailableOnHost("D3D12.dll"));
+    try std.testing.expect(windowsModuleUnavailableOnHost("dxgi.dll"));
+
+    // The two that must never be refused. Xenia gives up on graphics entirely
+    // when `vulkan-1.dll` is absent, and its controller driver returns
+    // X_STATUS_DLL_NOT_FOUND when `xinput1_4.dll` is.
+    try std.testing.expect(!windowsModuleUnavailableOnHost("vulkan-1.dll"));
+    try std.testing.expect(!windowsModuleUnavailableOnHost("xinput1_4.dll"));
+    try std.testing.expect(!windowsModuleUnavailableOnHost("user32.dll"));
+    try std.testing.expect(!windowsModuleUnavailableOnHost("SHCore.dll"));
+    try std.testing.expect(!windowsModuleUnavailableOnHost("winmm.dll"));
+}
+
+test "a dynamic lookup answers NULL for a name Rosetta has no implementation for" {
+    // The whole Vulkan path is reached this way, so it has to resolve even
+    // though no Win32 package owns a `vk` name.
+    try std.testing.expect(isRecognizedDynamicImport("vulkan-1.dll", "vkGetInstanceProcAddr"));
+    try std.testing.expect(isRecognizedDynamicImport("vulkan-1.dll", "vkDestroyInstance"));
+    try std.testing.expect(isRecognizedDynamicImport("", "vkCreateSwapchainKHR"));
+    // XInput resolves by name; the ordinal-100 spelling is handled separately
+    // at the call site because an ordinal is not a string.
+    try std.testing.expect(isRecognizedDynamicImport("xinput1_4.dll", "XInputGetState"));
+    try std.testing.expect(isRecognizedDynamicImport("xinput1_4.dll", "XInputGetStateEx"));
+    // Names Rosetta does not implement. A stub here would answer the caller's
+    // explicit "do you have this?" with yes and then fail somewhere else.
+    try std.testing.expect(!isRecognizedDynamicImport("XAudio2_8.dll", "XAudio2Create"));
+    try std.testing.expect(!isRecognizedDynamicImport("dxilconv.dll", "DxcCreateInstance"));
+    try std.testing.expect(!isRecognizedDynamicImport("", ""));
+}
+
+test "the two all-or-nothing dynamic probes a controller stack makes now resolve" {
+    // SDL's WIN_LoadHIDDLL resolves these seven and unloads hid.dll if any one
+    // is missing, which disables the raw-input joystick backend entirely. The
+    // 2026-09-11 run refused all seven.
+    const raw_input = [_][]const u8{
+        "HidD_GetManufacturerString",
+        "HidD_GetProductString",
+        "HidP_GetCaps",
+        "HidP_GetButtonCaps",
+        "HidP_GetValueCaps",
+        "HidP_MaxDataListLength",
+        "HidP_GetData",
+    };
+    for (raw_input) |name| {
+        if (!isRecognizedDynamicImport("hid.dll", name)) {
+            std.debug.print("hid.dll export '{s}' still resolves to NULL\n", .{name});
+            return error.HidExportUnresolved;
+        }
+    }
+    // hidapi's list adds these.
+    try std.testing.expect(isRecognizedDynamicImport("hid.dll", "HidD_GetAttributes"));
+    try std.testing.expect(isRecognizedDynamicImport("hid.dll", "HidD_GetPreparsedData"));
+    try std.testing.expect(isRecognizedDynamicImport("WinUSB.dll", "WinUsb_AbortPipe"));
+
+    // Xenia's per-monitor DPI v1 probe. Answering it is not a courtesy:
+    // Rosetta presents one virtual display at a known scale, so the question
+    // has a correct answer and refusing it took a fallback for nothing.
+    try std.testing.expect(isRecognizedDynamicImport("SHCore.dll", "GetDpiForMonitor"));
+    try std.testing.expect(!windowsModuleUnavailableOnHost("SHCore.dll"));
+    try std.testing.expect(!windowsModuleUnavailableOnHost("hid.dll"));
+    try std.testing.expect(windowsModuleUnavailableOnHost("libusbK.dll"));
 }
 
 test "Win32 default geometry is normalized before native window creation" {

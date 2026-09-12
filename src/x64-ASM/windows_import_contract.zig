@@ -16,6 +16,17 @@ const std = @import("std");
 const return_contract = @import("dll_win32_return_contract");
 const library_inventory = @import("dll_win32_library_inventory");
 
+/// Whether a name is one libusb's `winusbx_init` requires as a whole list.
+///
+/// The twelve are resolved together and the module is discarded if any one
+/// is missing, so the dispatcher answers them as a set rather than one per
+/// run. The list itself lives in `pkg/dll/win32/winusb`; this is only the
+/// route from the runtime, which imports the catalogue and not the leaves.
+pub fn isWinUsbRequiredImport(function_name: []const u8) bool {
+    if (!std.mem.startsWith(u8, function_name, "WinUsb_")) return false;
+    return library_inventory.isDegradedImport("WINUSB.dll", function_name);
+}
+
 pub const ReturnConvention = return_contract.ReturnConvention;
 pub const Outcome = return_contract.Outcome;
 pub const Fallback = return_contract.Fallback;
@@ -27,7 +38,10 @@ pub const isComponentObjectName = return_contract.isComponentObjectName;
 pub const Subsystem = library_inventory.Subsystem;
 pub const subsystemFor = library_inventory.subsystemFor;
 pub const isWindowsSurface = library_inventory.isWindowsSurface;
-pub const isDegradedImport = library_inventory.isDegradedImport;
+pub const isContractImport = library_inventory.isContractImport;
+pub const ModuleAvailability = library_inventory.ModuleAvailability;
+pub const moduleAvailability = library_inventory.moduleAvailability;
+pub const isDegradedImport = isContractImport;
 
 /// The capability one *import* belongs to.
 ///
@@ -290,4 +304,27 @@ test "an import's capability is its name's when the name is unambiguous" {
     // With no name-shaped answer the library decides.
     try std.testing.expectEqual(Subsystem.legacy_drawing, subsystemForImport("GDI32.dll", "BitBlt"));
     try std.testing.expectEqual(Subsystem.unrecognized, subsystemForImport("mygame.dll", "Something"));
+}
+
+test "libusb's WinUSB list is answered as a set, and the isochronous probe is not" {
+    // Serving these one at a time is what made two consecutive runs report
+    // `WinUsb_AbortPipe` and then `WinUsb_ControlTransfer`: libusb requires
+    // all twelve and discards the module if any is missing.
+    try std.testing.expect(isWinUsbRequiredImport("WinUsb_AbortPipe"));
+    try std.testing.expect(isWinUsbRequiredImport("WinUsb_ControlTransfer"));
+    try std.testing.expect(isWinUsbRequiredImport("WinUsb_Initialize"));
+    try std.testing.expect(isWinUsbRequiredImport("WinUsb_Free"));
+    try std.testing.expect(isWinUsbRequiredImport("WinUsb_WritePipe"));
+    try std.testing.expect(isWinUsbRequiredImport("WinUsb_GetPipePolicy"));
+
+    // The optional probe stays refused: serving it would promise an
+    // isochronous transport Rosetta does not model, and would make four more
+    // names required.
+    try std.testing.expect(!isWinUsbRequiredImport("WinUsb_ReadIsochPipeAsap"));
+    try std.testing.expect(!isWinUsbRequiredImport("WinUsb_QueryPipeEx"));
+    try std.testing.expect(!isWinUsbRequiredImport("WinUsb_RegisterIsochBuffer"));
+
+    // And nothing outside the family borrows the answer.
+    try std.testing.expect(!isWinUsbRequiredImport("GetProcAddress"));
+    try std.testing.expect(!isWinUsbRequiredImport(""));
 }
