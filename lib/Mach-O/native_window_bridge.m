@@ -32,10 +32,13 @@ static BOOL g_fullscreen;
 static BOOL g_reported_off_main_thread;
 static uint64_t g_diagnostic_frames_presented;
 static uint64_t g_guest_frames_presented;
+static CFAbsoluteTime g_last_foreground_reassertion;
+static uint64_t g_foreground_reassertions;
 
 static const uint32_t kRosetteDefaultWindowWidth = 1280u;
 static const uint32_t kRosetteDefaultWindowHeight = 720u;
 static const uint32_t kRosetteMaxWindowDimension = 16u * 1024u;
+static const CFTimeInterval kRosetteForegroundReassertionInterval = 0.25;
 
 static uint32_t RosetteMachONormalizeWindowDimension(uint32_t requested,
                                                      uint32_t fallback) {
@@ -55,17 +58,46 @@ static BOOL RosetteMachOHasFinitePositiveRect(NSRect rect) {
          NSWidth(rect) > 0.0 && NSHeight(rect) > 0.0;
 }
 
+static void RosetteMachOUpdateMetalDrawable(void);
+
+static CGFloat RosetteMachOClamp(CGFloat value, CGFloat low, CGFloat high) {
+  if (high < low) {
+    return low;
+  }
+  if (value < low) {
+    return low;
+  }
+  if (value > high) {
+    return high;
+  }
+  return value;
+}
+
 static void RosetteMachOPlaceWindowSafely(void) {
   if (!g_window) {
     return;
   }
   const NSRect frame = g_window.frame;
-  NSScreen *screen = g_window.screen ?: [NSScreen mainScreen];
+  // The main screen first: that is where the keyboard focus is, which is
+  // where the user is looking. `g_window.screen` at creation time is only
+  // whichever screen AppKit's default placement happened to overlap, and
+  // centring on that puts the window on a display the user may not be
+  // watching.
+  NSScreen *screen = [NSScreen mainScreen] ?: g_window.screen;
   if (screen && RosetteMachOHasFinitePositiveRect(screen.visibleFrame) &&
       RosetteMachOHasFinitePositiveRect(frame)) {
     const NSRect visible = screen.visibleFrame;
-    const CGFloat x = NSMidX(visible) - NSWidth(frame) * 0.5;
-    const CGFloat y = NSMidY(visible) - NSHeight(frame) * 0.5;
+    CGFloat x = NSMidX(visible) - NSWidth(frame) * 0.5;
+    CGFloat y = NSMidY(visible) - NSHeight(frame) * 0.5;
+    // Centring alone does not guarantee the window is on the display: a
+    // frame wider or taller than the visible area, or a visible area whose
+    // origin is negative on a multi-display arrangement, both put the
+    // centred origin outside it. AppKit reports such a window as visible,
+    // on screen and unoccluded, and a person sees a sliver of it or none.
+    // Clamping keeps the whole frame inside when it fits, and pins it to the
+    // corner nearest the user when it does not.
+    x = RosetteMachOClamp(x, NSMinX(visible), NSMaxX(visible) - NSWidth(frame));
+    y = RosetteMachOClamp(y, NSMinY(visible), NSMaxY(visible) - NSHeight(frame));
     if (isfinite((double)x) && isfinite((double)y)) {
       [g_window setFrameOrigin:NSMakePoint(x, y)];
       return;
@@ -75,6 +107,88 @@ static void RosetteMachOPlaceWindowSafely(void) {
   // finite origin is still valid and avoids NSWindow's internal centered-frame
   // sentinel (`INT_MIN`) while the application is becoming visible.
   [g_window setFrameOrigin:NSMakePoint(0.0, 0.0)];
+}
+
+static void RosetteMachOConfigureForegroundWindowPolicy(void) {
+  if (!g_window) {
+    return;
+  }
+
+  // The standalone PE runner has no persistent Cocoa application delegate to
+  // keep this window in front after another app receives focus.  Keep the
+  // Rosette surface in the user's active Space and above ordinary document
+  // windows so a successful Vulkan present remains observable.  The
+  // occlusion bit is still read from AppKit below; this policy never fakes a
+  // visible result in the diagnostic log.
+  g_window.level = NSFloatingWindowLevel;
+  g_window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+                                 NSWindowCollectionBehaviorFullScreenAuxiliary;
+  g_window.hidesOnDeactivate = NO;
+}
+
+static BOOL RosetteMachOWindowNeedsForegroundRepair(void) {
+  if (!g_window || !g_application) {
+    return NO;
+  }
+
+  // A miniaturized window is not merely occluded: it has no drawable that the
+  // user can observe.  Keep this case separate from the normal occlusion
+  // predicate so the foreground repair path can deminiaturize it.  The old
+  // predicate explicitly excluded miniaturized windows, which made the
+  // recovery code unreachable after AppKit collapsed the Rosette window.
+  if (g_window.isMiniaturized) {
+    return YES;
+  }
+
+  if (!g_window.isVisible || g_window.screen == nil) {
+    return NO;
+  }
+  return (g_window.occlusionState & NSWindowOcclusionStateVisible) == 0;
+}
+
+static void RosetteMachOBringWindowToFrontOnMainThread(const char *reason) {
+  if (!g_window || !g_application) {
+    return;
+  }
+
+  RosetteMachOConfigureForegroundWindowPolicy();
+  if (g_window.isMiniaturized) {
+    [g_window deminiaturize:nil];
+  }
+  [g_application activateIgnoringOtherApps:YES];
+  [g_window orderFrontRegardless];
+  [g_window makeKeyAndOrderFront:nil];
+  RosetteMachOPlaceWindowSafely();
+  RosetteMachOUpdateMetalDrawable();
+  g_last_foreground_reassertion = CFAbsoluteTimeGetCurrent();
+  ++g_foreground_reassertions;
+  const uint64_t count = g_foreground_reassertions;
+  const BOOL sparse_report = count <= 4u || (count & (count - 1u)) == 0u;
+  // A permanently covered window can cause the pump to retry every 250 ms.
+  // Keep the recovery attempts observable without turning that condition into
+  // an unbounded log stream; the detailed PRESENT CHAIN verdict remains the
+  // authoritative statement that visibility was not recovered.
+  if (reason == NULL || strcmp(reason, "occluded") != 0 || sparse_report) {
+    fprintf(stderr,
+            "macho-processor: AppKit window foreground reasserted: reason=%s "
+            "count=%llu\n",
+            reason ? reason : "unspecified", (unsigned long long)count);
+  }
+}
+
+static void RosetteMachOReassertForegroundIfOccludedOnMainThread(void) {
+  if (!RosetteMachOWindowNeedsForegroundRepair()) {
+    return;
+  }
+
+  const CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+  if (g_last_foreground_reassertion != 0.0 &&
+      now - g_last_foreground_reassertion <
+          kRosetteForegroundReassertionInterval) {
+    return;
+  }
+  RosetteMachOBringWindowToFrontOnMainThread(
+      g_window.isMiniaturized ? "miniaturized" : "occluded");
 }
 
 static void RosetteMachORunOnMainThreadSync(dispatch_block_t block) {
@@ -96,6 +210,22 @@ static void RosetteMachORunOnMainThreadSync(dispatch_block_t block) {
   block();
 }
 
+// Whether a VkSwapchainKHR is live on the layer.
+//
+// `drawableSize` belongs to whoever vends the drawables. Before a swapchain
+// exists that is this bridge, which sizes the layer so the window is sane and
+// the host diagnostic clear has somewhere to go. From the moment MoltenVK
+// creates a swapchain on the layer it is MoltenVK's: it sets drawableSize to
+// the swapchain's imageExtent, watches the property, and treats a change it
+// did not make as the swapchain going out of date.
+//
+// This bridge used to write drawableSize from every event pump - which the
+// guest's message loop calls once per GetMessage - so on the 2026-09-11 run
+// the layer read 2560x1440 while the guest's swapchain was 1280x720, for the
+// whole run. Fighting the driver for a property it owns cannot make a frame
+// appear and can stop one.
+static BOOL g_drawable_owned_by_swapchain = NO;
+
 static void RosetteMachOUpdateMetalDrawable(void) {
   if (!g_window || !g_view || !g_metal_layer) {
     return;
@@ -104,11 +234,24 @@ static void RosetteMachOUpdateMetalDrawable(void) {
   const NSRect bounds = g_view.bounds;
   g_metal_layer.frame = bounds;
   g_metal_layer.contentsScale = scale;
-  g_metal_layer.drawableSize =
-      CGSizeMake(MAX(bounds.size.width, 1.0) * scale,
-                 MAX(bounds.size.height, 1.0) * scale);
+  if (!g_drawable_owned_by_swapchain) {
+    g_metal_layer.drawableSize =
+        CGSizeMake(MAX(bounds.size.width, 1.0) * scale,
+                   MAX(bounds.size.height, 1.0) * scale);
+  }
   g_width = (uint32_t)MAX(bounds.size.width, 1.0);
   g_height = (uint32_t)MAX(bounds.size.height, 1.0);
+}
+
+int rosette_macho_native_window_set_drawable_owner(int owned_by_swapchain) {
+  const BOOL requested = owned_by_swapchain != 0;
+  const BOOL changed = requested != g_drawable_owned_by_swapchain;
+  g_drawable_owned_by_swapchain = requested;
+  return changed ? 1 : 0;
+}
+
+int rosette_macho_native_window_drawable_owned_by_swapchain(void) {
+  return g_drawable_owned_by_swapchain ? 1 : 0;
 }
 
 static BOOL RosetteMachOEnsureApplicationOnMainThread(void) {
@@ -157,6 +300,7 @@ static BOOL RosetteMachOEnsureWindowOnMainThread(uint32_t width,
   g_window.title = title.length ? title : @"Xenia Canary (Rosette)";
   g_window.acceptsMouseMovedEvents = YES;
   g_window.tabbingMode = NSWindowTabbingModeDisallowed;
+  RosetteMachOConfigureForegroundWindowPolicy();
 
   g_view = [[RosetteMachOMetalView alloc] initWithFrame:content_rect];
   if (!g_view) {
@@ -198,6 +342,7 @@ static BOOL RosetteMachOEnsureWindowOnMainThread(uint32_t width,
   g_window.contentView = g_view;
   RosetteMachOPlaceWindowSafely();
   RosetteMachOUpdateMetalDrawable();
+  RosetteMachOBringWindowToFrontOnMainThread("created");
   return YES;
 }
 
@@ -269,8 +414,7 @@ int rosette_macho_native_window_show(void) {
   @autoreleasepool {
     RosetteMachORunOnMainThreadSync(^{
       if (RosetteMachOEnsureWindowOnMainThread(g_width, g_height, nil)) {
-        [g_window makeKeyAndOrderFront:nil];
-        [g_application activateIgnoringOtherApps:YES];
+        RosetteMachOBringWindowToFrontOnMainThread("show");
         RosetteMachOUpdateMetalDrawable();
         result = YES;
       }
@@ -573,6 +717,7 @@ uint32_t rosette_macho_native_window_pump_events(void) {
       }
       [g_application updateWindows];
       RosetteMachOUpdateMetalDrawable();
+      RosetteMachOReassertForegroundIfOccludedOnMainThread();
       g_events_pumped += count;
     });
   }
@@ -584,6 +729,11 @@ RosetteMachONativeWindowStatus rosette_macho_native_window_status(void) {
   @autoreleasepool {
     RosetteMachORunOnMainThreadSync(^{
       RosetteMachOUpdateMetalDrawable();
+      // Presentation diagnostics are also a repair opportunity.  A title can
+      // spend a long time in a bounded guest build between event-pump calls;
+      // sampling the broken window must not merely report it and then leave it
+      // miniaturized until the next unrelated UI callback.
+      RosetteMachOReassertForegroundIfOccludedOnMainThread();
       status.application = (uintptr_t)(__bridge void *)g_application;
       status.window = (uintptr_t)(__bridge void *)g_window;
       status.view = (uintptr_t)(__bridge void *)g_view;
@@ -617,12 +767,28 @@ int rosette_macho_native_window_describe(
       if (g_window == nil) {
         return;
       }
+      // Keep the facts below truthful after attempting the repair: if AppKit
+      // has not completed deminiaturization yet, the captured miniaturized
+      // state remains visible in the log and is still the authoritative break.
+      RosetteMachOReassertForegroundIfOccludedOnMainThread();
       described = 1;
       out->window_exists = 1;
       out->window = (uintptr_t)(__bridge void *)g_window;
       out->view = (uintptr_t)(__bridge void *)g_view;
       out->metal_layer = (uintptr_t)(__bridge void *)g_metal_layer;
       out->screen = (uintptr_t)(__bridge void *)g_window.screen;
+      out->screen_count = (uint32_t)[NSScreen screens].count;
+      // The visible frame, not the full frame: the menu bar and the Dock are
+      // not places a window can be seen, and a window centred on a screen's
+      // full frame can still have its title bar behind the menu bar.
+      NSScreen *const describing_screen = g_window.screen ?: [NSScreen mainScreen];
+      if (describing_screen != nil) {
+        const NSRect visible = describing_screen.visibleFrame;
+        out->screen_visible_x = (double)NSMinX(visible);
+        out->screen_visible_y = (double)NSMinY(visible);
+        out->screen_visible_width = (double)NSWidth(visible);
+        out->screen_visible_height = (double)NSHeight(visible);
+      }
 
       const NSRect window_frame = g_window.frame;
       out->window_x = (double)NSMinX(window_frame);
@@ -693,6 +859,8 @@ void rosette_macho_native_window_shutdown(void) {
       g_fullscreen = NO;
       g_diagnostic_frames_presented = 0;
       g_guest_frames_presented = 0;
+      g_last_foreground_reassertion = 0.0;
+      g_foreground_reassertions = 0;
     });
   }
 }

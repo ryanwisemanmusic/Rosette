@@ -72,7 +72,26 @@ typedef struct RosetteMachONativeWindowGeometry {
   uint8_t layer_presents_with_transaction;
   uint8_t on_main_thread;
   uint8_t reserved[2];
+
+  // The visible frame of the screen the window is on, in the same global
+  // coordinate space as window_x/window_y. A window can be on a screen and
+  // almost entirely outside the part of it a person can see; nothing above
+  // distinguishes that from a window in the middle of the display.
+  double screen_visible_x;
+  double screen_visible_y;
+  double screen_visible_width;
+  double screen_visible_height;
+  uint32_t screen_count;
+  uint32_t reserved_screen;
 } RosetteMachONativeWindowGeometry;
+
+// The Zig mirror in lib/gpu/window_geometry.zig is filled by writing through
+// a pointer to this type, so the two layouts have to be the same object. A
+// field added on one side and not the other has no compiler that can see
+// both; this pair of assertions is that compiler.
+_Static_assert(sizeof(RosetteMachONativeWindowGeometry) == 232,
+               "RosetteMachONativeWindowGeometry changed size; update the Zig "
+               "mirror in lib/gpu/window_geometry.zig and both assertions");
 
 // Fills `out` with the current chain. Returns 1 when a window exists, 0 when
 // there is nothing to describe. Safe to call from any thread: the AppKit reads
@@ -88,6 +107,15 @@ int rosette_macho_native_window_show(void);
 int rosette_macho_native_window_hide(void);
 int rosette_macho_native_window_set_fullscreen(int fullscreen);
 int rosette_macho_native_window_attach_metal_layer(void);
+// Hand the CAMetalLayer's drawableSize to the Vulkan driver, or take it back.
+//
+// A CAMetalLayer's drawableSize belongs to whoever vends its drawables. Once
+// MoltenVK has created a swapchain on the layer, it sets drawableSize from
+// the swapchain's imageExtent and treats any other write as the swapchain
+// going out of date, so this bridge must stop touching it. Returns 1 when the
+// ownership actually changed. Idempotent.
+int rosette_macho_native_window_set_drawable_owner(int owned_by_swapchain);
+int rosette_macho_native_window_drawable_owned_by_swapchain(void);
 // A host-generated Metal clear. Proves the Cocoa/Metal boundary is alive and
 // nothing else: no guest image, no Vulkan command, no guest swap. The name says
 // diagnostic because a frame from here must never be counted as guest output.
