@@ -1,0 +1,12 @@
+name = "dll-win32-capability-gap"
+version = "0.1.0-local"
+kind = "per-dll-missing-condition-inventory"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
+# What each declined Windows DLL would have to gain before Rosette could
+# serve it, and what the guest loses meanwhile. Deciding to decline, and
+# choosing the value returned, stay with the dispatcher and the return
+# contract; this package only records the standing work.
