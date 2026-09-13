@@ -1,0 +1,16 @@
+name = "common-xenia-kernel-shim-map"
+version = "0.1.0-local"
+kind = "xenia-kernel-export-shim-recognition"
+role = "build-time"
+# Route-independent: the shape of a mangled C++ name and the console's export
+# naming are both properties of Xenia and the Xbox 360, not of the machine
+# Rosette was compiled for.
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
+# The package recognises `xe::kernel::<module>::<Export>_entry` in a COFF
+# symbol table, recovers the console export name, and classifies it. Reading
+# the symbol table, resolving an address, arming a tracepoint and counting
+# entries all stay in lib and src, because every one of those is a fact about
+# a running process.
