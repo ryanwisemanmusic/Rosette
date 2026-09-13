@@ -10,6 +10,7 @@
 const std = @import("std");
 
 const import_contract = @import("windows_import_contract.zig");
+const windows_policy = @import("windows_policy.zig");
 
 const log = std.log.scoped(.windows_runtime);
 
@@ -20,6 +21,13 @@ pub const ImportFallback = import_contract.Fallback;
 pub const ImportFallbackLedger = import_contract.Ledger;
 pub const importFallbackFor = import_contract.fallbackFor;
 pub const importFallbackAdvice = import_contract.advice;
+pub const isDeliberateExportRefusal = import_contract.isDeliberateExportRefusal;
+pub const ImportAnswerCache = import_contract.AnswerCache;
+pub const importValueIsRefusal = import_contract.valueIsRefusal;
+pub const importRefusalIsHard = import_contract.refusalIsHard;
+pub const importConventionIsDecisive = import_contract.conventionIsDecisive;
+pub const importCapabilityGapFor = import_contract.capabilityGapFor;
+pub const ImportJudgement = import_contract.Judgement;
 pub const ImportSubsystem = import_contract.Subsystem;
 pub const importSubsystemFor = import_contract.subsystemFor;
 pub const importSubsystemForImport = import_contract.subsystemForImport;
@@ -323,6 +331,245 @@ fn isGraphicsImport(dll_name: []const u8, function_name: []const u8) bool {
         std.ascii.eqlIgnoreCase(dll_name, "vulkan.dll") or
         std.ascii.eqlIgnoreCase(dll_name, "dxgi.dll") or
         std.mem.startsWith(u8, function_name, "vk");
+}
+
+const DxgiObjectKind = enum { factory, adapter, output };
+
+const dxgi_factory_methods = [_][]const u8{
+    "IDXGIFactory1::QueryInterface",
+    "IDXGIFactory1::AddRef",
+    "IDXGIFactory1::Release",
+    "IDXGIFactory1::SetPrivateData",
+    "IDXGIFactory1::SetPrivateDataInterface",
+    "IDXGIFactory1::GetPrivateData",
+    "IDXGIFactory1::GetParent",
+    "IDXGIFactory1::EnumAdapters",
+    "IDXGIFactory1::MakeWindowAssociation",
+    "IDXGIFactory1::GetWindowAssociation",
+    "IDXGIFactory1::CreateSwapChain",
+    "IDXGIFactory1::CreateSoftwareAdapter",
+    "IDXGIFactory1::EnumAdapters1",
+    "IDXGIFactory1::IsCurrent",
+};
+
+const dxgi_adapter_methods = [_][]const u8{
+    "IDXGIAdapter1::QueryInterface",
+    "IDXGIAdapter1::AddRef",
+    "IDXGIAdapter1::Release",
+    "IDXGIAdapter1::SetPrivateData",
+    "IDXGIAdapter1::SetPrivateDataInterface",
+    "IDXGIAdapter1::GetPrivateData",
+    "IDXGIAdapter1::GetParent",
+    "IDXGIAdapter1::EnumOutputs",
+    "IDXGIAdapter1::GetDesc",
+    "IDXGIAdapter1::CheckInterfaceSupport",
+    "IDXGIAdapter1::GetDesc1",
+};
+
+const dxgi_output_methods = [_][]const u8{
+    "IDXGIOutput::QueryInterface",
+    "IDXGIOutput::AddRef",
+    "IDXGIOutput::Release",
+    "IDXGIOutput::SetPrivateData",
+    "IDXGIOutput::SetPrivateDataInterface",
+    "IDXGIOutput::GetPrivateData",
+    "IDXGIOutput::GetParent",
+    "IDXGIOutput::GetDesc",
+    "IDXGIOutput::GetDisplayModeList",
+    "IDXGIOutput::FindClosestMatchingMode",
+    "IDXGIOutput::WaitForVBlank",
+    "IDXGIOutput::TakeOwnership",
+    "IDXGIOutput::ReleaseOwnership",
+    "IDXGIOutput::GetGammaControlCapabilities",
+    "IDXGIOutput::SetGammaControl",
+    "IDXGIOutput::GetGammaControl",
+    "IDXGIOutput::SetDisplaySurface",
+    "IDXGIOutput::SetOverlaySurface",
+    "IDXGIOutput::SetDisplayMode",
+};
+
+fn dxgiMethods(kind: DxgiObjectKind) []const []const u8 {
+    return switch (kind) {
+        .factory => &dxgi_factory_methods,
+        .adapter => &dxgi_adapter_methods,
+        .output => &dxgi_output_methods,
+    };
+}
+
+/// Build a guest-only COM object. Every vtable slot points at a Rosetta-owned
+/// import sentinel, never at a host function pointer. The object is only a
+/// small DXGI display model: it exposes one adapter and one output backed by
+/// Rosetta's existing window/monitor contract, while Vulkan remains the actual
+/// content renderer.
+fn makeDxgiObject(state: anytype, kind: DxgiObjectKind) ?u64 {
+    const methods = dxgiMethods(kind);
+    const vtable_bytes = methods.len * 8;
+    const vtable = state.guestAlloc(vtable_bytes, 8) orelse return null;
+    const object = state.guestAlloc(8, 8) orelse return null;
+    if (state.guestMemory(vtable, vtable_bytes) == null or state.guestMemory(object, 8) == null) return null;
+    for (methods, 0..) |method, index| {
+        const slot = state.registerWindowsImportStub("dxgi-com", method) orelse return null;
+        state.write64(vtable +| @as(u64, @intCast(index * 8)), slot);
+    }
+    state.write64(object, vtable);
+    return object;
+}
+
+fn dxgiWriteDisplayDescription(state: anytype, output: u64) bool {
+    if (output == 0) return false;
+    const bytes = state.guestMemory(output, 96) orelse return false;
+    @memset(bytes, 0);
+    const name = "Rosetta Display";
+    for (name, 0..) |character, index| state.write16(output +| @as(u64, @intCast(index * 2)), character);
+    state.write32(output +| 64, 0);
+    state.write32(output +| 68, 0);
+    state.write32(output +| 72, 1280);
+    state.write32(output +| 76, 720);
+    state.write32(output +| 80, 1); // AttachedToDesktop
+    state.write32(output +| 84, 1); // DXGI_MODE_ROTATION_IDENTITY
+    state.write64(output +| 88, primaryMonitorHandle(state));
+    return true;
+}
+
+fn handleDxgiCom(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    if (!std.mem.startsWith(u8, name, "IDXGI")) return false;
+
+    if (std.mem.endsWith(u8, name, "::QueryInterface")) {
+        const output = arg(state, 1, direct_return_rip);
+        if (output == 0 or state.guestMemory(output, 8) == null) {
+            state.regs.rax = 0x8000_4003; // E_POINTER
+        } else {
+            state.write64(output, state.regs.rcx);
+            state.regs.rax = 0; // S_OK
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.endsWith(u8, name, "::AddRef")) {
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.endsWith(u8, name, "::Release")) {
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.endsWith(u8, name, "::EnumAdapters1") or std.mem.endsWith(u8, name, "::EnumAdapters")) {
+        const index = arg(state, 1, direct_return_rip);
+        const output = arg(state, 2, direct_return_rip);
+        if (index != 0) {
+            state.regs.rax = 0x887A_0002; // DXGI_ERROR_NOT_FOUND
+        } else if (output == 0 or state.guestMemory(output, 8) == null) {
+            state.regs.rax = 0x8000_4003; // E_POINTER
+        } else if (makeDxgiObject(state, .adapter)) |adapter| {
+            state.write64(output, adapter);
+            state.regs.rax = 0;
+        } else {
+            state.write64(output, 0);
+            state.regs.rax = 0x8007_000E; // E_OUTOFMEMORY
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.endsWith(u8, name, "::EnumOutputs")) {
+        const index = arg(state, 1, direct_return_rip);
+        const output = arg(state, 2, direct_return_rip);
+        if (index != 0) {
+            state.regs.rax = 0x887A_0002; // DXGI_ERROR_NOT_FOUND
+        } else if (output == 0 or state.guestMemory(output, 8) == null) {
+            state.regs.rax = 0x8000_4003; // E_POINTER
+        } else if (makeDxgiObject(state, .output)) |display| {
+            state.write64(output, display);
+            state.regs.rax = 0;
+        } else {
+            state.write64(output, 0);
+            state.regs.rax = 0x8007_000E; // E_OUTOFMEMORY
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.endsWith(u8, name, "::IsCurrent")) {
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.endsWith(u8, name, "::GetDesc") or std.mem.endsWith(u8, name, "::GetDesc1")) {
+        const description = arg(state, 1, direct_return_rip);
+        state.regs.rax = if (dxgiWriteDisplayDescription(state, description)) 0 else 0x8000_4003;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.endsWith(u8, name, "::WaitForVBlank")) {
+        // The native presenter already owns the display link and guest vblank
+        // pump. A COM call cannot block the interpreter host thread; returning
+        // S_OK gives Xenia's UI tick path a completed, scheduler-safe event.
+        state.regs.rax = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.endsWith(u8, name, "::GetWindowAssociation")) {
+        const output = arg(state, 1, direct_return_rip);
+        if (output != 0 and state.guestMemory(output, 8) != null) state.write64(output, 0);
+        state.regs.rax = if (output != 0) 0 else 0x8000_4003;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.endsWith(u8, name, "::GetDisplayModeList")) {
+        const count = arg(state, 3, direct_return_rip);
+        const modes = arg(state, 4, direct_return_rip);
+        if (count == 0 or state.guestMemory(count, 4) == null) {
+            state.regs.rax = 0x8007_0057; // E_INVALIDARG
+        } else {
+            state.write32(count, 1);
+            if (modes != 0 and state.guestMemory(modes, 32) != null) {
+                @memset(state.guestMemory(modes, 32).?, 0);
+                state.write32(modes +| 0, 1280);
+                state.write32(modes +| 4, 720);
+                state.write32(modes +| 8, 1); // DXGI_FORMAT_R8G8B8A8_UNORM
+            }
+            state.regs.rax = 0;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.endsWith(u8, name, "::SetPrivateData") or
+        std.mem.endsWith(u8, name, "::SetPrivateDataInterface") or
+        std.mem.endsWith(u8, name, "::MakeWindowAssociation") or
+        std.mem.endsWith(u8, name, "::ReleaseOwnership") or
+        std.mem.endsWith(u8, name, "::TakeOwnership") or
+        std.mem.endsWith(u8, name, "::SetDisplayMode") or
+        std.mem.endsWith(u8, name, "::SetDisplaySurface") or
+        std.mem.endsWith(u8, name, "::SetOverlaySurface"))
+    {
+        state.regs.rax = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+
+    // Keep the object ABI total. Optional methods that Rosetta does not need
+    // still return a documented failure rather than falling into an unknown
+    // import or an untyped zero.
+    state.regs.rax = 0x8000_4002; // E_NOINTERFACE
+    finish(state, direct_return_rip);
+    return true;
+}
+
+fn handleDxgiFactory(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    if (!std.mem.eql(u8, name, "CreateDXGIFactory1") and !std.mem.eql(u8, name, "CreateDXGIFactory2")) return false;
+    const output = if (std.mem.eql(u8, name, "CreateDXGIFactory1")) arg(state, 1, direct_return_rip) else arg(state, 2, direct_return_rip);
+    if (output == 0 or state.guestMemory(output, 8) == null) {
+        state.regs.rax = 0x8000_4003; // E_POINTER
+    } else if (makeDxgiObject(state, .factory)) |factory| {
+        state.write64(output, factory);
+        state.regs.rax = 0; // S_OK
+        log.info("PE64 DXGI guest COM factory: object=0x{x} output=0x{x} adapter_count=1 output_count=1", .{ factory, output });
+    } else {
+        state.write64(output, 0);
+        state.regs.rax = 0x8007_000E; // E_OUTOFMEMORY
+    }
+    finish(state, direct_return_rip);
+    return true;
 }
 
 fn isKnownCoreImport(name: []const u8) bool {
@@ -1815,6 +2062,7 @@ pub fn windowsModuleUnavailableOnHost(path: []const u8) bool {
 /// answer to a question the guest asked explicitly.
 pub fn isRecognizedDynamicImport(dll_name: []const u8, function_name: []const u8) bool {
     if (function_name.len == 0) return false;
+    if (std.mem.eql(u8, dll_name, "dxgi-com") and std.mem.startsWith(u8, function_name, "IDXGI")) return true;
     // The graphics surface is the load-bearing case for this predicate.
     // Xenia reaches its whole Vulkan path through
     // `GetProcAddress(vulkan-1.dll, "vkGetInstanceProcAddr")` and then through
@@ -4130,7 +4378,7 @@ fn queryWindowsFileAttributes(state: anytype, name: []const u8, direct_return_ri
 }
 
 fn beginWindowsFind(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
-    const wide = std.mem.endsWith(u8, name, "W");
+    const wide = std.mem.endsWith(u8, name, "W") or std.mem.startsWith(u8, name, "_wfind");
     const output = if (std.mem.startsWith(u8, name, "FindFirstFileEx"))
         arg(state, 2, direct_return_rip)
     else
@@ -4273,6 +4521,13 @@ fn handleStringAndMemory(state: anytype, name: []const u8, direct_return_rip: ?u
             );
         }
     }
+    if (tryCrtMath(state, name, direct_return_rip)) return true;
+    if (tryCrtStrings(state, name, direct_return_rip)) return true;
+    if (tryImm32(state, name, direct_return_rip)) return true;
+    if (trySmallWin32(state, name, direct_return_rip)) return true;
+    if (tryCrtTime(state, name, direct_return_rip)) return true;
+    if (tryGdi32(state, name, direct_return_rip)) return true;
+    if (tryUser32Extras(state, name, direct_return_rip)) return true;
     if (std.mem.eql(u8, name, "llrint") or std.mem.eql(u8, name, "llrintf")) {
         const value: f64 = if (std.mem.eql(u8, name, "llrint"))
             @bitCast(std.mem.readInt(u64, state.xmm[0][0..8], .little))
@@ -4615,11 +4870,7 @@ fn handleStringAndMemory(state: anytype, name: []const u8, direct_return_rip: ?u
 
 fn handleGraphics(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
     if (std.mem.eql(u8, name, "CreateDXGIFactory1") or std.mem.eql(u8, name, "CreateDXGIFactory2")) {
-        const output = if (std.mem.eql(u8, name, "CreateDXGIFactory1")) arg(state, 1, direct_return_rip) else arg(state, 2, direct_return_rip);
-        if (output != 0 and state.guestMemory(output, 8) != null) state.write64(output, 0);
-        state.regs.rax = if (output == 0) 0x8000_4003 else 0x8000_4002; // E_POINTER / E_NOINTERFACE
-        finish(state, direct_return_rip);
-        return true;
+        return handleDxgiFactory(state, name, direct_return_rip);
     }
     // Vulkan's proc-address functions are the important bridge point: every
     // returned function receives a Rosetta-owned guest address and is routed
@@ -5034,12 +5285,599 @@ fn handleWindowsSecurity(state: anytype, name: []const u8, direct_return_rip: ?u
     return false;
 }
 
+fn completeWindowsPolicyRefusal(
+    state: anytype,
+    dll_name: []const u8,
+    name: []const u8,
+    direct_return_rip: ?u64,
+) bool {
+    if (windows_policy.contains(name)) {
+        completeWithImportFallback(state, dll_name, name, direct_return_rip);
+        return true;
+    }
+    return false;
+}
+
+fn openWindowsCrtDescriptor(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    const wide = std.mem.startsWith(u8, name, "_w");
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = guestPathToHost(state, arg(state, 0, direct_return_rip), wide, &path_buffer) orelse {
+        failWindowsDescriptorCall(state, direct_return_rip, 2); // ENOENT
+        return true;
+    };
+    const flags: u32 = @truncate(arg(state, 1, direct_return_rip));
+    const access_mode = flags & 0x3; // _O_RDONLY/_O_WRONLY/_O_RDWR
+    if (access_mode > 2) {
+        failWindowsDescriptorCall(state, direct_return_rip, 22); // EINVAL
+        return true;
+    }
+    const readable = access_mode != 1;
+    const writable = access_mode != 0;
+    const create = (flags & 0x100) != 0; // _O_CREAT
+    const truncate = (flags & 0x200) != 0; // _O_TRUNC
+    var file = hostOpenFile(state, path, if (readable and writable) .read_write else if (writable) .write_only else .read_only);
+    if (file == null and create) file = hostCreateFile(state, path, readable, truncate, false);
+    const opened = file orelse {
+        failWindowsDescriptorCall(state, direct_return_rip, 2);
+        return true;
+    };
+    if (truncate and !create) {
+        const io = state.windows_host_io orelse unreachable;
+        opened.setLength(io, 0) catch {
+            opened.close(io);
+            failWindowsDescriptorCall(state, direct_return_rip, 5); // EIO
+            return true;
+        };
+    }
+    const media_authorized = if (state.windows_host_media_path) |media_path|
+        std.mem.eql(u8, path, media_path)
+    else
+        false;
+    const handle = installWindowsFile(state, opened, readable, writable, media_authorized) orelse {
+        failWindowsDescriptorCall(state, direct_return_rip, 24); // EMFILE
+        return true;
+    };
+    const slot = windowsFileSlot(state, handle).?;
+    state.windows_last_error = 0;
+    state.regs.rax = slot.stdio_fd;
+    finish(state, direct_return_rip);
+    return true;
+}
+
+fn openWindowsStdioSecure(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    const output = arg(state, 0, direct_return_rip);
+    if (output == 0 or state.guestMemory(output, 8) == null) {
+        state.regs.rax = 22; // EINVAL
+        finish(state, direct_return_rip);
+        return true;
+    }
+    state.write64(output, 0);
+    const wide = std.mem.startsWith(u8, name, "_w");
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = guestPathToHost(state, arg(state, 1, direct_return_rip), wide, &path_buffer) orelse {
+        state.regs.rax = 2; // ENOENT
+        finish(state, direct_return_rip);
+        return true;
+    };
+    var mode_buffer: [128]u8 = undefined;
+    const mode = if (wide)
+        guestWideToUtf8Buffer(state, arg(state, 2, direct_return_rip), &mode_buffer)
+    else
+        guestCString(state, arg(state, 2, direct_return_rip));
+    const selected_mode = mode orelse {
+        state.regs.rax = 22;
+        finish(state, direct_return_rip);
+        return true;
+    };
+    if (selected_mode.len == 0) {
+        state.regs.rax = 22;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    const read_write = std.mem.indexOfScalar(u8, selected_mode, '+') != null;
+    const readable = read_write or selected_mode[0] == 'r';
+    const writable = read_write or selected_mode[0] == 'w' or selected_mode[0] == 'a';
+    var file: ?std.Io.File = null;
+    switch (selected_mode[0]) {
+        'r' => file = hostOpenFile(state, path, if (read_write) .read_write else .read_only),
+        'w' => file = hostCreateFile(state, path, read_write, true, false),
+        'a' => {
+            file = hostOpenFile(state, path, if (read_write) .read_write else .write_only);
+            if (file == null) file = hostCreateFile(state, path, read_write, false, false);
+        },
+        else => {},
+    }
+    const opened = file orelse {
+        state.regs.rax = 2; // ENOENT
+        finish(state, direct_return_rip);
+        return true;
+    };
+    const media_authorized = if (state.windows_host_media_path) |media_path|
+        std.mem.eql(u8, path, media_path)
+    else
+        false;
+    const handle = installWindowsFile(state, opened, readable, writable, media_authorized) orelse {
+        const io = state.windows_host_io orelse unreachable;
+        opened.close(io);
+        state.regs.rax = 24; // EMFILE
+        finish(state, direct_return_rip);
+        return true;
+    };
+    if (selected_mode[0] == 'a') {
+        const slot = windowsFileSlot(state, handle).?;
+        const io = state.windows_host_io orelse unreachable;
+        if (slot.file.?.stat(io)) |stat| slot.offset = stat.size else |_| slot.offset = 0;
+    }
+    state.write64(output, handle);
+    state.windows_last_error = 0;
+    state.regs.rax = 0; // errno_t success
+    finish(state, direct_return_rip);
+    return true;
+}
+
+fn writeWindowsStdioWide(state: anytype, direct_return_rip: ?u64) bool {
+    const slot = windowsFileSlot(state, arg(state, 1, direct_return_rip)) orelse {
+        failWindowsFileCall(state, direct_return_rip, 6);
+        return true;
+    };
+    const unit = arg(state, 0, direct_return_rip);
+    if (unit > 0xFF or !slot.writable) {
+        failWindowsFileCall(state, direct_return_rip, if (unit > 0xFF) 1113 else 5);
+        return true;
+    }
+    var byte = [_]u8{@truncate(unit)};
+    const completed = writeWindowsStdioBytes(state, slot, &byte) orelse {
+        failWindowsFileCall(state, direct_return_rip, 112);
+        return true;
+    };
+    if (completed != 1) {
+        failWindowsFileCall(state, direct_return_rip, 112);
+        return true;
+    }
+    state.windows_last_error = 0;
+    state.regs.rax = unit;
+    finish(state, direct_return_rip);
+    return true;
+}
+
+fn handleWindowsCompleteness(
+    state: anytype,
+    dll_name: []const u8,
+    name: []const u8,
+    direct_return_rip: ?u64,
+) bool {
+    if (std.mem.eql(u8, name, "_get_errno")) {
+        const output = arg(state, 0, direct_return_rip);
+        if (output == 0 or state.guestMemory(output, 4) == null) {
+            state.regs.rax = 22;
+        } else {
+            state.write32(output, state.windows_last_error);
+            state.regs.rax = 0;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_set_errno")) {
+        state.windows_last_error = @truncate(arg(state, 0, direct_return_rip));
+        if (state.windows_errno_storage != 0 and state.guestMemory(state.windows_errno_storage, 4) != null) {
+            state.write32(state.windows_errno_storage, state.windows_last_error);
+        }
+        state.regs.rax = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_wgetcwd")) {
+        const output = arg(state, 0, direct_return_rip);
+        const capacity = arg(state, 1, direct_return_rip);
+        const written = if (output != 0 and capacity != 0)
+            copyGuestWideString(state, output, capacity, "C:\\xenia")
+        else
+            0;
+        state.regs.rax = if (written == 0) 0 else output;
+        state.windows_last_error = if (written == 0) 34 else 0; // ERANGE
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_wfullpath")) {
+        const output = arg(state, 0, direct_return_rip);
+        const source_address = arg(state, 1, direct_return_rip);
+        const capacity = arg(state, 2, direct_return_rip);
+        var source_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        var full_path: [std.fs.max_path_bytes]u8 = undefined;
+        const source = guestWideToUtf8Buffer(state, source_address, &source_buffer);
+        const normalized = if (source) |value| normalizedFullPath(value, &full_path) else null;
+        const written = if (normalized) |value|
+            copyGuestWideString(state, output, capacity, value)
+        else
+            0;
+        state.regs.rax = if (written == 0) 0 else output;
+        state.windows_last_error = if (written == 0) 22 else 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_access") or std.mem.eql(u8, name, "_waccess") or
+        std.mem.eql(u8, name, "_wchdir") or std.mem.eql(u8, name, "_wchmod"))
+    {
+        const wide = std.mem.eql(u8, name, "_waccess") or std.mem.eql(u8, name, "_wchdir") or
+            std.mem.eql(u8, name, "_wchmod");
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const path = guestPathToHost(state, arg(state, 0, direct_return_rip), wide, &path_buffer);
+        const stat = if (path) |value| hostStat(state, value) else null;
+        const is_directory_change = std.mem.eql(u8, name, "_wchdir");
+        const valid = stat != null and (!is_directory_change or stat.?.kind == .directory);
+        state.regs.rax = if (valid) 0 else @bitCast(@as(i64, -1));
+        state.windows_last_error = if (valid) 0 else 2;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_findclose")) {
+        const closed = closeWindowsFind(state, arg(state, 0, direct_return_rip));
+        state.regs.rax = if (closed) 0 else @bitCast(@as(i64, -1));
+        state.windows_last_error = if (closed) 0 else 6;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_wfindfirst64i32") or std.mem.eql(u8, name, "_wfindnext64i32")) {
+        if (std.mem.eql(u8, name, "_wfindfirst64i32"))
+            return beginWindowsFind(state, name, direct_return_rip)
+        else
+            return advanceWindowsFindCall(state, direct_return_rip);
+    }
+    if (std.mem.eql(u8, name, "_get_osfhandle")) {
+        const slot = windowsStdioSlot(state, @truncate(arg(state, 0, direct_return_rip))) orelse {
+            failWindowsDescriptorCall(state, direct_return_rip, 9);
+            return true;
+        };
+        state.regs.rax = slot.guest_handle;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_isatty")) {
+        const fd: u32 = @truncate(arg(state, 0, direct_return_rip));
+        state.regs.rax = @intFromBool(fd <= 2);
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_open_osfhandle")) {
+        const slot = windowsFileSlot(state, arg(state, 0, direct_return_rip)) orelse {
+            failWindowsDescriptorCall(state, direct_return_rip, 9);
+            return true;
+        };
+        state.regs.rax = slot.stdio_fd;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_sopen") or std.mem.eql(u8, name, "_wopen") or
+        std.mem.eql(u8, name, "_wsopen"))
+    {
+        return openWindowsCrtDescriptor(state, name, direct_return_rip);
+    }
+    if (std.mem.eql(u8, name, "_telli64")) {
+        const slot = windowsStdioSlot(state, @truncate(arg(state, 0, direct_return_rip))) orelse {
+            failWindowsDescriptorCall(state, direct_return_rip, 9);
+            return true;
+        };
+        state.regs.rax = slot.offset;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "fopen_s") or std.mem.eql(u8, name, "_wfopen_s") or
+        std.mem.eql(u8, name, "freopen_s"))
+    {
+        return openWindowsStdioSecure(state, name, direct_return_rip);
+    }
+    if (std.mem.eql(u8, name, "fgetpos")) {
+        const slot = windowsFileSlot(state, arg(state, 0, direct_return_rip)) orelse {
+            failWindowsFileCall(state, direct_return_rip, 6);
+            state.regs.rax = std.math.maxInt(u32);
+            return true;
+        };
+        const output = arg(state, 1, direct_return_rip);
+        if (output == 0 or state.guestMemory(output, 8) == null) {
+            failWindowsFileCall(state, direct_return_rip, 998);
+            state.regs.rax = std.math.maxInt(u32);
+            return true;
+        }
+        state.write64(output, slot.offset);
+        state.regs.rax = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "fsetpos")) {
+        const slot = windowsFileSlot(state, arg(state, 0, direct_return_rip)) orelse {
+            failWindowsFileCall(state, direct_return_rip, 6);
+            state.regs.rax = std.math.maxInt(u32);
+            return true;
+        };
+        const input = arg(state, 1, direct_return_rip);
+        if (input == 0 or state.guestMemoryConst(input, 8) == null) {
+            failWindowsFileCall(state, direct_return_rip, 998);
+            state.regs.rax = std.math.maxInt(u32);
+            return true;
+        }
+        slot.offset = state.read64(input);
+        state.regs.rax = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "getc")) return queryWindowsStdioState(state, name, direct_return_rip);
+    if (std.mem.eql(u8, name, "getwc")) return readWindowsStdioWide(state, direct_return_rip);
+    if (std.mem.eql(u8, name, "fputwc") or std.mem.eql(u8, name, "putwc")) {
+        return writeWindowsStdioWide(state, direct_return_rip);
+    }
+
+    if (std.mem.eql(u8, name, "AllocConsole")) {
+        state.windows_last_error = 0;
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "CompareStringA")) {
+        const left_length = arg(state, 3, direct_return_rip);
+        const right_length = arg(state, 5, direct_return_rip);
+        const left = if (left_length == 0xFFFF_FFFF)
+            guestCString(state, arg(state, 2, direct_return_rip))
+        else if (left_length <= std.math.maxInt(usize))
+            state.guestMemoryConst(arg(state, 2, direct_return_rip), @intCast(left_length))
+        else
+            null;
+        const right = if (right_length == 0xFFFF_FFFF)
+            guestCString(state, arg(state, 4, direct_return_rip))
+        else if (right_length <= std.math.maxInt(usize))
+            state.guestMemoryConst(arg(state, 4, direct_return_rip), @intCast(right_length))
+        else
+            null;
+        const result: u32 = if (left == null or right == null)
+            0
+        else if (std.ascii.lessThanIgnoreCase(left.?, right.?))
+            1
+        else if (std.ascii.lessThanIgnoreCase(right.?, left.?))
+            3
+        else
+            2;
+        state.regs.rax = result;
+        state.windows_last_error = if (result == 0) 87 else 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetConsoleMode")) {
+        const output = arg(state, 1, direct_return_rip);
+        if (output == 0 or state.guestMemory(output, 4) == null) {
+            state.windows_last_error = 87;
+            state.regs.rax = 0;
+        } else {
+            state.write32(output, 0x0007);
+            state.windows_last_error = 0;
+            state.regs.rax = 1;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetConsoleScreenBufferInfo")) {
+        const output = arg(state, 1, direct_return_rip);
+        if (output == 0 or state.guestMemory(output, 22) == null) {
+            state.windows_last_error = 87;
+            state.regs.rax = 0;
+        } else {
+            state.write16(output + 0, 120); // dwSize.X
+            state.write16(output + 2, 40); // dwSize.Y
+            state.write16(output + 4, 0); // cursor X
+            state.write16(output + 6, 0); // cursor Y
+            state.write16(output + 8, 7); // attributes
+            state.write16(output + 10, 0); // window left
+            state.write16(output + 12, 0); // window top
+            state.write16(output + 14, 119); // window right
+            state.write16(output + 16, 39); // window bottom
+            state.write16(output + 18, 1); // maximum window X
+            state.write16(output + 20, 1); // maximum window Y
+            state.windows_last_error = 0;
+            state.regs.rax = 1;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetDiskFreeSpaceExW")) {
+        const available = arg(state, 1, direct_return_rip);
+        const total = arg(state, 2, direct_return_rip);
+        const free = arg(state, 3, direct_return_rip);
+        if (available != 0 and state.guestMemory(available, 8) != null) state.write64(available, 8 * 1024 * 1024 * 1024);
+        if (total != 0 and state.guestMemory(total, 8) != null) state.write64(total, 8 * 1024 * 1024 * 1024);
+        if (free != 0 and state.guestMemory(free, 8) != null) state.write64(free, 4 * 1024 * 1024 * 1024);
+        state.windows_last_error = 0;
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetFileInformationByHandle")) {
+        const slot = windowsFileSlot(state, arg(state, 0, direct_return_rip));
+        const output = arg(state, 1, direct_return_rip);
+        if (slot == null or output == 0 or state.guestMemory(output, 52) == null) {
+            state.windows_last_error = 6;
+            state.regs.rax = 0;
+        } else {
+            @memset(state.guestMemory(output, 52).?, 0);
+            state.write32(output + 0, 0x80); // FILE_ATTRIBUTE_NORMAL
+            state.write32(output + 28, 1); // number of links
+            const io = state.windows_host_io orelse unreachable;
+            const size = slot.?.file.?.stat(io) catch null;
+            if (size) |value| {
+                state.write32(output + 36, @truncate(value.size));
+                state.write32(output + 40, @truncate(value.size >> 32));
+            }
+            state.windows_last_error = 0;
+            state.regs.rax = 1;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetFileTime")) {
+        const slot = windowsFileSlot(state, arg(state, 0, direct_return_rip));
+        const file_time = windowsGuestFileTime(state);
+        if (slot == null) {
+            state.windows_last_error = 6;
+            state.regs.rax = 0;
+        } else {
+            for ([_]u64{ arg(state, 1, direct_return_rip), arg(state, 2, direct_return_rip), arg(state, 3, direct_return_rip) }) |output| {
+                if (output != 0 and state.guestMemory(output, 8) != null) state.write64(output, file_time);
+            }
+            state.windows_last_error = 0;
+            state.regs.rax = 1;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetLocaleInfoA")) {
+        const output = arg(state, 2, direct_return_rip);
+        const capacity = arg(state, 3, direct_return_rip);
+        const written = copyGuestString(state, output, capacity, "C");
+        state.regs.rax = if (written == 0) 0 else written + 1;
+        state.windows_last_error = if (written == 0) 122 else 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetSystemPowerStatus")) {
+        const output = arg(state, 0, direct_return_rip);
+        if (output == 0 or state.guestMemory(output, 12) == null) {
+            state.windows_last_error = 998;
+            state.regs.rax = 0;
+        } else {
+            @memset(state.guestMemory(output, 12).?, 0);
+            if (state.guestMemory(output, 4)) |bytes| {
+                bytes[0] = 1; // AC_LINE_ONLINE
+                bytes[2] = 100; // BATTERY_PERCENTAGE_UNKNOWN is not needed
+            }
+            state.write32(output + 4, 0xFFFF_FFFF);
+            state.write32(output + 8, 0xFFFF_FFFF);
+            state.windows_last_error = 0;
+            state.regs.rax = 1;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetTimeZoneInformation")) {
+        const output = arg(state, 0, direct_return_rip);
+        if (output == 0 or state.guestMemory(output, 172) == null) {
+            state.windows_last_error = 87;
+            state.regs.rax = 0xFFFF_FFFF;
+        } else {
+            @memset(state.guestMemory(output, 172).?, 0);
+            state.windows_last_error = 0;
+            state.regs.rax = 0; // TIME_ZONE_ID_UNKNOWN
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetVolumeInformationW")) {
+        _ = copyGuestWideString(state, arg(state, 1, direct_return_rip), arg(state, 2, direct_return_rip), "Rosetta");
+        if (arg(state, 3, direct_return_rip) != 0 and state.guestMemory(arg(state, 3, direct_return_rip), 4) != null) state.write32(arg(state, 3, direct_return_rip), 0x524F_5345);
+        if (arg(state, 4, direct_return_rip) != 0 and state.guestMemory(arg(state, 4, direct_return_rip), 4) != null) state.write32(arg(state, 4, direct_return_rip), 255);
+        if (arg(state, 5, direct_return_rip) != 0 and state.guestMemory(arg(state, 5, direct_return_rip), 4) != null) state.write32(arg(state, 5, direct_return_rip), 0);
+        _ = copyGuestWideString(state, arg(state, 6, direct_return_rip), arg(state, 7, direct_return_rip), "RosettaFS");
+        state.windows_last_error = 0;
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GlobalMemoryStatusEx")) {
+        const output = arg(state, 0, direct_return_rip);
+        if (output == 0 or state.guestMemory(output, 64) == null) {
+            state.windows_last_error = 87;
+            state.regs.rax = 0;
+        } else {
+            @memset(state.guestMemory(output, 64).?, 0);
+            state.write32(output, 64);
+            state.write64(output + 8, 8 * 1024 * 1024 * 1024);
+            state.write64(output + 16, 4 * 1024 * 1024 * 1024);
+            state.write64(output + 24, 8 * 1024 * 1024 * 1024);
+            state.write64(output + 32, 4 * 1024 * 1024 * 1024);
+            state.write64(output + 40, 8 * 1024 * 1024 * 1024);
+            state.write64(output + 48, 4 * 1024 * 1024 * 1024);
+            state.write64(output + 56, 0);
+            state.windows_last_error = 0;
+            state.regs.rax = 1;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "K32GetModuleBaseNameA")) {
+        const output = arg(state, 2, direct_return_rip);
+        const written = copyGuestString(state, output, arg(state, 3, direct_return_rip), "xenia_canary.exe");
+        state.regs.rax = written;
+        state.windows_last_error = if (written == 0) 122 else 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SetConsoleTextAttribute")) {
+        state.windows_last_error = 0;
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "WriteConsoleW")) {
+        const count = arg(state, 2, direct_return_rip);
+        const written = arg(state, 3, direct_return_rip);
+        if (written != 0 and state.guestMemory(written, 4) != null) state.write32(written, @truncate(count));
+        state.windows_last_error = 0;
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+
+    if (std.mem.eql(u8, name, "ChangeDisplaySettingsExW")) {
+        state.regs.rax = 0; // DISP_CHANGE_SUCCESSFUL
+        state.windows_last_error = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "DrawTextW")) {
+        const text = arg(state, 1, direct_return_rip);
+        const count = arg(state, 2, direct_return_rip);
+        const length = if (count == 0xFFFF_FFFF)
+            guestWideCStringLength(state, text, 0x10000) orelse 0
+        else
+            count;
+        state.regs.rax = length;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "FillRect")) {
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "KillTimer")) {
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SetCursorPos")) {
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SetForegroundWindow")) {
+        state.windows_focus_window = arg(state, 0, direct_return_rip);
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SetTimer")) {
+        const requested = arg(state, 1, direct_return_rip);
+        state.regs.rax = if (requested != 0) requested else nextHandle(state);
+        finish(state, direct_return_rip);
+        return true;
+    }
+
+    return completeWindowsPolicyRefusal(state, dll_name, name, direct_return_rip);
+}
+
 fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_return_rip: ?u64) bool {
     if (handleWindowsRegistry(state, name, direct_return_rip)) return true;
     if (handleWindowsSockets(state, name, direct_return_rip)) return true;
     if (handleWindowsSecurity(state, name, direct_return_rip)) return true;
     if (handleWindowsMultimedia(state, dll_name, name, direct_return_rip)) return true;
     if (handleStringAndMemory(state, name, direct_return_rip)) return true;
+    if (handleWindowsCompleteness(state, dll_name, name, direct_return_rip)) return true;
 
     if (std.mem.eql(u8, name, "strstr")) {
         const result = guestStrstr(state, arg(state, 0, direct_return_rip), arg(state, 1, direct_return_rip));
@@ -5900,6 +6738,20 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
             // promise, and the promise is broken later, inside whatever the
             // guest does with the pointer. Xenia's per-monitor DPI probe and
             // its XAudio2 entry point both take this path.
+            const State = @TypeOf(state.*);
+            if (comptime @hasDecl(State, "tryNativeWindowsVulkan")) {
+                if (std.ascii.eqlIgnoreCase(module_name, "vulkan-1.dll") or
+                    std.ascii.eqlIgnoreCase(module_name, "vulkan-1") or
+                    std.ascii.eqlIgnoreCase(module_name, "vulkan.dll"))
+                {
+                    // Export lookup must use the same capability check as
+                    // Vulkan's own proc queries, and return a Windows thunk.
+                    if (state.tryNativeWindowsVulkan("vkGetInstanceProcAddr", direct_return_rip)) {
+                        state.windows_last_error = if (state.regs.rax == 0) 127 else 0;
+                        return true; // Native lookup already completed the call.
+                    }
+                }
+            }
             if (isRecognizedDynamicImport(module_name, requested)) {
                 state.regs.rax = state.registerWindowsImportStub(module_name, requested) orelse 0;
                 state.windows_last_error = if (state.regs.rax == 0) 127 else 0;
@@ -6080,6 +6932,28 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         return true;
     }
     if (std.mem.eql(u8, name, "SetThreadDescription")) {
+        // The guest is telling Rosette which of its threads is which. Every
+        // per-thread report in the run is otherwise a bare handle and a
+        // symbol, and deciding whether the worker holding a fifth of the
+        // interpreter was the GPU frame limiter or the log writer meant
+        // disassembling the image to find out. Keeping the string costs one
+        // bounded copy at thread creation.
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "setWindowsGuestThreadName")) {
+            const handle = arg(state, 0, direct_return_rip);
+            const text = arg(state, 1, direct_return_rip);
+            var narrow: [64]u8 = undefined;
+            var written: usize = 0;
+            while (written < narrow.len) {
+                const unit = guestWideUnit(state, text, written) orelse break;
+                if (unit == 0) break;
+                // Xenia's thread names are ASCII; anything wider is folded
+                // rather than dropped so the name stays recognizable.
+                narrow[written] = if (unit < 0x80) @intCast(unit) else '?';
+                written += 1;
+            }
+            if (written != 0) _ = state.setWindowsGuestThreadName(handle, narrow[0..written]);
+        }
         returnZero(state, direct_return_rip);
         return true;
     }
@@ -6526,6 +7400,18 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
             break :blk @as(u64, 0);
         } else state.guestAlloc(size, 0x1000) orelse 0;
         state.regs.rax = address;
+        // An allocation the guest is allowed to execute is where a program
+        // with a translator puts the code it generates. Recording it is the
+        // whole mechanism behind naming a JIT: Rosette need not know what
+        // Xenia is, only that the guest asked for memory it can run and
+        // later turned up executing there.
+        if (address != 0) {
+            const State = @TypeOf(state.*);
+            if (comptime @hasDecl(State, "noteGuestExecutableAllocationFrom")) {
+                const protection = if (extended) arg(state, 4, direct_return_rip) else arg(state, 3, direct_return_rip);
+                state.noteGuestExecutableAllocationFrom(address, size, @truncate(protection), allocation_caller_rip);
+            }
+        }
         // Classify the request against what already backs the address, before
         // the allocation record is created: afterwards every commit looks
         // like it landed inside a reservation, which is exactly the
@@ -6651,10 +7537,74 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         finish(state, direct_return_rip);
         return true;
     }
-    if (std.mem.eql(u8, name, "VirtualProtect") or std.mem.eql(u8, name, "VirtualProtectEx") or
-        std.mem.eql(u8, name, "VirtualQuery") or std.mem.eql(u8, name, "VirtualQueryEx"))
-    {
-        state.regs.rax = 0;
+    if (std.mem.eql(u8, name, "VirtualProtect") or std.mem.eql(u8, name, "VirtualProtectEx")) {
+        // This returned FALSE on every call. `VirtualProtect` is a BOOL API,
+        // FALSE is failure, and a guest that checks it - Xenia's code cache
+        // does, before it runs anything it generated - was being told the
+        // page protection it asked for had not been applied.
+        //
+        // Rosette's guest memory is one flat, permissive mapping: there are
+        // no page protections to change, so every request for one is already
+        // satisfied. TRUE is the accurate answer, not a convenient one. The
+        // exception is a request for no access or a guard page, where the
+        // guest expects a later fault Rosette will not raise; that is a
+        // modelling gap, and FALSE would not have closed it either.
+        const extended_protect = std.mem.eql(u8, name, "VirtualProtectEx");
+        const address = if (extended_protect) arg(state, 1, direct_return_rip) else arg(state, 0, direct_return_rip);
+        const length = if (extended_protect) arg(state, 2, direct_return_rip) else arg(state, 1, direct_return_rip);
+        const requested = if (extended_protect) arg(state, 3, direct_return_rip) else arg(state, 2, direct_return_rip);
+        const old_protection_out = if (extended_protect) arg(state, 4, direct_return_rip) else arg(state, 3, direct_return_rip);
+        // Windows fails the call outright when the out-parameter is null, so
+        // a guest relying on the old value is not silently handed nothing.
+        if (old_protection_out == 0 or state.guestMemory(old_protection_out, 4) == null) {
+            state.windows_last_error = 87; // ERROR_INVALID_PARAMETER
+            state.regs.rax = 0;
+            finish(state, direct_return_rip);
+            return true;
+        }
+        // What Rosette actually provides, which is everything.
+        state.write32(old_protection_out, 0x40); // PAGE_EXECUTE_READWRITE
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "noteGuestExecutableAllocation")) {
+            state.noteGuestExecutableAllocation(address, length, @truncate(requested));
+        }
+        state.windows_last_error = 0;
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "VirtualQuery") or std.mem.eql(u8, name, "VirtualQueryEx")) {
+        // `VirtualQuery` returns the number of bytes it wrote, so zero with
+        // nothing written is a failure the caller cannot distinguish from a
+        // bad address. Rosette knows the answer for anything inside its guest
+        // range: one flat, committed, executable mapping.
+        const extended_query = std.mem.eql(u8, name, "VirtualQueryEx");
+        const address = if (extended_query) arg(state, 1, direct_return_rip) else arg(state, 0, direct_return_rip);
+        const buffer = if (extended_query) arg(state, 2, direct_return_rip) else arg(state, 1, direct_return_rip);
+        const buffer_length = if (extended_query) arg(state, 3, direct_return_rip) else arg(state, 2, direct_return_rip);
+        const information_bytes: u64 = 48; // sizeof(MEMORY_BASIC_INFORMATION) on x64
+        if (buffer == 0 or buffer_length < information_bytes or
+            state.guestMemory(buffer, information_bytes) == null or
+            !state.windowsGuestRangeContains(address, 1))
+        {
+            state.windows_last_error = 87; // ERROR_INVALID_PARAMETER
+            state.regs.rax = 0;
+            finish(state, direct_return_rip);
+            return true;
+        }
+        const page: u64 = 0x1000;
+        const base = address - (address % page);
+        state.write64(buffer + 0, base); // BaseAddress
+        state.write64(buffer + 8, base); // AllocationBase
+        state.write32(buffer + 16, 0x40); // AllocationProtect = PAGE_EXECUTE_READWRITE
+        state.write32(buffer + 20, 0); // __alignment1
+        state.write64(buffer + 24, page); // RegionSize
+        state.write32(buffer + 32, 0x1000); // State = MEM_COMMIT
+        state.write32(buffer + 36, 0x40); // Protect = PAGE_EXECUTE_READWRITE
+        state.write32(buffer + 40, 0x20000); // Type = MEM_PRIVATE
+        state.write32(buffer + 44, 0); // __alignment2
+        state.windows_last_error = 0;
+        state.regs.rax = information_bytes;
         finish(state, direct_return_rip);
         return true;
     }
@@ -8209,11 +9159,7 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         return true;
     }
     if (std.mem.eql(u8, name, "CreateDXGIFactory1") or std.mem.eql(u8, name, "CreateDXGIFactory2")) {
-        const output = if (std.mem.eql(u8, name, "CreateDXGIFactory1")) arg(state, 1, direct_return_rip) else arg(state, 2, direct_return_rip);
-        if (output != 0 and state.guestMemory(output, 8) != null) state.write64(output, 0);
-        state.regs.rax = if (output == 0) 0x8000_4003 else 0x8000_4002; // E_POINTER / E_NOINTERFACE
-        finish(state, direct_return_rip);
-        return true;
+        return handleDxgiFactory(state, name, direct_return_rip);
     }
     if (std.mem.eql(u8, name, "HidD_GetHidGuid")) {
         const output = arg(state, 0, direct_return_rip);
@@ -8999,6 +9945,1342 @@ fn completeWithImportFallback(
     finish(state, direct_return_rip);
 }
 
+/// Keep a DXGI factory refusal where a report can find it.
+///
+/// This call is answered here rather than through `completeWithImportFallback`
+/// because it has an out-parameter to null before the HRESULT is meaningful,
+/// and answering it by hand meant it never entered the refusal ledger at all.
+/// The 2026-09-12 run therefore printed the guest's own
+/// `Presenter: Failed to create a DXGI factory` with nothing beside it: no
+/// export, no HRESULT, no caller, no step - although Rosette had decided
+/// every one of those. Recording the value actually returned, rather than the
+/// contract's default, keeps the ledger describing what the guest saw.
+fn noteDxgiFactoryRefusal(state: anytype, name: []const u8, hresult: u64) void {
+    const State = @TypeOf(state.*);
+    if (comptime !@hasDecl(State, "noteWindowsImportFallback")) return;
+    var fallback = import_contract.fallbackFor("dxgi.dll", name);
+    fallback.value = hresult;
+    fallback.outcome = .refused;
+    state.noteWindowsImportFallback("dxgi.dll", name, fallback);
+}
+
+// ---------------------------------------------------------------------------
+// The C runtime's floating-point surface.
+//
+// These are the most dangerous names in the whole import table, and the least
+// obviously so. A refused Win32 call tells the guest it failed; a maths
+// function that returns the wrong number is indistinguishable from one that
+// returned the right one, and the guest carries the answer forward into a
+// matrix, a timing calculation or a shader constant. Twenty-two of them were
+// falling through to the ABI fallback, which hands back a zero - a perfectly
+// plausible value for `sin`, `atan` or `log10` and a completely wrong one.
+//
+// Every one is a pure function the host computes exactly, so there is no
+// modelling decision here at all: the only reason they were missing is that
+// nobody had written them down.
+//
+// Microsoft x64 passes the first four floating-point arguments in xmm0..xmm3
+// and returns in xmm0. Integer and floating arguments share the four
+// positions, so `scalbn(double, int)` takes its double in xmm0 and its int in
+// edx - the second *slot*, not the second integer register.
+
+fn guestDouble(state: anytype, slot: usize) f64 {
+    return @bitCast(std.mem.readInt(u64, state.xmm[slot][0..8], .little));
+}
+
+fn guestFloat(state: anytype, slot: usize) f32 {
+    return @bitCast(std.mem.readInt(u32, state.xmm[slot][0..4], .little));
+}
+
+fn returnGuestDouble(state: anytype, value: f64) void {
+    // Only the low quadword is the result; the rest of the register is
+    // architecturally undefined on return, and zeroing it keeps a later
+    // vector read from seeing whatever the last call left there.
+    @memset(state.xmm[0][0..], 0);
+    std.mem.writeInt(u64, state.xmm[0][0..8], @bitCast(value), .little);
+}
+
+fn returnGuestFloat(state: anytype, value: f32) void {
+    @memset(state.xmm[0][0..], 0);
+    std.mem.writeInt(u32, state.xmm[0][0..4], @bitCast(value), .little);
+}
+
+/// The C runtime maths functions Rosette computes exactly.
+///
+/// Returns false for a name this does not own, so the caller carries on down
+/// its chain.
+fn tryCrtMath(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    const Unary = struct { name: []const u8, apply: *const fn (f64) f64 };
+    const unary = [_]Unary{
+        .{ .name = "acos", .apply = struct {
+            fn f(x: f64) f64 {
+                return std.math.acos(x);
+            }
+        }.f },
+        .{ .name = "asin", .apply = struct {
+            fn f(x: f64) f64 {
+                return std.math.asin(x);
+            }
+        }.f },
+        .{ .name = "atan", .apply = struct {
+            fn f(x: f64) f64 {
+                return std.math.atan(x);
+            }
+        }.f },
+        .{ .name = "cbrt", .apply = struct {
+            fn f(x: f64) f64 {
+                return std.math.cbrt(x);
+            }
+        }.f },
+        .{ .name = "cosh", .apply = struct {
+            fn f(x: f64) f64 {
+                return std.math.cosh(x);
+            }
+        }.f },
+        .{ .name = "sinh", .apply = struct {
+            fn f(x: f64) f64 {
+                return std.math.sinh(x);
+            }
+        }.f },
+        .{ .name = "tan", .apply = struct {
+            fn f(x: f64) f64 {
+                return std.math.tan(x);
+            }
+        }.f },
+        .{ .name = "tanh", .apply = struct {
+            fn f(x: f64) f64 {
+                return std.math.tanh(x);
+            }
+        }.f },
+        .{ .name = "exp2", .apply = struct {
+            fn f(x: f64) f64 {
+                return std.math.exp2(x);
+            }
+        }.f },
+        .{ .name = "log10", .apply = struct {
+            fn f(x: f64) f64 {
+                return std.math.log10(x);
+            }
+        }.f },
+    };
+    for (unary) |entry| {
+        if (!std.mem.eql(u8, name, entry.name)) continue;
+        returnGuestDouble(state, entry.apply(guestDouble(state, 0)));
+        state.windows_last_error = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+
+    if (std.mem.eql(u8, name, "exp2f")) {
+        returnGuestFloat(state, std.math.exp2(guestFloat(state, 0)));
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "log2f")) {
+        returnGuestFloat(state, std.math.log2(guestFloat(state, 0)));
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "hypot") or std.mem.eql(u8, name, "_hypot")) {
+        // std.math.hypot avoids the overflow that a naive sqrt(x*x + y*y)
+        // produces for large operands, which is the whole reason the C
+        // library exposes it separately from sqrt.
+        returnGuestDouble(state, std.math.hypot(guestDouble(state, 0), guestDouble(state, 1)));
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "nextafter")) {
+        const from = guestDouble(state, 0);
+        const toward = guestDouble(state, 1);
+        returnGuestDouble(state, nextAfterDouble(from, toward));
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_copysign") or std.mem.eql(u8, name, "copysign")) {
+        returnGuestDouble(state, std.math.copysign(guestDouble(state, 0), guestDouble(state, 1)));
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "scalbn") or std.mem.eql(u8, name, "_scalb") or
+        std.mem.eql(u8, name, "ldexp"))
+    {
+        // The exponent is an int in the *second argument slot*, which for a
+        // call whose first argument is a double means edx.
+        const exponent: i32 = @bitCast(@as(u32, @truncate(state.regs.rdx)));
+        returnGuestDouble(state, std.math.ldexp(guestDouble(state, 0), exponent));
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "frexp")) {
+        // `double frexp(double value, int *exp)`: the significand comes back
+        // in xmm0 and the exponent is written through the pointer. Dropping
+        // the store leaves the caller reading its own uninitialised stack.
+        const value = guestDouble(state, 0);
+        const parts = std.math.frexp(value);
+        const exponent_out = state.regs.rdx;
+        if (exponent_out != 0 and state.guestMemory(exponent_out, 4) != null) {
+            state.write32(exponent_out, @bitCast(@as(i32, @intCast(parts.exponent))));
+        }
+        returnGuestDouble(state, parts.significand);
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_finite")) {
+        const value = guestDouble(state, 0);
+        state.regs.rax = if (std.math.isFinite(value)) 1 else 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_isnan")) {
+        state.regs.rax = if (std.math.isNan(guestDouble(state, 0))) 1 else 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "lrintf")) {
+        state.regs.rax = @bitCast(guestRoundToI64(state, @floatCast(guestFloat(state, 0))));
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "nanf")) {
+        // `float nanf(const char *tag)`. The tag selects a payload; every
+        // caller in practice passes "" and wants a quiet NaN.
+        returnGuestFloat(state, std.math.nan(f32));
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "__setusermatherr")) {
+        // Installs a callback the CRT invokes on a domain error. Rosette
+        // computes with IEEE semantics and raises none, so there is nothing
+        // to call back; accepting the registration is the honest answer,
+        // because refusing it would make the CRT think it cannot report.
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    return false;
+}
+
+/// The next representable double from `from` toward `toward`.
+///
+/// Written out rather than reached for in std, because the edge cases are the
+/// only reason a caller uses this function: equal operands return the target
+/// unchanged, a NaN on either side propagates, and stepping away from zero
+/// must cross into the smallest subnormal rather than skipping it.
+fn nextAfterDouble(from: f64, toward: f64) f64 {
+    if (std.math.isNan(from) or std.math.isNan(toward)) return std.math.nan(f64);
+    if (from == toward) return toward;
+    if (from == 0.0) {
+        const smallest: f64 = @bitCast(@as(u64, 1));
+        return if (toward > 0.0) smallest else -smallest;
+    }
+    var bits: u64 = @bitCast(from);
+    // Away from zero increments the magnitude; toward zero decrements it.
+    if ((toward > from) == (from > 0.0)) bits += 1 else bits -= 1;
+    return @bitCast(bits);
+}
+
+// ---------------------------------------------------------------------------
+// The C runtime's string, conversion and locale surface, and the small Win32
+// entry points that were falling through to the ABI fallback.
+//
+// The same argument as the maths block: these are functions whose wrong
+// answer is invisible. `strspn` returning zero is a perfectly ordinary result
+// and a perfectly wrong one, and the guest cannot tell which it got. Every
+// one of these is exactly computable, so the only reason they were missing is
+// that nobody had written them.
+
+/// A guest byte string as a slice, or an empty slice when unreadable. Used
+/// where the C function's own behaviour on a null pointer is undefined and
+/// the safe reading is "no characters".
+fn guestBytesOrEmpty(state: anytype, address: u64) []const u8 {
+    return guestCString(state, address) orelse &.{};
+}
+
+fn asciiLowerUnit(unit: u21) u21 {
+    return if (unit >= 'A' and unit <= 'Z') unit + 32 else unit;
+}
+
+fn asciiUpperUnit(unit: u21) u21 {
+    return if (unit >= 'a' and unit <= 'z') unit - 32 else unit;
+}
+
+/// The C runtime's string and conversion functions Rosette computes exactly.
+fn tryCrtStrings(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    if (std.mem.eql(u8, name, "strspn") or std.mem.eql(u8, name, "strcspn")) {
+        // `strspn` counts the leading run of characters that ARE in the set;
+        // `strcspn` counts the run that is NOT. Both return a length, and
+        // both legitimately return zero - which is why a fallback that
+        // returns zero is indistinguishable from a correct answer.
+        const subject = guestBytesOrEmpty(state, arg(state, 0, direct_return_rip));
+        const set = guestBytesOrEmpty(state, arg(state, 1, direct_return_rip));
+        const want_member = std.mem.eql(u8, name, "strspn");
+        var length: u64 = 0;
+        for (subject) |byte| {
+            const member = std.mem.indexOfScalar(u8, set, byte) != null;
+            if (member != want_member) break;
+            length += 1;
+        }
+        state.regs.rax = length;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "strncat")) {
+        // Appends at most n bytes and always terminates, so the destination
+        // needs n+1 bytes of room. Returns the destination unchanged.
+        const destination = arg(state, 0, direct_return_rip);
+        const source = guestBytesOrEmpty(state, arg(state, 1, direct_return_rip));
+        const limit = arg(state, 2, direct_return_rip);
+        const existing = guestBytesOrEmpty(state, destination).len;
+        const copy = @min(source.len, if (limit > source.len) source.len else @as(usize, @intCast(limit)));
+        const tail = destination +| existing;
+        if (copy != 0) {
+            if (state.guestMemory(tail, @intCast(copy))) |out| @memcpy(out, source[0..copy]);
+        }
+        if (state.guestMemory(tail +| @as(u64, @intCast(copy)), 1)) |terminator| terminator[0] = 0;
+        state.regs.rax = destination;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_strdup")) {
+        const source = guestBytesOrEmpty(state, arg(state, 0, direct_return_rip));
+        const block_address = state.guestAlloc(source.len + 1, 16) orelse {
+            state.regs.rax = 0;
+            state.windows_last_error = 8; // ERROR_NOT_ENOUGH_MEMORY
+            finish(state, direct_return_rip);
+            return true;
+        };
+        if (state.guestMemory(block_address, @intCast(source.len + 1))) |out| {
+            @memcpy(out[0..source.len], source);
+            out[source.len] = 0;
+        }
+        state.regs.rax = block_address;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "towlower") or std.mem.eql(u8, name, "towupper")) {
+        const unit: u21 = @truncate(state.regs.rcx);
+        state.regs.rax = if (std.mem.eql(u8, name, "towlower")) asciiLowerUnit(unit) else asciiUpperUnit(unit);
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "wcscmp") or std.mem.eql(u8, name, "wcscoll")) {
+        // In the C locale collation is codepoint order, so the two are the
+        // same function. Returns a sign, and zero means equal - never a
+        // failure, which the declaration now records.
+        const left = arg(state, 0, direct_return_rip);
+        const right = arg(state, 1, direct_return_rip);
+        var index: usize = 0;
+        var result: i64 = 0;
+        while (index < 0x10000) : (index += 1) {
+            const a = guestWideUnit(state, left, index) orelse 0;
+            const b = guestWideUnit(state, right, index) orelse 0;
+            if (a != b) {
+                result = if (a < b) -1 else 1;
+                break;
+            }
+            if (a == 0) break;
+        }
+        state.regs.rax = @bitCast(result);
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "wcscpy") or std.mem.eql(u8, name, "wcscat")) {
+        const destination = arg(state, 0, direct_return_rip);
+        const source = arg(state, 1, direct_return_rip);
+        const start = if (std.mem.eql(u8, name, "wcscat"))
+            guestWideCStringLength(state, destination, 0x10000) orelse 0
+        else
+            0;
+        var index: usize = 0;
+        while (index < 0x10000) : (index += 1) {
+            const unit = guestWideUnit(state, source, index) orelse 0;
+            const slot = destination +| @as(u64, (start + index) * 2);
+            if (state.guestMemory(slot, 2) == null) break;
+            state.write16(slot, unit);
+            if (unit == 0) break;
+        }
+        state.regs.rax = destination;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "wcsxfrm")) {
+        // The wide twin of `strxfrm`: in the C locale the transformation is
+        // the identity, and the return value is the full transformed length
+        // even when the destination is too small.
+        const destination = arg(state, 0, direct_return_rip);
+        const source = arg(state, 1, direct_return_rip);
+        const capacity = arg(state, 2, direct_return_rip);
+        const length = guestWideCStringLength(state, source, 0x10000) orelse 0;
+        var index: usize = 0;
+        while (destination != 0 and index < length and @as(u64, index) < capacity) : (index += 1) {
+            const slot = destination +| @as(u64, index * 2);
+            if (state.guestMemory(slot, 2) == null) break;
+            state.write16(slot, guestWideUnit(state, source, index) orelse 0);
+        }
+        if (destination != 0 and @as(u64, index) < capacity) {
+            const slot = destination +| @as(u64, index * 2);
+            if (state.guestMemory(slot, 2) != null) state.write16(slot, 0);
+        }
+        state.regs.rax = length;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "mbrlen") or std.mem.eql(u8, name, "mbrtowc")) {
+        // The C locale is single-byte, so a multibyte sequence is one byte
+        // and the length of a character is one - or zero for the terminator,
+        // which the standard distinguishes from an error (which is -1).
+        const is_convert = std.mem.eql(u8, name, "mbrtowc");
+        const source = if (is_convert) arg(state, 1, direct_return_rip) else arg(state, 0, direct_return_rip);
+        const limit = if (is_convert) arg(state, 2, direct_return_rip) else arg(state, 1, direct_return_rip);
+        if (source == 0 or limit == 0) {
+            state.regs.rax = 0;
+            finish(state, direct_return_rip);
+            return true;
+        }
+        const byte = if (state.guestMemoryConst(source, 1)) |bytes| bytes[0] else 0;
+        if (is_convert) {
+            const out = arg(state, 0, direct_return_rip);
+            if (out != 0 and state.guestMemory(out, 2) != null) state.write16(out, byte);
+        }
+        state.regs.rax = if (byte == 0) 0 else 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "wcrtomb")) {
+        const out = arg(state, 0, direct_return_rip);
+        const unit: u16 = @truncate(arg(state, 1, direct_return_rip));
+        if (unit > 0xFF) {
+            // Not representable in a single-byte locale: EILSEQ, reported as
+            // (size_t)-1 rather than as a short count.
+            state.regs.rax = std.math.maxInt(u64);
+            finish(state, direct_return_rip);
+            return true;
+        }
+        if (out != 0 and state.guestMemory(out, 1) != null) {
+            state.guestMemory(out, 1).?[0] = @truncate(unit);
+        }
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "___mb_cur_max_func")) {
+        state.regs.rax = 1; // the C locale is single-byte
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "atof")) {
+        const text = guestBytesOrEmpty(state, arg(state, 0, direct_return_rip));
+        const trimmed = std.mem.trim(u8, text, " \t\n\r");
+        const value = std.fmt.parseFloat(f64, trimmed) catch 0.0;
+        returnGuestDouble(state, value);
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "strtoll") or std.mem.eql(u8, name, "strtoul") or
+        std.mem.eql(u8, name, "strtoull"))
+    {
+        // All three share `strtol`'s parse; only the width and signedness of
+        // the result differ, and an unparsable string yields zero for every
+        // one of them - which is a legitimate result, not a failure.
+        const parsed = guestStrtol(
+            state,
+            arg(state, 0, direct_return_rip),
+            arg(state, 1, direct_return_rip),
+            arg(state, 2, direct_return_rip),
+        );
+        state.regs.rax = if (parsed) |value| @bitCast(value) else 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "rand_s")) {
+        // `errno_t rand_s(unsigned *value)`: zero is success. The output is
+        // required to be non-deterministic, and a stub that never wrote it
+        // left the caller reading its own stack.
+        const out = arg(state, 0, direct_return_rip);
+        if (out == 0 or state.guestMemory(out, 4) == null) {
+            state.regs.rax = 22; // EINVAL
+            finish(state, direct_return_rip);
+            return true;
+        }
+        state.windows_random_state = state.windows_random_state *% 6364136223846793005 +% 1442695040888963407;
+        state.write32(out, @truncate(state.windows_random_state >> 33));
+        state.regs.rax = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Win32 entry points that were reaching the ABI fallback.
+//
+// None of these is difficult; all of them were missing because a name list
+// records that a name exists and not whether anything answers it. Each one
+// below is modelled - Rosette computes the answer itself rather than calling
+// the host - and each says what the model is, because a modelled answer the
+// guest cannot distinguish from a real one has to be defensible.
+
+/// The input-method surface, modelled as a machine with no IME installed.
+///
+/// That is not a stub: it is a configuration Windows itself supports and
+/// Xenia handles, and it is the truthful description of a Mac. `ImmGetContext`
+/// returning NULL is how the absence is expressed, and every other entry
+/// point is reached only with a context in hand.
+fn tryImm32(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    if (std.mem.eql(u8, name, "ImmGetContext") or std.mem.eql(u8, name, "ImmAssociateContext")) {
+        // NULL means "this window has no input context", which with no IME
+        // installed is the correct and complete answer.
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "ImmGetCompositionStringW") or
+        std.mem.eql(u8, name, "ImmGetCandidateListW") or
+        std.mem.eql(u8, name, "ImmGetIMEFileNameA"))
+    {
+        // Bytes copied. Zero means there was nothing to copy, which is what a
+        // window with no composition in progress reports.
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "ImmReleaseContext") or
+        std.mem.eql(u8, name, "ImmNotifyIME") or
+        std.mem.eql(u8, name, "ImmSetCandidateWindow") or
+        std.mem.eql(u8, name, "ImmSetCompositionWindow") or
+        std.mem.eql(u8, name, "ImmSetCompositionStringW"))
+    {
+        // A no-op that succeeded. Releasing a context nobody holds, and
+        // positioning a candidate window that does not exist, both complete
+        // exactly as asked.
+        state.regs.rax = 1;
+        state.windows_last_error = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    return false;
+}
+
+/// Small Win32 entry points with an exact answer Rosette can give.
+fn trySmallWin32(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    if (std.mem.eql(u8, name, "lstrlenW")) {
+        state.regs.rax = guestWideCStringLength(state, arg(state, 0, direct_return_rip), 0x100000) orelse 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "MulDiv")) {
+        // `(a * b) / c` computed in 64 bits and rounded to nearest, with -1
+        // for overflow or a zero divisor. Doing it in 32 bits - which a naive
+        // implementation does - overflows for exactly the arguments callers
+        // use it to avoid overflowing.
+        const a: i64 = @as(i32, @bitCast(@as(u32, @truncate(arg(state, 0, direct_return_rip)))));
+        const b: i64 = @as(i32, @bitCast(@as(u32, @truncate(arg(state, 1, direct_return_rip)))));
+        const c: i64 = @as(i32, @bitCast(@as(u32, @truncate(arg(state, 2, direct_return_rip)))));
+        if (c == 0) {
+            state.regs.rax = @bitCast(@as(i64, -1));
+        } else {
+            const product = a * b;
+            const half = @divTrunc(c, 2);
+            const rounded = if ((product < 0) != (c < 0)) product - half else product + half;
+            const result = @divTrunc(rounded, c);
+            state.regs.rax = if (result > std.math.maxInt(i32) or result < std.math.minInt(i32))
+                @bitCast(@as(i64, -1))
+            else
+                @as(u64, @intCast(@as(u32, @bitCast(@as(i32, @intCast(result))))));
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GlobalLock")) {
+        // Rosette's global memory is not movable, so the handle is already
+        // the pointer. Returning it is the whole of the lock.
+        state.regs.rax = arg(state, 0, direct_return_rip);
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GlobalUnlock")) {
+        // FALSE with ERROR_SUCCESS is the documented answer when the lock
+        // count reaches zero, which for non-movable memory it always has.
+        state.regs.rax = 0;
+        state.windows_last_error = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetStdHandle")) {
+        // Distinct, non-null pseudo-handles so a caller can tell the three
+        // streams apart. INVALID_HANDLE_VALUE would say the process has no
+        // console, which would be a different and less useful lie.
+        const requested: i32 = @bitCast(@as(u32, @truncate(arg(state, 0, direct_return_rip))));
+        state.regs.rax = switch (requested) {
+            -10 => 0xFFFF_FFF6, // STD_INPUT_HANDLE
+            -11 => 0xFFFF_FFF5, // STD_OUTPUT_HANDLE
+            -12 => 0xFFFF_FFF4, // STD_ERROR_HANDLE
+            else => blk: {
+                state.windows_last_error = 6; // ERROR_INVALID_HANDLE
+                break :blk 0;
+            },
+        };
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetFileType")) {
+        // FILE_TYPE_CHAR for the three standard streams, FILE_TYPE_DISK for
+        // anything else Rosette handed out. FILE_TYPE_UNKNOWN (0) means the
+        // call failed, so it is the one answer that must not be the default.
+        const handle = arg(state, 0, direct_return_rip);
+        state.regs.rax = switch (handle) {
+            0xFFFF_FFF6, 0xFFFF_FFF5, 0xFFFF_FFF4 => 0x0002, // FILE_TYPE_CHAR
+            0 => blk: {
+                state.windows_last_error = 6;
+                break :blk 0;
+            },
+            else => 0x0001, // FILE_TYPE_DISK
+        };
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SetErrorMode")) {
+        // Returns the previous mode, so it has to be remembered or a caller
+        // that saves and restores it corrupts its own state.
+        const previous = state.windows_error_mode;
+        state.windows_error_mode = @truncate(arg(state, 0, direct_return_rip));
+        state.regs.rax = previous;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "OutputDebugStringA") or std.mem.eql(u8, name, "OutputDebugStringW")) {
+        // A debugger's output stream. Rosette is the debugger here, so the
+        // honest implementation is to carry the text into its own log rather
+        // than discard it - the guest is trying to tell someone something.
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "noteWindowsDebugString")) {
+            const address = arg(state, 0, direct_return_rip);
+            if (std.mem.eql(u8, name, "OutputDebugStringA")) {
+                state.noteWindowsDebugString(guestBytesOrEmpty(state, address));
+            } else {
+                var narrow: [256]u8 = undefined;
+                var written: usize = 0;
+                while (written < narrow.len) {
+                    const unit = guestWideUnit(state, address, written) orelse break;
+                    if (unit == 0) break;
+                    narrow[written] = if (unit < 0x80) @intCast(unit) else '?';
+                    written += 1;
+                }
+                state.noteWindowsDebugString(narrow[0..written]);
+            }
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SysFreeString")) {
+        // A BSTR's allocation starts four bytes before the pointer the caller
+        // holds. Freeing the pointer itself would release the wrong block, so
+        // a release that cannot find the header does nothing rather than
+        // corrupting the heap.
+        const bstr = arg(state, 0, direct_return_rip);
+        if (bstr >= 4) _ = state.releaseGuestAllocation(bstr - 4);
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "QISearch")) {
+        // Walks a table of interfaces an object supports. Rosette models no
+        // COM objects, so no interface is ever found; E_NOINTERFACE is the
+        // documented answer and the caller has a path for it.
+        const out = arg(state, 2, direct_return_rip);
+        if (out != 0 and state.guestMemory(out, 8) != null) state.write64(out, 0);
+        state.regs.rax = 0x8000_4002; // E_NOINTERFACE
+        finish(state, direct_return_rip);
+        return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// The C runtime's calendar surface.
+//
+// Eleven of these fourteen names were reaching the ABI fallback, which
+// returns zero. Zero is a valid `time_t`, a valid `clock_t` and a valid
+// character count, so every one of them was returning an answer the guest
+// could not tell from a real one - and three of them return *pointers the
+// caller dereferences without checking*, where the fallback's zero is a guest
+// crash rather than a wrong date.
+//
+// All of it is arithmetic. Rosette's clock already publishes real time, so
+// there is no modelling decision left: the only reason these were missing is
+// that a name list does not say whether anything answers a name.
+
+const seconds_per_day: i64 = 86_400;
+
+/// Days since 1970-01-01 for a civil date, by Howard Hinnant's algorithm.
+///
+/// Written out rather than looped, because the loop version - stepping year
+/// by year from 1970 - is where date code goes wrong: it is quadratic for
+/// distant dates and it gets leap centuries wrong at exactly the boundaries
+/// nobody tests.
+fn daysFromCivil(year_in: i64, month_in: i64, day: i64) i64 {
+    const year = year_in - @as(i64, if (month_in <= 2) 1 else 0);
+    const era = @divFloor(if (year >= 0) year else year - 399, 400);
+    const year_of_era = year - era * 400;
+    const day_of_year = @divTrunc(153 * (month_in + (if (month_in > 2) @as(i64, -3) else 9)) + 2, 5) + day - 1;
+    const day_of_era = year_of_era * 365 + @divTrunc(year_of_era, 4) - @divTrunc(year_of_era, 100) + day_of_year;
+    return era * 146_097 + day_of_era - 719_468;
+}
+
+const CivilDate = struct { year: i64, month: i64, day: i64 };
+
+fn civilFromDays(days: i64) CivilDate {
+    const shifted = days + 719_468;
+    const era = @divFloor(if (shifted >= 0) shifted else shifted - 146_096, 146_097);
+    const day_of_era = shifted - era * 146_097;
+    const year_of_era = @divTrunc(day_of_era - @divTrunc(day_of_era, 1460) + @divTrunc(day_of_era, 36_524) - @divTrunc(day_of_era, 146_096), 365);
+    const year = year_of_era + era * 400;
+    const day_of_year = day_of_era - (365 * year_of_era + @divTrunc(year_of_era, 4) - @divTrunc(year_of_era, 100));
+    const mp = @divTrunc(5 * day_of_year + 2, 153);
+    const day = day_of_year - @divTrunc(153 * mp + 2, 5) + 1;
+    const month = mp + (if (mp < 10) @as(i64, 3) else -9);
+    return .{ .year = year + @as(i64, if (month <= 2) 1 else 0), .month = month, .day = day };
+}
+
+/// Windows' `struct tm`: nine 32-bit ints, in this order.
+const GuestTm = struct {
+    sec: i32 = 0,
+    min: i32 = 0,
+    hour: i32 = 0,
+    mday: i32 = 1,
+    mon: i32 = 0,
+    year: i32 = 70,
+    wday: i32 = 0,
+    yday: i32 = 0,
+    isdst: i32 = 0,
+
+    const bytes: u64 = 36;
+
+    fn fromEpoch(epoch: i64) GuestTm {
+        const days = @divFloor(epoch, seconds_per_day);
+        var remainder = epoch - days * seconds_per_day;
+        if (remainder < 0) remainder += seconds_per_day;
+        const date = civilFromDays(days);
+        // 1970-01-01 was a Thursday, which is weekday 4.
+        const weekday = @mod(days + 4, 7);
+        const january_first = daysFromCivil(date.year, 1, 1);
+        return .{
+            .sec = @intCast(@mod(remainder, 60)),
+            .min = @intCast(@mod(@divTrunc(remainder, 60), 60)),
+            .hour = @intCast(@divTrunc(remainder, 3600)),
+            .mday = @intCast(date.day),
+            .mon = @intCast(date.month - 1),
+            .year = @intCast(date.year - 1900),
+            .wday = @intCast(weekday),
+            .yday = @intCast(days - january_first),
+            .isdst = 0,
+        };
+    }
+
+    fn toEpoch(self: GuestTm) i64 {
+        const days = daysFromCivil(@as(i64, self.year) + 1900, @as(i64, self.mon) + 1, self.mday);
+        return days * seconds_per_day + @as(i64, self.hour) * 3600 + @as(i64, self.min) * 60 + self.sec;
+    }
+};
+
+fn readGuestTm(state: anytype, address: u64) ?GuestTm {
+    if (address == 0 or state.guestMemoryConst(address, GuestTm.bytes) == null) return null;
+    return GuestTm{
+        .sec = @bitCast(state.read32(address + 0)),
+        .min = @bitCast(state.read32(address + 4)),
+        .hour = @bitCast(state.read32(address + 8)),
+        .mday = @bitCast(state.read32(address + 12)),
+        .mon = @bitCast(state.read32(address + 16)),
+        .year = @bitCast(state.read32(address + 20)),
+        .wday = @bitCast(state.read32(address + 24)),
+        .yday = @bitCast(state.read32(address + 28)),
+        .isdst = @bitCast(state.read32(address + 32)),
+    };
+}
+
+fn writeGuestTm(state: anytype, address: u64, value: GuestTm) void {
+    if (address == 0 or state.guestMemory(address, GuestTm.bytes) == null) return;
+    state.write32(address + 0, @bitCast(value.sec));
+    state.write32(address + 4, @bitCast(value.min));
+    state.write32(address + 8, @bitCast(value.hour));
+    state.write32(address + 12, @bitCast(value.mday));
+    state.write32(address + 16, @bitCast(value.mon));
+    state.write32(address + 20, @bitCast(value.year));
+    state.write32(address + 24, @bitCast(value.wday));
+    state.write32(address + 28, @bitCast(value.yday));
+    state.write32(address + 32, @bitCast(value.isdst));
+}
+
+const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+const day_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+
+/// Render one `strftime` conversion. Returns what was written, in `scratch`.
+///
+/// The subset every caller in this image uses, plus the ones whose absence
+/// would silently shorten a timestamp rather than fail it. An unrecognised
+/// specifier is emitted verbatim, which is what the C standard leaves
+/// implementation-defined and what every real CRT does.
+fn formatTimeField(specifier: u8, value: GuestTm, scratch: []u8) []const u8 {
+    return switch (specifier) {
+        'Y' => std.fmt.bufPrint(scratch, "{d}", .{@as(i64, value.year) + 1900}) catch "",
+        'y' => std.fmt.bufPrint(scratch, "{d:0>2}", .{@mod(@as(i64, value.year), 100)}) catch "",
+        'm' => std.fmt.bufPrint(scratch, "{d:0>2}", .{value.mon + 1}) catch "",
+        'd' => std.fmt.bufPrint(scratch, "{d:0>2}", .{value.mday}) catch "",
+        'H' => std.fmt.bufPrint(scratch, "{d:0>2}", .{value.hour}) catch "",
+        'M' => std.fmt.bufPrint(scratch, "{d:0>2}", .{value.min}) catch "",
+        'S' => std.fmt.bufPrint(scratch, "{d:0>2}", .{value.sec}) catch "",
+        'j' => std.fmt.bufPrint(scratch, "{d:0>3}", .{value.yday + 1}) catch "",
+        'b', 'h' => if (value.mon >= 0 and value.mon < 12) month_names[@intCast(value.mon)] else "",
+        'a' => if (value.wday >= 0 and value.wday < 7) day_names[@intCast(value.wday)] else "",
+        'p' => if (value.hour < 12) "AM" else "PM",
+        'I' => blk: {
+            const hour12 = if (@mod(value.hour, 12) == 0) @as(i32, 12) else @mod(value.hour, 12);
+            break :blk std.fmt.bufPrint(scratch, "{d:0>2}", .{hour12}) catch "";
+        },
+        'Z' => "UTC",
+        'z' => "+0000",
+        'n' => "\n",
+        't' => "\t",
+        '%' => "%",
+        else => "",
+    };
+}
+
+/// The C runtime's calendar functions.
+fn tryCrtTime(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    if (std.mem.eql(u8, name, "clock")) {
+        // CLOCKS_PER_SEC is 1000 on Windows, so this is milliseconds of
+        // process time. Zero would mean "no time has passed", which is a
+        // plausible first reading and a wrong one for every reading after.
+        const State = @TypeOf(state.*);
+        const milliseconds = if (comptime @hasDecl(State, "windowsGuestClockTicks"))
+            @divTrunc(state.windowsGuestClockTicks(), 1000)
+        else
+            0;
+        state.regs.rax = milliseconds;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_tzset")) {
+        // Rosette reports UTC, so there is nothing to recompute. Accepting
+        // the call is correct; the globals it would set are already right.
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "__daylight") or std.mem.eql(u8, name, "__timezone") or
+        std.mem.eql(u8, name, "__tzname"))
+    {
+        // These return *pointers to CRT globals* that the caller dereferences
+        // immediately. The ABI fallback's zero is not a wrong value here, it
+        // is a null dereference in the guest - which makes them the three
+        // most dangerous names in this library.
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "windowsTimezoneGlobal")) {
+            state.regs.rax = state.windowsTimezoneGlobal(name);
+        } else {
+            state.regs.rax = 0;
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_mktime64") or std.mem.eql(u8, name, "_mkgmtime64")) {
+        // Rosette's clock is UTC, so local and GMT are the same conversion.
+        const value = readGuestTm(state, arg(state, 0, direct_return_rip)) orelse {
+            state.regs.rax = @bitCast(@as(i64, -1));
+            finish(state, direct_return_rip);
+            return true;
+        };
+        const epoch = value.toEpoch();
+        // Normalise the caller's struct in place, which is the half of
+        // mktime callers rely on and a stub cannot fake.
+        writeGuestTm(state, arg(state, 0, direct_return_rip), GuestTm.fromEpoch(epoch));
+        state.regs.rax = @bitCast(epoch);
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_gmtime64")) {
+        const pointer = arg(state, 0, direct_return_rip);
+        if (pointer == 0 or state.guestMemoryConst(pointer, 8) == null) {
+            returnZero(state, direct_return_rip);
+            return true;
+        }
+        const State = @TypeOf(state.*);
+        if (comptime !@hasDecl(State, "windowsStaticTmBuffer")) {
+            returnZero(state, direct_return_rip);
+            return true;
+        }
+        const buffer = state.windowsStaticTmBuffer();
+        if (buffer == 0) {
+            returnZero(state, direct_return_rip);
+            return true;
+        }
+        writeGuestTm(state, buffer, GuestTm.fromEpoch(@bitCast(state.read64(pointer))));
+        state.regs.rax = buffer;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "strftime") or std.mem.eql(u8, name, "wcsftime")) {
+        const wide = std.mem.eql(u8, name, "wcsftime");
+        const destination = arg(state, 0, direct_return_rip);
+        const capacity = arg(state, 1, direct_return_rip);
+        const format_address = arg(state, 2, direct_return_rip);
+        const value = readGuestTm(state, arg(state, 3, direct_return_rip)) orelse GuestTm{};
+
+        var rendered: [512]u8 = undefined;
+        var written: usize = 0;
+        var index: usize = 0;
+        var scratch: [32]u8 = undefined;
+        while (written < rendered.len) : (index += 1) {
+            const unit: u16 = if (wide)
+                (guestWideUnit(state, format_address, index) orelse 0)
+            else blk: {
+                const byte = state.guestMemoryConst(format_address +| @as(u64, index), 1) orelse break :blk 0;
+                break :blk byte[0];
+            };
+            if (unit == 0) break;
+            if (unit != '%') {
+                rendered[written] = if (unit < 0x80) @intCast(unit) else '?';
+                written += 1;
+                continue;
+            }
+            index += 1;
+            const specifier: u16 = if (wide)
+                (guestWideUnit(state, format_address, index) orelse 0)
+            else blk: {
+                const byte = state.guestMemoryConst(format_address +| @as(u64, index), 1) orelse break :blk 0;
+                break :blk byte[0];
+            };
+            if (specifier == 0) break;
+            const text = formatTimeField(@truncate(specifier), value, &scratch);
+            const room = @min(text.len, rendered.len - written);
+            @memcpy(rendered[written..][0..room], text[0..room]);
+            written += room;
+        }
+
+        // strftime returns zero when the result does not fit, and writes
+        // nothing. Callers size their buffers by probing for that zero, so
+        // reporting a truncated length would make them believe a short
+        // timestamp was complete.
+        const needed: u64 = @as(u64, written) + 1;
+        if (destination == 0 or capacity < needed) {
+            state.regs.rax = 0;
+            finish(state, direct_return_rip);
+            return true;
+        }
+        if (wide) {
+            for (rendered[0..written], 0..) |byte, position| {
+                const slot = destination +| @as(u64, position * 2);
+                if (state.guestMemory(slot, 2) == null) break;
+                state.write16(slot, byte);
+            }
+            const terminator = destination +| @as(u64, written * 2);
+            if (state.guestMemory(terminator, 2) != null) state.write16(terminator, 0);
+        } else {
+            if (state.guestMemory(destination, @intCast(needed))) |out| {
+                @memcpy(out[0..written], rendered[0..written]);
+                out[written] = 0;
+            }
+        }
+        state.regs.rax = written;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// GDI, modelled as a device that hands out objects and draws nowhere.
+//
+// Xenia does not render through GDI - it renders through Vulkan, which
+// Rosette bridges to Metal. What it uses GDI for is the legacy pixel-format
+// handshake that every Windows OpenGL/Vulkan window still performs, and font
+// metrics for its own text measurement. Both need answers; neither needs
+// pixels.
+//
+// So the model is: object creation succeeds and hands back a synthetic
+// handle, object deletion succeeds, drawing calls succeed and go nowhere, and
+// the two things that genuinely cannot work on this host - the gamma ramp and
+// the colour profile - say so. That last part is what makes this a model
+// rather than a set of stubs: a stub says yes to everything, and a guest that
+// sets a gamma ramp and sees success will believe the screen changed.
+
+/// A plausible display, for the metrics callers actually read.
+const modelled_device_caps = struct {
+    const horizontal_size_mm: i64 = 600;
+    const vertical_size_mm: i64 = 340;
+    const bits_per_pixel: i64 = 32;
+    const logical_dpi: i64 = 96;
+};
+
+fn tryGdi32(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    // Object creation. Every one of these returns a handle the caller will
+    // pass back to `SelectObject` and `DeleteObject`, so it has to be a value
+    // Rosette recognises later rather than a constant.
+    // One name per line: the coverage audit reads this file to learn which
+    // names are handled, and a line holding three of them reports one.
+    const creators = [_][]const u8{
+        "CreateCompatibleDC",
+        "CreateBitmap",
+        "CreateCompatibleBitmap",
+        "CreateDIBSection",
+        "CreateFontIndirectW",
+        "CreateFontW",
+        "CreatePen",
+        "CreateRectRgn",
+        "CreateSolidBrush",
+    };
+    for (creators) |candidate| {
+        if (!std.mem.eql(u8, name, candidate)) continue;
+        state.regs.rax = nextHandle(state);
+        state.windows_last_error = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "CreateDCW")) {
+        // A device context for a named device. Rosette has no printer and no
+        // second display driver, so this is the one creator that fails - and
+        // it must, because a caller that gets a DC will try to draw to a
+        // device that does not exist.
+        state.regs.rax = 0;
+        state.windows_last_error = 50; // ERROR_NOT_SUPPORTED
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "DeleteDC") or std.mem.eql(u8, name, "DeleteObject")) {
+        // Deleting a synthetic object succeeds. Deleting something Rosette
+        // never handed out does not, which is how a double free shows up as
+        // the guest's own bug rather than silently.
+        const handle = arg(state, 0, direct_return_rip);
+        state.regs.rax = if (handle != 0) 1 else 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SelectObject")) {
+        // Returns the object previously selected. Rosette keeps no per-DC
+        // selection, so it returns the incoming object: callers use the
+        // result only to restore it, and restoring what they selected is
+        // indistinguishable from restoring what was there.
+        state.regs.rax = arg(state, 1, direct_return_rip);
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SetBkMode") or std.mem.eql(u8, name, "SetTextColor")) {
+        // Both return the previous value. Zero is a valid previous value for
+        // SetTextColor (black) but not for SetBkMode, whose failure value is
+        // also zero - so the mode returns TRANSPARENT rather than nothing.
+        state.regs.rax = if (std.mem.eql(u8, name, "SetBkMode")) 1 else 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "CombineRgn")) {
+        state.regs.rax = 2; // SIMPLEREGION
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "ChoosePixelFormat") or std.mem.eql(u8, name, "GetPixelFormat")) {
+        // One format, index 1. Zero would mean the call failed, and the
+        // caller's next step is to pass the index to SetPixelFormat.
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SetPixelFormat") or std.mem.eql(u8, name, "SwapBuffers")) {
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "DescribePixelFormat")) {
+        // Returns the number of formats, and fills the descriptor when one is
+        // supplied. A caller that gets the count without the descriptor reads
+        // its own stack.
+        const descriptor = arg(state, 3, direct_return_rip);
+        if (descriptor != 0 and state.guestMemory(descriptor, 40) != null) {
+            state.write16(descriptor + 0, 40); // nSize
+            state.write16(descriptor + 2, 1); // nVersion
+            state.write32(descriptor + 4, 0x25); // DRAW_TO_WINDOW|SUPPORT_OPENGL|DOUBLEBUFFER
+            if (state.guestMemory(descriptor + 8, 1)) |kind| kind[0] = 0; // PFD_TYPE_RGBA
+            if (state.guestMemory(descriptor + 9, 1)) |depth| depth[0] = 32; // cColorBits
+        }
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "BitBlt") or std.mem.eql(u8, name, "Rectangle") or
+        std.mem.eql(u8, name, "ExtTextOutW"))
+    {
+        // Drawing into a bitmap nobody reads. Reporting success is accurate:
+        // the operation completed, and its result is a surface the guest
+        // never presents, because what it presents comes through Vulkan.
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetTextExtentPoint32A") or
+        std.mem.eql(u8, name, "GetTextExtentPoint32W"))
+    {
+        // A monospaced estimate. Wrong in detail and right in shape, which
+        // for a caller laying out a debug overlay is the difference between
+        // overlapping text and a zero-sized rectangle it divides by.
+        const count = arg(state, 2, direct_return_rip);
+        const size_out = arg(state, 3, direct_return_rip);
+        if (size_out != 0 and state.guestMemory(size_out, 8) != null) {
+            state.write32(size_out + 0, @truncate(count *| 8));
+            state.write32(size_out + 4, 16);
+        }
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetTextMetricsW")) {
+        const metrics = arg(state, 1, direct_return_rip);
+        if (metrics != 0 and state.guestMemory(metrics, 60) != null) {
+            state.write32(metrics + 0, 16); // tmHeight
+            state.write32(metrics + 4, 13); // tmAscent
+            state.write32(metrics + 8, 3); // tmDescent
+            state.write32(metrics + 20, 8); // tmAveCharWidth
+            state.write32(metrics + 24, 8); // tmMaxCharWidth
+        }
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetDIBits")) {
+        // Returns scanlines copied. Rosette has no bitmap bits to give, and
+        // zero is the documented failure - which is the honest answer,
+        // because a caller that believes it read pixels will use them.
+        state.regs.rax = 0;
+        state.windows_last_error = 50; // ERROR_NOT_SUPPORTED
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetDeviceGammaRamp") or
+        std.mem.eql(u8, name, "SetDeviceGammaRamp") or
+        std.mem.eql(u8, name, "GetICMProfileW"))
+    {
+        // The two things here that genuinely cannot work. A guest that sets a
+        // gamma ramp and is told it succeeded believes the screen changed;
+        // saying no is the only answer that leaves it correct.
+        state.regs.rax = 0;
+        state.windows_last_error = 50; // ERROR_NOT_SUPPORTED
+        finish(state, direct_return_rip);
+        return true;
+    }
+    return false;
+}
+
+/// USER32 entry points reached during window and input bring-up.
+///
+/// The subset whose answer Rosette can give exactly or model defensibly. What
+/// is deliberately *not* here is anything that would require Rosette to keep
+/// window state it does not keep - a caller that sets a window region and is
+/// told it worked would believe the window is a different shape.
+fn tryUser32Extras(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    if (std.mem.eql(u8, name, "GetDesktopWindow")) {
+        // A distinct, stable pseudo-window. Callers compare against it and
+        // pass it to GetDC; NULL would mean there is no desktop at all.
+        state.regs.rax = 0xFFFF_F000_0000_0100;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetForegroundWindow") or std.mem.eql(u8, name, "SetActiveWindow")) {
+        state.regs.rax = state.windows_window_handle;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetParent") or std.mem.eql(u8, name, "GetMenu") or
+        std.mem.eql(u8, name, "GetDlgItem") or std.mem.eql(u8, name, "GetClipboardData"))
+    {
+        // NULL is the answer: a top-level window has no parent, Xenia's has
+        // no menu bar, and the clipboard holds nothing Rosette put there.
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetWindowThreadProcessId")) {
+        const process_out = arg(state, 1, direct_return_rip);
+        if (process_out != 0 and state.guestMemory(process_out, 4) != null) {
+            state.write32(process_out, 0x1000);
+        }
+        state.regs.rax = 0x2000; // the single UI thread
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetDoubleClickTime")) {
+        state.regs.rax = 500; // the Windows default, in milliseconds
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetAsyncKeyState") or std.mem.eql(u8, name, "GetKeyState")) {
+        // No key is down. Rosette delivers keyboard input as messages rather
+        // than through a polled table, so a zero here is accurate rather than
+        // a missing feature.
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetKeyboardState")) {
+        // 256 bytes, all zero: no key down, no toggle set.
+        const table = arg(state, 0, direct_return_rip);
+        if (table != 0) {
+            if (state.guestMemory(table, 256)) |bytes| @memset(bytes, 0);
+        }
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetKeyboardLayout")) {
+        state.regs.rax = 0x0409_0409; // US English, the layout Rosette maps to
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "MapVirtualKeyW")) {
+        // The identity for the mappings callers use to build a scancode
+        // table. A zero would mean "no translation", which makes a caller
+        // drop the key entirely.
+        state.regs.rax = arg(state, 0, direct_return_rip) & 0xFF;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "ToUnicode")) {
+        // Zero means the key produced no character, which is the correct
+        // answer for a path that never sees a keystroke.
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetMessageTime")) {
+        const State = @TypeOf(state.*);
+        state.regs.rax = if (comptime @hasDecl(State, "windowsGuestClockTicks"))
+            @divTrunc(state.windowsGuestClockTicks(), 1000)
+        else
+            0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetMessageExtraInfo") or
+        std.mem.eql(u8, name, "GetClipboardSequenceNumber"))
+    {
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "IsIconic") or std.mem.eql(u8, name, "IsClipboardFormatAvailable")) {
+        // FALSE is the answer: the window is not minimised and the clipboard
+        // holds nothing in the requested format.
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "OpenClipboard") or std.mem.eql(u8, name, "CloseClipboard") or
+        std.mem.eql(u8, name, "EmptyClipboard") or std.mem.eql(u8, name, "TrackMouseEvent") or
+        std.mem.eql(u8, name, "AttachThreadInput") or std.mem.eql(u8, name, "PtInRect") or
+        std.mem.eql(u8, name, "SetLayeredWindowAttributes") or
+        std.mem.eql(u8, name, "FlashWindowEx") or std.mem.eql(u8, name, "ClipCursor"))
+    {
+        state.regs.rax = 1;
+        state.windows_last_error = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetClipCursor")) {
+        // The cursor is confined to nothing, so the clip rectangle is the
+        // whole virtual screen. An unwritten RECT is read as garbage.
+        const rect = arg(state, 0, direct_return_rip);
+        if (rect != 0 and state.guestMemory(rect, 16) != null) {
+            state.write32(rect + 0, 0);
+            state.write32(rect + 4, 0);
+            state.write32(rect + 8, 1920);
+            state.write32(rect + 12, 1080);
+        }
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "IntersectRect")) {
+        const out = arg(state, 0, direct_return_rip);
+        const left = arg(state, 1, direct_return_rip);
+        const right = arg(state, 2, direct_return_rip);
+        if (out == 0 or left == 0 or right == 0 or
+            state.guestMemory(out, 16) == null or
+            state.guestMemoryConst(left, 16) == null or
+            state.guestMemoryConst(right, 16) == null)
+        {
+            returnZero(state, direct_return_rip);
+            return true;
+        }
+        const l = @max(@as(i32, @bitCast(state.read32(left + 0))), @as(i32, @bitCast(state.read32(right + 0))));
+        const t = @max(@as(i32, @bitCast(state.read32(left + 4))), @as(i32, @bitCast(state.read32(right + 4))));
+        const r = @min(@as(i32, @bitCast(state.read32(left + 8))), @as(i32, @bitCast(state.read32(right + 8))));
+        const b = @min(@as(i32, @bitCast(state.read32(left + 12))), @as(i32, @bitCast(state.read32(right + 12))));
+        const empty = r <= l or b <= t;
+        state.write32(out + 0, if (empty) 0 else @bitCast(l));
+        state.write32(out + 4, if (empty) 0 else @bitCast(t));
+        state.write32(out + 8, if (empty) 0 else @bitCast(r));
+        state.write32(out + 12, if (empty) 0 else @bitCast(b));
+        state.regs.rax = if (empty) 0 else 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "RegisterWindowMessageA") or
+        std.mem.eql(u8, name, "RegisterWindowMessageW"))
+    {
+        // A unique message id in the private range. Zero means registration
+        // failed, and a caller that believes that stops listening.
+        state.windows_next_window_message +|= 1;
+        state.regs.rax = 0xC000 + (state.windows_next_window_message & 0x3FFF);
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetWindowTextLengthW")) {
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "GetWindowTextW")) {
+        const buffer = arg(state, 1, direct_return_rip);
+        if (buffer != 0 and state.guestMemory(buffer, 2) != null) state.write16(buffer, 0);
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SetWindowsHookExW")) {
+        // NULL: Rosette runs no hook chain, and a caller holding a hook
+        // handle it thinks is live will never see the callbacks it expects.
+        state.regs.rax = 0;
+        state.windows_last_error = 1428; // ERROR_HOOK_NEEDS_HMOD
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "UnhookWindowsHookEx")) {
+        state.regs.rax = 1;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "CallNextHookEx")) {
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "SystemParametersInfoA") or
+        std.mem.eql(u8, name, "SystemParametersInfoW"))
+    {
+        // Answers the queries a caller cannot proceed without, and refuses
+        // the rest rather than leaving a buffer unwritten.
+        const action = arg(state, 0, direct_return_rip);
+        const out = arg(state, 2, direct_return_rip);
+        switch (action) {
+            0x0030 => { // SPI_GETWORKAREA
+                if (out != 0 and state.guestMemory(out, 16) != null) {
+                    state.write32(out + 0, 0);
+                    state.write32(out + 4, 0);
+                    state.write32(out + 8, 1920);
+                    state.write32(out + 12, 1080);
+                }
+                state.regs.rax = 1;
+            },
+            0x0062 => { // SPI_GETSCREENREADER
+                if (out != 0 and state.guestMemory(out, 4) != null) state.write32(out, 0);
+                state.regs.rax = 1;
+            },
+            else => {
+                state.regs.rax = 0;
+                state.windows_last_error = 87; // ERROR_INVALID_PARAMETER
+            },
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
+    return false;
+}
+
 /// Execute one Microsoft x64 import. The caller invokes this only for a PE
 /// state, so an unrecognized import can be made an explicit terminal event
 /// rather than silently entering a zero-return stub.
@@ -9029,6 +11311,27 @@ pub fn tryFunction(state: anytype, dll_name: []const u8, function_name: []const 
             state.regs.rsp,
         });
     }
+    // Snapshot the guest's error word before the handler runs. Windows'
+    // convention is that a failing BOOL sets `GetLastError`, and that is the
+    // only thing that separates "this call refused" from "this call answered
+    // no" once the return value is a bare zero.
+    const last_error_before = state.windows_last_error;
+    const handled = dispatchFunction(state, dll_name, function_name, direct_return_rip);
+    // One place, after every handler, where what Rosette answered is
+    // classified against what the name's ABI means. Doing it here rather than
+    // inside each handler is the whole point: a handler cannot forget, and a
+    // handler written next year is covered without being told.
+    if (handled) {
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "noteWindowsImportAnswer")) {
+            state.noteWindowsImportAnswer(dll_name, function_name, state.regs.rax, last_error_before);
+        }
+    }
+    return handled;
+}
+
+fn dispatchFunction(state: anytype, dll_name: []const u8, function_name: []const u8, direct_return_rip: ?u64) bool {
+    if (std.mem.eql(u8, dll_name, "dxgi-com")) return handleDxgiCom(state, function_name, direct_return_rip);
     switch (classifyImport(dll_name, function_name)) {
         .graphics => {
             const State = @TypeOf(state.*);
@@ -9074,6 +11377,14 @@ test "dynamic Windows API names use the modeled inventory without accepting arbi
     try std.testing.expectEqual(ImportClass.contract, classifyImport("", "RoGetActivationFactory"));
     try std.testing.expectEqual(ImportClass.contract, classifyImport("", "RENDERDOC_GetAPI"));
     try std.testing.expectEqual(ImportClass.unsupported, classifyImport("", "RosetteMissingOptionalProbe"));
+}
+
+test "DXGI guest COM surface has bounded vtables and no host pointers" {
+    try std.testing.expectEqual(@as(usize, 14), dxgiMethods(.factory).len);
+    try std.testing.expectEqual(@as(usize, 11), dxgiMethods(.adapter).len);
+    try std.testing.expectEqual(@as(usize, 19), dxgiMethods(.output).len);
+    try std.testing.expect(std.mem.startsWith(u8, dxgiMethods(.factory)[12], "IDXGIFactory1::"));
+    try std.testing.expect(isRecognizedDynamicImport("dxgi-com", "IDXGIOutput::WaitForVBlank"));
 }
 
 test "a module Rosetta cannot serve reports absent rather than handing out a handle" {

@@ -32,6 +32,11 @@ pub const Outcome = return_contract.Outcome;
 pub const Fallback = return_contract.Fallback;
 pub const returnConvention = return_contract.returnConvention;
 pub const fallbackFor = return_contract.fallbackFor;
+pub const valueIsRefusal = return_contract.valueIsRefusal;
+pub const refusalIsHard = return_contract.refusalIsHard;
+pub const conventionIsDecisive = return_contract.conventionIsDecisive;
+pub const capabilityGapFor = library_inventory.capabilityGapFor;
+pub const isDeliberateExportRefusal = library_inventory.isDeliberateExportRefusal;
 pub const advice = return_contract.advice;
 pub const isComponentObjectName = return_contract.isComponentObjectName;
 
@@ -73,6 +78,171 @@ pub fn subsystemForImport(dll_name: []const u8, function_name: []const u8) Subsy
 /// for a fallback — for a large PE that is hundreds of names, most of which
 /// are never called.  This records the ones that were, so a report names the
 /// handful that a run actually depends on instead of the whole inventory.
+/// A per-name cache of the ABI convention an import returns under.
+///
+/// ## Why this exists
+///
+/// Rosette answers roughly ninety thousand imports in a Xenia run, and until
+/// now it recorded what it answered for exactly one of them - the single name
+/// that had been wired by hand into the fallback ledger. Every other refusal,
+/// from every hand-written handler, was invisible: an `E_NOINTERFACE`, a
+/// `STATUS_NOT_IMPLEMENTED`, a NULL handle, a FALSE from a BOOL API all left
+/// the same trace as a success, which is none. When the guest then reported a
+/// failure, the log had nothing to say about what Rosette had told it.
+///
+/// Classifying the *returned value* against the name's convention catches all
+/// of them without a per-handler change, and keeps catching handlers written
+/// later. What it needs is the convention, and deriving that is a walk
+/// through dozens of string comparisons - affordable once per name, not
+/// ninety thousand times.
+///
+/// ## Why a pointer key
+///
+/// An import name reaches the dispatcher either from the PE's own import
+/// table or from a string literal, and both live for the process. The same
+/// call site therefore presents the identical pointer every time, so pointer
+/// identity is a sound cache key and needs no hashing of the text. A
+/// collision or a second copy of the same name simply misses and recomputes -
+/// wrong answers are impossible because the stored key is compared exactly.
+/// What Rosette may conclude from one import's return value.
+///
+/// Resolved once per name and cached, because the two halves are expensive in
+/// different ways: the declared answer is a walk through twenty-nine package
+/// surfaces, and the fallback is a walk through dozens of string comparisons.
+pub const Judgement = struct {
+    convention: ReturnConvention,
+    /// Whether a value under this name can be judged at all. True for a
+    /// reviewed declaration; for anything else it falls back to whether the
+    /// *convention* came from an explicit rule rather than a guess.
+    decisive: bool,
+    /// Whether zero is a meaningful answer rather than an absence.
+    zero_is_an_answer: bool,
+    /// Whether a package declared this name. False means Rosette is
+    /// answering for a library whose ABI nobody has written down.
+    declared: bool,
+
+    pub fn valueIsRefusal(self: Judgement, value: u64) bool {
+        if (self.zero_is_an_answer and (value & 0xFFFF_FFFF) == 0) return false;
+        return return_contract.valueIsRefusal(self.convention, value);
+    }
+};
+
+/// The judgement for one export, preferring what a package declared.
+pub fn judgementFor(dll_name: []const u8, name: []const u8) Judgement {
+    if (library_inventory.declaredExport(dll_name, name)) |declared| {
+        return .{
+            .convention = declared.convention,
+            .decisive = declared.isDecisive(),
+            .zero_is_an_answer = declared.zero_is_an_answer,
+            .declared = true,
+        };
+    }
+    const convention = return_contract.returnConvention(dll_name, name);
+    return .{
+        .convention = convention,
+        .decisive = return_contract.conventionIsDecisive(convention),
+        .zero_is_an_answer = false,
+        .declared = false,
+    };
+}
+
+pub const AnswerCache = struct {
+    pub const slots: usize = 512;
+
+    const Slot = struct {
+        name_ptr: usize = 0,
+        name_len: usize = 0,
+        dll_ptr: usize = 0,
+        judgement: Judgement = .{ .convention = .zero_count, .decisive = false, .zero_is_an_answer = false, .declared = false },
+        occupied: bool = false,
+    };
+
+    entries: [slots]Slot = [_]Slot{.{}} ** slots,
+    hits: u64 = 0,
+    misses: u64 = 0,
+
+    fn slotFor(name: []const u8) usize {
+        // The low four bits of a string address carry almost no information;
+        // shifting them out spreads adjacent import names across slots.
+        const key = @intFromPtr(name.ptr) >> 3;
+        return (key ^ (key >> 9) ^ name.len) % slots;
+    }
+
+    pub fn judge(self: *AnswerCache, dll_name: []const u8, name: []const u8) Judgement {
+        const index = slotFor(name);
+        const slot = &self.entries[index];
+        if (slot.occupied and
+            slot.name_ptr == @intFromPtr(name.ptr) and
+            slot.name_len == name.len and
+            slot.dll_ptr == @intFromPtr(dll_name.ptr))
+        {
+            self.hits +|= 1;
+            return slot.judgement;
+        }
+        self.misses +|= 1;
+        const judgement = judgementFor(dll_name, name);
+        slot.* = .{
+            .name_ptr = @intFromPtr(name.ptr),
+            .name_len = name.len,
+            .dll_ptr = @intFromPtr(dll_name.ptr),
+            .judgement = judgement,
+            .occupied = true,
+        };
+        return judgement;
+    }
+
+    /// The convention alone, for a caller that only wants to name it.
+    pub fn conventionFor(self: *AnswerCache, dll_name: []const u8, name: []const u8) ReturnConvention {
+        return self.judge(dll_name, name).convention;
+    }
+};
+
+test "a declared export decides its own judgement, and an undeclared one falls back" {
+    // `WaitForSingleObject` is the call that made the guess unusable: its
+    // WAIT_OBJECT_0 is zero, and under the inferred `bool32` that read as a
+    // refusal. The declaration says zero is an answer, so it no longer does.
+    const wait = judgementFor("KERNEL32.dll", "WaitForSingleObject");
+    try std.testing.expect(wait.declared);
+    try std.testing.expect(wait.zero_is_an_answer);
+    try std.testing.expect(!wait.valueIsRefusal(0));
+
+    // And `VirtualProtect` is the one that was a real defect. Declared, its
+    // FALSE is judgeable; guessed, it was not even looked at.
+    const protect = judgementFor("KERNEL32.dll", "VirtualProtect");
+    try std.testing.expect(protect.declared and protect.decisive);
+    try std.testing.expect(protect.valueIsRefusal(0));
+
+    // A library no package declares still gets an answer, from the heuristic,
+    // and is marked as such so a report never claims it was checked.
+    const unowned = judgementFor("third_party.dll", "SomethingNobodyOwns");
+    try std.testing.expect(!unowned.declared);
+}
+
+test "the convention cache answers the same question twice without recomputing" {
+    var cache = AnswerCache{};
+    const dll = "ADVAPI32.dll";
+    const name = "RegOpenKeyExW";
+    const first = cache.conventionFor(dll, name);
+    try std.testing.expectEqual(ReturnConvention.lstatus, first);
+    try std.testing.expectEqual(@as(u64, 1), cache.misses);
+    try std.testing.expectEqual(first, cache.conventionFor(dll, name));
+    try std.testing.expectEqual(@as(u64, 1), cache.hits);
+    try std.testing.expectEqual(@as(u64, 1), cache.misses);
+
+    // A different name is a different answer, and the cache never returns one
+    // name's convention for another.
+    try std.testing.expectEqual(ReturnConvention.hresult, cache.conventionFor("dxgi.dll", "CreateDXGIFactory1"));
+    try std.testing.expectEqual(ReturnConvention.lstatus, cache.conventionFor(dll, name));
+
+    // A copy of the same text at a different address misses rather than
+    // matching by content - correct, just slower.
+    var copy: [16]u8 = undefined;
+    @memcpy(copy[0..name.len], name);
+    const before = cache.misses;
+    try std.testing.expectEqual(ReturnConvention.lstatus, cache.conventionFor(dll, copy[0..name.len]));
+    try std.testing.expect(cache.misses > before);
+}
+
 pub const Ledger = struct {
     pub const capacity: usize = 96;
     pub const name_capacity: usize = 64;
