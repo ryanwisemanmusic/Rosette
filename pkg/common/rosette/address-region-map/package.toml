@@ -1,0 +1,16 @@
+name = "common-rosette-address-region-map"
+version = "0.1.0-local"
+kind = "guest-address-space-region-classification"
+role = "build-time"
+# Route-independent: what a region of guest address space is - the image the
+# loader mapped, a thunk the host synthesised, a block the guest allocated
+# executable and jumped into - is a property of how a process is hosted, not
+# of the host architecture.
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
+# The package answers "what is at this address" for addresses no symbol
+# covers. Establishing the ranges - reading the image's sections, recording
+# where the import stubs were laid down, noticing an executable allocation -
+# stays with the loader and the Win32 surface in lib/ and src/.
