@@ -554,9 +554,12 @@ fn executeVshufpd(self: anytype, d: DecodedInsn) void {
     for (0..count / 16) |block| {
         const base = block * 16;
         for (0..2) |lane| {
-            const select_rhs = ((d.imm >> @as(u6, @intCast(block * 2 + lane))) & 1) != 0;
-            const source = if (select_rhs) rhs else lhs;
-            @memcpy(computed[base + lane * 8 ..][0..8], source[base + lane * 8 ..][0..8]);
+            // The bit picks the element within the source; the source is
+            // fixed by position (SRC1, then SRC2).
+            const select_high = ((d.imm >> @as(u6, @intCast(block * 2 + lane))) & 1) != 0;
+            const source = if (lane == 0) lhs else rhs;
+            const element: usize = if (select_high) 8 else 0;
+            @memcpy(computed[base + lane * 8 ..][0..8], source[base + element ..][0..8]);
         }
     }
     const old = readVectorRegister(self, d.xmm_dst);
@@ -610,7 +613,7 @@ fn executeVpbroadcast(self: anytype, d: DecodedInsn) void {
     if (self.terminated) return;
     var computed = [_]u8{0} ** 64;
     for (0..count / width) |lane| {
-        writePackedValue(&computed, lane * width, width, @intCast(scalar), false);
+        writePackedValue(&computed, lane * width, width, @bitCast(scalar), false);
     }
     const old = readVectorRegister(self, d.xmm_dst);
     writeVectorRegister(self, d.xmm_dst, maskedVector(self, d, computed, old, count, width), count);

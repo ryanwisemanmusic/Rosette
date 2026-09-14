@@ -315,7 +315,9 @@ fn packedIntegerOperation(op: Op) PackedIntegerOperation {
         .vpsubb, .vpsubw, .vpsubd, .vpsubq => .sub,
         .vpmullw, .vpmulld_38 => .mul_low,
         .vpsubsb, .vpsubsw => .sub_signed_saturate,
-        .vpsubusw => .sub_unsigned_saturate,
+        .vpsubusw, .vpsubusb => .sub_unsigned_saturate,
+        .vpaddusb, .vpaddusw => .add_unsigned_saturate,
+        .vpavgb, .vpavgw => .average_unsigned,
         .vpaddsb, .vpaddsw => .add_signed_saturate,
         else => unreachable,
     };
@@ -324,10 +326,12 @@ fn packedIntegerOperation(op: Op) PackedIntegerOperation {
 fn packedIntegerLaneBits(op: Op) u8 {
     return switch (op) {
         .vpaddb, .vpsubb => 8,
-        .vpaddw, .vpsubw, .vpmullw, .vpsubsb, .vpsubsw, .vpsubusw, .vpaddsw, .vpmulhw, .vpmulhuw => 16,
+        // VPSUBSB is opcode E8 and saturates bytes; it was listed among the
+        // word operations and so saturated pairs of bytes as one word.
+        .vpaddw, .vpsubw, .vpmullw, .vpsubsw, .vpsubusw, .vpaddsw, .vpmulhw, .vpmulhuw, .vpaddusw, .vpavgw => 16,
         .vpaddd, .vpsubd, .vpmulld_38 => 32,
         .vpaddq, .vpsubq => 64,
-        .vpaddsb => 8,
+        .vpaddsb, .vpsubsb, .vpaddusb, .vpsubusb, .vpavgb => 8,
         else => unreachable,
     };
 }
@@ -344,6 +348,8 @@ fn packedMinMaxKind(op: Op) packed_ops.MinMaxKind {
         .vpmaxsd => .{ .lane_bits = 32, .signed = true, .take_max = true },
         .vpminud => .{ .lane_bits = 32, .signed = false, .take_max = false },
         .vpmaxud => .{ .lane_bits = 32, .signed = false, .take_max = true },
+        .vpminsw => .{ .lane_bits = 16, .signed = true, .take_max = false },
+        .vpmaxsw => .{ .lane_bits = 16, .signed = true, .take_max = true },
         else => unreachable,
     };
 }
@@ -944,6 +950,21 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             };
             _ = self.x87.push(readExtendedFloat80(input));
         },
+        .fisttp_mem32 => {
+            if (self.guestMemory(d.addr, 4) == null) {
+                self.terminateForGuestAccess(d.addr, 4, .write, "fisttp_mem32");
+                return;
+            }
+            const value = self.x87.get(0) orelse return;
+            // Truncates toward zero into a signed 32-bit integer; anything
+            // outside (-2^31 - 1, 2^31) or unordered stores the indefinite.
+            const invalid = std.math.isNan(value) or !std.math.isFinite(value) or
+                value <= -0x1p31 - 1.0 or value >= 0x1p31;
+            const integer: i32 = if (invalid) std.math.minInt(i32) else @intFromFloat(value);
+            if (invalid) self.x87.stackFault(false);
+            _ = self.x87.pop();
+            self.writeMemVal(d.addr, .bits32, @as(u64, @as(u32, @bitCast(integer))));
+        },
         .fisttp_mem64 => {
             const output = self.guestMemory(d.addr, 8) orelse {
                 self.terminateForGuestAccess(d.addr, 8, .write, "fisttp_mem64");
@@ -1028,6 +1049,31 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         .fclex => self.x87.clearExceptions(),
         .fnstsw_ax => self.setReg(.al_ax_eax_rax, .bits16, self.x87.statusWord()),
         .fnstcw_mem16 => self.writeMemVal(d.addr, .bits16, self.x87.control),
+        .fstenv_mem => {
+            // The 28-byte protected-mode environment: control, status and tag
+            // words, then instruction and data pointers this model does not
+            // keep (zero). FNSTENV then masks every exception.
+            const output = self.guestMemory(d.addr, 28) orelse {
+                self.terminateForGuestAccess(d.addr, 28, .write, "fstenv_mem");
+                return;
+            };
+            @memset(output, 0);
+            std.mem.writeInt(u16, output[0..2], self.x87.control, .little);
+            std.mem.writeInt(u16, output[4..6], self.x87.statusWord(), .little);
+            std.mem.writeInt(u16, output[8..10], self.x87.tagWord(), .little);
+            self.x87.control |= 0x3F;
+        },
+        .fldenv_mem => {
+            // TOP and the tags describe this model's own register stack; the
+            // control word and the exception and condition bits are restored.
+            const input = self.guestMemory(d.addr, 28) orelse {
+                self.terminateForGuestAccess(d.addr, 28, .write, "fldenv_mem");
+                return;
+            };
+            self.x87.control = std.mem.readInt(u16, input[0..2], .little);
+            const status = std.mem.readInt(u16, input[4..6], .little);
+            self.x87.status = (self.x87.status & 0x3800) | (status & ~@as(u16, 0x3800));
+        },
         .fldcw_mem16 => self.x87.control = @truncate(self.readMemVal(d.addr, .bits16)),
         .x87_binary => self.x87.binary(
             @truncate((d.imm >> 3) & 7),
@@ -1247,6 +1293,14 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         .adc_mem8_reg8, .adc_mem16_reg16, .adc_mem32_reg32, .adc_mem64_reg64 => {
             const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.adc_mem8_reg8) + @intFromEnum(Size.bits8));
             self.executeHighwayMemoryBinary(d, .adc, sz, .register_to_memory);
+        },
+        .sbb_reg16_mem16, .sbb_reg32_mem32, .sbb_reg64_mem64 => {
+            const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sbb_reg16_mem16) + @intFromEnum(Size.bits16));
+            self.executeHighwayMemoryBinary(d, .sbb, sz, .memory_to_register);
+        },
+        .sbb_mem8_reg8, .sbb_mem16_reg16, .sbb_mem32_reg32, .sbb_mem64_reg64 => {
+            const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sbb_mem8_reg8) + @intFromEnum(Size.bits8));
+            self.executeHighwayMemoryBinary(d, .sbb, sz, .register_to_memory);
         },
         .sbb_reg8_mem8 => {
             const a = self.regOperandVal(d.dst_reg, .bits8, d.dst_high8);
@@ -2636,6 +2690,16 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         .vmovsd_mem_xmm => {
             self.writeMemVal(d.addr, .bits64, std.mem.readInt(u64, self.xmm[d.xmm_src][0..8], .little));
         },
+        .vmovss_xmm_xmm_xmm, .vmovsd_xmm_xmm_xmm => {
+            // Low element from xmm_src2, the rest of the lane from VEX.vvvv,
+            // upper YMM lane cleared. Read both sources before the store: the
+            // destination may be either of them.
+            var merged = self.xmm[d.xmm_src];
+            const width: usize = if (d.op == .vmovss_xmm_xmm_xmm) 4 else 8;
+            @memcpy(merged[0..width], self.xmm[d.xmm_src2][0..width]);
+            self.xmm[d.xmm_dst] = merged;
+            @memset(&self.ymm_hi[d.xmm_dst], 0);
+        },
         .vmovss_xmm_xmm => {
             const source = std.mem.readInt(u32, self.xmm[d.xmm_src][0..4], .little);
             if (!d.legacy_sse) @memset(&self.xmm[d.xmm_dst], 0);
@@ -2888,7 +2952,8 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             if (d.vector_256) {
                 const source_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src] else self.readMem128(d.addr + 16);
                 self.ymm_hi[d.xmm_dst] = shufflePackedDwords(source_high, control);
-            } else {
+            } else if (!d.legacy_sse) {
+                // VEX.128 clears the upper lane; legacy PSHUFD keeps it.
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }
         },
@@ -2901,7 +2966,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 const lhs_high = self.ymm_hi[d.xmm_src];
                 const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
                 self.ymm_hi[d.xmm_dst] = shufflePackedSingles(lhs_high, rhs_high, control);
-            } else {
+            } else if (!d.legacy_sse) {
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }
         },
@@ -3057,7 +3122,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }
         },
-        .vpminub, .vpminsb, .vpminsd, .vpminuw, .vpminud, .vpmaxub, .vpmaxsb, .vpmaxsd, .vpmaxuw, .vpmaxud => {
+        .vpminub, .vpminsb, .vpminsd, .vpminuw, .vpminud, .vpmaxub, .vpmaxsb, .vpmaxsd, .vpmaxuw, .vpmaxud, .vpminsw, .vpmaxsw => {
             const kind = packedMinMaxKind(d.op);
             const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
             self.xmm[d.xmm_dst] = packedMinMax(self.xmm[d.xmm_src], rhs_low, kind);
@@ -3068,7 +3133,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }
         },
-        .vpsubb, .vpsubd, .vpsubq, .vpsubw, .vpaddb, .vpaddd, .vpaddq, .vpaddw, .vpmullw, .vpmulld_38, .vpsubsb, .vpsubsw, .vpsubusw, .vpaddsb, .vpaddsw => {
+        .vpsubb, .vpsubd, .vpsubq, .vpsubw, .vpaddb, .vpaddd, .vpaddq, .vpaddw, .vpmullw, .vpmulld_38, .vpsubsb, .vpsubsw, .vpsubusw, .vpaddsb, .vpaddsw, .vpaddusb, .vpaddusw, .vpsubusb, .vpavgb, .vpavgw => {
             const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
             self.xmm[d.xmm_dst] = packedIntegerBinary(
                 self.xmm[d.xmm_src],
