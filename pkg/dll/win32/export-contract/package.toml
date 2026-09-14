@@ -1,0 +1,13 @@
+name = "dll-win32-export-contract"
+version = "0.1.0-local"
+kind = "per-export-windows-abi-declaration"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
+# The shape a per-DLL package uses to declare one export: its Microsoft x64
+# arity, the convention its return value follows, whether a zero is an answer
+# or an absence, and what Rosette does when the guest calls it. Choosing the
+# value to return, and returning it, stay with the return contract and the
+# dispatcher.
