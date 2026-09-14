@@ -23,6 +23,7 @@ pub const xenia_gpu_causal_trace = @import("xenia_gpu_causal_trace.zig");
 pub const graphics_health_contract = @import("graphics_health_contract.zig");
 pub const application_controller = @import("application_controller.zig");
 pub const xenia_pm4_walk = @import("xenia_pm4_walk.zig");
+pub const graphics_contract_validator = @import("graphics_contract_validator.zig");
 pub const bringup_failure = @import("bringup_failure.zig");
 pub const run_horizon = @import("run_horizon.zig");
 pub const claim_reconciliation = @import("claim_reconciliation.zig");
@@ -102,6 +103,7 @@ test {
     _ = graphics_health_contract;
     _ = application_controller;
     _ = xenia_pm4_walk;
+    _ = graphics_contract_validator;
     _ = bringup_failure;
     _ = run_horizon;
     _ = claim_reconciliation;
