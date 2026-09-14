@@ -1,7 +1,7 @@
 // Mirror: AVERAGE/PAVGW.inc
 // Lowering contract mirrors x86 table under arm64_neon ABI.
 
-source_isa = "arm64_neon"
+source_isa = "x86"
 target_isa = "arm64_neon"
 x86_table = "AVERAGE/PAVGW.inc"
 x86_handler = "x86_pavgw"
@@ -22,5 +22,20 @@ encodings = [
   { opcode = "EVEX.256.66.0F.WIG E3 /r", form = "VPAVGW ymm1 {k1}{z}, ymm2, ymm3/m256", op_en = "C", vector_length = 0 },
   { opcode = "EVEX.512.66.0F.WIG E3 /r", form = "VPAVGW zmm1 {k1}{z}, zmm2, zmm3/m512", op_en = "C", vector_length = 0 }
 ]
+
+
+neon_register_model = """
+PAVGW is an SSE/AVX/AVX512 packed unsigned word average operation.
+"""
+neon_flag_model = """
+PAVGW does not modify flags.
+"""
+neon_assembly = """
+// NEON lowering: PAVGW stub (average packed unsigned words)
+"""
+semantic_general = """
+Computes (SRC1 + SRC2 + 1) >> 1 for each packed unsigned word element with rounding.
+"""
+flags_written = []
 
 abi_contract = ["x86_table_shape", "neon_mirror_shape", "arm64_lowering_shape"]

@@ -1241,6 +1241,8 @@ const arithmetic_vpaddq = @import("ARITHMETIC/vpaddq.zig");
 const arithmetic_vpaddw = @import("ARITHMETIC/vpaddw.zig");
 const arithmetic_vpaddsb = @import("ARITHMETIC/vpaddsb.zig");
 const arithmetic_vpaddsw = @import("ARITHMETIC/vpaddsw.zig");
+const arithmetic_vpaddusb = @import("ARITHMETIC/vpaddusb.zig");
+const arithmetic_vpaddusw = @import("ARITHMETIC/vpaddusw.zig");
 const atomic_cmpxchg = @import("ATOMIC/cmpxchg.zig");
 const atomic_cmpxchg8b = @import("ATOMIC/cmpxchg8b.zig");
 const atomic_cmpxchg16b = @import("ATOMIC/cmpxchg16b.zig");
@@ -2432,6 +2434,8 @@ pub const mirror_tables = blk: {
         mirror(arithmetic_vpaddw.family, arithmetic_vpaddw.path, arithmetic_vpaddw.source),
         mirror(arithmetic_vpaddsb.family, arithmetic_vpaddsb.path, arithmetic_vpaddsb.source),
         mirror(arithmetic_vpaddsw.family, arithmetic_vpaddsw.path, arithmetic_vpaddsw.source),
+        mirror(arithmetic_vpaddusb.family, arithmetic_vpaddusb.path, arithmetic_vpaddusb.source),
+        mirror(arithmetic_vpaddusw.family, arithmetic_vpaddusw.path, arithmetic_vpaddusw.source),
         mirror(atomic_cmpxchg.family, atomic_cmpxchg.path, atomic_cmpxchg.source),
         mirror(atomic_cmpxchg8b.family, atomic_cmpxchg8b.path, atomic_cmpxchg8b.source),
         mirror(atomic_cmpxchg16b.family, atomic_cmpxchg16b.path, atomic_cmpxchg16b.source),

@@ -1900,6 +1900,8 @@ const arithmetic_vpaddq = @import("ARITHMETIC/vpaddq.zig");
 const arithmetic_vpaddw = @import("ARITHMETIC/vpaddw.zig");
 const arithmetic_vpaddsb = @import("ARITHMETIC/vpaddsb.zig");
 const arithmetic_vpaddsw = @import("ARITHMETIC/vpaddsw.zig");
+const arithmetic_vpaddusb = @import("ARITHMETIC/vpaddusb.zig");
+const arithmetic_vpaddusw = @import("ARITHMETIC/vpaddusw.zig");
 const atomic_cmpxchg = @import("ATOMIC/cmpxchg.zig");
 const atomic_cmpxchg8b = @import("ATOMIC/cmpxchg8b.zig");
 const atomic_cmpxchg16b = @import("ATOMIC/cmpxchg16b.zig");
@@ -3091,6 +3093,8 @@ pub const tables = blk: {
         entry(arithmetic_vpaddw.family, arithmetic_vpaddw.path, arithmetic_vpaddw.source),
         entry(arithmetic_vpaddsb.family, arithmetic_vpaddsb.path, arithmetic_vpaddsb.source),
         entry(arithmetic_vpaddsw.family, arithmetic_vpaddsw.path, arithmetic_vpaddsw.source),
+        entry(arithmetic_vpaddusb.family, arithmetic_vpaddusb.path, arithmetic_vpaddusb.source),
+        entry(arithmetic_vpaddusw.family, arithmetic_vpaddusw.path, arithmetic_vpaddusw.source),
         entry(atomic_cmpxchg.family, atomic_cmpxchg.path, atomic_cmpxchg.source),
         entry(atomic_cmpxchg8b.family, atomic_cmpxchg8b.path, atomic_cmpxchg8b.source),
         entry(atomic_cmpxchg16b.family, atomic_cmpxchg16b.path, atomic_cmpxchg16b.source),
@@ -3335,7 +3339,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 1043), tableCount());
+    try std.testing.expectEqual(@as(usize, 1045), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();

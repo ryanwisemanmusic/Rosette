@@ -761,6 +761,25 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         return decoded;
     }
 
+    if (opcode2 == 0x76 or opcode2 == 0xFB) {
+        // PCMPEQD (66 0F 76) and PSUBQ (66 0F FB): legacy two-operand forms
+        // of operations the vector executor already runs, laid out like
+        // PADDQ below. libstdc++'s basic_stringbuf __xfer_bufptrs uses both.
+        if (!has_66 or has_f2 or has_f3 or pos.* >= bytes.len) return .{};
+        var decoded = DecodedInsn{ .legacy_sse = true, .size = .bits64 };
+        const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.op = if (opcode2 == 0x76) .vpcmpeqd else .vpsubq;
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = decoded.xmm_dst;
+        if (decoded.is_reg_form) {
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
+        } else {
+            decoded.addr = rm.addr;
+        }
+        decoded.len = @intCast(pos.*);
+        return decoded;
+    }
+
     if (opcode2 == 0xD4) {
         // 66 0F D4 /r is the legacy SSE2 PADDQ form.  The shared vector
         // executor already implements the operation as VPADDQ, but the
@@ -786,9 +805,27 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
     }
 
     if (opcode2 == 0x70) {
-        d.op = .nop;
-        d.len = @as(u8, @intCast(pos.* + 3));
-        return d;
+        // PSHUFD: 66 0F 70 /r ib. This decoded as a NOP three bytes past the
+        // opcode, so the shuffle never happened and a memory operand resumed
+        // inside its own displacement. MinGW's libstdc++ is built without
+        // AVX, and its basic_filebuf move constructor swaps its buffer
+        // pointers with exactly this instruction. PSHUFHW/PSHUFLW (F3/F2)
+        // and the MMX PSHUFW stay invalid until they execute.
+        if (!has_66 or has_f2 or has_f3 or pos.* >= bytes.len) return .{};
+        var decoded = DecodedInsn{ .op = .vpshufd, .legacy_sse = true, .size = .bits64 };
+        const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        if (decoded.is_reg_form) {
+            decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
+        } else {
+            decoded.addr = rm.addr;
+        }
+        if (pos.* >= bytes.len) return .{};
+        decoded.imm = bytes[pos.*];
+        decoded.uses_imm = true;
+        pos.* += 1;
+        decoded.len = @intCast(pos.*);
+        return decoded;
     }
 
     if (opcode2 == 0xD1 or opcode2 == 0xD2 or opcode2 == 0xD3) {

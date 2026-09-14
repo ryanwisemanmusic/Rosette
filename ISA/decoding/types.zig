@@ -1141,6 +1141,33 @@ pub const Op = enum(u16) {
     fscale,
     fnop,
     fclex,
+    // AVX forms Xenia's x64 JIT emits that had no decoder entry. Appended so
+    // no existing operation identity or enum-offset family moves.
+    vpaddusb,
+    vpaddusw,
+    vpsubusb,
+    vpavgb,
+    vpavgw,
+    vpminsw,
+    // VMOVSS/VMOVSD xmm1, xmm2, xmm3: the register form that merges the low
+    // element of one source with the rest of the lane from VEX.vvvv.
+    vmovss_xmm_xmm_xmm,
+    vmovsd_xmm_xmm_xmm,
+    // Forms xenia_canary.exe's own code contains that had no decoder entry
+    // (xenia_image_corpus.txt). SBB's memory forms were refused outright
+    // rather than risk the enum-offset family below it.
+    fisttp_mem32,
+    sbb_reg16_mem16,
+    sbb_reg32_mem32,
+    sbb_reg64_mem64,
+    sbb_mem8_reg8,
+    sbb_mem16_reg16,
+    sbb_mem32_reg32,
+    sbb_mem64_reg64,
+    // FSTENV/FNSTENV and FLDENV m28: MinGW's feclearexcept round-trips the
+    // x87 environment through them.
+    fstenv_mem,
+    fldenv_mem,
 };
 
 fn canonicalMnemonic(op: Op, buffer: *[32]u8) ?[]const u8 {

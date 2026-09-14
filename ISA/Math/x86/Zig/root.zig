@@ -1167,6 +1167,8 @@ const arithmetic_vpaddq = @import("ARITHMETIC/vpaddq.zig");
 const arithmetic_vpaddw = @import("ARITHMETIC/vpaddw.zig");
 const arithmetic_vpaddsb = @import("ARITHMETIC/vpaddsb.zig");
 const arithmetic_vpaddsw = @import("ARITHMETIC/vpaddsw.zig");
+const arithmetic_vpaddusb = @import("ARITHMETIC/vpaddusb.zig");
+const arithmetic_vpaddusw = @import("ARITHMETIC/vpaddusw.zig");
 const atomic_cmpxchg = @import("ATOMIC/cmpxchg.zig");
 const atomic_cmpxchg8b = @import("ATOMIC/cmpxchg8b.zig");
 const atomic_cmpxchg16b = @import("ATOMIC/cmpxchg16b.zig");
@@ -2358,6 +2360,8 @@ pub const specs = blk: {
         spec(arithmetic_vpaddw.meta),
         spec(arithmetic_vpaddsb.meta),
         spec(arithmetic_vpaddsw.meta),
+        spec(arithmetic_vpaddusb.meta),
+        spec(arithmetic_vpaddusw.meta),
         spec(atomic_cmpxchg.meta),
         spec(atomic_cmpxchg8b.meta),
         spec(atomic_cmpxchg16b.meta),
@@ -3549,6 +3553,8 @@ pub const proof_reports = [_]proofs.ProofReport{
     arithmetic_vpaddw.proof_report,
     arithmetic_vpaddsb.proof_report,
     arithmetic_vpaddsw.proof_report,
+    arithmetic_vpaddusb.proof_report,
+    arithmetic_vpaddusw.proof_report,
     atomic_cmpxchg.proof_report,
     atomic_cmpxchg8b.proof_report,
     atomic_cmpxchg16b.proof_report,
@@ -3630,7 +3636,7 @@ fn validateSpec(instruction_spec: core.InstructionMathSpec) void {
 }
 
 test "x86 math specs cover current ISA tables" {
-    try std.testing.expectEqual(@as(usize, 1187), tableCount());
+    try std.testing.expectEqual(@as(usize, 1189), tableCount());
     try std.testing.expectEqual(tableCount(), proofReportCount());
     // Every table has a report, every report has a case, and any report that
     // models arithmetic carries at least two of them. A blanket "two cases per

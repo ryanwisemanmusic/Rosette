@@ -1730,6 +1730,10 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
                 // DA/DE address the integer-memory forms (FI*), while
                 // D8/DC address single/double floating-point memory.
                 if (opcode == 0xDA or opcode == 0xDE) x87.imm |= @as(u64, 1) << 3;
+                // The operand address is the ModR/M displacement; without it every
+                // FADD/FMUL/FSUB/FDIV/FCOM m32/m64 with a displacement read the bytes
+                // at its base (or, RIP-relative, the next instruction).
+                x87.addr = rm.addr;
                 x87.len = @intCast(modrm_pos);
                 return x87;
             }
@@ -1744,12 +1748,15 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
                 0xD9 => switch (group) {
                     0 => x87.op = .fld_mem32,
                     3 => x87.op = .fstp_mem32,
+                    4 => x87.op = .fldenv_mem,
+                    6 => x87.op = .fstenv_mem,
                     5 => x87.op = .fldcw_mem16,
                     7 => x87.op = .fnstcw_mem16,
                     else => return .{},
                 },
                 0xDB => switch (group) {
                     0 => x87.op = .fild_mem32,
+                    1 => x87.op = .fisttp_mem32,
                     5 => x87.op = .fld_mem80,
                     7 => x87.op = .fstp_mem80,
                     else => return .{},

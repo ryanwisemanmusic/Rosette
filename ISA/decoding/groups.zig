@@ -113,8 +113,13 @@ pub fn decodeArithRmReg(bytes: []const u8, start_pos: usize, prefixes: LegacyPre
             else
                 Op.adc_mem64_reg64,
         }
-    else if (arith_type == .sbb and !is_reg_reg and (!is_mem_to_reg or sz != .bits8))
-        .invalid
+    else if (arith_type == .sbb and !is_reg_reg)
+        switch (sz) {
+            .bits8 => if (is_mem_to_reg) Op.sbb_reg8_mem8 else Op.sbb_mem8_reg8,
+            .bits16 => if (is_mem_to_reg) Op.sbb_reg16_mem16 else Op.sbb_mem16_reg16,
+            .bits32 => if (is_mem_to_reg) Op.sbb_reg32_mem32 else Op.sbb_mem32_reg32,
+            .bits64 => if (is_mem_to_reg) Op.sbb_reg64_mem64 else Op.sbb_mem64_reg64,
+        }
     else if (is_reg_reg)
         reg_reg_ops[@intFromEnum(arith_type)]
     else if (is_mem_to_reg)
@@ -125,7 +130,7 @@ pub fn decodeArithRmReg(bytes: []const u8, start_pos: usize, prefixes: LegacyPre
     var d = DecodedInsn{
         .op = if (base_op == .invalid)
             .invalid
-        else if (arith_type == .adc)
+        else if (arith_type == .adc or (arith_type == .sbb and !is_reg_reg))
             base_op
         else
             @enumFromInt(@intFromEnum(base_op) + off),
@@ -573,7 +578,7 @@ pub fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
         return d;
     }
 
-    if (group == 6 and sz != .bits8) {
+    if (group == 6) {
         const base_op: Op = if (is_mem) .div_mem8 else .div_reg8;
         d.op = @enumFromInt(@intFromEnum(base_op) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
         d.size = sz;
@@ -582,7 +587,7 @@ pub fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
         d.len = @intCast(pos);
         return d;
     }
-    if (group == 7 and sz != .bits8) {
+    if (group == 7) {
         const base_op: Op = if (is_mem) .idiv_mem8 else .idiv_reg8;
         d.op = @enumFromInt(@intFromEnum(base_op) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
         d.size = sz;
