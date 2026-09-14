@@ -22,6 +22,7 @@ pub const importValueIsRefusal = windows_runtime.importValueIsRefusal;
 pub const importRefusalIsHard = windows_runtime.importRefusalIsHard;
 pub const importConventionIsDecisive = windows_runtime.importConventionIsDecisive;
 pub const importCapabilityGapFor = windows_runtime.importCapabilityGapFor;
+pub const isCapabilityGap = windows_runtime.isCapabilityGap;
 pub const ImportJudgement = windows_runtime.ImportJudgement;
 pub const ImportSubsystem = windows_runtime.ImportSubsystem;
 pub const importSubsystemFor = windows_runtime.importSubsystemFor;
@@ -31,6 +32,7 @@ pub const importSubsystemForImport = windows_runtime.importSubsystemForImport;
 /// state already reaches this module for the import contract.
 pub const windowsModuleNameLooksReadable = windows_runtime.windowsModuleNameLooksReadable;
 pub const windowsModuleAvailability = windows_runtime.windowsModuleAvailability;
+pub const windowsModuleFallback = windows_runtime.windowsModuleFallback;
 pub const windowsModuleUnavailableOnHost = windows_runtime.windowsModuleUnavailableOnHost;
 pub const isRecognizedDynamicImport = windows_runtime.isRecognizedDynamicImport;
 

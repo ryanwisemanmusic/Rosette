@@ -16,7 +16,6 @@ const std = @import("std");
 pub const refusals = [_][]const u8{
     "_ecvt_s",
     "_assert",
-    "_crt_at_quick_exit",
     "__stdio_common_vfprintf",
     "__stdio_common_vfwprintf",
     "__stdio_common_vsprintf",
@@ -32,9 +31,6 @@ pub const refusals = [_][]const u8{
     "CreateHardLinkW",
     "DeviceIoControl",
     "EnumResourceNamesW",
-    "FindFirstVolumeW",
-    "FindNextVolumeW",
-    "FindVolumeClose",
     "FlushViewOfFile",
     "GetOverlappedResult",
     "GetThreadContext",

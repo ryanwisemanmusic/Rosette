@@ -37,6 +37,22 @@ pub const refusalIsHard = return_contract.refusalIsHard;
 pub const conventionIsDecisive = return_contract.conventionIsDecisive;
 pub const capabilityGapFor = library_inventory.capabilityGapFor;
 pub const isDeliberateExportRefusal = library_inventory.isDeliberateExportRefusal;
+
+/// Whether a runtime fallback is an actual missing implementation rather than
+/// an intentional policy answer.
+///
+/// The distinction is deliberately made against the per-export package
+/// contract, not against the fact that a fallback ledger entry exists. A
+/// modeled handler may still return an ABI refusal when the optional host
+/// service is absent, and a policy refusal is an explicit decision; neither
+/// is capability work. A name-only fallback has no package row, so it is a
+/// gap unless the dynamic policy explicitly owns the refusal.
+pub fn isCapabilityGap(dll_name: []const u8, function_name: []const u8) bool {
+    if (library_inventory.declaredExport(dll_name, function_name)) |declared| {
+        return declared.behaviour == .not_implemented;
+    }
+    return !library_inventory.isDeliberateExportRefusal(dll_name, function_name);
+}
 pub const advice = return_contract.advice;
 pub const isComponentObjectName = return_contract.isComponentObjectName;
 
@@ -46,6 +62,7 @@ pub const isWindowsSurface = library_inventory.isWindowsSurface;
 pub const isContractImport = library_inventory.isContractImport;
 pub const ModuleAvailability = library_inventory.ModuleAvailability;
 pub const moduleAvailability = library_inventory.moduleAvailability;
+pub const moduleFallback = library_inventory.moduleFallback;
 pub const isDegradedImport = isContractImport;
 
 /// The capability one *import* belongs to.
@@ -216,6 +233,13 @@ test "a declared export decides its own judgement, and an undeclared one falls b
     // and is marked as such so a report never claims it was checked.
     const unowned = judgementFor("third_party.dll", "SomethingNobodyOwns");
     try std.testing.expect(!unowned.declared);
+}
+
+test "capability gaps distinguish missing work from explicit answers" {
+    try std.testing.expect(!isCapabilityGap("api-ms-win-crt-runtime-l1-1-0.dll", "_get_wpgmptr"));
+    try std.testing.expect(!isCapabilityGap("VERSION.dll", "GetFileVersionInfoA"));
+    try std.testing.expect(!isCapabilityGap("api-ms-win-core-synch-l1-2-0.dll", "WaitOnAddress"));
+    try std.testing.expect(isCapabilityGap("third_party.dll", "AnExportNobodyImplemented"));
 }
 
 test "the convention cache answers the same question twice without recomputing" {
