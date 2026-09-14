@@ -418,6 +418,33 @@ pub const Census = struct {
         return best;
     }
 
+    /// Fill `out` with the busiest retained `_entry` bodies, in descending
+    /// hit order.  Forwarder entries are deliberately kept separate from
+    /// `busiest`: they are an implementation-layout cost, not another count
+    /// of what the title asked the kernel to do.  Selection is bounded by the
+    /// fixed census table and happens only while producing the exit report.
+    pub fn topForwarders(self: *const Census, out: []?*const Slot) usize {
+        for (out) |*entry| entry.* = null;
+        var filled: usize = 0;
+        for (self.slots) |*slot| {
+            if (slot.address == 0 or slot.hits == 0 or slot.kind != .shim) continue;
+            var position: usize = 0;
+            while (position < filled) : (position += 1) {
+                const current = out[position].?;
+                if (slot.hits > current.hits or
+                    (slot.hits == current.hits and slot.address < current.address)) break;
+            }
+            if (position >= out.len) continue;
+            if (filled < out.len) filled += 1;
+            var move = filled;
+            while (move > position + 1) : (move -= 1) {
+                out[move - 1] = out[move - 2];
+            }
+            out[position] = slot;
+        }
+        return filled;
+    }
+
     pub fn slotAt(self: *const Census, index_plus_one: u32) ?*const Slot {
         if (index_plus_one == 0) return null;
         const index: usize = @as(usize, index_plus_one) - 1;
@@ -589,6 +616,28 @@ test "one guest call is never counted twice when both symbols are armed" {
         @as(u64, 1),
         census.findExportOfKind("VdQueryVideoMode", .shim).?.hits,
     );
+}
+
+test "top forwarders expose implementation cost separately from title calls" {
+    var census = Census{};
+    defer census.deinit(testing.allocator);
+    _ = census.arm(testing.allocator, TRAMPOLINE_VIDEO_MODE, 0x1409cb000);
+    _ = census.arm(testing.allocator, ENTRY_VIDEO_MODE, 0x1409caf00);
+    _ = census.arm(testing.allocator, TRAMPOLINE_SWAP, 0x1409cc000);
+    _ = census.arm(testing.allocator, ENTRY_SWAP, 0x1409cae00);
+
+    _ = census.note(0x1409caf00, 10);
+    _ = census.note(0x1409caf00, 11);
+    _ = census.note(0x1409caf00, 12);
+    _ = census.note(0x1409cae00, 13);
+
+    var top: [2]?*const Slot = .{ null, null };
+    try testing.expectEqual(@as(usize, 2), census.topForwarders(&top));
+    try testing.expectEqualStrings("VdQueryVideoMode", top[0].?.export_name);
+    try testing.expectEqual(@as(u64, 3), top[0].?.hits);
+    try testing.expectEqualStrings("VdSwap", top[1].?.export_name);
+    try testing.expectEqual(@as(u64, 1), top[1].?.hits);
+    try testing.expectEqual(@as(u64, 0), census.total_calls);
 }
 
 test "an inlined forwarder leaves the trampoline count intact" {
