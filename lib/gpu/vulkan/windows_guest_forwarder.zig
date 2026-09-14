@@ -9,6 +9,7 @@
 //! called.
 
 const std = @import("std");
+const vulkan_contract = @import("dll_win32_catalogue").vulkan;
 const dynamic_forwarder = @import("dyld").dynamic_library_forwarder;
 
 const log = std.log.scoped(.windows_guest_vulkan);
@@ -115,7 +116,7 @@ pub const Bridge = struct {
             std.mem.eql(u8, name, "vkBeginCommandBuffer") or
             std.mem.eql(u8, name, "vkEndCommandBuffer") or
             std.mem.eql(u8, name, "vkQueueSubmit") or
-            std.mem.eql(u8, name, "vkQueueSubmit2") or
+            (std.mem.eql(u8, name, "vkQueueSubmit2") or std.mem.eql(u8, name, "vkQueueSubmit2KHR")) or
             std.mem.eql(u8, name, "vkQueuePresentKHR") or
             std.mem.eql(u8, name, "vkWaitForFences") or
             std.mem.eql(u8, name, "vkDeviceWaitIdle");
@@ -219,6 +220,7 @@ pub const Bridge = struct {
     /// forwarder. `false` means this adapter does not own the name, so the
     /// normal Windows runtime may apply its explicit modelled path.
     pub fn dispatch(self: *Bridge, state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+        if (vulkan_contract.isProcLookup(name)) return self.lookupWindowsProc(state, direct_return_rip);
         if (!owns(name)) return false;
         self.dispatch_attempts +|= 1;
         const call_id = self.dispatch_attempts;
@@ -314,6 +316,9 @@ pub const Bridge = struct {
             self.surface_name_remaps +|= 1;
         }
 
+        const original_xmm = state.xmm;
+        defer state.xmm = original_xmm;
+        mapWindowsScalarFloats(&state.xmm, name);
         const dispatched = self.forwarder.dispatchGuestSymbol(state, symbol_token);
         const result = state.regs.rax;
         const native_objects_ready = self.forwarder.guestVulkanInstanceReady() or
@@ -333,6 +338,27 @@ pub const Bridge = struct {
         return true;
     }
 
+    /// Apply native capability gating before minting a Microsoft-ABI thunk.
+    /// A native/SysV token must never escape into the Windows function table.
+    fn lookupWindowsProc(self: *Bridge, state: anytype, direct_return_rip: ?u64) bool {
+        const requested = state.guestCString(state.regs.rdx, 512) orelse {
+            state.regs.rax = 0;
+            finishWindowsCall(state, direct_return_rip);
+            return true;
+        };
+        state.windows_graphics.noteProcAddressQuery(requested);
+        const library = self.ensureLibrary() orelse {
+            state.regs.rax = 0;
+            finishWindowsCall(state, direct_return_rip);
+            return true;
+        };
+        const native_name = if (std.mem.eql(u8, requested, "vkCreateWin32SurfaceKHR")) "vkCreateMetalSurfaceEXT" else requested;
+        const available = self.forwarder.lookupVulkanProcGuest(library, native_name) != 0;
+        state.regs.rax = if (available) state.registerWindowsImportStub("vulkan-1.dll", requested) orelse 0 else 0;
+        finishWindowsCall(state, direct_return_rip);
+        return true;
+    }
+
     fn ensureLibrary(self: *Bridge) ?u64 {
         if (self.library_token != 0) return self.library_token;
         self.library_token = self.forwarder.openGuest(vulkan_library_path, rtld_lazy | rtld_local);
@@ -340,11 +366,15 @@ pub const Bridge = struct {
     }
 };
 
+fn mapWindowsScalarFloats(xmm: anytype, name: []const u8) void {
+    const count = vulkan_contract.scalarFloatCount(name);
+    for (0..count) |index| xmm[index] = xmm[index + 1];
+}
+
 fn owns(name: []const u8) bool {
     if (!std.mem.startsWith(u8, name, "vk")) return false;
-    // These two functions are intentionally left with the Windows runtime.
-    // They return Microsoft-ABI Rosetta stubs; calls through those stubs come
-    // back here with the requested function's actual name.
+    // Proc lookup has its own path above: it returns Microsoft-ABI stubs
+    // after consulting the same native capability gate as direct dispatch.
     if (std.mem.eql(u8, name, "vkGetInstanceProcAddr") or
         std.mem.eql(u8, name, "vkGetDeviceProcAddr")) return false;
     if (std.mem.eql(u8, name, "vkCreateWin32SurfaceKHR")) return true;
@@ -374,7 +404,7 @@ fn noteLogicalContract(state: anytype, name: []const u8, result: u64) void {
     // VK_SUBOPTIMAL_KHR, VK_TIMEOUT, and VK_NOT_READY are still valid driver
     // outcomes and must not inflate the native-failure ledger.
     const vk_result: i32 = @bitCast(@as(u32, @truncate(result)));
-    const ok = vk_result >= 0;
+    const ok = vulkan_contract.completesOperation(name, vk_result);
     // Only these entry points return VkResult.  Void commands leave rax
     // unspecified, so treating its stale value as an error turns ordinary
     // command traffic into a false native-failure count.
@@ -383,11 +413,11 @@ fn noteLogicalContract(state: anytype, name: []const u8, result: u64) void {
         std.mem.eql(u8, name, "vkCreateDevice") or
         std.mem.eql(u8, name, "vkCreateSwapchainKHR") or
         std.mem.eql(u8, name, "vkGetSwapchainImagesKHR") or
-        std.mem.eql(u8, name, "vkAcquireNextImageKHR") or
+        vulkan_contract.isAcquire(name) or
         std.mem.eql(u8, name, "vkQueueSubmit") or
-        std.mem.eql(u8, name, "vkQueueSubmit2") or
+        (std.mem.eql(u8, name, "vkQueueSubmit2") or std.mem.eql(u8, name, "vkQueueSubmit2KHR")) or
         std.mem.eql(u8, name, "vkQueuePresentKHR");
-    if (result_bearing) state.windows_graphics.noteNativeVulkanResult(name, ok);
+    if (result_bearing) state.windows_graphics.noteNativeVulkanResult(name, vk_result >= 0);
     if (std.mem.eql(u8, name, "vkCreateInstance")) {
         _ = state.windows_graphics.noteCreateInstance(ok);
     } else if (std.mem.eql(u8, name, "vkCreateWin32SurfaceKHR")) {
@@ -397,15 +427,16 @@ fn noteLogicalContract(state: anytype, name: []const u8, result: u64) void {
     } else if (std.mem.eql(u8, name, "vkGetDeviceQueue") or
         std.mem.eql(u8, name, "vkGetDeviceQueue2"))
     {
-        _ = state.windows_graphics.noteGetQueue(ok);
+        _ = state.windows_graphics.noteGetQueue(true);
     } else if (std.mem.eql(u8, name, "vkCreateSwapchainKHR")) {
         _ = state.windows_graphics.noteCreateSwapchain(ok);
     } else if (std.mem.eql(u8, name, "vkGetSwapchainImagesKHR")) {
         _ = state.windows_graphics.noteSwapchainImages(ok);
-    } else if (std.mem.eql(u8, name, "vkAcquireNextImageKHR")) {
-        _ = state.windows_graphics.noteAcquire(ok);
+    } else if (vulkan_contract.isAcquire(name)) {
+        // Timeout/not-ready is neither a failure nor an acquired frame.
+        if (ok) _ = state.windows_graphics.noteAcquire(true);
     } else if (std.mem.eql(u8, name, "vkQueueSubmit") or
-        std.mem.eql(u8, name, "vkQueueSubmit2"))
+        (std.mem.eql(u8, name, "vkQueueSubmit2") or std.mem.eql(u8, name, "vkQueueSubmit2KHR")))
     {
         _ = state.windows_graphics.noteQueueSubmit(ok);
     } else if (std.mem.eql(u8, name, "vkQueuePresentKHR")) {
@@ -456,4 +487,67 @@ test "Windows Vulkan adapter maps Microsoft x64 arguments to SysV" {
     try std.testing.expectEqual(@as(u64, 40), microsoftStackArgumentOffset(4, false));
     try std.testing.expectEqual(@as(u64, 48), microsoftStackArgumentOffset(5, false));
     try std.testing.expectEqual(@as(u64, 56), microsoftStackArgumentOffset(6, false));
+}
+
+test "Windows depth bias preserves all three scalar bit patterns" {
+    var xmm: [16][16]u8 = @splat(@splat(0));
+    const bits = [_]u32{ 0x3f800000, 0x80000000, 0xc0200000 };
+    for (bits, 1..) |value, index| std.mem.writeInt(u32, xmm[index][0..4], value, .little);
+    const saved = xmm;
+    mapWindowsScalarFloats(&xmm, "vkCmdSetDepthBias");
+    for (bits, 0..) |value, index| try std.testing.expectEqual(value, std.mem.readInt(u32, xmm[index][0..4], .little));
+    xmm = saved;
+    mapWindowsScalarFloats(&xmm, "vkCmdSetBlendConstants");
+    try std.testing.expectEqualDeep(saved, xmm);
+}
+
+test "Xenia Windows GPU and UI entry points have a bridge dispatch contract" {
+    for (vulkan_contract.xenia_entry_points) |name| {
+        if (!owns(name) and !vulkan_contract.isProcLookup(name)) {
+            std.debug.print("missing Windows Vulkan dispatch contract: {s}\n", .{name});
+            return error.MissingVulkanDispatchContract;
+        }
+    }
+}
+
+test "Windows proc lookup keeps absent commands null and returns Windows thunks" {
+    const State = struct {
+        regs: struct { rax: u64 = 0, rdx: u64 = 0, rip: u64 = 0 } = .{},
+        requested: []const u8 = "vkCmdUnknownRosetteCommand",
+        registrations: u32 = 0,
+        windows_graphics: struct {
+            queries: u32 = 0,
+            pub fn noteProcAddressQuery(self: *@This(), _: []const u8) void {
+                self.queries += 1;
+            }
+        } = .{},
+        pub fn guestCString(self: *@This(), _: u64, _: usize) ?[]const u8 {
+            return self.requested;
+        }
+        pub fn registerWindowsImportStub(self: *@This(), _: []const u8, _: []const u8) ?u64 {
+            self.registrations += 1;
+            return 0x1234;
+        }
+        pub fn pop(_: *@This()) u64 {
+            return 0x5678;
+        }
+    };
+    var bridge = Bridge{};
+    defer bridge.deinit();
+    var state = State{};
+    try std.testing.expect(bridge.lookupWindowsProc(&state, 0x9876));
+    try std.testing.expectEqual(@as(u64, 0), state.regs.rax);
+    try std.testing.expectEqual(@as(u32, 0), state.registrations);
+    state.requested = "vkCreateWin32SurfaceKHR";
+    try std.testing.expect(bridge.lookupWindowsProc(&state, null));
+    try std.testing.expectEqual(@as(u64, 0x1234), state.regs.rax);
+    try std.testing.expectEqual(@as(u64, 0x5678), state.regs.rip);
+    bridge.forwarder.real_vulkan.device = @ptrFromInt(0x1000);
+    bridge.forwarder.real_vulkan.fn_ptrs.resolved = true;
+    state.requested = "vkCmdBeginConditionalRenderingEXT";
+    try std.testing.expect(bridge.lookupWindowsProc(&state, null));
+    try std.testing.expectEqual(@as(u64, 0), state.regs.rax);
+    try std.testing.expectEqual(@as(u32, 1), state.registrations);
+    // The device is a test sentinel, not an owned native object.
+    bridge.forwarder.real_vulkan.device = null;
 }
