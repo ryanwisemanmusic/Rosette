@@ -1,0 +1,10 @@
+name = "dll-win32-catalogue"
+version = "0.1.0-local"
+kind = "windows-dll-catalogue"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+
+# The per-DLL packages, gathered so one lookup can answer which package owns
+# a name. Dispatch, return values and guest memory effects stay in
+# src/x64-ASM/windows_runtime.zig.
