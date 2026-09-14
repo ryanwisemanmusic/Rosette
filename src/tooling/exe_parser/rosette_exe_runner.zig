@@ -1,6 +1,16 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const core = @import("exe_runner_core.zig");
+const log_flood_governor = @import("log_flood_governor.zig");
+
+/// Every `std.log` line the runner writes passes the per-call-site flood
+/// governor on its way to stderr, which the Xenia launcher tees onto the host
+/// disk. See `log_flood_governor.zig`.
+pub const std_options: std.Options = .{ .logFn = log_flood_governor.governedLog };
+
+test {
+    _ = log_flood_governor;
+}
 
 fn bootWrite(text: []const u8) void {
     _ = std.c.write(2, text.ptr, text.len);

@@ -147,6 +147,26 @@ pub const Index = struct {
         return null;
     }
 
+    /// Visit every symbol the index kept, with its loaded address.
+    ///
+    /// Added for the kernel-call census, which cannot ask for a name it does
+    /// not already know: the whole point of it is that Xenia's 692 export
+    /// shims are discovered from the image rather than transcribed into a
+    /// table that would go stale the next time Xenia is rebuilt.
+    ///
+    /// `name` is borrowed from the image bytes and outlives the call. A
+    /// visitor that keeps it must also keep the image, which every caller in
+    /// Rosette does for the whole run.
+    pub fn forEachSymbol(
+        self: *const Index,
+        context: anytype,
+        comptime visit: fn (@TypeOf(context), name: []const u8, address: u64) void,
+    ) void {
+        for (self.entries) |entry| {
+            visit(context, self.nameOf(entry), self.image_base + entry.rva);
+        }
+    }
+
     /// Write `<name>+0x<offset>` into `buffer`, or an empty slice when the
     /// address has no name. A truncated name is still useful, so the writer
     /// clips rather than refusing.
@@ -624,4 +644,255 @@ fn buildFixture(allocator: std.mem.Allocator) !Fixture {
             .sections = sections,
         },
     };
+}
+
+/// How many places in the image contain a direct branch to each target.
+///
+/// ## Why a report needs this
+///
+/// A tracepoint armed on a function's entry address counts *calls*. The
+/// address exists whether or not anything calls it: a compiler that inlines a
+/// small function into its only caller still emits the out-of-line copy,
+/// still names it in the COFF table, and leaves it unreachable. An armed
+/// count of zero on such a symbol says nothing about the guest, and reads
+/// exactly like a function the guest never got to.
+///
+/// That is not hypothetical. `xe::gpu::GraphicsSystem::MarkVblank` is four
+/// instructions long and has one call site, in the frame limiter lambda.
+/// MinGW inlined it. Rosette armed the out-of-line body, counted zero for
+/// 4.6 billion instructions, and reported the emulated display clock as
+/// stopped while the loop containing the inlined copy was spending a fifth of
+/// the run.
+///
+/// A census separates the two readings, and it needs no run to do it: the
+/// image either contains a branch to the address or it does not.
+///
+/// ## What the scan is, exactly
+///
+/// A byte scan of the executable sections for `E8 rel32` (call) and
+/// `E9 rel32` (tail jump), resolving each displacement against the address of
+/// the following instruction. It is not a disassembly, so a `0xE8` byte that
+/// is really part of an immediate, a displacement or a jump table can produce
+/// a match that is not an instruction.
+///
+/// The error is one-directional and it is the safe direction. A real direct
+/// call is never missed - the encoding is unambiguous once the opcode byte is
+/// found, and every direct call starts with one of these two bytes. So a
+/// count of zero is a *proof* that no direct branch to the address exists,
+/// which is the reading the caller acts on; a non-zero count is evidence that
+/// one probably does, and the caller treats it only as "do not claim this was
+/// inlined away".
+///
+/// Indirect calls - virtual dispatch, a pointer through the IAT, a
+/// `std::function` - are invisible to this scan by construction. A symbol
+/// reached only that way reports zero sites, so a caller must read a zero as
+/// "no *direct* branch", never as "unreachable".
+///
+/// `counts` is filled in step with `targets`; a zero target is skipped and
+/// left at zero. Linear in the executable bytes, run once at load.
+pub fn countDirectCallSites(
+    bytes: []const u8,
+    image: *const parser.Image,
+    image_base: u64,
+    targets: []const u64,
+    counts: []u32,
+) void {
+    @memset(counts, 0);
+    if (targets.len == 0) return;
+    for (image.sections) |section| {
+        if (!section.isExecutable()) continue;
+        const start: usize = section.raw_offset;
+        const available = if (start >= bytes.len) 0 else bytes.len - start;
+        const length = @min(@as(usize, section.raw_size), available);
+        if (length < 5) continue;
+        const body = bytes[start .. start + length];
+        const section_base = image_base +| section.virtual_address;
+        var offset: usize = 0;
+        while (offset + 5 <= body.len) : (offset += 1) {
+            const opcode = body[offset];
+            if (opcode != 0xE8 and opcode != 0xE9) continue;
+            const displacement = std.mem.readInt(i32, body[offset + 1 ..][0..4], .little);
+            const next = section_base +| @as(u64, offset + 5);
+            const target = @as(u64, @bitCast(@as(i64, @bitCast(next)) +% displacement));
+            for (targets, 0..) |wanted, index| {
+                if (wanted == 0 or wanted != target) continue;
+                if (index < counts.len) counts[index] +|= 1;
+            }
+        }
+    }
+}
+
+/// How many places in the image's data store each address as a pointer.
+///
+/// The companion to `countDirectCallSites`, and the reason that one cannot be
+/// read alone. A C++ virtual function has no direct call site either: it is
+/// reached through a vtable, so a byte scan of `.text` finds nothing and the
+/// symbol looks exactly like a body the optimizer deleted. On the 2026-09-12
+/// image that mistake cost three claims at once - `GraphicsSystem::
+/// InitializeRingBuffer`, `CommandProcessor::ExecutePrimaryBuffer` and
+/// `SDLAudioDriver::Initialize` were all reported as inlined away, when all
+/// three are `virtual`, all three have their address in `.rdata`, and all
+/// three had simply never been called. Two chain stages went from a finding
+/// to `unobservable` on the strength of it.
+///
+/// So: no call site *and* no stored pointer is unreachable. No call site with
+/// a stored pointer is an indirect target, and its zero is evidence.
+///
+/// Scans initialized, non-executable sections for a little-endian 64-bit word
+/// equal to a target, on a 4-byte stride. Like the call-site scan this can
+/// over-count - an integer that happens to equal a code address is
+/// indistinguishable from a pointer to it - and over-counting is again the
+/// safe direction: it withholds the "inlined away" claim rather than making
+/// one that is wrong.
+pub fn countDataReferences(
+    bytes: []const u8,
+    image: *const parser.Image,
+    targets: []const u64,
+    counts: []u32,
+) void {
+    @memset(counts, 0);
+    if (targets.len == 0) return;
+    for (image.sections) |section| {
+        if (section.isExecutable()) continue;
+        if (!section.isReadable()) continue;
+        const start: usize = section.raw_offset;
+        const available = if (start >= bytes.len) 0 else bytes.len - start;
+        const length = @min(@as(usize, section.raw_size), available);
+        if (length < 8) continue;
+        const body = bytes[start .. start + length];
+        var offset: usize = 0;
+        while (offset + 8 <= body.len) : (offset += 4) {
+            const value = std.mem.readInt(u64, body[offset..][0..8], .little);
+            if (value == 0) continue;
+            for (targets, 0..) |wanted, index| {
+                if (wanted == 0 or wanted != value) continue;
+                if (index < counts.len) counts[index] +|= 1;
+            }
+        }
+    }
+}
+
+test "a virtual function is found through its vtable, not through a call site" {
+    // The exact shape that misled the 2026-09-12 report: a function nothing
+    // branches to, whose address is stored in read-only data.
+    const load_base: u64 = 0x140000000;
+    var bytes = [_]u8{0} ** 0x80;
+    // .text at file 0x40, RVA 0x1000. .rdata at file 0x60, RVA 0x2000.
+    const virtual_function = load_base + 0x1008;
+    std.mem.writeInt(u64, bytes[0x60..0x68], virtual_function, .little);
+
+    var sections = [_]parser.Section{
+        .{
+            .name = ".text\x00\x00\x00".*,
+            .virtual_size = 0x20,
+            .virtual_address = 0x1000,
+            .raw_size = 0x20,
+            .raw_offset = 0x40,
+            .characteristics = 0x6000_0020,
+        },
+        .{
+            .name = ".rdata\x00\x00".*,
+            .virtual_size = 0x20,
+            .virtual_address = 0x2000,
+            .raw_size = 0x20,
+            .raw_offset = 0x60,
+            .characteristics = 0x4000_0040,
+        },
+    };
+    const image = parser.Image{
+        .pe_offset = 0,
+        .machine = 0x8664,
+        .coff_characteristics = 0,
+        .optional_header_kind = .pe32_plus,
+        .optional_header_size = 240,
+        .entry_rva = 0x1000,
+        .image_base = load_base,
+        .subsystem = 2,
+        .dll_characteristics = 0,
+        .section_alignment = 0x1000,
+        .file_alignment = 0x200,
+        .size_of_image = 0x3000,
+        .size_of_headers = 0x400,
+        .size_of_stack_reserve = 0,
+        .size_of_stack_commit = 0,
+        .size_of_heap_reserve = 0,
+        .size_of_heap_commit = 0,
+        .number_of_rva_and_sizes = 16,
+        .data_directories = [_]parser.DataDirectory{.{}} ** parser.data_directory_count,
+        .number_of_sections = 2,
+        .sections = &sections,
+    };
+
+    var call_sites = [_]u32{0};
+    countDirectCallSites(&bytes, &image, load_base, &[_]u64{virtual_function}, &call_sites);
+    try std.testing.expectEqual(@as(u32, 0), call_sites[0]);
+
+    var data_refs = [_]u32{0};
+    countDataReferences(&bytes, &image, &[_]u64{virtual_function}, &data_refs);
+    // One stored pointer: unreachable by direct branch, entirely reachable
+    // through the vtable. A zero entry count here is the guest, not the build.
+    try std.testing.expectEqual(@as(u32, 1), data_refs[0]);
+
+    // The scan must not read the code section, or a `call rel32` displacement
+    // would count as a pointer.
+    var nothing = [_]u32{0};
+    countDataReferences(&bytes, &image, &[_]u64{load_base + 0x1000}, &nothing);
+    try std.testing.expectEqual(@as(u32, 0), nothing[0]);
+}
+
+test "a direct call is found and an address nothing branches to reads zero" {
+    // Two 16-byte functions in one executable section: the first calls the
+    // second, and nothing calls the first.
+    const load_base: u64 = 0x140000000;
+    var bytes = [_]u8{0} ** 0x60;
+    // Section raw data starts at 0x40 and is 0x20 bytes, mapped at RVA 0x1000.
+    // caller at RVA 0x1000 (file 0x40): `call rel32` to RVA 0x1010.
+    bytes[0x40] = 0xE8;
+    std.mem.writeInt(i32, bytes[0x41..0x45], 0x0B, .little); // 0x1005 + 0x0B = 0x1010
+    // A `0xE9` that lands nowhere interesting, to prove misses are not counted.
+    bytes[0x50] = 0xE9;
+    std.mem.writeInt(i32, bytes[0x51..0x55], 0x100, .little);
+
+    var sections = [_]parser.Section{.{
+        .name = ".text\x00\x00\x00".*,
+        .virtual_size = 0x20,
+        .virtual_address = 0x1000,
+        .raw_size = 0x20,
+        .raw_offset = 0x40,
+        .characteristics = 0x6000_0020,
+    }};
+    const image = parser.Image{
+        .pe_offset = 0,
+        .machine = 0x8664,
+        .coff_characteristics = 0,
+        .optional_header_kind = .pe32_plus,
+        .optional_header_size = 240,
+        .entry_rva = 0x1000,
+        .image_base = load_base,
+        .subsystem = 2,
+        .dll_characteristics = 0,
+        .section_alignment = 0x1000,
+        .file_alignment = 0x200,
+        .size_of_image = 0x2000,
+        .size_of_headers = 0x400,
+        .size_of_stack_reserve = 0,
+        .size_of_stack_commit = 0,
+        .size_of_heap_reserve = 0,
+        .size_of_heap_commit = 0,
+        .number_of_rva_and_sizes = 16,
+        .data_directories = [_]parser.DataDirectory{.{}} ** parser.data_directory_count,
+        .number_of_sections = 1,
+        .sections = &sections,
+    };
+
+    const callee = load_base + 0x1010;
+    const caller = load_base + 0x1000;
+    var counts = [_]u32{ 0, 0, 0 };
+    countDirectCallSites(&bytes, &image, load_base, &[_]u64{ callee, caller, 0 }, &counts);
+    // The callee is branched to once; the caller is branched to by nothing,
+    // which is the state that means "inlined away, or reached only
+    // indirectly" rather than "never ran".
+    try std.testing.expectEqual(@as(u32, 1), counts[0]);
+    try std.testing.expectEqual(@as(u32, 0), counts[1]);
+    try std.testing.expectEqual(@as(u32, 0), counts[2]);
 }

@@ -29,9 +29,11 @@ const maximum_stack_reserve: u64 = 128 * 1024 * 1024;
 // nominal heap reserve before it reaches swapchain creation. Keep the guest
 // heap separate from the main stack and give it enough bounded room for the
 // graphics bootstrap without making the runtime an unbounded allocator.
-const minimum_heap_reserve: u64 = 512 * 1024 * 1024;
-const maximum_heap_reserve: u64 = 512 * 1024 * 1024;
-const maximum_runtime_memory: u64 = 1024 * 1024 * 1024;
+// The 2026-09-14 run exhausted 512 MiB after 15 minutes with 31 threads
+// live, and the title's next CreateThread got no stack.
+const minimum_heap_reserve: u64 = 1024 * 1024 * 1024;
+const maximum_heap_reserve: u64 = 1024 * 1024 * 1024;
+const maximum_runtime_memory: u64 = 2048 * 1024 * 1024;
 const synthetic_thunk_stride: u64 = 16;
 const tls_directory_index: usize = 9;
 const tls_directory_size_pe64: u32 = 40;
@@ -101,7 +103,7 @@ fn discoverWindowsConditionEntries(
     image: *const parser.Image,
     bytes: []const u8,
     load_base: u64,
-) struct { wait: ?u64, signal: ?u64, broadcast: ?u64 } {
+) struct { wait: ?u64, signal: ?u64, broadcast: ?u64, timedwait: ?u64 } {
     // These prefixes describe the MinGW pthread implementation's ABI entry,
     // not an arbitrary interior instruction.  Include the stack frame size
     // and first null/error check so nearby helper functions do not match.
@@ -118,10 +120,20 @@ fn discoverWindowsConditionEntries(
         0x55, 0x57, 0x56, 0x53, 0x48, 0x83, 0xEC, 0x48,
         0x48, 0x85, 0xC9, 0x0F, 0x84,
     };
+    // pthread_cond_timedwait_impl(cond, mutex, timespec, relative): six
+    // pushes, a 0x78 frame, EINVAL in eax, the four arguments saved, and the
+    // null check on the condition.
+    const timedwait_signature = [_]u8{
+        0x41, 0x55, 0x41, 0x54, 0x55, 0x57, 0x56, 0x53,
+        0x48, 0x83, 0xEC, 0x78, 0xB8, 0x16, 0x00, 0x00,
+        0x00, 0x48, 0x89, 0xCE, 0x48, 0x89, 0xD7, 0x4C,
+        0x89, 0xC5, 0x45, 0x89, 0xCC, 0x48, 0x85, 0xC9,
+    };
     return .{
         .wait = locateExecutableSignature(image, bytes, load_base, &wait_signature),
         .signal = locateExecutableSignature(image, bytes, load_base, &signal_signature),
         .broadcast = locateExecutableSignature(image, bytes, load_base, &broadcast_signature),
+        .timedwait = locateExecutableSignature(image, bytes, load_base, &timedwait_signature),
     };
 }
 
@@ -975,10 +987,26 @@ fn reportExitSummary() void {
     state.reportFirstFrameChain();
     state.reportGuestOutputChain();
     state.reportGuestMilestones();
+    state.reportGuestCodeProgress();
+    state.reportGuestKernelCalls();
+    // After the census and before the threads: the wall has moved to the
+    // ring, the register delivery row explains it, and the lock report
+    // explains any thread the thread list shows parked on a lock.
+    state.reportGuestAccessViolations();
+    // What the title's register traffic and ring actually carried: the
+    // register delivery row says a write reached the ring, these say what
+    // it put there and what the title keeps reading back.
+    state.reportGpuRegisterTraffic();
+    state.reportGpuRing();
+    state.reportGuestVfsResolves();
+    state.reportGuestLockContention();
+    state.reportRunThroughput();
     state.reportGuestThreads();
     state.reportAudioChain();
     state.reportWindowsDynamicRefusals();
     state.reportWindowsMemoryContract();
+    state.reportWindowsRegistry();
+    state.reportWindowsGuestOutputGovernor();
 }
 
 /// The execution state's view of the symbol index.
@@ -1075,6 +1103,35 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
     const stack_base = image_end;
     const stack_limit = std.math.sub(u64, stack_base, sizes.stack_reserve) catch return error.AddressOverflow;
     state.guest_heap_limit = stack_limit;
+    // Write the layout down where a report can read it back, not only into a
+    // log line. Everything below this point that ends up with a bare
+    // hexadecimal address - a thread's rip, a caller, a fault site - is
+    // resolved against these regions when no symbol covers it, and the
+    // 2026-09-12 run printed `<unnamed>` for three threads sitting in
+    // ranges Rosette had itself just laid out here.
+    state.noteGuestRegion(state.image_low, state.image_high - state.image_low, .image_data, "loaded image");
+    state.noteGuestRegion(state.image_high, sizes.thunk_span, .import_thunk, "win32 import stubs");
+    state.noteGuestRegion(state.heap_next, stack_limit -| state.heap_next, .guest_heap, "guest heap");
+    state.noteGuestRegion(stack_limit, stack_base -| stack_limit, .guest_stack, "guest stacks");
+    var executable_ranges: [elf.WINDOWS_EXECUTABLE_RANGE_CAPACITY]elf.WindowsExecutableRange = undefined;
+    var executable_range_count: usize = 0;
+    for (image.sections) |section| {
+        if (section.mappedSize() == 0) continue;
+        if (section.isExecutable() and executable_range_count < executable_ranges.len) {
+            executable_ranges[executable_range_count] = .{
+                .guest_base = load_base +| section.virtual_address,
+                .length = section.mappedSize(),
+            };
+            executable_range_count += 1;
+        }
+        state.noteGuestRegion(
+            load_base +| section.virtual_address,
+            section.mappedSize(),
+            if (section.isExecutable()) .image_code else .image_data,
+            std.mem.sliceTo(&section.name, 0),
+        );
+    }
+    state.configureWindowsExecutableRanges(executable_ranges[0..executable_range_count]);
     log.info("PE64 memory layout: image=[0x{x},0x{x}) thunks=[0x{x},0x{x}) heap=[0x{x},0x{x}) stack=[0x{x},0x{x}) total={d}", .{
         state.image_low,
         state.image_high,
@@ -1122,6 +1179,49 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
         @intCast(@min(symbol_index.count(), std.math.maxInt(u32))),
         symbol_index.coveragePercent(),
     );
+    // Arm every kernel export shim the image names. Twenty-two hand-picked
+    // milestones say whether Xenia got somewhere; these say what the *title*
+    // asked for, which is the question every guest-owned stage of the guest
+    // output chain has been unable to answer. See
+    // `lib/processor/ELF_processor/kernel_call_census.zig`.
+    {
+        const ShimArmer = struct {
+            state: *elf.ElfState,
+            fn visit(self: @This(), name: []const u8, address: u64) void {
+                self.state.armGuestKernelShim(name, address);
+            }
+        };
+        symbol_index.forEachSymbol(ShimArmer{ .state = &state }, ShimArmer.visit);
+        state.reportGuestKernelShimArming();
+    }
+    // Count, once, how many places in the image branch to each armed
+    // milestone. A tracepoint measures calls; an address the optimizer left
+    // unreachable is entered zero times no matter what the guest does, and
+    // without this column the two are the same number. See
+    // `pe_symbols.countDirectCallSites`.
+    {
+        var call_sites: [elf.GUEST_MILESTONE_COUNT]u32 = [_]u32{0} ** elf.GUEST_MILESTONE_COUNT;
+        pe_symbols.countDirectCallSites(
+            bytes,
+            image,
+            load_base,
+            state.guestMilestoneAddresses(),
+            &call_sites,
+        );
+        state.noteGuestMilestoneCallSites(&call_sites);
+        // And how many places store the address as a pointer. A virtual
+        // function has no call site, so without this the two are the same
+        // number and a `virtual` that was never called reads as one the
+        // compiler deleted.
+        var data_refs: [elf.GUEST_MILESTONE_COUNT]u32 = [_]u32{0} ** elf.GUEST_MILESTONE_COUNT;
+        pe_symbols.countDataReferences(
+            bytes,
+            image,
+            state.guestMilestoneAddresses(),
+            &data_refs,
+        );
+        state.noteGuestMilestoneDataReferences(&data_refs);
+    }
     try copyImage(&state, bytes, image, load_base);
     const condition_entries = discoverWindowsConditionEntries(image, bytes, load_base);
     state.configureWindowsConditionEntries(
@@ -1129,6 +1229,7 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
         condition_entries.signal,
         condition_entries.broadcast,
     );
+    state.configureWindowsTimedConditionEntry(condition_entries.timedwait);
 
     const thunk_base = state.image_high;
     const dynamic_relocations = try allocator.alloc(elf.DynamicRelocation, parsed_imports.descriptors.len);
@@ -1157,6 +1258,7 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
     }
     state.dynamic_relocations = dynamic_relocations;
     state.windows_runtime_enabled = true;
+    state.configureWindowsTraceRing();
     state.windows_unknown_imports_fatal = unknownImportsFatal();
     state.windows_host_io = options.host_io;
     state.windows_host_working_directory = options.host_working_directory;
