@@ -14,6 +14,9 @@ pub const tier_consistency = @import("tier_consistency.zig");
 pub const guest_state = @import("guest_state.zig");
 pub const selection = @import("selection.zig");
 pub const frame = @import("frame.zig");
+pub const frame_capture = @import("frame_capture.zig");
+pub const transport_timing = @import("transport_timing.zig");
+pub const texel_custody = @import("texel_custody.zig");
 pub const presenter = @import("presenter.zig");
 
 pub const Presenter = presenter.Presenter;
@@ -32,5 +35,8 @@ test {
     _ = guest_state;
     _ = selection;
     _ = frame;
+    _ = frame_capture;
+    _ = transport_timing;
+    _ = texel_custody;
     _ = presenter;
 }

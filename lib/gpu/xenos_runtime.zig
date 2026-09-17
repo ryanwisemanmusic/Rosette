@@ -16,6 +16,7 @@ const pipeline = @import("pipeline_state.zig");
 const pm4 = @import("pm4.zig");
 const pm4_contract = @import("xenia_pm4_contract");
 const executor_module = @import("pm4_executor.zig");
+const pm4_draw_backend = @import("pm4_draw_backend.zig");
 const packet_trace = @import("packet_trace.zig");
 const registers = @import("xenos_registers.zig");
 const formats = @import("xenos_formats.zig");
@@ -95,6 +96,19 @@ pub const Report = struct {
     draw_completion_observations: u64 = 0,
     draw_completion_signals: u64 = 0,
     renderable_draw_observations: u64 = 0,
+    rectangle_draws: u64 = 0,
+    rectangle_draws_lowered: u64 = 0,
+    rectangle_draws_empty: u64 = 0,
+    rectangle_draws_rejected: u64 = 0,
+    rectangle_host_indices: u64 = 0,
+    rectangle_trailing_vertices: u64 = 0,
+    rectangle_backend: ?pm4_draw_backend.Backend = null,
+    rectangle_rejection: ?pm4_draw_backend.RejectReason = null,
+    /// The plan that was produced during this batch, if any. Keeping the
+    /// complete value beside the counters lets a caller distinguish a
+    /// vertex-shader fallback from a native geometry route without inferring
+    /// topology or restart state from an aggregate index count.
+    rectangle_plan: ?pm4_draw_backend.Plan = null,
     unknown_opcodes: u64 = 0,
     truncated: bool = false,
     /// The batch's last packet did not fit the window and everything before it
@@ -189,6 +203,20 @@ pub const Runtime = struct {
     draw_completion_signals: u64 = 0,
     draw_completion_observations: u64 = 0,
     renderable_draw_observations: u64 = 0,
+    /// Rosetta's PM4 backend plan for rectangle-list draws.  These counters
+    /// describe a lowering plan, not a claim that the PE/Xenia command
+    /// processor submitted a replacement Vulkan draw.
+    rectangle_draws: u64 = 0,
+    rectangle_draws_lowered: u64 = 0,
+    rectangle_draws_empty: u64 = 0,
+    rectangle_draws_rejected: u64 = 0,
+    rectangle_host_indices: u64 = 0,
+    rectangle_trailing_vertices: u64 = 0,
+    rectangle_backend_capabilities: pm4_draw_backend.Capabilities = .{},
+    rectangle_backend: ?pm4_draw_backend.Backend = null,
+    last_rectangle_plan: ?pm4_draw_backend.Plan = null,
+    rectangle_plan_generation: u64 = 0,
+    last_rectangle_rejection: ?pm4_draw_backend.RejectReason = null,
     retained_draw_observations: u64 = 0,
     retained_event_observations: u64 = 0,
     execution_disposition: ExecutionDisposition = .live,
@@ -380,6 +408,13 @@ pub const Runtime = struct {
         const draw_observations_before = self.draw_completion_observations;
         const draw_signals_before = self.draw_completion_signals;
         const renderable_draws_before = self.renderable_draw_observations;
+        const rectangle_draws_before = self.rectangle_draws;
+        const rectangle_lowered_before = self.rectangle_draws_lowered;
+        const rectangle_empty_before = self.rectangle_draws_empty;
+        const rectangle_rejected_before = self.rectangle_draws_rejected;
+        const rectangle_indices_before = self.rectangle_host_indices;
+        const rectangle_trailing_before = self.rectangle_trailing_vertices;
+        const rectangle_plan_generation_before = self.rectangle_plan_generation;
         const indirect_buffers_before = self.indirect_buffers;
         const indirect_requested_before = self.indirect_dwords_requested;
         const indirect_read_before = self.indirect_dwords_read;
@@ -438,6 +473,25 @@ pub const Runtime = struct {
         report.draw_completion_observations = self.draw_completion_observations - draw_observations_before;
         report.draw_completion_signals = self.draw_completion_signals - draw_signals_before;
         report.renderable_draw_observations = self.renderable_draw_observations - renderable_draws_before;
+        report.rectangle_draws = self.rectangle_draws - rectangle_draws_before;
+        report.rectangle_draws_lowered = self.rectangle_draws_lowered - rectangle_lowered_before;
+        report.rectangle_draws_empty = self.rectangle_draws_empty - rectangle_empty_before;
+        report.rectangle_draws_rejected = self.rectangle_draws_rejected - rectangle_rejected_before;
+        report.rectangle_host_indices = self.rectangle_host_indices - rectangle_indices_before;
+        report.rectangle_trailing_vertices = self.rectangle_trailing_vertices - rectangle_trailing_before;
+        if (report.rectangle_draws != 0) {
+            report.rectangle_backend = if (report.rectangle_draws_lowered != 0 or report.rectangle_draws_empty != 0)
+                if (self.last_rectangle_plan) |plan| plan.backend else null
+            else
+                null;
+            report.rectangle_rejection = if (report.rectangle_draws_rejected != 0)
+                self.last_rectangle_rejection
+            else
+                null;
+            if (self.rectangle_plan_generation != rectangle_plan_generation_before) {
+                report.rectangle_plan = self.last_rectangle_plan;
+            }
+        }
         report.unknown_opcodes = self.executor.unknown_opcode_count -| unknown_opcodes_before;
         report.indirect_buffers = self.indirect_buffers - indirect_buffers_before;
         report.indirect_dwords_requested = self.indirect_dwords_requested - indirect_requested_before;
@@ -752,9 +806,34 @@ pub const Runtime = struct {
         self.color_resolve_observations +|= 1;
     }
 
+    fn observeRectangleBackend(self: *Runtime, draw: executor_module.Draw) void {
+        if (draw.primitive != .rectangle_list) return;
+        self.rectangle_draws +|= 1;
+        switch (pm4_draw_backend.lower(draw, self.rectangle_backend_capabilities)) {
+            .not_rectangle_list => unreachable,
+            .rejected => |reason| {
+                self.rectangle_draws_rejected +|= 1;
+                self.last_rectangle_rejection = reason;
+            },
+            .ready => |plan| {
+                self.last_rectangle_plan = plan;
+                self.rectangle_plan_generation +|= 1;
+                self.rectangle_trailing_vertices +|= plan.ignored_trailing_vertices;
+                if (plan.isEmpty()) {
+                    self.rectangle_draws_empty +|= 1;
+                } else {
+                    self.rectangle_draws_lowered +|= 1;
+                    self.rectangle_host_indices +|= plan.host_index_count;
+                    self.rectangle_backend = plan.backend;
+                }
+            },
+        }
+    }
+
     fn onDraw(context: *anyopaque, draw: executor_module.Draw) void {
         const self: *Runtime = @ptrCast(@alignCast(context));
         self.last_draw = draw;
+        self.observeRectangleBackend(draw);
         self.draw_completion_observations +|= 1;
         if (!self.execution_disposition.publishesEffects()) {
             self.retained_draw_observations +|= 1;
@@ -957,6 +1036,35 @@ test "Xenos runtime consumes big-endian ring words and derives pipeline state" {
     try std.testing.expectEqual(@as(u32, 3), runtime.last_draw.?.count);
     try std.testing.expectEqual(@as(u64, 1), runtime.draw_completion_signals);
     try std.testing.expectEqual(pipeline.Topology.triangle_list, runtime.pipelineState().topology);
+}
+
+test "Xenos runtime records a complete rectangle PM4 backend plan" {
+    var bytes = [_]u8{0} ** 64;
+    const draw = pm4.packetType3(.draw_indx_2, 1, false).?;
+    std.mem.writeInt(u32, bytes[0..4], draw, .big);
+    std.mem.writeInt(u32, bytes[4..8], (registers.DrawInitiator{
+        .primitive = .rectangle_list,
+        .source = .auto_index,
+        .major_mode_explicit = false,
+        .index_format = .uint16,
+        .not_end_of_pipe = false,
+        .index_count = 3,
+    }).encode(), .big);
+
+    var runtime = Runtime.init();
+    const report = try runtime.executeRingBytes(&bytes, 0, 2, 16);
+    try std.testing.expectEqual(@as(u64, 1), report.draws);
+    try std.testing.expectEqual(@as(u64, 1), report.rectangle_draws);
+    try std.testing.expectEqual(@as(u64, 1), report.rectangle_draws_lowered);
+    try std.testing.expectEqual(@as(u64, 0), report.rectangle_draws_rejected);
+    try std.testing.expectEqual(@as(u64, 4), report.rectangle_host_indices);
+    try std.testing.expectEqual(pm4_draw_backend.Backend.vertex_shader_indexed, report.rectangle_backend.?);
+    try std.testing.expectEqual(pm4_draw_backend.GeometryShader.none, report.rectangle_plan.?.host_geometry_shader);
+    try std.testing.expectEqual(pipeline.Topology.triangle_strip, report.rectangle_plan.?.host_topology);
+    try std.testing.expect(report.rectangle_plan.?.host_primitive_restart);
+    try std.testing.expect(report.rectangle_plan.?.uses_builtin_index_buffer);
+    try std.testing.expectEqual(pm4_draw_backend.Backend.vertex_shader_indexed, runtime.last_rectangle_plan.?.backend);
+    try std.testing.expectEqual(@as(u32, 4), runtime.last_rectangle_plan.?.host_index_count);
 }
 
 test "Xenos runtime reports a bounded truncated ring" {

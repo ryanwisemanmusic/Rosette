@@ -71,6 +71,31 @@ pub const Bridge = struct {
     boundary_trace_enabled: bool = false,
     boundary_trace_events: u64 = 0,
     boundary_failure_events: u64 = 0,
+    scalar_width_normalizations: u64 = 0,
+    scalar_width_normalized_calls: u64 = 0,
+    scalar_width_last_reported: u64 = 0,
+
+    fn normalizeMicrosoftArgument(self: *Bridge, name: []const u8, signature: vulkan_contract.argument_widths.Signature, index: usize, raw: u64) u64 {
+        const normalized = signature.normalize(index, raw);
+        if (normalized != raw) {
+            self.scalar_width_normalizations +|= 1;
+            const count = self.scalar_width_normalizations;
+            if (count <= 4 or (count & (count - 1)) == 0) log.info(
+                "Vulkan DWORD argument normalized: name={s} argument={d} raw=0x{x} value={d} (0x{x}) normalization={d}; upper slot bits are not part of the declared Vulkan scalar",
+                .{ name, index + 1, raw, normalized, normalized, count },
+            );
+        }
+        return normalized;
+    }
+
+    fn reportArgumentWidths(self: *Bridge, full: bool) void {
+        if (!full and self.scalar_width_last_reported == self.scalar_width_normalizations) return;
+        self.scalar_width_last_reported = self.scalar_width_normalizations;
+        log.info("Vulkan ABI argument widths: normalized_calls={d} DWORD_upper_halves_discarded={d} contract=vendored_registry typed_scalars_only=true pointers_handles_sizes_timeouts_preserved=true", .{
+            self.scalar_width_normalized_calls,
+            self.scalar_width_normalizations,
+        });
+    }
 
     pub fn deinit(self: *Bridge) void {
         if (graphicsStateDumpEnabled() and self.forwarder.guest_proc_queries != 0) {
@@ -113,6 +138,7 @@ pub const Bridge = struct {
             std.mem.eql(u8, name, "vkCreateBuffer") or
             std.mem.eql(u8, name, "vkCreateImageView") or
             std.mem.eql(u8, name, "vkUpdateDescriptorSets") or
+            std.mem.eql(u8, name, "vkCmdBindDescriptorSets") or
             std.mem.eql(u8, name, "vkBeginCommandBuffer") or
             std.mem.eql(u8, name, "vkEndCommandBuffer") or
             std.mem.eql(u8, name, "vkQueueSubmit") or
@@ -195,6 +221,7 @@ pub const Bridge = struct {
     /// checkpoint so a black window's evidence does not have to wait for the
     /// run to end.
     pub fn reportPresentChain(self: *Bridge) void {
+        self.reportArgumentWidths(false);
         self.forwarder.reportPresentChain(false);
     }
 
@@ -202,6 +229,7 @@ pub const Bridge = struct {
     /// Keeping this separate from the periodic callback prevents a healthy
     /// run from repeating the same topology at every step checkpoint.
     pub fn reportPresentChainFull(self: *Bridge) void {
+        self.reportArgumentWidths(true);
         self.forwarder.reportPresentChain(true);
     }
 
@@ -258,6 +286,11 @@ pub const Bridge = struct {
         }
 
         const original_regs = state.regs;
+        const signature = vulkan_contract.argument_widths.lookup(name) orelse {
+            self.dispatch_failures +|= 1;
+            trace_outcome = "argument_signature_missing";
+            return false;
+        };
         if (std.mem.eql(u8, name, "vkCreateWin32SurfaceKHR")) {
             if (!ensureWindow(state)) {
                 self.dispatch_failures +|= 1;
@@ -271,25 +304,39 @@ pub const Bridge = struct {
             return false;
         };
 
-        // At a Microsoft x64 callee boundary, argument 6 starts at +0x38
-        // when the call pushed a return address, or +0x30 for the direct
-        // callback shortcut.  SysV argument 6 starts at [rsp+8].
+        // Read declared parameters, not entire untyped eight-byte values.
+        // DWORD stack stores leave the upper half unspecified; forwarding
+        // that half made count=2 become 0x1_00000002 and dropped every bind.
+        // Normalize registers too, while preserving full 64-bit pointers,
+        // handles, VkDeviceSize, size_t, device addresses and timeouts.
         const has_direct_return = direct_return_rip != null;
-        const windows_arg6_offset = microsoftStackArgumentOffset(6, has_direct_return);
+        var arguments: [6 + max_stack_arguments]u64 = @splat(0);
+        std.debug.assert(signature.argument_count <= arguments.len);
+        const normalization_before = self.scalar_width_normalizations;
+        for (0..signature.argument_count) |index| {
+            const raw = switch (index) {
+                0 => original_regs.rcx,
+                1 => original_regs.rdx,
+                2 => original_regs.r8,
+                3 => original_regs.r9,
+                else => state.read64(original_regs.rsp +| microsoftStackArgumentOffset(index, has_direct_return)),
+            };
+            arguments[index] = self.normalizeMicrosoftArgument(name, signature, index, raw);
+        }
+        if (normalization_before != self.scalar_width_normalizations) self.scalar_width_normalized_calls +|= 1;
         for (0..max_stack_arguments) |index| {
-            const source = original_regs.rsp +| windows_arg6_offset +| @as(u64, @intCast(index * 8));
-            state.write64(scratch_stack +| 8 +| @as(u64, @intCast(index * 8)), state.read64(source));
+            state.write64(scratch_stack +| 8 +| @as(u64, @intCast(index * 8)), arguments[index + 6]);
         }
 
         const mapped = mapMicrosoftToSysV(
             .{
-                .rcx = original_regs.rcx,
-                .rdx = original_regs.rdx,
-                .r8 = original_regs.r8,
-                .r9 = original_regs.r9,
+                .rcx = arguments[0],
+                .rdx = arguments[1],
+                .r8 = arguments[2],
+                .r9 = arguments[3],
             },
-            state.read64(original_regs.rsp +| microsoftStackArgumentOffset(4, has_direct_return)),
-            state.read64(original_regs.rsp +| microsoftStackArgumentOffset(5, has_direct_return)),
+            arguments[4],
+            arguments[5],
         );
         state.regs.rdi = mapped.rdi;
         state.regs.rsi = mapped.rsi;
@@ -319,6 +366,8 @@ pub const Bridge = struct {
         const original_xmm = state.xmm;
         defer state.xmm = original_xmm;
         mapWindowsScalarFloats(&state.xmm, name);
+        const command = std.mem.startsWith(u8, name, "vkCmd");
+        const native_commands_before = self.forwarder.vulkan_real_command_calls;
         const dispatched = self.forwarder.dispatchGuestSymbol(state, symbol_token);
         const result = state.regs.rax;
         const native_objects_ready = self.forwarder.guestVulkanInstanceReady() or
@@ -331,10 +380,18 @@ pub const Bridge = struct {
         }
         state.regs.rax = result;
         self.dispatches +|= 1;
-        noteNativeForwarding(state, name, native_objects_ready);
-        noteLogicalContract(state, name, result);
+        // Every void command has an actual native-call admission ledger.
+        // Handling a thunk is not proof that its native marshaller accepted
+        // the guest's pointers/handles. Never inflate the PE graphics chain
+        // for a rejected command; leave the precise name/site in the ledger.
+        const reached_native_command = !command or
+            self.forwarder.vulkan_real_command_calls != native_commands_before;
+        if (reached_native_command) {
+            noteNativeForwarding(state, name, native_objects_ready);
+            noteLogicalContract(state, name, result);
+        }
         finishWindowsCall(state, direct_return_rip);
-        trace_outcome = "forwarded";
+        trace_outcome = if (reached_native_command) "forwarded" else "handled_native_refused";
         return true;
     }
 

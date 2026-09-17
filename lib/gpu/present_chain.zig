@@ -59,6 +59,50 @@ pub const Owner = enum {
 pub const max_surfaces: usize = 8;
 pub const max_swapchains: usize = 8;
 pub const max_swapchain_images: usize = 8;
+/// The provenance graph is deliberately bounded. A run can create thousands
+/// of transient Vulkan images, but the useful question at this boundary is
+/// whether a bounded set of live image identities can be followed into the
+/// acquired image. Overflow is reported rather than turning an incomplete
+/// graph into proof of a visible frame.
+pub const max_resource_images: usize = 512;
+
+/// How pixels moved between Vulkan images. A buffer upload has no image
+/// source; it is distinct from an unresolved image source.
+pub const TransferKind = enum(u8) {
+    none,
+    image_copy,
+    buffer_to_image,
+    image_blit,
+    image_resolve,
+    render_pass_resolve,
+
+    pub fn label(self: TransferKind) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .image_copy => "image_copy",
+            .buffer_to_image => "buffer_to_image",
+            .image_blit => "image_blit",
+            .image_resolve => "image_resolve",
+            .render_pass_resolve => "render_pass_resolve",
+        };
+    }
+};
+
+pub const transfer_kind_count: usize = 6;
+
+pub const ResourceTransfer = struct {
+    source: u64 = 0,
+    destination: u64 = 0,
+    kind: TransferKind = .none,
+};
+
+const ResourceImageState = struct {
+    image: u64 = 0,
+    write_kind: WriteKind = .none,
+    source_image: u64 = 0,
+    transfer_kind: TransferKind = .none,
+    source_known: bool = false,
+};
 
 /// The strongest target attribution Rosette can make for a command.
 /// `swapchain_image` is deliberately narrower than "a Vulkan command ran":
@@ -178,19 +222,62 @@ pub const SwapchainRecord = struct {
     target_events: u64 = 0,
     offscreen_events: u64 = 0,
     unknown_target_events: u64 = 0,
+    /// A draw was connected to the acquired image and Rosette also saw an
+    /// image descriptor bound for that command. This is stronger than a draw
+    /// count, but still separate from pixel readback.
+    presents_with_sampled_source: u64 = 0,
+    /// An acquired image received an image transfer whose source image was
+    /// known to Rosette's bounded resource graph.
+    presents_with_propagated_transfer: u64 = 0,
+    /// A route reached the acquired image, but its descriptor/transfer source
+    /// could not be resolved.
+    presents_with_unresolved_source: u64 = 0,
+    /// An acquired image was populated from a buffer upload. This proves a
+    /// write route, but there is no image producer to name as a sampled or
+    /// propagated source.
+    presents_with_buffer_upload: u64 = 0,
     acquired_image_index: u32 = 0,
     acquired_image_handle: u64 = 0,
     last_target_image: u64 = 0,
     last_target_kind: TargetKind = .none,
     /// The strongest write the most recently presented frame received.
     last_write_kind: WriteKind = .none,
+    last_sampled_image: u64 = 0,
+    last_transfer_source: u64 = 0,
+    last_transfer_kind: TransferKind = .none,
     pixel_evidence: PixelEvidence = .unprobed,
     /// The colour every pixel held, when the readback found only one.
     pixel_uniform_value: u32 = 0,
     pixel_hash: u64 = 0,
     pixel_probe_frame: u64 = 0,
+    /// The exact synthetic image sampled by the most recent probe. Keeping
+    /// this beside the frame makes a readback actionable when a swapchain has
+    /// three images and the next present rotates away from the one sampled.
+    pixel_probe_image: u64 = 0,
+    /// The write classification in force when the most recent probe ran. A
+    /// clear sampled before the first draw must not be reported as evidence
+    /// about a later content frame.
+    pixel_probe_write_kind: WriteKind = .none,
+    /// Last probe captured from a frame whose acquired image was marked
+    /// `.content`. Periodic probes can land on clear-only frames, so this
+    /// history is retained separately from the latest probe.
+    pixel_content_probe_frame: u64 = 0,
+    pixel_content_probe_image: u64 = 0,
+    pixel_content_probe_evidence: PixelEvidence = .unprobed,
+    pixel_content_probe_uniform_value: u32 = 0,
+    pixel_content_probe_hash: u64 = 0,
     last_present_result: i32 = 0,
     last_image_index: u32 = 0,
+};
+
+/// The pending frame is the small piece of state the present boundary needs
+/// before `notePresent` clears its per-acquire ledger. It lets the Vulkan
+/// forwarder select a probe based on the image that is actually about to be
+/// presented instead of guessing from global command counters.
+pub const PendingFrame = struct {
+    acquired_image: u64 = 0,
+    has_target: bool = false,
+    write_kind: WriteKind = .none,
 };
 
 /// What the chain can be asked, in the order the answers matter.
@@ -273,6 +360,20 @@ pub const Chain = struct {
     /// present. A boolean here is what let a render-pass load clear read as
     /// frame content on the 2026-09-12 run.
     pending_write_kind: [max_swapchains]WriteKind = [_]WriteKind{.none} ** max_swapchains,
+    pending_sampled_image: [max_swapchains]u64 = [_]u64{0} ** max_swapchains,
+    pending_transfer_source: [max_swapchains]u64 = [_]u64{0} ** max_swapchains,
+    pending_transfer_kind: [max_swapchains]TransferKind = [_]TransferKind{.none} ** max_swapchains,
+    pending_unresolved_source: [max_swapchains]bool = [_]bool{false} ** max_swapchains,
+    pending_buffer_upload: [max_swapchains]bool = [_]bool{false} ** max_swapchains,
+
+    resource_images: [max_resource_images]ResourceImageState = [_]ResourceImageState{.{}} ** max_resource_images,
+    resource_image_count: usize = 0,
+    resource_image_overflow: u64 = 0,
+    resource_submission_events: u64 = 0,
+    resource_transfer_events: u64 = 0,
+    resource_transfer_resolved: u64 = 0,
+    resource_transfer_unresolved: u64 = 0,
+    resource_transfer_kind_counts: [transfer_kind_count]u64 = [_]u64{0} ** transfer_kind_count,
 
     pub fn noteSurface(self: *Chain, handle: u64, layer: u64, owner: Owner) void {
         if (handle == 0) return;
@@ -328,15 +429,29 @@ pub const Chain = struct {
             stored.target_events = previous.target_events;
             stored.offscreen_events = previous.offscreen_events;
             stored.unknown_target_events = previous.unknown_target_events;
+            stored.presents_with_sampled_source = previous.presents_with_sampled_source;
+            stored.presents_with_propagated_transfer = previous.presents_with_propagated_transfer;
+            stored.presents_with_unresolved_source = previous.presents_with_unresolved_source;
+            stored.presents_with_buffer_upload = previous.presents_with_buffer_upload;
             stored.acquired_image_index = previous.acquired_image_index;
             stored.acquired_image_handle = previous.acquired_image_handle;
             stored.last_target_image = previous.last_target_image;
             stored.last_target_kind = previous.last_target_kind;
             stored.last_write_kind = previous.last_write_kind;
+            stored.last_sampled_image = previous.last_sampled_image;
+            stored.last_transfer_source = previous.last_transfer_source;
+            stored.last_transfer_kind = previous.last_transfer_kind;
             stored.pixel_evidence = previous.pixel_evidence;
             stored.pixel_hash = previous.pixel_hash;
             stored.pixel_uniform_value = previous.pixel_uniform_value;
             stored.pixel_probe_frame = previous.pixel_probe_frame;
+            stored.pixel_probe_image = previous.pixel_probe_image;
+            stored.pixel_probe_write_kind = previous.pixel_probe_write_kind;
+            stored.pixel_content_probe_frame = previous.pixel_content_probe_frame;
+            stored.pixel_content_probe_image = previous.pixel_content_probe_image;
+            stored.pixel_content_probe_evidence = previous.pixel_content_probe_evidence;
+            stored.pixel_content_probe_uniform_value = previous.pixel_content_probe_uniform_value;
+            stored.pixel_content_probe_hash = previous.pixel_content_probe_hash;
             self.swapchains[index] = stored;
             return;
         }
@@ -380,6 +495,11 @@ pub const Chain = struct {
             0;
         self.pending_target[index] = false;
         self.pending_write_kind[index] = .none;
+        self.pending_sampled_image[index] = 0;
+        self.pending_transfer_source[index] = 0;
+        self.pending_transfer_kind[index] = .none;
+        self.pending_unresolved_source[index] = false;
+        self.pending_buffer_upload[index] = false;
     }
 
     /// Record an explicitly attributed write for tests and for command paths
@@ -433,6 +553,192 @@ pub const Chain = struct {
         return .offscreen_image;
     }
 
+    fn resourceImageIndex(self: *const Chain, image: u64) ?usize {
+        if (image == 0) return null;
+        for (self.resource_images[0..self.resource_image_count], 0..) |record, index| {
+            if (record.image == image) return index;
+        }
+        return null;
+    }
+
+    fn mutableResourceImage(self: *Chain, image: u64) ?*ResourceImageState {
+        if (image == 0) return null;
+        if (self.resourceImageIndex(image)) |index| return &self.resource_images[index];
+        if (self.resource_image_count == max_resource_images) {
+            self.resource_image_overflow +|= 1;
+            return null;
+        }
+        const record = &self.resource_images[self.resource_image_count];
+        record.* = .{ .image = image };
+        self.resource_image_count += 1;
+        return record;
+    }
+
+    fn resourceImageState(self: *const Chain, image: u64) ?ResourceImageState {
+        const index = self.resourceImageIndex(image) orelse return null;
+        return self.resource_images[index];
+    }
+
+    /// Release a host image identity from the bounded live graph after the
+    /// Vulkan object is destroyed. Counters and the last-present evidence are
+    /// intentionally retained, while pending routes that used the destroyed
+    /// image become unresolved instead of silently retaining a stale identity.
+    pub fn forgetResourceImage(self: *Chain, image: u64) void {
+        const index = self.resourceImageIndex(image) orelse return;
+        self.resource_image_count -= 1;
+        if (index != self.resource_image_count) {
+            self.resource_images[index] = self.resource_images[self.resource_image_count];
+        }
+        self.resource_images[self.resource_image_count] = .{};
+        for (0..self.swapchain_count) |swapchain_index| {
+            if (self.pending_sampled_image[swapchain_index] == image) {
+                self.pending_sampled_image[swapchain_index] = 0;
+                self.pending_unresolved_source[swapchain_index] = true;
+            }
+            if (self.pending_transfer_source[swapchain_index] == image) {
+                self.pending_transfer_source[swapchain_index] = 0;
+                self.pending_transfer_kind[swapchain_index] = .none;
+                self.pending_unresolved_source[swapchain_index] = true;
+            }
+        }
+    }
+
+    fn acquiredResourceIndex(self: *const Chain, image: u64) ?usize {
+        if (image == 0) return null;
+        for (self.swapchains[0..self.swapchain_count], 0..) |record, index| {
+            if (record.retired or !self.pending_target[index]) continue;
+            if (record.acquired_image_handle == image) return index;
+        }
+        return null;
+    }
+
+    /// Record the resource edges a submitted command buffer carried. Target
+    /// attribution says what the command wrote; this graph says where the
+    /// value came from. Keeping them independent makes a black-but-successful
+    /// present diagnosable without changing the existing frame verdict.
+    pub fn noteResourceSubmission(
+        self: *Chain,
+        targets: []const u64,
+        write: WriteKind,
+        sampled_images: []const u64,
+        transfers: []const ResourceTransfer,
+    ) void {
+        self.resource_submission_events +|= 1;
+
+        for (targets) |image| {
+            if (image == 0 or write == .none) continue;
+            const state = self.mutableResourceImage(image) orelse continue;
+            // This is the latest write to the image. Do not retain a stale
+            // transfer edge after a later clear or direct draw, or a later
+            // transfer can be attributed to the wrong producer.
+            state.write_kind = write;
+            state.source_image = 0;
+            state.transfer_kind = .none;
+            state.source_known = true;
+        }
+
+        for (transfers) |transfer| {
+            self.resource_transfer_events +|= 1;
+            self.resource_transfer_kind_counts[@as(usize, @intFromEnum(transfer.kind))] +|= 1;
+            if (transfer.destination == 0) {
+                self.resource_transfer_unresolved +|= 1;
+                continue;
+            }
+            const destination = self.mutableResourceImage(transfer.destination) orelse continue;
+            if (transfer.kind == .buffer_to_image) {
+                destination.* = .{
+                    .image = transfer.destination,
+                    .write_kind = .content,
+                    .source_image = 0,
+                    .transfer_kind = transfer.kind,
+                    .source_known = true,
+                };
+                if (self.acquiredResourceIndex(transfer.destination)) |index| {
+                    self.pending_buffer_upload[index] = true;
+                }
+                continue;
+            }
+
+            if (transfer.source != 0) {
+                if (self.resourceImageState(transfer.source)) |source| {
+                    if (source.source_known) {
+                        self.resource_transfer_resolved +|= 1;
+                        destination.* = .{
+                            .image = transfer.destination,
+                            .write_kind = if (source.write_kind == .none) .content else source.write_kind,
+                            .source_image = source.image,
+                            .transfer_kind = transfer.kind,
+                            .source_known = true,
+                        };
+                        if (self.acquiredResourceIndex(transfer.destination)) |index| {
+                            self.pending_transfer_source[index] = source.image;
+                            self.pending_transfer_kind[index] = transfer.kind;
+                        }
+                    } else {
+                        self.resource_transfer_unresolved +|= 1;
+                        destination.* = .{
+                            .image = transfer.destination,
+                            .write_kind = .content,
+                            .source_image = if (source.source_image != 0) source.source_image else source.image,
+                            .transfer_kind = transfer.kind,
+                            .source_known = false,
+                        };
+                        if (self.acquiredResourceIndex(transfer.destination)) |index| {
+                            self.pending_unresolved_source[index] = true;
+                        }
+                    }
+                } else {
+                    self.resource_transfer_unresolved +|= 1;
+                    destination.* = .{
+                        .image = transfer.destination,
+                        .write_kind = .content,
+                        .source_image = transfer.source,
+                        .transfer_kind = transfer.kind,
+                        .source_known = false,
+                    };
+                    if (self.acquiredResourceIndex(transfer.destination)) |index| {
+                        self.pending_unresolved_source[index] = true;
+                    }
+                }
+            } else {
+                self.resource_transfer_unresolved +|= 1;
+                destination.* = .{
+                    .image = transfer.destination,
+                    .write_kind = .content,
+                    .source_image = 0,
+                    .transfer_kind = transfer.kind,
+                    .source_known = false,
+                };
+                if (self.acquiredResourceIndex(transfer.destination)) |index| {
+                    self.pending_unresolved_source[index] = true;
+                }
+            }
+        }
+
+        // A descriptor image is evidence of the producer route only when the
+        // same submitted command also targets the acquired image with a draw
+        // or dispatch. Descriptor updates are persistent; recording the edge
+        // at submission avoids attributing a later acquire to an old bind.
+        if (write == .content) {
+            for (targets) |target| {
+                const index = self.acquiredResourceIndex(target) orelse continue;
+                for (sampled_images) |sampled| {
+                    if (sampled == target) continue;
+                    if (sampled == 0) {
+                        self.pending_unresolved_source[index] = true;
+                        continue;
+                    }
+                    if (self.pending_sampled_image[index] == 0) {
+                        self.pending_sampled_image[index] = sampled;
+                    }
+                    if (self.resourceImageState(sampled) == null) {
+                        self.pending_unresolved_source[index] = true;
+                    }
+                }
+            }
+        }
+    }
+
     /// Record bounded host readback evidence separately from the command
     /// attribution verdict.  A probe can say "the image is solid clear" or
     /// "the pixels changed" without turning a successful copy into an
@@ -444,6 +750,39 @@ pub const Chain = struct {
         record.pixel_hash = hash;
         record.pixel_probe_frame = frame;
         record.pixel_uniform_value = uniform_value;
+    }
+
+    /// Attach the frame identity to the probe recorded immediately before it.
+    /// This is deliberately a second call so existing probe users can retain
+    /// the compact evidence API while the Vulkan boundary supplies the
+    /// acquired image and write classification after every success/failure.
+    /// When the sample belongs to content, retain it even if a later periodic
+    /// sample lands on a clear-only image.
+    pub fn notePixelProbeContext(self: *Chain, handle: u64, image: u64, write_kind: WriteKind) void {
+        const index = self.swapchainIndex(handle) orelse return;
+        const record = &self.swapchains[index];
+        record.pixel_probe_image = image;
+        record.pixel_probe_write_kind = write_kind;
+        if (write_kind == .content and record.pixel_probe_frame >= record.pixel_content_probe_frame and record.pixel_probe_frame != 0) {
+            record.pixel_content_probe_frame = record.pixel_probe_frame;
+            record.pixel_content_probe_image = image;
+            record.pixel_content_probe_evidence = record.pixel_evidence;
+            record.pixel_content_probe_uniform_value = record.pixel_uniform_value;
+            record.pixel_content_probe_hash = record.pixel_hash;
+        }
+    }
+
+    pub fn pendingFrame(self: *const Chain, handle: u64) ?PendingFrame {
+        for (self.swapchains[0..self.swapchain_count], 0..) |record, index| {
+            if (record.handle != handle) continue;
+            if (!self.pending_target[index] and self.pending_write_kind[index] == .none) return null;
+            return .{
+                .acquired_image = record.acquired_image_handle,
+                .has_target = self.pending_target[index],
+                .write_kind = self.pending_write_kind[index],
+            };
+        }
+        return null;
     }
 
     pub fn notePresent(self: *Chain, handle: u64, result: i32) void {
@@ -468,9 +807,25 @@ pub const Chain = struct {
             } else {
                 record.presents_without_target +|= 1;
             }
+            if (self.pending_sampled_image[index] != 0) {
+                record.presents_with_sampled_source +|= 1;
+                record.last_sampled_image = self.pending_sampled_image[index];
+            }
+            if (self.pending_transfer_source[index] != 0) {
+                record.presents_with_propagated_transfer +|= 1;
+                record.last_transfer_source = self.pending_transfer_source[index];
+                record.last_transfer_kind = self.pending_transfer_kind[index];
+            }
+            if (self.pending_unresolved_source[index]) record.presents_with_unresolved_source +|= 1;
+            if (self.pending_buffer_upload[index]) record.presents_with_buffer_upload +|= 1;
         }
         self.pending_target[index] = false;
         self.pending_write_kind[index] = .none;
+        self.pending_sampled_image[index] = 0;
+        self.pending_transfer_source[index] = 0;
+        self.pending_transfer_kind[index] = .none;
+        self.pending_unresolved_source[index] = false;
+        self.pending_buffer_upload[index] = false;
     }
 
     pub fn liveSwapchains(self: *const Chain) usize {
@@ -499,6 +854,30 @@ pub const Chain = struct {
     pub fn totalPresentsClearOnly(self: *const Chain) u64 {
         var total: u64 = 0;
         for (self.swapchains[0..self.swapchain_count]) |record| total +|= record.presents_clear_only;
+        return total;
+    }
+
+    pub fn totalPresentsWithSampledSource(self: *const Chain) u64 {
+        var total: u64 = 0;
+        for (self.swapchains[0..self.swapchain_count]) |record| total +|= record.presents_with_sampled_source;
+        return total;
+    }
+
+    pub fn totalPresentsWithPropagatedTransfer(self: *const Chain) u64 {
+        var total: u64 = 0;
+        for (self.swapchains[0..self.swapchain_count]) |record| total +|= record.presents_with_propagated_transfer;
+        return total;
+    }
+
+    pub fn totalPresentsWithUnresolvedSource(self: *const Chain) u64 {
+        var total: u64 = 0;
+        for (self.swapchains[0..self.swapchain_count]) |record| total +|= record.presents_with_unresolved_source;
+        return total;
+    }
+
+    pub fn totalPresentsWithBufferUpload(self: *const Chain) u64 {
+        var total: u64 = 0;
+        for (self.swapchains[0..self.swapchain_count]) |record| total +|= record.presents_with_buffer_upload;
         return total;
     }
 
@@ -906,13 +1285,154 @@ test "a black frame on an opaque format is not evidence of a picture" {
     chain.noteSurface(1, 0xAAAA, .guest);
     chain.noteSwapchain(.{ .handle = 2, .surface = 1, .image_count = 2 });
     chain.notePixelProbe(2, .uniform_colour, 0x52bda05e66a4a325, 1, 0xFF000000);
+    chain.notePixelProbeContext(2, 0x200, .content);
     try std.testing.expectEqual(PixelEvidence.uniform_colour, chain.swapchains[0].pixel_evidence);
     try std.testing.expectEqual(@as(u32, 0xFF000000), chain.swapchains[0].pixel_uniform_value);
+    try std.testing.expectEqual(@as(u64, 0x200), chain.swapchains[0].pixel_content_probe_image);
+    try std.testing.expectEqual(@as(u64, 1), chain.swapchains[0].pixel_content_probe_frame);
 
     // A resize must not lose the colour: it is the one number that says what
     // the window is actually showing.
     chain.noteSwapchain(.{ .handle = 2, .surface = 1, .image_count = 2, .width = 1920 });
     try std.testing.expectEqual(@as(u32, 0xFF000000), chain.swapchains[0].pixel_uniform_value);
+    try std.testing.expectEqual(@as(u64, 1), chain.swapchains[0].pixel_content_probe_frame);
+}
+
+test "pending frame preserves content classification until present" {
+    var chain = Chain{};
+    chain.noteSurface(1, 0xAAAA, .guest);
+    chain.noteSwapchain(.{ .handle = 2, .surface = 1, .image_count = 2 });
+    chain.noteSwapchainImages(2, &.{ 0x200, 0x201 });
+    chain.noteAcquire(2, 1);
+    _ = chain.noteTargetImage(0x201, .content);
+
+    const pending = chain.pendingFrame(2).?;
+    try std.testing.expectEqual(@as(u64, 0x201), pending.acquired_image);
+    try std.testing.expect(pending.has_target);
+    try std.testing.expectEqual(WriteKind.content, pending.write_kind);
+
+    chain.notePresent(2, 0);
+    try std.testing.expect(chain.pendingFrame(2) == null);
+}
+
+test "resource graph follows an offscreen image into the acquired image" {
+    var chain = Chain{};
+    chain.noteSurface(1, 0xAAAA, .guest);
+    chain.noteSwapchain(.{ .handle = 2, .surface = 1, .image_count = 2 });
+    chain.noteSwapchainImages(2, &.{ 0x200, 0x201 });
+
+    // The producer rendered into an offscreen image in an earlier submission.
+    chain.noteResourceSubmission(&.{0x400}, .content, &.{}, &.{});
+    chain.noteAcquire(2, 0);
+    _ = chain.noteTargetImage(0x200, .content);
+    chain.noteResourceSubmission(&.{0x200}, .content, &.{}, &.{.{
+        .source = 0x400,
+        .destination = 0x200,
+        .kind = .image_copy,
+    }});
+    chain.notePresent(2, 0);
+
+    try std.testing.expectEqual(@as(u64, 1), chain.resource_transfer_events);
+    try std.testing.expectEqual(@as(u64, 1), chain.resource_transfer_resolved);
+    try std.testing.expectEqual(@as(u64, 1), chain.totalPresentsWithPropagatedTransfer());
+    try std.testing.expectEqual(@as(u64, 0), chain.totalPresentsWithUnresolvedSource());
+    try std.testing.expectEqual(@as(u64, 0x400), chain.swapchains[0].last_transfer_source);
+    try std.testing.expectEqual(TransferKind.image_copy, chain.swapchains[0].last_transfer_kind);
+}
+
+test "resource graph records a descriptor image sampled by a swapchain draw" {
+    var chain = Chain{};
+    chain.noteSurface(1, 0xAAAA, .guest);
+    chain.noteSwapchain(.{ .handle = 2, .surface = 1, .image_count = 1 });
+    chain.noteSwapchainImages(2, &.{0x200});
+    chain.noteResourceSubmission(&.{0x500}, .content, &.{}, &.{});
+
+    chain.noteAcquire(2, 0);
+    _ = chain.noteTargetImage(0x200, .content);
+    chain.noteResourceSubmission(&.{0x200}, .content, &.{0x500}, &.{});
+    chain.notePresent(2, 0);
+
+    try std.testing.expectEqual(@as(u64, 1), chain.totalPresentsWithSampledSource());
+    try std.testing.expectEqual(@as(u64, 0), chain.totalPresentsWithUnresolvedSource());
+    try std.testing.expectEqual(@as(u64, 0x500), chain.swapchains[0].last_sampled_image);
+}
+
+test "resource graph keeps an unresolved transfer source visible" {
+    var chain = Chain{};
+    chain.noteSurface(1, 0xAAAA, .guest);
+    chain.noteSwapchain(.{ .handle = 2, .surface = 1, .image_count = 1 });
+    chain.noteSwapchainImages(2, &.{0x200});
+
+    chain.noteAcquire(2, 0);
+    _ = chain.noteTargetImage(0x200, .content);
+    chain.noteResourceSubmission(&.{0x200}, .content, &.{}, &.{.{
+        .source = 0x999,
+        .destination = 0x200,
+        .kind = .image_blit,
+    }});
+    chain.notePresent(2, 0);
+
+    try std.testing.expectEqual(@as(u64, 1), chain.resource_transfer_unresolved);
+    try std.testing.expectEqual(@as(u64, 0), chain.totalPresentsWithPropagatedTransfer());
+    try std.testing.expectEqual(@as(u64, 1), chain.totalPresentsWithUnresolvedSource());
+}
+
+test "resource graph preserves an unresolved transfer through a second image" {
+    var chain = Chain{};
+    chain.noteSurface(1, 0xAAAA, .guest);
+    chain.noteSwapchain(.{ .handle = 2, .surface = 1, .image_count = 1 });
+    chain.noteSwapchainImages(2, &.{0x200});
+
+    chain.noteResourceSubmission(&.{}, .none, &.{}, &.{.{
+        .source = 0x999,
+        .destination = 0x300,
+        .kind = .image_copy,
+    }});
+    chain.noteAcquire(2, 0);
+    _ = chain.noteTargetImage(0x200, .content);
+    chain.noteResourceSubmission(&.{0x200}, .content, &.{}, &.{.{
+        .source = 0x300,
+        .destination = 0x200,
+        .kind = .image_blit,
+    }});
+    chain.notePresent(2, 0);
+
+    try std.testing.expectEqual(@as(u64, 2), chain.resource_transfer_unresolved);
+    try std.testing.expectEqual(@as(u64, 0), chain.resource_transfer_resolved);
+    try std.testing.expectEqual(@as(u64, 1), chain.totalPresentsWithUnresolvedSource());
+    try std.testing.expectEqual(@as(u64, 0), chain.totalPresentsWithPropagatedTransfer());
+}
+
+test "resource graph distinguishes a buffer upload from an image source" {
+    var chain = Chain{};
+    chain.noteSurface(1, 0xAAAA, .guest);
+    chain.noteSwapchain(.{ .handle = 2, .surface = 1, .image_count = 1 });
+    chain.noteSwapchainImages(2, &.{0x200});
+    chain.noteAcquire(2, 0);
+    _ = chain.noteTargetImage(0x200, .content);
+    chain.noteResourceSubmission(&.{0x200}, .content, &.{}, &.{.{
+        .source = 0,
+        .destination = 0x200,
+        .kind = .buffer_to_image,
+    }});
+    chain.notePresent(2, 0);
+
+    try std.testing.expectEqual(@as(u64, 1), chain.resource_transfer_kind_counts[@intFromEnum(TransferKind.buffer_to_image)]);
+    try std.testing.expectEqual(@as(u64, 1), chain.totalPresentsWithBufferUpload());
+    try std.testing.expectEqual(@as(u64, 0), chain.totalPresentsWithPropagatedTransfer());
+    try std.testing.expectEqual(@as(u64, 0), chain.totalPresentsWithUnresolvedSource());
+}
+
+test "resource graph releases destroyed image identities without erasing evidence" {
+    var chain = Chain{};
+    chain.noteResourceSubmission(&.{0x400}, .content, &.{}, &.{});
+    try std.testing.expectEqual(@as(usize, 1), chain.resource_image_count);
+
+    chain.forgetResourceImage(0x400);
+
+    try std.testing.expectEqual(@as(usize, 0), chain.resource_image_count);
+    try std.testing.expectEqual(@as(u64, 1), chain.resource_submission_events);
+    try std.testing.expectEqual(@as(?usize, null), chain.resourceImageIndex(0x400));
 }
 
 test "one owner standing down settles a contested layer" {

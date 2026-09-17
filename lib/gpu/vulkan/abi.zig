@@ -256,11 +256,15 @@ pub const IMAGE_ASPECT_COLOR_BIT: u32 = 0x0000_0001;
 
 pub const ACCESS_TRANSFER_WRITE_BIT: u32 = 0x0000_1000;
 pub const ACCESS_MEMORY_READ_BIT: u32 = 0x0000_8000;
+pub const ACCESS_MEMORY_WRITE_BIT: u32 = 0x0001_0000;
+pub const ACCESS_HOST_READ_BIT: u32 = 0x0000_2000;
 
 pub const PIPELINE_STAGE_TOP_OF_PIPE_BIT: u32 = 0x0000_0001;
 pub const PIPELINE_STAGE_TRANSFER_BIT: u32 = 0x0000_1000;
 pub const PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT: u32 = 0x0000_2000;
 pub const PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT: u32 = 0x0000_0400;
+pub const PIPELINE_STAGE_HOST_BIT: u32 = 0x0000_4000;
+pub const PIPELINE_STAGE_ALL_COMMANDS_BIT: u32 = 0x0001_0000;
 
 pub const COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT: u32 = 0x0000_0002;
 pub const COMMAND_BUFFER_LEVEL_PRIMARY: u32 = 0;
@@ -366,6 +370,28 @@ pub const PhysicalDeviceIdentity = extern struct {
 /// Room for the whole of `VkPhysicalDeviceProperties` (about 824 bytes) so the
 /// driver never writes past the buffer Rosette hands it.
 pub const physical_device_properties_bytes: usize = 1024;
+
+/// Native 64-bit Vulkan C layout, checked against the vendored header by the
+/// capture fixture. Both size_t and VkDeviceSize have eight-byte alignment.
+pub const min_memory_map_alignment_offset: usize = 600;
+pub fn nativeMemoryMapAlignment(properties: []const u8) ?u64 {
+    if (properties.len < min_memory_map_alignment_offset + 8) return null;
+    const alignment = std.mem.readInt(u64, properties[min_memory_map_alignment_offset..][0..8], .little);
+    if (alignment == 0 or alignment > 0x1_0000_0000 or (alignment & (alignment - 1)) != 0) return null;
+    return alignment;
+}
+
+test "native map alignment is bounded and read at the 64-bit Vulkan header offset" {
+    var properties: [physical_device_properties_bytes]u8 = @splat(0);
+    try std.testing.expect(nativeMemoryMapAlignment(&properties) == null);
+    std.mem.writeInt(u64, properties[600..608], 64, .little);
+    try std.testing.expectEqual(@as(?u64, 64), nativeMemoryMapAlignment(&properties));
+    std.mem.writeInt(u64, properties[600..608], 63, .little);
+    try std.testing.expect(nativeMemoryMapAlignment(&properties) == null);
+    std.mem.writeInt(u64, properties[600..608], 0x2_0000_0000, .little);
+    try std.testing.expect(nativeMemoryMapAlignment(&properties) == null);
+    try std.testing.expect(nativeMemoryMapAlignment(properties[0..607]) == null);
+}
 
 pub const PhysicalDeviceFeatures2 = extern struct {
     s_type: u32 = STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,

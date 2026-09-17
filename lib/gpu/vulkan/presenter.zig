@@ -166,6 +166,11 @@ pub const Report = struct {
     present_mode: u32 = 0,
     image_usage: u32 = 0,
     swapchain_image_count: u32 = 0,
+    /// The exact extent Rosette supplied to this bring-up attempt.  Keeping
+    /// it beside the driver's selected extent makes a geometry regression
+    /// actionable even when the driver accepts the resulting swapchain.
+    requested_extent_width: u32 = 0,
+    requested_extent_height: u32 = 0,
     extent_width: u32 = 0,
     extent_height: u32 = 0,
     swapchain_generations: u32 = 0,
@@ -406,6 +411,16 @@ pub const Presenter = struct {
         self.report.stage = .ready;
         self.report.last_result = abi.SUCCESS;
         return self.stage;
+    }
+
+    /// Whether the driver reported a drawable geometry that violated the
+    /// exact layer extent contract.  This is intentionally exposed as a
+    /// typed fact instead of making the dyld forwarder parse a diagnostic
+    /// string; the forwarder uses it to terminate the process before an
+    /// unproven presenter can claim the CAMetalLayer.
+    pub fn extentContractFailed(self: *const Presenter) bool {
+        const rejection = self.report.rejection orelse return false;
+        return rejection == error.SurfaceExtentMismatch;
     }
 
     fn instanceProc(self: *Presenter, comptime T: type, name: [*:0]const u8) ?T {
@@ -824,6 +839,10 @@ pub const Presenter = struct {
     // -- swapchain --------------------------------------------------------
 
     pub fn createSwapchain(self: *Presenter, fallback_width: u32, fallback_height: u32) bool {
+        const requested_width = @max(fallback_width, 1);
+        const requested_height = @max(fallback_height, 1);
+        self.report.requested_extent_width = requested_width;
+        self.report.requested_extent_height = requested_height;
         const instance_entries = &self.instance_entries.?;
         var capabilities = abi.SurfaceCapabilitiesKHR{};
         const capability_result = instance_entries.get_surface_capabilities(
@@ -858,7 +877,7 @@ pub const Presenter = struct {
             return self.rejectSwapchain(error.UsageUnsupported);
         const composite_alpha = selection.chooseCompositeAlpha(capabilities) orelse
             return self.rejectSwapchain(error.NoCompositeAlpha);
-        const extent = switch (selection.chooseExtent(capabilities, fallback_width, fallback_height)) {
+        const extent = switch (selection.chooseExtent(capabilities, requested_width, requested_height)) {
             .not_presentable => {
                 // Not a failure. The window is minimised, occluded or being
                 // resized; the swapchain it had is simply unusable meanwhile.
@@ -868,6 +887,21 @@ pub const Presenter = struct {
             },
             .extent => |value| value,
         };
+
+        // `currentExtent` is authoritative under Vulkan, but it is not
+        // automatically compatible with Rosette's layer contract.  On a
+        // Retina display MoltenVK can report the backing-pixel extent after
+        // the CAMetalLayer was preflighted at the guest's logical extent. If
+        // we accepted that value, the driver would own a 2560x1440 drawable
+        // while Xenia had negotiated 1280x720; both sides can return success
+        // and the visible result is then scaled, rejected, or black. Refuse
+        // before vkCreateSwapchainKHR so no invalid native object is exposed.
+        const requested_extent = abi.Extent2D{ .width = requested_width, .height = requested_height };
+        if (!selection.extentMatches(extent, requested_extent)) {
+            self.report.extent_width = extent.width;
+            self.report.extent_height = extent.height;
+            return self.rejectSwapchain(error.SurfaceExtentMismatch);
+        }
 
         const previous = self.swapchain;
         const create_info = abi.SwapchainCreateInfoKHR{

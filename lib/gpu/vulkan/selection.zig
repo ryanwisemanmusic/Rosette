@@ -30,6 +30,12 @@ pub const Rejection = error{
     NoSurfaceFormat,
     NoPresentMode,
     SurfaceNotPresentable,
+    /// The surface has a fixed drawable extent, but it is not the extent the
+    /// window contract proved before the swapchain was admitted.  This is
+    /// deliberately distinct from a generic swapchain failure: choosing the
+    /// fixed extent would make the layer and the guest disagree while the
+    /// driver still reports success.
+    SurfaceExtentMismatch,
     UsageUnsupported,
     NoCompositeAlpha,
     NoPresentQueue,
@@ -42,6 +48,7 @@ pub fn rejectionLabel(rejection: Rejection) []const u8 {
         error.NoSurfaceFormat => "the surface reported no formats",
         error.NoPresentMode => "the surface reported no present modes",
         error.SurfaceNotPresentable => "the surface extent is zero, so it cannot hold a drawable right now",
+        error.SurfaceExtentMismatch => "the surface fixed extent differs from the extent proven by the window contract",
         error.UsageUnsupported => "the surface does not support the image usage the presenter copies with",
         error.NoCompositeAlpha => "the surface reported no composite-alpha mode",
         error.NoPresentQueue => "no queue family can present to this surface",
@@ -149,6 +156,16 @@ pub fn chooseExtent(
     );
     if (width == 0 or height == 0) return .not_presentable;
     return .{ .extent = .{ .width = width, .height = height } };
+}
+
+/// Exact extent admission for a layer-backed presenter. `chooseExtent` keeps
+/// the Vulkan rule that a fixed `currentExtent` is authoritative; this helper
+/// is the second question: did that authoritative answer remain the geometry
+/// that Rosette proved immediately before asking the driver to create a
+/// swapchain? Keeping the predicate here makes the native presenter and its
+/// tests agree without weakening the general Vulkan selection rule.
+pub fn extentMatches(actual: abi.Extent2D, expected: abi.Extent2D) bool {
+    return actual.width == expected.width and actual.height == expected.height;
 }
 
 pub fn chooseImageUsage(capabilities: abi.SurfaceCapabilitiesKHR) ?u32 {
@@ -389,6 +406,12 @@ test "a fixed current extent overrides the window's own idea of its size" {
     const chosen = chooseExtent(fixed, 1280, 720);
     try std.testing.expectEqual(@as(u32, 2560), chosen.extent.width);
     try std.testing.expectEqual(@as(u32, 1440), chosen.extent.height);
+}
+
+test "an extent contract distinguishes a fixed driver mismatch from a match" {
+    const required = abi.Extent2D{ .width = 1280, .height = 720 };
+    try std.testing.expect(extentMatches(required, required));
+    try std.testing.expect(!extentMatches(.{ .width = 2560, .height = 1440 }, required));
 }
 
 test "an undefined current extent clamps the requested size into the surface bounds" {

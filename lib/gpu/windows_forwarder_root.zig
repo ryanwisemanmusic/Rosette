@@ -26,21 +26,34 @@ pub const FrameClassification = provenance.Classification;
 pub const NativePresenter = vulkan.Presenter;
 
 const present_chain = @import("present_chain.zig");
+pub const screen_validity = @import("screen_validity");
 pub const PresentChain = present_chain.Chain;
 pub const PresentChainVerdict = present_chain.Verdict;
 pub const PresentChainOwner = present_chain.Owner;
 pub const PresentSwapchainRecord = present_chain.SwapchainRecord;
 pub const PresentTargetKind = present_chain.TargetKind;
 pub const PresentPixelEvidence = present_chain.PixelEvidence;
+pub const PresentTransferKind = present_chain.TransferKind;
+pub const PresentResourceTransfer = present_chain.ResourceTransfer;
 /// What a Vulkan command can put into the image it targets. The forwarder
 /// classifies each command it forwards so a frame built only from clears is
 /// never counted as a frame that carried a picture.
 pub const PresentWriteKind = present_chain.WriteKind;
 pub const frame_content = present_chain.frame_content;
 pub const WindowGeometry = present_chain.Geometry;
+pub const ScreenValidity = screen_validity.Ledger;
+pub const ScreenValiditySnapshot = screen_validity.Snapshot;
+pub const ScreenValidityStage = screen_validity.Stage;
+pub const ScreenValidityStatus = screen_validity.Status;
+pub const ScreenValidityOwner = screen_validity.Owner;
+pub const ScreenValidityDrawableOwner = screen_validity.DrawableOwner;
+pub const ScreenValidityPixelEvidence = screen_validity.PixelEvidence;
+pub const ScreenValidityEvaluation = screen_validity.Evaluation;
+pub const ScreenValidityVerdict = screen_validity.Verdict;
 
 test {
     _ = present_chain;
+    _ = screen_validity;
 }
 pub const NativePresenterStage = vulkan.Stage;
 pub const Runtime = runtime.Runtime;

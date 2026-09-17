@@ -34,8 +34,11 @@ pub const Stage = enum(u8) {
     }
 };
 
-/// The host vertex-shader type a draw asked for. The backend implements two of
-/// these and refuses the rest, and the refusal is not a defect in the title.
+/// The host vertex-shader type a draw asked for. The backend implements the
+/// ordinary path, point expansion, and the rectangle-list fallback. The
+/// loaded Xenia image admission repair keeps the fallback's own shader,
+/// pipeline, and indexed submission path intact; it only prevents the
+/// backend's stale admission guard from rejecting it before submission.
 pub const HostVertexShaderType = enum(u8) {
     vertex = 0,
     point_list_as_triangle_strip = 1,
@@ -55,7 +58,9 @@ pub const HostVertexShaderType = enum(u8) {
 
     /// Whether the Vulkan backend implements it today.
     pub fn implemented(self: HostVertexShaderType) bool {
-        return self == .vertex or self == .point_list_as_triangle_strip;
+        return self == .vertex or
+            self == .point_list_as_triangle_strip or
+            self == .rectangle_list_as_triangle_strip;
     }
 };
 
@@ -351,6 +356,7 @@ test "an unimplemented stage is neither half's defect and stays distinguishable"
     try std.testing.expectEqual(@as(u64, 0), ledger.summary().emulatorDefects());
 
     try std.testing.expect(HostVertexShaderType.vertex.implemented());
+    try std.testing.expect(HostVertexShaderType.rectangle_list_as_triangle_strip.implemented());
     try std.testing.expect(!HostVertexShaderType.tessellation.implemented());
 }
 

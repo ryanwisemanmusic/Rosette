@@ -56,6 +56,7 @@ pub const import_binding = @import("import_binding.zig");
 pub const kernel_variables = @import("kernel_variables.zig");
 pub const pm4 = @import("pm4.zig");
 pub const pm4_executor = @import("pm4_executor.zig");
+pub const pm4_draw_backend = @import("pm4_draw_backend.zig");
 pub const pm4_fault_journal = @import("pm4_fault_journal.zig");
 pub const packet_trace = @import("packet_trace.zig");
 pub const packet_census = @import("packet_census.zig");
@@ -141,6 +142,7 @@ pub const BackendComparisonOutcome = backend_frame_compare.ComparisonOutcome;
 pub const CapabilityMatrix = capability_matrix.Matrix;
 pub const Pm4FetchConstant = pm4.FetchConstant;
 pub const Pm4Executor = pm4_executor.Executor;
+pub const Pm4DrawBackend = pm4_draw_backend;
 pub const Pm4FaultJournal = pm4_fault_journal.Journal;
 pub const Pm4FaultRecord = pm4_fault_journal.Record;
 pub const XenosTextureFormat = xenos_formats.TextureFormat;
@@ -266,21 +268,34 @@ pub const NativePresenterStage = vulkan.Stage;
 /// The window-to-compositor chain a presented pixel has to travel, and which
 /// link of it is the first that cannot carry a frame.
 const present_chain = @import("present_chain.zig");
+pub const screen_validity = @import("screen_validity");
 pub const PresentChain = present_chain.Chain;
 pub const PresentChainVerdict = present_chain.Verdict;
 pub const PresentChainOwner = present_chain.Owner;
 pub const PresentSwapchainRecord = present_chain.SwapchainRecord;
 pub const PresentTargetKind = present_chain.TargetKind;
 pub const PresentPixelEvidence = present_chain.PixelEvidence;
+pub const PresentTransferKind = present_chain.TransferKind;
+pub const PresentResourceTransfer = present_chain.ResourceTransfer;
 /// What a Vulkan command can put into the image it targets. The forwarder
 /// classifies each command it forwards so a frame built only from clears is
 /// never counted as a frame that carried a picture.
 pub const PresentWriteKind = present_chain.WriteKind;
 pub const frame_content = present_chain.frame_content;
 pub const WindowGeometry = present_chain.Geometry;
+pub const ScreenValidity = screen_validity.Ledger;
+pub const ScreenValiditySnapshot = screen_validity.Snapshot;
+pub const ScreenValidityStage = screen_validity.Stage;
+pub const ScreenValidityStatus = screen_validity.Status;
+pub const ScreenValidityOwner = screen_validity.Owner;
+pub const ScreenValidityDrawableOwner = screen_validity.DrawableOwner;
+pub const ScreenValidityPixelEvidence = screen_validity.PixelEvidence;
+pub const ScreenValidityEvaluation = screen_validity.Evaluation;
+pub const ScreenValidityVerdict = screen_validity.Verdict;
 
 test {
     _ = present_chain;
+    _ = screen_validity;
 }
 pub const NativeFrameSource = vulkan.Source;
 pub const Runtime = runtime.Runtime;
@@ -327,6 +342,7 @@ test {
     _ = kernel_variables;
     _ = pm4;
     _ = pm4_executor;
+    _ = pm4_draw_backend;
     _ = packet_trace;
     _ = packet_census;
     _ = early_frontier;

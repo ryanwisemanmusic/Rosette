@@ -12,6 +12,12 @@
 
 const std = @import("std");
 
+/// A placement that leaves most of the window beyond the visible screen is a
+/// presentation defect even though AppKit still reports the window as
+/// visible/on-screen. The native bridge repairs to 100%; this value is shared
+/// with the screen-validity contract by policy.
+pub const minimum_screen_visible_fraction_percent: u32 = 75;
+
 /// Everything about the on-screen chain that decides whether a presented
 /// swapchain image can be seen. Mirrors
 /// `RosetteMachONativeWindowGeometry` field for field.
@@ -114,6 +120,7 @@ pub const Geometry = extern struct {
         const percent = self.visibleFractionPercent();
         if (percent == 0) return "the window's frame lies entirely outside its screen's visible area; AppKit still reports it on screen and unoccluded, and nothing of it can be seen";
         if (percent < 25) return "less than a quarter of the window's frame lies inside its screen's visible area; a presented frame is being drawn mostly off the edge of the display";
+        if (percent < minimum_screen_visible_fraction_percent) return "less than three quarters of the window's frame lies inside its screen's visible area; repair placement before treating a present as screen-visible";
         return null;
     }
 
@@ -122,7 +129,7 @@ pub const Geometry = extern struct {
     /// outermost thing to fix rather than a symptom of it.
     pub fn firstBrokenLink(self: Geometry) ?[]const u8 {
         if (self.window_exists == 0) return "no NSWindow exists";
-        if (self.window_miniaturized != 0) return "the window is miniaturized";
+        if (self.window_miniaturized != 0) return "the window is miniaturized (user-owned visibility; do not restore or steal focus)";
         if (self.window_visible == 0) return "the window is not visible (never ordered on screen, or ordered out)";
         if (self.window_on_screen == 0) return "the window is not on any screen";
         if (self.window_alpha <= 0.0) return "the window's alpha is zero";
@@ -136,7 +143,7 @@ pub const Geometry = extern struct {
         if (self.layer_device == 0) return "the CAMetalLayer has no MTLDevice, so it can vend no drawable";
         if (self.drawable_width <= 0.0 or self.drawable_height <= 0.0) return "the CAMetalLayer's drawableSize is zero, so every present targets nothing";
         if (self.view_width <= 0.0 or self.view_height <= 0.0) return "the content view has zero area";
-        if (!self.occlusionVisible()) return "the window is fully occluded; it presents happily and shows nothing";
+        if (!self.occlusionVisible()) return "the window is fully occluded by user-owned window ordering; presentation can continue, but screen visibility is unproven (do not raise it or steal focus)";
         return null;
     }
 };
