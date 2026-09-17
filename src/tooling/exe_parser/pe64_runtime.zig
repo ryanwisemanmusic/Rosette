@@ -11,6 +11,7 @@
 const std = @import("std");
 const parser = @import("pe_parser.zig");
 const pe_symbols = @import("pe_symbols.zig");
+const xenia_issue_draw_patch = @import("xenia_issue_draw_patch.zig");
 const fmt = @import("pe_format.zig");
 const imports_mod = @import("imports/imports.zig");
 const x64_decoder = @import("x64_decoder");
@@ -984,6 +985,10 @@ fn reportExitSummary() void {
     if (!state.windows_runtime_enabled) return;
     exit_summary_written = true;
     log.info("PE64 EXIT SUMMARY: writing the final chains at process exit (steps={d})", .{state.executed_steps});
+    // ExitProcess runs atexit handlers without returning through ElfState's
+    // normal run epilogue. Publish the terminal native Vulkan/pixel snapshot
+    // here as well; the state helper is idempotent for ordinary returns.
+    state.reportPresentChainFinal();
     state.reportFirstFrameChain();
     state.reportGuestOutputChain();
     state.reportGuestMilestones();
@@ -1114,12 +1119,17 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
     state.noteGuestRegion(state.heap_next, stack_limit -| state.heap_next, .guest_heap, "guest heap");
     state.noteGuestRegion(stack_limit, stack_base -| stack_limit, .guest_stack, "guest stacks");
     var executable_ranges: [elf.WINDOWS_EXECUTABLE_RANGE_CAPACITY]elf.WindowsExecutableRange = undefined;
+    var patch_ranges: [elf.WINDOWS_EXECUTABLE_RANGE_CAPACITY]xenia_issue_draw_patch.AddressRange = undefined;
     var executable_range_count: usize = 0;
     for (image.sections) |section| {
         if (section.mappedSize() == 0) continue;
         if (section.isExecutable() and executable_range_count < executable_ranges.len) {
             executable_ranges[executable_range_count] = .{
                 .guest_base = load_base +| section.virtual_address,
+                .length = section.mappedSize(),
+            };
+            patch_ranges[executable_range_count] = .{
+                .base = load_base +| section.virtual_address,
                 .length = section.mappedSize(),
             };
             executable_range_count += 1;
@@ -1223,6 +1233,46 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
         state.noteGuestMilestoneDataReferences(&data_refs);
     }
     try copyImage(&state, bytes, image, load_base);
+    // Xenia's primitive processor has already prepared the correct
+    // rectangle-list fallback for a no-geometry-shader host.  The current
+    // VulkanCommandProcessor binary rejects only that prepared shader enum in
+    // IssueDraw, before it can reach its own pipeline/index-buffer submission.
+    // Repair the loaded image before the first instruction is decoded.  This
+    // never writes `bytes` or the Xenia bundle, and a signature/cave failure is
+    // reported rather than silently turning an unknown binary into a patch
+    // target.
+    const issue_draw_patch_result = xenia_issue_draw_patch.apply(
+        state.mem,
+        load_base,
+        patch_ranges[0..executable_range_count],
+        .{
+            .issue_draw_address = symbol_index.addressOf(xenia_issue_draw_patch.issue_draw_symbol),
+            .symbol_index = &symbol_index,
+        },
+    );
+    switch (issue_draw_patch_result.status) {
+        .missing_symbol => log.info("PE64 Rosetta Vulkan compatibility: IssueDraw rectangle fallback patch not armed status=missing_symbol; this image does not expose the exact Xenia Vulkan IssueDraw symbol", .{}),
+        .applied => log.info("PE64 Rosetta Vulkan compatibility: IssueDraw rectangle fallback admission patched in loaded guest image target=0x{x} guard=0x{x} cave=0x{x} allow=0x{x} reject=0x{x}; Xenia's existing primitive processor, rectangle vertex shader, built-in index buffer, pipeline, and vkCmdDrawIndexed path remain the submission owner", .{
+            issue_draw_patch_result.target_address,
+            issue_draw_patch_result.guard_address,
+            issue_draw_patch_result.cave_address,
+            issue_draw_patch_result.allow_address,
+            issue_draw_patch_result.failure_address,
+        }),
+        .already_applied => log.info("PE64 Rosetta Vulkan compatibility: IssueDraw rectangle fallback admission was already patched in the loaded guest image target=0x{x} guard=0x{x} cave=0x{x}; patching is idempotent", .{
+            issue_draw_patch_result.target_address,
+            issue_draw_patch_result.guard_address,
+            issue_draw_patch_result.cave_address,
+        }),
+        else => log.warn("PE64 Rosetta Vulkan compatibility: IssueDraw rectangle fallback patch not applied status={s} target=0x{x} guard=0x{x} cave=0x{x} allow=0x{x} reject=0x{x}; the image was left unchanged", .{
+            @tagName(issue_draw_patch_result.status),
+            issue_draw_patch_result.target_address,
+            issue_draw_patch_result.guard_address,
+            issue_draw_patch_result.cave_address,
+            issue_draw_patch_result.allow_address,
+            issue_draw_patch_result.failure_address,
+        }),
+    }
     const condition_entries = discoverWindowsConditionEntries(image, bytes, load_base);
     state.configureWindowsConditionEntries(
         condition_entries.wait,

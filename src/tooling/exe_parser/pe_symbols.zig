@@ -147,6 +147,21 @@ pub const Index = struct {
         return null;
     }
 
+    /// Whether the COFF table has a symbol whose entry address is exactly
+    /// `address`.  Runtime compatibility patches use this to keep their code
+    /// caves out of symbol boundaries.  A padding run is normally safe by
+    /// itself, but a zero-sized label placed in that padding is still a live
+    /// address from the image's point of view and must not be overwritten.
+    pub fn hasExactAddress(self: *const Index, address: u64) bool {
+        if (address < self.image_base) return false;
+        const rva = address - self.image_base;
+        if (rva > std.math.maxInt(u32)) return false;
+        for (self.entries) |entry| {
+            if (entry.rva == @as(u32, @intCast(rva))) return true;
+        }
+        return false;
+    }
+
     /// Visit every symbol the index kept, with its loaded address.
     ///
     /// Added for the kernel-call census, which cannot ask for a name it does

@@ -29,6 +29,7 @@ extern fn rosette_macho_native_window_ensure(width: u32, height: u32, title: [*:
 extern fn rosette_macho_native_window_show() c_int;
 extern fn rosette_macho_native_window_pump_events() u32;
 extern fn rosette_macho_native_window_set_drawable_owner(owned_by_swapchain: c_int) c_int;
+extern fn rosette_macho_native_window_prepare_drawable_size(width: u32, height: u32) c_int;
 
 fn nativeEnsureApplication(_: ?*anyopaque) callconv(.c) c_int {
     if (comptime builtin.target.os.tag != .macos) return 0;
@@ -87,6 +88,12 @@ fn nativeMetalDrawableOwner(context: ?*anyopaque, owned_by_swapchain: c_int) cal
     _ = context;
     if (comptime builtin.target.os.tag != .macos) return 0;
     return rosette_macho_native_window_set_drawable_owner(owned_by_swapchain);
+}
+
+fn nativeMetalDrawablePrepare(context: ?*anyopaque, width: u32, height: u32) callconv(.c) c_int {
+    _ = context;
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    return rosette_macho_native_window_prepare_drawable_size(width, height);
 }
 
 fn nativeVulkanDispatch(
@@ -210,6 +217,7 @@ fn windowsGraphicsHooks(native_context: ?*anyopaque) pe64_runtime.GraphicsHooks 
         .native_vulkan_dispatch = nativeVulkanDispatch,
         .native_metal_layer_host_pointer = nativeMetalLayerHostPointer,
         .native_metal_drawable_owner = nativeMetalDrawableOwner,
+        .native_metal_drawable_prepare = nativeMetalDrawablePrepare,
         .report_present_chain = nativeReportPresentChain,
         .report_present_chain_full = nativeReportPresentChainFull,
         .update_present_diagnostics = nativeUpdatePresentDiagnostics,
