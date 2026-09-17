@@ -21,6 +21,7 @@ const xenia_warning_severity_map = @import("xenia_warning_severity_map");
 const xenia_guest_milestone_map = @import("xenia_guest_milestone_map");
 const xenia_guest_address_map = @import("xenia_guest_address_map");
 const frame_content_contract = @import("frame_content_contract");
+const screen_validity = @import("screen_validity");
 /// What a guest address is when no symbol names it. The subsystem lives in
 /// its own file; this module only holds the map and asks it questions.
 const guest_address_space = @import("guest_address_space.zig");
@@ -49,6 +50,7 @@ const kernel_call_census = @import("kernel_call_census.zig");
 const xenia_kernel_shim_map = @import("xenia_kernel_shim_map");
 /// The performance counter Rosette publishes to the guest, and what it counts.
 const guest_clock = @import("guest_clock.zig");
+const wait_cost = @import("wait_cost.zig");
 
 /// One resolved guest symbol. `name` points into a buffer the caller owns for
 /// the duration of the call and is never retained.
@@ -235,7 +237,12 @@ pub const WindowsAllocationRefusal = struct {
     commit_requested: bool = false,
 };
 
-pub const MAX_WINDOWS_ALLOCATION_RELOCATIONS: usize = 16;
+/// Fixed-address PE arenas normally have fewer than twenty relocation sites.
+/// Sixteen made the report silently lose distinct call sites in the observed
+/// run, so leave enough room for the complete bootstrap and retain a small
+/// digest for pathological images beyond this bound.
+pub const MAX_WINDOWS_ALLOCATION_RELOCATIONS: usize = 64;
+pub const MAX_WINDOWS_ALLOCATION_RELOCATION_OVERFLOW_SAMPLES: usize = 8;
 
 /// One fixed allocation Rosetta moved to the next candidate in Xenia's own
 /// deterministic context arena. The guest receives `actual_base`; the
@@ -246,6 +253,7 @@ pub const WindowsAllocationRelocation = struct {
     length: u64 = 0,
     caller_rip: u64 = 0,
     step: u64 = 0,
+    last_step: u64 = 0,
     occurrences: u64 = 0,
 };
 
@@ -823,6 +831,10 @@ const MAX_WINDOWS_WAIT_OBJECTS: usize = 2048;
 const WINDOWS_PTHREAD_ETIMEDOUT: u64 = 138;
 /// Distinct call sites of timed condition waits a run keeps.
 const WINDOWS_TIMED_WAIT_SITE_CAPACITY: usize = 16;
+/// The first few deadline expiries carry the full wait context. After that the
+/// aggregate/site counters remain active, but the recurring poll cannot turn
+/// the log into one line per half-second.
+const WINDOWS_TIMED_CONDITION_TIMEOUT_SAMPLE_LIMIT: u8 = 10;
 
 /// One place in the guest that makes timed condition waits, and how they end.
 const WindowsTimedWaitSite = struct {
@@ -833,7 +845,52 @@ const WindowsTimedWaitSite = struct {
     signalled: u64 = 0,
     immediate: u64 = 0,
     last_milliseconds: u64 = 0,
+    last_condition: u64 = 0,
+    last_mutex: u64 = 0,
+    last_thread_handle: u64 = 0,
+    last_thread_id: u64 = 0,
 };
+
+const WindowsTimedWaitClassification = enum {
+    no_timeout,
+    short_periodic_poll_candidate,
+    possible_lost_wakeup,
+    mixed_timeout_signal,
+
+    fn label(self: WindowsTimedWaitClassification) []const u8 {
+        return switch (self) {
+            .no_timeout => "no_timeout",
+            .short_periodic_poll_candidate => "short_periodic_poll_candidate",
+            .possible_lost_wakeup => "possible_lost_wakeup",
+            .mixed_timeout_signal => "mixed_timeout_signal",
+        };
+    }
+
+    fn action(self: WindowsTimedWaitClassification) []const u8 {
+        return switch (self) {
+            .no_timeout => "no timeout evidence yet",
+            .short_periodic_poll_candidate => "correlate the caller with the optional-service poll; this is not a graphics blocker unless a producer depends on this condition",
+            .possible_lost_wakeup => "find the missing signal or broadcast before changing the timeout",
+            .mixed_timeout_signal => "inspect signal ordering and the condition owner for a race or an intentionally periodic wait",
+        };
+    }
+};
+
+fn classifyWindowsTimedWaitSite(site: WindowsTimedWaitSite) WindowsTimedWaitClassification {
+    if (site.timeouts == 0) return .no_timeout;
+    const timeout_dominates = site.timeouts >= 8 and
+        (site.signalled == 0 or site.timeouts >= site.signalled +| site.signalled +| site.signalled +| site.signalled);
+    if (site.last_milliseconds != 0 and site.last_milliseconds <= 2_000 and timeout_dominates) {
+        return .short_periodic_poll_candidate;
+    }
+    if (site.signalled == 0) return .possible_lost_wakeup;
+    return .mixed_timeout_signal;
+}
+
+fn windowsTimedWaitPercent(part: u64, total: u64) u8 {
+    if (total == 0) return 0;
+    return @intCast(@min(@as(u64, 100), (part *| 100) / total));
+}
 /// Clock reads inside one worker slice that make the slice a poll.
 const WINDOWS_CLOCK_POLL_YIELD_READS: u32 = 16;
 /// Instructions, owner and workers together, between two run heartbeats.
@@ -862,6 +919,14 @@ const WINDOWS_TEB_LAST_ERROR_OFFSET: u64 = 0x68;
 // state. This is a scheduling bound, not a correctness timeout: the worker
 // context is saved and resumed at the next explicit cooperative point.
 const WINDOWS_GUEST_THREAD_SERVICE_SLICE: u64 = 10_000;
+/// Where in a worker slice the spin probe records the machine state, and how
+/// many instructions after it a repeat of that exact state is looked for. A
+/// poll loop returns to the same instruction with the same registers every
+/// iteration; a compute loop advances a pointer or a count and never does.
+const WINDOWS_GUEST_SPIN_PROBE_AT: u64 = 1024;
+const WINDOWS_GUEST_SPIN_PROBE_SPAN: u64 = 256;
+/// The most turns a spinning thread gives away in a row.
+const WINDOWS_GUEST_SPIN_MAX_BACKOFF: u8 = 8;
 const WINDOWS_GUEST_THREAD_SERVICE_OWNER_STRIDE: u64 = 1_000;
 // A PE title can spend millions of owner-thread instructions in a compute
 // routine that contains no PAUSE, wait, or message-pump call.  Keep worker
@@ -874,6 +939,13 @@ const WINDOWS_GUEST_THREAD_SCHEDULER_QUANTUM: u64 = 1_000_000;
 /// owns the counter and the reasoning behind what it counts.
 pub const WINDOWS_GUEST_CLOCK_HZ: u64 = guest_clock.hz;
 const WINDOWS_GUEST_CLOCK_SAMPLE_STRIDE: u64 = guest_clock.sample_stride;
+
+/// A condition wait is ordinary immediately after it is entered: its
+/// predicate may be about to become true.  Escalate only after a meaningful
+/// amount of guest work or guest time has passed, so the forensic trigger
+/// describes a sustained absence of notification rather than startup noise.
+const WINDOWS_WAIT_ESCALATION_MIN_AGE_STEPS: u64 = 1_000_000;
+const WINDOWS_WAIT_ESCALATION_MIN_AGE_TICKS: u64 = WINDOWS_GUEST_CLOCK_HZ / 10;
 
 /// Guest clock ticks in one guest millisecond, which is the unit every Win32
 /// timeout is expressed in.
@@ -1142,6 +1214,48 @@ pub const WindowsVirtualAllocation = struct {
     code_generation: u64 = 1,
 };
 
+/// A driver-owned mapping, borrowed only until vkUnmapMemory/free/device
+/// destruction. Do not copy it into a second CPU allocation: coherent Vulkan
+/// memory must retain one identity for CPU stores, GPU stores and readback.
+const NativeMemoryAlias = struct {
+    guest_base: u64 = 0,
+    bytes: ?[]u8 = null,
+    reserved_span: u64 = 0,
+    slot_base: u64 = 0,
+};
+const native_alias_address_base: u64 = 0x70_0000_0000;
+const native_alias_address_limit: u64 = 0x400_0000_0000;
+const native_alias_alignment: u64 = 0x1_0000_0000;
+
+test "borrowed native memory is bounded, collision-safe, reused and never freed by ElfState" {
+    var state = ElfState.init(std.testing.allocator);
+    var bytes = [_]u8{ 1, 2, 3, 4 };
+    const alias = state.borrowNativeMemory(&bytes).?;
+    try std.testing.expectEqual(@as(u32, 0x04030201), state.read32(alias));
+    state.write32(alias, 0x08070605);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 6, 7, 8 }, &bytes);
+    // Bulk Windows CRT writes must use the same borrowed bytes, not just the
+    // interpreter's scalar/vector store helpers.
+    const source = state.mem_base + 0x2000;
+    state.write32(source, 0x0c0b0a09);
+    state.windows_runtime_enabled = true;
+    state.regs.rcx = alias;
+    state.regs.rdx = source;
+    state.regs.r8 = 4;
+    try std.testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ucrtbase.dll", "memcpy", state.mem_base + 0x1000));
+    try std.testing.expectEqualSlices(u8, &.{ 9, 10, 11, 12 }, &bytes);
+    try std.testing.expect(!state.createWindowsVirtualAllocation(alias, 4096));
+    try std.testing.expect(!state.createWindowsVirtualAllocation(alias & ~@as(u64, 4095), 4096));
+    try std.testing.expect(state.guestMemory(alias, 5) == null);
+    try std.testing.expect(state.guestMemory(std.math.maxInt(u64), 2) == null);
+    state.releaseNativeMemory(alias);
+    try std.testing.expect(state.guestMemory(alias, 1) == null);
+    try std.testing.expectEqual(alias, state.borrowNativeMemory(&bytes).?);
+    state.deinit(); // Stack bytes still belong to this test, not munmap/free.
+    bytes[0] = 9;
+    try std.testing.expectEqual(@as(u8, 9), bytes[0]);
+}
+
 /// A bounded view into one fixed Windows VirtualAlloc range.  PE64 execution
 /// normally fetches from the image, but Xenia's x64 backend emits guest
 /// instructions into these Rosette-owned ranges and then dispatches to them.
@@ -1320,6 +1434,18 @@ const WindowsGuestThreadStatus = enum(u8) {
     failed,
 };
 
+/// A non-vacant slot is not necessarily a living worker.  Completed
+/// one-shot workers remain in the table until their handle can be retired, so
+/// counting occupancy as liveness makes a normal exit look like a missing
+/// thread.  Keep this predicate beside the status enum so every diagnostic
+/// uses the same lifecycle definition.
+fn isLiveWindowsGuestThread(status: WindowsGuestThreadStatus) bool {
+    return switch (status) {
+        .pending, .runnable, .running, .blocked => true,
+        .vacant, .completed, .failed => false,
+    };
+}
+
 const WindowsSrwLock = struct {
     address: u64 = 0,
     owner_thread_id: u64 = 0,
@@ -1409,6 +1535,16 @@ const WindowsGuestThread = struct {
     // deadline expires.  Zero means an infinite wait or a non-Wait boundary.
     blocked_wait_timeout: u64 = 0,
     blocked_wait_deadline: u64 = 0,
+    /// Monotonic age of the current park. The wait fields above are cleared
+    /// as soon as a producer wakes a worker, so these survive until the
+    /// resumed import consumes the one-shot result and closes the wait-cost
+    /// record.
+    blocked_since_total_steps: u64 = 0,
+    blocked_since_guest_ticks: u64 = 0,
+    wait_cost_site: u8 = 0,
+    wait_cost_start_step: u64 = 0,
+    wait_cost_start_ticks: u64 = 0,
+    wait_cost_deadline: u64 = 0,
     /// The last Windows import this thread called, and when.
     ///
     /// The question that follows every spin: what was the thread doing
@@ -1435,6 +1571,10 @@ const WindowsGuestThread = struct {
     last_kernel_slot: u32 = 0,
     last_kernel_step: u64 = 0,
     kernel_calls: u64 = 0,
+    /// Turns this thread still gives away, and the size of its current
+    /// backoff; see `noteWindowsGuestSliceShape`.
+    spin_skip_remaining: u8 = 0,
+    spin_backoff: u8 = 0,
     /// A call on this thread whose return value is wanted. See
     /// `GuestReturnCapture`.
     return_capture: GuestReturnCapture = .{},
@@ -1480,6 +1620,10 @@ const WindowsGuestThread = struct {
     condition_resume_timeout: bool = false,
     /// The timed-wait site of the wait this thread is in, plus one.
     timed_wait_site: u8 = 0,
+    /// The requested interval retained for timeout diagnostics. The generic
+    /// blocked-wait field is intentionally cleared for condition waits, so
+    /// keep this separate until the waiter has actually returned.
+    timed_wait_milliseconds: u64 = 0,
     context: WindowsGuestThreadContext = .{},
 
     /// Whether a signal on `handle` concerns this thread's wait.
@@ -2112,6 +2256,11 @@ pub const WindowsGraphicsHooks = struct {
     /// `CAMetalLayer`'s `drawableSize`. Absent on a host with no AppKit
     /// bridge, where there is no layer to hand over.
     native_metal_drawable_owner: ?*const fn (?*anyopaque, c_int) callconv(.c) c_int = null,
+    /// Prepare the layer's pixel extent immediately before the real Vulkan
+    /// swapchain is created. This is separate from ownership: MoltenVK must
+    /// see the intended drawable size during capability negotiation, while
+    /// the bridge must not write it after the swapchain starts vending images.
+    native_metal_drawable_prepare: ?*const fn (?*anyopaque, u32, u32) callconv(.c) c_int = null,
 };
 
 /// The host audio device, reached the same way the window is: optional C-ABI
@@ -2884,6 +3033,11 @@ pub const ElfState = struct {
     // formatted value was already present in the source temporary or was
     // introduced while copying it into Xenia's config buffer.
     trace_string_memory: bool = false,
+    // These two traces are checked around every interpreted instruction when
+    // enabled. Resolve their environment policy once at state construction;
+    // getenv is a host call and must never sit in the PE hot path.
+    trace_vector: bool = false,
+    trace_utf8: bool = false,
     // Boundary-only scheduler tracing. Unlike ABI diagnostics this emits no
     // per-import records, so it can identify a worker that repeatedly yields
     // at one guest lock without changing the hot instruction path materially.
@@ -3120,6 +3274,9 @@ pub const ElfState = struct {
         [_]WindowsAllocationRelocation{.{}} ** MAX_WINDOWS_ALLOCATION_RELOCATIONS,
     windows_allocation_relocation_count: u32 = 0,
     windows_allocation_relocation_overflow: u64 = 0,
+    windows_allocation_relocation_overflow_records: [MAX_WINDOWS_ALLOCATION_RELOCATION_OVERFLOW_SAMPLES]WindowsAllocationRelocation =
+        [_]WindowsAllocationRelocation{.{}} ** MAX_WINDOWS_ALLOCATION_RELOCATION_OVERFLOW_SAMPLES,
+    windows_allocation_relocation_overflow_record_count: u32 = 0,
     windows_proc_refusals: [MAX_WINDOWS_DYNAMIC_REFUSALS]WindowsDynamicRefusal =
         [_]WindowsDynamicRefusal{.{}} ** MAX_WINDOWS_DYNAMIC_REFUSALS,
     windows_proc_refusal_count: u32 = 0,
@@ -3362,6 +3519,9 @@ pub const ElfState = struct {
     windows_memory_view_count: usize = 0,
     windows_virtual_allocations: [MAX_WINDOWS_VIRTUAL_ALLOCATIONS]WindowsVirtualAllocation = [_]WindowsVirtualAllocation{.{}} ** MAX_WINDOWS_VIRTUAL_ALLOCATIONS,
     windows_virtual_allocation_count: usize = 0,
+    native_memory_aliases: [256]NativeMemoryAlias = @splat(.{}),
+    native_memory_alias_count: usize = 0,
+    native_memory_alias_next: u64 = native_alias_address_base,
     /// Executable PE sections and a generation invalidated only by writes
     /// that overlap one of them.  Data writes therefore do not evict the
     /// image's decode cache, while self-modifying code still does.
@@ -3543,6 +3703,16 @@ pub const ElfState = struct {
     windows_wait_resumes: u64 = 0,
     windows_wait_unblocks: u64 = 0,
     windows_wait_timeouts: u64 = 0,
+    /// Per-wait duration, timeout overshoot, and signal accounting. The
+    /// legacy counters above remain cheap scheduler counters; this ledger is
+    /// the bounded evidence needed to identify a poll that consumed the run.
+    windows_wait_cost: wait_cost.Ledger = .{},
+    /// One-shot forensic triggers emitted from the bounded wait ledger. They
+    /// are counters rather than booleans because a condition can be resolved
+    /// and later become a new episode, while a timeout hotspot is reported
+    /// once for the lifetime of the run.
+    windows_wait_unsignalled_escalations: u64 = 0,
+    windows_wait_timeout_hotspot_escalations: u64 = 0,
     windows_wait_unknown_objects: u64 = 0,
     windows_wait_trace_events: u64 = 0,
     windows_wait_registration_trace_events: u64 = 0,
@@ -3585,6 +3755,7 @@ pub const ElfState = struct {
     windows_condition_timed_waits: u64 = 0,
     windows_condition_timed_immediate: u64 = 0,
     windows_condition_timeouts: u64 = 0,
+    windows_condition_timeout_samples: u8 = 0,
     /// Waitable timers. CreateWaitableTimer used to hand back a handle no
     /// wait table knew, so every wait on it answered STATUS_INVALID_HANDLE
     /// at once: the 2026-09-14 run made 36,978 of them from
@@ -3598,6 +3769,10 @@ pub const ElfState = struct {
     /// Stacks returned to the guest heap when their thread finished, not
     /// when its slot was next reused.
     windows_thread_stacks_released: u64 = 0,
+    /// Worker slices that repeated an exact machine state with no kernel call,
+    /// and the scheduling turns spinning threads gave away because of it.
+    windows_spin_slices: u64 = 0,
+    windows_spin_turns_given: u64 = 0,
     windows_nt_delay_parks: u64 = 0,
     windows_nt_delay_yields: u64 = 0,
     windows_slice_clock_reads: u32 = 0,
@@ -3638,6 +3813,11 @@ pub const ElfState = struct {
     windows_message_drops: u64 = 0,
     windows_paint_requests: u64 = 0,
     windows_paint_deliveries: u64 = 0,
+    /// The PE may terminate through ExitProcess, which runs the loader's
+    /// atexit summary without returning through runWithLimit's epilogue. Keep
+    /// the final host-side Vulkan snapshot idempotent so both exits publish
+    /// the terminal frame state and neither duplicates it.
+    windows_present_chain_final_reported: bool = false,
     windows_message_dispatch_frames: [MAX_WINDOWS_MESSAGE_DISPATCH_FRAMES]WindowsMessageDispatchFrame = [_]WindowsMessageDispatchFrame{.{}} ** MAX_WINDOWS_MESSAGE_DISPATCH_FRAMES,
     windows_message_dispatch_frame_count: usize = 0,
     windows_audio_callback_frames: [MAX_WINDOWS_AUDIO_CALLBACK_FRAMES]WindowsAudioCallbackFrame = [_]WindowsAudioCallbackFrame{.{}} ** MAX_WINDOWS_AUDIO_CALLBACK_FRAMES,
@@ -3707,6 +3887,11 @@ pub const ElfState = struct {
     windows_direct_stub_count: usize = 0,
     windows_dynamic_stub_start: usize = 0,
     windows_graphics: WindowsGraphicsState = .{},
+    /// Rosetta's local screen verdict is deliberately stricter than a
+    /// successful Vulkan call. The native bridge may have richer pixel
+    /// evidence, but this state must never call transport-only traffic a
+    /// valid picture when that evidence has not crossed the seam.
+    windows_screen_validity: screen_validity.Ledger = .{},
     windows_present_no_work_checkpoints: u32 = 0,
     windows_present_no_work_reported: bool = false,
     /// Said once that the no-presents verdict is being held because the guest
@@ -3763,6 +3948,8 @@ pub const ElfState = struct {
         state.trace_formatter = envFlag("ROSETTA_ELF_TRACE_FORMATTER");
         state.trace_formatter_address = envU64("ROSETTA_ELF_TRACE_FORMATTER_ADDRESS");
         state.trace_string_memory = envFlag("ROSETTA_ELF_TRACE_STRING_MEMORY") or envFlag("ROSETTE_ELF_TRACE_STRING_MEMORY");
+        state.trace_vector = envFlag("ROSETTE_ELF_TRACE_VECTOR");
+        state.trace_utf8 = envFlag("ROSETTE_ELF_TRACE_UTF8");
         state.trace_windows_threads = envFlag("ROSETTA_ELF_TRACE_WINDOWS_THREADS");
         state.trace_windows_messages = envFlag("ROSETTA_ELF_TRACE_WINDOWS_MESSAGES");
         state.trace_windows_audio = envFlag("ROSETTE_ELF_TRACE_WINDOWS_AUDIO") or envFlag("ROSETTA_ELF_TRACE_WINDOWS_AUDIO");
@@ -3851,6 +4038,9 @@ pub const ElfState = struct {
             if (allocation.backing) |backing| std.posix.munmap(backing);
             allocation.* = .{};
         }
+        // The Vulkan driver, not ElfState, owns these bytes.
+        @memset(&self.native_memory_aliases, .{});
+        self.native_memory_alias_count = 0;
         if (self.windows_heap_allocations.len != 0) self.allocator.free(self.windows_heap_allocations);
         if (self.windows_heap_free_indices.len != 0) self.allocator.free(self.windows_heap_free_indices);
         if (self.interactive_output_path) |path| self.allocator.free(path);
@@ -4004,6 +4194,86 @@ pub const ElfState = struct {
         }
     }
 
+    fn beginWindowsWaitAccounting(
+        self: *ElfState,
+        thread: *WindowsGuestThread,
+        key: u64,
+        kind: wait_cost.WaitKind,
+        timeout_milliseconds: u64,
+        deadline: u64,
+    ) void {
+        if (thread.wait_cost_site != 0) return;
+        const accounting_step = self.totalInterpretedSteps();
+        const ticks = self.guest_clock.ticks;
+        thread.wait_cost_site = self.windows_wait_cost.begin(key, kind, accounting_step, ticks, timeout_milliseconds);
+        thread.wait_cost_start_step = accounting_step;
+        thread.wait_cost_start_ticks = ticks;
+        thread.wait_cost_deadline = deadline;
+        thread.blocked_since_total_steps = accounting_step;
+        thread.blocked_since_guest_ticks = ticks;
+    }
+
+    fn endWindowsWaitAccounting(self: *ElfState, thread: *WindowsGuestThread, outcome: wait_cost.Outcome) void {
+        if (thread.wait_cost_site != 0) {
+            self.windows_wait_cost.end(
+                thread.wait_cost_site,
+                outcome,
+                thread.wait_cost_start_step,
+                thread.wait_cost_start_ticks,
+                self.totalInterpretedSteps(),
+                self.guest_clock.ticks,
+                thread.wait_cost_deadline,
+            );
+        }
+        thread.wait_cost_site = 0;
+        thread.wait_cost_start_step = 0;
+        thread.wait_cost_start_ticks = 0;
+        thread.wait_cost_deadline = 0;
+        thread.blocked_since_total_steps = 0;
+        thread.blocked_since_guest_ticks = 0;
+    }
+
+    fn endWindowsWaitAccountingIfKind(
+        self: *ElfState,
+        thread: *WindowsGuestThread,
+        kind: wait_cost.WaitKind,
+        outcome: wait_cost.Outcome,
+    ) void {
+        if (thread.wait_cost_site == 0) return;
+        const index = @as(usize, thread.wait_cost_site) - 1;
+        if (index >= self.windows_wait_cost.count or self.windows_wait_cost.sites[index].kind != kind) return;
+        self.endWindowsWaitAccounting(thread, outcome);
+    }
+
+    fn endWindowsHandleWaitAccounting(self: *ElfState, thread: *WindowsGuestThread, outcome: wait_cost.Outcome) void {
+        if (thread.wait_cost_site == 0) return;
+        const index = @as(usize, thread.wait_cost_site) - 1;
+        if (index >= self.windows_wait_cost.count) return;
+        switch (self.windows_wait_cost.sites[index].kind) {
+            .finite_handle, .infinite_handle, .multiple => self.endWindowsWaitAccounting(thread, outcome),
+            else => {},
+        }
+    }
+
+    fn noteWindowsWaitSignal(self: *ElfState, key: u64) void {
+        const thread_handle = if (self.windows_active_guest_thread_slot) |slot|
+            self.windows_guest_threads[slot].handle
+        else
+            self.active_guest_thread;
+        self.windows_wait_cost.signal(
+            key,
+            self.totalInterpretedSteps(),
+            self.guest_clock.ticks,
+            .{ .thread_handle = thread_handle, .rip = self.last_instruction_rip },
+        );
+    }
+
+    fn endActiveWindowsSrwWaitAccounting(self: *ElfState) void {
+        if (self.windows_active_guest_thread_slot) |index| {
+            self.endWindowsWaitAccountingIfKind(&self.windows_guest_threads[index], .srw_lock, .signaled);
+        }
+    }
+
     /// Park the active worker for a guest-millisecond interval.
     ///
     /// `Sleep(n)` used to return immediately, which turns every timed back-off
@@ -4026,6 +4296,13 @@ pub const ElfState = struct {
         thread.blocked_wait_timeout = milliseconds;
         thread.blocked_wait_deadline = self.guest_clock.ticks +|
             (milliseconds *| WINDOWS_GUEST_CLOCK_TICKS_PER_MILLISECOND);
+        self.beginWindowsWaitAccounting(
+            thread,
+            0,
+            .deadline,
+            milliseconds,
+            thread.blocked_wait_deadline,
+        );
         self.windows_thread_blocks +|= 1;
         self.windows_guest_sleep_parks +|= 1;
         return true;
@@ -4049,6 +4326,13 @@ pub const ElfState = struct {
         thread.blocked_condition_mutex = 0;
         thread.blocked_wait_timeout = std.math.divCeil(u64, ticks, WINDOWS_GUEST_CLOCK_TICKS_PER_MILLISECOND) catch 0;
         thread.blocked_wait_deadline = self.guest_clock.ticks +| ticks;
+        self.beginWindowsWaitAccounting(
+            thread,
+            0,
+            .deadline,
+            thread.blocked_wait_timeout,
+            thread.blocked_wait_deadline,
+        );
         self.windows_thread_blocks +|= 1;
         self.windows_nt_delay_parks +|= 1;
         return true;
@@ -4660,7 +4944,7 @@ pub const ElfState = struct {
         const now = self.guest_clock.ticks;
         // A timer that fires wins over a timeout falling due in the same sweep.
         woken +|= self.fireDueWindowsTimers(now);
-        for (&self.windows_guest_threads) |*thread| {
+        for (&self.windows_guest_threads, 0..) |*thread, slot| {
             if (thread.status != .blocked or thread.blocked_wait_deadline == 0 or
                 now < thread.blocked_wait_deadline)
             {
@@ -4670,6 +4954,7 @@ pub const ElfState = struct {
                 // A timed condition wait ran out. It resumes the way a
                 // signalled waiter does, through its mutex, and returns
                 // ETIMEDOUT instead of zero.
+                self.noteWindowsTimedConditionTimeout(thread, slot, now);
                 thread.status = .runnable;
                 thread.blocked_condition = 0;
                 thread.blocked_wait_deadline = 0;
@@ -4697,6 +4982,7 @@ pub const ElfState = struct {
             thread.wait_resume = handle != 0;
             thread.wait_resume_handle = handle;
             thread.wait_resume_timeout = handle != 0;
+            if (handle == 0) self.endWindowsWaitAccountingIfKind(thread, .deadline, .timed_out);
             self.windows_thread_unblocks +|= 1;
             self.windows_wait_unblocks +|= 1;
             woken +|= 1;
@@ -4710,6 +4996,7 @@ pub const ElfState = struct {
     pub fn signalWindowsWaitObject(self: *ElfState, handle: u64, pulse: bool) u64 {
         const index = self.windowsWaitObjectIndex(handle) orelse return 0;
         const object = &self.windows_wait_objects[index];
+        self.noteWindowsWaitSignal(handle);
         object.signaled = true;
         const woken = self.wakeWindowsGuestThreadsForWait(handle, object.manual_reset);
         if (object.kind == .semaphore and object.count == 0) object.count = 1;
@@ -4746,6 +5033,7 @@ pub const ElfState = struct {
         const index = self.windowsWaitObjectIndex(handle) orelse return false;
         const object = &self.windows_wait_objects[index];
         if (object.kind != .semaphore or release_count == 0) return false;
+        self.noteWindowsWaitSignal(handle);
         const maximum = if (object.maximum == 0) std.math.maxInt(u32) else object.maximum;
         const increment: u32 = @intCast(@min(release_count, std.math.maxInt(u32)));
         object.count = @min(maximum, object.count +| increment);
@@ -4780,10 +5068,12 @@ pub const ElfState = struct {
                 thread.blocked_wait_timeout = 0;
                 self.windows_wait_resumes +|= 1;
                 if (resumed_by_timeout) {
+                    self.endWindowsHandleWaitAccounting(thread, .timed_out);
                     self.windows_wait_timeouts +|= 1;
                     self.traceWindowsWaitDecision(handle, waited_timeout, .timeout);
                     return .timeout;
                 }
+                self.endWindowsHandleWaitAccounting(thread, .signaled);
                 return .signaled;
             }
         }
@@ -4832,6 +5122,13 @@ pub const ElfState = struct {
             thread.blocked_condition_mutex = 0;
             thread.condition_resume = false;
             thread.wait_resume_timeout = false;
+            self.beginWindowsWaitAccounting(
+                thread,
+                handle,
+                if (timeout == std.math.maxInt(u32)) .infinite_handle else .finite_handle,
+                timeout,
+                thread.blocked_wait_deadline,
+            );
             self.windows_thread_blocks +|= 1;
             self.windows_wait_blocks +|= 1;
             self.traceWindowsWaitDecision(handle, timeout, .blocked);
@@ -4885,11 +5182,13 @@ pub const ElfState = struct {
                     thread.blocked_wait_timeout = 0;
                     self.windows_wait_resumes +|= 1;
                     if (by_timeout) {
+                        self.endWindowsWaitAccountingIfKind(&self.windows_guest_threads[index], .multiple, .timed_out);
                         thread.multi_wait_deadline = 0;
                         self.windows_wait_timeouts +|= 1;
                         return .timeout;
                     }
                     if (!recheck) {
+                        self.endWindowsWaitAccountingIfKind(&self.windows_guest_threads[index], .multiple, .signaled);
                         thread.multi_wait_deadline = 0;
                         return .{ .signaled = @intCast(woken_index) };
                     }
@@ -4899,6 +5198,12 @@ pub const ElfState = struct {
         }
 
         if (self.takeReadyWindowsWaitObjects(handles, wait_all)) |result| {
+            if (self.windows_active_guest_thread_slot) |index| {
+                switch (result) {
+                    .signaled => self.endWindowsWaitAccountingIfKind(&self.windows_guest_threads[index], .multiple, .signaled),
+                    else => {},
+                }
+            }
             self.clearActiveMultiWaitDeadline();
             return result;
         }
@@ -4930,6 +5235,7 @@ pub const ElfState = struct {
             thread.blocked_condition_mutex = 0;
             thread.condition_resume = false;
             thread.wait_resume_timeout = false;
+            self.beginWindowsWaitAccounting(thread, handles[0], .multiple, timeout, deadline);
             self.windows_thread_blocks +|= 1;
             self.windows_wait_blocks +|= 1;
             self.windows_wait_multiple_blocks +|= 1;
@@ -5039,16 +5345,87 @@ pub const ElfState = struct {
         }
     }
 
+    /// Keep the last concrete wait identity beside the site aggregate. The
+    /// first ten expiry records already carry this information, but retaining
+    /// it here makes the final site line actionable even when the run is too
+    /// long for a reader to scroll back to those samples.
+    fn rememberWindowsTimedWaitContext(
+        self: *ElfState,
+        site: u8,
+        slot: usize,
+        condition: u64,
+        mutex: u64,
+    ) void {
+        if (site == 0 or site > self.windows_timed_wait_site_count) return;
+        const record = &self.windows_timed_wait_sites[site - 1];
+        record.last_condition = condition;
+        record.last_mutex = mutex;
+        record.last_thread_handle = self.windows_guest_threads[slot].handle;
+        record.last_thread_id = self.windows_guest_threads[slot].thread_id;
+    }
+
+    /// Emit the first ten deadline expiries with enough context to identify
+    /// the waiter, not merely the fact that a periodic wait happened. The
+    /// aggregate counters remain unbounded; only this detailed sample is
+    /// bounded so a 500 ms poll cannot dominate a long Xenia run's log.
+    fn noteWindowsTimedConditionTimeout(self: *ElfState, thread: *const WindowsGuestThread, slot: usize, now: u64) void {
+        if (self.windows_condition_timeout_samples >= WINDOWS_TIMED_CONDITION_TIMEOUT_SAMPLE_LIMIT) return;
+        self.windows_condition_timeout_samples += 1;
+        if (comptime @import("builtin").is_test) return;
+
+        const site = thread.timed_wait_site;
+        const site_index: ?usize = if (site != 0 and @as(usize, site) <= self.windows_timed_wait_site_count)
+            @as(usize, site) - 1
+        else
+            null;
+        const caller_address = if (site_index) |index| self.windows_timed_wait_sites[index].caller else 0;
+        var caller_text: [guest_symbol_text_bytes]u8 = undefined;
+        var rip_text: [guest_symbol_text_bytes]u8 = undefined;
+        const caller = if (caller_address == 0)
+            if (site == 0) "<site-table-full>" else "<unknown>"
+        else
+            self.describeGuestAddressOrUnnamed(caller_address, &caller_text);
+        const rip = if (thread.context.last_instruction_rip != 0)
+            thread.context.last_instruction_rip
+        else
+            thread.context.regs.rip;
+        const thread_name = if (thread.name_len != 0) thread.nameText() else "<unnamed>";
+        const last_import = if (thread.last_import_len != 0) thread.lastImportText() else "<none>";
+        log.info("PE64 TIMED WAIT TIMEOUT SAMPLE: sample={d}/{d} slot={d} caller={s} thread={s} handle=0x{x} thread_id={d} condition=0x{x} mutex=0x{x} timeout_ms={d} deadline_ticks={d} now_ticks={d} overdue_ticks={d} rip=0x{x} at={s} last_import={s} last_import_step={d} owner_step={d} wait_model=guest_clock_deadline safe_action=return_ETIMEDOUT synthetic_signal=0", .{
+            self.windows_condition_timeout_samples,
+            WINDOWS_TIMED_CONDITION_TIMEOUT_SAMPLE_LIMIT,
+            slot,
+            caller,
+            thread_name,
+            thread.handle,
+            thread.thread_id,
+            thread.blocked_condition,
+            thread.blocked_condition_mutex,
+            thread.timed_wait_milliseconds,
+            thread.blocked_wait_deadline,
+            now,
+            now -| thread.blocked_wait_deadline,
+            rip,
+            self.describeGuestAddressOrUnnamed(rip, &rip_text),
+            last_import,
+            thread.last_import_step,
+            self.executed_steps,
+        });
+    }
+
     /// Where timed condition waits come from and how they end, busiest first
     /// up to `limit` sites.
     fn reportWindowsTimedWaitSites(self: *const ElfState, limit: usize) void {
         if (self.windows_timed_wait_site_count == 0) return;
         var timeouts: u64 = 0;
         for (self.windows_timed_wait_sites[0..self.windows_timed_wait_site_count]) |site| timeouts +|= site.timeouts;
-        log.info("PE64 TIMED WAIT SITES: {d} site(s), {d} timed condition wait(s), {d} timed out; a site whose waits all time out waits on a condition nobody signals - a periodic loop when the interval is its purpose (discord-rpc polls its IO every 500 ms), a lost wakeup when it is not", .{
+        log.info("PE64 TIMED WAIT SITES: {d} site(s), {d} timed condition wait(s), {d} timed out, first_timeout_samples={d}/{d}, suppressed={d}; inspect each site's classification and action: timeout-dominant short waits are polling candidates, while unsignalled long waits need a lost-wakeup investigation", .{
             self.windows_timed_wait_site_count,
             self.windows_condition_timed_waits,
             timeouts,
+            self.windows_condition_timeout_samples,
+            WINDOWS_TIMED_CONDITION_TIMEOUT_SAMPLE_LIMIT,
+            self.windows_condition_timeouts -| @as(u64, self.windows_condition_timeout_samples),
         });
         var printed = [_]bool{false} ** WINDOWS_TIMED_WAIT_SITE_CAPACITY;
         var shown: usize = 0;
@@ -5061,15 +5438,23 @@ pub const ElfState = struct {
             const index = best orelse break;
             printed[index] = true;
             const site = self.windows_timed_wait_sites[index];
+            const classification = classifyWindowsTimedWaitSite(site);
             var caller_text: [guest_symbol_text_bytes]u8 = undefined;
-            log.info("PE64 TIMED WAIT SITES:   caller={s} thread={s} waits={d} timeouts={d} signalled={d} already_past={d} last_timeout_ms={d}{s}", .{
+            log.info("PE64 TIMED WAIT SITES:   caller={s} thread={s} waits={d} timeouts={d} ({d}%) signalled={d} already_past={d} last_timeout_ms={d} condition=0x{x} mutex=0x{x} last_handle=0x{x} last_thread_id={d} classification={s} action={s}{s}", .{
                 self.describeGuestAddressOrUnnamed(site.caller, &caller_text),
                 self.guestThreadLabel(site.first_thread_slot_plus_one),
                 site.waits,
                 site.timeouts,
+                windowsTimedWaitPercent(site.timeouts, site.waits),
                 site.signalled,
                 site.immediate,
                 site.last_milliseconds,
+                site.last_condition,
+                site.last_mutex,
+                site.last_thread_handle,
+                site.last_thread_id,
+                classification.label(),
+                classification.action(),
                 if (site.waits != 0 and site.timeouts == site.waits) " every-wait-timed-out" else "",
             });
         }
@@ -5125,6 +5510,8 @@ pub const ElfState = struct {
             self.windows_condition_timed_waits +|= 1;
             const site = self.noteWindowsTimedWaitSite(return_rip orelse self.read64(self.regs.rsp), slot, milliseconds);
             self.windows_guest_threads[slot].timed_wait_site = site;
+            self.windows_guest_threads[slot].timed_wait_milliseconds = milliseconds;
+            self.rememberWindowsTimedWaitContext(site, slot, condition, mutex);
             if (milliseconds == 0) {
                 // Already past: ETIMEDOUT with the mutex still held, as the
                 // image returns it, and the rest of the slice to someone else.
@@ -5309,6 +5696,7 @@ pub const ElfState = struct {
             // Either a handoff this thread is now collecting, or the owner
             // context finishing a wait it queued for.
             if (self.windows_active_guest_thread_slot == null) lock.owner_waiting = false;
+            self.endActiveWindowsSrwWaitAccounting();
             return .acquired;
         }
         if (lock.owner_thread_id != 0 or self.read64(address) != 0) {
@@ -5323,6 +5711,7 @@ pub const ElfState = struct {
                 lock.owner_thread_id = thread_id;
                 self.write64(address, 1);
                 self.windows_srw_compatibility_acquires +|= 1;
+                self.endActiveWindowsSrwWaitAccounting();
                 return .acquired;
             }
             return .contended;
@@ -5330,6 +5719,7 @@ pub const ElfState = struct {
         lock.owner_thread_id = thread_id;
         self.write64(address, 1);
         if (self.windows_active_guest_thread_slot == null) lock.owner_waiting = false;
+        self.endActiveWindowsSrwWaitAccounting();
         return .acquired;
     }
 
@@ -5361,6 +5751,7 @@ pub const ElfState = struct {
     /// and blocks behind it. That is the order Windows produces when the
     /// released thread really yields.
     fn handOffWindowsSrwLock(self: *ElfState, lock: *WindowsSrwLock, address: u64) void {
+        self.noteWindowsWaitSignal(address);
         var chosen: ?usize = null;
         var chosen_sequence: u64 = std.math.maxInt(u64);
         for (&self.windows_guest_threads, 0..) |*thread, index| {
@@ -5480,6 +5871,7 @@ pub const ElfState = struct {
         thread.wait_resume = false;
         thread.wait_resume_handle = 0;
         thread.wait_resume_timeout = false;
+        self.beginWindowsWaitAccounting(thread, address, .srw_lock, 0, 0);
         self.windows_thread_blocks +|= 1;
         if (self.trace_windows_threads and
             (self.windows_thread_blocks <= 8 or self.windows_thread_blocks % 1024 == 0))
@@ -5516,19 +5908,29 @@ pub const ElfState = struct {
         if (self.windows_guest_threads[index].condition_resume) {
             const mutex = self.windows_guest_threads[index].blocked_condition_mutex;
             if (mutex == 0) {
+                const timed_out = self.windows_guest_threads[index].condition_resume_timeout;
                 self.windows_guest_threads[index].condition_resume = false;
                 self.windows_condition_wait_resumes +|= 1;
+                self.endWindowsWaitAccounting(
+                    &self.windows_guest_threads[index],
+                    if (timed_out) .timed_out else .signaled,
+                );
                 return .resumed;
             }
 
             switch (self.acquireWindowsGuestPthreadMutex(mutex)) {
                 .acquired => {
+                    const timed_out = self.windows_guest_threads[index].condition_resume_timeout;
                     self.windows_guest_threads[index].condition_resume = false;
                     self.windows_guest_threads[index].blocked_condition_mutex = 0;
                     self.windows_guest_threads[index].wait_resume = false;
                     self.windows_guest_threads[index].wait_resume_handle = 0;
                     self.windows_condition_wait_resumes +|= 1;
                     self.windows_condition_mutex_reacquires +|= 1;
+                    self.endWindowsWaitAccounting(
+                        &self.windows_guest_threads[index],
+                        if (timed_out) .timed_out else .signaled,
+                    );
                     return .resumed;
                 },
                 .invalid => {
@@ -5587,6 +5989,13 @@ pub const ElfState = struct {
         thread.wait_resume = false;
         thread.wait_resume_handle = 0;
         thread.wait_resume_timeout = false;
+        self.beginWindowsWaitAccounting(
+            thread,
+            address,
+            if (deadline != 0) .timed_condition else .condition,
+            if (deadline == 0) 0 else thread.timed_wait_milliseconds,
+            deadline,
+        );
         self.windows_thread_blocks +|= 1;
         self.windows_condition_wait_blocks +|= 1;
         if (self.trace_windows_threads and
@@ -5614,6 +6023,7 @@ pub const ElfState = struct {
         } else {
             self.windows_condition_signal_calls +|= 1;
         }
+        self.noteWindowsWaitSignal(address);
         var woken: u64 = 0;
         for (&self.windows_guest_threads) |*thread| {
             if (thread.status != .blocked or thread.blocked_condition != address) continue;
@@ -5881,6 +6291,33 @@ pub const ElfState = struct {
         return previous;
     }
 
+    fn windowsGuestRegisterDigest(self: *const ElfState) u64 {
+        const r = self.regs;
+        var digest: u64 = r.rflags;
+        for ([_]u64{ r.rax, r.rbx, r.rcx, r.rdx, r.rsi, r.rdi, r.rbp, r.rsp, r.r8, r.r9, r.r10, r.r11, r.r12, r.r13, r.r14, r.r15 }) |value| {
+            digest = (digest ^ value) *% 0x9E37_79B9_7F4A_7C15;
+        }
+        return digest;
+    }
+
+    /// A slice that came back to the same instruction with every register the
+    /// same, and made no kernel call, is a user-mode spin: the title polling a
+    /// flag another thread sets. Under cooperative scheduling it takes an
+    /// equal turn from the threads that would set it; on 2026-09-16
+    /// XThread001A spent 19% of the run in one 256-byte loop. Each spinning
+    /// slice doubles the turns the thread gives away, up to
+    /// WINDOWS_GUEST_SPIN_MAX_BACKOFF; any other slice resets it.
+    fn noteWindowsGuestSliceShape(self: *ElfState, index: usize, repeated_state: bool, kernel_calls_before: u64) void {
+        const thread = &self.windows_guest_threads[index];
+        if (!repeated_state or thread.kernel_calls != kernel_calls_before) {
+            thread.spin_backoff = 0;
+            return;
+        }
+        self.windows_spin_slices +|= 1;
+        thread.spin_backoff = if (thread.spin_backoff == 0) 1 else @min(thread.spin_backoff *| 2, WINDOWS_GUEST_SPIN_MAX_BACKOFF);
+        thread.spin_skip_remaining = thread.spin_backoff;
+    }
+
     fn nextWindowsGuestThread(self: *const ElfState) ?usize {
         if (self.windows_preferred_next_guest_thread) |preferred| {
             if (preferred < self.windows_guest_threads.len and
@@ -5923,9 +6360,11 @@ pub const ElfState = struct {
             log.err("Windows guest thread return without an active thread context at rip=0x{x}", .{self.regs.rip});
             return;
         };
+        self.endWindowsWaitAccounting(&self.windows_guest_threads[index], .aborted);
         self.windows_guest_threads[index].status = .completed;
         self.windows_thread_completions +|= 1;
         if (self.windowsWaitObjectIndex(self.windows_guest_threads[index].handle)) |wait_index| {
+            self.noteWindowsWaitSignal(self.windows_guest_threads[index].handle);
             self.windows_wait_objects[wait_index].signaled = true;
             _ = self.wakeWindowsGuestThreadsForWait(self.windows_guest_threads[index].handle, true);
         }
@@ -5973,7 +6412,18 @@ pub const ElfState = struct {
     pub fn serviceWindowsGuestThreads(self: *ElfState, max_steps: u64) u64 {
         if (max_steps == 0 or self.windows_active_guest_thread_slot != null or self.terminated) return 0;
         _ = self.wakeExpiredWindowsGuestWaits();
-        const index = self.nextWindowsGuestThread() orelse return 0;
+        var index = self.nextWindowsGuestThread() orelse return 0;
+        // A thread backing off from a user-mode spin gives its turn to the
+        // next runnable thread. Bounded by the table, so a run in which every
+        // runnable thread spins still runs one of them.
+        var passes: usize = 0;
+        while (self.windows_guest_threads[index].spin_skip_remaining != 0 and passes < self.windows_guest_threads.len) : (passes += 1) {
+            self.windows_guest_threads[index].spin_skip_remaining -= 1;
+            self.windows_spin_turns_given +|= 1;
+            self.windows_last_serviced_guest_thread_slot = index;
+            self.windows_preferred_next_guest_thread = null;
+            index = self.nextWindowsGuestThread() orelse return 0;
+        }
         // A preference is for one scheduling decision only.
         self.windows_preferred_next_guest_thread = null;
         self.windows_thread_service_calls +|= 1;
@@ -6086,8 +6536,21 @@ pub const ElfState = struct {
         var executed: u64 = 0;
         self.windows_guest_slice_yield_requested = false;
         self.windows_slice_clock_reads = 0;
+        const slice_kernel_calls = self.windows_guest_threads[index].kernel_calls;
+        var spin_probe_rip: u64 = 0;
+        var spin_probe_state: u64 = 0;
+        var slice_repeated_state = false;
         while (!self.terminated and self.windows_active_guest_thread_slot != null and executed < max_steps) : (executed += 1) {
             const continue_running = self.step();
+            if (executed == WINDOWS_GUEST_SPIN_PROBE_AT) {
+                spin_probe_rip = self.regs.rip;
+                spin_probe_state = self.windowsGuestRegisterDigest();
+            } else if (!slice_repeated_state and executed > WINDOWS_GUEST_SPIN_PROBE_AT and
+                executed <= WINDOWS_GUEST_SPIN_PROBE_AT + WINDOWS_GUEST_SPIN_PROBE_SPAN and
+                self.regs.rip == spin_probe_rip and self.windowsGuestRegisterDigest() == spin_probe_state)
+            {
+                slice_repeated_state = true;
+            }
             // A yield boundary ends the slice here rather than inside the
             // import handler, so the tail below still saves this worker's
             // context and restores the owner's.
@@ -6145,6 +6608,10 @@ pub const ElfState = struct {
             }
             if (self.windows_guest_threads[index].status == .blocked) break;
             if (!continue_running) break;
+            // A spin proven by a repeated state gains nothing from the rest
+            // of its slice: 2026-09-16 spent ~8% of every instruction running
+            // detected spins out to the full quantum. Hand the turn back now.
+            if (slice_repeated_state and self.windows_guest_threads[index].kernel_calls == slice_kernel_calls) break;
         }
 
         if (self.terminated) {
@@ -6166,6 +6633,7 @@ pub const ElfState = struct {
             if (!blocked) {
                 self.windows_guest_threads[index].status = .runnable;
                 self.windows_thread_yields +|= 1;
+                self.noteWindowsGuestSliceShape(index, slice_repeated_state, slice_kernel_calls);
             }
             const parent = self.windows_parent_guest_context;
             self.restoreWindowsGuestContext(&parent);
@@ -7097,13 +7565,36 @@ pub const ElfState = struct {
         caller_rip: u64,
     ) WindowsAllocationDisposition {
         self.windows_allocation_dispositions[@intFromEnum(WindowsAllocationDisposition.relocated)] +|= 1;
+        const accounting_step = self.totalInterpretedSteps();
         for (self.windows_allocation_relocations[0..self.windows_allocation_relocation_count]) |*record| {
             if (record.requested_base == requested_base and record.actual_base == actual_base and record.caller_rip == caller_rip) {
                 record.occurrences +|= 1;
+                record.last_step = accounting_step;
                 return .relocated;
             }
         }
         if (self.windows_allocation_relocation_count >= self.windows_allocation_relocations.len) {
+            for (self.windows_allocation_relocation_overflow_records[0..self.windows_allocation_relocation_overflow_record_count]) |*record| {
+                if (record.requested_base == requested_base and record.actual_base == actual_base and record.caller_rip == caller_rip) {
+                    record.occurrences +|= 1;
+                    record.last_step = accounting_step;
+                    self.windows_allocation_relocation_overflow +|= 1;
+                    return .relocated;
+                }
+            }
+            if (self.windows_allocation_relocation_overflow_record_count < self.windows_allocation_relocation_overflow_records.len) {
+                const overflow_record = &self.windows_allocation_relocation_overflow_records[self.windows_allocation_relocation_overflow_record_count];
+                overflow_record.* = .{
+                    .requested_base = requested_base,
+                    .actual_base = actual_base,
+                    .length = length,
+                    .caller_rip = caller_rip,
+                    .step = accounting_step,
+                    .last_step = accounting_step,
+                    .occurrences = 1,
+                };
+                self.windows_allocation_relocation_overflow_record_count += 1;
+            }
             self.windows_allocation_relocation_overflow +|= 1;
             return .relocated;
         }
@@ -7113,7 +7604,8 @@ pub const ElfState = struct {
             .actual_base = actual_base,
             .length = length,
             .caller_rip = caller_rip,
-            .step = self.executed_steps,
+            .step = accounting_step,
+            .last_step = accounting_step,
             .occurrences = 1,
         };
         self.windows_allocation_relocation_count += 1;
@@ -7122,7 +7614,7 @@ pub const ElfState = struct {
             requested_base,
             actual_base,
             length,
-            self.executed_steps,
+            accounting_step,
             caller_rip,
             self.describeGuestAddressOrUnnamed(caller_rip, &caller_text),
         });
@@ -7239,17 +7731,34 @@ pub const ElfState = struct {
         }
         for (self.windows_allocation_relocations[0..self.windows_allocation_relocation_count]) |*record| {
             var caller_text: [guest_symbol_text_bytes]u8 = undefined;
-            log.info("PE64 MEMORY CONTRACT:   relocated x{d} requested=0x{x} actual=0x{x} length={d} first_step={d} caller={s}", .{
+            log.info("PE64 MEMORY CONTRACT:   relocated x{d} requested=0x{x} actual=0x{x} length={d} first_step={d} last_step={d} caller={s}", .{
                 record.occurrences,
                 record.requested_base,
                 record.actual_base,
                 record.length,
                 record.step,
+                record.last_step,
                 self.describeGuestAddressOrUnnamed(record.caller_rip, &caller_text),
             });
         }
         if (self.windows_allocation_relocation_overflow != 0) {
-            log.info("PE64 MEMORY CONTRACT:   {d} further relocation site(s) did not fit the bounded table", .{self.windows_allocation_relocation_overflow});
+            log.info("PE64 MEMORY CONTRACT:   {d} further relocation request(s) exceeded the primary bounded table; retained_overflow_sites={d} digest_capacity={d}", .{
+                self.windows_allocation_relocation_overflow,
+                self.windows_allocation_relocation_overflow_record_count,
+                self.windows_allocation_relocation_overflow_records.len,
+            });
+            for (self.windows_allocation_relocation_overflow_records[0..self.windows_allocation_relocation_overflow_record_count]) |*record| {
+                var caller_text: [guest_symbol_text_bytes]u8 = undefined;
+                log.info("PE64 MEMORY CONTRACT:     overflow_digest x{d} requested=0x{x} actual=0x{x} length={d} first_step={d} last_step={d} caller={s}", .{
+                    record.occurrences,
+                    record.requested_base,
+                    record.actual_base,
+                    record.length,
+                    record.step,
+                    record.last_step,
+                    self.describeGuestAddressOrUnnamed(record.caller_rip, &caller_text),
+                });
+            }
         }
         if (self.windows_allocation_refusal_overflow != 0) {
             log.info("PE64 MEMORY CONTRACT:   {d} further refusal site(s) did not fit the bounded table", .{self.windows_allocation_refusal_overflow});
@@ -7370,7 +7879,62 @@ pub const ElfState = struct {
         }
         if (self.windowsMappedRangeContains(address, count)) return true;
         if (self.windowsVirtualAllocationContains(address, count)) return true;
+        if (self.nativeMemoryAlias(address, count) != null) return true;
         return false;
+    }
+
+    fn nativeMemoryAlias(self: *const ElfState, address: u64, count: u64) ?[]u8 {
+        if (address < native_alias_address_base or address >= native_alias_address_limit) return null;
+        const length = std.math.cast(usize, count) orelse return null;
+        for (self.native_memory_aliases[0..self.native_memory_alias_count]) |alias| {
+            const bytes = alias.bytes orelse continue;
+            if (address < alias.guest_base) continue;
+            const offset = std.math.cast(usize, address - alias.guest_base) orelse continue;
+            if (offset <= bytes.len and length <= bytes.len - offset) return bytes[offset..][0..length];
+        }
+        return null;
+    }
+
+    pub fn borrowNativeMemory(self: *ElfState, bytes: []u8) ?u64 {
+        if (bytes.len == 0 or bytes.len > 64 * 1024 * 1024) return null;
+        // Preserve the native pointer's low 32 bits. Therefore guest_pointer
+        // minus map offset retains every native alignment up to 4 GiB. These
+        // are address-space slots only: no multi-gigabyte backing is allocated.
+        const native_low = @intFromPtr(bytes.ptr) & (native_alias_alignment - 1);
+        const span = std.mem.alignForward(u64, @as(u64, @intCast(bytes.len)) + native_low, native_alias_alignment);
+        for (&self.native_memory_aliases, 0..) |*alias, index| {
+            if (alias.bytes != null or alias.reserved_span < span or !self.windowsViewRangeIsFree(alias.slot_base, span)) continue;
+            alias.guest_base = alias.slot_base + native_low;
+            alias.bytes = bytes;
+            self.native_memory_alias_count = @max(self.native_memory_alias_count, index + 1);
+            return alias.guest_base;
+        }
+        var candidate = self.native_memory_alias_next;
+        // Bounded address search. Guest mappings can legitimately occupy a
+        // candidate; never overlap them or silently change their ownership.
+        for (0..256) |_| {
+            const next = std.math.add(u64, candidate, span + native_alias_alignment) catch return null;
+            if (next > native_alias_address_limit) return null;
+            if (self.windowsViewRangeIsFree(candidate, span)) {
+                for (&self.native_memory_aliases, 0..) |*alias, index| {
+                    if (alias.bytes != null) continue;
+                    alias.* = .{ .guest_base = candidate + native_low, .bytes = bytes, .reserved_span = span, .slot_base = candidate };
+                    self.native_memory_alias_count = @max(self.native_memory_alias_count, index + 1);
+                    self.native_memory_alias_next = next;
+                    return alias.guest_base;
+                }
+                return null;
+            }
+            candidate = next;
+        }
+        return null;
+    }
+
+    pub fn releaseNativeMemory(self: *ElfState, guest_base: u64) void {
+        for (self.native_memory_aliases[0..self.native_memory_alias_count]) |*alias| {
+            if (alias.guest_base == guest_base) alias.bytes = null;
+        }
+        while (self.native_memory_alias_count != 0 and self.native_memory_aliases[self.native_memory_alias_count - 1].bytes == null) self.native_memory_alias_count -= 1;
     }
 
     fn windowsMappingIndex(self: *const ElfState, handle: u64) ?usize {
@@ -7385,6 +7949,10 @@ pub const ElfState = struct {
         const end = std.math.add(u64, guest_base, length) catch return false;
         const ordinary_end = std.math.add(u64, self.mem_base, self.mem_size) catch std.math.maxInt(u64);
         if (guest_base < ordinary_end and end > self.mem_base) return false;
+        for (self.native_memory_aliases[0..self.native_memory_alias_count]) |alias| {
+            const bytes = alias.bytes orelse continue;
+            if (guest_base < alias.guest_base + bytes.len and end > alias.guest_base) return false;
+        }
         for (self.windows_memory_views[0..self.windows_memory_view_count]) |view| {
             if (view.length == 0) continue;
             const view_end = std.math.add(u64, view.guest_base, view.length) catch std.math.maxInt(u64);
@@ -7532,6 +8100,8 @@ pub const ElfState = struct {
     /// addresses real storage without reserving the range in the host VM.
     pub fn createWindowsVirtualAllocation(self: *ElfState, guest_base: u64, requested_length: u64) bool {
         if (guest_base == 0 or requested_length == 0) return false;
+        // A driver-owned Vulkan alias is not a VirtualAlloc reservation.
+        if (self.nativeMemoryAlias(guest_base, 1) != null) return false;
         const page_size: u64 = @intCast(std.heap.page_size_min);
         if (guest_base % page_size != 0) return false;
         const rounded_length = std.math.add(u64, requested_length, page_size - 1) catch return false;
@@ -7706,6 +8276,7 @@ pub const ElfState = struct {
     }
 
     fn windowsMappedMemoryConst(self: *const ElfState, address: u64, count: u64) ?[]const u8 {
+        if (self.nativeMemoryAlias(address, count)) |bytes| return bytes;
         if (count > std.math.maxInt(usize)) return null;
         const end = std.math.add(u64, address, count) catch return null;
         const count_usize: usize = @intCast(count);
@@ -7797,6 +8368,7 @@ pub const ElfState = struct {
     }
 
     fn windowsMappedMemory(self: *ElfState, address: u64, count: u64) ?[]u8 {
+        if (self.nativeMemoryAlias(address, count)) |bytes| return bytes;
         if (count > std.math.maxInt(usize)) return null;
         const end = std.math.add(u64, address, count) catch return null;
         const count_usize: usize = @intCast(count);
@@ -8962,7 +9534,7 @@ pub const ElfState = struct {
     fn substantiateVulkanShaderCreation(self: *const ElfState) void {
         const graphics = &self.windows_graphics;
         log.warn(
-            "PE64 guest advisory substantiation: Rosette's Vulkan bridge forwarded vk_calls={d} native_vk_calls={d} with native_vk_failures={d}, ordering_violations={d} and unmodeled={d}. A zero native failure count means the host driver accepted everything Rosette handed it, so a creation the guest calls failed was refused before the driver - by the guest's own validation or by a bridge refusal - and the bridge's refusal counters are the next thing to read",
+            "PE64 guest advisory substantiation: Rosette's Vulkan bridge observed vk_calls={d} native_vk_calls={d} with native_vk_failures={d}, ordering_violations={d} and unmodeled={d}. Zero aggregate failures do NOT prove every shader creation reached the driver or that the guest consumed its published handle. Read the positive per-entry create ledger below; reconcile attempts, publications, bridge refusals and driver results against the guest warning",
             .{
                 graphics.vulkan_calls,
                 graphics.native_vulkan_calls,
@@ -8971,6 +9543,11 @@ pub const ElfState = struct {
                 graphics.unmodeled_calls,
             },
         );
+        if (graphics.hooks.report_present_chain_full) |callback| {
+            callback(graphics.hooks.native_context);
+        } else {
+            log.warn("PE64 guest advisory substantiation: native create-ledger reporting hook is unavailable; aggregate counters cannot locate this shader failure", .{});
+        }
     }
 
     /// The eight-hex-digit XThread id Xenia prints after a log level marker
@@ -10460,6 +11037,36 @@ pub const ElfState = struct {
         return "";
     }
 
+    /// Distinguish a real wait cycle from a join chain whose target is still
+    /// runnable. A bare blocked handle cannot answer that question: the main
+    /// thread in the observed run waited on a live XThread, and the live
+    /// XThread was itself the one doing useful work. Follow only the bounded
+    /// guest-thread edges and keep non-thread objects as a separate verdict.
+    fn windowsJoinVerdict(self: *const ElfState, handle: u64) []const u8 {
+        if (handle == 0) return "not_thread_join";
+        var current = handle;
+        var seen: [8]u64 = [_]u64{0} ** 8;
+        var depth: usize = 0;
+        while (depth < seen.len) : (depth += 1) {
+            for (seen[0..depth]) |previous| {
+                if (previous == current) return "join_cycle";
+            }
+            seen[depth] = current;
+            const index = self.windowsGuestThreadIndex(current) orelse return if (depth == 0) "not_thread_join" else "chain_to_non_thread";
+            const thread = &self.windows_guest_threads[index];
+            switch (thread.status) {
+                .completed, .failed => return if (depth == 0) "target_completed" else "chain_reaches_completed",
+                .pending, .runnable, .running => return if (depth == 0) "active_target" else "chain_reaches_active_target",
+                .blocked => {
+                    if (thread.blocked_wait_handle == 0) return if (depth == 0) "target_blocked" else "chain_reaches_blocked_target";
+                    current = thread.blocked_wait_handle;
+                },
+                .vacant => return "not_thread_join",
+            }
+        }
+        return "join_chain_too_deep";
+    }
+
     /// Read guest bytes for the spin disassembler.
     ///
     /// Routed through the same two sources `decodeAt` uses, so a loop in a
@@ -10793,11 +11400,13 @@ pub const ElfState = struct {
         return self.windows_guest_threads[index].context.regs.rip;
     }
 
-    /// The live worker holding the largest share of the run, if any.
+    /// The live worker holding the largest share of the run, if any. A
+    /// completed worker may retain historical instruction steps in its table
+    /// slot, but it cannot be the source of current starvation or slowdown.
     fn busiestWindowsGuestThread(self: *const ElfState) ?usize {
         var best: ?usize = null;
         for (&self.windows_guest_threads, 0..) |*thread, index| {
-            if (thread.status == .vacant) continue;
+            if (!isLiveWindowsGuestThread(thread.status)) continue;
             if (thread.executed_steps == 0) continue;
             if (best == null or thread.executed_steps > self.windows_guest_threads[best.?].executed_steps) {
                 best = index;
@@ -10830,13 +11439,33 @@ pub const ElfState = struct {
         const interpreted = self.totalInterpretedSteps();
         if (interpreted == 0) return;
         var live: usize = 0;
+        var created: usize = 0;
+        var completed: usize = 0;
+        var failed: usize = 0;
         for (&self.windows_guest_threads) |*candidate| {
-            if (candidate.status != .vacant) live += 1;
+            switch (candidate.status) {
+                .vacant => {},
+                .completed => {
+                    created += 1;
+                    completed += 1;
+                },
+                .failed => {
+                    created += 1;
+                    failed += 1;
+                },
+                else => {
+                    created += 1;
+                    if (isLiveWindowsGuestThread(candidate.status)) live += 1;
+                },
+            }
         }
         var where: [guest_symbol_text_bytes]u8 = undefined;
         var start: [guest_symbol_text_bytes]u8 = undefined;
-        log.info("PE64 THREAD SHARE: {d} live worker(s); busiest handle=0x{x}{s}{s}{s} status={s} steps={d} ({d}% of the run) at={s} rip=0x{x} pages~{d} start={s}", .{
+        log.info("PE64 THREAD SHARE: {d} live worker(s), {d} created ({d} completed, {d} failed); busiest handle=0x{x}{s}{s}{s} status={s} steps={d} ({d}% of the run) at={s} rip=0x{x} pages~{d} start={s}", .{
             live,
+            created,
+            completed,
+            failed,
             thread.handle,
             if (thread.name_len != 0) " name='" else "",
             thread.nameText(),
@@ -10860,18 +11489,47 @@ pub const ElfState = struct {
     /// run in which the work is shared.
     pub fn reportGuestThreads(self: *const ElfState) void {
         const interpreted = self.totalInterpretedSteps();
+        var created: usize = 0;
         var live: usize = 0;
+        var completed: usize = 0;
+        var failed: usize = 0;
+        var vacant: usize = 0;
         for (&self.windows_guest_threads) |*thread| {
-            if (thread.status == .vacant) continue;
-            live += 1;
+            switch (thread.status) {
+                .vacant => vacant += 1,
+                .completed => {
+                    created += 1;
+                    completed += 1;
+                },
+                .failed => {
+                    created += 1;
+                    failed += 1;
+                },
+                else => {
+                    created += 1;
+                    if (isLiveWindowsGuestThread(thread.status)) live += 1;
+                },
+            }
         }
         const worker_steps = self.windows_worker_executed_steps;
-        if (live == 0) {
+        if (created == 0) {
             log.info("PE64 GUEST THREADS: no guest worker threads were created", .{});
             return;
         }
-        // "N live of 32" invites reading 32 as a target the run is working
-        // towards. It is Rosette's own table size and nothing more.
+        // Keep lifecycle counts explicit. A completed one-shot worker is a
+        // valid Windows outcome and is not evidence that a requested thread
+        // failed to start; only a failed status or a refused creation is a
+        // lifecycle defect.
+        log.info("PE64 GUEST THREADS: created={d} live={d} completed={d} failed={d} vacant={d} capacity={d}; completed workers are normal one-shot exits, while failed={d} or refused={d} identify lifecycle loss", .{
+            created,
+            live,
+            completed,
+            failed,
+            vacant,
+            self.windows_guest_threads.len,
+            failed,
+            self.windows_thread_table_full,
+        });
         if (self.windows_thread_suspended_creations != 0 or self.windows_thread_suspend_calls != 0 or self.windows_thread_resume_calls != 0) {
             log.info("PE64 GUEST THREADS: suspension created_suspended={d} suspend_calls={d} resume_calls={d}; a thread whose suspend count is not zero is never scheduled, as CREATE_SUSPENDED and SuspendThread promise", .{
                 self.windows_thread_suspended_creations,
@@ -10879,7 +11537,7 @@ pub const ElfState = struct {
                 self.windows_thread_resume_calls,
             });
         }
-        log.info("PE64 GUEST THREADS: {d} live (Rosette's table holds {d} at once and gives a finished thread's slot to a new one when it is full; {d} reused, {d} refused); workers ran {d} of {d} interpreted instruction(s) ({d}%), the owner ran {d}", .{
+        log.info("PE64 GUEST THREADS: {d} live (active statuses pending/runnable/running/blocked; table holds {d} slots and gives a finished thread's slot to a new one when it is full; {d} reused, {d} refused); workers ran {d} of {d} interpreted instruction(s) ({d}%), the owner ran {d}", .{
             live,
             self.windows_guest_threads.len,
             self.windows_thread_slots_recycled,
@@ -10891,7 +11549,7 @@ pub const ElfState = struct {
         });
         var spinning_threads: usize = 0;
         for (&self.windows_guest_threads, 0..) |*thread, index| {
-            if (thread.status == .vacant) continue;
+            if (!isLiveWindowsGuestThread(thread.status)) continue;
             var where: [guest_symbol_text_bytes]u8 = undefined;
             var start: [guest_symbol_text_bytes]u8 = undefined;
             const share = if (interpreted == 0) 0 else @divTrunc(thread.executed_steps *| 100, interpreted);
@@ -10938,7 +11596,7 @@ pub const ElfState = struct {
                     // title's own thread is the whole shape of what it does.
                     var low_text: [guest_symbol_text_bytes]u8 = undefined;
                     var high_text: [guest_symbol_text_bytes]u8 = undefined;
-                    log.info("PE64 GUEST THREADS:     {d}% of the run across {d} page(s), lifetime code=[0x{x},0x{x}]: moving through code, not spinning on one branch. Those ends are {s} and {s}", .{
+                    log.info("PE64 GUEST THREADS:     {d}% of the run across {d} page(s), lifetime code=[0x{x},0x{x}]: broad execution footprint, NOT proof of progress or absence of a multi-function polling loop. Those ends are {s} and {s}", .{
                         share,
                         thread.codePages(),
                         thread.code.low,
@@ -10946,6 +11604,13 @@ pub const ElfState = struct {
                         self.describeGuestAddressOrUnnamed(thread.code.low, &low_text),
                         self.describeGuestAddressOrUnnamed(thread.code.high, &high_text),
                     });
+                }
+            }
+            if (share >= 5) {
+                for (thread.code.heat.top(), 0..) |candidate, rank| {
+                    if (candidate.count == 0) continue;
+                    var hotspot_text: [guest_symbol_text_bytes]u8 = undefined;
+                    log.info("PE64 CPU HOTSPOT: thread=0x{x} name='{s}' rank={d} region=0x{x} at={s} samples={d} count_lower/upper={d}/{d}; 256-byte lifetime candidate, one sample per ~1024 worker instructions; not a wall-time or spin verdict", .{ thread.handle, if (thread.name_len != 0) thread.nameText() else "<unnamed>", rank + 1, candidate.address, self.describeGuestAddressOrUnnamed(candidate.address, &hotspot_text), thread.code.heat.samples, candidate.count - candidate.error_bound, candidate.count });
                 }
             }
             // What this thread last asked the emulated kernel for. For every
@@ -10971,6 +11636,15 @@ pub const ElfState = struct {
                 // and is that one making progress?".
                 var target_text: [96]u8 = undefined;
                 const target = self.describeWindowsWaitTarget(thread.blocked_wait_handle, &target_text);
+                const join = self.windowsJoinVerdict(thread.blocked_wait_handle);
+                const blocked_age_steps = if (thread.blocked_since_total_steps == 0)
+                    0
+                else
+                    self.totalInterpretedSteps() -| thread.blocked_since_total_steps;
+                const blocked_age_ticks = if (thread.blocked_since_guest_ticks == 0)
+                    0
+                else
+                    self.guest_clock.ticks -| thread.blocked_since_guest_ticks;
                 var owner_text: [128]u8 = undefined;
                 const lock_owner: []const u8 = blk: {
                     if (thread.blocked_srw_lock == 0) break :blk "";
@@ -10982,9 +11656,12 @@ pub const ElfState = struct {
                         self.windowsSrwWaiterCount(lock),
                     }) catch "";
                 };
-                log.info("PE64 GUEST THREADS:     blocked_on wait=0x{x}{s} lock=0x{x}{s} condition=0x{x} timeout={d} deadline={d}", .{
+                log.info("PE64 GUEST THREADS:     blocked_on wait=0x{x}{s} join={s} age_steps={d} age_ticks={d} lock=0x{x}{s} condition=0x{x} timeout={d} deadline={d}", .{
                     thread.blocked_wait_handle,
                     target,
+                    join,
+                    blocked_age_steps,
+                    blocked_age_ticks,
                     thread.blocked_srw_lock,
                     lock_owner,
                     thread.blocked_condition,
@@ -10995,7 +11672,7 @@ pub const ElfState = struct {
         }
         if (spinning_threads != 0) {
             for (&self.windows_guest_threads, 0..) |*thread, index| {
-                if (thread.status == .vacant) continue;
+                if (!isLiveWindowsGuestThread(thread.status)) continue;
                 const share = if (interpreted == 0) 0 else @divTrunc(thread.executed_steps *| 100, interpreted);
                 if (share < 5 or !thread.code.isSpin()) continue;
                 self.reportGuestThreadSpin(index);
@@ -11012,6 +11689,1067 @@ pub const ElfState = struct {
             } else {
                 log.info("PE64 GUEST THREADS:   verdict: the busiest worker holds {d}% of the run ('{s}'), in {s}; no single thread is monopolising the interpreter", .{ share, named, described });
             }
+        }
+    }
+
+    const WindowsBlockedCause = enum {
+        timed_condition,
+        condition,
+        finite_handle,
+        infinite_handle,
+        srw_lock,
+        deadline,
+        unknown,
+
+        fn label(self: WindowsBlockedCause) []const u8 {
+            return switch (self) {
+                .timed_condition => "timed_condition",
+                .condition => "condition",
+                .finite_handle => "finite_handle",
+                .infinite_handle => "infinite_handle",
+                .srw_lock => "srw_lock",
+                .deadline => "deadline",
+                .unknown => "unknown",
+            };
+        }
+
+        fn action(self: WindowsBlockedCause) []const u8 {
+            return switch (self) {
+                .timed_condition => "ETIMEDOUT is returned at the guest-clock deadline; do not synthesize a signal, and inspect signal/broadcast only if this condition carries graphics work",
+                .condition => "find the signal or broadcast owner; Rosette wakes a waiter only after a real guest notification",
+                .finite_handle => "allow the guest-clock timeout to expire; inspect the producer if output depends on this wait and it keeps expiring",
+                .infinite_handle => "find SetEvent, ReleaseSemaphore, or thread completion for this handle; a runnable producer makes this a legitimate wait, not a Rosette deadlock",
+                .srw_lock => "find the releasing owner; Rosette directs the oldest waiter during the handoff",
+                .deadline => "this is an expected deadline park, not an object wait; verify the guest clock reaches the stored deadline",
+                .unknown => "the blocked state has no recognized wait model; add the missing Rosette wait boundary before changing wake policy",
+            };
+        }
+    };
+
+    fn classifyWindowsBlockedThread(thread: *const WindowsGuestThread) WindowsBlockedCause {
+        if (thread.blocked_condition != 0) {
+            return if (thread.timed_wait_site != 0 or thread.timed_wait_milliseconds != 0)
+                .timed_condition
+            else
+                .condition;
+        }
+        if (thread.blocked_srw_lock != 0) return .srw_lock;
+        if (thread.blocked_wait_handle != 0) {
+            return if (thread.blocked_wait_deadline != 0) .finite_handle else .infinite_handle;
+        }
+        if (thread.blocked_wait_deadline != 0) return .deadline;
+        return .unknown;
+    }
+
+    /// The finding is the thing a run can act on; the blocked cause above is
+    /// only the shape of the wait.  In particular, an infinite wait on a
+    /// thread that is itself active is a live join chain, while an infinite
+    /// wait on a thread that is not ready is a real upstream dependency.  The
+    /// same distinction is made for condition and finite-handle waits by
+    /// consulting the duration ledger for this live waiter.
+    const WindowsBlockedFinding = enum {
+        expected_deadline,
+        periodic_timeout_poll,
+        active_join_chain,
+        join_target_not_ready,
+        join_cycle,
+        unsignalled_condition,
+        condition_producer_pending,
+        timeout_hotspot,
+        producer_not_ready,
+        active_wait_with_history,
+        lock_owner_pending,
+        ready_but_blocked,
+        missing_wait_model,
+
+        fn label(self: WindowsBlockedFinding) []const u8 {
+            return switch (self) {
+                .expected_deadline => "expected_deadline",
+                .periodic_timeout_poll => "periodic_timeout_poll",
+                .active_join_chain => "active_join_chain",
+                .join_target_not_ready => "join_target_not_ready",
+                .join_cycle => "join_cycle",
+                .unsignalled_condition => "unsignalled_condition",
+                .condition_producer_pending => "condition_producer_pending",
+                .timeout_hotspot => "timeout_hotspot",
+                .producer_not_ready => "producer_not_ready",
+                .active_wait_with_history => "active_wait_with_history",
+                .lock_owner_pending => "lock_owner_pending",
+                .ready_but_blocked => "ready_but_blocked",
+                .missing_wait_model => "missing_wait_model",
+            };
+        }
+
+        fn priority(self: WindowsBlockedFinding) u8 {
+            return switch (self) {
+                .expected_deadline => 10,
+                .periodic_timeout_poll => 20,
+                .active_join_chain => 25,
+                .timeout_hotspot => 60,
+                .producer_not_ready, .condition_producer_pending => 70,
+                .active_wait_with_history => 5,
+                .lock_owner_pending, .unsignalled_condition => 80,
+                .join_target_not_ready => 85,
+                .join_cycle => 95,
+                .missing_wait_model, .ready_but_blocked => 100,
+            };
+        }
+
+        fn isLivenessFinding(self: WindowsBlockedFinding) bool {
+            return switch (self) {
+                .expected_deadline, .periodic_timeout_poll, .active_join_chain, .timeout_hotspot, .active_wait_with_history => false,
+                else => true,
+            };
+        }
+
+        fn isExpected(self: WindowsBlockedFinding) bool {
+            return self == .expected_deadline or self == .active_join_chain;
+        }
+
+        fn action(self: WindowsBlockedFinding) []const u8 {
+            return switch (self) {
+                .expected_deadline => "verify guest-clock advancement to the stored deadline; this park is expected pacing",
+                .periodic_timeout_poll => "correlate the timed caller with its optional-service producer; repeated expiry is cost, not a missing signal by itself",
+                .active_join_chain => "the join chain reaches an active target; monitor target progress before calling this a deadlock",
+                .join_target_not_ready => "inspect the target thread's last import/status and the event that completes it; this join is upstream of screen output",
+                .join_cycle => "break the join cycle or repair the thread-completion edge; no timeout can resolve an infinite cycle",
+                .unsignalled_condition => "find the signal/broadcast owner for this condition; no notification is recorded for the active waiter",
+                .condition_producer_pending => "inspect the condition producer and signal ordering; prior signals exist but this waiter remains active",
+                .timeout_hotspot => "inspect the finite-handle producer and decide whether repeated expiry is intentional polling or missing work",
+                .producer_not_ready => "find SetEvent, ReleaseSemaphore, thread completion, or the producer for this handle; do not synthesize readiness",
+                .active_wait_with_history => "signals or completions have occurred for this active handle; retain it as producer context, not as an unresolved blocker",
+                .lock_owner_pending => "find the releasing SRW owner and its last progress point; the oldest waiter should be handed off on release",
+                .ready_but_blocked => "the object is ready while the thread is still blocked; audit wake consumption and scheduler state before continuing",
+                .missing_wait_model => "add the missing Rosette wait boundary; answering this wait would invent progress",
+            };
+        }
+    };
+
+    fn windowsWaitCostSiteForThread(self: *const ElfState, thread: *const WindowsGuestThread) ?*const wait_cost.Site {
+        if (thread.wait_cost_site != 0) {
+            const index = @as(usize, thread.wait_cost_site) - 1;
+            if (index < self.windows_wait_cost.count) return &self.windows_wait_cost.sites[index];
+        }
+        const cause = classifyWindowsBlockedThread(thread);
+        const kind: wait_cost.WaitKind = switch (cause) {
+            .timed_condition => .timed_condition,
+            .condition => .condition,
+            .finite_handle => .finite_handle,
+            .infinite_handle => .infinite_handle,
+            .srw_lock => .srw_lock,
+            .deadline => .deadline,
+            .unknown => return null,
+        };
+        const key = switch (cause) {
+            .timed_condition, .condition => thread.blocked_condition,
+            .finite_handle, .infinite_handle => thread.blocked_wait_handle,
+            .srw_lock => thread.blocked_srw_lock,
+            .deadline => 0,
+            .unknown => 0,
+        };
+        return wait_cost.siteAt(&self.windows_wait_cost, key, kind);
+    }
+
+    /// Find the oldest currently blocked thread represented by a ledger site.
+    /// The wait token is the authoritative join; the field-based fallback is
+    /// for a site whose token could not be allocated because the bounded
+    /// ledger was full. A diagnostic must be able to say that no waiter was
+    /// found instead of borrowing an unrelated thread with a similar handle.
+    fn windowsWaiterSlotForSite(self: *const ElfState, site_index: usize, site: wait_cost.Site) ?usize {
+        var selected: ?usize = null;
+        var selected_start: u64 = std.math.maxInt(u64);
+        for (&self.windows_guest_threads, 0..) |*thread, index| {
+            if (thread.status != .blocked) continue;
+            var matches = false;
+            if (thread.wait_cost_site != 0) {
+                const accounted_index = @as(usize, thread.wait_cost_site) - 1;
+                matches = accounted_index == site_index;
+            } else {
+                matches = switch (site.kind) {
+                    .condition, .timed_condition => thread.blocked_condition == site.key,
+                    .finite_handle, .infinite_handle, .multiple => thread.waitsOnHandle(site.key),
+                    .srw_lock => thread.blocked_srw_lock == site.key,
+                    .deadline => false,
+                };
+            }
+            if (!matches) continue;
+            const start = if (thread.blocked_since_total_steps == 0)
+                std.math.maxInt(u64)
+            else
+                thread.blocked_since_total_steps;
+            if (selected == null or start < selected_start) {
+                selected = index;
+                selected_start = start;
+            }
+        }
+        return selected;
+    }
+
+    /// Emit the causal snapshot behind a newly material liveness/cost
+    /// finding. The ordinary ranked report is intentionally repeatable; this
+    /// path is a bounded trigger that preserves the state at the first
+    /// actionable observation, including the producer-side evidence needed
+    /// to decide whether the problem is in the guest or in Rosetta's wake
+    /// model.
+    fn reportWindowsWaitEscalation(
+        self: *ElfState,
+        site_index: usize,
+        site: *const wait_cost.Site,
+        classification: wait_cost.Classification,
+    ) void {
+        const waiter_slot = self.windowsWaiterSlotForSite(site_index, site.*);
+        var waiter_handle: u64 = 0;
+        var waiter_thread_id: u64 = 0;
+        var waiter_name: []const u8 = "<no current blocked waiter>";
+        var waiter_age_steps: u64 = 0;
+        var waiter_age_ticks: u64 = 0;
+        var waiter_condition: u64 = 0;
+        var waiter_mutex: u64 = 0;
+        var waiter_wait_handle: u64 = 0;
+        var waiter_last_import: []const u8 = "<not retained>";
+        var waiter_last_import_step: u64 = 0;
+        var waiter_rip: u64 = 0;
+        var waiter_kernel_step: u64 = 0;
+        var waiter_slot_text: ?usize = null;
+        var kernel_module: []const u8 = "<none>";
+        var kernel_export: []const u8 = "<none>";
+
+        if (waiter_slot) |slot| {
+            const thread = &self.windows_guest_threads[slot];
+            waiter_slot_text = slot;
+            waiter_handle = thread.handle;
+            waiter_thread_id = thread.thread_id;
+            waiter_name = if (thread.name_len != 0) thread.nameText() else "<unnamed>";
+            waiter_age_steps = if (thread.blocked_since_total_steps == 0)
+                0
+            else
+                self.totalInterpretedSteps() -| thread.blocked_since_total_steps;
+            waiter_age_ticks = if (thread.blocked_since_guest_ticks == 0)
+                0
+            else
+                self.guest_clock.ticks -| thread.blocked_since_guest_ticks;
+            waiter_condition = thread.blocked_condition;
+            waiter_mutex = thread.blocked_condition_mutex;
+            waiter_wait_handle = thread.blocked_wait_handle;
+            waiter_last_import = if (thread.last_import_len != 0) thread.lastImportText() else "<none>";
+            waiter_last_import_step = thread.last_import_step;
+            waiter_rip = self.windowsGuestThreadRip(slot);
+            waiter_kernel_step = thread.last_kernel_step;
+            if (self.guest_kernel_calls.slotAt(thread.last_kernel_slot)) |entry| {
+                kernel_module = entry.module.moduleName();
+                kernel_export = entry.export_name;
+            }
+        }
+
+        const site_age_steps = if (site.first_step == 0)
+            0
+        else
+            self.totalInterpretedSteps() -| site.first_step;
+        const site_age_ticks = if (site.first_ticks == 0)
+            0
+        else
+            self.guest_clock.ticks -| site.first_ticks;
+        const age_steps = if (waiter_slot != null) waiter_age_steps else site_age_steps;
+        const age_ticks = if (waiter_slot != null) waiter_age_ticks else site_age_ticks;
+        const site_handle = if (site.kind == .finite_handle or site.kind == .infinite_handle or site.kind == .multiple)
+            site.key
+        else
+            waiter_wait_handle;
+
+        var rip_text: [guest_symbol_text_bytes]u8 = undefined;
+        const rip_description = if (waiter_slot != null)
+            self.describeGuestAddressOrUnnamed(waiter_rip, &rip_text)
+        else
+            "<not available>";
+        var signal_rip_text: [guest_symbol_text_bytes]u8 = undefined;
+        const signal_rip_description = if (site.last_signal_rip != 0)
+            self.describeGuestAddressOrUnnamed(site.last_signal_rip, &signal_rip_text)
+        else
+            "<none>";
+
+        var mutex_state: u32 = 0;
+        var mutex_owner_thread_id: u64 = 0;
+        var mutex_model: []const u8 = "not_observed";
+        var mutex_owner_text_buffer: [128]u8 = undefined;
+        var mutex_owner_text: []const u8 = "not_observed";
+        if (waiter_mutex != 0) {
+            if (self.windowsPthreadMutexImpl(waiter_mutex)) |impl| {
+                mutex_state = self.read32(impl);
+                mutex_owner_thread_id = @as(u64, self.read32(impl + 0x14));
+                mutex_model = if (mutex_state == 0) "unlocked" else "owned_or_contended";
+                mutex_owner_text = self.describeWindowsSrwOwner(mutex_owner_thread_id, &mutex_owner_text_buffer);
+            } else {
+                mutex_model = "unreadable";
+                mutex_owner_text = "unreadable";
+            }
+        }
+
+        var object_kind: []const u8 = "none";
+        var readiness: []const u8 = "not_applicable";
+        if (site_handle != 0) {
+            object_kind = self.windowsWaitObjectKindName(site_handle);
+            readiness = if (self.windowsWaitObjectReady(site_handle)) |ready|
+                if (ready) "ready" else "not_ready"
+            else
+                "unmodeled";
+        }
+
+        const pending_workers = self.countWindowsWorkers(.pending);
+        const runnable_workers = self.countWindowsWorkers(.runnable);
+        const running_workers = self.countWindowsWorkers(.running);
+        const blocked_workers = self.countWindowsWorkers(.blocked);
+        const timeout_percent = if (site.waits == 0)
+            0
+        else
+            @min(@as(u64, 100), (site.timed_out *| 100) / site.waits);
+        const timeout_tick_percent = if (site.total_ticks == 0)
+            0
+        else
+            @min(@as(u64, 100), (site.timed_out_ticks *| 100) / site.total_ticks);
+
+        if (classification == .unsignalled_condition) {
+            log.warn("PE64 WAIT ESCALATION: class=unsignalled_condition severity=critical trigger=sustained_absence_of_notification site={d} key=0x{x} kind={s} waiter_slot={?d} waiter_thread=0x{x} thread_id={d} name='{s}' age_steps={d} age_ticks={d} wait_started_step={d} wait_last_step={d} wait_started_ticks={d} wait_last_ticks={d} condition=0x{x} mutex=0x{x} mutex_model={s} mutex_state={d} mutex_owner_thread_id={d} mutex_owner={s}", .{
+                site_index,
+                site.key,
+                site.kind.label(),
+                waiter_slot_text,
+                waiter_handle,
+                waiter_thread_id,
+                waiter_name,
+                age_steps,
+                age_ticks,
+                site.first_step,
+                site.last_step,
+                site.first_ticks,
+                site.last_ticks,
+                waiter_condition,
+                waiter_mutex,
+                mutex_model,
+                mutex_state,
+                mutex_owner_thread_id,
+                mutex_owner_text,
+            });
+            log.warn("PE64 WAIT ESCALATION:   context=unsignalled_condition last_import={s} last_import_step={d} rip=0x{x} at={s} last_kernel={s}!{s} last_kernel_step={d} total_steps={d} guest_ticks={d} workers(pending/runnable/running/blocked)={d}/{d}/{d}/{d} condition_signal_calls={d} condition_broadcast_calls={d} matching_notifications={d} last_signal_step={d} action=capture_the_predicate_writer_and_signal_or_broadcast_owner; Rosetta_keeps_the_waiter_blocked_until_real_notification", .{
+                waiter_last_import,
+                waiter_last_import_step,
+                waiter_rip,
+                rip_description,
+                kernel_module,
+                kernel_export,
+                waiter_kernel_step,
+                self.totalInterpretedSteps(),
+                self.guest_clock.ticks,
+                pending_workers,
+                runnable_workers,
+                running_workers,
+                blocked_workers,
+                self.windows_condition_signal_calls,
+                self.windows_condition_broadcast_calls,
+                site.signals,
+                site.last_signal_step,
+            });
+            return;
+        }
+
+        log.warn("PE64 WAIT ESCALATION: class=timeout_hotspot severity=high trigger=timeout_cost_threshold site={d} key=0x{x} kind={s} handle=0x{x} object_kind={s} readiness={s} waiter_slot={?d} waiter_thread=0x{x} thread_id={d} name='{s}' age_steps={d} age_ticks={d} last_import={s} last_import_step={d} rip=0x{x} at={s} timeout_ms={d} waits={d} active={d} signaled={d} timeouts={d} ({d}%)", .{
+            site_index,
+            site.key,
+            site.kind.label(),
+            site_handle,
+            object_kind,
+            readiness,
+            waiter_slot_text,
+            waiter_handle,
+            waiter_thread_id,
+            waiter_name,
+            age_steps,
+            age_ticks,
+            waiter_last_import,
+            waiter_last_import_step,
+            waiter_rip,
+            rip_description,
+            site.last_timeout_milliseconds,
+            site.waits,
+            site.active,
+            site.signaled,
+            site.timed_out,
+            timeout_percent,
+        });
+        log.warn("PE64 WAIT ESCALATION:   context=timeout_hotspot signals={d} total_guest_ticks={d} timeout_guest_ticks={d} ({d}%) max_wait_ticks={d} max_timeout_overshoot_ticks={d} first_step={d} last_step={d} last_timeout_step={d} last_signal_step={d} last_signal_thread=0x{x} last_signal_rip=0x{x} last_signal_at={s} workers(pending/runnable/running/blocked)={d}/{d}/{d}/{d} producer_evidence={s} action=inspect_the_producer_and_decide_polling_vs_missing_work; Rosetta_does_not_convert_expiry_into_success", .{
+            site.signals,
+            site.total_ticks,
+            site.timed_out_ticks,
+            timeout_tick_percent,
+            site.max_ticks,
+            site.max_timeout_overshoot_ticks,
+            site.first_step,
+            site.last_step,
+            site.last_timeout_step,
+            site.last_signal_step,
+            site.last_signal_thread_handle,
+            site.last_signal_rip,
+            signal_rip_description,
+            pending_workers,
+            runnable_workers,
+            running_workers,
+            blocked_workers,
+            if (waiter_slot == null) "no_current_waiter_at_capture" else "current_waiter_recorded",
+        });
+    }
+
+    /// Turn repeated ledger classifications into bounded events. The
+    /// periodic report remains the durable summary; these events are the
+    /// handoff a human can use to inspect the next run without reconstructing
+    /// the cause from several heartbeats.
+    fn reportWindowsWaitEscalations(self: *ElfState) void {
+        const total_steps = self.totalInterpretedSteps();
+        for (self.windows_wait_cost.sites[0..self.windows_wait_cost.count], 0..) |*site, index| {
+            const classification = wait_cost.classify(site.*);
+            switch (classification) {
+                .unsignalled_condition => {
+                    if (site.active == 0) continue;
+                    const age_steps = if (site.first_step == 0) 0 else total_steps -| site.first_step;
+                    const age_ticks = if (site.first_ticks == 0) 0 else self.guest_clock.ticks -| site.first_ticks;
+                    if (age_steps < WINDOWS_WAIT_ESCALATION_MIN_AGE_STEPS and
+                        age_ticks < WINDOWS_WAIT_ESCALATION_MIN_AGE_TICKS)
+                    {
+                        continue;
+                    }
+                    if (!site.claimUnsignalledEscalation()) continue;
+                    self.windows_wait_unsignalled_escalations +|= 1;
+                    self.reportWindowsWaitEscalation(index, site, classification);
+                },
+                .timeout_hotspot => {
+                    if (!site.claimTimeoutHotspotEscalation()) continue;
+                    self.windows_wait_timeout_hotspot_escalations +|= 1;
+                    self.reportWindowsWaitEscalation(index, site, classification);
+                },
+                else => {},
+            }
+        }
+    }
+
+    fn classifyWindowsBlockedFinding(self: *const ElfState, thread: *const WindowsGuestThread) WindowsBlockedFinding {
+        const cause = classifyWindowsBlockedThread(thread);
+        switch (cause) {
+            .unknown => return .missing_wait_model,
+            .deadline => return .expected_deadline,
+            .srw_lock => return .lock_owner_pending,
+            .timed_condition, .condition => {
+                if (self.windowsWaitCostSiteForThread(thread)) |site| {
+                    return switch (wait_cost.classify(site.*)) {
+                        .periodic_timeout_poll => .periodic_timeout_poll,
+                        .lost_wakeup_candidate => .unsignalled_condition,
+                        .unsignalled_condition => .unsignalled_condition,
+                        .mixed_timeout_signal => .condition_producer_pending,
+                        .pending_producer => .condition_producer_pending,
+                        else => if (cause == .timed_condition) .periodic_timeout_poll else .condition_producer_pending,
+                    };
+                }
+                return if (cause == .timed_condition) .periodic_timeout_poll else .unsignalled_condition;
+            },
+            .finite_handle => {
+                if (self.windowsWaitCostSiteForThread(thread)) |site| {
+                    if (wait_cost.classify(site.*) == .timeout_hotspot) return .timeout_hotspot;
+                }
+                return .producer_not_ready;
+            },
+            .infinite_handle => {
+                if (self.windowsWaitObjectReady(thread.blocked_wait_handle)) |ready| {
+                    if (ready) return .ready_but_blocked;
+                }
+                const join = self.windowsJoinVerdict(thread.blocked_wait_handle);
+                if (std.mem.eql(u8, join, "active_target") or
+                    std.mem.eql(u8, join, "chain_reaches_active_target"))
+                {
+                    return .active_join_chain;
+                }
+                if (std.mem.eql(u8, join, "join_cycle") or
+                    std.mem.eql(u8, join, "join_chain_too_deep"))
+                {
+                    return .join_cycle;
+                }
+                if (!std.mem.eql(u8, join, "not_thread_join")) return .join_target_not_ready;
+                // A semaphore/event can remain actively waited on while its
+                // producer continues to signal it. That is a live background
+                // service, not the same finding as a handle that has never
+                // produced a completion. Preserve it as context so the
+                // upstream report does not inflate liveness debt with healthy
+                // history (ASYNC_IO in the long run is the concrete case).
+                if (self.windowsWaitCostSiteForThread(thread)) |site| {
+                    if (wait_cost.classify(site.*) == .healthy) return .active_wait_with_history;
+                }
+                return .producer_not_ready;
+            },
+        }
+    }
+
+    /// Print the bounded wait graph that sits underneath the thread report.
+    ///
+    /// A timed condition timeout is not a lost wakeup by itself: the guest
+    /// requested a deadline and the correct Rosette action is to return
+    /// ETIMEDOUT. Likewise, an infinite join on a runnable thread is not a
+    /// deadlock. This report names the cause, the object state, and the
+    /// producer status so the next run can target the actual missing signal
+    /// instead of shortening every wait.
+    fn reportWindowsBlockedDiagnostics(self: *const ElfState, limit: usize) void {
+        var blocked: usize = 0;
+        var timed_conditions: usize = 0;
+        var conditions: usize = 0;
+        var finite_handles: usize = 0;
+        var infinite_handles: usize = 0;
+        var srw_locks: usize = 0;
+        var deadlines: usize = 0;
+        var unknown: usize = 0;
+        for (&self.windows_guest_threads) |*thread| {
+            if (thread.status != .blocked) continue;
+            blocked += 1;
+            switch (classifyWindowsBlockedThread(thread)) {
+                .timed_condition => timed_conditions += 1,
+                .condition => conditions += 1,
+                .finite_handle => finite_handles += 1,
+                .infinite_handle => infinite_handles += 1,
+                .srw_lock => srw_locks += 1,
+                .deadline => deadlines += 1,
+                .unknown => unknown += 1,
+            }
+        }
+        if (blocked == 0) return;
+        log.info("PE64 BLOCKED WAIT DIAGNOSTICS: blocked={d} timed_condition={d} condition={d} finite_handle={d} infinite_handle={d} srw_lock={d} deadline={d} unknown={d}; waits remain cooperative and only a real signal, completion, or guest-clock deadline may make a blocked thread runnable", .{
+            blocked,
+            timed_conditions,
+            conditions,
+            finite_handles,
+            infinite_handles,
+            srw_locks,
+            deadlines,
+            unknown,
+        });
+
+        var shown: usize = 0;
+        for (&self.windows_guest_threads, 0..) |*thread, index| {
+            if (thread.status != .blocked or shown == limit) continue;
+            shown += 1;
+            const cause = classifyWindowsBlockedThread(thread);
+            const finding = self.classifyWindowsBlockedFinding(thread);
+            const wait_site = self.windowsWaitCostSiteForThread(thread);
+            var target_text: [128]u8 = undefined;
+            const target = self.describeWindowsWaitTarget(thread.blocked_wait_handle, &target_text);
+            const join = self.windowsJoinVerdict(thread.blocked_wait_handle);
+            const blocked_age_steps = if (thread.blocked_since_total_steps == 0)
+                0
+            else
+                self.totalInterpretedSteps() -| thread.blocked_since_total_steps;
+            const blocked_age_ticks = if (thread.blocked_since_guest_ticks == 0)
+                0
+            else
+                self.guest_clock.ticks -| thread.blocked_since_guest_ticks;
+            const object_kind = if (thread.blocked_wait_handle != 0)
+                self.windowsWaitObjectKindName(thread.blocked_wait_handle)
+            else
+                "none";
+            const readiness = if (thread.blocked_wait_handle == 0)
+                "not_applicable"
+            else if (self.windowsWaitObjectReady(thread.blocked_wait_handle)) |ready|
+                if (ready) "ready" else "not_ready"
+            else
+                "unmodeled";
+            const last_import = if (thread.last_import_len != 0) thread.lastImportText() else "<none>";
+            const site_classification = if (wait_site) |site| wait_cost.classify(site.*) else .no_data;
+            const site_key = if (wait_site) |site| site.key else 0;
+            const site_waits = if (wait_site) |site| site.waits else 0;
+            const site_signals = if (wait_site) |site| site.signals else 0;
+            const site_timeouts = if (wait_site) |site| site.timed_out else 0;
+            log.info("PE64 BLOCKED WAIT DIAGNOSTICS:   slot={d} thread=0x{x} name='{s}' cause={s} finding={s} priority={d} wait_handle=0x{x} kind={s} readiness={s}{s} join={s} age_steps={d} age_ticks={d} condition=0x{x} mutex=0x{x} lock=0x{x} timeout_ms={d} deadline_ticks={d} last_import={s} last_import_step={d} thread_steps={d} wait_site=0x{x} site_classification={s} site_waits={d} site_signals={d} site_timeouts={d} action={s} finding_action={s}", .{
+                index,
+                thread.handle,
+                if (thread.name_len != 0) thread.nameText() else "<unnamed>",
+                cause.label(),
+                finding.label(),
+                finding.priority(),
+                thread.blocked_wait_handle,
+                object_kind,
+                readiness,
+                target,
+                join,
+                blocked_age_steps,
+                blocked_age_ticks,
+                thread.blocked_condition,
+                thread.blocked_condition_mutex,
+                thread.blocked_srw_lock,
+                thread.blocked_wait_timeout,
+                thread.blocked_wait_deadline,
+                last_import,
+                thread.last_import_step,
+                thread.executed_steps,
+                site_key,
+                site_classification.label(),
+                site_waits,
+                site_signals,
+                site_timeouts,
+                cause.action(),
+                finding.action(),
+            });
+        }
+        if (shown != blocked) {
+            log.info("PE64 BLOCKED WAIT DIAGNOSTICS:   {d} blocked thread(s) omitted after bounded sample of {d}; aggregate counts above remain complete", .{ blocked - shown, limit });
+        }
+    }
+
+    /// Turn the raw wait graph and duration ledger into a short ranked action
+    /// list.  The full reports remain the audit trail; this report is the
+    /// answer to "what do I inspect first?" and is emitted at heartbeats and
+    /// at exit so a long run does not require reconstructing a finding from
+    /// lines written hours apart.
+    fn reportWindowsWaitFindings(self: *ElfState) void {
+        var blocked: usize = 0;
+        var liveness_blocks: usize = 0;
+        var cost_blocks: usize = 0;
+        var expected_blocks: usize = 0;
+        var expected_deadlines: usize = 0;
+        var periodic_polls: usize = 0;
+        var active_join_chains: usize = 0;
+        var join_targets_not_ready: usize = 0;
+        var join_cycles: usize = 0;
+        var conditions_without_signal: usize = 0;
+        var condition_producers_pending: usize = 0;
+        var timeout_hotspots: usize = 0;
+        var producers_not_ready: usize = 0;
+        var active_wait_contexts: usize = 0;
+        var locks_pending: usize = 0;
+        var ready_but_blocked: usize = 0;
+        var missing_models: usize = 0;
+
+        for (&self.windows_guest_threads) |*thread| {
+            if (thread.status != .blocked) continue;
+            blocked += 1;
+            const finding = self.classifyWindowsBlockedFinding(thread);
+            if (finding.isLivenessFinding()) liveness_blocks += 1;
+            if (finding == .timeout_hotspot or finding == .periodic_timeout_poll) cost_blocks += 1;
+            if (finding.isExpected()) expected_blocks += 1;
+            switch (finding) {
+                .expected_deadline => expected_deadlines += 1,
+                .periodic_timeout_poll => periodic_polls += 1,
+                .active_join_chain => active_join_chains += 1,
+                .join_target_not_ready => join_targets_not_ready += 1,
+                .join_cycle => join_cycles += 1,
+                .unsignalled_condition => conditions_without_signal += 1,
+                .condition_producer_pending => condition_producers_pending += 1,
+                .timeout_hotspot => timeout_hotspots += 1,
+                .producer_not_ready => producers_not_ready += 1,
+                .active_wait_with_history => active_wait_contexts += 1,
+                .lock_owner_pending => locks_pending += 1,
+                .ready_but_blocked => ready_but_blocked += 1,
+                .missing_wait_model => missing_models += 1,
+            }
+        }
+
+        var site_liveness: usize = 0;
+        var site_cost: usize = 0;
+        var site_expected: usize = 0;
+        var site_healthy: usize = 0;
+        for (self.windows_wait_cost.sites[0..self.windows_wait_cost.count]) |site| {
+            const classification = wait_cost.classify(site);
+            if (classification.isActionable()) site_liveness += 1;
+            if (classification.isCostHotspot()) site_cost += 1;
+            if (classification == .expected_deadline) site_expected += 1;
+            if (classification == .healthy) site_healthy += 1;
+        }
+
+        if (blocked == 0 and self.windows_wait_cost.count == 0) return;
+        self.reportWindowsWaitEscalations();
+        log.info("PE64 WAIT FINDINGS: blocked={d} liveness_blocks={d} cost_blocks={d} expected_blocks={d} wait_sites={d} site_liveness={d} site_cost={d} site_expected={d} site_healthy={d}; liveness findings can stop progress, cost findings explain slowdown, expected findings are not defects", .{
+            blocked,
+            liveness_blocks,
+            cost_blocks,
+            expected_blocks,
+            self.windows_wait_cost.count,
+            site_liveness,
+            site_cost,
+            site_expected,
+            site_healthy,
+        });
+        if (self.windows_wait_unsignalled_escalations != 0 or self.windows_wait_timeout_hotspot_escalations != 0) {
+            log.info("PE64 WAIT ESCALATIONS: unsignalled_condition={d} timeout_hotspot={d}; each count is a bounded forensic trigger, not a synthetic wake or success result", .{
+                self.windows_wait_unsignalled_escalations,
+                self.windows_wait_timeout_hotspot_escalations,
+            });
+        }
+        log.info("PE64 WAIT FINDINGS: blocked_by_class expected_deadline={d} periodic_poll={d} active_join_chain={d} join_target_not_ready={d} join_cycle={d} unsignalled_condition={d} condition_producer_pending={d} timeout_hotspot={d} producer_not_ready={d} active_wait_with_history={d} lock_owner_pending={d} ready_but_blocked={d} missing_wait_model={d}; ranked entries below include the exact waiter, object, last import, and next action", .{
+            expected_deadlines,
+            periodic_polls,
+            active_join_chains,
+            join_targets_not_ready,
+            join_cycles,
+            conditions_without_signal,
+            condition_producers_pending,
+            timeout_hotspots,
+            producers_not_ready,
+            active_wait_contexts,
+            locks_pending,
+            ready_but_blocked,
+            missing_models,
+        });
+
+        var selected_threads = [_]bool{false} ** MAX_WINDOWS_GUEST_THREADS;
+        var shown_threads: usize = 0;
+        while (shown_threads < 8) : (shown_threads += 1) {
+            var best_index: ?usize = null;
+            var best_priority: u8 = 0;
+            var best_age: u64 = 0;
+            for (&self.windows_guest_threads, 0..) |*thread, index| {
+                if (thread.status != .blocked or selected_threads[index]) continue;
+                const finding = self.classifyWindowsBlockedFinding(thread);
+                const age = if (thread.blocked_since_total_steps == 0)
+                    0
+                else
+                    self.totalInterpretedSteps() -| thread.blocked_since_total_steps;
+                if (best_index == null or finding.priority() > best_priority or
+                    (finding.priority() == best_priority and age > best_age))
+                {
+                    best_index = index;
+                    best_priority = finding.priority();
+                    best_age = age;
+                }
+            }
+            const index = best_index orelse break;
+            selected_threads[index] = true;
+            const thread = &self.windows_guest_threads[index];
+            const finding = self.classifyWindowsBlockedFinding(thread);
+            var target_text: [128]u8 = undefined;
+            const target = self.describeWindowsWaitTarget(thread.blocked_wait_handle, &target_text);
+            const join = self.windowsJoinVerdict(thread.blocked_wait_handle);
+            const object_kind = if (thread.blocked_wait_handle != 0)
+                self.windowsWaitObjectKindName(thread.blocked_wait_handle)
+            else
+                "none";
+            const readiness = if (thread.blocked_wait_handle == 0)
+                "not_applicable"
+            else if (self.windowsWaitObjectReady(thread.blocked_wait_handle)) |ready|
+                if (ready) "ready" else "not_ready"
+            else
+                "unmodeled";
+            const last_import = if (thread.last_import_len != 0) thread.lastImportText() else "<none>";
+            log.info("PE64 WAIT FINDINGS:   blocked_rank={d} slot={d} class={s} priority={d} thread=0x{x} name='{s}' age_steps={d} wait_handle=0x{x} kind={s} readiness={s}{s} join={s} condition=0x{x} lock=0x{x} timeout_ms={d} deadline_ticks={d} last_import={s} last_import_step={d} thread_steps={d} action={s}", .{
+                shown_threads + 1,
+                index,
+                finding.label(),
+                finding.priority(),
+                thread.handle,
+                if (thread.name_len != 0) thread.nameText() else "<unnamed>",
+                best_age,
+                thread.blocked_wait_handle,
+                object_kind,
+                readiness,
+                target,
+                join,
+                thread.blocked_condition,
+                thread.blocked_srw_lock,
+                thread.blocked_wait_timeout,
+                thread.blocked_wait_deadline,
+                last_import,
+                thread.last_import_step,
+                thread.executed_steps,
+                finding.action(),
+            });
+        }
+
+        var selected_sites = [_]bool{false} ** wait_cost.Ledger.capacity;
+        var shown_sites: usize = 0;
+        while (shown_sites < 8) : (shown_sites += 1) {
+            var best_index: ?usize = null;
+            var best_priority: u8 = 0;
+            var best_timeout_ticks: u64 = 0;
+            var best_waits: u64 = 0;
+            for (self.windows_wait_cost.sites[0..self.windows_wait_cost.count], 0..) |site, index| {
+                if (selected_sites[index]) continue;
+                const classification = wait_cost.classify(site);
+                if (best_index == null or classification.priority() > best_priority or
+                    (classification.priority() == best_priority and site.timed_out_ticks > best_timeout_ticks) or
+                    (classification.priority() == best_priority and site.timed_out_ticks == best_timeout_ticks and site.waits > best_waits))
+                {
+                    best_index = index;
+                    best_priority = classification.priority();
+                    best_timeout_ticks = site.timed_out_ticks;
+                    best_waits = site.waits;
+                }
+            }
+            const index = best_index orelse break;
+            selected_sites[index] = true;
+            const site = self.windows_wait_cost.sites[index];
+            const classification = wait_cost.classify(site);
+            const timeout_percent = if (site.waits == 0)
+                0
+            else
+                @min(@as(u64, 100), (site.timed_out *| 100) / site.waits);
+            const timeout_tick_percent = if (site.total_ticks == 0)
+                0
+            else
+                @min(@as(u64, 100), (site.timed_out_ticks *| 100) / site.total_ticks);
+            log.info("PE64 WAIT FINDINGS:   site_rank={d} key=0x{x} kind={s} class={s} priority={d} waits={d} active={d} signaled={d} timeouts={d} ({d}%) timeout_ticks={d} ({d}%) signals={d} timeout_ms={d} max_ticks={d} max_overshoot_ticks={d} first_step={d} last_step={d} first_ticks={d} last_ticks={d} last_signal_step={d} last_signal_thread=0x{x} last_signal_rip=0x{x} action={s}", .{
+                shown_sites + 1,
+                site.key,
+                site.kind.label(),
+                classification.label(),
+                classification.priority(),
+                site.waits,
+                site.active,
+                site.signaled,
+                site.timed_out,
+                timeout_percent,
+                site.timed_out_ticks,
+                timeout_tick_percent,
+                site.signals,
+                site.last_timeout_milliseconds,
+                site.max_ticks,
+                site.max_timeout_overshoot_ticks,
+                site.first_step,
+                site.last_step,
+                site.first_ticks,
+                site.last_ticks,
+                site.last_signal_step,
+                site.last_signal_thread_handle,
+                site.last_signal_rip,
+                classification.action(),
+            });
+        }
+    }
+
+    /// Put wait evidence ahead of the last-mile screen verdict.  A screen
+    /// chain can be perfectly instrumented and still be downstream of a
+    /// worker that never reaches its producer, a join whose target never
+    /// completes, or a wait model Rosette does not understand.  This compact
+    /// precedence line makes that causal order explicit at exit without
+    /// asking the reader to reconstruct it from the full blocked-thread
+    /// sample above.
+    fn reportWindowsUpstreamWaitPriority(self: *const ElfState) void {
+        var blocked: usize = 0;
+        var actionable: usize = 0;
+        var unknown: usize = 0;
+        var conditions: usize = 0;
+        var srw_locks: usize = 0;
+        var finite_handles: usize = 0;
+        var finite_pending: usize = 0;
+        var timeout_hotspots: usize = 0;
+        var periodic_polls: usize = 0;
+        var producer_handles_pending: usize = 0;
+        var unready_joins: usize = 0;
+        var join_cycles: usize = 0;
+        var active_join_chains: usize = 0;
+        var active_wait_contexts: usize = 0;
+        var ready_but_blocked: usize = 0;
+        var deadlines: usize = 0;
+        var oldest_age_steps: u64 = 0;
+        var oldest_thread: u64 = 0;
+
+        for (&self.windows_guest_threads) |*thread| {
+            if (thread.status != .blocked) continue;
+            blocked += 1;
+            const finding = self.classifyWindowsBlockedFinding(thread);
+            if (finding.isLivenessFinding()) actionable += 1;
+            if (finding == .timeout_hotspot) timeout_hotspots += 1;
+            if (finding == .periodic_timeout_poll) periodic_polls += 1;
+            const cause = classifyWindowsBlockedThread(thread);
+            switch (cause) {
+                .unknown => unknown += 1,
+                .condition, .timed_condition => conditions += @intFromBool(cause == .condition),
+                .srw_lock => srw_locks += 1,
+                .finite_handle => {
+                    finite_handles += 1;
+                    if (finding == .producer_not_ready) finite_pending += 1;
+                },
+                .deadline => deadlines += 1,
+                .infinite_handle => {},
+            }
+
+            const age_steps = if (thread.blocked_since_total_steps == 0)
+                0
+            else
+                self.totalInterpretedSteps() -| thread.blocked_since_total_steps;
+            if (age_steps > oldest_age_steps) {
+                oldest_age_steps = age_steps;
+                oldest_thread = thread.handle;
+            }
+
+            if (cause == .infinite_handle) {
+                const join = self.windowsJoinVerdict(thread.blocked_wait_handle);
+                const active_chain = std.mem.eql(u8, join, "active_target") or
+                    std.mem.eql(u8, join, "chain_reaches_active_target");
+                if (active_chain) {
+                    active_join_chains += 1;
+                } else if (std.mem.eql(u8, join, "join_cycle") or
+                    std.mem.eql(u8, join, "join_chain_too_deep"))
+                {
+                    join_cycles += 1;
+                } else if (!std.mem.eql(u8, join, "not_thread_join")) {
+                    // Only a thread object is a join. Other kernel handles
+                    // must not inflate the join count merely because their
+                    // current state is not ready.
+                    if (self.windowsWaitObjectReady(thread.blocked_wait_handle)) |ready| {
+                        if (!ready) unready_joins += 1;
+                    } else {
+                        unready_joins += 1;
+                    }
+                } else switch (finding) {
+                    .producer_not_ready => producer_handles_pending += 1,
+                    .active_wait_with_history => active_wait_contexts += 1,
+                    .ready_but_blocked => ready_but_blocked += 1,
+                    else => {},
+                }
+            }
+        }
+
+        var timed_waits: u64 = 0;
+        var timed_timeouts: u64 = 0;
+        var timed_ticks: u64 = 0;
+        var timed_total_ticks: u64 = 0;
+        for (self.windows_wait_cost.sites[0..self.windows_wait_cost.count]) |site| {
+            if (site.kind != .timed_condition) continue;
+            timed_waits +|= site.waits;
+            timed_timeouts +|= site.timed_out;
+            timed_ticks +|= site.timed_out_ticks;
+            timed_total_ticks +|= site.total_ticks;
+        }
+        const timeout_percent = if (timed_waits == 0)
+            0
+        else
+            @min(@as(u64, 100), (timed_timeouts *| 100) / timed_waits);
+        const timeout_tick_percent = if (timed_total_ticks == 0)
+            0
+        else
+            @min(@as(u64, 100), (timed_ticks *| 100) / timed_total_ticks);
+        if (blocked == 0 and timed_waits == 0) return;
+
+        const verdict = if (unknown != 0)
+            "missing_wait_model"
+        else if (ready_but_blocked != 0)
+            "ready_but_blocked"
+        else if (join_cycles != 0)
+            "join_cycle_or_depth"
+        else if (unready_joins != 0)
+            "join_target_not_ready"
+        else if (conditions != 0 or srw_locks != 0)
+            "unsignalled_condition_or_lock"
+        else if (producer_handles_pending != 0 or finite_pending != 0)
+            "producer_or_handle_pending"
+        else
+            "no_unresolved_upstream_wait";
+        log.info("PE64 UPSTREAM WAIT PRIORITY: verdict={s} blocked={d} actionable={d} unknown={d} condition={d} srw_lock={d} finite_handle={d} finite_pending={d} timeout_hotspots={d} periodic_polls={d} infinite_handle_pending={d} infinite_join_unready={d} join_cycles={d} active_join_chains={d} active_wait_contexts={d} ready_but_blocked={d} expected_deadlines={d} oldest_blocked_steps={d} oldest_thread=0x{x} timed_condition_timeouts={d}/{d} ({d}%) timeout_guest_ticks={d}/{d} ({d}%); screen validity is downstream of these waits, so resolve this verdict before interpreting SCREEN VALIDITY CHAIN", .{
+            verdict,
+            blocked,
+            actionable,
+            unknown,
+            conditions,
+            srw_locks,
+            finite_handles,
+            finite_pending,
+            timeout_hotspots,
+            periodic_polls,
+            producer_handles_pending,
+            unready_joins,
+            join_cycles,
+            active_join_chains,
+            active_wait_contexts,
+            ready_but_blocked,
+            deadlines,
+            oldest_age_steps,
+            oldest_thread,
+            timed_timeouts,
+            timed_waits,
+            timeout_percent,
+            timed_ticks,
+            timed_total_ticks,
+            timeout_tick_percent,
+        });
+    }
+
+    /// Report the cost of synchronization separately from its correctness
+    /// counters. A timeout count alone cannot tell a harmless one-shot delay
+    /// from a 99%-timeout poll that consumed the interpreter; duration and
+    /// overshoot make that distinction explicit and keep producer evidence
+    /// beside the consumer that waited for it.
+    fn reportWindowsWaitCost(self: *const ElfState) void {
+        const ledger = &self.windows_wait_cost;
+        if (ledger.count == 0 and ledger.dropped_sites == 0 and ledger.unmatched_signals == 0) return;
+        var waits: u64 = 0;
+        var active: u64 = 0;
+        var signals: u64 = 0;
+        var signaled: u64 = 0;
+        var timeouts: u64 = 0;
+        var timeout_ticks: u64 = 0;
+        var total_ticks: u64 = 0;
+        var max_ticks: u64 = 0;
+        var max_overshoot: u64 = 0;
+        var site_liveness: u64 = 0;
+        var site_cost: u64 = 0;
+        var site_expected: u64 = 0;
+        for (ledger.sites[0..ledger.count]) |site| {
+            waits +|= site.waits;
+            active +|= site.active;
+            signals +|= site.signals;
+            signaled +|= site.signaled;
+            timeouts +|= site.timed_out;
+            timeout_ticks +|= site.timed_out_ticks;
+            total_ticks +|= site.total_ticks;
+            max_ticks = @max(max_ticks, site.max_ticks);
+            max_overshoot = @max(max_overshoot, site.max_timeout_overshoot_ticks);
+            const classification = wait_cost.classify(site);
+            if (classification.isActionable()) site_liveness +|= 1;
+            if (classification.isCostHotspot()) site_cost +|= 1;
+            if (classification == .expected_deadline) site_expected +|= 1;
+        }
+        const timeout_percent = if (waits == 0) 0 else @min(@as(u64, 100), (timeouts *| 100) / waits);
+        const timeout_tick_percent = if (total_ticks == 0) 0 else @min(@as(u64, 100), (timeout_ticks *| 100) / total_ticks);
+        log.info("PE64 WAIT COST: sites={d} waits={d} active={d} signaled={d} timeouts={d} ({d}%) signals={d} unmatched_signals={d} total_guest_ticks={d} timeout_guest_ticks={d} ({d}%) max_wait_ticks={d} max_timeout_overshoot_ticks={d} classified(liveness/cost/expected)={d}/{d}/{d} dropped_sites={d} dropped_events={d}; timeout share is the direct poll/blocked-wait cost, not a liveness verdict", .{
+            ledger.count,
+            waits,
+            active,
+            signaled,
+            timeouts,
+            timeout_percent,
+            signals,
+            ledger.unmatched_signals,
+            total_ticks,
+            timeout_ticks,
+            timeout_tick_percent,
+            max_ticks,
+            max_overshoot,
+            site_liveness,
+            site_cost,
+            site_expected,
+            ledger.dropped_sites,
+            ledger.dropped_events,
+        });
+        for (ledger.sites[0..ledger.count]) |site| {
+            if (site.waits == 0 and site.signals == 0 and site.active == 0) continue;
+            const site_timeout_percent = if (site.waits == 0) 0 else @min(@as(u64, 100), (site.timed_out *| 100) / site.waits);
+            const site_timeout_tick_percent = if (site.total_ticks == 0)
+                0
+            else
+                @min(@as(u64, 100), (site.timed_out_ticks *| 100) / site.total_ticks);
+            const classification = wait_cost.classify(site);
+            log.info("PE64 WAIT COST:   key=0x{x} kind={s} waits={d} active={d} signaled={d} timeouts={d} ({d}%) signals={d} total_ticks={d} timeout_ticks={d} ({d}%) max_ticks={d} max_overshoot_ticks={d} first_step={d} last_step={d} last_signal_step={d} last_timeout_step={d} timeout_ms={d} classification={s} action={s}", .{
+                site.key,
+                site.kind.label(),
+                site.waits,
+                site.active,
+                site.signaled,
+                site.timed_out,
+                site_timeout_percent,
+                site.signals,
+                site.total_ticks,
+                site.timed_out_ticks,
+                site_timeout_tick_percent,
+                site.max_ticks,
+                site.max_timeout_overshoot_ticks,
+                site.first_step,
+                site.last_step,
+                site.last_signal_step,
+                site.last_timeout_step,
+                site.last_timeout_milliseconds,
+                classification.label(),
+                classification.action(),
+            });
         }
     }
 
@@ -11123,8 +12861,9 @@ pub const ElfState = struct {
         if (defined.hits == 0) {
             log.info("PE64 GUEST CODE PROGRESS:   not one guest function was translated. Either no title code has run at all, or this build translates ahead of time and the axis does not apply here; check XThread_Execute in the chain above before reading this as a stall", .{});
         } else {
-            const quiet = self.executed_steps -| defined.last_step;
-            const share = if (self.executed_steps == 0) @as(u64, 0) else quiet * 100 / self.executed_steps;
+            const interpreted = self.totalInterpretedSteps();
+            const quiet = interpreted -| defined.last_step;
+            const share = if (interpreted == 0) @as(u64, 0) else quiet * 100 / interpreted;
             if (share >= 25) {
                 log.info("PE64 GUEST CODE PROGRESS:   the last translation was at step {d}, {d} step(s) and {d}% of the run ago. The title has been executing code it already had for that whole span: it is looping, not advancing, and the loop is the finding rather than whatever it last asked the kernel for", .{
                     defined.last_step,
@@ -11389,6 +13128,35 @@ pub const ElfState = struct {
 
         // Where the calls went. A reader looking for graphics wants to know
         // in one line whether any of the traffic was graphics at all.
+        log.info("PE64 GUEST KERNEL CALLS:   step accounting total_interpreted_steps={d} owner_steps={d} worker_steps={d}; every first_step/last_step uses the combined denominator", .{
+            self.totalInterpretedSteps(),
+            self.executed_steps,
+            self.windows_worker_executed_steps,
+        });
+        const synchronization_exports = [_][]const u8{
+            "RtlEnterCriticalSection",
+            "RtlLeaveCriticalSection",
+            "KeWaitForSingleObject",
+            "KeWaitForMultipleObjects",
+            "NtWaitForSingleObject",
+            "NtWaitForMultipleObjects",
+            "NtDelayExecution",
+            "WaitForSingleObject",
+            "WaitForMultipleObjects",
+        };
+        for (synchronization_exports) |export_name| {
+            if (census.findExport(export_name)) |slot| {
+                if (slot.hits != 0) {
+                    log.info("PE64 GUEST SYNCHRONIZATION COST: export={s} calls={d} first_step={d} last_step={d} subsystem={s}; this is guest synchronization overhead, separate from Rosetta's blocked-wait ledger", .{
+                        export_name,
+                        slot.hits,
+                        slot.first_step,
+                        slot.last_step,
+                        slot.subsystem.label(),
+                    });
+                }
+            }
+        }
         const totals = census.subsystemTotals();
         inline for (@typeInfo(xenia_kernel_shim_map.Subsystem).@"enum".fields) |field| {
             const subsystem: xenia_kernel_shim_map.Subsystem = @enumFromInt(field.value);
@@ -11440,8 +13208,20 @@ pub const ElfState = struct {
                 log.info("PE64 GUEST KERNEL CALLS:     never called ({d}):", .{uncalled});
                 var line: [512]u8 = undefined;
                 var used: usize = 0;
+                var shutdown_only: u32 = 0;
+                var optional_display_queries: u32 = 0;
                 for (census.slots) |slot| {
                     if (slot.address == 0 or slot.subsystem != .video or slot.kind != .trampoline or slot.hits != 0) continue;
+                    if (std.mem.eql(u8, slot.export_name, "VdShutdownEngines")) {
+                        shutdown_only += 1;
+                    } else if (std.mem.eql(u8, slot.export_name, "VdSetDisplayModeOverride") or
+                        std.mem.eql(u8, slot.export_name, "VdQueryRealVideoMode") or
+                        std.mem.eql(u8, slot.export_name, "VdQueryVideoFlags") or
+                        std.mem.eql(u8, slot.export_name, "VdEnableDisableClockGating") or
+                        std.mem.eql(u8, slot.export_name, "VdGetGraphicsAsicID"))
+                    {
+                        optional_display_queries += 1;
+                    }
                     if (slot.export_name.len + 1 > line.len) continue;
                     const needed = slot.export_name.len + @as(usize, if (used == 0) 0 else 1);
                     if (used + needed > line.len) {
@@ -11456,6 +13236,12 @@ pub const ElfState = struct {
                     used += slot.export_name.len;
                 }
                 if (used != 0) log.info("PE64 GUEST KERNEL CALLS:       {s}", .{line[0..used]});
+                if (shutdown_only != 0) {
+                    log.info("PE64 GUEST KERNEL CALLS:       {d} never-called graphics export(s) are shutdown-only (VdShutdownEngines); their zero is expected until the title tears the device down, not a live rendering gap", .{shutdown_only});
+                }
+                if (optional_display_queries != 0) {
+                    log.info("PE64 GUEST KERNEL CALLS:       {d} never-called graphics export(s) are optional display/policy queries (mode override, physical mode, video flags, clock gating, ASIC identity); their zero does not block output when the run already crossed VdQueryVideoMode/VdSetDisplayMode/VdGetCurrentDisplayInformation/VdSwap", .{optional_display_queries});
+                }
             }
         }
 
@@ -11468,8 +13254,9 @@ pub const ElfState = struct {
             var index: usize = 0;
             while (index < shown) : (index += 1) {
                 const slot = census.nthLatestFirstEntry(index) orelse break;
-                log.info("PE64 GUEST KERNEL CALLS:     first_step={d:<12} {s}!{s} [{s}] calls={d}", .{
+                log.info("PE64 GUEST KERNEL CALLS:     first_step={d:<12} last_step={d:<12} {s}!{s} [{s}] calls={d}", .{
                     slot.first_step,
+                    slot.last_step,
                     slot.module.moduleName(),
                     slot.export_name,
                     slot.subsystem.label(),
@@ -11483,7 +13270,8 @@ pub const ElfState = struct {
                 });
             }
             if (census.slotAt(census.last_slot)) |latest| {
-                const quiet = self.executed_steps -| census.last_step;
+                const total_steps = self.totalInterpretedSteps();
+                const quiet = total_steps -| census.last_step;
                 log.info("PE64 GUEST KERNEL CALLS:   the most recent call of any kind was {s} at step {d}, which is {d} step(s) before the run ended; a title that has been silent for most of the run is not making requests Rosette could be failing", .{
                     latest.export_name,
                     census.last_step,
@@ -11934,6 +13722,7 @@ pub const ElfState = struct {
         // taken a few hundred thousand times in a run, against a witness row
         // whose total is otherwise unreadable.
         const caller = self.last_instruction_rip;
+        const accounting_step = self.totalInterpretedSteps();
         var placed = false;
         for (&self.guest_milestone_callers[index], 0..) |*slot, slot_index| {
             if (slot.* == caller) {
@@ -11954,14 +13743,14 @@ pub const ElfState = struct {
                 self.windows_guest_threads[slot].entered_xenia_title = true;
             }
             self.windows_guest_threads[slot].last_milestone = @intCast(index + 1);
-            self.windows_guest_threads[slot].last_milestone_step = self.executed_steps;
+            self.windows_guest_threads[slot].last_milestone_step = accounting_step;
         }
         if (self.guest_milestone_hits[index] == 0) {
-            self.guest_milestone_first_step[index] = self.executed_steps;
+            self.guest_milestone_first_step[index] = accounting_step;
             const milestone = xenia_guest_milestone_map.milestones[index];
             log.info("PE64 GUEST MILESTONE: {s} reached for the first time at step {d} rip=0x{x} owner={s} chain={s}; {s}", .{
                 milestone.readable,
-                self.executed_steps,
+                accounting_step,
                 target,
                 milestone.owner.label(),
                 milestone.chain.label(),
@@ -11969,7 +13758,7 @@ pub const ElfState = struct {
             });
         }
         self.guest_milestone_hits[index] +|= 1;
-        self.guest_milestone_last_step[index] = self.executed_steps;
+        self.guest_milestone_last_step[index] = accounting_step;
         // Arguments first: the wake repair below signals objects and must not
         // be what a ring decode reads its write pointer from.
         if (self.windows_runtime_enabled) self.noteGuestMilestoneArguments(index);
@@ -12798,6 +14587,12 @@ pub const ElfState = struct {
             self.guest_vfs_resolve_unreadable,
             self.guest_vfs_resolve_overflow,
         });
+        if (summary.device_path_not_found == 0 and summary.bare_module_unmatched_not_found == 0) {
+            log.info("PE64 GUEST VFS ROUTING: verified all observed device-prefixed paths resolved; bare-module probes reconciled={d}/{d}, unmatched_bare_module_not_found=0. Repeated bare-name warnings are module-name probes, not missing mounted devices", .{
+                summary.bare_module_paths_reconciled,
+                summary.bare_module_paths,
+            });
+        }
         var order: [GUEST_VFS_RESOLVE_CAPACITY]usize = undefined;
         const count = self.guest_vfs_resolve_count;
         for (0..count) |index| order[index] = index;
@@ -12987,7 +14782,8 @@ pub const ElfState = struct {
     }
 
     fn noteGuestKernelEntry(self: *ElfState, target: u64, via_jump: bool) void {
-        const slot_index = self.guest_kernel_calls.note(target, self.executed_steps);
+        const accounting_step = self.totalInterpretedSteps();
+        const slot_index = self.guest_kernel_calls.note(target, accounting_step);
         if (slot_index == 0) return;
         if (via_jump) self.guest_kernel_calls.tail_jump_entries +|= 1;
         if (self.guest_kernel_calls.slotAt(slot_index)) |slot| {
@@ -12996,7 +14792,7 @@ pub const ElfState = struct {
         if (self.windows_active_guest_thread_slot) |slot| {
             const thread = &self.windows_guest_threads[slot];
             thread.last_kernel_slot = slot_index;
-            thread.last_kernel_step = self.executed_steps;
+            thread.last_kernel_step = accounting_step;
             thread.kernel_calls +|= 1;
         }
     }
@@ -13479,6 +15275,97 @@ pub const ElfState = struct {
         }
     }
 
+    pub fn reportPresentChainFinal(self: *ElfState) void {
+        if (!self.windows_runtime_enabled or self.windows_present_chain_final_reported) return;
+        self.windows_present_chain_final_reported = true;
+        if (self.windows_graphics.hooks.report_present_chain_full) |callback| {
+            callback(self.windows_graphics.hooks.native_context);
+        } else if (self.windows_graphics.hooks.report_present_chain) |callback| {
+            callback(self.windows_graphics.hooks.native_context);
+        }
+    }
+
+    fn windowsScreenValiditySnapshot(self: *const ElfState) screen_validity.Snapshot {
+        const graphics = &self.windows_graphics;
+        const guest_presents = if (graphics.guest_present_observed) graphics.presents else 0;
+        const has_content_command = graphics.content_commands != 0;
+        const has_present = guest_presents != 0;
+        return .{
+            .step = self.totalInterpretedSteps(),
+            .guest_presents = guest_presents,
+            .guest_acquires = graphics.image_acquires,
+            .presents_with_target = if (has_present and graphics.image_acquires != 0) 1 else 0,
+            .presents_with_content = if (has_present and has_content_command) 1 else 0,
+            .presents_clear_only = if (has_present and !has_content_command and graphics.fill_commands != 0) 1 else 0,
+            .presents_without_target = if (has_present and graphics.image_acquires == 0) 1 else 0,
+            .presents_without_write = if (has_present and !has_content_command and graphics.fill_commands == 0) 1 else 0,
+            .content_commands = graphics.content_commands,
+            .native_present_requests = if (graphics.native_vulkan_forwarding) 0 else graphics.native_diagnostic_attempts,
+            .native_present_completions = if (graphics.native_vulkan_forwarding) 0 else graphics.native_diagnostic_frames,
+            .native_queue_submits = if (graphics.native_vulkan_forwarding) graphics.queue_submits else 0,
+            .expected_width = graphics.window_width,
+            .expected_height = graphics.window_height,
+            // The ELF state owns the logical extent, but it does not own a
+            // private AppKit drawable readback. Keep this unknown rather than
+            // promoting the requested window size into pixel evidence.
+            .extent_observed = false,
+            .drawable_owner = if (graphics.native_vulkan_forwarding and graphics.swapchain_ready)
+                .guest_swapchain
+            else if (graphics.native_presenter_ready)
+                .native_presenter
+            else
+                .unknown,
+            .pixel_probe_attempts = 0,
+            .pixel_probe_successes = 0,
+            .pixel_evidence = .unavailable,
+            .window_available = graphics.native_window_ready,
+            .window_chain_intact = graphics.native_window_ready and
+                (graphics.native_vulkan_forwarding or graphics.native_presenter_ready),
+            .window_user_visible = graphics.native_window_visible,
+            .window_visible_fraction_percent = if (graphics.native_window_visible) 100 else 0,
+        };
+    }
+
+    /// Emit a Rosetta-owned, fail-closed screen verdict. A successful guest
+    /// present or native diagnostic frame proves transport only. Without a
+    /// bounded pixel readback and source provenance this report must never
+    /// say that a detailed picture reached the user.
+    pub fn reportWindowsScreenValidity(self: *ElfState) void {
+        const snapshot = self.windowsScreenValiditySnapshot();
+        const evaluation = self.windows_screen_validity.observe(snapshot);
+        const first_blocking = if (evaluation.first_blocking) |stage| stage.label() else "none";
+        const content_class = if (snapshot.content_commands != 0)
+            "content_commands_observed"
+        else if (self.windows_graphics.fill_commands != 0)
+            "clear_or_uniform_only"
+        else
+            "no_content_or_fill_commands";
+        log.info("PE64 SCREEN VALIDITY: verdict={s} first_blocking={s} screen_stage={s} content_class={s} guest_presents={d} acquires={d} content_commands={d} fill_commands={d} native_forwarding={} native_diagnostic_frames={d} pixel_evidence={s} pixel_probe_successes={d} window_visible={} visible_fraction={d}% observations={d}; valid_on_screen is fail-closed until detailed pixel evidence and source provenance are observed", .{
+            evaluation.verdict.label(),
+            first_blocking,
+            evaluation.record(.screen_valid).status.label(),
+            content_class,
+            snapshot.guest_presents,
+            snapshot.guest_acquires,
+            snapshot.content_commands,
+            self.windows_graphics.fill_commands,
+            self.windows_graphics.native_vulkan_forwarding,
+            self.windows_graphics.native_diagnostic_frames,
+            snapshot.pixel_evidence.label(),
+            snapshot.pixel_probe_successes,
+            snapshot.window_user_visible,
+            snapshot.window_visible_fraction_percent,
+            self.windows_screen_validity.observations,
+        });
+        if (evaluation.first_blocking) |stage| {
+            log.info("PE64 SCREEN VALIDITY:   action={s} evidence={s} owner={s}; transport and content provenance remain separate contracts", .{
+                evaluation.action(),
+                evaluation.record(stage).evidence,
+                evaluation.record(stage).owner.label(),
+            });
+        }
+    }
+
     /// Record which import raised a file failure and with what error.
     pub fn noteWindowsFileFailure(self: *ElfState, error_code: u32) void {
         self.noteWindowsFileFailureDetail(error_code, "", 0);
@@ -13608,7 +15495,7 @@ pub const ElfState = struct {
         const slot = self.windows_active_guest_thread_slot orelse return;
         const thread = &self.windows_guest_threads[slot];
         thread.import_calls +|= 1;
-        thread.last_import_step = self.executed_steps;
+        thread.last_import_step = self.totalInterpretedSteps();
         const length = @min(name.len, WINDOWS_GUEST_THREAD_NAME_BYTES);
         @memcpy(thread.last_import[0..length], name[0..length]);
         thread.last_import_len = @intCast(length);
@@ -14551,6 +16438,15 @@ pub const ElfState = struct {
         return callback(self.windows_graphics.hooks.native_context, @intFromBool(owned_by_swapchain)) != 0;
     }
 
+    /// Set the host layer extent before a real Vulkan swapchain is created.
+    /// Returning false means the host could not prove that the layer now has
+    /// the requested pixels; the caller must not silently create a swapchain
+    /// whose images and drawable disagree.
+    pub fn prepareNativeMetalDrawable(self: *const ElfState, width: u32, height: u32) bool {
+        const callback = self.windows_graphics.hooks.native_metal_drawable_prepare orelse return false;
+        return callback(self.windows_graphics.hooks.native_context, width, height) != 0;
+    }
+
     pub fn validateNativeMetalLayerToken(_: *const ElfState, token: u64) bool {
         return token == 0xCAFE_BABE_0000_0001;
     }
@@ -15039,7 +16935,7 @@ pub const ElfState = struct {
                     self.guestMemoryConst(regexp_object, 0x20) orelse &[_]u8{},
                 });
             }
-            if (envFlag("ROSETTE_ELF_TRACE_VECTOR")) {
+            if (self.trace_vector) {
                 switch (decoded.op) {
                     .vcvtss2sd,
                     .vcvtsi2sd_xmm_reg,
@@ -15061,7 +16957,7 @@ pub const ElfState = struct {
                     else => {},
                 }
             }
-            if (envFlag("ROSETTE_ELF_TRACE_UTF8")) {
+            if (self.trace_utf8) {
                 // This is intentionally opt-in and lives behind the existing
                 // RIP trace gate.  The Windows PE uses the same utfcpp
                 // helpers for xe::to_utf16. The Windows libstdc++ ABI stores
@@ -15217,7 +17113,7 @@ pub const ElfState = struct {
                     self.regs.rsp,
                 });
             }
-            if (envFlag("ROSETTE_ELF_TRACE_VECTOR")) {
+            if (self.trace_vector) {
                 switch (decoded.op) {
                     .vcvtss2sd,
                     .vcvtsi2sd_xmm_reg,
@@ -15521,17 +17417,18 @@ pub const ElfState = struct {
     /// ~90% of it. A denominator that measures one thread of a cooperative
     /// scheduler is not a denominator.
     fn logStepBudget(self: *ElfState, steps: u64) void {
+        _ = steps;
         const now = monotonicNanoseconds();
         if (now == 0) return;
+        const interpreted = self.totalInterpretedSteps();
         if (self.run_first_checkpoint_nanos == 0) {
             self.run_first_checkpoint_nanos = now;
             self.run_last_checkpoint_nanos = now;
-            self.run_last_checkpoint_steps = steps;
+            self.run_last_checkpoint_steps = interpreted;
             return;
         }
         const total_nanos = now -| self.run_first_checkpoint_nanos;
         const window_nanos = now -| self.run_last_checkpoint_nanos;
-        const interpreted = self.totalInterpretedSteps();
         const worker_steps = interpreted -| self.executed_steps;
         const window_steps = interpreted -| self.run_last_checkpoint_steps;
         self.run_last_checkpoint_nanos = now;
@@ -15604,6 +17501,8 @@ pub const ElfState = struct {
         self.logGuestThreadShare();
         self.logGuestSchedulingHealth();
         self.reportWindowsTimedWaitSites(4);
+        self.reportWindowsBlockedDiagnostics(8);
+        self.reportWindowsWaitFindings();
         self.reportRunChainsIfChanged(steps);
     }
 
@@ -15615,6 +17514,13 @@ pub const ElfState = struct {
         self.logGuestThreadShare();
         self.logGuestSchedulingHealth();
         self.reportWindowsTimedWaitSites(WINDOWS_TIMED_WAIT_SITE_CAPACITY);
+        // The heartbeat is intentionally bounded; the final report is not.
+        // A live wait graph is evidence, so do not discard the last two
+        // blocked workers merely because an older sample cap was sixteen.
+        self.reportWindowsBlockedDiagnostics(self.windows_guest_threads.len);
+        self.reportWindowsWaitCost();
+        self.reportWindowsWaitFindings();
+        self.reportWindowsUpstreamWaitPriority();
     }
 
     /// The boundaries that decide whether a worker's turn is work or waste,
@@ -15622,14 +17528,32 @@ pub const ElfState = struct {
     /// can hold.
     fn logGuestSchedulingHealth(self: *const ElfState) void {
         var threads_live: usize = 0;
+        var threads_created: usize = 0;
+        var threads_completed: usize = 0;
+        var threads_failed: usize = 0;
+        var threads_vacant: usize = 0;
         for (&self.windows_guest_threads) |*thread| {
-            if (thread.status != .vacant) threads_live += 1;
+            switch (thread.status) {
+                .vacant => threads_vacant += 1,
+                .completed => {
+                    threads_created += 1;
+                    threads_completed += 1;
+                },
+                .failed => {
+                    threads_created += 1;
+                    threads_failed += 1;
+                },
+                else => {
+                    threads_created += 1;
+                    if (isLiveWindowsGuestThread(thread.status)) threads_live += 1;
+                },
+            }
         }
         var wait_objects_live: usize = 0;
         for (self.windows_wait_objects[0..self.windows_wait_object_high_water]) |*object| {
             if (object.handle != 0) wait_objects_live += 1;
         }
-        log.info("PE64 guest scheduling health: timed_condition_waits={d} immediate_timeouts={d} deadline_timeouts={d} nt_delay(parks/yields)={d}/{d} sleep_parks={d} clock_poll_yields={d} slice_yields={d} threads(live/capacity/reused/refused)={d}/{d}/{d}/{d} wait_objects(live/high_water/capacity/freed/refused)={d}/{d}/{d}/{d}/{d} timers(created/set/fired/armed/routines_not_delivered)={d}/{d}/{d}/{d}/{d} thread_stacks_released={d}; a refused thread or wait object is a fatal point, and a high water near capacity is the table the next title outgrows", .{
+        log.info("PE64 guest scheduling health: timed_condition_waits={d} immediate_timeouts={d} deadline_timeouts={d} nt_delay(parks/yields)={d}/{d} sleep_parks={d} clock_poll_yields={d} slice_yields={d} threads(live/capacity/reused/refused)={d}/{d}/{d}/{d} wait_objects(live/high_water/capacity/freed/refused)={d}/{d}/{d}/{d}/{d} timers(created/set/fired/armed/routines_not_delivered)={d}/{d}/{d}/{d}/{d} thread_stacks_released={d} spin(slices/turns_given)={d}/{d}; a refused thread or wait object is a fatal point, and a high water near capacity is the table the next title outgrows", .{
             self.windows_condition_timed_waits,
             self.windows_condition_timed_immediate,
             self.windows_condition_timeouts,
@@ -15653,6 +17577,16 @@ pub const ElfState = struct {
             self.windows_armed_timers,
             self.windows_timer_completion_routines,
             self.windows_thread_stacks_released,
+            self.windows_spin_slices,
+            self.windows_spin_turns_given,
+        });
+        log.info("PE64 guest thread lifecycle: created={d} live={d} completed={d} failed={d} vacant={d} capacity={d}; completed is a normal one-shot exit, failed/refused is the missing-thread signal", .{
+            threads_created,
+            threads_live,
+            threads_completed,
+            threads_failed,
+            threads_vacant,
+            self.windows_guest_threads.len,
         });
     }
 
@@ -15790,6 +17724,7 @@ pub const ElfState = struct {
             self.windows_get_message_idle_steps,
             self.windows_crt_unreadable_pointers,
         });
+        self.reportWindowsBlockedDiagnostics(16);
     }
 
     fn logGraphicsStop(self: *const ElfState) void {
@@ -16402,19 +18337,11 @@ pub const ElfState = struct {
             self.terminated = true;
         }
         if (self.windows_runtime_enabled) self.flushWindowsGuestOutput();
-        if (self.windows_runtime_enabled) {
-            // The first authentic guest frame can arrive between the last
-            // periodic checkpoint and the run's natural/forced exit.  Emit a
-            // final full presentation-chain snapshot so the log reflects the
-            // terminal state rather than the last 50M-step observation.
-            if (self.windows_graphics.hooks.report_present_chain_full) |callback| {
-                callback(self.windows_graphics.hooks.native_context);
-            } else if (self.windows_graphics.hooks.report_present_chain) |callback| {
-                // Keep older/native test harnesses useful even if they do not
-                // provide the new full-report hook.
-                callback(self.windows_graphics.hooks.native_context);
-            }
-        }
+        // The first authentic guest frame can arrive between the last
+        // periodic checkpoint and the run's natural/forced exit. ExitProcess
+        // bypasses this epilogue, so the loader's atexit summary calls the same
+        // idempotent helper as a second authority.
+        self.reportPresentChainFinal();
         if (self.trace_graphics_progress and self.windows_runtime_enabled) self.logGraphicsStop();
         if (self.windows_runtime_enabled and !self.trace_graphics_progress) self.logWindowsGuestFailurePointSummary();
         if (self.windows_runtime_enabled) {
@@ -16434,6 +18361,14 @@ pub const ElfState = struct {
             self.reportGuestOutputChain();
             self.reportGuestMilestones();
             self.reportGuestThreads();
+            // Keep the final report's wait graph complete even when the run
+            // exits before a normal throughput report is requested.
+            self.reportWindowsBlockedDiagnostics(self.windows_guest_threads.len);
+            self.reportWindowsWaitCost();
+            self.reportWindowsWaitFindings();
+            self.reportWindowsUpstreamWaitPriority();
+            self.reportWindowsScreenValidity();
+            self.reportWindowsMemoryContract();
         }
         if (self.faulted) self.logExitDiagnostics();
     }
@@ -17180,6 +19115,14 @@ pub const ElfState = struct {
     /// the C runtime's string imports need.
     pub fn guestMemoryTailConst(self: *const ElfState, addr: u64, maximum: usize) ?[]const u8 {
         if (maximum == 0) return null;
+        if (self.nativeMemoryAlias(addr, 1) != null) {
+            for (self.native_memory_aliases[0..self.native_memory_alias_count]) |alias| {
+                const bytes = alias.bytes orelse continue;
+                if (addr < alias.guest_base or addr >= alias.guest_base + bytes.len) continue;
+                const offset: usize = @intCast(addr - alias.guest_base);
+                return bytes[offset..@min(bytes.len, offset +| maximum)];
+            }
+        }
         if (self.addrToOffset(addr)) |off| {
             const start: usize = @intCast(off);
             if (start >= self.mem.len) return null;
@@ -23489,6 +25432,25 @@ test "the busiest worker is named, because the frontier only ever sees the owner
     try testing.expectEqual(@as(u64, 0xAA), state.windows_guest_threads[busiest].handle);
 }
 
+test "completed guest workers are not reported as live" {
+    try testing.expect(isLiveWindowsGuestThread(.pending));
+    try testing.expect(isLiveWindowsGuestThread(.runnable));
+    try testing.expect(isLiveWindowsGuestThread(.running));
+    try testing.expect(isLiveWindowsGuestThread(.blocked));
+    try testing.expect(!isLiveWindowsGuestThread(.completed));
+    try testing.expect(!isLiveWindowsGuestThread(.failed));
+    try testing.expect(!isLiveWindowsGuestThread(.vacant));
+
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_guest_threads[0] = .{ .status = .completed, .handle = 0xCC, .executed_steps = 10_000 };
+    state.windows_guest_threads[1] = .{ .status = .failed, .handle = 0xDD, .executed_steps = 20_000 };
+    state.executed_steps = 30_000;
+    state.windows_worker_executed_steps = 30_000;
+
+    try testing.expectEqual(@as(?usize, null), state.busiestWindowsGuestThread());
+}
+
 test "a clear does not count as a drawn frame in the graphics state" {
     var state = ElfState.init(testing.allocator);
     defer state.deinit();
@@ -24054,7 +26016,19 @@ const NativeGraphicsTestHarness = struct {
     starts: u64 = 0,
     stage: u32 = 10,
     frames: u64 = 0,
+    present_chain_reports: u64 = 0,
+    present_chain_full_reports: u64 = 0,
 };
+
+fn testPresentChainReport(context: ?*anyopaque) callconv(.c) void {
+    const harness: *NativeGraphicsTestHarness = @ptrCast(@alignCast(context.?));
+    harness.present_chain_reports +|= 1;
+}
+
+fn testPresentChainFullReport(context: ?*anyopaque) callconv(.c) void {
+    const harness: *NativeGraphicsTestHarness = @ptrCast(@alignCast(context.?));
+    harness.present_chain_full_reports +|= 1;
+}
 
 fn testNativePresenterStart(context: ?*anyopaque, _: u32, _: u32) callconv(.c) c_int {
     const harness: *NativeGraphicsTestHarness = @ptrCast(@alignCast(context.?));
@@ -24075,6 +26049,40 @@ fn testNativePresenterDiagnostic(context: ?*anyopaque, _: u64, _: u32, _: u32, _
     const harness: *NativeGraphicsTestHarness = @ptrCast(@alignCast(context.?));
     harness.frames +|= 1;
     return harness.frames;
+}
+
+test "the terminal present-chain snapshot is full and idempotent" {
+    var harness = NativeGraphicsTestHarness{};
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    state.windows_graphics.hooks = .{
+        .native_context = &harness,
+        .report_present_chain = testPresentChainReport,
+        .report_present_chain_full = testPresentChainFullReport,
+    };
+
+    state.reportPresentChainFinal();
+    state.reportPresentChainFinal();
+    try testing.expect(state.windows_present_chain_final_reported);
+    try testing.expectEqual(@as(u64, 1), harness.present_chain_full_reports);
+    try testing.expectEqual(@as(u64, 0), harness.present_chain_reports);
+}
+
+test "shader advisory requests positive native creation evidence without ending reporting" {
+    var harness = NativeGraphicsTestHarness{};
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    state.windows_graphics.hooks = .{
+        .native_context = &harness,
+        .report_present_chain_full = testPresentChainFullReport,
+    };
+    state.substantiateVulkanShaderCreation();
+    try testing.expectEqual(@as(u64, 1), harness.present_chain_full_reports);
+    try testing.expect(!state.windows_present_chain_final_reported);
+    state.reportPresentChainFinal();
+    try testing.expectEqual(@as(u64, 2), harness.present_chain_full_reports);
 }
 
 test "Windows graphics ledger keeps native diagnostics separate from guest output" {
@@ -26461,6 +28469,27 @@ test "a timed condition wait parks on the guest clock, and a signal or its deadl
     try testing.expectEqual(@as(u64, 1), state.windows_condition_timed_immediate);
 }
 
+test "timed condition timeout detail is capped at the first ten expiries" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_timed_wait_site_count = 1;
+    state.windows_timed_wait_sites[0] = .{ .caller = MEM_BASE + 0x1000, .last_milliseconds = 500 };
+    var thread: WindowsGuestThread = .{
+        .handle = 0xD4,
+        .thread_id = 6,
+        .timed_wait_site = 1,
+        .timed_wait_milliseconds = 500,
+        .blocked_condition = MEM_BASE + 0x2000,
+        .blocked_condition_mutex = MEM_BASE + 0x3000,
+        .blocked_wait_deadline = 100,
+    };
+
+    for (0..WINDOWS_TIMED_CONDITION_TIMEOUT_SAMPLE_LIMIT + 4) |_| {
+        state.noteWindowsTimedConditionTimeout(&thread, 2, 101);
+    }
+    try testing.expectEqual(WINDOWS_TIMED_CONDITION_TIMEOUT_SAMPLE_LIMIT, state.windows_condition_timeout_samples);
+}
+
 test "an NT delay parks a worker to the guest-clock tick, and a zero delay yields" {
     var state = ElfState.init(testing.allocator);
     defer state.deinit();
@@ -26728,6 +28757,21 @@ test "timed condition waits are counted by the site that makes them" {
     for (1..WINDOWS_TIMED_WAIT_SITE_CAPACITY) |offset| _ = state.noteWindowsTimedWaitSite(0x140b00000 + offset, 1, 30);
     try testing.expectEqual(@as(u8, 0), state.noteWindowsTimedWaitSite(0x140c00000, 1, 30));
     try testing.expectEqual(@as(u64, 1), state.windows_timed_wait_site_overflow);
+}
+
+test "timed condition site classification separates polling from lost wakeups" {
+    var site = WindowsTimedWaitSite{
+        .waits = 100,
+        .timeouts = 99,
+        .signalled = 1,
+        .last_milliseconds = 500,
+    };
+    try testing.expectEqual(WindowsTimedWaitClassification.short_periodic_poll_candidate, classifyWindowsTimedWaitSite(site));
+    try testing.expectEqual(@as(u8, 99), windowsTimedWaitPercent(site.timeouts, site.waits));
+
+    site.last_milliseconds = 5_000;
+    site.signalled = 0;
+    try testing.expectEqual(WindowsTimedWaitClassification.possible_lost_wakeup, classifyWindowsTimedWaitSite(site));
 }
 
 test "every instruction form in xenia_canary.exe decodes to a real operation" {
@@ -27003,4 +29047,22 @@ test "a waitable timer signals at its due tick, re-arms when periodic, and a syn
     try testing.expect(state.windowsWaitObjectReady(notification).?);
     try testing.expectEqual(@as(u32, 0), state.windows_armed_timers);
     try testing.expect(!state.setWindowsTimer(0xFFFF_F000_0000_0F04, -1, 0, 0, 0));
+}
+
+test "a worker slice that repeats its exact state without a kernel call backs off, and any other slice resets it" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_guest_threads[0] = .{ .status = .runnable, .handle = 0xFFFF_F000_0000_0A01, .kernel_calls = 5 };
+    state.noteWindowsGuestSliceShape(0, true, 5);
+    try testing.expectEqual(@as(u8, 1), state.windows_guest_threads[0].spin_skip_remaining);
+    state.noteWindowsGuestSliceShape(0, true, 5);
+    state.noteWindowsGuestSliceShape(0, true, 5);
+    state.noteWindowsGuestSliceShape(0, true, 5);
+    state.noteWindowsGuestSliceShape(0, true, 5);
+    try testing.expectEqual(WINDOWS_GUEST_SPIN_MAX_BACKOFF, state.windows_guest_threads[0].spin_backoff);
+    // A kernel call during the slice is not a spin.
+    state.windows_guest_threads[0].kernel_calls = 6;
+    state.noteWindowsGuestSliceShape(0, true, 5);
+    try testing.expectEqual(@as(u8, 0), state.windows_guest_threads[0].spin_backoff);
+    try testing.expectEqual(@as(u64, 5), state.windows_spin_slices);
 }

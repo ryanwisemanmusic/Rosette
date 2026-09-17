@@ -53,6 +53,45 @@ pub const minimum_samples: u64 = 64;
 /// anything larger is a function making progress.
 pub const spin_span_bytes: u64 = 0x1000;
 
+/// Space-Saving heavy hitters. Counts have an explicit error bound; neither
+/// a candidate nor a broad address span is a proof of useful progress.
+pub const Hotspot = struct { address: u64 = 0, count: u64 = 0, error_bound: u64 = 0 };
+pub const Heat = struct {
+    candidates: [16]Hotspot = @splat(.{}),
+    samples: u64 = 0,
+    pub fn sample(self: *Heat, address: u64) void {
+        const key = address & ~@as(u64, 255);
+        self.samples +|= 1;
+        var minimum: usize = 0;
+        for (&self.candidates, 0..) |*candidate, index| {
+            if (candidate.count != 0 and candidate.address == key) {
+                candidate.count +|= 1;
+                return;
+            }
+            if (candidate.count == 0) {
+                candidate.* = .{ .address = key, .count = 1 };
+                return;
+            }
+            if (candidate.count < self.candidates[minimum].count) minimum = index;
+        }
+        const previous = self.candidates[minimum].count;
+        self.candidates[minimum] = .{ .address = key, .count = previous +| 1, .error_bound = previous };
+    }
+    pub fn top(self: *const Heat) [3]Hotspot {
+        var result: [3]Hotspot = @splat(.{});
+        for (self.candidates) |candidate| {
+            for (0..3) |index| {
+                if (candidate.count <= result[index].count) continue;
+                var move: usize = 2;
+                while (move > index) : (move -= 1) result[move] = result[move - 1];
+                result[index] = candidate;
+                break;
+            }
+        }
+        return result;
+    }
+};
+
 /// Where a thread has been executing.
 ///
 /// Two windows are kept, current and previous, because the current one is
@@ -71,8 +110,12 @@ pub const Window = struct {
     previous_pages: [fingerprint_words]u64 = [_]u64{0} ** fingerprint_words,
     samples: u64 = 0,
     recent_samples: u64 = 0,
+    heat: Heat = .{},
 
     pub fn sample(self: *Window, address: u64) void {
+        // Window is sampled every 64 instructions. Heat is 16 times rarer:
+        // about one observation per 1,024 instructions, fixed memory/cost.
+        if ((self.samples & 15) == 0) self.heat.sample(address);
         if (address < self.low) self.low = address;
         if (address > self.high) self.high = address;
         if (address < self.recent_low) self.recent_low = address;
@@ -136,6 +179,19 @@ pub const Window = struct {
         return self.pageCount() <= 2;
     }
 };
+
+test "bounded heat identifies a hot generated-code region across widely moving callers" {
+    var heat = Heat{};
+    for (0..1000) |index| {
+        heat.sample(0xa0000100 + index % 32);
+        if (index % 8 == 0) heat.sample(0x140000000 + index * 4096);
+    }
+    const top = heat.top();
+    try std.testing.expectEqual(@as(u64, 0xa0000100), top[0].address);
+    try std.testing.expectEqual(@as(u64, 1000), top[0].count);
+    try std.testing.expectEqual(@as(u64, 0), top[0].error_bound);
+    for (top) |candidate| try std.testing.expect(candidate.error_bound <= candidate.count);
+}
 
 /// How guest bytes are read. A closure rather than a memory type, so this
 /// module never learns what a guest is.
