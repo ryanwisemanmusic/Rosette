@@ -165,6 +165,7 @@ fn sha1Compress(digest: [5]u32, block: [64]u8) [5]u32 {
 pub fn trySha1ProcessBlock(state: anytype, this_address: u64) bool {
     const digest_bytes = state.guestMemoryConst(this_address + SHA1_DIGEST_OFFSET, 20) orelse return false;
     const block_bytes = state.guestMemoryConst(this_address + SHA1_BLOCK_OFFSET, 64) orelse return false;
+
     const output = state.guestMemory(this_address + SHA1_DIGEST_OFFSET, 20) orelse return false;
     const block_index_bytes = state.guestMemoryConst(this_address + SHA1_BLOCK_INDEX_OFFSET, 8) orelse return false;
     const byte_count_bytes = state.guestMemoryConst(this_address + SHA1_BYTE_COUNT_OFFSET, 8) orelse return false;
@@ -219,6 +220,13 @@ pub fn sha1ProcessBytes(
     const block_bytes = state.guestMemoryConst(this_address + SHA1_BLOCK_OFFSET, 64) orelse return false;
 
     var block_index = std.mem.readInt(u64, block_index_bytes[0..8], .little);
+    // The skipped loop mutates its object while reading input. Interleaved
+    // reads/writes are not equivalent to deferred publication if they alias,
+    // including through different guest views of the same host backing.
+    const object_bytes = state.guestMemoryConst(this_address, SHA1_BYTE_COUNT_OFFSET + 8) orelse return false;
+    const source_begin = @intFromPtr(source.ptr);
+    const object_begin = @intFromPtr(object_bytes.ptr);
+    if (source_begin < object_begin + object_bytes.len and object_begin < source_begin + source.len) return false;
     var byte_count = std.mem.readInt(u64, byte_count_bytes[0..8], .little);
     // The same consistency gate `trySha1ProcessBlock` applies: a mismatch
     // means this is not the object shape Rosetta knows, and guessing would
@@ -235,7 +243,7 @@ pub fn sha1ProcessBytes(
     for (source) |byte| {
         block[@intCast(block_index)] = byte;
         block_index += 1;
-        byte_count += 1;
+        byte_count +%= 1;
         if (block_index == 64) {
             digest = sha1Compress(digest, block);
             block_index = 0;
