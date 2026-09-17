@@ -85,6 +85,10 @@ pub const runtime_output = @import("runtime_output.zig");
 pub const rosette_pkg_log = @import("rosette_pkg_log.zig");
 pub const paired_observation = @import("paired_observation.zig");
 pub const run_closure = @import("run_closure.zig");
+/// Cross-boundary implementation contract for audit Phases 0-5.  This is
+/// rooted here so its negative-path tests execute in the full project check,
+/// not merely when a developer happens to import the file directly.
+pub const audit_phase_contracts = @import("audit_phase_contracts.zig");
 
 // Rooted in build.zig so these run rather than merely compile: three modules so
 // far turned out to have tests that were never executed, and one of them had
@@ -165,4 +169,5 @@ test {
     _ = signal_expectation;
     _ = paired_observation;
     _ = run_closure;
+    _ = audit_phase_contracts;
 }
