@@ -26,6 +26,17 @@
 
 const std = @import("std");
 
+/// Executable memory (MAP_JIT region with per-thread write protection) and a
+/// label-resolving assembler, shared by every block compiler that emits
+/// through this module.
+pub const code_memory = @import("code_memory.zig");
+pub const assembler = @import("assembler.zig");
+
+test {
+    _ = code_memory;
+    _ = assembler;
+}
+
 /// A general-purpose register number. 31 means XZR/WZR in most contexts and SP
 /// in a few; the distinction is per-instruction and noted where it matters.
 pub const Reg = u5;
@@ -900,6 +911,57 @@ pub fn cbnz(width: Width, rt: Reg, offset_instructions: i32) u32 {
 
 pub fn ret() u32 {
     return 0xD65F0000 | (@as(u32, lr) << 5);
+}
+
+// ---------------------------------------------------------------------------
+// Register pairs
+// ---------------------------------------------------------------------------
+
+pub const PairIndexing = enum(u2) {
+    /// `[Xn], #imm`: access at Xn, then Xn += imm.
+    post_index = 0b01,
+    /// `[Xn, #imm]`: access at Xn + imm, Xn unchanged.
+    signed_offset = 0b10,
+    /// `[Xn, #imm]!`: Xn += imm, then access at Xn.
+    pre_index = 0b11,
+};
+
+/// `stp`/`ldp` of two 64-bit registers. `offset` is in bytes and must be a
+/// multiple of 8 in [-512, 504]; anything else has no encoding and is refused.
+pub fn pair64(is_load: bool, indexing: PairIndexing, rt: Reg, rt2: Reg, rn: Reg, offset: i32) ?u32 {
+    if (@rem(offset, 8) != 0 or offset < -512 or offset > 504) return null;
+    const imm7: u32 = @as(u32, @bitCast(@divExact(offset, 8))) & 0x7F;
+    return 0xA8000000 |
+        (@as(u32, @intFromEnum(indexing)) << 23) |
+        (@as(u32, @intFromBool(is_load)) << 22) |
+        (imm7 << 15) |
+        (@as(u32, rt2) << 10) |
+        (@as(u32, rn) << 5) | rt;
+}
+
+pub fn stp(indexing: PairIndexing, rt: Reg, rt2: Reg, rn: Reg, offset: i32) ?u32 {
+    return pair64(false, indexing, rt, rt2, rn, offset);
+}
+
+pub fn ldp(indexing: PairIndexing, rt: Reg, rt2: Reg, rn: Reg, offset: i32) ?u32 {
+    return pair64(true, indexing, rt, rt2, rn, offset);
+}
+
+/// `mrs Xt, NZCV`.
+pub fn mrsNzcv(rt: Reg) u32 {
+    return 0xD53B4200 | @as(u32, rt);
+}
+
+test "register pair forms match the assembler" {
+    try std.testing.expectEqual(@as(?u32, 0xa9bd7bfd), stp(.pre_index, 29, 30, sp, -48));
+    try std.testing.expectEqual(@as(?u32, 0xa90153f3), stp(.signed_offset, 19, 20, sp, 16));
+    try std.testing.expectEqual(@as(?u32, 0xa9025bf5), stp(.signed_offset, 21, 22, sp, 32));
+    try std.testing.expectEqual(@as(?u32, 0xa9425bf5), ldp(.signed_offset, 21, 22, sp, 32));
+    try std.testing.expectEqual(@as(?u32, 0xa94153f3), ldp(.signed_offset, 19, 20, sp, 16));
+    try std.testing.expectEqual(@as(?u32, 0xa8c37bfd), ldp(.post_index, 29, 30, sp, 48));
+    // An offset that is not a multiple of eight has no encoding.
+    try std.testing.expectEqual(@as(?u32, null), stp(.signed_offset, 19, 20, sp, 12));
+    try std.testing.expectEqual(@as(u32, 0xd53b4209), mrsNzcv(9));
 }
 
 pub fn retReg(rn: Reg) u32 {
