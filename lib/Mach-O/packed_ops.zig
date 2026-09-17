@@ -12,6 +12,9 @@ pub const PackedIntegerOperation = enum {
     add_signed_saturate,
     sub_signed_saturate,
     sub_unsigned_saturate,
+    add_unsigned_saturate,
+    /// PAVGB/PAVGW: (a + b + 1) >> 1, computed without overflow.
+    average_unsigned,
 };
 
 /// Packed narrowing operations that combine two source vectors into one
@@ -423,6 +426,8 @@ pub fn packedIntegerBinary(lhs: [16]u8, rhs: [16]u8, lane_bits: u8, operation: P
                         @as(i16, @as(i8, @bitCast(rhs[lane]))),
                 ),
                 .sub_unsigned_saturate => if (lhs[lane] < rhs[lane]) 0 else lhs[lane] - rhs[lane],
+                .add_unsigned_saturate => @as(u8, @intCast(@min(@as(u16, lhs[lane]) + rhs[lane], 0xFF))),
+                .average_unsigned => @as(u8, @intCast((@as(u16, lhs[lane]) + rhs[lane] + 1) >> 1)),
             };
         },
         16 => for (0..8) |lane| {
@@ -442,6 +447,8 @@ pub fn packedIntegerBinary(lhs: [16]u8, rhs: [16]u8, lane_bits: u8, operation: P
                         @as(i32, @as(i16, @bitCast(right))),
                 ),
                 .sub_unsigned_saturate => if (left < right) 0 else left - right,
+                .add_unsigned_saturate => @as(u16, @intCast(@min(@as(u32, left) + right, 0xFFFF))),
+                .average_unsigned => @as(u16, @intCast((@as(u32, left) + right + 1) >> 1)),
             };
             std.mem.writeInt(u16, result[offset..][0..2], value, .little);
         },
@@ -453,7 +460,7 @@ pub fn packedIntegerBinary(lhs: [16]u8, rhs: [16]u8, lane_bits: u8, operation: P
                 .add => left +% right,
                 .sub => left -% right,
                 .mul_low => left *% right,
-                .add_signed_saturate, .sub_signed_saturate, .sub_unsigned_saturate => unreachable,
+                .add_signed_saturate, .sub_signed_saturate, .sub_unsigned_saturate, .add_unsigned_saturate, .average_unsigned => unreachable,
             };
             std.mem.writeInt(u32, result[offset..][0..4], value, .little);
         },
@@ -465,7 +472,7 @@ pub fn packedIntegerBinary(lhs: [16]u8, rhs: [16]u8, lane_bits: u8, operation: P
                 .add => left +% right,
                 .sub => left -% right,
                 .mul_low => left *% right,
-                .add_signed_saturate, .sub_signed_saturate, .sub_unsigned_saturate => unreachable,
+                .add_signed_saturate, .sub_signed_saturate, .sub_unsigned_saturate, .add_unsigned_saturate, .average_unsigned => unreachable,
             };
             std.mem.writeInt(u64, result[offset..][0..8], value, .little);
         },

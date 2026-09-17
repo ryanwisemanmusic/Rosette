@@ -2,6 +2,7 @@
 #define ROSETTE_MACHO_NATIVE_WINDOW_BRIDGE_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -116,6 +117,13 @@ int rosette_macho_native_window_attach_metal_layer(void);
 // ownership actually changed. Idempotent.
 int rosette_macho_native_window_set_drawable_owner(int owned_by_swapchain);
 int rosette_macho_native_window_drawable_owned_by_swapchain(void);
+// Set the drawable extent before Vulkan creates a swapchain. This is a
+// preflight operation: it never changes the NSWindow or view size, and it
+// refuses to write a different extent while an existing swapchain owns the
+// layer. Returns 1 only when the layer already has, or now has, the requested
+// extent.
+int rosette_macho_native_window_prepare_drawable_size(uint32_t width,
+                                                      uint32_t height);
 // A host-generated Metal clear. Proves the Cocoa/Metal boundary is alive and
 // nothing else: no guest image, no Vulkan command, no guest swap. The name says
 // diagnostic because a frame from here must never be counted as guest output.
@@ -129,6 +137,28 @@ uint64_t rosette_macho_native_window_present_frame(
     uint64_t serial, const uint8_t *pixels, uint64_t source_length,
     uint32_t source_width, uint32_t source_height, uint64_t row_pitch,
     uint32_t format, uint8_t orientation, uint8_t fit);
+// A copied, completed acquired-image readback. This NEVER takes a drawable
+// from MoltenVK or counts as a guest/native Vulkan present. flags: PNG=1,
+// independent opaque-RGB Cocoa preview=2, diagnostic +4 EV comparison=4,
+// offline CPU replay (NOT Vulkan completion evidence)=8.
+// Return bits: saved=1, previewed=2,
+// failed=4. A closed preview stays closed; it does not quit the guest.
+typedef struct RosetteMachOReadbackFrame {
+  const uint8_t *pixels;
+  uint64_t length, frame, swapchain, image, hash;
+  uint32_t width, height, format, flags;
+  uint64_t visible_pixels, bright_pixels, transparent_pixels;
+  uint64_t rgb_sum[3];
+  uint64_t rgb_different_pixels;
+  uint8_t min_rgb[3], max_rgb[3], reserved[2];
+} RosetteMachOReadbackFrame;
+_Static_assert(sizeof(RosetteMachOReadbackFrame) == 128,
+               "readback packet must match Vulkan frame_capture.zig");
+_Static_assert(offsetof(RosetteMachOReadbackFrame, width) == 48 &&
+               offsetof(RosetteMachOReadbackFrame, min_rgb) == 120,
+               "readback packet offsets must match Vulkan frame_capture.zig");
+uint32_t rosette_macho_native_window_capture_frame(
+    const RosetteMachOReadbackFrame *frame);
 uint32_t rosette_macho_native_window_pump_events(void);
 RosetteMachONativeWindowStatus rosette_macho_native_window_status(void);
 void rosette_macho_native_window_shutdown(void);

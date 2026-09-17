@@ -7,14 +7,27 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
 
-@interface RosetteMachOMetalView : NSView
+static void RosetteMachOUpdateMetalDrawable(void);
+
+@interface RosetteMachOMetalView : NSView <CALayerDelegate>
 @end
 
 @implementation RosetteMachOMetalView
 
 - (CALayer *)makeBackingLayer {
   return [CAMetalLayer layer];
+}
+
+- (void)viewDidChangeBackingProperties {
+  [super viewDidChangeBackingProperties];
+  // AppKit may revisit a layer's backing properties when the window moves
+  // between displays. Re-apply the explicit Rosette extent at that boundary;
+  // the function is owner-aware and therefore never fights a live Vulkan
+  // swapchain.
+  RosetteMachOUpdateMetalDrawable();
 }
 
 @end
@@ -27,18 +40,56 @@ static id<MTLDevice> g_metal_device;
 static id<MTLCommandQueue> g_metal_command_queue;
 static uint32_t g_width = 1280;
 static uint32_t g_height = 720;
+// Logical AppKit content size. This is intentionally not the same state as
+// g_width/g_height: those two report the current CAMetalLayer drawable pixels,
+// while this pair is the fixed window contract in points. A Retina backing
+// scale or a Vulkan swapchain extent must never resize this window.
+static const uint32_t kRosetteLockedWindowWidth = 1280u;
+static const uint32_t kRosetteLockedWindowHeight = 720u;
 static uint32_t g_events_pumped;
 static BOOL g_fullscreen;
 static BOOL g_reported_off_main_thread;
 static uint64_t g_diagnostic_frames_presented;
 static uint64_t g_guest_frames_presented;
-static CFAbsoluteTime g_last_foreground_reassertion;
 static uint64_t g_foreground_reassertions;
+static uint64_t g_window_placement_repairs;
+static uint64_t g_window_placement_repair_failures;
+// The current Xenia admission contract is an exact 1280x720 drawable.  Keep
+// this separate from the window's backing scale: a Retina display may still
+// report a 2x backing scale, but allowing that scale to flow into a
+// CAMetalLayer whose swapchain is required to be 1280x720 creates the exact
+// 2560x1440-vs-1280x720 split that the Vulkan driver otherwise accepts.
+static const CGFloat kRosetteLockedDrawableContentsScale = 1.0;
+static BOOL g_drawable_contract_active = NO;
+static uint32_t g_drawable_contract_width;
+static uint32_t g_drawable_contract_height;
+static uint64_t g_window_size_lock_repairs;
+static uint64_t g_window_size_lock_refusals;
+static uint64_t g_fullscreen_lock_refusals;
+static BOOL g_reported_placement_policy;
+// CPU readback preview is a separate Cocoa window, never another consumer of
+// MoltenVK's CAMetalLayer. Closing it must not become a guest WM_QUIT.
+static NSWindow *g_readback_window;
+static NSImageView *g_readback_view;
+static NSImageView *g_readback_exposure_view;
+static BOOL g_readback_closed;
+static NSString *g_readback_directory;
+static uint64_t g_readback_saved;
 
-static const uint32_t kRosetteDefaultWindowWidth = 1280u;
-static const uint32_t kRosetteDefaultWindowHeight = 720u;
+@interface RosetteReadbackWindowDelegate : NSObject <NSWindowDelegate>
+@end
+@implementation RosetteReadbackWindowDelegate
+- (void)windowWillClose:(NSNotification *)notification {
+  (void)notification;
+  g_readback_closed = YES;
+}
+@end
+static RosetteReadbackWindowDelegate *g_readback_delegate;
+
+static const uint32_t kRosetteDefaultWindowWidth = kRosetteLockedWindowWidth;
+static const uint32_t kRosetteDefaultWindowHeight = kRosetteLockedWindowHeight;
 static const uint32_t kRosetteMaxWindowDimension = 16u * 1024u;
-static const CFTimeInterval kRosetteForegroundReassertionInterval = 0.25;
+static const CGFloat kRosetteMinimumOnScreenFraction = 0.999;
 
 static uint32_t RosetteMachONormalizeWindowDimension(uint32_t requested,
                                                      uint32_t fallback) {
@@ -58,7 +109,11 @@ static BOOL RosetteMachOHasFinitePositiveRect(NSRect rect) {
          NSWidth(rect) > 0.0 && NSHeight(rect) > 0.0;
 }
 
-static void RosetteMachOUpdateMetalDrawable(void);
+static BOOL RosetteMachOEnsureWindowOnMainThread(uint32_t width,
+                                                 uint32_t height,
+                                                 NSString *title);
+
+static void RosetteMachOEnforceLockedWindowSizeOnMainThread(const char *reason);
 
 static CGFloat RosetteMachOClamp(CGFloat value, CGFloat low, CGFloat high) {
   if (high < low) {
@@ -109,86 +164,172 @@ static void RosetteMachOPlaceWindowSafely(void) {
   [g_window setFrameOrigin:NSMakePoint(0.0, 0.0)];
 }
 
-static void RosetteMachOConfigureForegroundWindowPolicy(void) {
+/// Keep movement independent from the fixed logical content and drawable
+/// contracts. A min/max content size prevents resizing, while the normal
+/// title-bar movement remains available so the drawable follows the window.
+/// The repair path is retained as a guard for an AppKit restoration or a drag
+/// that leaves almost the entire frame outside the screen.
+static void RosetteMachOConfigureWindowPlacementPolicyOnMainThread(void) {
+  if (!g_window) {
+    return;
+  }
+  g_window.movable = YES;
+  g_window.movableByWindowBackground = NO;
+  if (!g_reported_placement_policy) {
+    fprintf(stderr,
+            "macho-processor: WINDOW PLACEMENT POLICY: mode=user_movable movable=true movable_by_background=false logical_content=1280x720 drawable=independent repair_path=retained offscreen_guard=retained\n");
+    g_reported_placement_policy = YES;
+  }
+}
+
+static CGFloat RosetteMachOVisibleWindowFraction(NSRect frame,
+                                                 NSRect visible_frame) {
+  if (!RosetteMachOHasFinitePositiveRect(frame) ||
+      !RosetteMachOHasFinitePositiveRect(visible_frame)) {
+    return 0.0;
+  }
+  const CGFloat frame_area = NSWidth(frame) * NSHeight(frame);
+  if (!(frame_area > 0.0) || !isfinite((double)frame_area)) {
+    return 0.0;
+  }
+  const NSRect intersection = NSIntersectionRect(frame, visible_frame);
+  const CGFloat intersection_area =
+      MAX(NSWidth(intersection), 0.0) * MAX(NSHeight(intersection), 0.0);
+  if (!(intersection_area > 0.0) || !isfinite((double)intersection_area)) {
+    return 0.0;
+  }
+  return MIN(intersection_area / frame_area, 1.0);
+}
+
+/// AppKit's `visible`, `screen` and occlusion fields can all be true while a
+/// window has only a small corner inside the screen's visibleFrame. That is a
+/// real presentation failure for the standalone Xenia window: Vulkan still
+/// accepts and completes the present, but the user cannot see the drawable.
+/// Repair only placement, never size or drawable ownership, and only when the
+/// whole frame can fit in the visible area. This keeps the strict 1280x720
+/// drawable contract independent from the host window placement policy.
+static void RosetteMachORepairWindowPlacementIfNeeded(void) {
+  if (!g_window || g_fullscreen) {
+    return;
+  }
+
+  const NSRect frame = g_window.frame;
+  NSScreen *screen = g_window.screen ?: [NSScreen mainScreen];
+  if (!screen) {
+    ++g_window_placement_repair_failures;
+    const uint64_t count = g_window_placement_repair_failures;
+    if (count <= 4u || (count & (count - 1u)) == 0u) {
+      fprintf(stderr,
+              "macho-processor: WINDOW PLACEMENT REPAIR failed: reason=no_screen frame=%.0fx%.0f@%.0f,%.0f failures=%llu\n",
+              (double)NSWidth(frame), (double)NSHeight(frame),
+              (double)NSMinX(frame), (double)NSMinY(frame),
+              (unsigned long long)count);
+    }
+    return;
+  }
+
+  const NSRect visible = screen.visibleFrame;
+  if (!RosetteMachOHasFinitePositiveRect(frame) ||
+      !RosetteMachOHasFinitePositiveRect(visible)) {
+    ++g_window_placement_repair_failures;
+    const uint64_t count = g_window_placement_repair_failures;
+    if (count <= 4u || (count & (count - 1u)) == 0u) {
+      fprintf(stderr,
+              "macho-processor: WINDOW PLACEMENT REPAIR failed: reason=invalid_geometry frame=%.0fx%.0f@%.0f,%.0f visible=%.0fx%.0f@%.0f,%.0f failures=%llu\n",
+              (double)NSWidth(frame), (double)NSHeight(frame),
+              (double)NSMinX(frame), (double)NSMinY(frame),
+              (double)NSWidth(visible), (double)NSHeight(visible),
+              (double)NSMinX(visible), (double)NSMinY(visible),
+              (unsigned long long)count);
+    }
+    return;
+  }
+
+  const CGFloat before_fraction =
+      RosetteMachOVisibleWindowFraction(frame, visible);
+  if (before_fraction >= kRosetteMinimumOnScreenFraction) {
+    return;
+  }
+
+  CGFloat x = RosetteMachOClamp(NSMinX(frame), NSMinX(visible),
+                                NSMaxX(visible) - NSWidth(frame));
+  CGFloat y = RosetteMachOClamp(NSMinY(frame), NSMinY(visible),
+                                NSMaxY(visible) - NSHeight(frame));
+  if (!isfinite((double)x) || !isfinite((double)y)) {
+    ++g_window_placement_repair_failures;
+    const uint64_t count = g_window_placement_repair_failures;
+    if (count <= 4u || (count & (count - 1u)) == 0u) {
+      fprintf(stderr,
+              "macho-processor: WINDOW PLACEMENT REPAIR failed: reason=nonfinite_clamp before_fraction=%.0f%% failures=%llu\n",
+              (double)(before_fraction * 100.0), (unsigned long long)count);
+    }
+    return;
+  }
+
+  // If the window itself is larger than the screen, clamping has no better
+  // origin to offer. Avoid repeatedly setting the same origin on every
+  // diagnostic poll; the resulting fraction remains truthful in the next
+  // geometry report.
+  if (fabs((double)x - (double)NSMinX(frame)) < 0.5 &&
+      fabs((double)y - (double)NSMinY(frame)) < 0.5) {
+    return;
+  }
+
+  [g_window setFrameOrigin:NSMakePoint(x, y)];
+  const NSRect repaired = g_window.frame;
+  const CGFloat after_fraction =
+      RosetteMachOVisibleWindowFraction(repaired, visible);
+  ++g_window_placement_repairs;
+  fprintf(stderr,
+          "macho-processor: WINDOW PLACEMENT REPAIR: reason=outside_visible_frame before=%.0fx%.0f@%.0f,%.0f visible_fraction=%.0f%% after=%.0fx%.0f@%.0f,%.0f visible_fraction=%.0f%% screen=%.0fx%.0f@%.0f,%.0f repairs=%llu result=%s\n",
+          (double)NSWidth(frame), (double)NSHeight(frame),
+          (double)NSMinX(frame), (double)NSMinY(frame),
+          (double)(before_fraction * 100.0), (double)NSWidth(repaired),
+          (double)NSHeight(repaired), (double)NSMinX(repaired),
+          (double)NSMinY(repaired), (double)(after_fraction * 100.0),
+          (double)NSWidth(visible), (double)NSHeight(visible),
+          (double)NSMinX(visible), (double)NSMinY(visible),
+          (unsigned long long)g_window_placement_repairs,
+          after_fraction >= kRosetteMinimumOnScreenFraction ? "on_screen"
+                                                             : "still_partial");
+}
+
+static void RosetteMachOConfigureOrdinaryWindowPolicy(void) {
   if (!g_window) {
     return;
   }
 
-  // The standalone PE runner has no persistent Cocoa application delegate to
-  // keep this window in front after another app receives focus.  Keep the
-  // Rosette surface in the user's active Space and above ordinary document
-  // windows so a successful Vulkan present remains observable.  The
-  // occlusion bit is still read from AppKit below; this policy never fakes a
-  // visible result in the diagnostic log.
-  g_window.level = NSFloatingWindowLevel;
-  g_window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
-                                 NSWindowCollectionBehaviorFullScreenAuxiliary;
+  // Occlusion and minimization are user choices, not graphics faults to
+  // repair by taking focus. A swapchain must not make the application float
+  // above other programs or follow the user into every Space.
+  g_window.level = NSNormalWindowLevel;
+  g_window.collectionBehavior = NSWindowCollectionBehaviorDefault;
   g_window.hidesOnDeactivate = NO;
 }
 
-static BOOL RosetteMachOWindowNeedsForegroundRepair(void) {
-  if (!g_window || !g_application) {
-    return NO;
-  }
-
-  // A miniaturized window is not merely occluded: it has no drawable that the
-  // user can observe.  Keep this case separate from the normal occlusion
-  // predicate so the foreground repair path can deminiaturize it.  The old
-  // predicate explicitly excluded miniaturized windows, which made the
-  // recovery code unreachable after AppKit collapsed the Rosette window.
-  if (g_window.isMiniaturized) {
-    return YES;
-  }
-
-  if (!g_window.isVisible || g_window.screen == nil) {
-    return NO;
-  }
-  return (g_window.occlusionState & NSWindowOcclusionStateVisible) == 0;
-}
-
-static void RosetteMachOBringWindowToFrontOnMainThread(const char *reason) {
+static void RosetteMachOShowWindowOnMainThread(const char *reason) {
   if (!g_window || !g_application) {
     return;
   }
 
-  RosetteMachOConfigureForegroundWindowPolicy();
+  RosetteMachOConfigureOrdinaryWindowPolicy();
   if (g_window.isMiniaturized) {
     [g_window deminiaturize:nil];
   }
-  [g_application activateIgnoringOtherApps:YES];
-  [g_window orderFrontRegardless];
-  [g_window makeKeyAndOrderFront:nil];
+  // Only creation or an explicit guest ShowWindow reaches here. Neither
+  // event is permission to activate over the user's currently focused app.
+  [g_window orderFront:nil];
   RosetteMachOPlaceWindowSafely();
   RosetteMachOUpdateMetalDrawable();
-  g_last_foreground_reassertion = CFAbsoluteTimeGetCurrent();
   ++g_foreground_reassertions;
   const uint64_t count = g_foreground_reassertions;
   const BOOL sparse_report = count <= 4u || (count & (count - 1u)) == 0u;
-  // A permanently covered window can cause the pump to retry every 250 ms.
-  // Keep the recovery attempts observable without turning that condition into
-  // an unbounded log stream; the detailed PRESENT CHAIN verdict remains the
-  // authoritative statement that visibility was not recovered.
-  if (reason == NULL || strcmp(reason, "occluded") != 0 || sparse_report) {
+  if (sparse_report) {
     fprintf(stderr,
-            "macho-processor: AppKit window foreground reasserted: reason=%s "
-            "count=%llu\n",
+            "macho-processor: AppKit window shown: reason=%s count=%llu "
+            "level=normal activation=unchanged occlusion_policy=user_owned\n",
             reason ? reason : "unspecified", (unsigned long long)count);
   }
-}
-
-static void RosetteMachOReassertForegroundIfOccludedOnMainThread(void) {
-  if (!RosetteMachOWindowNeedsForegroundRepair()) {
-    return;
-  }
-
-  const CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-  if (g_last_foreground_reassertion != 0.0 &&
-      now - g_last_foreground_reassertion <
-          kRosetteForegroundReassertionInterval) {
-    return;
-  }
-  RosetteMachOBringWindowToFrontOnMainThread(
-      g_window.isMiniaturized ? "miniaturized" : "occluded");
 }
 
 static void RosetteMachORunOnMainThreadSync(dispatch_block_t block) {
@@ -226,32 +367,196 @@ static void RosetteMachORunOnMainThreadSync(dispatch_block_t block) {
 // appear and can stop one.
 static BOOL g_drawable_owned_by_swapchain = NO;
 
+static BOOL RosetteMachOContentSizeMatchesLocked(void) {
+  if (!g_window) {
+    return YES;
+  }
+  const NSRect content_rect =
+      [g_window contentRectForFrameRect:g_window.frame];
+  return fabs((double)NSWidth(content_rect) -
+                  (double)kRosetteLockedWindowWidth) < 0.5 &&
+         fabs((double)NSHeight(content_rect) -
+                  (double)kRosetteLockedWindowHeight) < 0.5;
+}
+
+/// Keep the logical window fixed even if an external AppKit action or a stale
+/// guest resize request changed its content rectangle. This is a repair of the
+/// host contract, not a resize policy: guest `set_size` and fullscreen calls
+/// are rejected below, while this path repairs the one accidental/external
+/// drift that caused the observed 1280x722 layer.
+static void RosetteMachOEnforceLockedWindowSizeOnMainThread(const char *reason) {
+  if (!g_window || g_fullscreen || RosetteMachOContentSizeMatchesLocked()) {
+    return;
+  }
+
+  const NSRect before =
+      [g_window contentRectForFrameRect:g_window.frame];
+  [g_window setContentSize:NSMakeSize((CGFloat)kRosetteLockedWindowWidth,
+                                      (CGFloat)kRosetteLockedWindowHeight)];
+  if (g_view) {
+    // The content view is deliberately not autoresizable. Set its frame size
+    // after AppKit applies the window content rectangle so a stale backing
+    // layout cannot leave the layer at 1280x722 while the window says 720p.
+    [g_view setFrameSize:NSMakeSize((CGFloat)kRosetteLockedWindowWidth,
+                                   (CGFloat)kRosetteLockedWindowHeight)];
+    [g_view setBoundsSize:NSMakeSize((CGFloat)kRosetteLockedWindowWidth,
+                                     (CGFloat)kRosetteLockedWindowHeight)];
+  }
+  const NSRect after =
+      [g_window contentRectForFrameRect:g_window.frame];
+  const BOOL repaired = RosetteMachOContentSizeMatchesLocked() &&
+                        (!g_view ||
+                         (fabs((double)NSWidth(g_view.bounds) -
+                               (double)kRosetteLockedWindowWidth) < 0.5 &&
+                          fabs((double)NSHeight(g_view.bounds) -
+                               (double)kRosetteLockedWindowHeight) < 0.5));
+  if (repaired) {
+    ++g_window_size_lock_repairs;
+  }
+  fprintf(stderr,
+          "macho-processor: WINDOW SIZE LOCK: decision=%s reason=%s "
+          "before=%.0fx%.0f requested=%ux%u after=%.0fx%.0f "
+          "repairs=%llu refusals=%llu fullscreen_refusals=%llu\n",
+          repaired ? "repaired" : "repair_failed", reason ? reason : "unspecified",
+          (double)NSWidth(before), (double)NSHeight(before),
+          (unsigned)kRosetteLockedWindowWidth,
+          (unsigned)kRosetteLockedWindowHeight, (double)NSWidth(after),
+          (double)NSHeight(after), (unsigned long long)g_window_size_lock_repairs,
+          (unsigned long long)g_window_size_lock_refusals,
+          (unsigned long long)g_fullscreen_lock_refusals);
+}
+
 static void RosetteMachOUpdateMetalDrawable(void) {
   if (!g_window || !g_view || !g_metal_layer) {
     return;
   }
-  const CGFloat scale = MAX(g_window.backingScaleFactor, 1.0);
+  RosetteMachOEnforceLockedWindowSizeOnMainThread("drawable_update");
+  const CGFloat backing_scale = MAX(g_window.backingScaleFactor, 1.0);
   const NSRect bounds = g_view.bounds;
+  // `drawableSize` is already expressed in pixels. Multiplying the content
+  // size by the Retina backing scale here silently turns the default
+  // 1280x720 guest surface into a 2560x1440 swapchain target before MoltenVK
+  // has seen the guest's extent. The strict 720p phase pins contentsScale to
+  // 1.0 as well as drawableSize so AppKit cannot re-derive a 2x drawable while
+  // Vulkan is negotiating the surface. The backing scale is retained only as
+  // an observation in the geometry report; it is not an output-size input.
+  const uint32_t bounds_width =
+      (uint32_t)MAX(ceil(MAX(bounds.size.width, 1.0)), 1.0);
+  const uint32_t bounds_height =
+      (uint32_t)MAX(ceil(MAX(bounds.size.height, 1.0)), 1.0);
+  const uint32_t drawable_width =
+      g_drawable_contract_active ? g_drawable_contract_width : bounds_width;
+  const uint32_t drawable_height =
+      g_drawable_contract_active ? g_drawable_contract_height : bounds_height;
   g_metal_layer.frame = bounds;
-  g_metal_layer.contentsScale = scale;
+  // `drawableSize` is documented as an explicit pixel size, but the
+  // CAMetalLayer/AppKit path can re-derive it from bounds*contentsScale while
+  // a layer is being attached or its backing properties are changing.  The
+  // strict 720p phase therefore pins both inputs: contentsScale is not used
+  // as an output multiplier, and the display's native backing scale remains
+  // diagnostic-only.  Upscaling can be introduced later as a distinct,
+  // negotiated contract rather than appearing accidentally here.
+  g_metal_layer.contentsScale = kRosetteLockedDrawableContentsScale;
   if (!g_drawable_owned_by_swapchain) {
     g_metal_layer.drawableSize =
-        CGSizeMake(MAX(bounds.size.width, 1.0) * scale,
-                   MAX(bounds.size.height, 1.0) * scale);
+        CGSizeMake((CGFloat)drawable_width, (CGFloat)drawable_height);
   }
-  g_width = (uint32_t)MAX(bounds.size.width, 1.0);
-  g_height = (uint32_t)MAX(bounds.size.height, 1.0);
+  g_width = drawable_width;
+  g_height = drawable_height;
+  (void)backing_scale;
 }
 
 int rosette_macho_native_window_set_drawable_owner(int owned_by_swapchain) {
-  const BOOL requested = owned_by_swapchain != 0;
-  const BOOL changed = requested != g_drawable_owned_by_swapchain;
-  g_drawable_owned_by_swapchain = requested;
+  __block BOOL changed = NO;
+  @autoreleasepool {
+    RosetteMachORunOnMainThreadSync(^{
+      const BOOL requested = owned_by_swapchain != 0;
+      changed = requested != g_drawable_owned_by_swapchain;
+      g_drawable_owned_by_swapchain = requested;
+      if (!requested) {
+        // A later window admission starts a new contract from its logical
+        // bounds.  Never let a stale guest extent leak into that session.
+        g_drawable_contract_active = NO;
+        g_drawable_contract_width = 0;
+        g_drawable_contract_height = 0;
+        RosetteMachOUpdateMetalDrawable();
+      }
+    });
+  }
   return changed ? 1 : 0;
 }
 
 int rosette_macho_native_window_drawable_owned_by_swapchain(void) {
-  return g_drawable_owned_by_swapchain ? 1 : 0;
+  __block BOOL owned = NO;
+  @autoreleasepool {
+    RosetteMachORunOnMainThreadSync(^{
+      owned = g_drawable_owned_by_swapchain;
+    });
+  }
+  return owned ? 1 : 0;
+}
+
+int rosette_macho_native_window_prepare_drawable_size(uint32_t width,
+                                                      uint32_t height) {
+  if (width == 0u || height == 0u || width > kRosetteMaxWindowDimension ||
+      height > kRosetteMaxWindowDimension || width == 0x80000000u ||
+      height == 0x80000000u) {
+    return 0;
+  }
+
+  __block BOOL prepared = NO;
+  @autoreleasepool {
+    RosetteMachORunOnMainThreadSync(^{
+      if (!RosetteMachOEnsureWindowOnMainThread(g_width, g_height, nil) ||
+          !g_metal_layer) {
+        return;
+      }
+
+      const CGSize requested = CGSizeMake((CGFloat)width, (CGFloat)height);
+      const CGSize current = g_metal_layer.drawableSize;
+      if (g_drawable_owned_by_swapchain) {
+        // The old owner remains authoritative during a live swapchain. A
+        // same-size recreate is safe and needs no write; a different request
+        // is reported as a refusal instead of racing the driver's drawable
+        // pool and manufacturing an out-of-date swapchain.
+        prepared = fabs((double)current.width - (double)width) < 0.5 &&
+                   fabs((double)current.height - (double)height) < 0.5;
+        if (!prepared) {
+          fprintf(stderr,
+                  "macho-processor: CAMetalLayer drawable preflight refused: "
+                  "owner=vulkan_swapchain current=%ux%u requested=%ux%u\n",
+                  (unsigned)current.width, (unsigned)current.height,
+                  (unsigned)width, (unsigned)height);
+        }
+        return;
+      }
+
+      g_drawable_contract_active = NO;
+      g_metal_layer.drawableSize = requested;
+      const CGSize actual = g_metal_layer.drawableSize;
+      prepared = fabs((double)actual.width - (double)width) < 0.5 &&
+                 fabs((double)actual.height - (double)height) < 0.5;
+      if (prepared) {
+        // Keep the exact size stable across the native-presenter capability
+        // queries that follow this call.  Without a persistent contract an
+        // intervening AppKit layout pass can put the layer back on its bounds
+        // or its backing scale before vkCreateSwapchainKHR sees it.
+        g_drawable_contract_width = width;
+        g_drawable_contract_height = height;
+        g_drawable_contract_active = YES;
+      }
+      fprintf(stderr,
+              "macho-processor: CAMetalLayer drawable preflight: owner=%s "
+              "requested=%ux%u actual=%ux%u contentsScale=%.2f backingScale=%.2f result=%s\n",
+              g_drawable_owned_by_swapchain ? "vulkan_swapchain"
+                                            : "rosette_window_bridge",
+              (unsigned)width, (unsigned)height, (unsigned)actual.width,
+              (unsigned)actual.height, (double)g_metal_layer.contentsScale,
+              (double)g_window.backingScaleFactor,
+              prepared ? "ready" : "mismatch");
+    });
+  }
+  return prepared ? 1 : 0;
 }
 
 static BOOL RosetteMachOEnsureApplicationOnMainThread(void) {
@@ -274,21 +579,36 @@ static BOOL RosetteMachOEnsureWindowOnMainThread(uint32_t width,
     return NO;
   }
   if (g_window && g_view && g_metal_layer && g_metal_device) {
+    RosetteMachOConfigureWindowPlacementPolicyOnMainThread();
     if (title.length) {
       g_window.title = title;
     }
+    RosetteMachOEnforceLockedWindowSizeOnMainThread("ensure");
     return YES;
   }
 
-  g_width = RosetteMachONormalizeWindowDimension(width,
-                                                  kRosetteDefaultWindowWidth);
-  g_height = RosetteMachONormalizeWindowDimension(
+  const uint32_t requested_width = RosetteMachONormalizeWindowDimension(
+      width, kRosetteDefaultWindowWidth);
+  const uint32_t requested_height = RosetteMachONormalizeWindowDimension(
       height, kRosetteDefaultWindowHeight);
+  if (requested_width != kRosetteLockedWindowWidth ||
+      requested_height != kRosetteLockedWindowHeight) {
+    fprintf(stderr,
+            "macho-processor: WINDOW SIZE LOCK: decision=clamped "
+            "operation=ensure requested=%ux%u admitted=%ux%u "
+            "logical_content_points=locked drawable_pixels=independent\n",
+            (unsigned)requested_width, (unsigned)requested_height,
+            (unsigned)kRosetteLockedWindowWidth,
+            (unsigned)kRosetteLockedWindowHeight);
+  }
+  // g_width/g_height describe the drawable before a Vulkan owner takes over;
+  // the AppKit content rectangle below is always the fixed logical contract.
+  g_width = kRosetteLockedWindowWidth;
+  g_height = kRosetteLockedWindowHeight;
   const NSRect content_rect = NSMakeRect(0.0, 0.0, g_width, g_height);
   const NSWindowStyleMask style = NSWindowStyleMaskTitled |
                                   NSWindowStyleMaskClosable |
-                                  NSWindowStyleMaskMiniaturizable |
-                                  NSWindowStyleMaskResizable;
+                                  NSWindowStyleMaskMiniaturizable;
   g_window = [[NSWindow alloc] initWithContentRect:content_rect
                                          styleMask:style
                                            backing:NSBackingStoreBuffered
@@ -300,14 +620,24 @@ static BOOL RosetteMachOEnsureWindowOnMainThread(uint32_t width,
   g_window.title = title.length ? title : @"Xenia Canary (Rosette)";
   g_window.acceptsMouseMovedEvents = YES;
   g_window.tabbingMode = NSWindowTabbingModeDisallowed;
-  RosetteMachOConfigureForegroundWindowPolicy();
+  // There is no resize affordance, and the min/max content contract also
+  // protects against programmatic AppKit resizing. Fullscreen is disabled
+  // below because it is itself a size transition.
+  g_window.contentMinSize =
+      NSMakeSize((CGFloat)kRosetteLockedWindowWidth,
+                 (CGFloat)kRosetteLockedWindowHeight);
+  g_window.contentMaxSize =
+      NSMakeSize((CGFloat)kRosetteLockedWindowWidth,
+                 (CGFloat)kRosetteLockedWindowHeight);
+  RosetteMachOConfigureWindowPlacementPolicyOnMainThread();
+  RosetteMachOConfigureOrdinaryWindowPolicy();
 
   g_view = [[RosetteMachOMetalView alloc] initWithFrame:content_rect];
   if (!g_view) {
     g_window = nil;
     return NO;
   }
-  g_view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  g_view.autoresizingMask = NSViewNotSizable;
   g_view.wantsLayer = YES;
   CALayer *backing_layer = g_view.layer;
   if (![backing_layer isKindOfClass:[CAMetalLayer class]]) {
@@ -325,6 +655,9 @@ static BOOL RosetteMachOEnsureWindowOnMainThread(uint32_t width,
   }
 
   g_metal_layer.device = g_metal_device;
+  // MoltenVK uses the view delegate to track the display/backing properties.
+  // This does not transfer drawable ownership back from the swapchain.
+  g_metal_layer.delegate = g_view;
   g_metal_command_queue = [g_metal_device newCommandQueue];
   if (!g_metal_command_queue) {
     g_metal_layer = nil;
@@ -342,7 +675,7 @@ static BOOL RosetteMachOEnsureWindowOnMainThread(uint32_t width,
   g_window.contentView = g_view;
   RosetteMachOPlaceWindowSafely();
   RosetteMachOUpdateMetalDrawable();
-  RosetteMachOBringWindowToFrontOnMainThread("created");
+  RosetteMachOShowWindowOnMainThread("created");
   return YES;
 }
 
@@ -363,7 +696,8 @@ int rosette_macho_native_window_ensure(uint32_t width, uint32_t height,
   @autoreleasepool {
     RosetteMachORunOnMainThreadSync(^{
       result = RosetteMachOEnsureWindowOnMainThread(
-          width ? width : 1280, height ? height : 720, window_title);
+          width ? width : kRosetteLockedWindowWidth,
+          height ? height : kRosetteLockedWindowHeight, window_title);
     });
   }
   return result ? 1 : 0;
@@ -389,20 +723,35 @@ int rosette_macho_native_window_set_title(const char *title) {
 
 int rosette_macho_native_window_set_size(uint32_t width, uint32_t height) {
   if (!width || !height) {
+    ++g_window_size_lock_refusals;
     return 0;
   }
-  const uint32_t safe_width = RosetteMachONormalizeWindowDimension(
-      width, kRosetteDefaultWindowWidth);
-  const uint32_t safe_height = RosetteMachONormalizeWindowDimension(
-      height, kRosetteDefaultWindowHeight);
+  if (width != kRosetteLockedWindowWidth ||
+      height != kRosetteLockedWindowHeight) {
+    ++g_window_size_lock_refusals;
+    const uint64_t count = g_window_size_lock_refusals;
+    if (count <= 4u || (count & (count - 1u)) == 0u) {
+      fprintf(stderr,
+              "macho-processor: WINDOW SIZE LOCK: decision=refused "
+              "operation=set_size requested=%ux%u locked=%ux%u "
+              "refusal_count=%llu action=keep logical content fixed; "
+              "drawable pixels and backing scale remain separate\n",
+              (unsigned)width, (unsigned)height,
+              (unsigned)kRosetteLockedWindowWidth,
+              (unsigned)kRosetteLockedWindowHeight,
+              (unsigned long long)count);
+    }
+    return 0;
+  }
   __block BOOL result = NO;
   @autoreleasepool {
     RosetteMachORunOnMainThreadSync(^{
-      if (RosetteMachOEnsureWindowOnMainThread(safe_width, safe_height, nil)) {
-        [g_window setContentSize:NSMakeSize(safe_width, safe_height)];
+      if (RosetteMachOEnsureWindowOnMainThread(
+              kRosetteLockedWindowWidth, kRosetteLockedWindowHeight, nil)) {
+        RosetteMachOEnforceLockedWindowSizeOnMainThread("set_size_locked");
         RosetteMachOPlaceWindowSafely();
         RosetteMachOUpdateMetalDrawable();
-        result = YES;
+        result = RosetteMachOContentSizeMatchesLocked();
       }
     });
   }
@@ -414,7 +763,7 @@ int rosette_macho_native_window_show(void) {
   @autoreleasepool {
     RosetteMachORunOnMainThreadSync(^{
       if (RosetteMachOEnsureWindowOnMainThread(g_width, g_height, nil)) {
-        RosetteMachOBringWindowToFrontOnMainThread("show");
+        RosetteMachOShowWindowOnMainThread("show");
         RosetteMachOUpdateMetalDrawable();
         result = YES;
       }
@@ -444,6 +793,21 @@ int rosette_macho_native_window_set_fullscreen(int fullscreen) {
         return;
       }
       const BOOL requested = fullscreen != 0;
+      if (requested) {
+        ++g_fullscreen_lock_refusals;
+        const uint64_t count = g_fullscreen_lock_refusals;
+        if (count <= 4u || (count & (count - 1u)) == 0u) {
+          fprintf(stderr,
+                  "macho-processor: WINDOW SIZE LOCK: decision=refused "
+                  "operation=fullscreen requested=true locked=%ux%u "
+                  "refusal_count=%llu action=fullscreen is disabled until "
+                  "the fixed-size presentation contract is lifted\n",
+                  (unsigned)kRosetteLockedWindowWidth,
+                  (unsigned)kRosetteLockedWindowHeight,
+                  (unsigned long long)count);
+        }
+        return;
+      }
       if (requested != g_fullscreen) {
         [g_window toggleFullScreen:nil];
         g_fullscreen = requested;
@@ -717,7 +1081,6 @@ uint32_t rosette_macho_native_window_pump_events(void) {
       }
       [g_application updateWindows];
       RosetteMachOUpdateMetalDrawable();
-      RosetteMachOReassertForegroundIfOccludedOnMainThread();
       g_events_pumped += count;
     });
   }
@@ -729,11 +1092,10 @@ RosetteMachONativeWindowStatus rosette_macho_native_window_status(void) {
   @autoreleasepool {
     RosetteMachORunOnMainThreadSync(^{
       RosetteMachOUpdateMetalDrawable();
-      // Presentation diagnostics are also a repair opportunity.  A title can
-      // spend a long time in a bounded guest build between event-pump calls;
-      // sampling the broken window must not merely report it and then leave it
-      // miniaturized until the next unrelated UI callback.
-      RosetteMachOReassertForegroundIfOccludedOnMainThread();
+      // Status is observational: a backgrounded or minimized window stays
+      // where the user put it. In particular, do not turn a diagnostic poll
+      // into an application activation.
+      RosetteMachORepairWindowPlacementIfNeeded();
       status.application = (uintptr_t)(__bridge void *)g_application;
       status.window = (uintptr_t)(__bridge void *)g_window;
       status.view = (uintptr_t)(__bridge void *)g_view;
@@ -767,10 +1129,8 @@ int rosette_macho_native_window_describe(
       if (g_window == nil) {
         return;
       }
-      // Keep the facts below truthful after attempting the repair: if AppKit
-      // has not completed deminiaturization yet, the captured miniaturized
-      // state remains visible in the log and is still the authoritative break.
-      RosetteMachOReassertForegroundIfOccludedOnMainThread();
+      // Report actual occlusion/minimization without changing window order.
+      RosetteMachORepairWindowPlacementIfNeeded();
       described = 1;
       out->window_exists = 1;
       out->window = (uintptr_t)(__bridge void *)g_window;
@@ -842,9 +1202,210 @@ int rosette_macho_native_window_describe(
   return described;
 }
 
+static NSString *RosetteReadbackDirectory(void) {
+  if (g_readback_directory) return g_readback_directory;
+  const char *configured = getenv("ROSETTE_VULKAN_CAPTURE_DIR");
+  if (configured && configured[0]) {
+    g_readback_directory = [NSString stringWithUTF8String:configured];
+  } else {
+    NSString *cache = NSSearchPathForDirectoriesInDomains(
+        NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+    if (!cache) return nil;
+    g_readback_directory = [[cache stringByAppendingPathComponent:
+        @"Rosette/frame-captures"] stringByAppendingPathComponent:
+        NSProcessInfo.processInfo.globallyUniqueString];
+  }
+  NSError *error = nil;
+  if (!g_readback_directory || ![NSFileManager.defaultManager
+      createDirectoryAtPath:g_readback_directory
+      withIntermediateDirectories:YES attributes:nil error:&error]) {
+    fprintf(stderr, "macho-processor: FRAME CAPTURE: directory failure: %s\n",
+            error.localizedDescription.UTF8String ?: "invalid capture path");
+    g_readback_directory = nil;
+    return nil;
+  }
+  fprintf(stderr, "macho-processor: FRAME CAPTURE: directory=%s limit=24 "
+          "raw_alpha_and_opaque_rgb=YES source=completed-acquired-image\n",
+          g_readback_directory.fileSystemRepresentation);
+  return g_readback_directory;
+}
+
+static NSBitmapImageRep *RosetteReadbackBitmap(
+    const RosetteMachOReadbackFrame *frame, BOOL opaque) {
+  NSBitmapImageRep *bitmap = [[NSBitmapImageRep alloc]
+      initWithBitmapDataPlanes:NULL pixelsWide:frame->width
+      pixelsHigh:frame->height bitsPerSample:8 samplesPerPixel:4
+      hasAlpha:YES isPlanar:NO colorSpaceName:NSDeviceRGBColorSpace
+      bitmapFormat:NSBitmapFormatAlphaNonpremultiplied
+      bytesPerRow:(NSInteger)frame->width * 4 bitsPerPixel:32];
+  if (!bitmap || !bitmap.bitmapData) return nil;
+  const BOOL bgra = frame->format == 44 || frame->format == 50;
+  uint8_t *destination = bitmap.bitmapData;
+  for (uint64_t offset = 0; offset < frame->length; offset += 4) {
+    destination[offset] = frame->pixels[offset + (bgra ? 2 : 0)];
+    destination[offset + 1] = frame->pixels[offset + 1];
+    destination[offset + 2] = frame->pixels[offset + (bgra ? 0 : 2)];
+    destination[offset + 3] = opaque ? 255 : frame->pixels[offset + 3];
+  }
+  // The pixels are already encoded according to the Vulkan image format.
+  // Tag, don't transform them: UNORM and SRGB must not be gamma-converted twice.
+  NSColorSpace *space = (frame->format == 43 || frame->format == 50)
+      ? NSColorSpace.sRGBColorSpace : NSColorSpace.deviceRGBColorSpace;
+  return [bitmap bitmapImageRepByRetaggingWithColorSpace:space];
+}
+
+static NSBitmapImageRep *RosetteReadbackExposure(NSBitmapImageRep *source) {
+  NSBitmapImageRep *exposed = [[NSBitmapImageRep alloc]
+      initWithBitmapDataPlanes:NULL pixelsWide:source.pixelsWide pixelsHigh:source.pixelsHigh
+      bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO
+      colorSpaceName:NSDeviceRGBColorSpace bitmapFormat:NSBitmapFormatAlphaNonpremultiplied
+      bytesPerRow:source.pixelsWide * 4 bitsPerPixel:32];
+  if (!exposed || !exposed.bitmapData) return nil;
+  // Fixed diagnostic gain, NOT a replacement gamma ramp or a title fix.
+  // No per-channel normalization, black-level subtraction, or source edits.
+  for (NSInteger y = 0; y < exposed.pixelsHigh; y++) {
+    uint8_t *row = exposed.bitmapData + y * exposed.bytesPerRow;
+    const uint8_t *original = source.bitmapData + y * source.bytesPerRow;
+    for (NSInteger x = 0; x < exposed.pixelsWide; x++) {
+      for (unsigned channel = 0; channel < 3; channel++) {
+        row[x * 4 + channel] = (uint8_t)MIN(255u, (unsigned)original[x * 4 + channel] * 16u);
+      }
+      row[x * 4 + 3] = 255;
+    }
+  }
+  return [exposed bitmapImageRepByRetaggingWithColorSpace:source.colorSpace];
+}
+
+uint32_t rosette_macho_native_window_capture_frame(
+    const RosetteMachOReadbackFrame *frame) {
+  if (!frame || !frame->pixels || !frame->width || !frame->height ||
+      frame->width > (64ull * 1024 * 1024) / 4 / frame->height ||
+      frame->length != (uint64_t)frame->width * frame->height * 4 ||
+      !(frame->format == 37 || frame->format == 43 ||
+        frame->format == 44 || frame->format == 50) || (frame->flags & ~15u)) {
+    return 4;
+  }
+  @autoreleasepool {
+    uint32_t result = 0;
+    // Copy before returning: the caller reuses its mapped Vulkan staging area.
+    NSBitmapImageRep *opaque = RosetteReadbackBitmap(frame, YES);
+    if (!opaque) return 4;
+    NSBitmapImageRep *exposed = (frame->flags & 4u) ? RosetteReadbackExposure(opaque) : nil;
+    if ((frame->flags & 4u) && !exposed) return 4;
+    if ((frame->flags & 1u) && g_readback_saved < 24) {
+      g_readback_saved++;
+      NSString *directory = RosetteReadbackDirectory();
+      NSBitmapImageRep *raw = RosetteReadbackBitmap(frame, NO);
+      NSString *stem = [NSString stringWithFormat:
+          @"frame-%06llu-image-%016llx", (unsigned long long)frame->frame,
+          (unsigned long long)frame->image];
+      NSString *path = [directory stringByAppendingPathComponent:stem];
+      NSError *error = nil;
+      NSData *rawPNG = [raw representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+      NSData *rgbPNG = [opaque representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+      NSData *exposurePNG = exposed ? [exposed representationUsingType:NSBitmapImageFileTypePNG properties:@{}] : nil;
+      NSDictionary *metadata = @{
+        @"source": (frame->flags & 8u) ? @"offline CPU replay; no Vulkan completion verified" : @"completed acquired swapchain image before WSI",
+        @"frame": @(frame->frame), @"swapchain": @(frame->swapchain),
+        @"image": @(frame->image), @"width": @(frame->width),
+        @"height": @(frame->height), @"vk_format": @(frame->format),
+        @"raw_byte_hash_fnv1a64": [NSString stringWithFormat:@"%016llx", (unsigned long long)frame->hash],
+        @"row_order": @"Vulkan rows, top to bottom; no vertical flip",
+        @"raw_png": @"straight source alpha; BGRA converted to RGBA without color conversion",
+        @"rgb_png_and_raw_preview": @"source RGB with alpha forced to 255; no exposure boost",
+        @"diagnostic_exposure_multiplier": exposed ? @16 : @1,
+        @"diagnostic_exposure_formula": @"min(source_rgb * 16, 255); alpha=255; NOT rendered-image correctness evidence",
+        @"visible_pixels_max_rgb_gt_16": @(frame->visible_pixels),
+        @"bright_pixels_max_rgb_gt_64": @(frame->bright_pixels),
+        @"alpha_lt_255_pixels": @(frame->transparent_pixels),
+        @"rgb_different_from_first_pixels": @(frame->rgb_different_pixels),
+        @"rgb_sum": @[@(frame->rgb_sum[0]), @(frame->rgb_sum[1]), @(frame->rgb_sum[2])],
+        @"min_rgb": @[@(frame->min_rgb[0]), @(frame->min_rgb[1]), @(frame->min_rgb[2])],
+        @"max_rgb": @[@(frame->max_rgb[0]), @(frame->max_rgb[1]), @(frame->max_rgb[2])]
+      };
+      NSData *json = [NSJSONSerialization dataWithJSONObject:metadata
+          options:NSJSONWritingPrettyPrinted error:&error];
+      if (path && rawPNG && rgbPNG && json &&
+          [rawPNG writeToFile:[path stringByAppendingString:@".png"] options:NSDataWritingAtomic error:&error] &&
+          [rgbPNG writeToFile:[path stringByAppendingString:@"-rgb.png"] options:NSDataWritingAtomic error:&error] &&
+          (!exposed || (exposurePNG && [exposurePNG writeToFile:[path stringByAppendingString:@"-exposure16.png"] options:NSDataWritingAtomic error:&error])) &&
+          [json writeToFile:[path stringByAppendingString:@".json"] options:NSDataWritingAtomic error:&error]) {
+        result |= 1;
+        fprintf(stderr, "macho-processor: FRAME CAPTURE: saved=%s.png "
+            "opaque_rgb=%s-rgb.png custody=%s.json\n",
+            path.fileSystemRepresentation, path.fileSystemRepresentation,
+            path.fileSystemRepresentation);
+        if (exposed) fprintf(stderr, "macho-processor: FRAME EXPOSURE DIAGNOSTIC: path=%s-exposure16.png gain=16 source_unchanged=YES not_a_gamma_fix=YES\n", path.fileSystemRepresentation);
+      } else {
+        result |= 4;
+        fprintf(stderr, "macho-processor: FRAME CAPTURE: frame=%llu save failed: %s\n",
+            (unsigned long long)frame->frame,
+            error.localizedDescription.UTF8String ?: "bitmap/path unavailable");
+      }
+    }
+    if (frame->flags & 2u) {
+      __block BOOL previewed = NO;
+      RosetteMachORunOnMainThreadSync(^{
+        if (g_readback_closed || !RosetteMachOEnsureApplicationOnMainThread()) return;
+        if (!g_readback_window) {
+          g_readback_window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 960, 300)
+              styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                        NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
+              backing:NSBackingStoreBuffered defer:NO];
+          g_readback_window.releasedWhenClosed = NO;
+          g_readback_window.level = NSNormalWindowLevel;
+          g_readback_window.hidesOnDeactivate = NO;
+          g_readback_window.collectionBehavior =
+              NSWindowCollectionBehaviorDefault;
+          g_readback_window.tabbingMode = NSWindowTabbingModeDisallowed;
+          g_readback_delegate = [RosetteReadbackWindowDelegate new];
+          g_readback_window.delegate = g_readback_delegate;
+          NSView *comparison = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 960, 300)];
+          g_readback_view = [[NSImageView alloc] initWithFrame:NSMakeRect(0, 0, 480, 300)];
+          g_readback_view.imageScaling = NSImageScaleProportionallyUpOrDown;
+          g_readback_view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable | NSViewMaxXMargin;
+          g_readback_exposure_view = [[NSImageView alloc] initWithFrame:NSMakeRect(480, 0, 480, 300)];
+          g_readback_exposure_view.imageScaling = NSImageScaleProportionallyUpOrDown;
+          g_readback_exposure_view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable | NSViewMinXMargin;
+          [comparison addSubview:g_readback_view];
+          [comparison addSubview:g_readback_exposure_view];
+          g_readback_window.contentView = comparison;
+          [g_readback_window center];
+          // Do not steal the keyboard focus or mutate the guest window/layer.
+          [g_readback_window orderFront:nil];
+          fprintf(stderr, "macho-processor: COCOA READBACK: independent preview opened; "
+              "no CAMetalLayer drawables consumed; RGB alpha forced opaque\n");
+        }
+        NSImage *image = [[NSImage alloc] initWithSize:NSMakeSize(frame->width, frame->height)];
+        [image addRepresentation:opaque];
+        g_readback_view.image = image;
+        NSImage *exposureImage = [[NSImage alloc] initWithSize:NSMakeSize(frame->width, frame->height)];
+        if (exposed) [exposureImage addRepresentation:exposed];
+        g_readback_exposure_view.image = exposed ? exposureImage : image;
+        g_readback_window.title = [NSString stringWithFormat:
+            @"Rosette acquired-image RGB — frame %llu | left RAW, right %@ (not WSI)",
+            (unsigned long long)frame->frame, exposed ? @"x16 DIAGNOSTIC" : @"RAW"];
+        [g_readback_view displayIfNeeded];
+        previewed = g_readback_window && g_readback_view;
+      });
+      if (previewed) result |= 2;
+    }
+    return result;
+  }
+}
+
 void rosette_macho_native_window_shutdown(void) {
   @autoreleasepool {
     RosetteMachORunOnMainThreadSync(^{
+      g_readback_window.delegate = nil;
+      [g_readback_window close];
+      g_readback_window = nil;
+      g_readback_view = nil;
+      g_readback_exposure_view = nil;
+      g_readback_delegate = nil;
+      g_readback_closed = NO;
+      g_readback_directory = nil;
+      g_readback_saved = 0;
       if (g_fullscreen && g_window) {
         [g_window toggleFullScreen:nil];
       }
@@ -856,11 +1417,34 @@ void rosette_macho_native_window_shutdown(void) {
       g_metal_device = nil;
       g_view = nil;
       g_window = nil;
+      g_drawable_owned_by_swapchain = NO;
+      g_drawable_contract_active = NO;
+      g_drawable_contract_width = 0;
+      g_drawable_contract_height = 0;
       g_fullscreen = NO;
       g_diagnostic_frames_presented = 0;
       g_guest_frames_presented = 0;
-      g_last_foreground_reassertion = 0.0;
       g_foreground_reassertions = 0;
+      g_window_placement_repairs = 0;
+      g_window_placement_repair_failures = 0;
+      g_window_size_lock_repairs = 0;
+      g_window_size_lock_refusals = 0;
+      g_fullscreen_lock_refusals = 0;
+      g_reported_placement_policy = NO;
     });
   }
 }
+
+// The Zig forwarder discovers this callback through dlsym so test binaries
+// can omit the AppKit bridge.  ReleaseFast is otherwise free to dead-strip a
+// callback that has no ordinary C call edge, which makes a linked bridge look
+// exactly like a missing window to the presentation report.  Keep one typed,
+// retained edge in the Mach-O image so the callback remains discoverable.
+typedef int (*RosetteMachONativeWindowDescribeFn)(
+    RosetteMachONativeWindowGeometry *);
+__attribute__((used, retain)) static const RosetteMachONativeWindowDescribeFn
+    rosette_macho_native_window_describe_anchor =
+        rosette_macho_native_window_describe;
+__attribute__((used, retain)) static uint32_t (*const
+    rosette_macho_native_window_capture_frame_anchor)(const RosetteMachOReadbackFrame *) =
+        rosette_macho_native_window_capture_frame;

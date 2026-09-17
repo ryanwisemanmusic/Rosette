@@ -475,6 +475,10 @@ pub const MachOState = struct {
     terminated: bool = false,
     exit_code: u64 = 0,
     faulted: bool = false,
+    /// A drawable extent mismatch is a non-bypassable host/guest contract
+    /// fault. Keep a separate guard so a returning signal handler or a later
+    /// diagnostic checkpoint cannot re-enter the failed presentation path.
+    graphics_extent_contract_faulted: bool = false,
     termination_reason: u8 = @intFromEnum(exit_diagnostics.TerminationReason.unknown),
     host_termination_signal: u8 = 0,
     data: []const u8,
@@ -3235,6 +3239,12 @@ pub const MachOState = struct {
     }
     pub fn nativeMetalLayerHostPointer(self: *MachOState) usize {
         return native_window.nativeMetalLayerHostPointer(self);
+    }
+    pub fn prepareNativeMetalDrawable(self: *MachOState, width: u32, height: u32) bool {
+        return native_window.prepareNativeMetalDrawable(self, width, height);
+    }
+    pub fn setNativeMetalDrawableOwner(self: *MachOState, owned_by_swapchain: bool) bool {
+        return native_window.setNativeMetalDrawableOwner(self, owned_by_swapchain);
     }
     pub fn noteNativeVulkanSurfaceBound(self: *MachOState, layer_token: u64, guest_surface: u64, host_surface: u64) void {
         return native_window.noteNativeVulkanSurfaceBound(self, layer_token, guest_surface, host_surface);
@@ -6186,6 +6196,77 @@ pub const MachOState = struct {
     /// signal is real: `native_crash` has handlers installed for it, writes the
     /// host register file and the last guest progress, and re-raises, so the
     /// process still exits 139 and a supervisor keying on that keeps working.
+    ///
+    /// Unlike a generic window-admission refusal, this path cannot be made
+    /// conditional on a profile or an environment bypass. A layer whose
+    /// drawable extent is not the extent the presenter/guest is about to use
+    /// is already an invalid presentation graph; letting execution continue
+    /// would make every later Vulkan result and every black frame ambiguous.
+    pub fn faultOnGraphicsExtentContract(
+        self: *MachOState,
+        requested_width: u32,
+        requested_height: u32,
+        observed_width: u32,
+        observed_height: u32,
+        reason: []const u8,
+    ) void {
+        if (self.graphics_extent_contract_faulted) return;
+        self.graphics_extent_contract_faulted = true;
+        self.graphics_preflight_window_allowed = false;
+        self.faulted = true;
+        self.terminated = true;
+        self.exit_code = 125;
+        self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.runtime_invariant_failure);
+        self.audit_pause.noteTermination(.diagnostic_termination, self.executed_steps);
+
+        const status = self.native_window.snapshot();
+        const presenter = &self.dynamic_forwarder.native_presenter.report;
+        machoCapturePrint(
+            "macho-processor: GRAPHICS EXTENT CONTRACT FAULT: reason={s} required={d}x{d} observed={d}x{d} step={d} rip=0x{x} thread=0x{x} native_stage={s} drawable_owner={s}\n",
+            .{
+                reason,
+                requested_width,
+                requested_height,
+                observed_width,
+                observed_height,
+                self.executed_steps,
+                self.regs.rip,
+                self.active_guest_thread,
+                @tagName(self.dynamic_forwarder.native_presenter.stage),
+                @tagName(self.dynamic_forwarder.drawable_owner),
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: GRAPHICS EXTENT CONTRACT FAULT: bridge_status={d}x{d} host(app/window/view/layer/device)=0x{x}/0x{x}/0x{x}/0x{x}/0x{x} presenter(requested/selected)={d}x{d}/{d}x{d} rejection={s} VkResult={d}; the layer and swapchain must agree before either can own presentation\n",
+            .{
+                status.width,
+                status.height,
+                status.application,
+                status.window,
+                status.view,
+                status.metal_layer,
+                status.metal_device,
+                presenter.requested_extent_width,
+                presenter.requested_extent_height,
+                presenter.extent_width,
+                presenter.extent_height,
+                presenter.rejectionLabel(),
+                presenter.last_result,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: GRAPHICS EXTENT CONTRACT FAULT: termination=NON_BYPASSABLE; refusing to continue into vkCreateSwapchainKHR, drawable ownership handoff, guest execution, or retry logic. This is the required 1280x720 phase, not an advisory diagnostic\n",
+            .{},
+        );
+        macho_log.flushAsyncTransport();
+        self.macho_log.flush();
+        native_crash.recordPhase("graphics-extent-contract-fault");
+        _ = std.c.raise(std.c.SIG.SEGV);
+        // The native crash handler normally restores the default disposition
+        // and re-raises. If it returns, keep the failed path terminal anyway.
+        std.c.abort();
+    }
+
     pub fn faultOnWindowAdmission(self: *MachOState, outcome: gpu.WindowAdmissionOutcome) void {
         const detail = outcome.detail;
         machoCapturePrint(
@@ -13430,6 +13511,33 @@ pub const MachOState = struct {
                                 self.gpu_xenos_runtime.swap_count,
                             },
                         );
+                        if (execution.rectangle_draws != 0) {
+                            const route = if (execution.rectangle_backend) |backend| backend.label() else "none";
+                            const rejection = if (execution.rectangle_rejection) |reason| reason.label() else "none";
+                            const plan = execution.rectangle_plan;
+                            machoCapturePrint(
+                                "macho-processor: XENOS PM4 rectangle backend: observed={d} lowered={d} empty={d} rejected={d} host_indices={d} trailing_vertices={d} route={s} rejection={s} plan(guest_vertices/rectangles/topology/vertex/geometry/index_format/index_count/restart/builtin)={d}/{d}/{s}/{s}/{s}/{s}/{d}/{s}/{s}; Rosetta generated the Xenia-compatible rectangle plan, while the loaded-image IssueDraw repair leaves Xenia's shader translator and vkCmdDrawIndexed submission owner intact\n",
+                                .{
+                                    execution.rectangle_draws,
+                                    execution.rectangle_draws_lowered,
+                                    execution.rectangle_draws_empty,
+                                    execution.rectangle_draws_rejected,
+                                    execution.rectangle_host_indices,
+                                    execution.rectangle_trailing_vertices,
+                                    route,
+                                    rejection,
+                                    if (plan) |value| value.guest_vertex_count else 0,
+                                    if (plan) |value| value.rectangle_count else 0,
+                                    if (plan) |value| @tagName(value.host_topology) else "none",
+                                    if (plan) |value| value.host_vertex_shader.label() else "none",
+                                    if (plan) |value| value.host_geometry_shader.label() else "none",
+                                    if (plan) |value| @tagName(value.host_index_format) else "none",
+                                    if (plan) |value| value.host_index_count else 0,
+                                    if (plan) |value| if (value.host_primitive_restart) "YES" else "NO" else "NO",
+                                    if (plan) |value| if (value.uses_builtin_index_buffer) "YES" else "NO" else "NO",
+                                },
+                            );
+                        }
                         if (execution.swaps != 0) {
                             if (self.gpu_xenos_runtime.last_swap) |runtime_swap| {
                                 if (runtime_swap.plausible()) {
@@ -14342,6 +14450,34 @@ pub const MachOState = struct {
                 deferred_writes,
             },
         );
+
+        if (execution.rectangle_draws != 0) {
+            const route = if (execution.rectangle_backend) |backend| backend.label() else "none";
+            const rejection = if (execution.rectangle_rejection) |reason| reason.label() else "none";
+            const plan = execution.rectangle_plan;
+            machoCapturePrint(
+                "macho-processor: XENOS RETAINED BATCH rectangle backend: observed={d} lowered={d} empty={d} rejected={d} host_indices={d} trailing_vertices={d} route={s} rejection={s} plan(guest_vertices/rectangles/topology/vertex/geometry/index_format/index_count/restart/builtin)={d}/{d}/{s}/{s}/{s}/{s}/{d}/{s}/{s}; plan is diagnostic/reconstructive because Xenia already consumed this batch\n",
+                .{
+                    execution.rectangle_draws,
+                    execution.rectangle_draws_lowered,
+                    execution.rectangle_draws_empty,
+                    execution.rectangle_draws_rejected,
+                    execution.rectangle_host_indices,
+                    execution.rectangle_trailing_vertices,
+                    route,
+                    rejection,
+                    if (plan) |value| value.guest_vertex_count else 0,
+                    if (plan) |value| value.rectangle_count else 0,
+                    if (plan) |value| @tagName(value.host_topology) else "none",
+                    if (plan) |value| value.host_vertex_shader.label() else "none",
+                    if (plan) |value| value.host_geometry_shader.label() else "none",
+                    if (plan) |value| @tagName(value.host_index_format) else "none",
+                    if (plan) |value| value.host_index_count else 0,
+                    if (plan) |value| if (value.host_primitive_restart) "YES" else "NO" else "NO",
+                    if (plan) |value| if (value.uses_builtin_index_buffer) "YES" else "NO" else "NO",
+                },
+            );
+        }
 
         if (runtime_swap) |swap| {
             if (swap.plausible()) {
@@ -24351,7 +24487,7 @@ fn logGraphicsHostPreflightSnapshot(state: *const MachOState) void {
     const presenter = &state.dynamic_forwarder.native_presenter.report;
     const stage = state.dynamic_forwarder.nativePresenterStage();
     machoCapturePrint(
-        "macho-processor: GRAPHICS PREFLIGHT HOST SNAPSHOT: app=0x{x} window=0x{x} view=0x{x} layer=0x{x} metal_device=0x{x} drawable={d}x{d} ready(app/window/layer/main)={}/{}/{}/{} surface_bindings={d} native_stage={s} native_attempts={d} loader_attempts/failures={d}/{d} VkResult={d} rejection={s} physical_devices={d} queues(graphics/present/unified)={d}/{d}/{} swapchain_images={d} swapchain_extent={d}x{d} native_present_completed=NO\n",
+        "macho-processor: GRAPHICS PREFLIGHT HOST SNAPSHOT: app=0x{x} window=0x{x} view=0x{x} layer=0x{x} metal_device=0x{x} drawable={d}x{d} ready(app/window/layer/main)={}/{}/{}/{} surface_bindings={d} native_stage={s} native_attempts={d} loader_attempts/failures={d}/{d} VkResult={d} rejection={s}\n",
         .{
             status.application,
             status.window,
@@ -24371,6 +24507,11 @@ fn logGraphicsHostPreflightSnapshot(state: *const MachOState) void {
             state.dynamic_forwarder.native_vulkan_loader_failures,
             presenter.last_result,
             presenter.rejectionLabel(),
+        },
+    );
+    machoCapturePrint(
+        "macho-processor: GRAPHICS PREFLIGHT DRIVER SNAPSHOT: physical_devices={d} queues(graphics/present/unified)={d}/{d}/{} swapchain_images={d} swapchain_extent={d}x{d} requested={d}x{d} extent_contract(failed/failures/required/observed)={}/{}/{d}x{d}/{d}x{d} native_present_completed=NO\n",
+        .{
             presenter.physical_device_count,
             presenter.graphics_family,
             presenter.present_family,
@@ -24378,6 +24519,14 @@ fn logGraphicsHostPreflightSnapshot(state: *const MachOState) void {
             presenter.swapchain_image_count,
             presenter.extent_width,
             presenter.extent_height,
+            presenter.requested_extent_width,
+            presenter.requested_extent_height,
+            state.dynamic_forwarder.graphics_extent_contract_failed,
+            state.dynamic_forwarder.graphics_extent_contract_failures,
+            state.dynamic_forwarder.graphics_extent_requested_width,
+            state.dynamic_forwarder.graphics_extent_requested_height,
+            state.dynamic_forwarder.graphics_extent_observed_width,
+            state.dynamic_forwarder.graphics_extent_observed_height,
         },
     );
 }
@@ -25441,7 +25590,15 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         environmentFlag("ROSETTE_GRAPHICS_PREFLIGHT");
     if (state.graphics_preflight_enabled) {
         const graphics_preflight_off = environmentFlag("ROSETTE_GRAPHICS_PREFLIGHT_OFF");
-        if (!reportGraphicsPreflight(&state, vex_audit.ready()) and !graphics_preflight_off) {
+        const graphics_preflight_ok = reportGraphicsPreflight(&state, vex_audit.ready());
+        if (state.graphics_extent_contract_faulted or state.terminated) {
+            machoCapturePrint(
+                "macho-processor: GRAPHICS PREFLIGHT: terminating after non-bypassable runtime extent contract failure; static preflight bypass cannot admit an unproven CAMetalLayer geometry\n",
+                .{},
+            );
+            return state.exit_code;
+        }
+        if (!graphics_preflight_ok and !graphics_preflight_off) {
             machoCapturePrint(
                 "macho-processor: GRAPHICS PREFLIGHT: refusing guest/window start; a required static graphics condition is blocked or unevaluated. Set ROSETTE_GRAPHICS_PREFLIGHT_OFF=1 only to bypass this gate for diagnostics\n",
                 .{},
@@ -25584,6 +25741,13 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     machoCapturePrint("macho-processor: running {d} pre-main initializer(s)\n", .{state.metadata.initializer_addresses.len});
     const initializers_ok = state.runInitializers();
     state.initializer_resolver.logSummary();
+    if (state.graphics_extent_contract_faulted) {
+        machoCapturePrint(
+            "macho-processor: initializer phase: terminating after non-bypassable graphics extent contract failure; guest startup cannot continue\n",
+            .{},
+        );
+        return state.exit_code;
+    }
     if (!initializers_ok) {
         if (state.host_termination_signal != 0) {
             state.logHostTerminationSnapshot(state.executed_steps);
