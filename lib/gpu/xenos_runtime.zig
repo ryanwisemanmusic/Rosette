@@ -109,6 +109,17 @@ pub const Report = struct {
     /// vertex-shader fallback from a native geometry route without inferring
     /// topology or restart state from an aggregate index count.
     rectangle_plan: ?pm4_draw_backend.Plan = null,
+    /// Per-draw address-probe deltas.  These are intentionally separate from
+    /// PM4 command-memory readability: a healthy ring can still name a vertex,
+    /// index, or texture region that the macOS memory view cannot prove.
+    draw_resource_draws: u64 = 0,
+    draw_resource_probes: u64 = 0,
+    draw_resources_unmapped: u64 = 0,
+    draw_resources_unproven: u64 = 0,
+    draws_with_unmapped_resources: u64 = 0,
+    draws_with_unproven_resources: u64 = 0,
+    draws_with_complete_resources: u64 = 0,
+    last_draw_resources: ?DrawResourceEvidence = null,
     unknown_opcodes: u64 = 0,
     truncated: bool = false,
     /// The batch's last packet did not fit the window and everything before it
@@ -184,6 +195,56 @@ pub const RenderTargetEvidence = struct {
     pub fn outputReady(self: RenderTargetEvidence) bool {
         return self.plausible and self.raw_color_info != 0 and
             self.raw_surface_info != 0 and self.color_mask != 0;
+    }
+};
+
+/// Result of probing a draw resource through the process-owned Xenos memory
+/// callback.  `unproven` is deliberately distinct from `unmapped`: textures
+/// may be valid native Vulkan resources whose backing bytes are not CPU
+/// readable through the guest aperture, while a failed probe for a vertex or
+/// index range is a concrete address-translation lead.
+pub const ResourceMapping = enum(u8) {
+    not_required,
+    mapped,
+    unmapped,
+    unproven,
+
+    pub fn label(self: ResourceMapping) []const u8 {
+        return switch (self) {
+            .not_required => "not-required",
+            .mapped => "mapped",
+            .unmapped => "unmapped",
+            .unproven => "unproven",
+        };
+    }
+};
+
+/// Bounded evidence for the most recent PM4 draw.  This is a probe ledger,
+/// not a second renderer: it never fabricates a resource or changes Xenia's
+/// submission path.  Its purpose is to identify the exact guest address that
+/// prevented a draw from being classified as fully mapped.
+pub const DrawResourceEvidence = struct {
+    target_ready: bool = false,
+    index: ResourceMapping = .not_required,
+    vertex: ResourceMapping = .not_required,
+    texture: ResourceMapping = .not_required,
+    index_address: u32 = 0,
+    index_end_address: u64 = 0,
+    vertex_bindings: u32 = 0,
+    texture_bindings: u32 = 0,
+    first_unmapped_address: ?u64 = null,
+    first_unproven_address: ?u64 = null,
+
+    pub fn hasUnmapped(self: DrawResourceEvidence) bool {
+        return self.index == .unmapped or self.vertex == .unmapped or self.texture == .unmapped;
+    }
+
+    pub fn hasUnproven(self: DrawResourceEvidence) bool {
+        return self.index == .unproven or self.vertex == .unproven or self.texture == .unproven;
+    }
+
+    pub fn complete(self: DrawResourceEvidence) bool {
+        return !self.hasUnmapped() and !self.hasUnproven();
     }
 };
 
@@ -263,6 +324,14 @@ pub const Runtime = struct {
     indirect_last_missing_address: ?u32 = null,
     last_swap: ?pm4.SwapDescription = null,
     last_draw: ?executor_module.Draw = null,
+    draw_resource_draws: u64 = 0,
+    draw_resource_probes: u64 = 0,
+    draw_resources_unmapped: u64 = 0,
+    draw_resources_unproven: u64 = 0,
+    draws_with_unmapped_resources: u64 = 0,
+    draws_with_unproven_resources: u64 = 0,
+    draws_with_complete_resources: u64 = 0,
+    last_draw_resources: ?DrawResourceEvidence = null,
     shader_cache: shader.Cache = .{},
     last_shader_source_hash: u64 = 0,
     last_shader_type: shader.ShaderType = .unknown,
@@ -415,6 +484,13 @@ pub const Runtime = struct {
         const rectangle_indices_before = self.rectangle_host_indices;
         const rectangle_trailing_before = self.rectangle_trailing_vertices;
         const rectangle_plan_generation_before = self.rectangle_plan_generation;
+        const draw_resource_draws_before = self.draw_resource_draws;
+        const draw_resource_probes_before = self.draw_resource_probes;
+        const draw_resources_unmapped_before = self.draw_resources_unmapped;
+        const draw_resources_unproven_before = self.draw_resources_unproven;
+        const draws_with_unmapped_resources_before = self.draws_with_unmapped_resources;
+        const draws_with_unproven_resources_before = self.draws_with_unproven_resources;
+        const draws_with_complete_resources_before = self.draws_with_complete_resources;
         const indirect_buffers_before = self.indirect_buffers;
         const indirect_requested_before = self.indirect_dwords_requested;
         const indirect_read_before = self.indirect_dwords_read;
@@ -492,6 +568,14 @@ pub const Runtime = struct {
                 report.rectangle_plan = self.last_rectangle_plan;
             }
         }
+        report.draw_resource_draws = self.draw_resource_draws - draw_resource_draws_before;
+        report.draw_resource_probes = self.draw_resource_probes - draw_resource_probes_before;
+        report.draw_resources_unmapped = self.draw_resources_unmapped - draw_resources_unmapped_before;
+        report.draw_resources_unproven = self.draw_resources_unproven - draw_resources_unproven_before;
+        report.draws_with_unmapped_resources = self.draws_with_unmapped_resources - draws_with_unmapped_resources_before;
+        report.draws_with_unproven_resources = self.draws_with_unproven_resources - draws_with_unproven_resources_before;
+        report.draws_with_complete_resources = self.draws_with_complete_resources - draws_with_complete_resources_before;
+        if (report.draw_resource_draws != 0) report.last_draw_resources = self.last_draw_resources;
         report.unknown_opcodes = self.executor.unknown_opcode_count -| unknown_opcodes_before;
         report.indirect_buffers = self.indirect_buffers - indirect_buffers_before;
         report.indirect_dwords_requested = self.indirect_dwords_requested - indirect_requested_before;
@@ -830,10 +914,140 @@ pub const Runtime = struct {
         }
     }
 
+    fn mergeResourceMapping(left: ResourceMapping, right: ResourceMapping) ResourceMapping {
+        if (left == .unmapped or right == .unmapped) return .unmapped;
+        if (left == .unproven or right == .unproven) return .unproven;
+        if (left == .mapped or right == .mapped) return .mapped;
+        return .not_required;
+    }
+
+    fn noteResourceStatus(evidence: *DrawResourceEvidence, status: ResourceMapping, address: u64) void {
+        switch (status) {
+            .unmapped => {
+                if (evidence.first_unmapped_address == null) evidence.first_unmapped_address = address;
+            },
+            .unproven => {
+                if (evidence.first_unproven_address == null) evidence.first_unproven_address = address;
+            },
+            else => {},
+        }
+    }
+
+    fn probeResourceAddress(
+        self: *Runtime,
+        evidence: *DrawResourceEvidence,
+        address: u64,
+    ) ResourceMapping {
+        self.draw_resource_probes +|= 1;
+        const status: ResourceMapping = if (address > std.math.maxInt(u32))
+            .unproven
+        else if (self.executor.memory_read_callback == null or self.executor.memory_read_context == null)
+            .unproven
+        else if (self.executor.memory_read_callback.?(
+            self.executor.memory_read_context.?,
+            @intCast(address),
+        ) != null)
+            .mapped
+        else
+            .unmapped;
+        noteResourceStatus(evidence, status, address);
+        if (status == .unmapped) self.draw_resources_unmapped +|= 1;
+        if (status == .unproven) self.draw_resources_unproven +|= 1;
+        return status;
+    }
+
+    fn probeResourceRange(
+        self: *Runtime,
+        evidence: *DrawResourceEvidence,
+        start: u64,
+        byte_length: u64,
+    ) ResourceMapping {
+        if (byte_length == 0) {
+            noteResourceStatus(evidence, .unproven, start);
+            self.draw_resources_unproven +|= 1;
+            return .unproven;
+        }
+        var status = self.probeResourceAddress(evidence, start);
+        if (byte_length > 4) {
+            const last = std.math.add(u64, start, byte_length - 4) catch {
+                noteResourceStatus(evidence, .unproven, start);
+                self.draw_resources_unproven +|= 1;
+                return mergeResourceMapping(status, .unproven);
+            };
+            if (last != start) status = mergeResourceMapping(status, self.probeResourceAddress(evidence, last));
+        }
+        return status;
+    }
+
+    /// Probe the resource addresses represented by the register file at the
+    /// instant a draw is consumed.  The canonical physical projection and its
+    /// A/C/E aliases are selected by the process callback, so this is also a
+    /// direct check that the macOS address-translation layer is being used for
+    /// draw resources, not only for the PM4 ring and indirect buffers.
+    fn observeDrawResources(self: *Runtime, draw: executor_module.Draw) void {
+        var evidence = DrawResourceEvidence{
+            .target_ready = self.renderTargetEvidence().outputReady(),
+        };
+
+        if (draw.source == .dma) {
+            evidence.index_address = draw.index_address;
+            const bytes_per_index: u64 = if (draw.index_format == .uint32) 4 else 2;
+            const byte_length = @as(u64, draw.index_size_words) * bytes_per_index;
+            evidence.index_end_address = std.math.add(u64, @as(u64, draw.index_address), byte_length) catch std.math.maxInt(u64);
+            evidence.index = self.probeResourceRange(
+                &evidence,
+                draw.index_address,
+                byte_length,
+            );
+        }
+
+        for (0..registers.vertex_fetch_constant_count) |index| {
+            const fetch = self.vertexFetch(index) orelse continue;
+            if (fetch.type != .vertex or fetch.size_words == 0) continue;
+            evidence.vertex_bindings += 1;
+            evidence.vertex = mergeResourceMapping(
+                evidence.vertex,
+                self.probeResourceRange(&evidence, fetch.addressBytes(), fetch.sizeBytes()),
+            );
+        }
+
+        for (0..registers.shader_constant_fetch_count) |index| {
+            const fetch = self.textureFetch(index) orelse continue;
+            if (fetch.type != .texture) continue;
+            evidence.texture_bindings += 1;
+            if (fetch.base_address_bytes == 0) {
+                noteResourceStatus(&evidence, .unproven, fetch.base_address_bytes);
+                self.draw_resources_unproven +|= 1;
+                evidence.texture = mergeResourceMapping(evidence.texture, .unproven);
+            } else {
+                evidence.texture = mergeResourceMapping(
+                    evidence.texture,
+                    self.probeResourceAddress(&evidence, fetch.base_address_bytes),
+                );
+            }
+            // A non-zero mip address is a second resource region. Probe it
+            // independently so a title with a mapped base surface but a bad
+            // mip projection is not reported as wholly healthy.
+            if (fetch.mip_address_bytes != 0) {
+                evidence.texture = mergeResourceMapping(
+                    evidence.texture,
+                    self.probeResourceAddress(&evidence, fetch.mip_address_bytes),
+                );
+            }
+        }
+
+        self.draw_resource_draws +|= 1;
+        self.last_draw_resources = evidence;
+        if (evidence.hasUnmapped()) self.draws_with_unmapped_resources +|= 1;
+        if (evidence.hasUnproven()) self.draws_with_unproven_resources +|= 1;
+        if (evidence.complete()) self.draws_with_complete_resources +|= 1;
+    }
+
     fn onDraw(context: *anyopaque, draw: executor_module.Draw) void {
         const self: *Runtime = @ptrCast(@alignCast(context));
         self.last_draw = draw;
         self.observeRectangleBackend(draw);
+        self.observeDrawResources(draw);
         self.draw_completion_observations +|= 1;
         if (!self.execution_disposition.publishesEffects()) {
             self.retained_draw_observations +|= 1;
@@ -1231,6 +1445,45 @@ test "only a live draw with an explicit writable target is renderable output" {
     try std.testing.expectEqual(@as(u64, 1), report.draws);
     try std.testing.expectEqual(@as(u64, 1), report.renderable_draw_observations);
     try std.testing.expectEqual(@as(u64, 1), runtime.renderable_draw_observations);
+}
+
+test "draw resource probes distinguish a mapped vertex range from an unmapped index range" {
+    // The DMA draw names an index range beyond the fixture's readable window.
+    const header = pm4.packetType3(.draw_indx, 4, false).?;
+    var bytes = [_]u8{0} ** 32;
+    std.mem.writeInt(u32, bytes[0..4], header, .big);
+    std.mem.writeInt(u32, bytes[4..8], 0, .big); // visualization token
+    std.mem.writeInt(u32, bytes[8..12], (registers.DrawInitiator{
+        .primitive = .triangle_list,
+        .source = .dma,
+        .major_mode_explicit = false,
+        .index_format = .uint16,
+        .not_end_of_pipe = false,
+        .index_count = 3,
+    }).encode(), .big);
+    std.mem.writeInt(u32, bytes[12..16], 0x100, .big); // DMA base
+    std.mem.writeInt(u32, bytes[16..20], 4, .big); // DMA size in words
+
+    var memory = IndirectMemoryFixture{ .readable_until = 0x20 + 8 };
+    var runtime_with_memory = Runtime.init();
+    runtime_with_memory.executor.register_file.write(registers.RB_SURFACE_INFO, 1280);
+    runtime_with_memory.executor.register_file.write(registers.RB_COLOR_INFO, 0x101 | (6 << 16));
+    runtime_with_memory.executor.register_file.write(registers.RB_COLOR_MASK, 0xF);
+    // One active vertex fetch spans two dwords in the fixture's mapped range.
+    runtime_with_memory.executor.register_file.write(
+        registers.vertex_fetch_register_base,
+        (0x20 / 4 << 2) | @as(u32, @intFromEnum(registers.FetchConstantType.vertex)),
+    );
+    runtime_with_memory.executor.register_file.write(registers.vertex_fetch_register_base + 1, 2 << 2);
+    runtime_with_memory.attachMemory(&memory, IndirectMemoryFixture.read, &memory, null);
+    const report = try runtime_with_memory.executeRingBytes(&bytes, 0, 5, 8);
+
+    try std.testing.expectEqual(@as(u64, 1), report.draw_resource_draws);
+    try std.testing.expectEqual(ResourceMapping.mapped, report.last_draw_resources.?.vertex);
+    try std.testing.expectEqual(ResourceMapping.unmapped, report.last_draw_resources.?.index);
+    try std.testing.expectEqual(@as(u64, 1), report.draws_with_unmapped_resources);
+    try std.testing.expect(report.last_draw_resources.?.first_unmapped_address != null);
+    try std.testing.expectEqual(@as(u64, 0x100), report.last_draw_resources.?.first_unmapped_address.?);
 }
 
 test "Xenos runtime exposes typed resource and pipeline state" {

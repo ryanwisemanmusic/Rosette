@@ -116,16 +116,35 @@ pub const shader_constant_register_base = register_map.shader_constant_register_
 pub const vertex_fetch_register_base = register_map.vertex_fetch_register_base;
 
 pub const PrimitiveType = enum(u8) {
-    point_list = 0,
-    line_list = 1,
-    line_strip = 2,
+    /// Values are the VGT_DRAW_INITIATOR wire values used by Xenia.  These
+    /// are not a compact Rosetta enum: the gaps and the 0x10..0x16 2D forms
+    /// are part of the guest packet contract.  Keeping the explicit values is
+    /// essential because DrawInitiator.decode uses @enumFromInt on raw PM4
+    /// data.  The old table was shifted by one for point/line primitives and
+    /// silently turned a point-list draw into a line-list draw.
+    none = 0x00,
+    point_list = 0x01,
+    line_list = 0x02,
+    line_strip = 0x03,
     triangle_list = 4,
     triangle_fan = 5,
     triangle_strip = 6,
+    triangle_with_w_flags = 7,
     rectangle_list = 8,
-    quad_list = 9,
-    quad_strip = 10,
-    polygon = 11,
+    unused1 = 9,
+    unused2 = 10,
+    unused3 = 11,
+    line_loop = 12,
+    quad_list = 13,
+    quad_strip = 14,
+    polygon = 15,
+    copy_rect_list_v0 = 16,
+    copy_rect_list_v1 = 17,
+    copy_rect_list_v2 = 18,
+    copy_rect_list_v3 = 19,
+    fill_rect_list = 20,
+    line_strip_2d = 21,
+    tri_strip_2d = 22,
     _,
 };
 
@@ -798,6 +817,25 @@ test "draw initiator round-trips the Xenos bit fields" {
     };
     try std.testing.expectEqual(input.encode(), DrawInitiator.decode(input.encode()).encode());
     try std.testing.expectEqual(@as(u32, 1024), DrawInitiator.decode(input.encode()).index_count);
+}
+
+test "draw initiator preserves the Xenia primitive wire values" {
+    const cases = [_]struct { raw: u8, primitive: PrimitiveType }{
+        .{ .raw = 0x00, .primitive = .none },
+        .{ .raw = 0x01, .primitive = .point_list },
+        .{ .raw = 0x02, .primitive = .line_list },
+        .{ .raw = 0x03, .primitive = .line_strip },
+        .{ .raw = 0x07, .primitive = .triangle_with_w_flags },
+        .{ .raw = 0x0C, .primitive = .line_loop },
+        .{ .raw = 0x10, .primitive = .copy_rect_list_v0 },
+        .{ .raw = 0x14, .primitive = .fill_rect_list },
+        .{ .raw = 0x16, .primitive = .tri_strip_2d },
+    };
+    for (cases) |case| {
+        const decoded = DrawInitiator.decode(case.raw);
+        try std.testing.expectEqual(case.primitive, decoded.primitive);
+        try std.testing.expectEqual(case.raw, @as(u8, @truncate(decoded.encode())));
+    }
 }
 
 test "index offset keeps the Xenos 24-bit signed domain" {

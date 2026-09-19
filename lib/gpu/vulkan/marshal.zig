@@ -37,29 +37,63 @@
 const std = @import("std");
 
 /// Scratch space for translated arrays, owned by the caller for the duration of
-/// one call. Fixed rather than allocated: this runs on an import path, and the
-/// sizes involved are small and bounded by what a create-info can reference.
+/// one call. The inline buffer keeps the common import path allocation-free;
+/// large payloads can explicitly reserve a stable bounded spill buffer.
 // Xenia's translated SPIR-V modules and pipeline-cache blobs can exceed the
 // small bring-up payloads used by the descriptor and render-pass paths. Keep
 // the arena bounded, but large enough for a real Halo shader/module while it
 // is being copied out of guest memory.
 pub const scratch_bytes: usize = 256 * 1024;
+pub const max_spill_bytes: usize = 16 * 1024 * 1024;
 
 pub const Scratch = struct {
     buffer: [scratch_bytes]u8 align(16) = undefined,
+    spill: []u8 = &.{},
     used: usize = 0,
 
     pub fn reset(self: *Scratch) void {
         self.used = 0;
     }
 
+    /// Release the optional stable backing store. A caller that owns a Scratch
+    /// value for the lifetime of a forwarder must call this from its teardown
+    /// path; ordinary small calls never allocate it.
+    pub fn deinit(self: *Scratch) void {
+        if (self.spill.len != 0) std.heap.page_allocator.free(self.spill);
+        self.spill = &.{};
+        self.used = 0;
+    }
+
+    /// Reserve one stable address range for a large structure before its first
+    /// allocation. This must be called after `reset` and before `alloc`; moving
+    /// an already-returned slice would leave Vulkan pointers aimed at the old
+    /// buffer. The caller chooses the required size from the guest structure,
+    /// so the default path remains allocation-free and the spill is bounded.
+    pub fn reserve(self: *Scratch, required: usize) bool {
+        self.used = 0;
+        if (required <= self.buffer.len) return true;
+        if (required > max_spill_bytes) return false;
+        if (self.spill.len >= required) return true;
+
+        const spill_capacity = std.mem.alignForward(usize, required, 4096);
+        const replacement = std.heap.page_allocator.alloc(u8, spill_capacity) catch return false;
+        if (self.spill.len != 0) std.heap.page_allocator.free(self.spill);
+        self.spill = replacement;
+        return true;
+    }
+
+    pub fn capacity(self: *const Scratch) usize {
+        return if (self.spill.len != 0) self.spill.len else self.buffer.len;
+    }
+
     /// Reserve aligned space. Returns null when exhausted, which the caller
     /// must treat as "do not forward" rather than "forward a short array".
     pub fn alloc(self: *Scratch, size: usize) ?[]u8 {
         const aligned = std.mem.alignForward(usize, self.used, 16);
-        if (aligned + size > self.buffer.len) return null;
+        const storage = if (self.spill.len != 0) self.spill else self.buffer[0..];
+        if (aligned + size > storage.len) return null;
         self.used = aligned + size;
-        return self.buffer[aligned .. aligned + size];
+        return storage[aligned .. aligned + size];
     }
 };
 
@@ -1100,6 +1134,27 @@ test "an exhausted scratch refuses instead of truncating" {
     try std.testing.expect(scratch.alloc(64) != null);
     scratch.reset();
     try std.testing.expectEqual(@as(usize, 0), scratch.used);
+}
+
+test "reserved spill scratch keeps translated pointers stable for large modules" {
+    var scratch = Scratch{};
+    defer scratch.deinit();
+
+    try std.testing.expect(scratch.reserve(scratch_bytes + 4096));
+    const root = scratch.alloc(64) orelse return error.TestUnexpectedResult;
+    const code = scratch.alloc(scratch_bytes + 2048) orelse return error.TestUnexpectedResult;
+    root[0] = 0xA5;
+    code[0] = 0x5A;
+    try std.testing.expect(scratch.capacity() >= scratch_bytes + 4096);
+    try std.testing.expectEqual(@as(u8, 0xA5), root[0]);
+    try std.testing.expectEqual(@as(u8, 0x5A), code[0]);
+}
+
+test "spill scratch remains bounded instead of allocating an untrusted size" {
+    var scratch = Scratch{};
+    defer scratch.deinit();
+    try std.testing.expect(!scratch.reserve(max_spill_bytes + 1));
+    try std.testing.expectEqual(@as(usize, scratch_bytes), scratch.capacity());
 }
 
 // Offsets come from the compiler. A hand-counted one that is wrong by four

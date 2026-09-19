@@ -94,10 +94,11 @@ test "PE Vulkan mapped memory retains native byte identity across stores and unm
 
 test "acquired-image readback hands binary waits to WSI exactly once on the present family" {
     const Capture = struct {
-        const Mode = enum { success, no_transfer, submit_failure, invalidate_failure, completion_failure };
+        const Mode = enum { success, no_transfer, submit_failure, invalidate_failure, completion_failure, content, dim_content, uniform_content, present_failure, per_result_failure, present_completion_failure, wrong_acquired_image };
         var mode: Mode = .success;
         var submits: u32 = 0;
         var presents: u32 = 0;
+        var idle_calls: u32 = 0;
         var wait_counts: [2]u32 = @splat(99);
         var present_wait_count: u32 = 99;
         var pixels: [16]u8 = .{ 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255 };
@@ -127,20 +128,28 @@ test "acquired-image readback hands binary waits to WSI exactly once on the pres
             return if (mode == .submit_failure) abi.ERROR_OUT_OF_HOST_MEMORY else abi.SUCCESS;
         }
         fn idle(_: abi.Queue) callconv(.c) abi.Result {
+            idle_calls += 1;
+            if (mode == .present_completion_failure and idle_calls == 3) return abi.ERROR_OUT_OF_HOST_MEMORY;
             return if (mode == .completion_failure) abi.ERROR_DEVICE_LOST else abi.SUCCESS;
         }
         fn present(queue: abi.Queue, info: *const abi.PresentInfoKHR) callconv(.c) abi.Result {
             std.debug.assert(@intFromPtr(queue) == 0x302);
             presents += 1;
             present_wait_count = info.wait_semaphore_count;
-            for (0..info.swapchain_count) |index| info.results.?[index] = abi.SUCCESS;
-            return abi.SUCCESS;
+            for (0..info.swapchain_count) |index| info.results.?[index] = if (mode == .present_failure or mode == .per_result_failure) abi.ERROR_OUT_OF_DATE_KHR else abi.SUCCESS;
+            return if (mode == .present_failure) abi.ERROR_OUT_OF_DATE_KHR else abi.SUCCESS;
         }
     };
-    for ([_]Capture.Mode{ .success, .no_transfer, .submit_failure, .invalidate_failure, .completion_failure }) |mode| {
+    for (std.enums.values(Capture.Mode)) |mode| {
         Capture.mode = mode;
         Capture.submits = 0;
         Capture.presents = 0;
+        Capture.idle_calls = 0;
+        Capture.pixels = .{ 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255 };
+        if (mode == .dim_content or mode == .uniform_content) {
+            Capture.pixels = .{ 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255 };
+            if (mode == .dim_content) Capture.pixels[4] = 1;
+        }
         Capture.wait_counts = @splat(99);
         Capture.present_wait_count = 99;
         var state = ElfState.init(std.testing.allocator);
@@ -197,6 +206,15 @@ test "acquired-image readback hands binary waits to WSI exactly once on the pres
                 .image_count = 1,
                 .image_usage = if (mode == .no_transfer) 0 else abi.IMAGE_USAGE_TRANSFER_SRC_BIT,
             });
+            if (@intFromEnum(mode) >= @intFromEnum(Capture.Mode.content)) {
+                // Native identities in the command ledger, guest identities
+                // in the mapped readback packet. The actual bridge must join
+                // both before opening picture frame one.
+                const native_images = [_]u64{ 0xb01 + offset, 0xc01 + offset };
+                forwarder.present_chain.noteSwapchainImages(0x701 + offset, &native_images);
+                forwarder.present_chain.noteAcquire(0x701 + offset, if (mode == .wrong_acquired_image) 1 else 0);
+                forwarder.present_chain.noteContent(0x701 + offset);
+            }
             state.write64(waits + offset * 8, 0x801 + offset);
             state.write64(swapchains + offset * 8, 0x601 + offset);
             state.write32(indices + offset * 4, 0);
@@ -232,6 +250,14 @@ test "acquired-image readback hands binary waits to WSI exactly once on the pres
             try std.testing.expectEqual(@as(u64, 1), forwarder.pixel_probe.readback_wait_handoffs);
             try std.testing.expectEqual(@as(u64, 4), forwarder.pixel_probe.capture_last_stats.bright_pixels);
             try std.testing.expectEqual(@as(u64, 1), forwarder.vulkan_real_present_completions);
+        }
+        const opens_picture = mode == .content or mode == .dim_content;
+        try std.testing.expectEqual(@as(u64, if (opens_picture) 1 else 0), forwarder.picture_sequence.frames);
+        if (opens_picture) {
+            try std.testing.expectEqual(@as(u64, 1), forwarder.picture_sequence.first_present);
+            try std.testing.expectEqual(@as(u64, 0xa01), forwarder.picture_sequence.first_image);
+            // Two swapchains in one native request are one content tick.
+            try std.testing.expectEqual(@as(u64, 1), forwarder.picture_sequence.last_present);
         }
     }
 }

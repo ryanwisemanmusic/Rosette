@@ -102,7 +102,19 @@ const ResourceImageState = struct {
     source_image: u64 = 0,
     transfer_kind: TransferKind = .none,
     source_known: bool = false,
+    /// The images a render pass that targeted this one sampled, newest
+    /// first. A per-command-buffer sampled list names every texture the
+    /// buffer touched; this edge is the one recorded inside the render pass
+    /// that wrote this image, so a presenter's blit into the swapchain and
+    /// a gamma pass into its source can each be followed one link upstream.
+    pass_sources: [max_pass_sources]u64 = @splat(0),
 };
+
+/// Sampled sources retained per written image. Two covers the presenter's
+/// paint (one source) and a gamma or sharpening pass with a lookup table
+/// beside its image (still one image); anything wider is the title's own
+/// scene, where the question this graph answers no longer applies.
+pub const max_pass_sources: usize = 2;
 
 /// The strongest target attribution Rosette can make for a command.
 /// `swapchain_image` is deliberately narrower than "a Vulkan command ran":
@@ -278,6 +290,9 @@ pub const PendingFrame = struct {
     acquired_image: u64 = 0,
     has_target: bool = false,
     write_kind: WriteKind = .none,
+    /// The image a submitted command sampled while targeting the acquired
+    /// image, when one was resolved; zero otherwise.
+    sampled_image: u64 = 0,
 };
 
 /// What the chain can be asked, in the order the answers matter.
@@ -780,9 +795,29 @@ pub const Chain = struct {
                 .acquired_image = record.acquired_image_handle,
                 .has_target = self.pending_target[index],
                 .write_kind = self.pending_write_kind[index],
+                .sampled_image = self.pending_sampled_image[index],
             };
         }
         return null;
+    }
+
+    /// Record that a render pass writing `target` sampled `sampled`. Both are
+    /// host image identities. Called at queue submission, when the descriptor
+    /// sets the pass bound have been resolved to images.
+    pub fn noteRenderPassSource(self: *Chain, target: u64, sampled: u64) void {
+        if (target == 0 or sampled == 0 or target == sampled) return;
+        const state = self.mutableResourceImage(target) orelse return;
+        if (state.pass_sources[0] == sampled) return;
+        var index: usize = state.pass_sources.len - 1;
+        while (index > 0) : (index -= 1) state.pass_sources[index] = state.pass_sources[index - 1];
+        state.pass_sources[0] = sampled;
+    }
+
+    /// The images the most recent render passes into `image` sampled, newest
+    /// first, with zeros where nothing is known.
+    pub fn passSourcesOf(self: *const Chain, image: u64) [max_pass_sources]u64 {
+        const state = self.resourceImageState(image) orelse return @splat(0);
+        return state.pass_sources;
     }
 
     pub fn notePresent(self: *Chain, handle: u64, result: i32) void {
@@ -1354,6 +1389,36 @@ test "resource graph records a descriptor image sampled by a swapchain draw" {
 
     try std.testing.expectEqual(@as(u64, 1), chain.totalPresentsWithSampledSource());
     try std.testing.expectEqual(@as(u64, 0), chain.totalPresentsWithUnresolvedSource());
+    try std.testing.expectEqual(@as(u64, 0x500), chain.swapchains[0].last_sampled_image);
+}
+
+test "render pass sources follow a presented image two links upstream" {
+    var chain = Chain{};
+    chain.noteSurface(1, 0xAAAA, .guest);
+    chain.noteSwapchain(.{ .handle = 2, .surface = 1, .image_count = 1 });
+    chain.noteSwapchainImages(2, &.{0x200});
+    // The gamma pass writes the guest output image 0x500 from the swap
+    // texture 0x600; the presenter paints the acquired image from 0x500.
+    chain.noteRenderPassSource(0x500, 0x600);
+    chain.noteAcquire(2, 0);
+    _ = chain.noteTargetImage(0x200, .content);
+    chain.noteResourceSubmission(&.{0x200}, .content, &.{0x500}, &.{});
+    chain.noteRenderPassSource(0x200, 0x500);
+    const pending = chain.pendingFrame(2).?;
+    try std.testing.expectEqual(@as(u64, 0x500), pending.sampled_image);
+    try std.testing.expectEqual(@as(u64, 0x500), chain.passSourcesOf(0x200)[0]);
+    try std.testing.expectEqual(@as(u64, 0x600), chain.passSourcesOf(0x500)[0]);
+    try std.testing.expectEqual(@as(u64, 0), chain.passSourcesOf(0x600)[0]);
+    // A repeated edge does not push the older one out; a new one does.
+    chain.noteRenderPassSource(0x500, 0x600);
+    try std.testing.expectEqual(@as(u64, 0), chain.passSourcesOf(0x500)[1]);
+    chain.noteRenderPassSource(0x500, 0x700);
+    try std.testing.expectEqual([2]u64{ 0x700, 0x600 }, chain.passSourcesOf(0x500));
+    // Self-edges and zeros are not provenance.
+    chain.noteRenderPassSource(0x500, 0x500);
+    chain.noteRenderPassSource(0x500, 0);
+    try std.testing.expectEqual(@as(u64, 0x700), chain.passSourcesOf(0x500)[0]);
+    chain.notePresent(2, 0);
     try std.testing.expectEqual(@as(u64, 0x500), chain.swapchains[0].last_sampled_image);
 }
 

@@ -210,6 +210,7 @@ pub const IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: u32 = 6;
 pub const FILTER_NEAREST: u32 = 0;
 pub const FILTER_LINEAR: u32 = 1;
 
+pub const ACCESS_SHADER_READ_BIT: u32 = 0x0000_0020;
 pub const ACCESS_TRANSFER_READ_BIT: u32 = 0x0000_0800;
 
 /// Blitting is not universally supported for every format and tiling, and a
@@ -242,6 +243,8 @@ pub const COMPOSITE_ALPHA_OPAQUE_BIT_KHR: u32 = 0x0000_0001;
 pub const COMPOSITE_ALPHA_INHERIT_BIT_KHR: u32 = 0x0000_0008;
 
 pub const IMAGE_LAYOUT_UNDEFINED: u32 = 0;
+pub const IMAGE_LAYOUT_GENERAL: u32 = 1;
+pub const IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: u32 = 5;
 pub const IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: u32 = 7;
 pub const IMAGE_LAYOUT_PRESENT_SRC_KHR: u32 = 1_000_001_002;
 

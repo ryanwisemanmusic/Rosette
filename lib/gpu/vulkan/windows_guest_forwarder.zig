@@ -390,6 +390,7 @@ pub const Bridge = struct {
             noteNativeForwarding(state, name, native_objects_ready);
             noteLogicalContract(state, name, result);
         }
+        noteForwarderFrameEvidence(self, state);
         finishWindowsCall(state, direct_return_rip);
         trace_outcome = if (reached_native_command) "forwarded" else "handled_native_refused";
         return true;
@@ -503,6 +504,22 @@ fn noteLogicalContract(state: anytype, name: []const u8, result: u64) void {
     } else {
         state.windows_graphics.noteObservedCall(name);
     }
+}
+
+fn noteForwarderFrameEvidence(self: *const Bridge, state: anytype) void {
+    const State = @TypeOf(state.*);
+    if (comptime !@hasField(State, "windows_graphics")) return;
+    const evidence = self.forwarder.guestFrameEvidence();
+    state.windows_graphics.noteForwarderFrameEvidence(
+        evidence.presents_with_target,
+        evidence.presents_with_content,
+        evidence.presents_clear_only,
+        evidence.presents_without_target,
+        evidence.presents_without_write,
+        evidence.native_present_requests,
+        evidence.native_present_completions,
+        evidence.native_queue_submits,
+    );
 }
 
 fn finishWindowsCall(state: anytype, direct_return_rip: ?u64) void {

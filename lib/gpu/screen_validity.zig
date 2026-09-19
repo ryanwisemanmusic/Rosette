@@ -563,24 +563,27 @@ pub const Ledger = struct {
     last_snapshot: Snapshot = .{},
     observed: bool = false,
     changed_since_report: bool = false,
+    /// Pixel/sample identity is progress, not a changed platform contract.
+    /// Keep it available to verbose consumers without making every readback
+    /// repeat the complete stage inventory in a normal run.
+    semantic_changed_since_report: bool = false,
     observations: u64 = 0,
     transitions: u64 = 0,
 
     pub fn observe(self: *Ledger, observation: Snapshot) Evaluation {
         const next = evaluate(observation);
         var changed = !self.observed;
+        var semantic_changed = !self.observed;
         if (self.observed) {
-            if (next.verdict != self.current.verdict or next.first_blocking != self.current.first_blocking) changed = true;
+            if (next.verdict != self.current.verdict or next.first_blocking != self.current.first_blocking) semantic_changed = true;
             for (next.records, self.current.records) |new_record, old_record| {
                 if (new_record.status != old_record.status or new_record.owner != old_record.owner) {
-                    changed = true;
+                    semantic_changed = true;
                     self.transitions +|= 1;
                 }
             }
-            if (observation.pixel_evidence != self.last_snapshot.pixel_evidence or
-                observation.pixel_hash != self.last_snapshot.pixel_hash or
-                observation.pixel_sample_frame != self.last_snapshot.pixel_sample_frame or
-                observation.pixel_sample_image != self.last_snapshot.pixel_sample_image or
+            if ((observation.pixel_evidence != self.last_snapshot.pixel_evidence and
+                !(observation.pixel_evidence.showsDetail() and self.last_snapshot.pixel_evidence.showsDetail())) or
                 observation.pixel_sample_was_content != self.last_snapshot.pixel_sample_was_content or
                 observation.drawable_owner != self.last_snapshot.drawable_owner or
                 observation.contested_layer != self.last_snapshot.contested_layer or
@@ -591,15 +594,20 @@ pub const Ledger = struct {
                 observation.window_user_visible != self.last_snapshot.window_user_visible or
                 observation.window_visible_fraction_percent != self.last_snapshot.window_visible_fraction_percent)
             {
-                changed = true;
+                semantic_changed = true;
             }
+            changed = observation.pixel_evidence != self.last_snapshot.pixel_evidence or
+                observation.pixel_hash != self.last_snapshot.pixel_hash or
+                observation.pixel_sample_frame != self.last_snapshot.pixel_sample_frame or
+                observation.pixel_sample_image != self.last_snapshot.pixel_sample_image;
         } else {
             self.transitions = 0;
         }
         self.current = next;
         self.last_snapshot = observation;
         self.observed = true;
-        self.changed_since_report = self.changed_since_report or changed;
+        self.changed_since_report = self.changed_since_report or changed or semantic_changed;
+        self.semantic_changed_since_report = self.semantic_changed_since_report or semantic_changed;
         self.observations +|= 1;
         return next;
     }
@@ -610,6 +618,11 @@ pub const Ledger = struct {
 
     pub fn markReported(self: *Ledger) void {
         self.changed_since_report = false;
+        self.semantic_changed_since_report = false;
+    }
+
+    pub fn semanticChangedSinceReport(self: *const Ledger) bool {
+        return self.semantic_changed_since_report;
     }
 
     pub fn wasObserved(self: *const Ledger) bool {
@@ -764,6 +777,44 @@ test "the ledger only reports meaningful state changes" {
     _ = ledger.observe(second);
     try std.testing.expect(ledger.changedSinceReport());
     try std.testing.expect(ledger.observations == 3);
+}
+
+test "new frame hashes and acquired images do not repeat the screen contract" {
+    var ledger = Ledger{};
+    var sample = Snapshot{ .guest_presents = 1, .guest_acquires = 1, .pixel_evidence = .uniform_colour };
+    _ = ledger.observe(sample);
+    ledger.markReported();
+    for (2..514) |frame| {
+        sample.guest_presents = frame;
+        sample.guest_acquires = frame;
+        sample.pixel_hash = frame;
+        sample.pixel_sample_frame = frame;
+        sample.pixel_sample_image = frame % 3;
+        _ = ledger.observe(sample);
+        try std.testing.expect(ledger.changedSinceReport());
+        try std.testing.expect(!ledger.semanticChangedSinceReport());
+        ledger.markReported();
+    }
+    sample.pixel_evidence = .changing;
+    _ = ledger.observe(sample);
+    try std.testing.expect(ledger.semanticChangedSinceReport());
+    ledger.markReported();
+    sample.window_user_visible = true;
+    _ = ledger.observe(sample);
+    try std.testing.expect(ledger.semanticChangedSinceReport());
+}
+
+test "static versus changing detailed pixels is progress, not a new health verdict" {
+    var ledger = Ledger{};
+    var sample = Snapshot{ .pixel_evidence = .nonzero_static };
+    _ = ledger.observe(sample);
+    ledger.markReported();
+    sample.pixel_evidence = .changing;
+    _ = ledger.observe(sample);
+    try std.testing.expect(!ledger.semanticChangedSinceReport());
+    sample.pixel_evidence = .unavailable;
+    _ = ledger.observe(sample);
+    try std.testing.expect(ledger.semanticChangedSinceReport());
 }
 
 comptime {

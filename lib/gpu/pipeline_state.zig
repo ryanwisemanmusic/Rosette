@@ -203,13 +203,16 @@ pub fn key(state: State) u64 {
 
 pub fn topologyFromPrimitive(primitive: regs.PrimitiveType) Topology {
     return switch (primitive) {
+        .none, .triangle_with_w_flags, .unused1, .unused2, .unused3 => .triangle_list,
         .point_list => .point_list,
         .line_list => .line_list,
-        .line_strip => .line_strip,
+        .line_strip, .line_strip_2d => .line_strip,
         .triangle_list => .triangle_list,
         .triangle_strip => .triangle_strip,
         .triangle_fan, .polygon => .triangle_fan,
-        .rectangle_list, .quad_list, .quad_strip => .triangle_strip,
+        .rectangle_list, .quad_list, .quad_strip, .tri_strip_2d => .triangle_strip,
+        .line_loop => .line_loop,
+        .copy_rect_list_v0, .copy_rect_list_v1, .copy_rect_list_v2, .copy_rect_list_v3, .fill_rect_list => .triangle_list,
         _ => .triangle_list,
     };
 }

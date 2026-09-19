@@ -72,22 +72,75 @@ pub const Endian = enum(u3) {
 pub const Format = enum(u8) {
     /// Eight bits per channel.
     k_8_8_8_8 = 6,
-    /// Ten bits of colour, two of alpha, stored as if it were 16-bit channels.
-    k_2_10_10_10_as_16_16_16_16 = 61,
+    /// Ten bits of colour and two bits of alpha in one 32-bit word.
+    k_2_10_10_10 = 7,
+    /// The AS_16 form is still 32 bits per pixel.  The suffix changes the
+    /// Xenos sampling/resolve interpretation; it does not change the fetch
+    /// stride.  The old Rosetta value (61) was DXT3A_AS_1, so a real format 54
+    /// front buffer was silently treated as an unsupported format.
+    k_8_8_8_8_as_16_16_16_16 = 50,
+    k_2_10_10_10_as_16_16_16_16 = 54,
+    /// Gamma EDRAM is still a packed 8:8:8:8 word at the front-buffer seam.
+    k_8_8_8_8_gamma_edram = 62,
+    /// 16-bit unsigned channels. This is the format value that appeared as
+    /// `26` in the latest front-buffer evidence; it is 64 bits per pixel.
+    k_16_16_16_16 = 26,
+    /// The floating-point EDRAM encoding is deliberately named but not
+    /// claimed as CPU-convertible until a real sample proves its exponent
+    /// layout. It must never fall through as RGBA8.
+    k_2_10_10_10_float_edram = 63,
     _,
 
     pub fn label(self: Format) []const u8 {
         return switch (self) {
             .k_8_8_8_8 => "k_8_8_8_8",
+            .k_2_10_10_10 => "k_2_10_10_10",
+            .k_8_8_8_8_as_16_16_16_16 => "k_8_8_8_8_AS_16_16_16_16",
             .k_2_10_10_10_as_16_16_16_16 => "k_2_10_10_10_AS_16_16_16_16",
+            .k_8_8_8_8_gamma_edram => "k_8_8_8_8_GAMMA_EDRAM",
+            .k_16_16_16_16 => "k_16_16_16_16",
+            .k_2_10_10_10_float_edram => "k_2_10_10_10_FLOAT_EDRAM",
             _ => "unsupported",
         };
     }
 
     pub fn supported(self: Format) bool {
         return switch (self) {
-            .k_8_8_8_8, .k_2_10_10_10_as_16_16_16_16 => true,
+            .k_8_8_8_8,
+            .k_2_10_10_10,
+            .k_8_8_8_8_as_16_16_16_16,
+            .k_2_10_10_10_as_16_16_16_16,
+            .k_8_8_8_8_gamma_edram,
+            .k_16_16_16_16,
+            => true,
+            .k_2_10_10_10_float_edram => false,
             _ => false,
+        };
+    }
+
+    /// Bytes per texel for the CPU-readable front-buffer subset. Returning
+    /// null is more useful than assuming four: it makes an observed 64-bit or
+    /// floating format either use its real stride or produce an explicit
+    /// unsupported-format finding.
+    pub fn bytesPerPixel(self: Format) ?u8 {
+        return switch (self) {
+            .k_8_8_8_8,
+            .k_2_10_10_10,
+            .k_8_8_8_8_as_16_16_16_16,
+            .k_2_10_10_10_as_16_16_16_16,
+            .k_8_8_8_8_gamma_edram,
+            => 4,
+            .k_16_16_16_16 => 8,
+            .k_2_10_10_10_float_edram => null,
+            else => null,
+        };
+    }
+
+    fn bytesPerPixelLog2(self: Format) ?u5 {
+        return switch (self.bytesPerPixel() orelse return null) {
+            4 => 2,
+            8 => 3,
+            else => null,
         };
     }
 };
@@ -234,6 +287,10 @@ pub fn tiledSizeBytes32(width: u32, height: u32) u64 {
 }
 
 pub fn linearSizeBytes32(width: u32, height: u32, row_pitch_bytes: u32) u64 {
+    return linearSizeBytes(width, height, row_pitch_bytes);
+}
+
+pub fn linearSizeBytes(width: u32, height: u32, row_pitch_bytes: u32) u64 {
     const pitch = if (row_pitch_bytes != 0) row_pitch_bytes else width * 4;
     return @as(u64, pitch) * height;
 }
@@ -250,10 +307,19 @@ pub const Surface = struct {
     row_pitch_bytes: u32 = 0,
 
     pub fn requiredBytes(self: Surface) u64 {
+        const bytes_per_pixel = self.format.bytesPerPixel() orelse return 0;
+        const bytes_per_pixel_log2 = self.format.bytesPerPixelLog2() orelse return 0;
         return if (self.tiled)
-            tiledSizeBytes32(self.width, self.height)
+            tiledAddressUpperBound2D(self.width, self.height, self.width, bytes_per_pixel_log2)
         else
-            linearSizeBytes32(self.width, self.height, self.row_pitch_bytes);
+            linearSizeBytes(
+                self.width,
+                self.height,
+                if (self.row_pitch_bytes != 0)
+                    self.row_pitch_bytes
+                else
+                    self.width * @as(u32, bytes_per_pixel),
+            );
     }
 
     /// Whether this describes something a window could show. Extents are
@@ -301,11 +367,13 @@ pub fn convertToBgra8(
     if (source.len < surface.requiredBytes()) return .source_too_small;
     const needed = @as(u64, surface.width) * surface.height * 4;
     if (destination.len < needed) return .destination_too_small;
+    const bytes_per_pixel = surface.format.bytesPerPixel() orelse return .unsupported_format;
+    const bytes_per_pixel_log2 = surface.format.bytesPerPixelLog2() orelse return .unsupported_format;
 
     const source_pitch: u32 = if (surface.tiled)
         alignPitch(surface.width)
     else if (surface.row_pitch_bytes != 0)
-        surface.row_pitch_bytes / 4
+        surface.row_pitch_bytes / bytes_per_pixel
     else
         surface.width;
 
@@ -314,25 +382,38 @@ pub fn convertToBgra8(
         var x: u32 = 0;
         while (x < surface.width) : (x += 1) {
             const byte_offset: usize = if (surface.tiled)
-                tiledOffset2D(x, y, surface.width, 2)
+                tiledOffset2D(x, y, surface.width, bytes_per_pixel_log2)
             else
-                (@as(usize, y) * source_pitch + x) * 4;
+                (@as(usize, y) * source_pitch + x) * bytes_per_pixel;
             // Guarded per pixel rather than per surface: the tiled offset is a
             // bit-mixing function, and a bound proved for the last pixel is not
             // a bound proved for every pixel.
-            if (byte_offset + 4 > source.len) return .source_too_small;
-            const raw = std.mem.readInt(u32, source[byte_offset..][0..4], .little);
-            const swizzled = surface.endian.apply(raw);
-            const pixel = switch (surface.format) {
-                .k_2_10_10_10_as_16_16_16_16 => expand2101010(swizzled),
-                else => swizzled,
-            };
             const at: usize = (@as(usize, y) * surface.width + x) * 4;
-            // The console stores ARGB; the destination wants BGRA.
-            destination[at + 0] = @truncate(pixel >> 0);
-            destination[at + 1] = @truncate(pixel >> 8);
-            destination[at + 2] = @truncate(pixel >> 16);
-            destination[at + 3] = @truncate(pixel >> 24);
+            if (bytes_per_pixel == 4) {
+                if (byte_offset + 4 > source.len) return .source_too_small;
+                const raw = std.mem.readInt(u32, source[byte_offset..][0..4], .little);
+                const swizzled = surface.endian.apply(raw);
+                const pixel = switch (surface.format) {
+                    .k_2_10_10_10, .k_2_10_10_10_as_16_16_16_16 => expand2101010(swizzled),
+                    else => swizzled,
+                };
+                // The console stores ARGB; the destination wants BGRA.
+                destination[at + 0] = @truncate(pixel >> 0);
+                destination[at + 1] = @truncate(pixel >> 8);
+                destination[at + 2] = @truncate(pixel >> 16);
+                destination[at + 3] = @truncate(pixel >> 24);
+            } else {
+                if (byte_offset + 8 > source.len) return .source_too_small;
+                // Xenos 16_16_16_16 is two 32-bit words containing R/G and
+                // B/A. Apply the fetch endian contract to each word, then
+                // narrow the normalized high byte of every channel.
+                const rg = surface.endian.apply(std.mem.readInt(u32, source[byte_offset..][0..4], .little));
+                const ba = surface.endian.apply(std.mem.readInt(u32, source[byte_offset + 4 ..][0..4], .little));
+                destination[at + 0] = @truncate(ba >> 8);
+                destination[at + 1] = @truncate(rg >> 24);
+                destination[at + 2] = @truncate(rg >> 8);
+                destination[at + 3] = @truncate(ba >> 24);
+            }
         }
     }
     return null;
@@ -580,6 +661,45 @@ test "ten-bit colour narrows to eight without wrapping a channel" {
     try std.testing.expectEqual(@as(u32, 0xFF000000), expand2101010(0xC0000000));
     // The red channel alone lands in the red byte, not in green or blue.
     try std.testing.expectEqual(@as(u32, 0x00FF0000), expand2101010(0x3FF << 20));
+}
+
+test "front-buffer format numbers and strides match Xenos" {
+    try std.testing.expectEqual(@as(u8, 6), @intFromEnum(Format.k_8_8_8_8));
+    try std.testing.expectEqual(@as(u8, 7), @intFromEnum(Format.k_2_10_10_10));
+    try std.testing.expectEqual(@as(u8, 50), @intFromEnum(Format.k_8_8_8_8_as_16_16_16_16));
+    try std.testing.expectEqual(@as(u8, 54), @intFromEnum(Format.k_2_10_10_10_as_16_16_16_16));
+    try std.testing.expectEqual(@as(u8, 26), @intFromEnum(Format.k_16_16_16_16));
+    try std.testing.expectEqual(@as(?u8, 4), Format.k_8_8_8_8.bytesPerPixel());
+    try std.testing.expectEqual(@as(?u8, 8), Format.k_16_16_16_16.bytesPerPixel());
+    try std.testing.expectEqual(@as(u64, 64 * 64 * 8), (Surface{
+        .width = 64,
+        .height = 64,
+        .format = .k_16_16_16_16,
+        .tiled = false,
+    }).requiredBytes());
+}
+
+test "a 16-bit RGBA front buffer narrows to BGRA8 without falling through as 32-bit" {
+    const width: u32 = 64;
+    const height: u32 = 64;
+    var source = std.mem.zeroes([width * height * 8]u8);
+    var index: u32 = 0;
+    while (index < width * height) : (index += 1) {
+        const at = @as(usize, index) * 8;
+        std.mem.writeInt(u16, source[at..][0..2], 0x1200, .little); // R
+        std.mem.writeInt(u16, source[at + 2 ..][0..2], 0x3400, .little); // G
+        std.mem.writeInt(u16, source[at + 4 ..][0..2], 0x5600, .little); // B
+        std.mem.writeInt(u16, source[at + 6 ..][0..2], 0x7800, .little); // A
+    }
+    var destination = std.mem.zeroes([width * height * 4]u8);
+    try std.testing.expect(convertToBgra8(&source, .{
+        .width = width,
+        .height = height,
+        .format = .k_16_16_16_16,
+        .endian = .none,
+        .tiled = false,
+    }, &destination) == null);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x56, 0x34, 0x12, 0x78 }, destination[0..4]);
 }
 
 test "a surface whose extent no display produced is refused before conversion" {
