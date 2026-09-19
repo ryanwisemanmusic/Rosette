@@ -8045,8 +8045,16 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
     }
     if (std.mem.eql(u8, name, "XInputGetState") or std.mem.eql(u8, name, "XInputGetStateEx")) {
         const output = arg(state, 1, direct_return_rip);
-        if (output != 0) _ = clearGuestMemory(state, output, 16); // XINPUT_STATE
-        state.regs.rax = 1167; // ERROR_DEVICE_NOT_CONNECTED
+        const bridged = if (comptime @hasDecl(@TypeOf(state.*), "writeWindowsXInputState"))
+            state.writeWindowsXInputState(output)
+        else
+            false;
+        if (!bridged) {
+            if (output != 0) _ = clearGuestMemory(state, output, 16); // XINPUT_STATE
+            state.regs.rax = 1167; // ERROR_DEVICE_NOT_CONNECTED
+        } else {
+            state.regs.rax = 0;
+        }
         finish(state, direct_return_rip);
         return true;
     }
