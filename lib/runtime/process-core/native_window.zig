@@ -86,6 +86,14 @@ pub fn nativeMetalLayerHostPointer(self: anytype) usize {
     return self.native_window.hostMetalLayer();
 }
 
+pub fn prepareNativeMetalDrawable(self: anytype, width: u32, height: u32) bool {
+    return self.native_window.prepareDrawableSize(width, height);
+}
+
+pub fn setNativeMetalDrawableOwner(self: anytype, owned_by_swapchain: bool) bool {
+    return self.native_window.setDrawableOwner(owned_by_swapchain);
+}
+
 pub fn noteNativeVulkanSurfaceBound(self: anytype, layer_token: u64, guest_surface: u64, host_surface: u64) void {
     self.native_window.noteSurfaceBound(layer_token, guest_surface, host_surface);
 }

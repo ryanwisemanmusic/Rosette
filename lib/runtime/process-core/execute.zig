@@ -2729,11 +2729,32 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             self.writeMemVal(d.addr, .bits64, std.mem.readInt(u64, self.xmm[d.xmm_src][8..16], .little));
         },
         .vmovhlps => {
-            @memcpy(self.xmm[d.xmm_dst][0..8], self.xmm[d.xmm_src][8..16]);
+            if (d.legacy_sse) {
+                // Legacy MOVHLPS merges the source high quadword into the
+                // destination low half and preserves the destination high
+                // half. VEX carries two explicit source registers.
+                @memcpy(self.xmm[d.xmm_dst][0..8], self.xmm[d.xmm_src][8..16]);
+            } else {
+                const source1 = self.xmm[d.xmm_src];
+                const source2 = self.xmm[d.xmm_src2];
+                var result = source1;
+                @memcpy(result[0..8], source2[8..16]);
+                self.xmm[d.xmm_dst] = result;
+            }
             if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
         },
         .vmovlhps => {
-            @memcpy(self.xmm[d.xmm_dst][8..16], self.xmm[d.xmm_src][0..8]);
+            if (d.legacy_sse) {
+                // Legacy MOVLHPS preserves the destination low quadword and
+                // copies the source low quadword into its high half.
+                @memcpy(self.xmm[d.xmm_dst][8..16], self.xmm[d.xmm_src][0..8]);
+            } else {
+                const source1 = self.xmm[d.xmm_src];
+                const source2 = self.xmm[d.xmm_src2];
+                var result = source1;
+                @memcpy(result[8..16], source2[0..8]);
+                self.xmm[d.xmm_dst] = result;
+            }
             if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
         },
         .vmovshdup, .vmovsldup, .vmovddup => {
