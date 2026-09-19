@@ -9,10 +9,12 @@ ifneq ($(wildcard build.zig),)
 ROOT_DIR := $(ROOT_DIR:/build=)
 BP :=
 APP_BP := ../
+ASSET_PREFIX := ../
 else
 # CWD is the repo root: BP prefix needed for build/ paths
 BP := build/
 APP_BP :=
+ASSET_PREFIX :=
 endif
 
 INCLUDE_DIR := $(ROOT_DIR)/include
@@ -142,13 +144,25 @@ SHELL_UPDATE_RECORD_SCRIPT := $(ROOT_DIR)/tools/record_shell_update.py
 SHELL_UPDATE_RECORD_OUT := $(ROOT_DIR)/.rosette/shell-update.json
 BUILD_IDENTITY_SCRIPT := $(ROOT_DIR)/tools/build_identity_manifest.py
 BUILD_IDENTITY_OUT := $(ROOT_DIR)/.rosette/build-identity.json
+AUDIT_PHASE_COVERAGE_SCRIPT := $(ROOT_DIR)/tools/audit_phase_coverage.py
+AUDIT_PHASE_COVERAGE_OUT := $(ROOT_DIR)/.rosette/audit-phase-coverage.json
 XENIA_FORK_MANIFEST_SCRIPT := $(ROOT_DIR)/tools/build_xenia_fork_manifest.py
 XENIA_FORK_MANIFEST_OUT := $(ROOT_DIR)/.rosette/xenia-fork-manifest.json
+XENIA_SOURCE_LOG = $(XENIA_ROOT)/.rosette/rosette-xenia.log
+WARNING_LEDGER_SCRIPT := $(ROOT_DIR)/tools/audit_warning_ledger.py
+WARNING_LEDGER_OUT := $(ROOT_DIR)/.rosette/warning-ledger.json
+GENERATED_TRACE_SCRIPT := $(ROOT_DIR)/tools/analyze_generated_code_trace.py
+GENERATED_TRACE_OUT := $(ROOT_DIR)/.rosette/generated-code-trace.json
 # Prefer the checkout on the volume used by the Rosette/Xenia run when it is
 # present. The user-facing volume path is the parent directory; the Git
 # checkout itself is its xenia/ child. Keep the older local path as an
 # override-compatible fallback for machines that have that checkout instead.
-XENIA_ROOT ?= $(if $(wildcard /Volumes/2023\ Drive/xenia/xenia/.git),/Volumes/2023 Drive/xenia/xenia,/Users/ryanwiseman/Documents/xenia-canary-canary_experimental)
+# The sanctioned macOS Xenia checkout is intentionally the default.  Keeping
+# Keep the historical mount first, but follow the current external-drive
+# naming when that mount has been renumbered by macOS. The path is only ever
+# read by Rosetta's audits/build helpers; callers on another machine can still
+# override XENIA_ROOT explicitly.
+XENIA_ROOT ?= $(shell if [ -d "/Volumes/2023 Drive/xenia/xenia" ]; then printf '%s' "/Volumes/2023 Drive/xenia/xenia"; elif [ -d "/Volumes/2023 Drive 1/xenia/xenia" ]; then printf '%s' "/Volumes/2023 Drive 1/xenia/xenia"; else printf '%s' "/Volumes/2023 Drive/xenia/xenia"; fi)
 XENIA_WINDOWS_BUILD_SCRIPT := $(ROOT_DIR)/tools/xenia/scripts/rosette-xenia-windows.sh
 XENIA_WINDOWS_SOURCE_ROOT ?= $(XENIA_ROOT)
 XENIA_WINDOWS_BUILD_DIR ?= $(ROOT_DIR)/.rosette/xenia-windows
@@ -158,7 +172,9 @@ XENIA_WINDOWS_TARGET ?= xenia-app
 XENIA_WINDOWS_JOBS ?=
 XENIA_WINDOWS_MEDIA_IMAGE ?=
 EVIDENCE_REPLAY_SCRIPT := $(ROOT_DIR)/tools/replay_evidence.py
+EVIDENCE_FIXTURE_SCRIPT := $(ROOT_DIR)/tools/create_evidence_fixture.py
 EVIDENCE_REPLAY_JOURNAL ?= $(ROOT_DIR)/.rosette/rosette-evidence.r3j
+EVIDENCE_REPLAY_OUT := $(ROOT_DIR)/.rosette/evidence-replay.json
 COMPAT_ROUTER_SRC := $(ROOT_DIR)/src/compat/rosetta2/main.zig
 COMPAT_ROUTER_BIN := $(ZIG_OUT_DIR)/bin/rosette-router
 LINK_AUDIT_SRC := src/tooling/link-audit/main.zig
@@ -166,7 +182,11 @@ LINK_AUDIT_BIN := $(ZIG_OUT_DIR)/bin/rosette-link-audit
 C_FIX_BIN := $(ZIG_OUT_DIR)/bin/rosette-c-fix
 
 AVX_SHIM_DYLIB := $(ZIG_OUT_DIR)/lib/avx-shim.dylib
-ASSETS_DIR ?= $(if $(wildcard assets/dll/mscoree),assets,include/assets)
+# Keep the default asset root anchored to the repository.  This Makefile is
+# intentionally invocable from either the repository root or build/, while a
+# relative default here made the native DLL prerequisites disappear when the
+# latter form was used.
+ASSETS_DIR ?= $(if $(wildcard $(ASSET_PREFIX)assets/dll/mscoree),$(ASSET_PREFIX)assets,$(ASSET_PREFIX)include/assets)
 DLL_ASSETS_DIR := $(ASSETS_DIR)/dll
 EXE_EXAMPLES_DIR := $(ASSETS_DIR)/exe_examples
 EXE ?= $(EXE_EXAMPLES_DIR)/Notepad.exe
@@ -226,14 +246,14 @@ STAPLER ?= xcrun stapler
 # On macOS, prepend the LLP64 override shim so it wins the include lookup
 # for "win32/windows_base.h" over the upstream-mirrored shim/canonical.
 ifeq ($(shell uname -s),Darwin)
-MACOS_SHIM_INC := -Iinclude/shims/macos
+MACOS_SHIM_INC := -I$(ASSET_PREFIX)include/shims/macos
 else
 MACOS_SHIM_INC :=
 endif
 # Reference header path (the canonical win32 headers mirrored upstream)
-REFERENCE_INC := -I.rosette/include
-SHIM_INC := -Iinclude/shims/win32 $(REFERENCE_INC)
-INCLUDE_INC := -Iinclude
+REFERENCE_INC := -I$(ASSET_PREFIX).rosette/include
+SHIM_INC := -I$(ASSET_PREFIX)include/shims/win32 $(REFERENCE_INC)
+INCLUDE_INC := -I$(ASSET_PREFIX)include
 export MACOS_SHIM_INC
 
 # ---------------------------------------------------------------------------
@@ -241,7 +261,7 @@ export MACOS_SHIM_INC
 # ---------------------------------------------------------------------------
 OBJC_SRC      := src/graphics/Objective_C/window_main.m
 OBJC_GDI_SRC  := src/graphics/Objective_C/window_gdi.m
-TRACE_WINDOW_SRC := src/graphics/Objective_C/toolbar/window/trace_window.m
+TRACE_WINDOW_SRC := $(ASSET_PREFIX)src/graphics/Objective_C/toolbar/window/trace_window.m
 OBJCXX_SRC    := src/graphics/Objective_C/cout_bridge.cpp
 DEFAULT_SRC    := src/graphics/Objective_C/default_main.cpp
 CLI_C_SRC      := src/graphics/CLI/window_main.c
@@ -268,7 +288,7 @@ ISO_BIN := $(ZIG_OUT_DIR)/bin/rosette-iso
 ISO_SRC := $(ROOT_DIR)/src/tooling/iso/main.zig
 XBOX360_MEDIA_TOOL := $(ROOT_DIR)/tools/xbox360_media.py
 
-.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build link-audit-build pkg-boundary-audit isa-execution-audit build-routes-audit vendor-library-audit vendor-audit shell-helper-build test-census xenia-fork-manifest xenia-windows-prepare xenia-windows-build build-identity replay-evidence shell shell-update shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse iso-build iso-run app-wrapper installer uninstaller app-all release notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
+.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build link-audit-build pkg-boundary-audit isa-execution-audit build-routes-audit dll-coverage-audit vendor-library-audit vendor-audit diagnostic-audit shell-helper-build test-census audit-phase-coverage xenia-fork-manifest xenia-windows-prepare xenia-windows-build build-identity evidence-fixture replay-evidence shell shell-update shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse iso-build iso-run app-wrapper installer uninstaller app-all release notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
 
 all: headers-check zig-build test-run
 
@@ -297,8 +317,9 @@ help:
 		'  make xenia-windows-prepare  Stage an isolated Windows Xenia source mirror and support capsule' \
 		'  make xenia-windows-build    Configure/build/bundle the Rosette-owned Windows Xenia PE' \
 		'  make build-identity  Hash Rosette/Xenia/build/test/shell inputs into an admission manifest' \
-		'  make replay-evidence Replay a durable .r3j journal without the original runtime' \
+		'  make replay-evidence Replay a durable .r3j journal without the original runtime (or create the no-Xenia fixture)' \
 		'  make vendor-audit Audit vendored library sources, target records, and host providers' \
+		'  make diagnostic-audit Run bounded disassembly, warning-ledger, and generated-code checks' \
 		'  make shell-uninstall Remove Rosette shell integration' \
 		'  make shell-clean-state Kill stale Rosette shell/ELF helper processes' \
 		'  make c-fix        Run C transpiler on C sources to fix implicit narrowing conversions' \
@@ -377,7 +398,7 @@ clean: exe-runner-cleanup
 
 elf-processor-build:
 	@mkdir -p "$(ZIG_CACHE_DIR)/global"
-	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build-exe -O "$(ROSETTE_RUNTIME_OPTIMIZE)" --dep x64_decoder --dep x64_interpreter --dep x64_linux_runtime --dep x64_syscalls --dep x64_guest_abi --dep exit_diagnostics --dep cleo_routing --dep guard_rollback --dep execution_history --dep evex_runtime --dep x86_vector_helpers --dep xenia_fatal_condition_map --dep xenia_guest_frontier_map --dep xenia_warning_severity_map --dep xenia_guest_milestone_map --dep xenia_guest_address_map --dep frame_content_contract -Mroot="$(ELF_PROCESSOR_SRC)" --dep isa_highway --dep isa_registry --dep isa_decode --dep runtime_abi_handshake --dep flags --dep cpu_state --dep bit_test --dep capabilities -Mx64_decoder=ISA/decoding/root.zig --dep flags -Mcpu_state=src/x64-ASM/cpu_state.zig --dep flags -Mbit_test=src/x64-ASM/bit_test.zig -Mflags=src/x64-ASM/flags.zig -Mcapabilities=src/x64-ASM/capabilities.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig --dep windows_runtime --dep x64_syscalls -Mx64_linux_runtime=src/x64-ASM/linux_runtime.zig -Mx64_syscalls=src/x64-ASM/syscalls.zig --dep dll_win32_return_contract --dep dll_win32_library_inventory -Mwindows_runtime=src/x64-ASM/windows_runtime.zig -Mdll_win32_return_contract=pkg/dll/win32/return-contract/src/root.zig --dep dll_win32_catalogue -Mdll_win32_library_inventory=pkg/dll/win32/library-inventory/src/root.zig --dep dll_win32_advapi32 --dep dll_win32_api_ms_win_crt_convert_l1_1_0 --dep dll_win32_api_ms_win_crt_environment_l1_1_0 --dep dll_win32_api_ms_win_crt_filesystem_l1_1_0 --dep dll_win32_api_ms_win_crt_heap_l1_1_0 --dep dll_win32_api_ms_win_crt_locale_l1_1_0 --dep dll_win32_api_ms_win_crt_math_l1_1_0 --dep dll_win32_api_ms_win_crt_private_l1_1_0 --dep dll_win32_api_ms_win_crt_runtime_l1_1_0 --dep dll_win32_api_ms_win_crt_stdio_l1_1_0 --dep dll_win32_api_ms_win_crt_string_l1_1_0 --dep dll_win32_api_ms_win_crt_time_l1_1_0 --dep dll_win32_api_ms_win_crt_utility_l1_1_0 --dep dll_win32_bcrypt --dep dll_win32_cfgmgr32 --dep dll_win32_dwmapi --dep dll_win32_dxgi --dep dll_win32_dynamic --dep dll_win32_gdi32 --dep dll_win32_hid --dep dll_win32_imm32 --dep dll_win32_libusbk --dep dll_win32_kernel32 --dep dll_win32_msvcrt --dep dll_win32_ole32 --dep dll_win32_oleaut32 --dep dll_win32_setupapi --dep dll_win32_shcore --dep dll_win32_shell32 --dep dll_win32_shlwapi --dep dll_win32_user32 --dep dll_win32_version --dep dll_win32_winmm --dep dll_win32_winusb --dep dll_win32_wsock32 -Mdll_win32_catalogue=pkg/dll/win32/catalogue/src/root.zig -Mdll_win32_advapi32=pkg/dll/win32/advapi32/src/root.zig -Mdll_win32_api_ms_win_crt_convert_l1_1_0=pkg/dll/win32/api-ms-win-crt-convert-l1-1-0/src/root.zig -Mdll_win32_api_ms_win_crt_environment_l1_1_0=pkg/dll/win32/api-ms-win-crt-environment-l1-1-0/src/root.zig -Mdll_win32_api_ms_win_crt_filesystem_l1_1_0=pkg/dll/win32/api-ms-win-crt-filesystem-l1-1-0/src/root.zig -Mdll_win32_api_ms_win_crt_heap_l1_1_0=pkg/dll/win32/api-ms-win-crt-heap-l1-1-0/src/root.zig -Mdll_win32_api_ms_win_crt_locale_l1_1_0=pkg/dll/win32/api-ms-win-crt-locale-l1-1-0/src/root.zig -Mdll_win32_api_ms_win_crt_math_l1_1_0=pkg/dll/win32/api-ms-win-crt-math-l1-1-0/src/root.zig -Mdll_win32_api_ms_win_crt_private_l1_1_0=pkg/dll/win32/api-ms-win-crt-private-l1-1-0/src/root.zig -Mdll_win32_api_ms_win_crt_runtime_l1_1_0=pkg/dll/win32/api-ms-win-crt-runtime-l1-1-0/src/root.zig -Mdll_win32_api_ms_win_crt_stdio_l1_1_0=pkg/dll/win32/api-ms-win-crt-stdio-l1-1-0/src/root.zig -Mdll_win32_api_ms_win_crt_string_l1_1_0=pkg/dll/win32/api-ms-win-crt-string-l1-1-0/src/root.zig -Mdll_win32_api_ms_win_crt_time_l1_1_0=pkg/dll/win32/api-ms-win-crt-time-l1-1-0/src/root.zig -Mdll_win32_api_ms_win_crt_utility_l1_1_0=pkg/dll/win32/api-ms-win-crt-utility-l1-1-0/src/root.zig -Mdll_win32_bcrypt=pkg/dll/win32/bcrypt/src/root.zig -Mdll_win32_cfgmgr32=pkg/dll/win32/cfgmgr32/src/root.zig -Mdll_win32_dwmapi=pkg/dll/win32/dwmapi/src/root.zig -Mdll_win32_dxgi=pkg/dll/win32/dxgi/src/root.zig -Mdll_win32_dynamic=pkg/dll/win32/dynamic/src/root.zig -Mdll_win32_gdi32=pkg/dll/win32/gdi32/src/root.zig -Mdll_win32_hid=pkg/dll/win32/hid/src/root.zig -Mdll_win32_imm32=pkg/dll/win32/imm32/src/root.zig -Mdll_win32_libusbk=pkg/dll/win32/libusbk/src/root.zig -Mdll_win32_kernel32=pkg/dll/win32/kernel32/src/root.zig -Mdll_win32_msvcrt=pkg/dll/win32/msvcrt/src/root.zig -Mdll_win32_ole32=pkg/dll/win32/ole32/src/root.zig -Mdll_win32_oleaut32=pkg/dll/win32/oleaut32/src/root.zig -Mdll_win32_setupapi=pkg/dll/win32/setupapi/src/root.zig -Mdll_win32_shcore=pkg/dll/win32/shcore/src/root.zig -Mdll_win32_shell32=pkg/dll/win32/shell32/src/root.zig -Mdll_win32_shlwapi=pkg/dll/win32/shlwapi/src/root.zig -Mdll_win32_user32=pkg/dll/win32/user32/src/root.zig -Mdll_win32_version=pkg/dll/win32/version/src/root.zig -Mdll_win32_winmm=pkg/dll/win32/winmm/src/root.zig -Mdll_win32_winusb=pkg/dll/win32/winusb/src/root.zig -Mdll_win32_wsock32=pkg/dll/win32/wsock32/src/root.zig -Mx64_guest_abi=src/x64-ASM/guest_abi.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -Misa_highway=ISA/highway.zig -Misa_registry=ISA/root.zig -Misa_decode=ISA/decode/root.zig -Mruntime_abi_handshake=src/tooling/runtime-abi-handshake/runtime.zig -Mguard_rollback=lib/runtime/guard-rollback/root.zig -Mcleo_routing=lib/CLEO/cleo_routing.zig -Mexecution_history=lib/runtime/execution-history/root.zig --dep x64_decoder --dep exit_diagnostics -Mevex_runtime=lib/runtime/process-core/evex.zig --dep x64_decoder --dep phrase_filter -Mxenia_fatal_condition_map=pkg/common/xenia/fatal-condition-map/src/root.zig -Mxenia_guest_frontier_map=pkg/common/xenia/guest-frontier-map/src/root.zig -Mxenia_guest_milestone_map=pkg/common/xenia/guest-milestone-map/src/root.zig -Mxenia_guest_address_map=pkg/common/xenia/guest-address-map/src/root.zig -Mframe_content_contract=pkg/common/rosette/frame-content-contract/src/root.zig --dep phrase_filter -Mxenia_warning_severity_map=pkg/common/xenia/warning-severity-map/src/root.zig -Mphrase_filter=pkg/common/text/phrase-filter/src/root.zig --dep x64_decoder -Mx86_vector_helpers=lib/Mach-O/execution_helpers.zig -femit-bin="$(ELF_PROCESSOR_BIN)"
+	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build-exe -O "$(ROSETTE_RUNTIME_OPTIMIZE)" --dep x64_decoder --dep x64_interpreter --dep x64_linux_runtime --dep x64_syscalls --dep x64_guest_abi --dep exit_diagnostics --dep cleo_routing --dep guard_rollback --dep execution_history --dep evex_runtime --dep x86_vector_helpers --dep xenia_fatal_condition_map --dep xenia_guest_frontier_map --dep xenia_warning_severity_map --dep xenia_guest_milestone_map --dep xenia_guest_address_map --dep frame_content_contract --dep screen_validity --dep address_region_map --dep xenia_kernel_shim_map --dep xenia_kernel_export_map --dep arm64_encode -Mroot="$(ELF_PROCESSOR_SRC)" --dep isa_highway --dep isa_registry --dep isa_decode --dep runtime_abi_handshake --dep flags --dep cpu_state --dep bit_test --dep capabilities -Mx64_decoder=ISA/decoding/root.zig --dep flags -Mcpu_state=src/x64-ASM/cpu_state.zig --dep flags -Mbit_test=src/x64-ASM/bit_test.zig -Mflags=src/x64-ASM/flags.zig -Mcapabilities=src/x64-ASM/capabilities.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig --dep windows_runtime --dep x64_syscalls -Mx64_linux_runtime=src/x64-ASM/linux_runtime.zig -Mx64_syscalls=src/x64-ASM/syscalls.zig --dep dll_win32_return_contract --dep dll_win32_library_inventory -Mwindows_runtime=src/x64-ASM/windows_runtime.zig -Mdll_win32_return_contract=pkg/dll/win32/return-contract/src/root.zig --dep dll_win32_catalogue --dep dll_win32_capability_gap -Mdll_win32_library_inventory=pkg/dll/win32/library-inventory/src/root.zig --dep dll_win32_advapi32 --dep dll_win32_api_ms_win_crt_convert_l1_1_0 --dep dll_win32_api_ms_win_crt_environment_l1_1_0 --dep dll_win32_api_ms_win_crt_filesystem_l1_1_0 --dep dll_win32_api_ms_win_crt_heap_l1_1_0 --dep dll_win32_api_ms_win_crt_locale_l1_1_0 --dep dll_win32_api_ms_win_crt_math_l1_1_0 --dep dll_win32_api_ms_win_crt_private_l1_1_0 --dep dll_win32_api_ms_win_crt_runtime_l1_1_0 --dep dll_win32_api_ms_win_crt_stdio_l1_1_0 --dep dll_win32_api_ms_win_crt_string_l1_1_0 --dep dll_win32_api_ms_win_crt_time_l1_1_0 --dep dll_win32_api_ms_win_crt_utility_l1_1_0 --dep dll_win32_bcrypt --dep dll_win32_cfgmgr32 --dep dll_win32_dwmapi --dep dll_win32_dxgi --dep dll_win32_vulkan_1 --dep dll_win32_dynamic --dep dll_win32_gdi32 --dep dll_win32_hid --dep dll_win32_imm32 --dep dll_win32_libusbk --dep dll_win32_kernel32 --dep dll_win32_msvcrt --dep dll_win32_ole32 --dep dll_win32_oleaut32 --dep dll_win32_setupapi --dep dll_win32_shcore --dep dll_win32_shell32 --dep dll_win32_shlwapi --dep dll_win32_user32 --dep dll_win32_version --dep dll_win32_winmm --dep dll_win32_winusb --dep dll_win32_wsock32 --dep dll_win32_export_contract -Mdll_win32_catalogue=pkg/dll/win32/catalogue/src/root.zig --dep dll_win32_export_contract -Mdll_win32_advapi32=pkg/dll/win32/advapi32/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_convert_l1_1_0=pkg/dll/win32/api-ms-win-crt-convert-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_environment_l1_1_0=pkg/dll/win32/api-ms-win-crt-environment-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_filesystem_l1_1_0=pkg/dll/win32/api-ms-win-crt-filesystem-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_heap_l1_1_0=pkg/dll/win32/api-ms-win-crt-heap-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_locale_l1_1_0=pkg/dll/win32/api-ms-win-crt-locale-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_math_l1_1_0=pkg/dll/win32/api-ms-win-crt-math-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_private_l1_1_0=pkg/dll/win32/api-ms-win-crt-private-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_runtime_l1_1_0=pkg/dll/win32/api-ms-win-crt-runtime-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_stdio_l1_1_0=pkg/dll/win32/api-ms-win-crt-stdio-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_string_l1_1_0=pkg/dll/win32/api-ms-win-crt-string-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_time_l1_1_0=pkg/dll/win32/api-ms-win-crt-time-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_utility_l1_1_0=pkg/dll/win32/api-ms-win-crt-utility-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_bcrypt=pkg/dll/win32/bcrypt/src/root.zig -Mdll_win32_cfgmgr32=pkg/dll/win32/cfgmgr32/src/root.zig --dep dll_win32_export_contract -Mdll_win32_dwmapi=pkg/dll/win32/dwmapi/src/root.zig --dep dll_win32_export_contract -Mdll_win32_dxgi=pkg/dll/win32/dxgi/src/root.zig -Mdll_win32_vulkan_1=pkg/dll/win32/vulkan-1/src/root.zig -Mdll_win32_dynamic=pkg/dll/win32/dynamic/src/root.zig --dep dll_win32_export_contract -Mdll_win32_gdi32=pkg/dll/win32/gdi32/src/root.zig -Mdll_win32_hid=pkg/dll/win32/hid/src/root.zig --dep dll_win32_export_contract -Mdll_win32_imm32=pkg/dll/win32/imm32/src/root.zig -Mdll_win32_libusbk=pkg/dll/win32/libusbk/src/root.zig --dep dll_win32_export_contract -Mdll_win32_kernel32=pkg/dll/win32/kernel32/src/root.zig --dep dll_win32_export_contract -Mdll_win32_msvcrt=pkg/dll/win32/msvcrt/src/root.zig --dep dll_win32_export_contract -Mdll_win32_ole32=pkg/dll/win32/ole32/src/root.zig --dep dll_win32_export_contract -Mdll_win32_oleaut32=pkg/dll/win32/oleaut32/src/root.zig --dep dll_win32_export_contract -Mdll_win32_setupapi=pkg/dll/win32/setupapi/src/root.zig -Mdll_win32_shcore=pkg/dll/win32/shcore/src/root.zig --dep dll_win32_export_contract -Mdll_win32_shell32=pkg/dll/win32/shell32/src/root.zig --dep dll_win32_export_contract -Mdll_win32_shlwapi=pkg/dll/win32/shlwapi/src/root.zig --dep dll_win32_export_contract -Mdll_win32_user32=pkg/dll/win32/user32/src/root.zig --dep dll_win32_export_contract -Mdll_win32_version=pkg/dll/win32/version/src/root.zig --dep dll_win32_export_contract -Mdll_win32_winmm=pkg/dll/win32/winmm/src/root.zig -Mdll_win32_winusb=pkg/dll/win32/winusb/src/root.zig --dep dll_win32_export_contract -Mdll_win32_wsock32=pkg/dll/win32/wsock32/src/root.zig -Mx64_guest_abi=src/x64-ASM/guest_abi.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -Misa_highway=ISA/highway.zig -Misa_registry=ISA/root.zig -Misa_decode=ISA/decode/root.zig -Mruntime_abi_handshake=src/tooling/runtime-abi-handshake/runtime.zig -Mguard_rollback=lib/runtime/guard-rollback/root.zig -Mcleo_routing=lib/CLEO/cleo_routing.zig -Mexecution_history=lib/runtime/execution-history/root.zig --dep x64_decoder --dep exit_diagnostics -Mevex_runtime=lib/runtime/process-core/evex.zig --dep x64_decoder --dep phrase_filter -Mxenia_fatal_condition_map=pkg/common/xenia/fatal-condition-map/src/root.zig -Mxenia_guest_frontier_map=pkg/common/xenia/guest-frontier-map/src/root.zig -Mxenia_guest_milestone_map=pkg/common/xenia/guest-milestone-map/src/root.zig -Mxenia_guest_address_map=pkg/common/xenia/guest-address-map/src/root.zig -Mframe_content_contract=pkg/common/rosette/frame-content-contract/src/root.zig -Mscreen_validity=lib/gpu/screen_validity.zig -Maddress_region_map=pkg/common/rosette/address-region-map/src/root.zig --dep phrase_filter -Mxenia_warning_severity_map=pkg/common/xenia/warning-severity-map/src/root.zig -Mphrase_filter=pkg/common/text/phrase-filter/src/root.zig --dep x64_decoder -Mx86_vector_helpers=lib/Mach-O/execution_helpers.zig --dep dll_win32_return_contract -Mdll_win32_export_contract=pkg/dll/win32/export-contract/src/root.zig -Mdll_win32_capability_gap=pkg/dll/win32/capability-gap/src/root.zig -Mxenia_kernel_shim_map=pkg/common/xenia/kernel-shim-map/src/root.zig -Mxenia_kernel_export_map=pkg/common/xenia/kernel-export-map/src/root.zig -Marm64_encode=lib/compiler/arm64/encode.zig -femit-bin="$(ELF_PROCESSOR_BIN)"
 
 macho-processor-build:
 	@mkdir -p "$(ZIG_CACHE_DIR)/global"
@@ -436,12 +457,32 @@ isa-execution-audit:
 build-routes-audit:
 	@cd "$(ROOT_DIR)" && python3 tools/audit_build_routes.py
 
+# Every name the guest imports must be declared by exactly one pkg/dll/win32
+# package, and every declaration must match what the dispatcher actually
+# handles. A declaration that has gone stale is worse than none, because the
+# refusal report trusts it.
+dll-coverage-audit:
+	@cd "$(ROOT_DIR)" && python3 tools/audit_dll_coverage.py
+
 vendor-library-audit:
 	@cd "$(ROOT_DIR)" && python3 tools/check_vendor_libraries.py $(if $(XENIA_ROOT),--xenia-root "$(XENIA_ROOT)",)
 
 vendor-audit: vendor-library-audit
 
-shell-helper-build: pkg-boundary-audit isa-execution-audit build-routes-audit vendor-library-audit c-fix-build assembler-runner-build elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build compat-router-build
+diagnostic-audit:
+	@cd "$(ROOT_DIR)" && bash tools/test_native_readback_capture.sh
+	@cd "$(ROOT_DIR)" && python3 tools/generate_vulkan_argument_widths.py --check
+	@cd "$(ROOT_DIR)" && python3 tools/rosette_adjacent_disasm.py --self-test
+	@cd "$(ROOT_DIR)" && python3 "$(WARNING_LEDGER_SCRIPT)" --self-test
+	@cd "$(ROOT_DIR)" && python3 "$(GENERATED_TRACE_SCRIPT)" --self-test
+	@if [ -f "$(XENIA_SOURCE_LOG)" ]; then cd "$(ROOT_DIR)" && python3 "$(WARNING_LEDGER_SCRIPT)" --log "$(XENIA_SOURCE_LOG)" --format json > "$(WARNING_LEDGER_OUT)"; else echo "diagnostic-audit: warning ledger SKIP (no Xenia source log)"; fi
+	@if [ -f "$(XENIA_SOURCE_LOG)" ]; then cd "$(ROOT_DIR)" && python3 "$(GENERATED_TRACE_SCRIPT)" --log "$(XENIA_SOURCE_LOG)" --format json > "$(GENERATED_TRACE_OUT)"; else echo "diagnostic-audit: generated-code trace SKIP (no Xenia source log)"; fi
+
+# The sanctioned Xenia launcher uses the app/bundling runner directly. Keep
+# it on this gate so a shell update cannot leave that runner older than the
+# processor and reports it just rebuilt. `exe-runner-build` also copies the
+# same artifact to zig-out/bin for the standalone route.
+shell-helper-build: pkg-boundary-audit isa-execution-audit build-routes-audit dll-coverage-audit vendor-library-audit diagnostic-audit c-fix-build assembler-runner-build exe-runner-build elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build compat-router-build
 	@mkdir -p "$(ZIG_CACHE_DIR)/global"
 	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build-exe -lc --dep entrypoint_alignment --dep entrypoint_kernel_process_guard --dep compat_source_include_compat --dep compat_third_party_include_compat -Mroot="$(SHELL_HELPER_SRC)" -Mentrypoint_alignment=src/entrypoint/alignment/root.zig -Mentrypoint_kernel_process_guard=src/entrypoint/kernel/process_guard.zig -Mcompat_source_include_compat=src/compat/source/include_compat.zig -Mcompat_third_party_include_compat=src/compat/third_party/include_compat.zig -femit-bin="$(SHELL_HELPER_BIN)"
 
@@ -452,11 +493,30 @@ shell-helper-build: pkg-boundary-audit isa-execution-audit build-routes-audit ve
 test-census:
 	@cd "$(ROOT_DIR)" && python3 "$(TEST_CENSUS_SCRIPT)" --root "$(ROOT_DIR)" --output "$(TEST_CENSUS_OUT)" --run-check --strict
 
+# The six-phase matrix is source-only and deliberately does not inspect or
+# execute Xenia. Its hash is included in build identity so a green test census
+# cannot hide a stale cross-boundary contract.
+audit-phase-coverage:
+	@cd "$(ROOT_DIR)" && python3 "$(AUDIT_PHASE_COVERAGE_SCRIPT)" --root "$(ROOT_DIR)" --output "$(AUDIT_PHASE_COVERAGE_OUT)"
+
 # The fork manifest is source-only and never invokes Xenia.  It is kept as a
 # separate artifact so an identity can bind the classification and pinned
 # base without pretending that a source census is a behavior proof.
 xenia-fork-manifest:
 	@cd "$(ROOT_DIR)" && python3 "$(XENIA_FORK_MANIFEST_SCRIPT)" --root "$(XENIA_ROOT)" --output "$(XENIA_FORK_MANIFEST_OUT)"
+
+# Replay is a release gate even on a clean checkout. Preserve a real journal
+# if one exists; otherwise create the deterministic source-only fixture so the
+# verifier proves its envelope and causal-order path without running Xenia.
+evidence-fixture:
+	@if [ -f "$(EVIDENCE_REPLAY_JOURNAL)" ]; then \
+		echo "evidence-fixture: preserving existing $(EVIDENCE_REPLAY_JOURNAL)"; \
+	elif [ "$(EVIDENCE_REPLAY_JOURNAL)" = "$(ROOT_DIR)/.rosette/rosette-evidence.r3j" ]; then \
+		cd "$(ROOT_DIR)" && python3 "$(EVIDENCE_FIXTURE_SCRIPT)" --output "$(EVIDENCE_REPLAY_JOURNAL)"; \
+	else \
+		echo "evidence-fixture: missing custom journal $(EVIDENCE_REPLAY_JOURNAL)" >&2; \
+		exit 1; \
+	fi
 
 # The Windows path is deliberately isolated from the supplied Xenia checkout.
 # The adapter mirrors the complete source tree before CMake generates version,
@@ -470,10 +530,11 @@ xenia-windows-build:
 # The manifest is deliberately generated after the check artifacts exist. It
 # hashes their bytes and the shell-update record, while keeping filesystem
 # paths as metadata only. It never invokes Xenia.
-build-identity: shell-helper-build test-census xenia-fork-manifest
-	@cd "$(ROOT_DIR)" && python3 "$(BUILD_IDENTITY_SCRIPT)" --root "$(ROOT_DIR)" --xenia-root "$(XENIA_ROOT)" --helper "$(SHELL_HELPER_BIN)" --census "$(TEST_CENSUS_OUT)" --shell-update "$(SHELL_UPDATE_RECORD_OUT)" --fork-manifest "$(XENIA_FORK_MANIFEST_OUT)" --output "$(BUILD_IDENTITY_OUT)"
+build-identity: shell-helper-build test-census audit-phase-coverage xenia-fork-manifest replay-evidence
+	@cd "$(ROOT_DIR)" && python3 "$(BUILD_IDENTITY_SCRIPT)" --root "$(ROOT_DIR)" --xenia-root "$(XENIA_ROOT)" --helper "$(SHELL_HELPER_BIN)" --census "$(TEST_CENSUS_OUT)" --shell-update "$(SHELL_UPDATE_RECORD_OUT)" --fork-manifest "$(XENIA_FORK_MANIFEST_OUT)" --phase-coverage "$(AUDIT_PHASE_COVERAGE_OUT)" --evidence-replay "$(EVIDENCE_REPLAY_OUT)" --output "$(BUILD_IDENTITY_OUT)"
 
-replay-evidence:
+replay-evidence: evidence-fixture
+	@cd "$(ROOT_DIR)" && python3 "$(EVIDENCE_REPLAY_SCRIPT)" "$(EVIDENCE_REPLAY_JOURNAL)" --json > "$(EVIDENCE_REPLAY_OUT)"
 	@cd "$(ROOT_DIR)" && python3 "$(EVIDENCE_REPLAY_SCRIPT)" "$(EVIDENCE_REPLAY_JOURNAL)"
 
 shell shell-update: override ROSETTE_RUNTIME_OPTIMIZE := ReleaseFast
@@ -486,10 +547,10 @@ shell: shell-helper-build
 # I use most, this is one of the biggest go-to.
 # It enables you to update your global shell if you are trying to debug
 # something
-shell-update: shell-helper-build test-census xenia-fork-manifest
+shell-update: shell-helper-build test-census audit-phase-coverage xenia-fork-manifest replay-evidence
 	@"$(SHELL_HELPER_BIN)" update "$(ROOT_DIR)"
 	@cd "$(ROOT_DIR)" && python3 "$(SHELL_UPDATE_RECORD_SCRIPT)" --root "$(ROOT_DIR)" --helper "$(SHELL_HELPER_BIN)" --source "$(SHELL_HELPER_SRC)" --census "$(TEST_CENSUS_OUT)" --output "$(SHELL_UPDATE_RECORD_OUT)"
-	@cd "$(ROOT_DIR)" && python3 "$(BUILD_IDENTITY_SCRIPT)" --root "$(ROOT_DIR)" --xenia-root "$(XENIA_ROOT)" --helper "$(SHELL_HELPER_BIN)" --census "$(TEST_CENSUS_OUT)" --shell-update "$(SHELL_UPDATE_RECORD_OUT)" --fork-manifest "$(XENIA_FORK_MANIFEST_OUT)" --output "$(BUILD_IDENTITY_OUT)"
+	@cd "$(ROOT_DIR)" && python3 "$(BUILD_IDENTITY_SCRIPT)" --root "$(ROOT_DIR)" --xenia-root "$(XENIA_ROOT)" --helper "$(SHELL_HELPER_BIN)" --census "$(TEST_CENSUS_OUT)" --shell-update "$(SHELL_UPDATE_RECORD_OUT)" --fork-manifest "$(XENIA_FORK_MANIFEST_OUT)" --phase-coverage "$(AUDIT_PHASE_COVERAGE_OUT)" --evidence-replay "$(EVIDENCE_REPLAY_OUT)" --output "$(BUILD_IDENTITY_OUT)"
 
 shell-uninstall: shell-helper-build
 	@"$(SHELL_HELPER_BIN)" uninstall
@@ -547,6 +608,9 @@ app-wrapper: mscoree-native shell-helper-build
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/elf_processor"
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/macho_processor"
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/rosette-exec.dylib"
+	@# zig cc links the x86_64 AVX shim unsigned; the bundle signature below
+	@# refuses any unsigned subcomponent, so sign it with the rest.
+	@if [ -f "program/app/Rosette.app/Contents/MacOS/avx-shim.dylib" ]; then codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "program/app/Rosette.app/Contents/MacOS/avx-shim.dylib"; fi
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/rosette"
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app"
 	@codesign --verify --deep --strict --verbose=2 "program/app/Rosette.app"
@@ -808,8 +872,8 @@ MSCOREE_NATIVE_HELPER_APP_BIN := $(MSCOREE_NATIVE_HELPER_APP)/Contents/MacOS/ros
 MSCOREE_NATIVE_WINDOW_SRC := $(MSCOREE_NATIVE_DIR)/mscoree_window.m
 MSCOREE_NATIVE_HELPER_SRC := $(MSCOREE_NATIVE_DIR)/mscoree_window_helper.m
 MSCOREE_WARNINGS := -Wno-format -Wno-incompatible-pointer-types -Wno-unsequenced -Wno-visibility
-MSCOREE_CFLAGS := -O2 -std=c11 $(MSCOREE_WARNINGS) $(MACOS_SHIM_INC) -Iinclude/shims/win32 $(REFERENCE_INC) -Iinclude -I$(MSCOREE_NATIVE_DIR)
-MSCOREE_OBJC_FLAGS := -O2 -fobjc-arc $(MACOS_SHIM_INC) -Iinclude/shims/win32 $(REFERENCE_INC) -Iinclude -I$(MSCOREE_NATIVE_DIR)
+MSCOREE_CFLAGS := -O2 -std=c11 $(MSCOREE_WARNINGS) $(MACOS_SHIM_INC) $(SHIM_INC) $(INCLUDE_INC) -I$(MSCOREE_NATIVE_DIR)
+MSCOREE_OBJC_FLAGS := -O2 -fobjc-arc $(MACOS_SHIM_INC) $(SHIM_INC) $(INCLUDE_INC) -I$(MSCOREE_NATIVE_DIR)
 MSCOREE_FRAMEWORKS := -framework Cocoa -framework Foundation
 
 mscoree-native: $(MSCOREE_NATIVE_LIB) $(MSCOREE_NATIVE_HELPER) $(MSCOREE_NATIVE_HELPER_APP)
@@ -854,7 +918,7 @@ $(MSCOREE_NATIVE_HELPER_APP): $(MSCOREE_NATIVE_WINDOW_SRC) $(MSCOREE_NATIVE_HELP
 
 exe-runner-build: mscoree-native
 	@mkdir -p "$(ZIG_CACHE_DIR)/global"
-	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build exe-runner --build-file $(APP_BP)app/bundling/build.zig $(APP_BUNDLE_RELEASE_FLAG) 2>&1
+	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build exe-runner --build-file app/bundling/build.zig $(APP_BUNDLE_RELEASE_FLAG) 2>&1
 	@cp "$(ROOT_DIR)/app/bundling/zig-out/bin/rosette_exe_runner" "$(EXE_RUNNER_BIN)"
 
 gate-runner-build: exe-runner-build
