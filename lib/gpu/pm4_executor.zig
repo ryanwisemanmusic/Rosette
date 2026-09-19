@@ -169,6 +169,11 @@ pub const Executor = struct {
     active_fault_context: ?FaultContext = null,
     last_draw: ?Draw = null,
     last_swap: ?pm4.SwapDescription = null,
+    /// The fetch constant immediately paired with the last XE_SWAP. The
+    /// conventional fetch register is reused for ordinary textures, so the
+    /// register file's final value after a batch is not a front-buffer proof.
+    last_swap_fetch: ?pm4.FetchConstant = null,
+    pending_swap_fetch: ?pm4.FetchConstant = null,
     callback_context: ?*anyopaque = null,
     event_callback: ?Callback = null,
     draw_callback: ?DrawCallback = null,
@@ -255,13 +260,17 @@ pub const Executor = struct {
             switch (header.kind) {
                 .type0 => self.executeType0(header, payload),
                 .type1 => {
+                    self.pending_swap_fetch = null;
                     if (payload.len != 2) return self.fail(.invalid_packet);
                     self.noteCommandRegister(header.register_index);
                     self.noteCommandRegister(header.register_index_2);
                     self.register_file.write(header.register_index, payload[0]);
                     self.register_file.write(header.register_index_2, payload[1]);
                 },
-                .type2 => self.type2_count +%= 1,
+                .type2 => {
+                    self.type2_count +%= 1;
+                    self.pending_swap_fetch = null;
+                },
                 .type3 => try self.executeType3(header.opcode, payload, dwords[index .. index + total_usize], header.predicated),
             }
             index += total_usize;
@@ -291,6 +300,14 @@ pub const Executor = struct {
             self.noteCommandRegisterRange(header.register_index, payload.len);
             self.register_file.writeRange(header.register_index, payload);
         }
+        if (!header.one_register and
+            header.register_index == regs.shader_constant_fetch_base and
+            payload.len == 6)
+        {
+            self.pending_swap_fetch = .{ .dwords = payload[0..6].* };
+        } else {
+            self.pending_swap_fetch = null;
+        }
     }
 
     fn executeType3(self: *Executor, opcode: pm4.Type3Opcode, payload: []const u32, packet: []const u32, predicated: bool) Error!void {
@@ -307,8 +324,10 @@ pub const Executor = struct {
         // set in a malformed or stale ring packet.
         if (predicated and (raw == 0x64 or (self.bin_select & self.bin_mask) == 0)) {
             self.predicated_skip_count +%= 1;
+            self.pending_swap_fetch = null;
             return;
         }
+        if (raw != 0x64) self.pending_swap_fetch = null;
         switch (raw) {
             0x10 => {}, // NOP
             0x26 => self.executeWaitForIdle(payload),
@@ -351,6 +370,8 @@ pub const Executor = struct {
                 const swap = pm4.decodeSwapSequence(packet) orelse return self.fail(.invalid_packet);
                 self.swap_count +%= 1;
                 self.last_swap = swap;
+                self.last_swap_fetch = self.pending_swap_fetch;
+                self.pending_swap_fetch = null;
                 self.emitEvent(.{ .swap = swap });
             },
             else => self.unknown_opcode_count +%= 1,
@@ -1324,11 +1345,28 @@ test "PM4 executor refuses a packet whose count walks past the ring span" {
 
 test "PM4 executor recognizes the authentic XE_SWAP message" {
     var packet: [pm4.swap_reservation_dwords]u32 = undefined;
-    _ = pm4.encodeSwapSequence(&packet, .{}, .{ .frontbuffer_physical_address = 0x1000, .width = 1280, .height = 720 }, pm4.swap_reservation_dwords).?;
+    var fetch = pm4.FetchConstant{};
+    fetch.setFormat(54);
+    fetch.setEndianness(1);
+    fetch.setTiled(true);
+    fetch.setSize2d(1280, 720);
+    _ = pm4.encodeSwapSequence(&packet, fetch, .{ .frontbuffer_physical_address = 0x1000, .width = 1280, .height = 720 }, pm4.swap_reservation_dwords).?;
+    // A later ordinary texture write must not replace the fetch paired with
+    // the swap when callers inspect the batch after execution.
+    var later_texture = pm4.FetchConstant{};
+    later_texture.setFormat(53);
+    later_texture.setEndianness(1);
+    later_texture.setTiled(true);
+    later_texture.setSize2d(256, 256);
+    packet[13] = pm4.packetType0(pm4.shader_constant_fetch_00_0, 6, false).?;
+    @memcpy(packet[14..20], &later_texture.dwords);
     var executor: Executor = .{};
     try executor.execute(&packet);
     try std.testing.expectEqual(@as(u64, 1), executor.swap_count);
     try std.testing.expectEqual(@as(u32, 1280), executor.last_swap.?.width);
+    try std.testing.expectEqual(@as(u6, 54), executor.last_swap_fetch.?.format());
+    try std.testing.expectEqual(@as(u32, 1280), executor.last_swap_fetch.?.size2d().width);
+    try std.testing.expectEqual(@as(u32, 720), executor.last_swap_fetch.?.size2d().height);
 }
 
 // The aggregates answer how much was submitted; the histogram answers which

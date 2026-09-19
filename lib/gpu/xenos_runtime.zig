@@ -417,18 +417,12 @@ pub const Runtime = struct {
         self.interrupts.publish(.fence, @truncate(fence), 1);
     }
 
-    /// Recover the six-dword fetch constant the command processor last saw at
-    /// the conventional front-buffer slot.  A zero constant is not useful as
-    /// a presentation description, so return null until at least one dword is
-    /// populated.
+    /// Recover the six-dword fetch constant paired with the most recent
+    /// `XE_SWAP`. The conventional fetch register is reused for ordinary
+    /// textures, so the register file's final value is not a valid
+    /// front-buffer description after a batch containing later texture setup.
     pub fn frontBufferFetch(self: *const Runtime) ?pm4.FetchConstant {
-        var fetch = pm4.FetchConstant{};
-        var nonzero = false;
-        for (0..fetch.dwords.len) |index| {
-            fetch.dwords[index] = self.executor.register_file.peek(pm4.shader_constant_fetch_00_0 + @as(registers.Register, @intCast(index)));
-            nonzero = nonzero or fetch.dwords[index] != 0;
-        }
-        return if (nonzero) fetch else null;
+        return self.executor.last_swap_fetch;
     }
 
     /// Return only quality evidence from live PM4 consumption. The common

@@ -9,6 +9,7 @@
 //! called.
 
 const std = @import("std");
+const gpu = @import("gpu");
 const vulkan_contract = @import("dll_win32_catalogue").vulkan;
 const dynamic_forwarder = @import("dyld").dynamic_library_forwarder;
 
@@ -103,6 +104,35 @@ pub const Bridge = struct {
         }
         self.forwarder.deinit();
         self.* = .{};
+    }
+
+    /// Present a Xenos front buffer discovered by the PE/Xenia route. Raw
+    /// enum values cross the C callback because the producer lives in the PE
+    /// processor; validate them here before they become typed GPU facts.
+    pub fn presentGuestFrontBuffer(
+        self: *Bridge,
+        state: anytype,
+        source: u64,
+        width: u32,
+        height: u32,
+        tiled: bool,
+        endian_raw: u32,
+        format_raw: u32,
+        guest_swap_observed: bool,
+    ) bool {
+        if (endian_raw > std.math.maxInt(u3) or format_raw > std.math.maxInt(u8)) return false;
+        const endian: gpu.xenos_texture.Endian = @enumFromInt(@as(u3, @intCast(endian_raw)));
+        const format: gpu.xenos_texture.Format = @enumFromInt(@as(u8, @intCast(format_raw)));
+        return self.forwarder.presentGuestFrontBuffer(
+            state,
+            source,
+            width,
+            height,
+            tiled,
+            endian,
+            format,
+            guest_swap_observed,
+        );
     }
 
     fn boundaryTraceEnabled(self: *Bridge) bool {

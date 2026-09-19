@@ -172,6 +172,27 @@ pub fn tiledOffset2D(x: u32, y: u32, pitch: u32, bytes_per_block_log2: u5) u32 {
     return @intCast(mixed);
 }
 
+/// The same address calculation written in the form used by Xenia's
+/// `TiledOffset2D` reference: outer/inner block address followed by the
+/// bank/pipe swizzle. Keeping this test oracle separate from the production
+/// transcription makes an algebraically plausible but incorrectly grouped
+/// bit expression fail loudly instead of producing a sheared image.
+fn xeniaTiledOffset2DReference(x: u32, y: u32, pitch: u32, bytes_per_block_log2: u5) u32 {
+    const aligned_pitch = alignPitch(pitch);
+    const outer_blocks = (((y >> 5) * (aligned_pitch >> 5)) + (x >> 5)) << 6;
+    const inner_blocks = (((y >> 1) & 0b111) << 3) | (x & 0b111);
+    const outer_inner_bytes = (outer_blocks | inner_blocks) << bytes_per_block_log2;
+    const bank = (y >> 4) & 1;
+    const pipe = ((x >> 3) & 3) ^ (((y >> 3) & 1) << 1);
+    return ((y & 1) << 4) |
+        (pipe << 6) |
+        (bank << 11) |
+        (outer_inner_bytes & 0xF) |
+        (((outer_inner_bytes >> 4) & 1) << 5) |
+        (((outer_inner_bytes >> 5) & 7) << 8) |
+        ((outer_inner_bytes >> 8) << 12);
+}
+
 /// Byte offset of a block within a tiled 3D surface (or array texture).
 ///
 /// Xenos volume textures use 32×32×4 tiles.  This is the corresponding
@@ -461,6 +482,23 @@ test "the tiled address function is injective across a tile" {
     // Every block in the tile is the destination of exactly one pixel, so the
     // mapping is a permutation and no part of the picture is dropped.
     for (seen) |touched| try std.testing.expect(touched);
+}
+
+test "the 2D tiled address matches Xenia's bank and pipe reference" {
+    const pitches = [_]u32{ 32, 37, 1152, 1153, 1280 };
+    const xs = [_]u32{ 0, 1, 7, 8, 15, 16, 31, 32, 63, 64, 127, 255, 511, 1023, 1151 };
+    const ys = [_]u32{ 0, 1, 7, 8, 15, 16, 31, 32, 63, 64, 127, 255, 639, 719, 735 };
+    for (pitches) |pitch| {
+        for (ys) |y| {
+            for (xs) |x| {
+                if (x >= pitch) continue;
+                try std.testing.expectEqual(
+                    xeniaTiledOffset2DReference(x, y, pitch, 2),
+                    tiledOffset2D(x, y, pitch, 2),
+                );
+            }
+        }
+    }
 }
 
 test "the 2D tiled upper bound covers every block in an unaligned extent" {
