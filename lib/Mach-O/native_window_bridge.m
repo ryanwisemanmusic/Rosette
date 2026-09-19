@@ -9,10 +9,33 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <pthread.h>
 
 static void RosetteMachOUpdateMetalDrawable(void);
 
 @interface RosetteMachOMetalView : NSView <CALayerDelegate>
+@end
+
+// AppKit's plain NSWindow may refuse key status for a window created by a
+// background guest process.  That is harmless for a screenshot-only layer
+// but fatal for the keyboard-backed XInput path: events never reach the view,
+// so the guest sees a permanently connected controller with packet zero.  The
+// subclass opts into normal key/main-window behavior; it does not change the
+// level, activation policy, size lock, or the user's ability to move the
+// window.
+@interface RosetteMachOInputWindow : NSWindow
+@end
+
+@implementation RosetteMachOInputWindow
+
+- (BOOL)canBecomeKeyWindow {
+  return YES;
+}
+
+- (BOOL)canBecomeMainWindow {
+  return YES;
+}
+
 @end
 
 @implementation RosetteMachOMetalView
@@ -28,6 +51,30 @@ static void RosetteMachOUpdateMetalDrawable(void);
   // the function is owner-aware and therefore never fights a live Vulkan
   // swapchain.
   RosetteMachOUpdateMetalDrawable();
+}
+
+- (BOOL)acceptsFirstResponder {
+  return YES;
+}
+
+- (BOOL)becomeFirstResponder {
+  return YES;
+}
+
+- (void)mouseDown:(NSEvent *)event {
+  NSWindow *window = self.window;
+  if (window != nil) {
+    // A content click is the user's explicit request to interact. This is
+    // deliberately not done during creation: the emulator may start behind
+    // another application, but clicking it must behave like any normal Cocoa
+    // window and make keyboard delivery possible.
+    if (!window.isKeyWindow) {
+      [NSApp activateIgnoringOtherApps:NO];
+      [window makeKeyAndOrderFront:nil];
+    }
+    [window makeFirstResponder:self];
+  }
+  [super mouseDown:event];
 }
 
 @end
@@ -66,6 +113,7 @@ static uint32_t g_drawable_contract_height;
 static uint64_t g_window_size_lock_repairs;
 static uint64_t g_window_size_lock_refusals;
 static uint64_t g_fullscreen_lock_refusals;
+static uint64_t g_window_hide_refusals;
 static BOOL g_reported_placement_policy;
 // CPU readback preview is a separate Cocoa window, never another consumer of
 // MoltenVK's CAMetalLayer. Closing it must not become a guest WM_QUIT.
@@ -75,6 +123,104 @@ static NSImageView *g_readback_exposure_view;
 static BOOL g_readback_closed;
 static NSString *g_readback_directory;
 static uint64_t g_readback_saved;
+
+// Keyboard-to-controller state is deliberately a tiny host-side model. The
+// guest sees only the value packet copied by the Zig callback; AppKit objects,
+// NSEvents and the lock never cross that boundary. The event pump owns all
+// mutations, while XInput/Xam polls may arrive from a guest worker thread.
+static pthread_mutex_t g_keyboard_lock = PTHREAD_MUTEX_INITIALIZER;
+static BOOL g_keyboard_keys[128];
+static BOOL g_keyboard_window_available;
+static BOOL g_keyboard_focused;
+static uint32_t g_keyboard_packet;
+static uint64_t g_keyboard_key_down_events;
+static uint64_t g_keyboard_key_up_events;
+static uint64_t g_keyboard_snapshot_reads;
+static uint64_t g_keyboard_focus_gain_events;
+static uint64_t g_keyboard_focus_loss_events;
+static uint64_t g_keyboard_rejected_key_events;
+static uint32_t g_keyboard_last_key_code;
+static BOOL g_reported_keyboard_mapping;
+
+static void RosetteMachOClearKeyboardStateLocked(void) {
+  memset(g_keyboard_keys, 0, sizeof(g_keyboard_keys));
+}
+
+static void RosetteMachOUpdateKeyboardFocusOnMainThread(void) {
+  if (!g_window) {
+    pthread_mutex_lock(&g_keyboard_lock);
+    if (g_keyboard_focused) {
+      ++g_keyboard_focus_loss_events;
+      ++g_keyboard_packet;
+    }
+    g_keyboard_window_available = NO;
+    g_keyboard_focused = NO;
+    RosetteMachOClearKeyboardStateLocked();
+    pthread_mutex_unlock(&g_keyboard_lock);
+    return;
+  }
+
+  const BOOL focused = g_window.isKeyWindow;
+  pthread_mutex_lock(&g_keyboard_lock);
+  if (focused && !g_keyboard_focused) {
+    ++g_keyboard_focus_gain_events;
+    ++g_keyboard_packet;
+  }
+  if (!focused && g_keyboard_focused) {
+    // AppKit may not deliver key-up events after focus leaves the window. Do
+    // not leak a stuck virtual button into the next foreground interval.
+    ++g_keyboard_focus_loss_events;
+    ++g_keyboard_packet;
+    RosetteMachOClearKeyboardStateLocked();
+  }
+  g_keyboard_window_available = YES;
+  g_keyboard_focused = focused;
+  pthread_mutex_unlock(&g_keyboard_lock);
+}
+
+static void RosetteMachOApplyKeyboardEvent(NSEvent *event, BOOL down) {
+  if (!event || !g_window || event.window != g_window) {
+    pthread_mutex_lock(&g_keyboard_lock);
+    ++g_keyboard_rejected_key_events;
+    pthread_mutex_unlock(&g_keyboard_lock);
+    return;
+  }
+  const NSUInteger key_code = event.keyCode;
+  if (key_code >= 128u) {
+    pthread_mutex_lock(&g_keyboard_lock);
+    ++g_keyboard_rejected_key_events;
+    pthread_mutex_unlock(&g_keyboard_lock);
+    return;
+  }
+  pthread_mutex_lock(&g_keyboard_lock);
+  g_keyboard_last_key_code = (uint32_t)key_code;
+  const BOOL was_down = g_keyboard_keys[key_code];
+  if (down) {
+    // Holding a key produces AppKit repeat events; a controller packet should
+    // change on the transition, not on every repeat notification.
+    if (!was_down) {
+      g_keyboard_keys[key_code] = YES;
+      ++g_keyboard_packet;
+      ++g_keyboard_key_down_events;
+    }
+  } else if (was_down) {
+    g_keyboard_keys[key_code] = NO;
+    ++g_keyboard_packet;
+    ++g_keyboard_key_up_events;
+  }
+  pthread_mutex_unlock(&g_keyboard_lock);
+}
+
+static BOOL RosetteMachOKeyboardKeyDownLocked(NSUInteger key_code) {
+  return key_code < 128u && g_keyboard_keys[key_code];
+}
+
+static int16_t RosetteMachOAxisLocked(NSUInteger negative_key, NSUInteger positive_key) {
+  const BOOL negative = RosetteMachOKeyboardKeyDownLocked(negative_key);
+  const BOOL positive = RosetteMachOKeyboardKeyDownLocked(positive_key);
+  if (negative == positive) return 0;
+  return negative ? (int16_t)-32767 : (int16_t)32767;
+}
 
 @interface RosetteReadbackWindowDelegate : NSObject <NSWindowDelegate>
 @end
@@ -318,7 +464,13 @@ static void RosetteMachOShowWindowOnMainThread(const char *reason) {
   }
   // Only creation or an explicit guest ShowWindow reaches here. Neither
   // event is permission to activate over the user's currently focused app.
-  [g_window orderFront:nil];
+  // `orderFront:` is ignored for a background application on some AppKit
+  // paths, which left the swapchain fully alive but the host window absent
+  // from the screen. `orderFrontRegardless` performs the non-activating
+  // ordering operation we need: it does not make the window always-on-top,
+  // key, or immovable, and the user can still put another application above
+  // it normally.
+  [g_window orderFrontRegardless];
   RosetteMachOPlaceWindowSafely();
   RosetteMachOUpdateMetalDrawable();
   ++g_foreground_reassertions;
@@ -327,8 +479,13 @@ static void RosetteMachOShowWindowOnMainThread(const char *reason) {
   if (sparse_report) {
     fprintf(stderr,
             "macho-processor: AppKit window shown: reason=%s count=%llu "
-            "level=normal activation=unchanged occlusion_policy=user_owned\n",
-            reason ? reason : "unspecified", (unsigned long long)count);
+            "level=normal ordering=front_regardless activation=unchanged "
+            "visible=%d on_screen=%d key=%d occlusion=%lu "
+            "occlusion_policy=user_owned\n",
+            reason ? reason : "unspecified", (unsigned long long)count,
+            g_window.isVisible ? 1 : 0, g_window.screen != nil ? 1 : 0,
+            g_window.isKeyWindow ? 1 : 0,
+            (unsigned long)g_window.occlusionState);
   }
 }
 
@@ -609,10 +766,10 @@ static BOOL RosetteMachOEnsureWindowOnMainThread(uint32_t width,
   const NSWindowStyleMask style = NSWindowStyleMaskTitled |
                                   NSWindowStyleMaskClosable |
                                   NSWindowStyleMaskMiniaturizable;
-  g_window = [[NSWindow alloc] initWithContentRect:content_rect
-                                         styleMask:style
-                                           backing:NSBackingStoreBuffered
-                                             defer:NO];
+  g_window = [[RosetteMachOInputWindow alloc] initWithContentRect:content_rect
+                                                          styleMask:style
+                                                            backing:NSBackingStoreBuffered
+                                                              defer:NO];
   if (!g_window) {
     return NO;
   }
@@ -673,6 +830,10 @@ static BOOL RosetteMachOEnsureWindowOnMainThread(uint32_t width,
   g_metal_layer.allowsNextDrawableTimeout = YES;
   g_metal_layer.maximumDrawableCount = 3;
   g_window.contentView = g_view;
+  g_window.initialFirstResponder = g_view;
+  pthread_mutex_lock(&g_keyboard_lock);
+  g_keyboard_window_available = YES;
+  pthread_mutex_unlock(&g_keyboard_lock);
   RosetteMachOPlaceWindowSafely();
   RosetteMachOUpdateMetalDrawable();
   RosetteMachOShowWindowOnMainThread("created");
@@ -777,8 +938,21 @@ int rosette_macho_native_window_hide(void) {
   @autoreleasepool {
     RosetteMachORunOnMainThreadSync(^{
       if (RosetteMachOEnsureWindowOnMainThread(g_width, g_height, nil)) {
-        [g_window orderOut:nil];
-        result = YES;
+        // The Xenia-facing window is a persistent diagnostic/presentation
+        // surface. A guest hide request is not allowed to erase a valid
+        // frame chain and leave Vulkan reporting successful presents to an
+        // invisible drawable. This does not pin the window above other apps:
+        // the user can still background it, move it, minimize it, or close
+        // the application normally.
+        ++g_window_hide_refusals;
+        const uint64_t count = g_window_hide_refusals;
+        if (count <= 4u || (count & (count - 1u)) == 0u) {
+          fprintf(stderr,
+                  "macho-processor: WINDOW VISIBILITY LOCK: decision=refused operation=hide refusal_count=%llu action=keep the persistent Xenia surface ordered; backgrounding and user movement remain allowed\n",
+                  (unsigned long long)count);
+        }
+        RosetteMachOShowWindowOnMainThread("hide_refused_persistent_surface");
+        result = NO;
       }
     });
   }
@@ -1061,6 +1235,63 @@ uint64_t rosette_macho_native_window_present_frame(
   return presented;
 }
 
+int rosette_macho_native_window_read_controller_state(
+    RosetteMachOKeyboardControllerState *out) {
+  if (!out) {
+    return 0;
+  }
+  memset(out, 0, sizeof(*out));
+  pthread_mutex_lock(&g_keyboard_lock);
+  ++g_keyboard_snapshot_reads;
+  out->packet_number = g_keyboard_packet;
+  out->connected = g_keyboard_window_available ? 1u : 0u;
+  out->focused = g_keyboard_focused ? 1u : 0u;
+  out->key_down_events = g_keyboard_key_down_events;
+  out->key_up_events = g_keyboard_key_up_events;
+  out->snapshot_reads = g_keyboard_snapshot_reads;
+  out->focus_gain_events = g_keyboard_focus_gain_events;
+  out->focus_loss_events = g_keyboard_focus_loss_events;
+  out->rejected_key_events = g_keyboard_rejected_key_events;
+  out->last_key_code = g_keyboard_last_key_code;
+  out->input_contract_version = 1u;
+  if (g_keyboard_window_available && g_keyboard_focused) {
+    // Left stick: WASD. XInput's positive Y is up.
+    out->thumb_lx = RosetteMachOAxisLocked(0u, 2u);   // A / D
+    out->thumb_ly = RosetteMachOAxisLocked(1u, 13u);  // S / W
+    // Right stick: IJKL.
+    out->thumb_rx = RosetteMachOAxisLocked(38u, 37u); // J / L
+    out->thumb_ry = RosetteMachOAxisLocked(40u, 34u); // K / I
+
+    // D-pad arrows.
+    if (RosetteMachOKeyboardKeyDownLocked(126u)) out->buttons |= 0x0001u; // up
+    if (RosetteMachOKeyboardKeyDownLocked(125u)) out->buttons |= 0x0002u; // down
+    if (RosetteMachOKeyboardKeyDownLocked(123u)) out->buttons |= 0x0004u; // left
+    if (RosetteMachOKeyboardKeyDownLocked(124u)) out->buttons |= 0x0008u; // right
+    if (RosetteMachOKeyboardKeyDownLocked(36u)) out->buttons |= 0x0010u;  // start
+    if (RosetteMachOKeyboardKeyDownLocked(51u)) out->buttons |= 0x0020u;  // back
+    if (RosetteMachOKeyboardKeyDownLocked(12u)) out->buttons |= 0x0100u;  // LB (Q)
+    if (RosetteMachOKeyboardKeyDownLocked(15u)) out->buttons |= 0x0200u;  // RB
+    if (RosetteMachOKeyboardKeyDownLocked(53u)) out->buttons |= 0x0400u;  // guide
+    if (RosetteMachOKeyboardKeyDownLocked(49u)) out->buttons |= 0x1000u;  // A
+    if (RosetteMachOKeyboardKeyDownLocked(8u)) out->buttons |= 0x2000u;   // B
+    if (RosetteMachOKeyboardKeyDownLocked(7u)) out->buttons |= 0x4000u;   // X
+    if (RosetteMachOKeyboardKeyDownLocked(16u)) out->buttons |= 0x8000u;  // Y
+    if (RosetteMachOKeyboardKeyDownLocked(3u)) out->buttons |= 0x0040u;   // left thumb
+    if (RosetteMachOKeyboardKeyDownLocked(9u)) out->buttons |= 0x0080u;   // right thumb
+    if (RosetteMachOKeyboardKeyDownLocked(6u)) out->left_trigger = 255u;  // Z
+    if (RosetteMachOKeyboardKeyDownLocked(14u)) out->right_trigger = 255u; // E
+  }
+  const BOOL available = g_keyboard_window_available;
+  pthread_mutex_unlock(&g_keyboard_lock);
+
+  if (!g_reported_keyboard_mapping && available) {
+    fprintf(stderr,
+            "macho-processor: INPUT BRIDGE: virtual keyboard controller active; mapping=WASD:left-stick IJKL:right-stick arrows:dpad space:A C:B X:X Y:Y return:Start delete:Back Q:LB R:RB F:left-thumb V:right-thumb Z/LT E/RT escape:Guide; controller is connected while the window exists and reports zero state when unfocused\n");
+    g_reported_keyboard_mapping = YES;
+  }
+  return available ? 1 : 0;
+}
+
 uint32_t rosette_macho_native_window_pump_events(void) {
   __block uint32_t count = 0;
   @autoreleasepool {
@@ -1077,8 +1308,15 @@ uint32_t rosette_macho_native_window_pump_events(void) {
         if (!event) {
           break;
         }
+        if (event.type == NSEventTypeKeyDown) {
+          RosetteMachOApplyKeyboardEvent(event, YES);
+        } else if (event.type == NSEventTypeKeyUp) {
+          RosetteMachOApplyKeyboardEvent(event, NO);
+        }
         [g_application sendEvent:event];
+        RosetteMachOUpdateKeyboardFocusOnMainThread();
       }
+      RosetteMachOUpdateKeyboardFocusOnMainThread();
       [g_application updateWindows];
       RosetteMachOUpdateMetalDrawable();
       g_events_pumped += count;
@@ -1282,11 +1520,15 @@ uint32_t rosette_macho_native_window_capture_frame(
       frame->width > (64ull * 1024 * 1024) / 4 / frame->height ||
       frame->length != (uint64_t)frame->width * frame->height * 4 ||
       !(frame->format == 37 || frame->format == 43 ||
-        frame->format == 44 || frame->format == 50) || (frame->flags & ~15u)) {
+        frame->format == 44 || frame->format == 50) || (frame->flags & ~31u)) {
     return 4;
   }
   @autoreleasepool {
     uint32_t result = 0;
+    const BOOL numbered = (frame->flags & 16u) && !(frame->flags & 8u);
+    // Never read beyond the legacy 128-byte packet without the extension
+    // bit. Offline RGB replay cannot fabricate a native picture epoch.
+    const uint64_t contentFrame = numbered ? frame->content_frame : 0;
     // Copy before returning: the caller reuses its mapped Vulkan staging area.
     NSBitmapImageRep *opaque = RosetteReadbackBitmap(frame, YES);
     if (!opaque) return 4;
@@ -1297,7 +1539,7 @@ uint32_t rosette_macho_native_window_capture_frame(
       NSString *directory = RosetteReadbackDirectory();
       NSBitmapImageRep *raw = RosetteReadbackBitmap(frame, NO);
       NSString *stem = [NSString stringWithFormat:
-          @"frame-%06llu-image-%016llx", (unsigned long long)frame->frame,
+          (frame->flags & 16u) ? @"present-%06llu-image-%016llx" : @"frame-%06llu-image-%016llx", (unsigned long long)frame->frame,
           (unsigned long long)frame->image];
       NSString *path = [directory stringByAppendingPathComponent:stem];
       NSError *error = nil;
@@ -1307,6 +1549,9 @@ uint32_t rosette_macho_native_window_capture_frame(
       NSDictionary *metadata = @{
         @"source": (frame->flags & 8u) ? @"offline CPU replay; no Vulkan completion verified" : @"completed acquired swapchain image before WSI",
         @"frame": @(frame->frame), @"swapchain": @(frame->swapchain),
+        @"raw_present_or_readback_id": @(frame->frame),
+        @"content_frame": @(contentFrame),
+        @"content_numbering": numbered ? @"native-completed content since first observed RGB detail; zero waits for picture; not game FPS or scanout proof" : @"unclassified/offline readback; no native picture epoch",
         @"image": @(frame->image), @"width": @(frame->width),
         @"height": @(frame->height), @"vk_format": @(frame->format),
         @"raw_byte_hash_fnv1a64": [NSString stringWithFormat:@"%016llx", (unsigned long long)frame->hash],
@@ -1350,13 +1595,19 @@ uint32_t rosette_macho_native_window_capture_frame(
         if (!g_readback_window) {
           g_readback_window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 960, 300)
               styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                        NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
+                        NSWindowStyleMaskMiniaturizable
               backing:NSBackingStoreBuffered defer:NO];
           g_readback_window.releasedWhenClosed = NO;
           g_readback_window.level = NSNormalWindowLevel;
           g_readback_window.hidesOnDeactivate = NO;
           g_readback_window.collectionBehavior =
               NSWindowCollectionBehaviorDefault;
+          // The debug surface is movable, but its split preview geometry is
+          // deliberately fixed until the presentation contract is repaired.
+          // Resizing it changes neither the guest drawable nor the readback;
+          // it only makes the diagnostic comparison harder to interpret.
+          g_readback_window.contentMinSize = NSMakeSize(960.0, 300.0);
+          g_readback_window.contentMaxSize = NSMakeSize(960.0, 300.0);
           g_readback_window.tabbingMode = NSWindowTabbingModeDisallowed;
           g_readback_delegate = [RosetteReadbackWindowDelegate new];
           g_readback_window.delegate = g_readback_delegate;
@@ -1372,7 +1623,11 @@ uint32_t rosette_macho_native_window_capture_frame(
           g_readback_window.contentView = comparison;
           [g_readback_window center];
           // Do not steal the keyboard focus or mutate the guest window/layer.
-          [g_readback_window orderFront:nil];
+          // As with the guest window, the preview may be created while the
+          // process is backgrounded. Order it without activating the app so
+          // the debug surface is actually observable while retaining normal
+          // user-controlled stacking and movement.
+          [g_readback_window orderFrontRegardless];
           fprintf(stderr, "macho-processor: COCOA READBACK: independent preview opened; "
               "no CAMetalLayer drawables consumed; RGB alpha forced opaque\n");
         }
@@ -1382,9 +1637,12 @@ uint32_t rosette_macho_native_window_capture_frame(
         NSImage *exposureImage = [[NSImage alloc] initWithSize:NSMakeSize(frame->width, frame->height)];
         if (exposed) [exposureImage addRepresentation:exposed];
         g_readback_exposure_view.image = exposed ? exposureImage : image;
+        NSString *numbering = numbered ? (contentFrame ?
+            [NSString stringWithFormat:@"content frame %llu", (unsigned long long)contentFrame] :
+            @"waiting for picture — frame 0") : @"unclassified readback";
         g_readback_window.title = [NSString stringWithFormat:
-            @"Rosette acquired-image RGB — frame %llu | left RAW, right %@ (not WSI)",
-            (unsigned long long)frame->frame, exposed ? @"x16 DIAGNOSTIC" : @"RAW"];
+            @"Rosette acquired-image RGB — %@ | raw present %llu | RAW / %@ (not WSI)",
+            numbering, (unsigned long long)frame->frame, exposed ? @"x16 DIAGNOSTIC" : @"RAW"];
         [g_readback_view displayIfNeeded];
         previewed = g_readback_window && g_readback_view;
       });
@@ -1424,6 +1682,7 @@ void rosette_macho_native_window_shutdown(void) {
       g_fullscreen = NO;
       g_diagnostic_frames_presented = 0;
       g_guest_frames_presented = 0;
+      g_window_hide_refusals = 0;
       g_foreground_reassertions = 0;
       g_window_placement_repairs = 0;
       g_window_placement_repair_failures = 0;
@@ -1431,6 +1690,20 @@ void rosette_macho_native_window_shutdown(void) {
       g_window_size_lock_refusals = 0;
       g_fullscreen_lock_refusals = 0;
       g_reported_placement_policy = NO;
+      pthread_mutex_lock(&g_keyboard_lock);
+      g_keyboard_window_available = NO;
+      g_keyboard_focused = NO;
+      RosetteMachOClearKeyboardStateLocked();
+      g_keyboard_packet = 0;
+      g_keyboard_key_down_events = 0;
+      g_keyboard_key_up_events = 0;
+      g_keyboard_snapshot_reads = 0;
+      g_keyboard_focus_gain_events = 0;
+      g_keyboard_focus_loss_events = 0;
+      g_keyboard_rejected_key_events = 0;
+      g_keyboard_last_key_code = 0;
+      pthread_mutex_unlock(&g_keyboard_lock);
+      g_reported_keyboard_mapping = NO;
     });
   }
 }

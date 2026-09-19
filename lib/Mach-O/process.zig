@@ -13511,6 +13511,29 @@ pub const MachOState = struct {
                                 self.gpu_xenos_runtime.swap_count,
                             },
                         );
+                        if (execution.draw_resource_draws != 0) {
+                            const mapping = execution.last_draw_resources;
+                            machoCapturePrint(
+                                "macho-processor: XENOS DRAW RESOURCE MAPPING: draws={d} probes={d} complete={d} unmapped_draws={d} unproven_draws={d} probe_failures(unmapped/unproven)={d}/{d}; last(target_ready/index/vertex/texture)={s}/{s}/{s}/{s} vertex_bindings={d} texture_bindings={d} first_unmapped=0x{x} first_unproven=0x{x}; command memory mapping is independent of these draw-resource probes\n",
+                                .{
+                                    execution.draw_resource_draws,
+                                    execution.draw_resource_probes,
+                                    execution.draws_with_complete_resources,
+                                    execution.draws_with_unmapped_resources,
+                                    execution.draws_with_unproven_resources,
+                                    execution.draw_resources_unmapped,
+                                    execution.draw_resources_unproven,
+                                    if (mapping) |value| if (value.target_ready) "YES" else "NO" else "unknown",
+                                    if (mapping) |value| value.index.label() else "unknown",
+                                    if (mapping) |value| value.vertex.label() else "unknown",
+                                    if (mapping) |value| value.texture.label() else "unknown",
+                                    if (mapping) |value| value.vertex_bindings else 0,
+                                    if (mapping) |value| value.texture_bindings else 0,
+                                    if (mapping) |value| value.first_unmapped_address orelse 0 else 0,
+                                    if (mapping) |value| value.first_unproven_address orelse 0 else 0,
+                                },
+                            );
+                        }
                         if (execution.rectangle_draws != 0) {
                             const route = if (execution.rectangle_backend) |backend| backend.label() else "none";
                             const rejection = if (execution.rectangle_rejection) |reason| reason.label() else "none";
@@ -16257,14 +16280,21 @@ pub const MachOState = struct {
             @enumFromInt(constant.endianness())
         else
             .@"8in32";
-        self.dynamic_forwarder.noteGuestFrontBuffer(host, swap.width, swap.height, tiled, endian, harness_supplied);
+        const format: gpu.xenos_texture.Format = if (resolved)
+            .k_8_8_8_8
+        else if (fetch) |constant|
+            @enumFromInt(constant.format())
+        else
+            .k_8_8_8_8;
+        self.dynamic_forwarder.noteGuestFrontBuffer(host, swap.width, swap.height, tiled, endian, format, harness_supplied);
         if (!self.gpu_frontbuffer_offered) {
             self.gpu_frontbuffer_offered = true;
             machoCapturePrint(
-                "macho-processor: GUEST FRONT BUFFER: console physical 0x{x:0>8} -> 0x{x} extent={d}x{d} tiled={s} endian={s} fetch={s}; the presenter will convert and show these pixels ahead of any emulator Vulkan image, because they are the console's own framebuffer\n",
+                "macho-processor: GUEST FRONT BUFFER: console physical 0x{x:0>8} -> 0x{x} extent={d}x{d} format={s}(raw={d}) tiled={s} endian={s} fetch={s}; the presenter will convert and show these pixels ahead of any emulator Vulkan image, because they are the console's own framebuffer\n",
                 .{
                     swap.frontbuffer_physical_address,                                                                                                                                                                                 host,
                     swap.width,                                                                                                                                                                                                        swap.height,
+                    format.label(),                                                                                                                                                                                                    @intFromEnum(format),
                     if (tiled) "YES" else "NO",                                                                                                                                                                                        endian.label(),
                     if (resolved) "EDRAM RESOLVE (linear RGBA8)" else if (fetch != null) "observed" else "ABSENT (tiling and byte order assumed; a wrong assumption here produces a sheared or colour-swapped picture, not an error)",
                 },

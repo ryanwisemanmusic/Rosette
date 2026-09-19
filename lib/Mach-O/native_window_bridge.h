@@ -86,6 +86,33 @@ typedef struct RosetteMachONativeWindowGeometry {
   uint32_t reserved_screen;
 } RosetteMachONativeWindowGeometry;
 
+// A keyboard-backed virtual XInput/Xam controller. The first sixteen bytes
+// intentionally match XINPUT_STATE; the trailing counters stay on the host
+// side and make an input report actionable without exposing AppKit objects to
+// the guest.
+typedef struct RosetteMachOKeyboardControllerState {
+  uint32_t packet_number;
+  uint16_t buttons;
+  uint8_t left_trigger;
+  uint8_t right_trigger;
+  int16_t thumb_lx;
+  int16_t thumb_ly;
+  int16_t thumb_rx;
+  int16_t thumb_ry;
+  uint32_t connected;
+  uint32_t focused;
+  uint64_t key_down_events;
+  uint64_t key_up_events;
+  uint64_t snapshot_reads;
+  uint64_t focus_gain_events;
+  uint64_t focus_loss_events;
+  uint64_t rejected_key_events;
+  uint32_t last_key_code;
+  uint32_t input_contract_version;
+} RosetteMachOKeyboardControllerState;
+_Static_assert(sizeof(RosetteMachOKeyboardControllerState) == 80,
+               "keyboard controller state must match the Zig input hook");
+
 // The Zig mirror in lib/gpu/window_geometry.zig is filled by writing through
 // a pointer to this type, so the two layouts have to be the same object. A
 // field added on one side and not the other has no compiler that can see
@@ -98,6 +125,8 @@ _Static_assert(sizeof(RosetteMachONativeWindowGeometry) == 232,
 // there is nothing to describe. Safe to call from any thread: the AppKit reads
 // are dispatched to the main thread when necessary.
 int rosette_macho_native_window_describe(RosetteMachONativeWindowGeometry *out);
+int rosette_macho_native_window_read_controller_state(
+    RosetteMachOKeyboardControllerState *out);
 
 int rosette_macho_native_application_ensure(void);
 int rosette_macho_native_window_ensure(uint32_t width, uint32_t height,
@@ -141,6 +170,9 @@ uint64_t rosette_macho_native_window_present_frame(
 // from MoltenVK or counts as a guest/native Vulkan present. flags: PNG=1,
 // independent opaque-RGB Cocoa preview=2, diagnostic +4 EV comparison=4,
 // offline CPU replay (NOT Vulkan completion evidence)=8.
+// Extended picture numbering=16: content_frame is read only with that flag.
+// frame always remains the raw present/readback ID; content_frame=0 waits for
+// a picture. Legacy 128-byte packets do not contain the appended field.
 // Return bits: saved=1, previewed=2,
 // failed=4. A closed preview stays closed; it does not quit the guest.
 typedef struct RosetteMachOReadbackFrame {
@@ -151,11 +183,13 @@ typedef struct RosetteMachOReadbackFrame {
   uint64_t rgb_sum[3];
   uint64_t rgb_different_pixels;
   uint8_t min_rgb[3], max_rgb[3], reserved[2];
+  uint64_t content_frame;
 } RosetteMachOReadbackFrame;
-_Static_assert(sizeof(RosetteMachOReadbackFrame) == 128,
+_Static_assert(sizeof(RosetteMachOReadbackFrame) == 136,
                "readback packet must match Vulkan frame_capture.zig");
 _Static_assert(offsetof(RosetteMachOReadbackFrame, width) == 48 &&
-               offsetof(RosetteMachOReadbackFrame, min_rgb) == 120,
+               offsetof(RosetteMachOReadbackFrame, min_rgb) == 120 &&
+               offsetof(RosetteMachOReadbackFrame, content_frame) == 128,
                "readback packet offsets must match Vulkan frame_capture.zig");
 uint32_t rosette_macho_native_window_capture_frame(
     const RosetteMachOReadbackFrame *frame);
