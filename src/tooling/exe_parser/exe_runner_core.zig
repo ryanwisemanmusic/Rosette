@@ -85,6 +85,32 @@ fn nativePresenterDiagnostic(context: ?*anyopaque, serial: u64, width: u32, heig
     return bridge.presentDiagnostic(serial, width, height, phase);
 }
 
+fn nativePresentGuestFrontBuffer(
+    context: ?*anyopaque,
+    state_pointer: *anyopaque,
+    source: u64,
+    width: u32,
+    height: u32,
+    tiled: c_int,
+    endian_raw: u32,
+    format_raw: u32,
+    guest_swap_observed: c_int,
+) callconv(.c) c_int {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    const bridge = nativeGraphics(context) orelse return 0;
+    const state: *elf_processor_state.ElfState = @ptrCast(@alignCast(state_pointer));
+    return if (bridge.presentGuestFrontBuffer(
+        state,
+        source,
+        width,
+        height,
+        tiled != 0,
+        endian_raw,
+        format_raw,
+        guest_swap_observed != 0,
+    )) 1 else 0;
+}
+
 fn nativeMetalLayerHostPointer(context: ?*anyopaque) callconv(.c) usize {
     const bridge = nativeGraphics(context) orelse return 0;
     return bridge.metalLayerHostPointer();
@@ -220,6 +246,7 @@ fn windowsGraphicsHooks(native_context: ?*anyopaque) pe64_runtime.GraphicsHooks 
         .native_presenter_stage = nativePresenterStage,
         .native_presenter_is_ready = nativePresenterIsReady,
         .native_presenter_present_diagnostic = nativePresenterDiagnostic,
+        .native_present_guest_frontbuffer = nativePresentGuestFrontBuffer,
         .native_vulkan_dispatch = nativeVulkanDispatch,
         .native_metal_layer_host_pointer = nativeMetalLayerHostPointer,
         .native_metal_drawable_owner = nativeMetalDrawableOwner,

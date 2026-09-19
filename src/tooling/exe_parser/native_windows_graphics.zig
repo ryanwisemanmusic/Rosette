@@ -184,6 +184,33 @@ pub const NativeWindowsGraphics = struct {
         return self.presenter.ledger.diagnostic_frames_presented;
     }
 
+    /// Present a console-owned Xenos front buffer through the same native
+    /// presenter that owns the window. The PE processor has already translated
+    /// Xenia's physical address and proved the VdSwap boundary; the bridge
+    /// keeps the conversion and frame provenance inside the Vulkan forwarder.
+    pub fn presentGuestFrontBuffer(
+        self: *NativeWindowsGraphics,
+        state: anytype,
+        source: u64,
+        width: u32,
+        height: u32,
+        tiled: bool,
+        endian_raw: u32,
+        format_raw: u32,
+        guest_swap_observed: bool,
+    ) bool {
+        return self.guest_vulkan.presentGuestFrontBuffer(
+            state,
+            source,
+            width,
+            height,
+            tiled,
+            endian_raw,
+            format_raw,
+            guest_swap_observed,
+        );
+    }
+
     pub fn shutdown(self: *NativeWindowsGraphics) void {
         self.guest_vulkan.deinit();
         self.presenter.shutdown();
