@@ -4,6 +4,8 @@ const guest_sleep = @import("scheduler").guest_sleep;
 const rosette_gpu = @import("gpu");
 const abi = @import("gpu").vulkan.abi;
 const marshal = @import("gpu").vulkan.marshal;
+const frame_capture = @import("gpu").vulkan.frame_capture;
+const transport_timing = @import("gpu").vulkan.transport_timing;
 const tier_consistency = @import("gpu").vulkan.tier_consistency;
 const guest_memory_geometry = @import("guest_memory_geometry.zig");
 const machoCapturePrint = @import("event_log").machoCapturePrint;
@@ -45,6 +47,41 @@ extern fn dlopen(path: ?[*:0]const u8, mode: c_int) ?*anyopaque;
 extern fn dlsym(handle: *anyopaque, symbol: [*:0]const u8) ?*anyopaque;
 extern fn dlclose(handle: *anyopaque) c_int;
 extern fn dlerror() ?[*:0]const u8;
+
+const HostWindowDescribeFn = *const fn (*rosette_gpu.WindowGeometry) callconv(.c) c_int;
+
+const HostWindowDescribeResolver = struct {
+    var describe: ?HostWindowDescribeFn = null;
+    var resolved: bool = false;
+
+    fn resolve() void {
+        if (resolved) return;
+        resolved = true;
+        // RTLD_DEFAULT searches every image already loaded in this process,
+        // which is where the AppKit bridge lives when it is linked.
+        const rtld_default: *anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -2))));
+        if (dlsym(rtld_default, "rosette_macho_native_window_describe")) |address| {
+            describe = @ptrCast(@alignCast(address));
+        }
+    }
+};
+
+const HostFrameCaptureFn = *const fn (*const frame_capture.Frame) callconv(.c) u32;
+const HostFrameCaptureResolver = struct {
+    var callback: ?HostFrameCaptureFn = null;
+    var resolved: bool = false;
+
+    fn resolve() ?HostFrameCaptureFn {
+        if (resolved) return callback;
+        resolved = true;
+        if (builtin.os.tag != .macos) return null;
+        const rtld_default: *anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -2))));
+        if (dlsym(rtld_default, "rosette_macho_native_window_capture_frame")) |address| {
+            callback = @ptrCast(@alignCast(address));
+        }
+        return callback;
+    }
+};
 
 pub const Signature = enum {
     no_args_i32,
@@ -416,6 +453,17 @@ const VulkanMemoryAllocation = struct {
     mapped_offset: u64 = 0,
     host_mapped_ptr: ?*anyopaque = null,
     host_mapped_size: u64 = 0,
+    memory_flags: u32 = 0,
+    memory_flags_known: bool = false,
+    native_alias_base: u64 = 0,
+    // Last CPU-visible contents. Changed-byte publication never overwrites
+    // unrelated GPU writes with an unchanged guest shadow.
+    shadow_baseline: ?[]u8 = null,
+
+    fn releaseBaseline(self: *VulkanMemoryAllocation) void {
+        if (self.shadow_baseline) |bytes| std.heap.c_allocator.free(bytes);
+        self.shadow_baseline = null;
+    }
 };
 
 /// Overflow-safe half-open range containment used at every synthetic/native
@@ -455,16 +503,82 @@ const VulkanCallTrace = struct {
     arg1: u64 = 0,
 };
 
-const MAX_VULKAN_RESOURCES = 128;
+const DescriptorBindRejectReason = enum(u8) {
+    none,
+    device_lost,
+    command_buffer_unmapped,
+    pipeline_layout_unmapped,
+    set_count_exceeds_limit,
+    descriptor_set_array_unreadable,
+    descriptor_set_unmapped,
+    dynamic_offset_count_exceeds_limit,
+    dynamic_offset_array_unreadable,
+    native_entry_point_missing,
+    count,
+};
+
+const DescriptorBindAdmission = struct {
+    entries: u64 = 0,
+    forwarded: u64 = 0,
+    rejected: u64 = 0,
+    rejected_by_reason: [@intFromEnum(DescriptorBindRejectReason.count)]u64 =
+        [_]u64{0} ** @intFromEnum(DescriptorBindRejectReason.count),
+    last_reason: DescriptorBindRejectReason = .none,
+    last_command_buffer: u64 = 0,
+    last_layout: u64 = 0,
+    last_set_count: u64 = 0,
+    last_sets: u64 = 0,
+    last_dynamic_count: u64 = 0,
+    last_dynamic_offsets: u64 = 0,
+    last_unmapped_handle: u64 = 0,
+};
+
+const VulkanCommandRejectReason = enum {
+    none,
+    device_lost,
+    command_buffer_unmapped,
+    native_entry_point_missing,
+    argument_marshalling_refused,
+    unimplemented_abi,
+};
+
+const VulkanCommandAdmission = struct {
+    entries: u64 = 0,
+    forwarded: u64 = 0,
+    rejected: u64 = 0,
+    last_reason: VulkanCommandRejectReason = .none,
+    last_refusal_line: u32 = 0,
+    /// Six SysV registers followed by the first six stack arguments. These
+    /// are the typed, normalized guest values, never real driver pointers.
+    last_arguments: [12]u64 = @splat(0),
+};
+
+/// Live image/buffer provenance records. This is a live-object budget, not a
+/// lifetime allocation count: vkDestroyImage/vkDestroyBuffer return slots to
+/// the table. The old 128-entry table was exhausted by Halo 3 while the real
+/// Vulkan driver was still accepting image creation, so Rosette started
+/// returning unwritten guest handles and the first later draw could not be
+/// trusted. Keep the bound finite for diagnosability, but make it large enough
+/// for a long-lived title's scene and staging-resource churn.
+const MAX_VULKAN_RESOURCES = 4096;
 const MAX_REAL_MEMORY = 512;
-const MAX_REAL_BUFFERS = 1024;
-const MAX_REAL_IMAGES = 1024;
+// These maps must not become the next lower ceiling than the provenance
+// table. A successful native create is only useful while both the native
+// reverse map and the detailed resource record can be retained.
+const MAX_REAL_BUFFERS = MAX_VULKAN_RESOURCES;
+const MAX_REAL_IMAGES = MAX_VULKAN_RESOURCES;
 const MAX_REAL_SAMPLERS = 256;
 const MAX_REAL_FENCES = 256;
 const MAX_REAL_SEMAPHORES = 256;
 const MAX_REAL_RENDER_PASSES = 256;
 const MAX_REAL_FRAMEBUFFERS = 256;
-const MAX_REAL_PIPELINES = 1024;
+// Halo 3 has already produced more than 2,000 graphics-pipeline objects in a
+// single run.  Keep the native reverse map and the detailed pipeline records
+// above that observed live/cumulative working set so a valid pipeline does not
+// become an "unknown_pipeline" draw merely because the old 1,024-row table
+// was the first bounded structure to fill.  This remains bounded and is much
+// smaller than the resource provenance budget.
+const MAX_REAL_PIPELINES = 4096;
 const MAX_REAL_SHADER_MODULES = 1024;
 /// One row per distinct `vkCreate*`/`vkAllocate*` entry point the guest
 /// reaches. Bounded because the set is bounded by the API, not by the run.
@@ -493,12 +607,18 @@ const VulkanCreateLedgerEntry = struct {
 const MAX_REAL_DESCRIPTOR_SET_LAYOUTS = 256;
 const MAX_REAL_PIPELINE_LAYOUTS = 256;
 const MAX_REAL_DESCRIPTOR_POOLS = 64;
-const MAX_REAL_DESCRIPTOR_SETS = 1024;
+// Descriptor sets are the one object family a long-running title can create
+// continuously without creating a new pool every frame.  The old 1024-entry
+// ceiling was reached by the overnight run even though the native driver was
+// still accepting allocations.  Keep the reverse map bounded, but give the
+// guest enough room for a realistic long-lived pool; exhaustion is still
+// converted to VK_ERROR_OUT_OF_HOST_MEMORY and reported rather than panicking.
+const MAX_REAL_DESCRIPTOR_SETS = 16_384;
 const MAX_REAL_COMMAND_POOLS = 32;
 const MAX_REAL_COMMAND_BUFFERS = 256;
 const MAX_REAL_SWAPCHAINS = 16;
-const MAX_REAL_BUFFER_VIEWS = 256;
-const MAX_REAL_IMAGE_VIEWS = 1024;
+const MAX_REAL_BUFFER_VIEWS = 4096;
+const MAX_REAL_IMAGE_VIEWS = 4096;
 const MAX_REAL_QUERY_POOLS = 256;
 const MAX_REAL_PIPELINE_CACHES = 32;
 const MAX_REAL_DESCRIPTOR_UPDATE_TEMPLATES = 128;
@@ -553,6 +673,19 @@ const RealHandle = u64;
 const HandleMap = struct {
     synthetic: u64 = 0,
     real: RealHandle = 0,
+    /// Descriptor sets are children of a descriptor pool.  Keeping the guest
+    /// pool token on the mapping itself lets pool reset/destruction reclaim
+    /// every child even when the optional provenance record was not available.
+    /// Other map families leave this zero.
+    owner: u64 = 0,
+
+    pub const InsertResult = enum {
+        inserted,
+        existing,
+        replaced,
+        invalid,
+        exhausted,
+    };
 
     pub fn findSlot(self: []HandleMap, synthetic: u64) ?*HandleMap {
         if (synthetic == 0) return null;
@@ -570,40 +703,73 @@ const HandleMap = struct {
         return null;
     }
 
-    pub fn alloc(self: []HandleMap, synthetic: u64, real: RealHandle) void {
-        if (synthetic == 0 or real == 0) @panic("invalid Vulkan handle mapping");
-        for (self) |*entry| {
-            if (entry.synthetic != 0) continue;
-            entry.* = .{ .synthetic = synthetic, .real = real };
-            return;
-        }
-        @panic("Vulkan handle map exhausted");
+    pub fn alloc(self: []HandleMap, synthetic: u64, real: RealHandle) InsertResult {
+        return HandleMap.allocOrFindOwned(self, synthetic, real, 0);
     }
 
-    pub fn allocOrFind(self: []HandleMap, synthetic: u64, real: RealHandle) void {
-        if (synthetic == 0 or real == 0) @panic("invalid Vulkan handle mapping");
+    pub fn allocOrFind(self: []HandleMap, synthetic: u64, real: RealHandle) InsertResult {
+        return HandleMap.allocOrFindOwned(self, synthetic, real, 0);
+    }
+
+    pub fn allocOrFindOwned(self: []HandleMap, synthetic: u64, real: RealHandle, owner: u64) InsertResult {
+        // This used to panic from a live guest allocation path.  A bounded
+        // bridge table is a resource contract, not a reason to take down the
+        // whole process; callers turn the result into a Vulkan failure and
+        // keep the run's diagnostics alive.
+        if (synthetic == 0 or real == 0) return .invalid;
         for (self) |*entry| {
             if (entry.synthetic == synthetic) {
+                const unchanged = entry.real == real and entry.owner == owner;
                 entry.real = real;
-                return;
+                entry.owner = owner;
+                return if (unchanged) .existing else .replaced;
             }
         }
         for (self) |*entry| {
             if (entry.synthetic == 0) {
-                entry.* = .{ .synthetic = synthetic, .real = real };
-                return;
+                entry.* = .{ .synthetic = synthetic, .real = real, .owner = owner };
+                return .inserted;
             }
         }
-        @panic("Vulkan handle map exhausted");
+        return .exhausted;
     }
 
-    pub fn remove(self: []HandleMap, synthetic: u64) void {
+    pub fn freeSlots(self: []const HandleMap) usize {
+        var free: usize = 0;
+        for (self) |entry| {
+            if (entry.synthetic == 0) free += 1;
+        }
+        return free;
+    }
+
+    pub fn occupied(self: []const HandleMap) usize {
+        return self.len - HandleMap.freeSlots(self);
+    }
+
+    /// Remove all mappings owned by one parent object.  This is deliberately
+    /// generic so a pool reset can invalidate descriptor-set mappings without
+    /// relying on a second, best-effort side table.
+    pub fn removeOwned(self: []HandleMap, owner: u64) usize {
+        if (owner == 0) return 0;
+        var removed: usize = 0;
+        for (self) |*entry| {
+            if (entry.synthetic != 0 and entry.owner == owner) {
+                entry.* = .{};
+                removed += 1;
+            }
+        }
+        return removed;
+    }
+
+    pub fn remove(self: []HandleMap, synthetic: u64) bool {
+        if (synthetic == 0) return false;
         for (self) |*entry| {
             if (entry.synthetic == synthetic) {
                 entry.* = .{};
-                return;
+                return true;
             }
         }
+        return false;
     }
 };
 
@@ -879,6 +1045,7 @@ const RealVulkanState = struct {
     descriptor_update_template_map: [MAX_REAL_DESCRIPTOR_UPDATE_TEMPLATES]HandleMap = [_]HandleMap{.{}} ** MAX_REAL_DESCRIPTOR_UPDATE_TEMPLATES,
     descriptor_update_template_records: [MAX_REAL_DESCRIPTOR_UPDATE_TEMPLATES]DescriptorUpdateTemplateRecord = [_]DescriptorUpdateTemplateRecord{.{}} ** MAX_REAL_DESCRIPTOR_UPDATE_TEMPLATES,
     queue_map: [MAX_REAL_QUEUES]HandleMap = [_]HandleMap{.{}} ** MAX_REAL_QUEUES,
+    queue_family_indices: [MAX_REAL_QUEUES]u32 = @splat(abi.QUEUE_FAMILY_IGNORED),
 
     /// Whether the real instance was successfully created.
     pub fn hasInstance(self: *const RealVulkanState) bool {
@@ -1003,7 +1170,7 @@ const RealVulkanState = struct {
 
     fn releaseSwapchainImageHandles(self: *RealVulkanState, record: *const SwapchainRecord) void {
         for (record.image_handles) |image| {
-            if (image != 0) HandleMap.remove(&self.image_map, image);
+            if (image != 0) _ = HandleMap.remove(&self.image_map, image);
         }
     }
 
@@ -1093,11 +1260,71 @@ const VulkanResource = struct {
 /// guest handles here so the provenance can be resolved again when the command
 /// is recorded, without storing host pointers or allocating in the hot path.
 const MAX_TRACKED_TARGET_ATTACHMENTS: usize = 8;
+const MAX_TRACKED_DESCRIPTOR_IMAGES: usize = 16;
+const MAX_TRACKED_RESOURCE_TRANSFERS: usize = 16;
+const MAX_TRACKED_DESCRIPTOR_SETS_PER_COMMAND: usize = 32;
+// Provenance is intentionally cheaper than the authoritative reverse map.
+// Once this table fills, descriptor handles remain reclaimable through the
+// pool owner stored in HandleMap; only detailed image provenance is bounded.
+// The native reverse map can retain 16,384 sets, but each detailed row also
+// carries bounded image and texel metadata and Forwarder is stack-constructed
+// by several small tests.  Four thousand rows cover the long-run allocation
+// frontier observed in Halo 3 without moving the diagnostic object itself
+// onto a multi-megabyte stack cliff; if a title exceeds this bound, the
+// classified overflow remains explicit instead of becoming a panic.
+const MAX_TRACKED_DESCRIPTOR_SETS: usize = 4096;
 const VK_ATTACHMENT_LOAD_OP_CLEAR: u32 = 1;
+// Vulkan enum values used by the bounded graphics-state audit.  Keeping these
+// local avoids turning a diagnostic into a second Vulkan registry while still
+// making the two presentation topologies legible in the report.
+const VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST: u32 = 3;
+const VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP: u32 = 4;
+const VK_DYNAMIC_STATE_VIEWPORT: u32 = 0;
+const VK_DYNAMIC_STATE_SCISSOR: u32 = 1;
+const VK_SHADER_STAGE_VERTEX_BIT: u32 = 0x0000_0001;
+const VK_PIPELINE_BIND_POINT_GRAPHICS: u32 = 0;
 
 const TrackedImageView = struct {
     synthetic: u64 = 0,
     image: u64 = 0,
+};
+
+const TrackedDescriptorImage = struct {
+    binding: u32 = 0,
+    array_element: u32 = 0,
+    image: u64 = 0,
+};
+
+const TrackedDescriptorSet = struct {
+    synthetic: u64 = 0,
+    pool: u64 = 0,
+    image_count: u8 = 0,
+    unknown_image_views: bool = false,
+    images: [MAX_TRACKED_DESCRIPTOR_IMAGES]TrackedDescriptorImage = [_]TrackedDescriptorImage{.{}} ** MAX_TRACKED_DESCRIPTOR_IMAGES,
+    texel_count: u8 = 0,
+    texels: [8]TrackedTexelBinding = @splat(.{}),
+};
+
+const TrackedTexelBinding = struct { binding: u32 = 0, element: u32 = 0, view: u64 = 0 };
+const TrackedBufferView = struct {
+    synthetic: u64 = 0,
+    buffer: u64 = 0,
+    format: u32 = 0,
+    offset: u64 = 0,
+    range: u64 = 0,
+    observed: bool = false,
+    last_hash: u64 = 0,
+};
+
+const TrackedImageTransfer = struct {
+    source: u64 = 0,
+    destination: u64 = 0,
+    kind: rosette_gpu.PresentTransferKind = .none,
+};
+
+const TrackedCommandDescriptorSet = struct {
+    set_index: u32 = 0,
+    synthetic: u64 = 0,
 };
 
 const TrackedFramebuffer = struct {
@@ -1113,22 +1340,194 @@ const TrackedRenderPass = struct {
     /// this separate from command-shape counters so present provenance does
     /// not mistake a successful begin/end pair for actual image content.
     color_load_clear: bool = false,
+    resolve_count: u8 = 0,
+    resolve_sources: [MAX_TRACKED_TARGET_ATTACHMENTS]u32 = [_]u32{0} ** MAX_TRACKED_TARGET_ATTACHMENTS,
+    resolve_destinations: [MAX_TRACKED_TARGET_ATTACHMENTS]u32 = [_]u32{0} ** MAX_TRACKED_TARGET_ATTACHMENTS,
+};
+
+/// The command stream can be completely accepted by Vulkan and still draw the
+/// wrong shape if one of the small pieces of graphics state is translated
+/// incorrectly.  Keep the state that determines Xenia's two presentation
+/// draws with the command buffer rather than trying to infer it from a
+/// successful present afterward.  This is deliberately bounded and only
+/// populated when ROSETTE_ELF_GRAPHICS_STATE_DUMP is enabled.
+const GraphicsStateTrace = struct {
+    pipeline_guest: u64 = 0,
+    pipeline_real: u64 = 0,
+    pipeline_original_real: u64 = 0,
+    pipeline_layout_real: u64 = 0,
+    pipeline_repair_real: u64 = 0,
+    pipeline_guest_output_candidate: bool = false,
+    pipeline_repair_applied: bool = false,
+    pipeline_bind_point: u32 = 0,
+    pipeline_bound: bool = false,
+    pipeline_topology: u32 = 0,
+    pipeline_topology_known: bool = false,
+    pipeline_stage_count: u32 = 0,
+    pipeline_dynamic_viewport: bool = false,
+    pipeline_dynamic_scissor: bool = false,
+    viewport_valid: bool = false,
+    viewport_first: u32 = 0,
+    viewport_count: u32 = 0,
+    viewport: abi.Viewport = .{},
+    scissor_valid: bool = false,
+    scissor_first: u32 = 0,
+    scissor_count: u32 = 0,
+    scissor: abi.Rect2D = .{},
+    push_constants_valid: bool = false,
+    push_layout_guest: u64 = 0,
+    push_layout_real: u64 = 0,
+    push_stage_flags: u32 = 0,
+    push_offset: u32 = 0,
+    push_size: u32 = 0,
+    push_hash: u64 = 0,
+    push_words: [4]u32 = [_]u32{0} ** 4,
+    rect_push_valid: bool = false,
+    rect_push_hash: u64 = 0,
+    rect_push_words: [4]u32 = [_]u32{0} ** 4,
+};
+
+/// A real graphics pipeline is opaque to the command stream, but its topology
+/// and dynamic-state declarations are exactly the facts needed to distinguish
+/// a four-vertex triangle strip from an accidental triangle list.  Retain a
+/// small fingerprint at creation time so a later draw can report both the
+/// guest handle and the host pipeline contract.
+const TrackedGraphicsPipeline = struct {
+    real: u64 = 0,
+    layout: u64 = 0,
+    repair_real: u64 = 0,
+    guest_output_candidate: bool = false,
+    topology: u32 = 0,
+    topology_known: bool = false,
+    stage_count: u32 = 0,
+    viewport_count: u32 = 0,
+    scissor_count: u32 = 0,
+    dynamic_viewport: bool = false,
+    dynamic_scissor: bool = false,
+    cull_mode: u32 = 0,
+    front_face: u32 = 0,
+};
+
+/// Pipeline-layout metadata is kept separately from the native handle map so
+/// the graphics repair can prove that a candidate pipeline actually exposes
+/// Xenia's vertex rectangle push-constant contract.  This is deliberately a
+/// small fingerprint, not a second Vulkan object lifetime.
+const TrackedPipelineLayout = struct {
+    real: u64 = 0,
+    has_vertex_rect_push_constants: bool = false,
 };
 
 const TrackedCommandTargets = struct {
     synthetic: u64 = 0,
     image_count: u8 = 0,
     images: [MAX_TRACKED_TARGET_ATTACHMENTS]u64 = [_]u64{0} ** MAX_TRACKED_TARGET_ATTACHMENTS,
+    bound_descriptor_set_count: u8 = 0,
+    bound_descriptor_sets: [MAX_TRACKED_DESCRIPTOR_SETS_PER_COMMAND]TrackedCommandDescriptorSet = [_]TrackedCommandDescriptorSet{.{}} ** MAX_TRACKED_DESCRIPTOR_SETS_PER_COMMAND,
+    sampled_image_count: u8 = 0,
+    sampled_images: [MAX_TRACKED_DESCRIPTOR_IMAGES]u64 = [_]u64{0} ** MAX_TRACKED_DESCRIPTOR_IMAGES,
+    sampled_images_unknown: bool = false,
+    transfer_count: u8 = 0,
+    transfers: [MAX_TRACKED_RESOURCE_TRANSFERS]TrackedImageTransfer = [_]TrackedImageTransfer{.{}} ** MAX_TRACKED_RESOURCE_TRANSFERS,
     /// The strongest thing any command recorded into this buffer can put on
     /// the screen. A boolean here was what let a render-pass load clear be
     /// counted as a frame that carried a picture.
     write_kind: WriteKind = .none,
+    /// The first colour attachment of the render pass being recorded, so a
+    /// descriptor set bound inside that pass can be attributed to the image
+    /// the pass writes. Zero outside a render pass.
+    current_pass_target: u64 = 0,
+    pass_edge_count: u8 = 0,
+    pass_edges: [MAX_TRACKED_PASS_EDGES]TrackedPassEdge = @splat(.{}),
+    graphics_state: GraphicsStateTrace = .{},
 };
+
+/// A descriptor set bound while a render pass targeted an image. Resolved to
+/// images at submission, like the per-command sampled list, and committed to
+/// `present_chain` as a per-target edge so the presenter's paint and the
+/// gamma pass beneath it can each be followed one link upstream.
+const TrackedPassEdge = struct { target: u64 = 0, set: u64 = 0 };
+const MAX_TRACKED_PASS_EDGES: usize = 16;
 
 /// Re-exported so every call site in this file spells the classification the
 /// same way `present_chain` and the contract package do.
 const WriteKind = rosette_gpu.PresentWriteKind;
+
+/// Why a guest vkUpdateDescriptorSets was not forwarded.
+const DescriptorUpdateRefusal = enum(u8) {
+    no_device,
+    too_many_writes,
+    guest_read,
+    unmapped_set,
+    inline_block,
+    p_next,
+    array_capacity,
+    null_array,
+    unmapped_sampler,
+    unmapped_image_view,
+    unmapped_buffer,
+    unmapped_buffer_view,
+    descriptor_type,
+};
+
+/// A target-overflow count is only useful when it says which bounded ledger
+/// lost the edge.  These are bookkeeping failures, not Vulkan command
+/// rejections: the native call can still succeed while Rosetta loses the
+/// provenance needed to explain a bad picture.  Keep the categories at the
+/// allocation site so the next run identifies the first pressure point.
+const TargetOverflowKind = enum(u8) {
+    descriptor_set_table,
+    descriptor_image_entries,
+    descriptor_image_array,
+    descriptor_address_arithmetic,
+    texel_entries,
+    texel_array,
+    command_sampled_images,
+    command_bound_sets,
+    command_pass_edges,
+    command_set_array,
+    command_set_index,
+    command_target_table,
+    command_images,
+    command_transfers,
+    image_view_table,
+    framebuffer_attachments,
+    framebuffer_table,
+    render_pass_attachments,
+    render_pass_resolves,
+    render_pass_table,
+    submission_sampled_images,
+    submission_sampled_sentinel,
+    submission_transfers,
+
+    pub fn label(self: TargetOverflowKind) []const u8 {
+        return @tagName(self);
+    }
+};
 const frame_content = rosette_gpu.frame_content;
+
+const ReadbackSample = struct {
+    frame: u64,
+    swapchain: u64,
+    image: u64,
+    width: u32,
+    height: u32,
+    format: u32,
+    stats: frame_capture.Stats,
+
+    fn pictureEvidence(self: ReadbackSample) transport_timing.PictureSequence.Sample {
+        return .{ .present = self.frame, .swapchain = self.swapchain, .image = self.image, .rgb_detail = self.stats.hasRgbDetail() };
+    }
+};
+const PendingReadbackCapture = struct {
+    sample: ReadbackSample,
+    bytes: []u8,
+    write_kind: WriteKind,
+    preview: bool,
+};
+
+fn resolvedPresentResult(batch: abi.Result, per_swapchain: abi.Result) abi.Result {
+    return if (per_swapchain == abi.NOT_READY) batch else per_swapchain;
+}
 
 /// One reusable, host-visible readback path.  It is deliberately small and
 /// opt-in at the capability boundary: the swapchain only receives the
@@ -1141,18 +1540,131 @@ const PixelProbeState = struct {
     mapped_coherent: bool = false,
     mapped: ?*anyopaque = null,
     command_pool: abi.CommandPool = 0,
+    command_pool_family: u32 = abi.QUEUE_FAMILY_IGNORED,
     command_buffer: abi.CommandBuffer = null,
     frame: u64 = 0,
     attempts: u64 = 0,
     successes: u64 = 0,
     failures: u64 = 0,
+    /// Content-frame samples have their own bounded retry budget. The startup
+    /// samples can all be clears, and a single first-content sample can still
+    /// be a transitional black frame; retry until detail is proven or the
+    /// bounded budget is consumed.
+    content_probe_attempts: u64 = 0,
+    detail_observed: bool = false,
     last_result: abi.Result = abi.SUCCESS,
     last_swapchain: abi.SwapchainKHR = 0,
+    capture_policy: frame_capture.Policy = .{},
+    capture_configured: bool = false,
+    capture_enabled: bool = true,
+    preview_enabled: bool = false,
+    exposure_enabled: bool = true,
+    preview_interval_ns: u64 = 250_000_000,
+    last_preview_probe_ns: u64 = 0,
+    capture_calls: u64 = 0,
+    capture_saved: u64 = 0,
+    capture_previewed: u64 = 0,
+    capture_failures: u64 = 0,
+    capture_missing: u64 = 0,
+    capture_last_frame: u64 = 0,
+    capture_last_stats: frame_capture.Stats = .{},
+    readback_wait_handoffs: u64 = 0,
+    readback_completion_failed: bool = false,
+    /// The most recent successful swapchain readback, whether or not the
+    /// capture callback ran for it.
+    last_stats: frame_capture.Stats = .{},
+    last_stats_frame: u64 = 0,
+    last_stats_format: u32 = 0,
+    last_sample: ?ReadbackSample = null,
+    probe_schedule: transport_timing.ProbeCadence = .{},
 };
+
+/// Where along Xenia's present path the picture's brightness is lost, read
+/// from three images in one present: the swap texture the texture cache hands
+/// the gamma pass, the guest output image the gamma pass writes, and the
+/// swapchain image the presenter paints from it.
+const BrightnessLoss = enum {
+    /// Nothing upstream of the swapchain could be read.
+    unknown,
+    /// The swap texture is already dark: the loss is in the title's own
+    /// render or resolve, or in the CPU-side state Xenia computed for them.
+    before_gamma_pass,
+    /// Bright into the gamma pass, dark out of it: the ramp or its lookup.
+    gamma_pass,
+    /// Bright out of the gamma pass, dark on the swapchain: the presenter's
+    /// paint (format, colour space, sampler).
+    present_paint,
+    /// The swapchain is bright; there is no loss to place.
+    none,
+
+    pub fn label(self: BrightnessLoss) []const u8 {
+        return switch (self) {
+            .unknown => "unknown",
+            .before_gamma_pass => "before_gamma_pass",
+            .gamma_pass => "gamma_pass",
+            .present_paint => "present_paint",
+            .none => "none",
+        };
+    }
+
+    pub fn meaning(self: BrightnessLoss) []const u8 {
+        return switch (self) {
+            .unknown => "no image upstream of the swapchain could be read back, so the loss cannot be placed",
+            .before_gamma_pass => "the swap texture Xenia's texture cache handed to the gamma pass is already dark when read as UNORM: read the swap_texture line's as_7e3 figures first, because a 10-bit front buffer holding 7e3 float patterns is dim as UNORM by construction (1.0 is 384/1023) and the programmed ramp is what turns it into intensities; if as_7e3 is dim too, the loss is in the title's render/resolve or in the CPU-side state Xenia computed for them",
+            .gamma_pass => "the swap texture is bright and the gamma pass's output is dark: read ramp_shape and ramp_out on the TEXEL CUSTODY line, the lookup table is where the brightness went",
+            .present_paint => "the gamma pass's output is bright and the swapchain image is dark: the presenter's paint from guest output to swapchain (format, colour space or sampler) is where the brightness went",
+            .none => "the presented image is bright; no brightness loss to place",
+        };
+    }
+};
+
+const LadderStage = struct {
+    label: []const u8,
+    real_image: u64 = 0,
+    synthetic_image: u64 = 0,
+    format: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    stats: ?frame_capture.Stats = null,
+    /// The same bytes read as Xenos 7e3 float, for a 10-bit image: Halo 3's
+    /// front buffer holds float bit patterns, and a UNORM reading of them
+    /// is dim by construction (1.0 is 384/1023).
+    seven_e3: ?frame_capture.SevenE3Stats = null,
+    status: []const u8 = "not_reached",
+};
+
+const BrightnessLadderState = struct {
+    samples: u64 = 0,
+    printed: u64 = 0,
+    readbacks: u64 = 0,
+    readback_failures: u64 = 0,
+    verdict_counts: [5]u64 = @splat(0),
+    last_verdict: BrightnessLoss = .unknown,
+    last_frame: u64 = 0,
+    /// Peak channel value (8-bit scale) at each stage of the last sample:
+    /// swap texture, guest output, swapchain. 256 means unread.
+    last_peaks: [3]u16 = .{ 256, 256, 256 },
+    probe_schedule: transport_timing.ProbeCadence = .{},
+};
+
+/// Whether the host image should gain TRANSFER_SRC for the ladder. Only a
+/// single-sampled 2D colour image in a layout the probe can decode.
+fn imageReadbackAugmentable(usage: u32, format: u32, image_type: u32, samples: u32) bool {
+    if ((usage & abi.IMAGE_USAGE_TRANSFER_SRC_BIT) != 0) return false;
+    if ((usage & (abi.IMAGE_USAGE_SAMPLED_BIT | abi.IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) == 0) return false;
+    if (image_type != abi.IMAGE_TYPE_2D or samples != abi.SAMPLE_COUNT_1_BIT) return false;
+    return frame_capture.layoutFor(format) != null;
+}
 
 const PIXEL_PROBE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const PIXEL_PROBE_INITIAL_SAMPLES: u64 = 4;
-const PIXEL_PROBE_INTERVAL: u64 = 60;
+const PIXEL_PROBE_CONTENT_SAMPLES: u64 = 8;
+
+fn shouldForceContentPixelProbe(probe: *const PixelProbeState, write_kind: WriteKind) bool {
+    return write_kind == .content and
+        !probe.detail_observed and
+        probe.content_probe_attempts < PIXEL_PROBE_CONTENT_SAMPLES;
+}
 
 const feature_chain_max = 7;
 const feature_chain_node_bytes = 256;
@@ -1651,6 +2163,21 @@ pub const VulkanFenceWatch = struct {
     }
 };
 
+/// Cumulative evidence for the guest-owned swapchain.  The PE-side Windows
+/// ledger sees the names of Vulkan calls, but only this forwarder owns target
+/// attribution and native completion truth.  Keeping this as a value-only
+/// snapshot avoids leaking the chain's bounded storage across the ABI seam.
+pub const GuestFrameEvidence = struct {
+    presents_with_target: u64 = 0,
+    presents_with_content: u64 = 0,
+    presents_clear_only: u64 = 0,
+    presents_without_target: u64 = 0,
+    presents_without_write: u64 = 0,
+    native_present_requests: u64 = 0,
+    native_present_completions: u64 = 0,
+    native_queue_submits: u64 = 0,
+};
+
 pub const Forwarder = struct {
     libraries: [MAX_LIBRARIES]Library = [_]Library{.{}} ** MAX_LIBRARIES,
     library_count: usize = 0,
@@ -1686,9 +2213,22 @@ pub const Forwarder = struct {
     /// struct measures a call that returned, and a black window is a chain
     /// that broke without any call failing.
     present_chain: rosette_gpu.PresentChain = .{},
+    /// The last-mile screen contract. PRESENT CHAIN proves transport and
+    /// topology; this ledger also requires pixel detail and a visible
+    /// compositor path before it calls a frame valid on screen.
+    screen_validity: rosette_gpu.ScreenValidity = .{},
     present_chain_verdict_logged: ?rosette_gpu.PresentChainVerdict = null,
     present_chain_reports: u64 = 0,
     present_chain_window_break: ??[]const u8 = null,
+    present_chain_window_facts: ?rosette_gpu.WindowGeometry = null,
+    present_chain_window_poll: transport_timing.ReportCadence = .{ .interval_ns = 1_000_000_000 },
+    graphics_report_cadence: transport_timing.ReportCadence = .{},
+    graphics_report_configured: bool = false,
+    graphics_report_verbose: bool = false,
+    graphics_report_anomalies: u64 = 0,
+    graphics_report_brightness: ?BrightnessLoss = null,
+    graphics_report_picture_started: bool = false,
+    picture_sequence: transport_timing.PictureSequence = .{},
     /// `no_presents` is a real presentation failure point, but it can be
     /// provisional during Xenia startup: the guest may create the swapchain
     /// long before it submits its first draw. Keep one bounded failure episode
@@ -1727,14 +2267,96 @@ pub const Forwarder = struct {
     /// the Vulkan handle maps; an untracked target is reported as unknown
     /// rather than being promoted to proof of a visible frame.
     tracked_image_views: [MAX_REAL_IMAGE_VIEWS]TrackedImageView = [_]TrackedImageView{.{}} ** MAX_REAL_IMAGE_VIEWS,
+    tracked_buffer_views: [MAX_REAL_BUFFER_VIEWS]TrackedBufferView = @splat(.{}),
+    texel_custody_samples: u64 = 0,
+    texel_custody_missing: u64 = 0,
+    texel_custody_zero: u64 = 0,
+    texel_custody_printed: u64 = 0,
+    /// What the most recently audited gamma ramp does, from `texel_custody`.
+    texel_custody_last_format: u32 = 0,
+    texel_custody_last_shape: rosette_gpu.vulkan.texel_custody.Shape = .unknown_size,
+    texel_custody_last_out: [3]u16 = .{ 0, 0, 0 },
+    texel_custody_default_samples: u64 = 0,
+    texel_custody_programmed_samples: u64 = 0,
+    /// Render-pass source edges committed to the present chain, and the
+    /// images whose host usage gained TRANSFER_SRC so the ladder can read
+    /// them. Neither changes what the guest sees.
+    vulkan_pass_source_edges: u64 = 0,
+    vulkan_image_usage_augmented: u64 = 0,
+    brightness_ladder: BrightnessLadderState = .{},
+    tracked_descriptor_sets: [MAX_TRACKED_DESCRIPTOR_SETS]TrackedDescriptorSet = [_]TrackedDescriptorSet{.{}} ** MAX_TRACKED_DESCRIPTOR_SETS,
     tracked_render_passes: [MAX_REAL_RENDER_PASSES]TrackedRenderPass = [_]TrackedRenderPass{.{}} ** MAX_REAL_RENDER_PASSES,
     tracked_framebuffers: [MAX_REAL_FRAMEBUFFERS]TrackedFramebuffer = [_]TrackedFramebuffer{.{}} ** MAX_REAL_FRAMEBUFFERS,
     tracked_command_targets: [MAX_REAL_COMMAND_BUFFERS]TrackedCommandTargets = [_]TrackedCommandTargets{.{}} ** MAX_REAL_COMMAND_BUFFERS,
+    tracked_graphics_pipelines: [MAX_REAL_PIPELINES]TrackedGraphicsPipeline = [_]TrackedGraphicsPipeline{.{}} ** MAX_REAL_PIPELINES,
+    tracked_pipeline_layouts: [MAX_REAL_PIPELINE_LAYOUTS]TrackedPipelineLayout = [_]TrackedPipelineLayout{.{}} ** MAX_REAL_PIPELINE_LAYOUTS,
+    /// State-trace counters are separate from command-shape counters.  A
+    /// command can be forwarded successfully while carrying a malformed
+    /// viewport, scissor, topology or push-constant rectangle.
+    graphics_state_trace_configured: bool = false,
+    graphics_state_trace_enabled: bool = false,
+    graphics_state_trace_draws: u64 = 0,
+    graphics_state_trace_push_constants: u64 = 0,
+    graphics_state_trace_printed: u64 = 0,
+    graphics_state_trace_missing_viewport: u64 = 0,
+    graphics_state_trace_missing_scissor: u64 = 0,
+    graphics_state_trace_bad_viewport: u64 = 0,
+    graphics_state_trace_bad_scissor: u64 = 0,
+    graphics_state_trace_bad_rect: u64 = 0,
+    graphics_state_trace_rect_candidates: u64 = 0,
+    graphics_state_trace_rect_non_candidates: u64 = 0,
+    graphics_state_trace_topology_mismatch: u64 = 0,
+    graphics_state_trace_unknown_pipeline: u64 = 0,
+    graphics_state_trace_pipeline_overflow: u64 = 0,
+    /// Xenia's guest-output presenter is a four-vertex triangle strip.  If a
+    /// translated pipeline arrives as a triangle list, retain the original
+    /// contract for diagnostics but create a strip twin and use it only after
+    /// the draw proves the 16-byte rectangle push-constant signature.
+    guest_output_topology_repair_configured: bool = false,
+    guest_output_topology_repair_enabled: bool = true,
+    graphics_topology_repair_candidates: u64 = 0,
+    graphics_topology_repair_pipeline_creations: u64 = 0,
+    graphics_topology_repair_create_failures: u64 = 0,
+    graphics_topology_repairs: u64 = 0,
+    graphics_topology_repair_bind_failures: u64 = 0,
     target_attribution_events: u64 = 0,
     target_offscreen_events: u64 = 0,
     target_unknown_events: u64 = 0,
     target_overflow_events: u64 = 0,
+    target_overflow_by_kind: [std.enums.values(TargetOverflowKind).len]u64 = [_]u64{0} ** std.enums.values(TargetOverflowKind).len,
+    /// Descriptor provenance is deliberately counted at each boundary. A
+    /// bind can precede an update, and the command can be submitted much
+    /// later, so a single bind-time snapshot cannot prove what the draw saw.
+    vulkan_descriptor_update_calls: u64 = 0,
+    vulkan_descriptor_update_forwarded: u64 = 0,
+    vulkan_descriptor_native_writes: u64 = 0,
+    vulkan_descriptor_native_copies: u64 = 0,
+    vulkan_descriptor_update_refusals: [std.enums.values(DescriptorUpdateRefusal).len]u64 = [_]u64{0} ** std.enums.values(DescriptorUpdateRefusal).len,
+    vulkan_descriptor_template_update_calls: u64 = 0,
+    vulkan_descriptor_push_calls: u64 = 0,
+    vulkan_descriptor_image_infos_observed: u64 = 0,
+    vulkan_descriptor_unknown_image_views: u64 = 0,
+    /// A Windows Vulkan call can reach the generic command dispatcher and
+    /// still be refused before the native driver because one of its guest
+    /// handles or pointer arrays cannot be translated. Keep that admission
+    /// edge separate from successful binds so a black frame never reports a
+    /// silently dropped bind as forwarded native work.
+    vulkan_descriptor_bind_admission: DescriptorBindAdmission = .{},
+    vulkan_command_admission: [forwarded_vulkan_commands.len]VulkanCommandAdmission =
+        [_]VulkanCommandAdmission{.{}} ** forwarded_vulkan_commands.len,
+    vulkan_command_admission_entries: u64 = 0,
+    vulkan_command_admission_rejected: u64 = 0,
+    vulkan_command_admission_untracked: u64 = 0,
+    vulkan_command_refusal_line: u32 = 0,
+    vulkan_descriptor_bind_calls: u64 = 0,
+    vulkan_descriptor_sets_bound: u64 = 0,
+    vulkan_descriptor_sets_resolved: u64 = 0,
+    vulkan_descriptor_sets_unknown: u64 = 0,
+    vulkan_descriptor_late_resolutions: u64 = 0,
+    vulkan_descriptor_sampled_images_recorded: u64 = 0,
+    vulkan_descriptor_sampled_unknown: u64 = 0,
     pixel_probe: PixelProbeState = .{},
+    transport_cost: transport_timing.Ledger = .{},
     /// Entry points the device does not provide that the guest nevertheless
     /// reached. An absence with no entry here was never asked for.
     vulkan_absent_reached: VulkanAbsentEntryPoints = .{},
@@ -1744,7 +2366,7 @@ pub const Forwarder = struct {
     vulkan_absent_names_len: usize = 0,
     vulkan_absent_count: u32 = 0,
     vulkan_presents: u64 = 0,
-    /// Guest command calls that reached a real command-buffer mapping.  The
+    /// Guest command calls that invoked a real native vkCmd entry point. The
     /// older `vulkan_modeled_command_calls` counter remains as total observed
     /// traffic for compatibility with existing diagnostics; this one is the
     /// execution truth used by host-coverage reporting.
@@ -1768,6 +2390,19 @@ pub const Forwarder = struct {
     vulkan_create_ledger_overflow: u64 = 0,
     vulkan_guest_object_publications: u64 = 0,
     vulkan_real_objects_destroyed: u64 = 0,
+    /// Handle maps are intentionally bounded because a reverse mapping is
+    /// part of the ABI contract.  Keep lifecycle counters beside the maps so
+    /// a long run can distinguish a legitimate live-object ceiling from a
+    /// Rosetta leak or a failed reclaim, instead of ending at `@panic`.
+    vulkan_handle_map_allocations: u64 = 0,
+    vulkan_handle_map_replacements: u64 = 0,
+    vulkan_handle_map_releases: u64 = 0,
+    vulkan_handle_map_exhaustions: u64 = 0,
+    vulkan_handle_map_invalid: u64 = 0,
+    vulkan_descriptor_set_map_high_water: usize = 0,
+    vulkan_descriptor_set_pool_reset_reclaims: u64 = 0,
+    vulkan_descriptor_set_pool_destroy_reclaims: u64 = 0,
+    vulkan_descriptor_set_free_reclaims: u64 = 0,
     vulkan_device_void_calls: u64 = 0,
     vulkan_device_lost_events: u64 = 0,
     vulkan_fence_completions: u64 = 0,
@@ -1786,6 +2421,10 @@ pub const Forwarder = struct {
     vulkan_synthetic_object_batches: u64 = 0,
     vulkan_shadow_uploads: u64 = 0,
     vulkan_shadow_upload_failures: u64 = 0,
+    vulkan_shadow_upload_bytes: u64 = 0,
+    vulkan_native_memory_aliases: u64 = 0,
+    vulkan_shadow_unchanged: u64 = 0,
+    vulkan_shadow_unmap_uploads: u64 = 0,
     /// Compact command-shape evidence for the frame-content verdict. These
     /// counters are intentionally separate from total command traffic: a
     /// successful submit is not proof that a draw, clear, or copy wrote the
@@ -1806,6 +2445,28 @@ pub const Forwarder = struct {
     /// Whether the window bridge has stopped writing the CAMetalLayer's
     /// drawableSize because a Vulkan swapchain now vends its drawables.
     metal_drawable_yielded: bool = false,
+    /// Extent handshakes completed before real swapchain creation. A swapchain
+    /// can report success while the layer still has a different drawable
+    /// size, so keep the preflight result beside the present-chain ledger.
+    metal_drawable_prepare_attempts: u64 = 0,
+    metal_drawable_prepare_successes: u64 = 0,
+    metal_drawable_prepare_failures: u64 = 0,
+    metal_drawable_prepared_width: u32 = 0,
+    metal_drawable_prepared_height: u32 = 0,
+    /// A drawable extent is a hard boundary, not a best-effort hint.  Keep a
+    /// durable record because a native driver can return success for a
+    /// swapchain whose extent no longer matches the layer and the failure
+    /// would otherwise only be visible in the end-of-run geometry report.
+    graphics_extent_contract_failed: bool = false,
+    graphics_extent_contract_failures: u64 = 0,
+    graphics_extent_requested_width: u32 = 0,
+    graphics_extent_requested_height: u32 = 0,
+    graphics_extent_observed_width: u32 = 0,
+    graphics_extent_observed_height: u32 = 0,
+    /// Which Vulkan owner currently holds drawableSize.  The C bridge only
+    /// needs the boolean ownership bit, while diagnostics need to distinguish
+    /// Rosette's smoke presenter from the guest swapchain during handoff.
+    drawable_owner: enum { window_bridge, native_presenter, guest_swapchain } = .window_bridge,
     /// Times Rosette's own presenter was stood down because the guest built a
     /// swapchain on the layer it held.
     native_presenter_retired_for_guest: u64 = 0,
@@ -1820,6 +2481,12 @@ pub const Forwarder = struct {
         [_]VulkanMemoryAllocation{.{}} ** MAX_VULKAN_MEMORY_ALLOCATIONS,
     vulkan_resources: [MAX_VULKAN_RESOURCES]VulkanResource =
         [_]VulkanResource{.{}} ** MAX_VULKAN_RESOURCES,
+    /// Resource-table lifecycle evidence. The table is a live-object map;
+    /// these counters make it possible to distinguish legitimate reuse from
+    /// a table that stayed full because the guest stopped destroying objects.
+    vulkan_resource_records_committed: u64 = 0,
+    vulkan_resource_records_released: u64 = 0,
+    vulkan_resource_high_water: u64 = 0,
     vulkan_resource_overflow: u64 = 0,
     vulkan_image_bindings: u64 = 0,
     vulkan_presenter_bind_attempts: u64 = 0,
@@ -1894,6 +2561,7 @@ pub const Forwarder = struct {
     guest_frontbuffer_height: u32 = 0,
     guest_frontbuffer_tiled: bool = true,
     guest_frontbuffer_endian: rosette_gpu.xenos_texture.Endian = .@"8in32",
+    guest_frontbuffer_format: rosette_gpu.xenos_texture.Format = .k_8_8_8_8,
     /// Converted pixels live in guest memory rather than in this struct: a
     /// 4096-square surface is sixty-seven megabytes, and a buffer that large
     /// inline would be paid for by every run whether or not a frame ever
@@ -1913,6 +2581,16 @@ pub const Forwarder = struct {
     /// empty front buffer is a GPU that never ran, and presenting it would put
     /// a black window up and label it guest output.
     guest_frontbuffer_nonzero_frames: u64 = 0,
+    /// A VdSwap is an explicit guest presentation boundary. Keep its
+    /// generation separate from conversion/publication so a front buffer can
+    /// be presented immediately even when Xenia's own RefreshGuestOutput path
+    /// is absent or inlined.
+    guest_frontbuffer_swap_generation: u64 = 0,
+    guest_frontbuffer_presented_generation: u64 = 0,
+    guest_frontbuffer_swap_pending: bool = false,
+    guest_frontbuffer_present_attempts: u64 = 0,
+    guest_frontbuffer_present_successes: u64 = 0,
+    guest_frontbuffer_present_failures: u64 = 0,
     /// Refreshes Rosette drove because the emulator would not. Attempts and
     /// successes are separate: "we tried and there was nothing to show" and "we
     /// never tried" are the two states this exists to tell apart.
@@ -1925,6 +2603,13 @@ pub const Forwarder = struct {
     /// pointer, so a rising count is the safety gate working rather than a
     /// failure.
     vulkan_marshal_refusals: u64 = 0,
+    /// Large Vulkan payloads, principally generated SPIR-V modules, may need
+    /// the marshaller's bounded spill arena. Keep this separate from ordinary
+    /// refusals so a shader-size problem cannot masquerade as a missing handle
+    /// or unreadable guest structure.
+    vulkan_marshal_spill_reserves: u64 = 0,
+    vulkan_marshal_spill_peak_bytes: u64 = 0,
+    vulkan_marshal_spill_failures: u64 = 0,
     /// Which Vulkan facts are answered by the driver and which synthetically.
     /// See `lib/gpu/vulkan/tier_consistency.zig`. A migration's dangerous state
     /// is not "modelled" or "real" but both at once on two facts a caller
@@ -1972,7 +2657,17 @@ pub const Forwarder = struct {
     },
 
     pub fn deinit(self: *Forwarder) void {
+        // A guest-side all-or-nothing resource warning can otherwise be
+        // reported with no per-create evidence when the run still presents
+        // frames (the normal failure snapshot is only opened for a missing
+        // present). Emit the bounded ledger automatically only when a create
+        // contract actually lost an object; healthy runs stay quiet.
+        if (self.vulkanCreateLedgerHasAnomaly()) {
+            machoCapturePrint("macho-processor: VULKAN CREATE ANOMALY: one or more guest create calls did not publish a usable native object; dumping the bounded create ledger\n", .{});
+            self.dumpVulkanCreateLedger();
+        }
         self.destroyNativeVulkanObjects();
+        self.vulkan_scratch.deinit();
         self.ppc_guest_bridge.deinit();
         self.gpu_runtime.deinit();
         for (self.libraries[0..self.library_count]) |loaded_library| {
@@ -2033,8 +2728,9 @@ pub const Forwarder = struct {
         return self.allocateGuestSymbol(library_token, symbol);
     }
 
-    fn lookupVulkanProcGuest(self: *Forwarder, library_token: u64, symbol: []const u8) u64 {
+    pub fn lookupVulkanProcGuest(self: *Forwarder, library_token: u64, symbol: []const u8) u64 {
         if (self.guestLibraryEntry(library_token) == null) return 0;
+        if (!isForwardableVulkanSymbol(symbol)) return 0;
         self.guest_proc_queries +|= 1;
         if (self.optionalVulkanProcUnavailable(symbol)) {
             self.vulkan_absent_reached.note(symbol, "reported absent to the guest, as a real loader would");
@@ -2771,10 +3467,12 @@ pub const Forwarder = struct {
                 state.regs.rax = 0;
             },
             .destroy_instance => {
+                self.releaseNativeMemoryAliases(state);
                 self.destroyNativeVulkanObjects();
                 state.regs.rax = 0;
             },
             .destroy_device => {
+                self.releaseNativeMemoryAliases(state);
                 self.destroyRealDevice();
                 state.regs.rax = 0;
             },
@@ -3303,6 +4001,485 @@ pub const Forwarder = struct {
         return true;
     }
 
+    fn graphicsStateTraceEnabled(self: *Forwarder) bool {
+        if (!self.graphics_state_trace_configured) {
+            self.graphics_state_trace_configured = true;
+            if (std.c.getenv("ROSETTE_ELF_GRAPHICS_STATE_DUMP")) |raw| {
+                const value = std.mem.trim(u8, std.mem.sliceTo(raw, 0), " \t\r\n");
+                self.graphics_state_trace_enabled = std.mem.eql(u8, value, "1") or
+                    std.ascii.eqlIgnoreCase(value, "true") or
+                    std.ascii.eqlIgnoreCase(value, "yes");
+            }
+        }
+        return self.graphics_state_trace_enabled;
+    }
+
+    fn guestOutputTopologyRepairEnabled(self: *Forwarder) bool {
+        if (!self.guest_output_topology_repair_configured) {
+            self.guest_output_topology_repair_configured = true;
+            self.guest_output_topology_repair_enabled = true;
+            if (std.c.getenv("ROSETTE_ELF_GUEST_OUTPUT_TOPOLOGY_REPAIR")) |raw| {
+                const value = std.mem.trim(u8, std.mem.sliceTo(raw, 0), " \t\r\n");
+                self.guest_output_topology_repair_enabled = !(std.mem.eql(u8, value, "0") or
+                    std.ascii.eqlIgnoreCase(value, "false") or
+                    std.ascii.eqlIgnoreCase(value, "no"));
+            }
+        }
+        return self.guest_output_topology_repair_enabled;
+    }
+
+    /// State recording is needed for the narrowly gated guest-output repair
+    /// even when the verbose graphics dump is disabled.  The recorder remains
+    /// bounded and the repair path itself only rebinds a pipeline immediately
+    /// before the matching four-vertex draw.
+    fn graphicsStateTrackingEnabled(self: *Forwarder) bool {
+        return self.graphicsStateTraceEnabled() or self.guestOutputTopologyRepairEnabled();
+    }
+
+    fn graphicsStateHash(bytes: []const u8) u64 {
+        var hash: u64 = 14695981039346656037;
+        for (bytes) |byte| hash = (hash ^ byte) *% 1099511628211;
+        return hash;
+    }
+
+    fn vulkanTopologyLabel(topology: u32) []const u8 {
+        return switch (topology) {
+            0 => "point_list",
+            1 => "line_list",
+            2 => "line_strip",
+            VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST => "triangle_list",
+            VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP => "triangle_strip",
+            5 => "triangle_fan",
+            else => "other",
+        };
+    }
+
+    fn trackedGraphicsPipeline(self: *const Forwarder, real: u64) ?*const TrackedGraphicsPipeline {
+        if (real == 0) return null;
+        for (&self.tracked_graphics_pipelines) |*record| {
+            if (record.real == real) return record;
+        }
+        return null;
+    }
+
+    fn trackedPipelineLayout(self: *const Forwarder, real: u64) ?*const TrackedPipelineLayout {
+        if (real == 0) return null;
+        for (&self.tracked_pipeline_layouts) |*record| {
+            if (record.real == real) return record;
+        }
+        return null;
+    }
+
+    fn rememberPipelineLayout(self: *Forwarder, real: u64, info: []const u8) void {
+        if (real == 0 or info.len < @sizeOf(marshal.PipelineLayoutCreateInfo)) return;
+        const root: *const marshal.PipelineLayoutCreateInfo = @ptrCast(@alignCast(info.ptr));
+        var metadata: TrackedPipelineLayout = .{ .real = real };
+        if (root.push_constant_range_count <= 64) {
+            if (root.push_constant_ranges) |pointer| {
+                const ranges: [*]const marshal.PushConstantRange = @ptrCast(@alignCast(pointer));
+                for (0..@as(usize, @intCast(root.push_constant_range_count))) |index| {
+                    const range = ranges[index];
+                    if (range.offset == 0 and range.size >= 16 and
+                        (range.stage_flags & VK_SHADER_STAGE_VERTEX_BIT) != 0)
+                    {
+                        metadata.has_vertex_rect_push_constants = true;
+                        break;
+                    }
+                }
+            }
+        }
+        for (&self.tracked_pipeline_layouts) |*record| {
+            if (record.real == real or record.real == 0) {
+                record.* = metadata;
+                return;
+            }
+        }
+    }
+
+    fn forgetPipelineLayout(self: *Forwarder, real: u64) void {
+        if (real == 0) return;
+        for (&self.tracked_pipeline_layouts) |*record| {
+            if (record.real == real) record.* = .{};
+        }
+    }
+
+    /// Recognize Xenia's guest-output paint pipeline without relying on a
+    /// shader name.  The topology is the only field Rosette repairs, and every
+    /// other requirement below is part of the presenter contract: two shader
+    /// stages, no vertex input, one dynamic viewport/scissor, one colour
+    /// attachment, no tessellation/depth work, and a vertex push range large
+    /// enough for the four rectangle floats.
+    fn isGuestOutputPaintPipeline(self: *const Forwarder, root: *const abi.GraphicsPipelineCreateInfo) bool {
+        const input_assembly = root.input_assembly_state orelse return false;
+        if (input_assembly.topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) return false;
+        if (root.stage_count != 2 or root.stages == null) return false;
+        const vertex_input = root.vertex_input_state orelse return false;
+        if (vertex_input.vertex_binding_description_count != 0 or vertex_input.vertex_attribute_description_count != 0) return false;
+        if (root.tessellation_state != null) return false;
+        const viewport = root.viewport_state orelse return false;
+        if (viewport.viewport_count != 1 or viewport.scissor_count != 1) return false;
+        var dynamic_viewport = false;
+        var dynamic_scissor = false;
+        if (root.dynamic_state) |dynamic| {
+            if (dynamic.dynamic_states) |states| {
+                for (0..@as(usize, @intCast(dynamic.dynamic_state_count))) |index| {
+                    switch (states[index]) {
+                        VK_DYNAMIC_STATE_VIEWPORT => dynamic_viewport = true,
+                        VK_DYNAMIC_STATE_SCISSOR => dynamic_scissor = true,
+                        else => {},
+                    }
+                }
+            }
+        }
+        if (!dynamic_viewport or !dynamic_scissor) return false;
+        if (root.rasterization_state) |rasterization| {
+            if (rasterization.rasterizer_discard_enable != 0 or rasterization.polygon_mode != 0 or rasterization.cull_mode != 0) return false;
+        }
+        if (root.multisample_state) |multisample| {
+            if (multisample.rasterization_samples != abi.SAMPLE_COUNT_1_BIT) return false;
+        }
+        if (root.depth_stencil_state) |depth_stencil| {
+            if (depth_stencil.depth_test_enable != 0 or depth_stencil.depth_write_enable != 0 or depth_stencil.stencil_test_enable != 0) return false;
+        }
+        const color_blend = root.color_blend_state orelse return false;
+        if (color_blend.attachment_count != 1) return false;
+        const layout = self.trackedPipelineLayout(root.layout) orelse return false;
+        return layout.has_vertex_rect_push_constants;
+    }
+
+    fn rememberGraphicsPipeline(self: *Forwarder, real: u64, root: *const abi.GraphicsPipelineCreateInfo, repair_real: u64, guest_output_candidate: bool) void {
+        if (real == 0) return;
+        var metadata: TrackedGraphicsPipeline = .{
+            .real = real,
+            .layout = root.layout,
+            .repair_real = repair_real,
+            .guest_output_candidate = guest_output_candidate,
+            .stage_count = root.stage_count,
+        };
+        if (root.input_assembly_state) |pointer| {
+            metadata.topology = pointer.topology;
+            metadata.topology_known = true;
+        }
+        if (root.viewport_state) |pointer| {
+            metadata.viewport_count = pointer.viewport_count;
+            metadata.scissor_count = pointer.scissor_count;
+        }
+        if (root.rasterization_state) |pointer| {
+            metadata.cull_mode = pointer.cull_mode;
+            metadata.front_face = pointer.front_face;
+        }
+        if (root.dynamic_state) |pointer| {
+            if (pointer.dynamic_states) |states| {
+                for (0..@as(usize, @intCast(pointer.dynamic_state_count))) |index| {
+                    switch (states[index]) {
+                        VK_DYNAMIC_STATE_VIEWPORT => metadata.dynamic_viewport = true,
+                        VK_DYNAMIC_STATE_SCISSOR => metadata.dynamic_scissor = true,
+                        else => {},
+                    }
+                }
+            }
+        }
+        for (&self.tracked_graphics_pipelines) |*record| {
+            if (record.real == real or record.real == 0) {
+                record.* = metadata;
+                return;
+            }
+        }
+        self.graphics_state_trace_pipeline_overflow +|= 1;
+    }
+
+    fn forgetGraphicsPipeline(self: *Forwarder, real: u64) void {
+        if (real == 0) return;
+        for (&self.tracked_graphics_pipelines) |*record| {
+            if (record.real == real) record.* = .{};
+        }
+    }
+
+    fn noteCommandPipelineState(self: *Forwarder, command_buffer: u64, guest_pipeline: u64, real_pipeline: u64, bind_point: u64) void {
+        if (!self.graphicsStateTrackingEnabled()) return;
+        const record = self.mutableCommandTargets(command_buffer) orelse return;
+        const trace = &record.graphics_state;
+        trace.pipeline_guest = guest_pipeline;
+        trace.pipeline_real = real_pipeline;
+        trace.pipeline_original_real = real_pipeline;
+        trace.pipeline_repair_real = 0;
+        trace.pipeline_guest_output_candidate = false;
+        trace.pipeline_repair_applied = false;
+        trace.pipeline_layout_real = 0;
+        trace.pipeline_bind_point = @intCast(bind_point);
+        trace.pipeline_bound = true;
+        trace.pipeline_topology_known = false;
+        if (self.trackedGraphicsPipeline(real_pipeline)) |metadata| {
+            trace.pipeline_layout_real = metadata.layout;
+            trace.pipeline_repair_real = metadata.repair_real;
+            trace.pipeline_guest_output_candidate = metadata.guest_output_candidate;
+            trace.pipeline_topology = metadata.topology;
+            trace.pipeline_topology_known = metadata.topology_known;
+            trace.pipeline_stage_count = metadata.stage_count;
+            trace.pipeline_dynamic_viewport = metadata.dynamic_viewport;
+            trace.pipeline_dynamic_scissor = metadata.dynamic_scissor;
+        } else if (self.graphicsStateTraceEnabled()) {
+            self.graphics_state_trace_unknown_pipeline +|= 1;
+        }
+    }
+
+    fn noteCommandViewport(self: *Forwarder, command_buffer: u64, first: u64, count: u64, values: []const abi.Viewport) void {
+        if (!self.graphicsStateTraceEnabled()) return;
+        const record = self.mutableCommandTargets(command_buffer) orelse return;
+        const trace = &record.graphics_state;
+        trace.viewport_first = @intCast(first);
+        trace.viewport_count = @intCast(count);
+        if (first == 0) {
+            trace.viewport_valid = count != 0 and values.len != 0;
+            if (trace.viewport_valid) trace.viewport = values[0];
+        }
+    }
+
+    fn noteCommandScissor(self: *Forwarder, command_buffer: u64, first: u64, count: u64, values: []const abi.Rect2D) void {
+        if (!self.graphicsStateTraceEnabled()) return;
+        const record = self.mutableCommandTargets(command_buffer) orelse return;
+        const trace = &record.graphics_state;
+        trace.scissor_first = @intCast(first);
+        trace.scissor_count = @intCast(count);
+        if (first == 0) {
+            trace.scissor_valid = count != 0 and values.len != 0;
+            if (trace.scissor_valid) trace.scissor = values[0];
+        }
+    }
+
+    fn noteCommandPushConstants(self: *Forwarder, command_buffer: u64, guest_layout: u64, real_layout: u64, stage_flags: u64, offset: u64, size: u64, bytes: []const u8) void {
+        if (!self.graphicsStateTrackingEnabled()) return;
+        const record = self.mutableCommandTargets(command_buffer) orelse return;
+        const trace = &record.graphics_state;
+        if (self.graphicsStateTraceEnabled()) self.graphics_state_trace_push_constants +|= 1;
+        trace.push_constants_valid = true;
+        trace.push_layout_guest = guest_layout;
+        trace.push_layout_real = real_layout;
+        trace.push_stage_flags = @intCast(stage_flags);
+        trace.push_offset = @intCast(offset);
+        trace.push_size = @intCast(size);
+        trace.push_hash = graphicsStateHash(bytes);
+        trace.push_words = [_]u32{0} ** 4;
+        for (0..4) |index| {
+            const at = index * 4;
+            if (at + 4 <= bytes.len) trace.push_words[index] = std.mem.readInt(u32, bytes[at..][0..4], .little);
+        }
+        // Xenia's guest-output rectangle is the first 16 bytes of the vertex
+        // push-constant range. Preserve it when a later fragment push updates
+        // the same command buffer with sharpening/resampling constants.
+        if (offset == 0 and size >= 16) {
+            trace.rect_push_valid = true;
+            trace.rect_push_hash = graphicsStateHash(bytes[0..16]);
+            for (0..4) |index| trace.rect_push_words[index] = std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little);
+        }
+    }
+
+    /// Rebind the strip twin only for Xenia's exact guest-output draw shape.
+    /// Vulkan bakes primitive topology into a graphics pipeline, so correcting
+    /// this at the draw boundary is the smallest place that can repair a list
+    /// pipeline without changing any ordinary scene geometry.
+    fn repairGuestOutputTopology(
+        self: *Forwarder,
+        command_buffer_guest: u64,
+        command_buffer_real: abi.CommandBuffer,
+        vertex_count: u64,
+        instance_count: u64,
+        first_vertex: u64,
+        first_instance: u64,
+    ) void {
+        if (!self.guestOutputTopologyRepairEnabled() or vertex_count != 4 or instance_count != 1 or first_vertex != 0 or first_instance != 0) return;
+        var repair_pipeline: u64 = 0;
+        var bind_point: u32 = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        var original_pipeline: u64 = 0;
+        var guest_pipeline: u64 = 0;
+        var push_layout: u64 = 0;
+        if (self.mutableCommandTargets(command_buffer_guest)) |record| {
+            const trace = &record.graphics_state;
+            if (!trace.pipeline_bound or trace.pipeline_bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS or
+                !trace.pipeline_guest_output_candidate or trace.pipeline_repair_real == 0 or
+                trace.pipeline_repair_applied or !trace.rect_push_valid or
+                trace.push_layout_real != trace.pipeline_layout_real)
+            {
+                return;
+            }
+            const rect_x: f32 = @bitCast(trace.rect_push_words[0]);
+            const rect_y: f32 = @bitCast(trace.rect_push_words[1]);
+            const rect_width: f32 = @bitCast(trace.rect_push_words[2]);
+            const rect_height: f32 = @bitCast(trace.rect_push_words[3]);
+            if (!std.math.isFinite(rect_x) or !std.math.isFinite(rect_y) or
+                !std.math.isFinite(rect_width) or !std.math.isFinite(rect_height) or
+                rect_width <= 0 or rect_height <= 0 or
+                @abs(rect_x) > 65536 or @abs(rect_y) > 65536 or
+                @abs(rect_width) > 65536 or @abs(rect_height) > 65536)
+            {
+                return;
+            }
+            repair_pipeline = trace.pipeline_repair_real;
+            bind_point = trace.pipeline_bind_point;
+            original_pipeline = trace.pipeline_original_real;
+            guest_pipeline = trace.pipeline_guest;
+            push_layout = trace.push_layout_real;
+        } else return;
+
+        const function = self.real_vulkan.fn_ptrs.cmd_bind_pipeline orelse {
+            self.graphics_topology_repair_bind_failures +|= 1;
+            return;
+        };
+        self.callNativeVulkanCommand(function, .{ command_buffer_real, bind_point, repair_pipeline });
+        if (self.mutableCommandTargets(command_buffer_guest)) |record| {
+            const trace = &record.graphics_state;
+            // A command-buffer record can only be replaced by another bind on
+            // the same guest thread. Keep the guard so a late state mutation
+            // cannot label an unrelated pipeline as repaired.
+            if (trace.pipeline_original_real == original_pipeline and trace.pipeline_guest == guest_pipeline and
+                trace.push_layout_real == push_layout and trace.pipeline_repair_real == repair_pipeline)
+            {
+                trace.pipeline_real = repair_pipeline;
+                trace.pipeline_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+                trace.pipeline_topology_known = true;
+                trace.pipeline_repair_applied = true;
+            }
+        }
+        self.graphics_topology_repairs +|= 1;
+        if (self.graphics_topology_repairs <= 8 or (self.graphics_topology_repairs & (self.graphics_topology_repairs - 1)) == 0) {
+            machoCapturePrint(
+                "macho-processor: Vulkan GUEST OUTPUT TOPOLOGY REPAIR: command_buffer=0x{x} guest_pipeline=0x{x} original_real=0x{x} repair_real=0x{x} topology=triangle_list->triangle_strip rect_push_layout=0x{x} repair_count={d}\n",
+                .{ command_buffer_guest, guest_pipeline, original_pipeline, repair_pipeline, push_layout, self.graphics_topology_repairs },
+            );
+        }
+    }
+
+    fn noteGraphicsDrawState(
+        self: *Forwarder,
+        command_buffer: u64,
+        kind: []const u8,
+        vertex_count: u64,
+        instance_count: u64,
+        first_vertex_or_index: u64,
+        auxiliary: u64,
+        first_instance: u64,
+    ) void {
+        if (!self.graphicsStateTraceEnabled()) return;
+        self.graphics_state_trace_draws +|= 1;
+        const ordinal = self.graphics_state_trace_draws;
+        const record = self.mutableCommandTargets(command_buffer) orelse return;
+        const trace = &record.graphics_state;
+        const needs_viewport = trace.pipeline_bound and trace.pipeline_dynamic_viewport;
+        const needs_scissor = trace.pipeline_bound and trace.pipeline_dynamic_scissor;
+        const missing_viewport = needs_viewport and !trace.viewport_valid;
+        const missing_scissor = needs_scissor and !trace.scissor_valid;
+        if (missing_viewport) self.graphics_state_trace_missing_viewport +|= 1;
+        if (missing_scissor) self.graphics_state_trace_missing_scissor +|= 1;
+        const viewport_bad = trace.viewport_valid and
+            (!std.math.isFinite(trace.viewport.x) or !std.math.isFinite(trace.viewport.y) or
+                !std.math.isFinite(trace.viewport.width) or !std.math.isFinite(trace.viewport.height) or
+                trace.viewport.width <= 0 or trace.viewport.height == 0 or
+                @abs(trace.viewport.width) > 65536 or @abs(trace.viewport.height) > 65536);
+        const scissor_bad = trace.scissor_valid and
+            (trace.scissor.extent.width == 0 or trace.scissor.extent.height == 0 or
+                trace.scissor.offset.x < -65536 or trace.scissor.offset.y < -65536);
+        if (viewport_bad) self.graphics_state_trace_bad_viewport +|= 1;
+        if (scissor_bad) self.graphics_state_trace_bad_scissor +|= 1;
+        const rect_words = trace.rect_push_words;
+        const rect_x: f32 = @bitCast(rect_words[0]);
+        const rect_y: f32 = @bitCast(rect_words[1]);
+        const rect_width: f32 = @bitCast(rect_words[2]);
+        const rect_height: f32 = @bitCast(rect_words[3]);
+        // A push at offset zero is common for ordinary shader constants.  It
+        // is not enough evidence to call those four words a presenter
+        // rectangle.  Require either the pipeline contract or the exact
+        // four-vertex presenter draw shape before classifying the values.
+        const rect_candidate = trace.rect_push_valid and
+            (trace.pipeline_guest_output_candidate or
+                (vertex_count == 4 and instance_count == 1 and first_vertex_or_index == 0 and first_instance == 0));
+        if (rect_candidate)
+            self.graphics_state_trace_rect_candidates +|= 1
+        else if (trace.rect_push_valid)
+            self.graphics_state_trace_rect_non_candidates +|= 1;
+        const rect_bad = rect_candidate and
+            (!std.math.isFinite(rect_x) or !std.math.isFinite(rect_y) or
+                !std.math.isFinite(rect_width) or !std.math.isFinite(rect_height) or
+                rect_width <= 0 or rect_height <= 0 or @abs(rect_x) > 8 or @abs(rect_y) > 8 or
+                @abs(rect_width) > 8 or @abs(rect_height) > 8);
+        if (rect_bad) self.graphics_state_trace_bad_rect +|= 1;
+        const topology_mismatch = trace.pipeline_topology_known and rect_candidate and
+            ((vertex_count == 4 and trace.pipeline_topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP) or
+                (vertex_count == 3 and trace.pipeline_topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST));
+        if (topology_mismatch) self.graphics_state_trace_topology_mismatch +|= 1;
+        const interesting = vertex_count == 3 or vertex_count == 4 or missing_viewport or missing_scissor or
+            viewport_bad or scissor_bad or rect_bad or topology_mismatch;
+        if (!interesting) return;
+        const sparse = ordinal <= 128 or (ordinal & (ordinal - 1)) == 0;
+        if (!sparse) return;
+        const descriptor_count = @as(usize, @intCast(record.bound_descriptor_set_count));
+        const first_descriptor = if (descriptor_count == 0) 0 else record.bound_descriptor_sets[0].synthetic;
+        const topology_name = if (trace.pipeline_topology_known) vulkanTopologyLabel(trace.pipeline_topology) else "unknown";
+        self.graphics_state_trace_printed +|= 1;
+        machoCapturePrint(
+            "macho-processor: Vulkan GRAPHICS STATE DRAW: ordinal={d} kind={s} command_buffer=0x{x} pipeline_guest=0x{x} pipeline_real=0x{x} bind_point={d} topology={d}/{s} stages={d} dynamic_viewport={} dynamic_scissor={} draw={d}/{d}/{d}/{d}/{d} viewport(valid/first/count)={}/{d}/{d} viewport_xywh={d:.3}/{d:.3}/{d:.3}/{d:.3} scissor(valid/first/count)={}/{d}/{d} scissor_xywh={d}/{d}/{d}/{d}\n",
+            .{
+                ordinal,
+                kind,
+                command_buffer,
+                trace.pipeline_guest,
+                trace.pipeline_real,
+                trace.pipeline_bind_point,
+                trace.pipeline_topology,
+                topology_name,
+                trace.pipeline_stage_count,
+                trace.pipeline_dynamic_viewport,
+                trace.pipeline_dynamic_scissor,
+                vertex_count,
+                instance_count,
+                first_vertex_or_index,
+                auxiliary,
+                first_instance,
+                trace.viewport_valid,
+                trace.viewport_first,
+                trace.viewport_count,
+                trace.viewport.x,
+                trace.viewport.y,
+                trace.viewport.width,
+                trace.viewport.height,
+                trace.scissor_valid,
+                trace.scissor_first,
+                trace.scissor_count,
+                trace.scissor.offset.x,
+                trace.scissor.offset.y,
+                trace.scissor.extent.width,
+                trace.scissor.extent.height,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: Vulkan GRAPHICS STATE DRAW DETAIL: ordinal={d} command_buffer=0x{x} descriptor_sets={d} first_descriptor=0x{x} push(valid/layout_guest/layout_real/stages/offset/size/hash)={}/0x{x}/0x{x}/0x{x}/{d}/{d}/0x{x} rect(valid/xywh/hash)={}/{d:.3}/{d:.3}/{d:.3}/{d:.3}/0x{x} anomalies(missing_viewport/missing_scissor/bad_viewport/bad_scissor/bad_rect/topology)={}/{}/{}/{}/{}/{}\n",
+            .{
+                ordinal,
+                command_buffer,
+                descriptor_count,
+                first_descriptor,
+                trace.push_constants_valid,
+                trace.push_layout_guest,
+                trace.push_layout_real,
+                trace.push_stage_flags,
+                trace.push_offset,
+                trace.push_size,
+                trace.push_hash,
+                trace.rect_push_valid,
+                rect_x,
+                rect_y,
+                rect_width,
+                rect_height,
+                trace.rect_push_hash,
+                missing_viewport,
+                missing_scissor,
+                viewport_bad,
+                scissor_bad,
+                rect_bad,
+                topology_mismatch,
+            },
+        );
+    }
+
     fn copyGuestHandleArray(
         self: *Forwarder,
         state: anytype,
@@ -3379,58 +4556,271 @@ pub const Forwarder = struct {
         }
     }
 
-    fn forwardVulkanCommand(self: *Forwarder, state: anytype, name_hash: u64, name: []const u8) void {
+    /// Count native work only after a typed driver entry point was invoked.
+    /// The tuple has the function's declared types, so @intCast/@bitCast keep
+    /// their ABI context rather than becoming untyped forwarding values.
+    fn callNativeVulkanCommand(self: *Forwarder, function: anytype, arguments: std.meta.ArgsTuple(@typeInfo(@TypeOf(function)).pointer.child)) void {
+        @call(.auto, function, arguments);
+        self.vulkan_real_command_calls +|= 1;
+    }
+
+    fn noteVulkanCommandRefusal(self: *Forwarder, source_line: u32) void {
+        self.vulkan_command_refusal_line = source_line;
+    }
+
+    fn nativeVulkanCommandFunctionAvailable(self: *const Forwarder, name: []const u8) bool {
+        @setEvalBranchQuota(5000);
+        const fields = [_]struct { name: []const u8, field: []const u8 }{
+            .{ .name = "vkCmdBeginConditionalRenderingEXT", .field = "cmd_begin_conditional_rendering" },
+            .{ .name = "vkCmdBeginQuery", .field = "cmd_begin_query" },
+            .{ .name = "vkCmdBeginRendering", .field = "cmd_begin_rendering" },
+            .{ .name = "vkCmdBeginRenderingKHR", .field = "cmd_begin_rendering" },
+            .{ .name = "vkCmdBeginRenderPass", .field = "cmd_begin_render_pass" },
+            .{ .name = "vkCmdBeginRenderPass2", .field = "cmd_begin_render_pass2" },
+            .{ .name = "vkCmdBeginRenderPass2KHR", .field = "cmd_begin_render_pass2" },
+            .{ .name = "vkCmdBindDescriptorSets", .field = "cmd_bind_descriptor_sets" },
+            .{ .name = "vkCmdBindIndexBuffer", .field = "cmd_bind_index_buffer" },
+            .{ .name = "vkCmdBindPipeline", .field = "cmd_bind_pipeline" },
+            .{ .name = "vkCmdBindVertexBuffers", .field = "cmd_bind_vertex_buffers" },
+            .{ .name = "vkCmdBlitImage", .field = "cmd_blit_image" },
+            .{ .name = "vkCmdClearAttachments", .field = "cmd_clear_attachments" },
+            .{ .name = "vkCmdClearColorImage", .field = "cmd_clear_color_image" },
+            .{ .name = "vkCmdClearDepthStencilImage", .field = "cmd_clear_depth_stencil_image" },
+            .{ .name = "vkCmdCopyBuffer", .field = "cmd_copy_buffer" },
+            .{ .name = "vkCmdCopyBufferToImage", .field = "cmd_copy_buffer_to_image" },
+            .{ .name = "vkCmdCopyImage", .field = "cmd_copy_image" },
+            .{ .name = "vkCmdCopyImageToBuffer", .field = "cmd_copy_image_to_buffer" },
+            .{ .name = "vkCmdCopyQueryPoolResults", .field = "cmd_copy_query_pool_results" },
+            .{ .name = "vkCmdDispatch", .field = "cmd_dispatch" },
+            .{ .name = "vkCmdDispatchBase", .field = "cmd_dispatch_base" },
+            .{ .name = "vkCmdDispatchIndirect", .field = "cmd_dispatch_indirect" },
+            .{ .name = "vkCmdDraw", .field = "cmd_draw" },
+            .{ .name = "vkCmdDrawIndexed", .field = "cmd_draw_indexed" },
+            .{ .name = "vkCmdDrawIndexedIndirect", .field = "cmd_draw_indexed_indirect" },
+            .{ .name = "vkCmdDrawIndexedIndirectCount", .field = "cmd_draw_indexed_indirect_count" },
+            .{ .name = "vkCmdDrawIndirect", .field = "cmd_draw_indirect" },
+            .{ .name = "vkCmdDrawIndirectCount", .field = "cmd_draw_indirect_count" },
+            .{ .name = "vkCmdEndConditionalRenderingEXT", .field = "cmd_end_conditional_rendering" },
+            .{ .name = "vkCmdEndQuery", .field = "cmd_end_query" },
+            .{ .name = "vkCmdEndRendering", .field = "cmd_end_rendering" },
+            .{ .name = "vkCmdEndRenderingKHR", .field = "cmd_end_rendering" },
+            .{ .name = "vkCmdEndRenderPass", .field = "cmd_end_render_pass" },
+            .{ .name = "vkCmdEndRenderPass2", .field = "cmd_end_render_pass2" },
+            .{ .name = "vkCmdEndRenderPass2KHR", .field = "cmd_end_render_pass2" },
+            .{ .name = "vkCmdExecuteCommands", .field = "cmd_execute_commands" },
+            .{ .name = "vkCmdFillBuffer", .field = "cmd_fill_buffer" },
+            .{ .name = "vkCmdNextSubpass", .field = "cmd_next_subpass" },
+            .{ .name = "vkCmdNextSubpass2", .field = "cmd_next_subpass2" },
+            .{ .name = "vkCmdNextSubpass2KHR", .field = "cmd_next_subpass2" },
+            .{ .name = "vkCmdPipelineBarrier", .field = "cmd_pipeline_barrier" },
+            .{ .name = "vkCmdPipelineBarrier2", .field = "cmd_pipeline_barrier2" },
+            .{ .name = "vkCmdPipelineBarrier2KHR", .field = "cmd_pipeline_barrier2" },
+            .{ .name = "vkCmdPushConstants", .field = "cmd_push_constants" },
+            .{ .name = "vkCmdPushDescriptorSetKHR", .field = "cmd_push_descriptor_set" },
+            .{ .name = "vkCmdResetQueryPool", .field = "cmd_reset_query_pool" },
+            .{ .name = "vkCmdResolveImage", .field = "cmd_resolve_image" },
+            .{ .name = "vkCmdSetBlendConstants", .field = "cmd_set_blend_constants" },
+            .{ .name = "vkCmdSetDepthBias", .field = "cmd_set_depth_bias" },
+            .{ .name = "vkCmdSetDepthBounds", .field = "cmd_set_depth_bounds" },
+            .{ .name = "vkCmdSetDepthCompareOp", .field = "cmd_set_depth_compare_op" },
+            .{ .name = "vkCmdSetDepthTestEnable", .field = "cmd_set_depth_test_enable" },
+            .{ .name = "vkCmdSetDepthWriteEnable", .field = "cmd_set_depth_write_enable" },
+            .{ .name = "vkCmdSetPrimitiveRestartEnable", .field = "cmd_set_primitive_restart_enable" },
+            .{ .name = "vkCmdSetScissor", .field = "cmd_set_scissor" },
+            .{ .name = "vkCmdSetStencilCompareMask", .field = "cmd_set_stencil_compare_mask" },
+            .{ .name = "vkCmdSetStencilOp", .field = "cmd_set_stencil_op" },
+            .{ .name = "vkCmdSetStencilReference", .field = "cmd_set_stencil_reference" },
+            .{ .name = "vkCmdSetStencilTestEnable", .field = "cmd_set_stencil_test_enable" },
+            .{ .name = "vkCmdSetStencilWriteMask", .field = "cmd_set_stencil_write_mask" },
+            .{ .name = "vkCmdSetViewport", .field = "cmd_set_viewport" },
+            .{ .name = "vkCmdUpdateBuffer", .field = "cmd_update_buffer" },
+        };
+        const hash = vulkanNameHash(name);
+        inline for (fields) |entry| {
+            const expected_hash = comptime vulkanNameHash(entry.name);
+            if (hash == expected_hash and std.mem.eql(u8, name, entry.name)) {
+                return @field(self.real_vulkan.fn_ptrs, entry.field) != null;
+            }
+        }
+        return false;
+    }
+
+    fn finishVulkanCommandAdmission(self: *Forwarder, state: anytype, name: []const u8, command_index: ?usize, forwarded: bool) void {
+        if (forwarded) {
+            if (command_index) |index| self.vulkan_command_admission[index].forwarded +|= 1;
+            self.noteVulkanCommandShape(name, state.regs.rdi);
+            if (self.vulkan_real_command_calls == 1) machoCapturePrint(
+                "macho-processor: Vulkan forwarding boundary: first real command={s} command_buffer=0x{x}\n",
+                .{ name, state.regs.rdi },
+            );
+            return;
+        }
+        self.vulkan_command_admission_rejected +|= 1;
+        const index = command_index orelse return;
+        const record = &self.vulkan_command_admission[index];
+        record.rejected +|= 1;
+        record.last_reason = if (self.real_vulkan.device_lost)
+            .device_lost
+        else if (self.real_vulkan.realCommandBuffer(state.regs.rdi) == null)
+            .command_buffer_unmapped
+        else if (!self.nativeVulkanCommandFunctionAvailable(name))
+            .native_entry_point_missing
+        else
+            .argument_marshalling_refused;
+        // Native-entry-point absence has no marshalling guard to name. Point
+        // to this classification site rather than emitting an unusable :0.
+        record.last_refusal_line = if (self.vulkan_command_refusal_line != 0)
+            self.vulkan_command_refusal_line
+        else
+            @src().line;
+        record.last_arguments = .{
+            state.regs.rdi,          state.regs.rsi,          state.regs.rdx,
+            state.regs.rcx,          state.regs.r8,           state.regs.r9,
+            guestStackArg(state, 0), guestStackArg(state, 1), guestStackArg(state, 2),
+            guestStackArg(state, 3), guestStackArg(state, 4), guestStackArg(state, 5),
+        };
+        if (record.rejected <= 4 or (record.rejected & (record.rejected - 1)) == 0) {
+            self.printVulkanCommandRefusal(name, record);
+        }
+    }
+
+    fn printVulkanCommandRefusal(_: *const Forwarder, name: []const u8, record: *const VulkanCommandAdmission) void {
+        const args = record.last_arguments;
+        machoCapturePrint(
+            "macho-processor: Vulkan command refused before native call: name={s} entries={d} forwarded={d} rejected={d} reason={s} refusal_site=dynamic_library_forwarder.zig:{d} args[0..11]=0x{x}/0x{x}/0x{x}/0x{x}/0x{x}/0x{x}/0x{x}/0x{x}/0x{x}/0x{x}/0x{x}/0x{x}; handled does not mean native work\n",
+            .{ name, record.entries, record.forwarded, record.rejected, @tagName(record.last_reason), record.last_refusal_line, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11] },
+        );
+    }
+
+    fn printVulkanCommandAdmission(self: *const Forwarder) void {
+        if (self.vulkan_command_admission_entries == 0) return;
+        machoCapturePrint(
+            "macho-processor: PRESENT CHAIN:   command_admission=entries:{d},forwarded:{d},rejected:{d},untracked:{d}; forwarded is counted only after a real vkCmd entry point was called\n",
+            .{ self.vulkan_command_admission_entries, self.vulkan_real_command_calls, self.vulkan_command_admission_rejected, self.vulkan_command_admission_untracked },
+        );
+        for (self.vulkan_command_admission, forwarded_vulkan_commands) |record, name| {
+            if (record.entries == 0) continue;
+            machoCapturePrint(
+                "macho-processor: PRESENT CHAIN:   command_admission name={s} entries={d} forwarded={d} rejected={d}\n",
+                .{ name, record.entries, record.forwarded, record.rejected },
+            );
+            if (record.rejected != 0) self.printVulkanCommandRefusal(name, &record);
+        }
+    }
+
+    fn forwardVulkanCommand(self: *Forwarder, state: anytype, requested_hash: u64, requested_name: []const u8) void {
+        const name = canonicalVulkanCommand(requested_name);
+        const name_hash = if (name.ptr == requested_name.ptr) requested_hash else vulkanNameHash(name);
+        const command_index = forwardedVulkanCommandIndex(name);
+        self.vulkan_command_admission_entries +|= 1;
+        if (command_index) |index| {
+            self.vulkan_command_admission[index].entries +|= 1;
+        } else {
+            self.vulkan_command_admission_untracked +|= 1;
+        }
+        self.vulkan_command_refusal_line = 0;
+        const native_calls_before = self.vulkan_real_command_calls;
+        defer self.finishVulkanCommandAdmission(state, name, command_index, self.vulkan_real_command_calls != native_calls_before);
+        const is_descriptor_bind = name_hash == vulkanNameHash("vkCmdBindDescriptorSets") and
+            std.mem.eql(u8, name, "vkCmdBindDescriptorSets");
+        if (is_descriptor_bind) self.vulkan_descriptor_bind_admission.entries +|= 1;
         self.vulkan_device_void_calls +|= 1;
         self.vulkan_modeled_command_calls +|= 1;
-        if (self.real_vulkan.device_lost) return;
+        if (self.real_vulkan.device_lost) {
+            if (is_descriptor_bind) self.rejectDescriptorBind(
+                .device_lost,
+                state.regs.rdi,
+                state.regs.rdx,
+                state.regs.r8,
+                state.regs.r9,
+                guestStackArg(state, 0),
+                guestStackArg(state, 1),
+                0,
+            );
+            return self.noteVulkanCommandRefusal(@src().line);
+        }
         const command_buffer = self.real_vulkan.realCommandBuffer(state.regs.rdi) orelse {
+            if (is_descriptor_bind) self.rejectDescriptorBind(
+                .command_buffer_unmapped,
+                state.regs.rdi,
+                state.regs.rdx,
+                state.regs.r8,
+                state.regs.r9,
+                guestStackArg(state, 0),
+                guestStackArg(state, 1),
+                state.regs.rdi,
+            );
             if (self.vulkan_modeled_command_calls <= 8) machoCapturePrint(
                 "macho-processor: Vulkan command not forwarded: {s} command_buffer=0x{x} has no real mapping\n",
                 .{ name, state.regs.rdi },
             );
-            return;
+            return self.noteVulkanCommandRefusal(@src().line);
         };
-        self.vulkan_real_command_calls +|= 1;
-        self.noteVulkanCommandShape(name, state.regs.rdi);
-        if (self.vulkan_modeled_command_calls == 1) machoCapturePrint(
-            "macho-processor: Vulkan forwarding boundary: first real command={s} command_buffer=0x{x}\n",
-            .{ name, state.regs.rdi },
-        );
-
         if ((name_hash == vulkanNameHash("vkCmdBindPipeline") and std.mem.eql(u8, name, "vkCmdBindPipeline"))) {
-            const pipeline = self.real_vulkan.realPipeline(state.regs.rdx) orelse return;
-            if (self.real_vulkan.fn_ptrs.cmd_bind_pipeline) |function| function(command_buffer, @intCast(state.regs.rsi), pipeline);
+            const pipeline = self.real_vulkan.realPipeline(state.regs.rdx) orelse return self.noteVulkanCommandRefusal(@src().line);
+            self.noteCommandPipelineState(state.regs.rdi, state.regs.rdx, pipeline, state.regs.rsi);
+            if (self.real_vulkan.fn_ptrs.cmd_bind_pipeline) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi), pipeline });
         } else if ((name_hash == vulkanNameHash("vkCmdExecuteCommands") and std.mem.eql(u8, name, "vkCmdExecuteCommands"))) {
             const count = state.regs.rsi;
             var secondary: [64]abi.CommandBuffer = [_]abi.CommandBuffer{null} ** 64;
-            if (count > secondary.len or (count != 0 and state.guestMemoryConst(state.regs.rdx, count * 8) == null)) return;
+            if (count > secondary.len or (count != 0 and state.guestMemoryConst(state.regs.rdx, count * 8) == null)) return self.noteVulkanCommandRefusal(@src().line);
             if (self.real_vulkan.fn_ptrs.cmd_execute_commands) |function| {
                 for (0..@as(usize, @intCast(count))) |index| {
                     const synthetic = state.read64(state.regs.rdx + @as(u64, @intCast(index)) * 8);
-                    secondary[index] = self.real_vulkan.realCommandBuffer(synthetic) orelse return;
+                    secondary[index] = self.real_vulkan.realCommandBuffer(synthetic) orelse return self.noteVulkanCommandRefusal(@src().line);
                     self.mergeCommandTargets(state.regs.rdi, synthetic);
                 }
-                function(command_buffer, @intCast(count), &secondary);
+                self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(count), &secondary });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdBindVertexBuffers") and std.mem.eql(u8, name, "vkCmdBindVertexBuffers"))) {
             const count = state.regs.rdx;
             var buffers: [32]abi.Buffer = undefined;
             var offsets: [32]u64 = undefined;
-            if (count > buffers.len or !copyGuestHandleArray(self, state, state.regs.rcx, count, @ptrCast(&buffers), .buffer)) return;
-            if (!copyGuestStructs(u64, state, state.regs.r8, count, &offsets)) return;
-            if (self.real_vulkan.fn_ptrs.cmd_bind_vertex_buffers) |function| function(command_buffer, @intCast(state.regs.rsi), @intCast(count), &buffers, &offsets);
+            if (count > buffers.len or !copyGuestHandleArray(self, state, state.regs.rcx, count, @ptrCast(&buffers), .buffer)) return self.noteVulkanCommandRefusal(@src().line);
+            if (!copyGuestStructs(u64, state, state.regs.r8, count, &offsets)) return self.noteVulkanCommandRefusal(@src().line);
+            if (self.real_vulkan.fn_ptrs.cmd_bind_vertex_buffers) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi), @intCast(count), &buffers, &offsets });
         } else if ((name_hash == vulkanNameHash("vkCmdBindIndexBuffer") and std.mem.eql(u8, name, "vkCmdBindIndexBuffer"))) {
-            const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return;
-            if (self.real_vulkan.fn_ptrs.cmd_bind_index_buffer) |function| function(command_buffer, buffer, state.regs.rdx, @intCast(state.regs.rcx));
-        } else if ((name_hash == vulkanNameHash("vkCmdBindDescriptorSets") and std.mem.eql(u8, name, "vkCmdBindDescriptorSets"))) {
+            const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
+            if (self.real_vulkan.fn_ptrs.cmd_bind_index_buffer) |function| self.callNativeVulkanCommand(function, .{ command_buffer, buffer, state.regs.rdx, @intCast(state.regs.rcx) });
+        } else if (is_descriptor_bind) {
             const set_count = state.regs.r8;
+            const guest_sets = state.regs.r9;
             const dynamic_count = guestStackArg(state, 0);
+            const guest_dynamic_offsets = guestStackArg(state, 1);
             var sets: [32]u64 = undefined;
             var dynamic_offsets: [64]u32 = undefined;
-            const layout = self.real_vulkan.realPipelineLayout(state.regs.rdx) orelse return;
-            if (!copyGuestHandleArray(self, state, state.regs.r9, set_count, &sets, .descriptor_set)) return;
-            if (!copyGuestStructs(u32, state, guestStackArg(state, 1), dynamic_count, &dynamic_offsets)) return;
-            if (self.real_vulkan.fn_ptrs.cmd_bind_descriptor_sets) |function| function(
+            const layout = self.real_vulkan.realPipelineLayout(state.regs.rdx) orelse {
+                self.rejectDescriptorBind(.pipeline_layout_unmapped, state.regs.rdi, state.regs.rdx, set_count, guest_sets, dynamic_count, guest_dynamic_offsets, state.regs.rdx);
+                return self.noteVulkanCommandRefusal(@src().line);
+            };
+            if (set_count > sets.len) {
+                self.rejectDescriptorBind(.set_count_exceeds_limit, state.regs.rdi, state.regs.rdx, set_count, guest_sets, dynamic_count, guest_dynamic_offsets, 0);
+                return self.noteVulkanCommandRefusal(@src().line);
+            }
+            if (set_count != 0 and state.guestMemoryConst(guest_sets, set_count * 8) == null) {
+                self.rejectDescriptorBind(.descriptor_set_array_unreadable, state.regs.rdi, state.regs.rdx, set_count, guest_sets, dynamic_count, guest_dynamic_offsets, 0);
+                return self.noteVulkanCommandRefusal(@src().line);
+            }
+            for (0..@as(usize, @intCast(set_count))) |index| {
+                const synthetic = state.read64(guest_sets + @as(u64, @intCast(index)) * 8);
+                sets[index] = self.real_vulkan.realDescriptorSet(synthetic) orelse {
+                    self.rejectDescriptorBind(.descriptor_set_unmapped, state.regs.rdi, state.regs.rdx, set_count, guest_sets, dynamic_count, guest_dynamic_offsets, synthetic);
+                    return self.noteVulkanCommandRefusal(@src().line);
+                };
+            }
+            if (dynamic_count > dynamic_offsets.len) {
+                self.rejectDescriptorBind(.dynamic_offset_count_exceeds_limit, state.regs.rdi, state.regs.rdx, set_count, guest_sets, dynamic_count, guest_dynamic_offsets, 0);
+                return self.noteVulkanCommandRefusal(@src().line);
+            }
+            if (!copyGuestStructs(u32, state, guest_dynamic_offsets, dynamic_count, &dynamic_offsets)) {
+                self.rejectDescriptorBind(.dynamic_offset_array_unreadable, state.regs.rdi, state.regs.rdx, set_count, guest_sets, dynamic_count, guest_dynamic_offsets, 0);
+                return self.noteVulkanCommandRefusal(@src().line);
+            }
+            const function = self.real_vulkan.fn_ptrs.cmd_bind_descriptor_sets orelse {
+                self.rejectDescriptorBind(.native_entry_point_missing, state.regs.rdi, state.regs.rdx, set_count, guest_sets, dynamic_count, guest_dynamic_offsets, 0);
+                return self.noteVulkanCommandRefusal(@src().line);
+            };
+            self.callNativeVulkanCommand(function, .{
                 command_buffer,
                 @intCast(state.regs.rsi),
                 layout,
@@ -3439,192 +4829,210 @@ pub const Forwarder = struct {
                 &sets,
                 @intCast(dynamic_count),
                 if (dynamic_count == 0) null else &dynamic_offsets,
-            );
+            });
+            self.vulkan_descriptor_bind_admission.forwarded +|= 1;
+            self.vulkan_descriptor_bind_calls +|= 1;
+            // Keep the descriptor-set identities with the command. The image
+            // contents of a set are persistent guest state and may be updated
+            // after recording but before queue submission; resolve them at
+            // the submission boundary instead of freezing a bind-time view.
+            self.noteCommandDescriptorSets(state, state.regs.rdi, state.regs.rcx, guest_sets, set_count);
         } else if ((name_hash == vulkanNameHash("vkCmdPushDescriptorSetKHR") and std.mem.eql(u8, name, "vkCmdPushDescriptorSetKHR"))) {
             self.forwardPushDescriptorSet(state, command_buffer);
         } else if ((name_hash == vulkanNameHash("vkCmdDraw") and std.mem.eql(u8, name, "vkCmdDraw"))) {
             if (self.real_vulkan.fn_ptrs.cmd_draw) |function| {
                 self.noteCommandTargets(state.regs.rdi, .content);
-                function(command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx), @intCast(state.regs.rcx), @intCast(state.regs.r8));
+                self.noteGraphicsDrawState(state.regs.rdi, "draw", state.regs.rsi, state.regs.rdx, state.regs.rcx, 0, state.regs.r8);
+                self.repairGuestOutputTopology(state.regs.rdi, command_buffer, state.regs.rsi, state.regs.rdx, state.regs.rcx, state.regs.r8);
+                self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx), @intCast(state.regs.rcx), @intCast(state.regs.r8) });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdDrawIndexed") and std.mem.eql(u8, name, "vkCmdDrawIndexed"))) {
             const vertex_offset: i32 = @bitCast(@as(u32, @truncate(state.regs.r8)));
             if (self.real_vulkan.fn_ptrs.cmd_draw_indexed) |function| {
                 self.noteCommandTargets(state.regs.rdi, .content);
-                function(command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx), @intCast(state.regs.rcx), vertex_offset, @intCast(state.regs.r9));
+                self.noteGraphicsDrawState(state.regs.rdi, "draw_indexed", state.regs.rsi, state.regs.rdx, state.regs.rcx, state.regs.r8, state.regs.r9);
+                self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx), @intCast(state.regs.rcx), vertex_offset, @intCast(state.regs.r9) });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdDrawIndirect") and std.mem.eql(u8, name, "vkCmdDrawIndirect"))) {
-            const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return;
+            const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
             if (self.real_vulkan.fn_ptrs.cmd_draw_indirect) |function| {
                 self.noteCommandTargets(state.regs.rdi, .content);
-                function(command_buffer, buffer, state.regs.rdx, @intCast(state.regs.rcx), @intCast(state.regs.r8));
+                self.callNativeVulkanCommand(function, .{ command_buffer, buffer, state.regs.rdx, @intCast(state.regs.rcx), @intCast(state.regs.r8) });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdDrawIndexedIndirect") and std.mem.eql(u8, name, "vkCmdDrawIndexedIndirect"))) {
-            const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return;
+            const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
             if (self.real_vulkan.fn_ptrs.cmd_draw_indexed_indirect) |function| {
                 self.noteCommandTargets(state.regs.rdi, .content);
-                function(command_buffer, buffer, state.regs.rdx, @intCast(state.regs.rcx), @intCast(state.regs.r8));
+                self.callNativeVulkanCommand(function, .{ command_buffer, buffer, state.regs.rdx, @intCast(state.regs.rcx), @intCast(state.regs.r8) });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdDrawIndirectCount") and std.mem.eql(u8, name, "vkCmdDrawIndirectCount")) or (name_hash == vulkanNameHash("vkCmdDrawIndexedIndirectCount") and std.mem.eql(u8, name, "vkCmdDrawIndexedIndirectCount"))) {
-            const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return;
-            const count_buffer = self.real_vulkan.realBuffer(state.regs.rcx) orelse return;
+            const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
+            const count_buffer = self.real_vulkan.realBuffer(state.regs.rcx) orelse return self.noteVulkanCommandRefusal(@src().line);
             const max_draw_count = guestStackArg(state, 0);
             const stride = guestStackArg(state, 1);
             if ((name_hash == vulkanNameHash("vkCmdDrawIndirectCount") and std.mem.eql(u8, name, "vkCmdDrawIndirectCount"))) {
                 if (self.real_vulkan.fn_ptrs.cmd_draw_indirect_count) |function| {
                     self.noteCommandTargets(state.regs.rdi, .content);
-                    function(command_buffer, buffer, state.regs.rdx, count_buffer, state.regs.r8, @intCast(max_draw_count), @intCast(stride));
+                    self.callNativeVulkanCommand(function, .{ command_buffer, buffer, state.regs.rdx, count_buffer, state.regs.r8, @intCast(max_draw_count), @intCast(stride) });
                 }
             } else if (self.real_vulkan.fn_ptrs.cmd_draw_indexed_indirect_count) |function| {
                 self.noteCommandTargets(state.regs.rdi, .content);
-                function(command_buffer, buffer, state.regs.rdx, count_buffer, state.regs.r8, @intCast(max_draw_count), @intCast(stride));
+                self.callNativeVulkanCommand(function, .{ command_buffer, buffer, state.regs.rdx, count_buffer, state.regs.r8, @intCast(max_draw_count), @intCast(stride) });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdDispatch") and std.mem.eql(u8, name, "vkCmdDispatch"))) {
             if (self.real_vulkan.fn_ptrs.cmd_dispatch) |function| {
                 self.noteCommandTargets(state.regs.rdi, .content);
-                function(command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx), @intCast(state.regs.rcx));
+                self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx), @intCast(state.regs.rcx) });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdDispatchIndirect") and std.mem.eql(u8, name, "vkCmdDispatchIndirect"))) {
-            const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return;
+            const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
             if (self.real_vulkan.fn_ptrs.cmd_dispatch_indirect) |function| {
                 self.noteCommandTargets(state.regs.rdi, .content);
-                function(command_buffer, buffer, state.regs.rdx);
+                self.callNativeVulkanCommand(function, .{ command_buffer, buffer, state.regs.rdx });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdDispatchBase") and std.mem.eql(u8, name, "vkCmdDispatchBase"))) {
             if (self.real_vulkan.fn_ptrs.cmd_dispatch_base) |function| {
                 self.noteCommandTargets(state.regs.rdi, .content);
-                function(command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx), @intCast(state.regs.rcx), @intCast(state.regs.r8), @intCast(state.regs.r9), @intCast(guestStackArg(state, 0)));
+                self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx), @intCast(state.regs.rcx), @intCast(state.regs.r8), @intCast(state.regs.r9), @intCast(guestStackArg(state, 0)) });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdSetViewport") and std.mem.eql(u8, name, "vkCmdSetViewport"))) {
             var viewports: [16]abi.Viewport = undefined;
-            if (!copyGuestStructs(abi.Viewport, state, state.regs.rcx, state.regs.rdx, &viewports)) return;
-            if (self.real_vulkan.fn_ptrs.cmd_set_viewport) |function| function(command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx), &viewports);
+            if (!copyGuestStructs(abi.Viewport, state, state.regs.rcx, state.regs.rdx, &viewports)) return self.noteVulkanCommandRefusal(@src().line);
+            self.noteCommandViewport(state.regs.rdi, state.regs.rsi, state.regs.rdx, viewports[0..@as(usize, @intCast(state.regs.rdx))]);
+            if (self.real_vulkan.fn_ptrs.cmd_set_viewport) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx), &viewports });
         } else if ((name_hash == vulkanNameHash("vkCmdSetScissor") and std.mem.eql(u8, name, "vkCmdSetScissor"))) {
             var scissors: [16]abi.Rect2D = undefined;
-            if (!copyGuestStructs(abi.Rect2D, state, state.regs.rcx, state.regs.rdx, &scissors)) return;
-            if (self.real_vulkan.fn_ptrs.cmd_set_scissor) |function| function(command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx), &scissors);
+            if (!copyGuestStructs(abi.Rect2D, state, state.regs.rcx, state.regs.rdx, &scissors)) return self.noteVulkanCommandRefusal(@src().line);
+            self.noteCommandScissor(state.regs.rdi, state.regs.rsi, state.regs.rdx, scissors[0..@as(usize, @intCast(state.regs.rdx))]);
+            if (self.real_vulkan.fn_ptrs.cmd_set_scissor) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx), &scissors });
         } else if ((name_hash == vulkanNameHash("vkCmdSetBlendConstants") and std.mem.eql(u8, name, "vkCmdSetBlendConstants"))) {
             var constants: [4]f32 = undefined;
-            if (!copyGuestStructs(f32, state, state.regs.rsi, 4, &constants)) return;
-            if (self.real_vulkan.fn_ptrs.cmd_set_blend_constants) |function| function(command_buffer, &constants);
+            if (!copyGuestStructs(f32, state, state.regs.rsi, 4, &constants)) return self.noteVulkanCommandRefusal(@src().line);
+            if (self.real_vulkan.fn_ptrs.cmd_set_blend_constants) |function| self.callNativeVulkanCommand(function, .{ command_buffer, &constants });
         } else if ((name_hash == vulkanNameHash("vkCmdSetDepthBias") and std.mem.eql(u8, name, "vkCmdSetDepthBias"))) {
-            if (self.real_vulkan.fn_ptrs.cmd_set_depth_bias) |function| function(
+            if (self.real_vulkan.fn_ptrs.cmd_set_depth_bias) |function| self.callNativeVulkanCommand(function, .{
                 command_buffer,
                 @bitCast(guestFloatArgument(state, 0)),
                 @bitCast(guestFloatArgument(state, 1)),
                 @bitCast(guestFloatArgument(state, 2)),
-            );
+            });
         } else if ((name_hash == vulkanNameHash("vkCmdSetDepthBounds") and std.mem.eql(u8, name, "vkCmdSetDepthBounds"))) {
-            if (self.real_vulkan.fn_ptrs.cmd_set_depth_bounds) |function| function(command_buffer, @bitCast(guestFloatArgument(state, 0)), @bitCast(guestFloatArgument(state, 1)));
+            if (self.real_vulkan.fn_ptrs.cmd_set_depth_bounds) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @bitCast(guestFloatArgument(state, 0)), @bitCast(guestFloatArgument(state, 1)) });
         } else if ((name_hash == vulkanNameHash("vkCmdSetDepthTestEnable") and std.mem.eql(u8, name, "vkCmdSetDepthTestEnable"))) {
-            if (self.real_vulkan.fn_ptrs.cmd_set_depth_test_enable) |function| function(command_buffer, @intCast(state.regs.rsi));
+            if (self.real_vulkan.fn_ptrs.cmd_set_depth_test_enable) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi) });
         } else if ((name_hash == vulkanNameHash("vkCmdSetDepthWriteEnable") and std.mem.eql(u8, name, "vkCmdSetDepthWriteEnable"))) {
-            if (self.real_vulkan.fn_ptrs.cmd_set_depth_write_enable) |function| function(command_buffer, @intCast(state.regs.rsi));
+            if (self.real_vulkan.fn_ptrs.cmd_set_depth_write_enable) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi) });
         } else if ((name_hash == vulkanNameHash("vkCmdSetDepthCompareOp") and std.mem.eql(u8, name, "vkCmdSetDepthCompareOp"))) {
-            if (self.real_vulkan.fn_ptrs.cmd_set_depth_compare_op) |function| function(command_buffer, @intCast(state.regs.rsi));
+            if (self.real_vulkan.fn_ptrs.cmd_set_depth_compare_op) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi) });
         } else if ((name_hash == vulkanNameHash("vkCmdSetStencilTestEnable") and std.mem.eql(u8, name, "vkCmdSetStencilTestEnable"))) {
-            if (self.real_vulkan.fn_ptrs.cmd_set_stencil_test_enable) |function| function(command_buffer, @intCast(state.regs.rsi));
+            if (self.real_vulkan.fn_ptrs.cmd_set_stencil_test_enable) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi) });
         } else if ((name_hash == vulkanNameHash("vkCmdSetStencilOp") and std.mem.eql(u8, name, "vkCmdSetStencilOp"))) {
-            if (self.real_vulkan.fn_ptrs.cmd_set_stencil_op) |function| function(
+            if (self.real_vulkan.fn_ptrs.cmd_set_stencil_op) |function| self.callNativeVulkanCommand(function, .{
                 command_buffer,
                 @intCast(state.regs.rsi),
                 @intCast(state.regs.rdx),
                 @intCast(state.regs.rcx),
                 @intCast(state.regs.r8),
                 @intCast(state.regs.r9),
-            );
+            });
         } else if ((name_hash == vulkanNameHash("vkCmdSetPrimitiveRestartEnable") and std.mem.eql(u8, name, "vkCmdSetPrimitiveRestartEnable"))) {
-            if (self.real_vulkan.fn_ptrs.cmd_set_primitive_restart_enable) |function| function(command_buffer, @intCast(state.regs.rsi));
+            if (self.real_vulkan.fn_ptrs.cmd_set_primitive_restart_enable) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi) });
         } else if ((name_hash == vulkanNameHash("vkCmdSetStencilCompareMask") and std.mem.eql(u8, name, "vkCmdSetStencilCompareMask"))) {
-            if (self.real_vulkan.fn_ptrs.cmd_set_stencil_compare_mask) |function| function(command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx));
+            if (self.real_vulkan.fn_ptrs.cmd_set_stencil_compare_mask) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx) });
         } else if ((name_hash == vulkanNameHash("vkCmdSetStencilWriteMask") and std.mem.eql(u8, name, "vkCmdSetStencilWriteMask"))) {
-            if (self.real_vulkan.fn_ptrs.cmd_set_stencil_write_mask) |function| function(command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx));
+            if (self.real_vulkan.fn_ptrs.cmd_set_stencil_write_mask) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx) });
         } else if ((name_hash == vulkanNameHash("vkCmdSetStencilReference") and std.mem.eql(u8, name, "vkCmdSetStencilReference"))) {
-            if (self.real_vulkan.fn_ptrs.cmd_set_stencil_reference) |function| function(command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx));
+            if (self.real_vulkan.fn_ptrs.cmd_set_stencil_reference) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx) });
         } else if ((name_hash == vulkanNameHash("vkCmdPushConstants") and std.mem.eql(u8, name, "vkCmdPushConstants"))) {
             const size = state.regs.r8;
             var bytes: [256]u8 = undefined;
-            if (!copyGuestBytes(state, state.regs.r9, size, &bytes)) return;
-            const layout = self.real_vulkan.realPipelineLayout(state.regs.rsi) orelse return;
-            if (self.real_vulkan.fn_ptrs.cmd_push_constants) |function| function(command_buffer, layout, @intCast(state.regs.rdx), @intCast(state.regs.rcx), @intCast(size), if (size == 0) null else &bytes);
+            if (!copyGuestBytes(state, state.regs.r9, size, &bytes)) return self.noteVulkanCommandRefusal(@src().line);
+            const layout = self.real_vulkan.realPipelineLayout(state.regs.rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
+            self.noteCommandPushConstants(state.regs.rdi, state.regs.rsi, layout, state.regs.rdx, state.regs.rcx, size, bytes[0..@as(usize, @intCast(size))]);
+            if (self.real_vulkan.fn_ptrs.cmd_push_constants) |function| self.callNativeVulkanCommand(function, .{ command_buffer, layout, @intCast(state.regs.rdx), @intCast(state.regs.rcx), @intCast(size), if (size == 0) null else &bytes });
         } else if ((name_hash == vulkanNameHash("vkCmdBeginConditionalRenderingEXT") and std.mem.eql(u8, name, "vkCmdBeginConditionalRenderingEXT"))) {
             if (self.real_vulkan.fn_ptrs.cmd_begin_conditional_rendering) |function| {
                 var info: abi.ConditionalRenderingBeginInfoEXT = undefined;
-                if (!copyGuestValue(abi.ConditionalRenderingBeginInfoEXT, state, state.regs.rsi, &info) or info.p_next != null) return;
-                info.buffer = self.real_vulkan.realBuffer(info.buffer) orelse return;
+                if (!copyGuestValue(abi.ConditionalRenderingBeginInfoEXT, state, state.regs.rsi, &info) or info.p_next != null) return self.noteVulkanCommandRefusal(@src().line);
+                info.buffer = self.real_vulkan.realBuffer(info.buffer) orelse return self.noteVulkanCommandRefusal(@src().line);
                 info.p_next = null;
-                function(command_buffer, &info);
+                self.callNativeVulkanCommand(function, .{ command_buffer, &info });
             } else self.faultOnUnavailableVulkanCommand(name);
         } else if ((name_hash == vulkanNameHash("vkCmdEndConditionalRenderingEXT") and std.mem.eql(u8, name, "vkCmdEndConditionalRenderingEXT"))) {
-            if (self.real_vulkan.fn_ptrs.cmd_end_conditional_rendering) |function| function(command_buffer) else self.faultOnUnavailableVulkanCommand(name);
+            if (self.real_vulkan.fn_ptrs.cmd_end_conditional_rendering) |function| self.callNativeVulkanCommand(function, .{command_buffer}) else self.faultOnUnavailableVulkanCommand(name);
         } else if ((name_hash == vulkanNameHash("vkCmdBeginRendering") and std.mem.eql(u8, name, "vkCmdBeginRendering")) or (name_hash == vulkanNameHash("vkCmdBeginRenderingKHR") and std.mem.eql(u8, name, "vkCmdBeginRenderingKHR"))) {
             if (self.real_vulkan.fn_ptrs.cmd_begin_rendering) |function| {
                 var info: abi.RenderingInfo = undefined;
-                if (!copyGuestValue(abi.RenderingInfo, state, state.regs.rsi, &info) or info.p_next != null) return;
-                if (info.color_attachment_count > 8) return;
+                if (!copyGuestValue(abi.RenderingInfo, state, state.regs.rsi, &info) or info.p_next != null) return self.noteVulkanCommandRefusal(@src().line);
+                if (info.color_attachment_count > 8) return self.noteVulkanCommandRefusal(@src().line);
                 var colors: [8]abi.RenderingAttachmentInfo = undefined;
                 const colors_address = if (info.color_attachments) |pointer| @intFromPtr(pointer) else 0;
-                if (!copyGuestStructs(abi.RenderingAttachmentInfo, state, colors_address, info.color_attachment_count, &colors)) return;
+                if (!copyGuestStructs(abi.RenderingAttachmentInfo, state, colors_address, info.color_attachment_count, &colors)) return self.noteVulkanCommandRefusal(@src().line);
                 var color_load_clear = false;
                 for (colors[0..@as(usize, @intCast(info.color_attachment_count))]) |*attachment| {
-                    if (attachment.p_next != null) return;
+                    if (attachment.p_next != null) return self.noteVulkanCommandRefusal(@src().line);
                     if (attachment.load_op == VK_ATTACHMENT_LOAD_OP_CLEAR) color_load_clear = true;
                     const guest_image_view = attachment.image_view;
                     const guest_resolve_image_view = attachment.resolve_image_view;
                     if (guest_image_view != 0) self.addCommandImageView(state.regs.rdi, guest_image_view);
                     if (guest_resolve_image_view != 0) self.addCommandImageView(state.regs.rdi, guest_resolve_image_view);
-                    if (guest_image_view != 0) attachment.image_view = self.real_vulkan.realImageView(guest_image_view) orelse return;
-                    if (guest_resolve_image_view != 0) attachment.resolve_image_view = self.real_vulkan.realImageView(guest_resolve_image_view) orelse return;
+                    self.noteCommandImageViewTransfer(state.regs.rdi, guest_image_view, guest_resolve_image_view, .render_pass_resolve);
+                    if (guest_image_view != 0) attachment.image_view = self.real_vulkan.realImageView(guest_image_view) orelse return self.noteVulkanCommandRefusal(@src().line);
+                    if (guest_resolve_image_view != 0) attachment.resolve_image_view = self.real_vulkan.realImageView(guest_resolve_image_view) orelse return self.noteVulkanCommandRefusal(@src().line);
                     attachment.p_next = null;
                 }
                 info.color_attachments = if (info.color_attachment_count == 0) null else &colors;
                 var depth: abi.RenderingAttachmentInfo = undefined;
                 var stencil: abi.RenderingAttachmentInfo = undefined;
                 if (info.depth_attachment) |pointer| {
-                    if (!copyGuestValue(abi.RenderingAttachmentInfo, state, @intFromPtr(pointer), &depth) or depth.p_next != null) return;
+                    if (!copyGuestValue(abi.RenderingAttachmentInfo, state, @intFromPtr(pointer), &depth) or depth.p_next != null) return self.noteVulkanCommandRefusal(@src().line);
                     const guest_depth_image_view = depth.image_view;
                     const guest_depth_resolve_image_view = depth.resolve_image_view;
                     if (guest_depth_image_view != 0) self.addCommandImageView(state.regs.rdi, guest_depth_image_view);
                     if (guest_depth_resolve_image_view != 0) self.addCommandImageView(state.regs.rdi, guest_depth_resolve_image_view);
-                    if (guest_depth_image_view != 0) depth.image_view = self.real_vulkan.realImageView(guest_depth_image_view) orelse return;
-                    if (guest_depth_resolve_image_view != 0) depth.resolve_image_view = self.real_vulkan.realImageView(guest_depth_resolve_image_view) orelse return;
+                    self.noteCommandImageViewTransfer(state.regs.rdi, guest_depth_image_view, guest_depth_resolve_image_view, .render_pass_resolve);
+                    if (guest_depth_image_view != 0) depth.image_view = self.real_vulkan.realImageView(guest_depth_image_view) orelse return self.noteVulkanCommandRefusal(@src().line);
+                    if (guest_depth_resolve_image_view != 0) depth.resolve_image_view = self.real_vulkan.realImageView(guest_depth_resolve_image_view) orelse return self.noteVulkanCommandRefusal(@src().line);
                     depth.p_next = null;
                     info.depth_attachment = &depth;
                 }
                 if (info.stencil_attachment) |pointer| {
-                    if (!copyGuestValue(abi.RenderingAttachmentInfo, state, @intFromPtr(pointer), &stencil) or stencil.p_next != null) return;
+                    if (!copyGuestValue(abi.RenderingAttachmentInfo, state, @intFromPtr(pointer), &stencil) or stencil.p_next != null) return self.noteVulkanCommandRefusal(@src().line);
                     const guest_stencil_image_view = stencil.image_view;
                     const guest_stencil_resolve_image_view = stencil.resolve_image_view;
                     if (guest_stencil_image_view != 0) self.addCommandImageView(state.regs.rdi, guest_stencil_image_view);
                     if (guest_stencil_resolve_image_view != 0) self.addCommandImageView(state.regs.rdi, guest_stencil_resolve_image_view);
-                    if (guest_stencil_image_view != 0) stencil.image_view = self.real_vulkan.realImageView(guest_stencil_image_view) orelse return;
-                    if (guest_stencil_resolve_image_view != 0) stencil.resolve_image_view = self.real_vulkan.realImageView(guest_stencil_resolve_image_view) orelse return;
+                    self.noteCommandImageViewTransfer(state.regs.rdi, guest_stencil_image_view, guest_stencil_resolve_image_view, .render_pass_resolve);
+                    if (guest_stencil_image_view != 0) stencil.image_view = self.real_vulkan.realImageView(guest_stencil_image_view) orelse return self.noteVulkanCommandRefusal(@src().line);
+                    if (guest_stencil_resolve_image_view != 0) stencil.resolve_image_view = self.real_vulkan.realImageView(guest_stencil_resolve_image_view) orelse return self.noteVulkanCommandRefusal(@src().line);
                     stencil.p_next = null;
                     info.stencil_attachment = &stencil;
                 }
                 info.p_next = null;
                 if (color_load_clear) self.noteLoadClearTarget(state.regs.rdi, "vkCmdBeginRendering") else self.noteCommandTargets(state.regs.rdi, .none);
-                function(command_buffer, &info);
+                self.callNativeVulkanCommand(function, .{ command_buffer, &info });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdEndRendering") and std.mem.eql(u8, name, "vkCmdEndRendering")) or (name_hash == vulkanNameHash("vkCmdEndRenderingKHR") and std.mem.eql(u8, name, "vkCmdEndRenderingKHR"))) {
-            if (self.real_vulkan.fn_ptrs.cmd_end_rendering) |function| function(command_buffer);
+            if (self.real_vulkan.fn_ptrs.cmd_end_rendering) |function| self.callNativeVulkanCommand(function, .{command_buffer});
         } else if ((name_hash == vulkanNameHash("vkCmdBeginRenderPass") and std.mem.eql(u8, name, "vkCmdBeginRenderPass"))) {
-            const guest = state.guestMemoryConst(state.regs.rsi, @sizeOf(abi.RenderPassBeginInfo)) orelse return;
+            const guest = state.guestMemoryConst(state.regs.rsi, @sizeOf(abi.RenderPassBeginInfo)) orelse return self.noteVulkanCommandRefusal(@src().line);
             var begin: abi.RenderPassBeginInfo = undefined;
             @memcpy(std.mem.asBytes(&begin), guest);
             const guest_render_pass = begin.render_pass;
             const guest_framebuffer = begin.framebuffer;
-            if (begin.p_next != null) return;
+            if (begin.p_next != null) return self.noteVulkanCommandRefusal(@src().line);
             begin.p_next = null;
-            begin.render_pass = self.real_vulkan.realRenderPass(begin.render_pass) orelse return;
-            begin.framebuffer = self.real_vulkan.realFramebuffer(begin.framebuffer) orelse return;
+            begin.render_pass = self.real_vulkan.realRenderPass(begin.render_pass) orelse return self.noteVulkanCommandRefusal(@src().line);
+            begin.framebuffer = self.real_vulkan.realFramebuffer(begin.framebuffer) orelse return self.noteVulkanCommandRefusal(@src().line);
             var clears: [32]abi.ClearValue = undefined;
             const clear_address = if (begin.clear_values) |pointer| @intFromPtr(pointer) else 0;
-            if (begin.clear_value_count != 0 and clear_address == 0) return;
-            if (!copyGuestStructs(abi.ClearValue, state, clear_address, begin.clear_value_count, &clears)) return;
+            if (begin.clear_value_count != 0 and clear_address == 0) return self.noteVulkanCommandRefusal(@src().line);
+            if (!copyGuestStructs(abi.ClearValue, state, clear_address, begin.clear_value_count, &clears)) return self.noteVulkanCommandRefusal(@src().line);
             begin.clear_values = if (begin.clear_value_count == 0) null else &clears;
             if (self.real_vulkan.fn_ptrs.cmd_begin_render_pass) |function| {
                 self.trackFramebufferTargets(state.regs.rdi, guest_framebuffer);
+                self.noteCommandPassTarget(state.regs.rdi, guest_framebuffer);
+                self.trackRenderPassTransfers(state.regs.rdi, guest_render_pass, guest_framebuffer);
                 if (self.trackedRenderPass(guest_render_pass)) |render_pass| {
                     if (render_pass.color_load_clear) {
                         self.noteLoadClearTarget(state.regs.rdi, "vkCmdBeginRenderPass");
@@ -3634,28 +5042,30 @@ pub const Forwarder = struct {
                 } else {
                     self.noteCommandTargets(state.regs.rdi, .none);
                 }
-                function(command_buffer, &begin, @intCast(state.regs.rdx));
+                self.callNativeVulkanCommand(function, .{ command_buffer, &begin, @intCast(state.regs.rdx) });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdNextSubpass") and std.mem.eql(u8, name, "vkCmdNextSubpass"))) {
-            if (self.real_vulkan.fn_ptrs.cmd_next_subpass) |function| function(command_buffer, @intCast(state.regs.rsi));
+            if (self.real_vulkan.fn_ptrs.cmd_next_subpass) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi) });
         } else if ((name_hash == vulkanNameHash("vkCmdBeginRenderPass2") and std.mem.eql(u8, name, "vkCmdBeginRenderPass2")) or (name_hash == vulkanNameHash("vkCmdBeginRenderPass2KHR") and std.mem.eql(u8, name, "vkCmdBeginRenderPass2KHR"))) {
             if (self.real_vulkan.fn_ptrs.cmd_begin_render_pass2) |function| {
-                const guest_begin = state.guestMemoryConst(state.regs.rsi, @sizeOf(abi.RenderPassBeginInfo)) orelse return;
-                const guest_subpass = state.guestMemoryConst(state.regs.rdx, @sizeOf(abi.SubpassBeginInfo)) orelse return;
+                const guest_begin = state.guestMemoryConst(state.regs.rsi, @sizeOf(abi.RenderPassBeginInfo)) orelse return self.noteVulkanCommandRefusal(@src().line);
+                const guest_subpass = state.guestMemoryConst(state.regs.rdx, @sizeOf(abi.SubpassBeginInfo)) orelse return self.noteVulkanCommandRefusal(@src().line);
                 var begin: abi.RenderPassBeginInfo = undefined;
                 var subpass: abi.SubpassBeginInfo = undefined;
                 @memcpy(std.mem.asBytes(&begin), guest_begin);
                 @memcpy(std.mem.asBytes(&subpass), guest_subpass);
                 const guest_render_pass = begin.render_pass;
                 const guest_framebuffer = begin.framebuffer;
-                if (begin.p_next != null or subpass.p_next != null) return;
-                begin.render_pass = self.real_vulkan.realRenderPass(begin.render_pass) orelse return;
-                begin.framebuffer = self.real_vulkan.realFramebuffer(begin.framebuffer) orelse return;
+                if (begin.p_next != null or subpass.p_next != null) return self.noteVulkanCommandRefusal(@src().line);
+                begin.render_pass = self.real_vulkan.realRenderPass(begin.render_pass) orelse return self.noteVulkanCommandRefusal(@src().line);
+                begin.framebuffer = self.real_vulkan.realFramebuffer(begin.framebuffer) orelse return self.noteVulkanCommandRefusal(@src().line);
                 var clears: [32]abi.ClearValue = undefined;
                 const clear_address = if (begin.clear_values) |pointer| @intFromPtr(pointer) else 0;
-                if (begin.clear_value_count != 0 and !copyGuestStructs(abi.ClearValue, state, clear_address, begin.clear_value_count, &clears)) return;
+                if (begin.clear_value_count != 0 and !copyGuestStructs(abi.ClearValue, state, clear_address, begin.clear_value_count, &clears)) return self.noteVulkanCommandRefusal(@src().line);
                 begin.clear_values = if (begin.clear_value_count == 0) null else &clears;
                 self.trackFramebufferTargets(state.regs.rdi, guest_framebuffer);
+                self.noteCommandPassTarget(state.regs.rdi, guest_framebuffer);
+                self.trackRenderPassTransfers(state.regs.rdi, guest_render_pass, guest_framebuffer);
                 if (self.trackedRenderPass(guest_render_pass)) |render_pass| {
                     if (render_pass.color_load_clear) {
                         self.noteLoadClearTarget(state.regs.rdi, "vkCmdBeginRenderPass2");
@@ -3665,109 +5075,111 @@ pub const Forwarder = struct {
                 } else {
                     self.noteCommandTargets(state.regs.rdi, .none);
                 }
-                function(command_buffer, &begin, &subpass);
+                self.callNativeVulkanCommand(function, .{ command_buffer, &begin, &subpass });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdNextSubpass2") and std.mem.eql(u8, name, "vkCmdNextSubpass2")) or (name_hash == vulkanNameHash("vkCmdNextSubpass2KHR") and std.mem.eql(u8, name, "vkCmdNextSubpass2KHR"))) {
             if (self.real_vulkan.fn_ptrs.cmd_next_subpass2) |function| {
                 var begin: abi.SubpassBeginInfo = undefined;
                 var end: abi.SubpassEndInfo = undefined;
-                if (!copyGuestValue(abi.SubpassBeginInfo, state, state.regs.rsi, &begin) or !copyGuestValue(abi.SubpassEndInfo, state, state.regs.rdx, &end)) return;
-                if (begin.p_next != null or end.p_next != null) return;
-                function(command_buffer, &begin, &end);
+                if (!copyGuestValue(abi.SubpassBeginInfo, state, state.regs.rsi, &begin) or !copyGuestValue(abi.SubpassEndInfo, state, state.regs.rdx, &end)) return self.noteVulkanCommandRefusal(@src().line);
+                if (begin.p_next != null or end.p_next != null) return self.noteVulkanCommandRefusal(@src().line);
+                self.callNativeVulkanCommand(function, .{ command_buffer, &begin, &end });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdEndRenderPass2") and std.mem.eql(u8, name, "vkCmdEndRenderPass2")) or (name_hash == vulkanNameHash("vkCmdEndRenderPass2KHR") and std.mem.eql(u8, name, "vkCmdEndRenderPass2KHR"))) {
+            self.clearCommandPassTarget(state.regs.rdi);
             if (self.real_vulkan.fn_ptrs.cmd_end_render_pass2) |function| {
                 var end: abi.SubpassEndInfo = undefined;
-                if (!copyGuestValue(abi.SubpassEndInfo, state, state.regs.rsi, &end) or end.p_next != null) return;
-                function(command_buffer, &end);
+                if (!copyGuestValue(abi.SubpassEndInfo, state, state.regs.rsi, &end) or end.p_next != null) return self.noteVulkanCommandRefusal(@src().line);
+                self.callNativeVulkanCommand(function, .{ command_buffer, &end });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdEndRenderPass") and std.mem.eql(u8, name, "vkCmdEndRenderPass"))) {
-            if (self.real_vulkan.fn_ptrs.cmd_end_render_pass) |function| function(command_buffer);
+            self.clearCommandPassTarget(state.regs.rdi);
+            if (self.real_vulkan.fn_ptrs.cmd_end_render_pass) |function| self.callNativeVulkanCommand(function, .{command_buffer});
         } else if ((name_hash == vulkanNameHash("vkCmdCopyBuffer") and std.mem.eql(u8, name, "vkCmdCopyBuffer"))) {
-            const src = self.real_vulkan.realBuffer(state.regs.rsi) orelse return;
-            const dst = self.real_vulkan.realBuffer(state.regs.rdx) orelse return;
+            const src = self.real_vulkan.realBuffer(state.regs.rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
+            const dst = self.real_vulkan.realBuffer(state.regs.rdx) orelse return self.noteVulkanCommandRefusal(@src().line);
             var regions: [64]abi.BufferCopy = undefined;
-            if (!copyGuestStructs(abi.BufferCopy, state, state.regs.r8, state.regs.rcx, &regions)) return;
-            if (self.real_vulkan.fn_ptrs.cmd_copy_buffer) |function| function(command_buffer, src, dst, @intCast(state.regs.rcx), &regions);
+            if (!copyGuestStructs(abi.BufferCopy, state, state.regs.r8, state.regs.rcx, &regions)) return self.noteVulkanCommandRefusal(@src().line);
+            if (self.real_vulkan.fn_ptrs.cmd_copy_buffer) |function| self.callNativeVulkanCommand(function, .{ command_buffer, src, dst, @intCast(state.regs.rcx), &regions });
         } else if ((name_hash == vulkanNameHash("vkCmdCopyImage") and std.mem.eql(u8, name, "vkCmdCopyImage"))) {
-            const src = self.real_vulkan.realImage(state.regs.rsi) orelse return;
-            const dst = self.real_vulkan.realImage(state.regs.rcx) orelse return;
+            const src = self.real_vulkan.realImage(state.regs.rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
+            const dst = self.real_vulkan.realImage(state.regs.rcx) orelse return self.noteVulkanCommandRefusal(@src().line);
             var regions: [64]abi.ImageCopy = undefined;
-            if (!copyGuestStructs(abi.ImageCopy, state, guestStackArg(state, 0), state.regs.r9, &regions)) return;
+            if (!copyGuestStructs(abi.ImageCopy, state, guestStackArg(state, 0), state.regs.r9, &regions)) return self.noteVulkanCommandRefusal(@src().line);
             if (self.real_vulkan.fn_ptrs.cmd_copy_image) |function| {
-                self.noteCommandImageTarget(state.regs.rdi, state.regs.rcx, .content);
-                function(command_buffer, src, @intCast(state.regs.rdx), dst, @intCast(state.regs.r8), @intCast(state.regs.r9), &regions);
+                self.noteCommandTransfer(state.regs.rdi, state.regs.rsi, state.regs.rcx, .image_copy);
+                self.callNativeVulkanCommand(function, .{ command_buffer, src, @intCast(state.regs.rdx), dst, @intCast(state.regs.r8), @intCast(state.regs.r9), &regions });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdCopyBufferToImage") and std.mem.eql(u8, name, "vkCmdCopyBufferToImage"))) {
-            const src = self.real_vulkan.realBuffer(state.regs.rsi) orelse return;
-            const dst = self.real_vulkan.realImage(state.regs.rdx) orelse return;
+            const src = self.real_vulkan.realBuffer(state.regs.rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
+            const dst = self.real_vulkan.realImage(state.regs.rdx) orelse return self.noteVulkanCommandRefusal(@src().line);
             var regions: [64]abi.BufferImageCopy = undefined;
-            if (!copyGuestStructs(abi.BufferImageCopy, state, state.regs.r9, state.regs.r8, &regions)) return;
+            if (!copyGuestStructs(abi.BufferImageCopy, state, state.regs.r9, state.regs.r8, &regions)) return self.noteVulkanCommandRefusal(@src().line);
             if (self.real_vulkan.fn_ptrs.cmd_copy_buffer_to_image) |function| {
-                self.noteCommandImageTarget(state.regs.rdi, state.regs.rdx, .content);
-                function(command_buffer, src, dst, @intCast(state.regs.rcx), @intCast(state.regs.r8), &regions);
+                self.noteCommandTransfer(state.regs.rdi, 0, state.regs.rdx, .buffer_to_image);
+                self.callNativeVulkanCommand(function, .{ command_buffer, src, dst, @intCast(state.regs.rcx), @intCast(state.regs.r8), &regions });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdCopyImageToBuffer") and std.mem.eql(u8, name, "vkCmdCopyImageToBuffer"))) {
-            const src = self.real_vulkan.realImage(state.regs.rsi) orelse return;
-            const dst = self.real_vulkan.realBuffer(state.regs.rcx) orelse return;
+            const src = self.real_vulkan.realImage(state.regs.rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
+            const dst = self.real_vulkan.realBuffer(state.regs.rcx) orelse return self.noteVulkanCommandRefusal(@src().line);
             var regions: [64]abi.BufferImageCopy = undefined;
-            if (!copyGuestStructs(abi.BufferImageCopy, state, state.regs.r9, state.regs.r8, &regions)) return;
-            if (self.real_vulkan.fn_ptrs.cmd_copy_image_to_buffer) |function| function(command_buffer, src, @intCast(state.regs.rdx), dst, @intCast(state.regs.r8), &regions);
+            if (!copyGuestStructs(abi.BufferImageCopy, state, state.regs.r9, state.regs.r8, &regions)) return self.noteVulkanCommandRefusal(@src().line);
+            if (self.real_vulkan.fn_ptrs.cmd_copy_image_to_buffer) |function| self.callNativeVulkanCommand(function, .{ command_buffer, src, @intCast(state.regs.rdx), dst, @intCast(state.regs.r8), &regions });
         } else if ((name_hash == vulkanNameHash("vkCmdBlitImage") and std.mem.eql(u8, name, "vkCmdBlitImage"))) {
-            const src = self.real_vulkan.realImage(state.regs.rsi) orelse return;
-            const dst = self.real_vulkan.realImage(state.regs.rcx) orelse return;
+            const src = self.real_vulkan.realImage(state.regs.rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
+            const dst = self.real_vulkan.realImage(state.regs.rcx) orelse return self.noteVulkanCommandRefusal(@src().line);
             var regions: [64]abi.ImageBlit = undefined;
-            if (!copyGuestStructs(abi.ImageBlit, state, guestStackArg(state, 0), state.regs.r9, &regions)) return;
+            if (!copyGuestStructs(abi.ImageBlit, state, guestStackArg(state, 0), state.regs.r9, &regions)) return self.noteVulkanCommandRefusal(@src().line);
             if (self.real_vulkan.fn_ptrs.cmd_blit_image) |function| {
-                self.noteCommandImageTarget(state.regs.rdi, state.regs.rcx, .content);
-                function(command_buffer, src, @intCast(state.regs.rdx), dst, @intCast(state.regs.r8), @intCast(state.regs.r9), &regions, @intCast(guestStackArg(state, 1)));
+                self.noteCommandTransfer(state.regs.rdi, state.regs.rsi, state.regs.rcx, .image_blit);
+                self.callNativeVulkanCommand(function, .{ command_buffer, src, @intCast(state.regs.rdx), dst, @intCast(state.regs.r8), @intCast(state.regs.r9), &regions, @intCast(guestStackArg(state, 1)) });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdFillBuffer") and std.mem.eql(u8, name, "vkCmdFillBuffer"))) {
-            const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return;
-            if (self.real_vulkan.fn_ptrs.cmd_fill_buffer) |function| function(command_buffer, buffer, state.regs.rdx, state.regs.rcx, @intCast(state.regs.r8));
+            const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
+            if (self.real_vulkan.fn_ptrs.cmd_fill_buffer) |function| self.callNativeVulkanCommand(function, .{ command_buffer, buffer, state.regs.rdx, state.regs.rcx, @intCast(state.regs.r8) });
         } else if ((name_hash == vulkanNameHash("vkCmdUpdateBuffer") and std.mem.eql(u8, name, "vkCmdUpdateBuffer"))) {
-            const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return;
+            const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
             const size = state.regs.r8;
             var bytes: [65536]u8 = undefined;
-            if (!copyGuestBytes(state, state.regs.r9, size, &bytes)) return;
-            if (self.real_vulkan.fn_ptrs.cmd_update_buffer) |function| function(command_buffer, buffer, state.regs.rdx, size, if (size == 0) null else &bytes);
+            if (!copyGuestBytes(state, state.regs.r9, size, &bytes)) return self.noteVulkanCommandRefusal(@src().line);
+            if (self.real_vulkan.fn_ptrs.cmd_update_buffer) |function| self.callNativeVulkanCommand(function, .{ command_buffer, buffer, state.regs.rdx, size, if (size == 0) null else &bytes });
         } else if ((name_hash == vulkanNameHash("vkCmdResolveImage") and std.mem.eql(u8, name, "vkCmdResolveImage"))) {
-            const src = self.real_vulkan.realImage(state.regs.rsi) orelse return;
-            const dst = self.real_vulkan.realImage(state.regs.rcx) orelse return;
+            const src = self.real_vulkan.realImage(state.regs.rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
+            const dst = self.real_vulkan.realImage(state.regs.rcx) orelse return self.noteVulkanCommandRefusal(@src().line);
             var regions: [64]abi.ImageResolve = undefined;
-            if (!copyGuestStructs(abi.ImageResolve, state, guestStackArg(state, 0), state.regs.r9, &regions)) return;
+            if (!copyGuestStructs(abi.ImageResolve, state, guestStackArg(state, 0), state.regs.r9, &regions)) return self.noteVulkanCommandRefusal(@src().line);
             if (self.real_vulkan.fn_ptrs.cmd_resolve_image) |function| {
-                self.noteCommandImageTarget(state.regs.rdi, state.regs.rcx, .content);
-                function(command_buffer, src, @intCast(state.regs.rdx), dst, @intCast(state.regs.r8), @intCast(state.regs.r9), &regions);
+                self.noteCommandTransfer(state.regs.rdi, state.regs.rsi, state.regs.rcx, .image_resolve);
+                self.callNativeVulkanCommand(function, .{ command_buffer, src, @intCast(state.regs.rdx), dst, @intCast(state.regs.r8), @intCast(state.regs.r9), &regions });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdClearColorImage") and std.mem.eql(u8, name, "vkCmdClearColorImage"))) {
-            const image = self.real_vulkan.realImage(state.regs.rsi) orelse return;
+            const image = self.real_vulkan.realImage(state.regs.rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
             var value: abi.ClearColorValue = undefined;
-            if (!copyGuestStructs(abi.ClearColorValue, state, state.regs.rcx, 1, @as(*[1]abi.ClearColorValue, @ptrCast(&value)))) return;
+            if (!copyGuestStructs(abi.ClearColorValue, state, state.regs.rcx, 1, @as(*[1]abi.ClearColorValue, @ptrCast(&value)))) return self.noteVulkanCommandRefusal(@src().line);
             var ranges: [32]abi.ImageSubresourceRange = undefined;
-            if (!copyGuestStructs(abi.ImageSubresourceRange, state, state.regs.r9, state.regs.r8, &ranges)) return;
+            if (!copyGuestStructs(abi.ImageSubresourceRange, state, state.regs.r9, state.regs.r8, &ranges)) return self.noteVulkanCommandRefusal(@src().line);
             if (self.real_vulkan.fn_ptrs.cmd_clear_color_image) |function| {
                 self.noteCommandImageTarget(state.regs.rdi, state.regs.rsi, .uniform_fill);
-                function(command_buffer, image, @intCast(state.regs.rdx), &value, @intCast(state.regs.r8), &ranges);
+                self.callNativeVulkanCommand(function, .{ command_buffer, image, @intCast(state.regs.rdx), &value, @intCast(state.regs.r8), &ranges });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdClearDepthStencilImage") and std.mem.eql(u8, name, "vkCmdClearDepthStencilImage"))) {
-            const image = self.real_vulkan.realImage(state.regs.rsi) orelse return;
+            const image = self.real_vulkan.realImage(state.regs.rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
             var value: abi.ClearDepthStencilValue = undefined;
-            if (!copyGuestStructs(abi.ClearDepthStencilValue, state, state.regs.rcx, 1, @as(*[1]abi.ClearDepthStencilValue, @ptrCast(&value)))) return;
+            if (!copyGuestStructs(abi.ClearDepthStencilValue, state, state.regs.rcx, 1, @as(*[1]abi.ClearDepthStencilValue, @ptrCast(&value)))) return self.noteVulkanCommandRefusal(@src().line);
             var ranges: [32]abi.ImageSubresourceRange = undefined;
-            if (!copyGuestStructs(abi.ImageSubresourceRange, state, state.regs.r9, state.regs.r8, &ranges)) return;
+            if (!copyGuestStructs(abi.ImageSubresourceRange, state, state.regs.r9, state.regs.r8, &ranges)) return self.noteVulkanCommandRefusal(@src().line);
             if (self.real_vulkan.fn_ptrs.cmd_clear_depth_stencil_image) |function| {
                 self.noteCommandImageTarget(state.regs.rdi, state.regs.rsi, .uniform_fill);
-                function(command_buffer, image, @intCast(state.regs.rdx), &value, @intCast(state.regs.r8), &ranges);
+                self.callNativeVulkanCommand(function, .{ command_buffer, image, @intCast(state.regs.rdx), &value, @intCast(state.regs.r8), &ranges });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdClearAttachments") and std.mem.eql(u8, name, "vkCmdClearAttachments"))) {
             var attachments: [32]abi.ClearAttachment = undefined;
             var rects: [64]abi.ClearRect = undefined;
-            if (!copyGuestStructs(abi.ClearAttachment, state, state.regs.rdx, state.regs.rsi, &attachments)) return;
-            if (!copyGuestStructs(abi.ClearRect, state, state.regs.r8, state.regs.rcx, &rects)) return;
+            if (!copyGuestStructs(abi.ClearAttachment, state, state.regs.rdx, state.regs.rsi, &attachments)) return self.noteVulkanCommandRefusal(@src().line);
+            if (!copyGuestStructs(abi.ClearRect, state, state.regs.r8, state.regs.rcx, &rects)) return self.noteVulkanCommandRefusal(@src().line);
             if (self.real_vulkan.fn_ptrs.cmd_clear_attachments) |function| {
                 self.noteCommandTargets(state.regs.rdi, .uniform_fill);
-                function(command_buffer, @intCast(state.regs.rsi), &attachments, @intCast(state.regs.rcx), &rects);
+                self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi), &attachments, @intCast(state.regs.rcx), &rects });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdPipelineBarrier") and std.mem.eql(u8, name, "vkCmdPipelineBarrier"))) {
             const memory_count = state.regs.r8;
@@ -3779,20 +5191,20 @@ pub const Forwarder = struct {
             var memory: [32]abi.MemoryBarrier = undefined;
             var buffers: [32]abi.BufferMemoryBarrier = undefined;
             var images: [32]abi.ImageMemoryBarrier = undefined;
-            if (!copyGuestStructs(abi.MemoryBarrier, state, memory_address, memory_count, &memory)) return;
-            if (!copyGuestStructs(abi.BufferMemoryBarrier, state, buffer_address, buffer_count, &buffers)) return;
-            if (!copyGuestStructs(abi.ImageMemoryBarrier, state, image_address, image_count, &images)) return;
+            if (!copyGuestStructs(abi.MemoryBarrier, state, memory_address, memory_count, &memory)) return self.noteVulkanCommandRefusal(@src().line);
+            if (!copyGuestStructs(abi.BufferMemoryBarrier, state, buffer_address, buffer_count, &buffers)) return self.noteVulkanCommandRefusal(@src().line);
+            if (!copyGuestStructs(abi.ImageMemoryBarrier, state, image_address, image_count, &images)) return self.noteVulkanCommandRefusal(@src().line);
             for (memory[0..@as(usize, @intCast(memory_count))]) |*barrier| {
-                if (barrier.p_next != null) return;
+                if (barrier.p_next != null) return self.noteVulkanCommandRefusal(@src().line);
                 barrier.p_next = null;
             }
             for (buffers[0..@as(usize, @intCast(buffer_count))]) |*barrier| {
-                if (barrier.p_next != null) return;
-                barrier.buffer = self.real_vulkan.realBuffer(barrier.buffer) orelse return;
+                if (barrier.p_next != null) return self.noteVulkanCommandRefusal(@src().line);
+                barrier.buffer = self.real_vulkan.realBuffer(barrier.buffer) orelse return self.noteVulkanCommandRefusal(@src().line);
                 barrier.p_next = null;
             }
-            if (!self.copyGuestImageBarriers(state, image_address, image_count, &images)) return;
-            if (self.real_vulkan.fn_ptrs.cmd_pipeline_barrier) |function| function(
+            if (!self.copyGuestImageBarriers(state, image_address, image_count, &images)) return self.noteVulkanCommandRefusal(@src().line);
+            if (self.real_vulkan.fn_ptrs.cmd_pipeline_barrier) |function| self.callNativeVulkanCommand(function, .{
                 command_buffer,
                 @intCast(state.regs.rsi),
                 @intCast(state.regs.rdx),
@@ -3803,22 +5215,22 @@ pub const Forwarder = struct {
                 if (buffer_count == 0) null else &buffers,
                 @intCast(image_count),
                 if (image_count == 0) null else &images,
-            );
+            });
         } else if ((name_hash == vulkanNameHash("vkCmdPipelineBarrier2") and std.mem.eql(u8, name, "vkCmdPipelineBarrier2")) or (name_hash == vulkanNameHash("vkCmdPipelineBarrier2KHR") and std.mem.eql(u8, name, "vkCmdPipelineBarrier2KHR"))) {
             self.forwardPipelineBarrier2(state, command_buffer);
         } else if ((name_hash == vulkanNameHash("vkCmdBeginQuery") and std.mem.eql(u8, name, "vkCmdBeginQuery"))) {
-            const pool = self.real_vulkan.realQueryPool(state.regs.rsi) orelse return;
-            if (self.real_vulkan.fn_ptrs.cmd_begin_query) |function| function(command_buffer, pool, @intCast(state.regs.rdx), @intCast(state.regs.rcx));
+            const pool = self.real_vulkan.realQueryPool(state.regs.rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
+            if (self.real_vulkan.fn_ptrs.cmd_begin_query) |function| self.callNativeVulkanCommand(function, .{ command_buffer, pool, @intCast(state.regs.rdx), @intCast(state.regs.rcx) });
         } else if ((name_hash == vulkanNameHash("vkCmdEndQuery") and std.mem.eql(u8, name, "vkCmdEndQuery"))) {
-            const pool = self.real_vulkan.realQueryPool(state.regs.rsi) orelse return;
-            if (self.real_vulkan.fn_ptrs.cmd_end_query) |function| function(command_buffer, pool, @intCast(state.regs.rdx));
+            const pool = self.real_vulkan.realQueryPool(state.regs.rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
+            if (self.real_vulkan.fn_ptrs.cmd_end_query) |function| self.callNativeVulkanCommand(function, .{ command_buffer, pool, @intCast(state.regs.rdx) });
         } else if ((name_hash == vulkanNameHash("vkCmdResetQueryPool") and std.mem.eql(u8, name, "vkCmdResetQueryPool"))) {
-            const pool = self.real_vulkan.realQueryPool(state.regs.rsi) orelse return;
-            if (self.real_vulkan.fn_ptrs.cmd_reset_query_pool) |function| function(command_buffer, pool, @intCast(state.regs.rdx), @intCast(state.regs.rcx));
+            const pool = self.real_vulkan.realQueryPool(state.regs.rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
+            if (self.real_vulkan.fn_ptrs.cmd_reset_query_pool) |function| self.callNativeVulkanCommand(function, .{ command_buffer, pool, @intCast(state.regs.rdx), @intCast(state.regs.rcx) });
         } else if ((name_hash == vulkanNameHash("vkCmdCopyQueryPoolResults") and std.mem.eql(u8, name, "vkCmdCopyQueryPoolResults"))) {
-            const pool = self.real_vulkan.realQueryPool(state.regs.rsi) orelse return;
-            const buffer = self.real_vulkan.realBuffer(state.regs.r8) orelse return;
-            if (self.real_vulkan.fn_ptrs.cmd_copy_query_pool_results) |function| function(
+            const pool = self.real_vulkan.realQueryPool(state.regs.rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
+            const buffer = self.real_vulkan.realBuffer(state.regs.r8) orelse return self.noteVulkanCommandRefusal(@src().line);
+            if (self.real_vulkan.fn_ptrs.cmd_copy_query_pool_results) |function| self.callNativeVulkanCommand(function, .{
                 command_buffer,
                 pool,
                 @intCast(state.regs.rdx),
@@ -3827,7 +5239,7 @@ pub const Forwarder = struct {
                 state.regs.r9,
                 guestStackArg(state, 0),
                 @intCast(guestStackArg(state, 1)),
-            );
+            });
         } else {
             if (self.vulkan_modeled_command_calls <= 8) machoCapturePrint("macho-processor: Vulkan command ABI not implemented: {s}\n", .{name});
         }
@@ -3836,8 +5248,8 @@ pub const Forwarder = struct {
     fn forwardPipelineBarrier2(self: *Forwarder, state: anytype, command_buffer: abi.CommandBuffer) void {
         const dependency_address = state.regs.rsi;
         var dependency: abi.DependencyInfo = undefined;
-        if (!copyGuestValue(abi.DependencyInfo, state, dependency_address, &dependency) or dependency.p_next != null) return;
-        if (dependency.memory_barrier_count > 32 or dependency.buffer_memory_barrier_count > 32 or dependency.image_memory_barrier_count > 32) return;
+        if (!copyGuestValue(abi.DependencyInfo, state, dependency_address, &dependency) or dependency.p_next != null) return self.noteVulkanCommandRefusal(@src().line);
+        if (dependency.memory_barrier_count > 32 or dependency.buffer_memory_barrier_count > 32 or dependency.image_memory_barrier_count > 32) return self.noteVulkanCommandRefusal(@src().line);
         var memory: [32]abi.MemoryBarrier2 = undefined;
         var buffers: [32]abi.BufferMemoryBarrier2 = undefined;
         var images: [32]abi.ImageMemoryBarrier2 = undefined;
@@ -3846,27 +5258,49 @@ pub const Forwarder = struct {
         const image_address = if (dependency.image_memory_barriers) |pointer| @intFromPtr(pointer) else 0;
         if (!copyGuestStructs(abi.MemoryBarrier2, state, memory_address, dependency.memory_barrier_count, &memory) or
             !copyGuestStructs(abi.BufferMemoryBarrier2, state, buffer_address, dependency.buffer_memory_barrier_count, &buffers) or
-            !copyGuestStructs(abi.ImageMemoryBarrier2, state, image_address, dependency.image_memory_barrier_count, &images)) return;
-        for (memory[0..@as(usize, @intCast(dependency.memory_barrier_count))]) |*barrier| if (barrier.p_next != null) return;
+            !copyGuestStructs(abi.ImageMemoryBarrier2, state, image_address, dependency.image_memory_barrier_count, &images)) return self.noteVulkanCommandRefusal(@src().line);
+        for (memory[0..@as(usize, @intCast(dependency.memory_barrier_count))]) |*barrier| if (barrier.p_next != null) return self.noteVulkanCommandRefusal(@src().line);
         for (buffers[0..@as(usize, @intCast(dependency.buffer_memory_barrier_count))]) |*barrier| {
-            if (barrier.p_next != null) return;
-            barrier.buffer = self.real_vulkan.realBuffer(barrier.buffer) orelse return;
+            if (barrier.p_next != null) return self.noteVulkanCommandRefusal(@src().line);
+            barrier.buffer = self.real_vulkan.realBuffer(barrier.buffer) orelse return self.noteVulkanCommandRefusal(@src().line);
         }
         for (images[0..@as(usize, @intCast(dependency.image_memory_barrier_count))]) |*barrier| {
-            if (barrier.p_next != null) return;
-            barrier.image = self.real_vulkan.realImage(barrier.image) orelse return;
+            if (barrier.p_next != null) return self.noteVulkanCommandRefusal(@src().line);
+            barrier.image = self.real_vulkan.realImage(barrier.image) orelse return self.noteVulkanCommandRefusal(@src().line);
         }
         dependency.memory_barriers = if (dependency.memory_barrier_count == 0) null else &memory;
         dependency.buffer_memory_barriers = if (dependency.buffer_memory_barrier_count == 0) null else &buffers;
         dependency.image_memory_barriers = if (dependency.image_memory_barrier_count == 0) null else &images;
-        if (self.real_vulkan.fn_ptrs.cmd_pipeline_barrier2) |function| function(command_buffer, &dependency);
+        if (self.real_vulkan.fn_ptrs.cmd_pipeline_barrier2) |function| self.callNativeVulkanCommand(function, .{ command_buffer, &dependency });
     }
 
+    /// vkUpdateDescriptorSets is refused whole when any handle or array in it
+    /// cannot be translated, and the refusal used to be a bare `return`: the
+    /// update was counted as made, the set kept whatever it held before, and a
+    /// shader sampled that. Every refusal is now counted by reason and the
+    /// first of each reason is printed with its descriptor type and binding.
     fn updateDescriptorSets(self: *Forwarder, state: anytype) void {
+        self.vulkan_descriptor_update_calls +|= 1;
+        const refusal = self.updateDescriptorSetsNative(state) orelse return;
+        const index = @intFromEnum(refusal);
+        self.vulkan_descriptor_update_refusals[index] +|= 1;
+        if (self.vulkan_descriptor_update_refusals[index] == 1) {
+            // VkWriteDescriptorSet: dstBinding at 24, descriptorType at 36.
+            const readable = state.regs.rsi != 0 and state.guestMemoryConst(state.regs.rdx, 64) != null;
+            const first_binding: u64 = if (readable) @as(u32, @truncate(state.read64(state.regs.rdx + 24))) else 0;
+            const first_type: u64 = if (readable) @as(u32, @truncate(state.read64(state.regs.rdx + 32) >> 32)) else 0;
+            machoCapturePrint(
+                "macho-processor: DESCRIPTOR UPDATE REFUSED: reason={s} writes={d} copies={d} first_write(type={d} binding={d}) update_call={d}; the whole vkUpdateDescriptorSets was dropped, so every set it named keeps its previous contents and a shader bound to one reads stale or null resources\n",
+                .{ @tagName(refusal), state.regs.rsi, state.regs.rcx, first_type, first_binding, self.vulkan_descriptor_update_calls },
+            );
+        }
+    }
+
+    fn updateDescriptorSetsNative(self: *Forwarder, state: anytype) ?DescriptorUpdateRefusal {
         const write_count = state.regs.rsi;
         const copy_count = state.regs.rcx;
-        if (self.real_vulkan.device_lost or !self.real_vulkan.hasDevice() or self.real_vulkan.fn_ptrs.update_descriptor_sets == null) return;
-        if (write_count > 64 or copy_count > 64) return;
+        if (self.real_vulkan.device_lost or !self.real_vulkan.hasDevice() or self.real_vulkan.fn_ptrs.update_descriptor_sets == null) return .no_device;
+        if (write_count > 64 or copy_count > 64) return .too_many_writes;
         var writes: [64]abi.WriteDescriptorSet = undefined;
         var copies: [64]abi.CopyDescriptorSet = undefined;
         var images: [256]abi.DescriptorImageInfo = undefined;
@@ -3874,25 +5308,25 @@ pub const Forwarder = struct {
         var texel_views: [256]u64 = undefined;
         var inline_blocks: [64]abi.WriteDescriptorSetInlineUniformBlock = undefined;
         var inline_data: [64][256]u8 = undefined;
-        if (!copyGuestStructs(abi.WriteDescriptorSet, state, state.regs.rdx, write_count, &writes)) return;
-        if (!copyGuestStructs(abi.CopyDescriptorSet, state, state.regs.r8, copy_count, &copies)) return;
+        if (!copyGuestStructs(abi.WriteDescriptorSet, state, state.regs.rdx, write_count, &writes)) return .guest_read;
+        if (!copyGuestStructs(abi.CopyDescriptorSet, state, state.regs.r8, copy_count, &copies)) return .guest_read;
         var image_cursor: usize = 0;
         var buffer_cursor: usize = 0;
         var texel_cursor: usize = 0;
         for (writes[0..@as(usize, @intCast(write_count))], 0..) |*write, write_index| {
-            write.dst_set = self.real_vulkan.realDescriptorSet(write.dst_set) orelse return;
+            write.dst_set = self.real_vulkan.realDescriptorSet(write.dst_set) orelse return .unmapped_set;
             const count: usize = @intCast(write.descriptor_count);
             if (write.descriptor_type == abi.DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
-                if (write.p_next == null or count > inline_data[write_index].len) return;
+                if (write.p_next == null or count > inline_data[write_index].len) return .inline_block;
                 var block: abi.WriteDescriptorSetInlineUniformBlock = undefined;
                 if (!copyGuestValue(abi.WriteDescriptorSetInlineUniformBlock, state, @intFromPtr(write.p_next.?), &block) or
                     block.s_type != abi.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK or
                     block.p_next != null or block.data_size != count)
                 {
-                    return;
+                    return .inline_block;
                 }
                 const data_address = if (block.data) |pointer| @intFromPtr(pointer) else 0;
-                if (!copyGuestBytes(state, data_address, count, &inline_data[write_index])) return;
+                if (!copyGuestBytes(state, data_address, count, &inline_data[write_index])) return .guest_read;
                 block.p_next = null;
                 block.data = if (count == 0) null else @ptrCast(@alignCast(inline_data[write_index][0..].ptr));
                 inline_blocks[write_index] = block;
@@ -3901,59 +5335,75 @@ pub const Forwarder = struct {
                 write.buffer_info = null;
                 write.texel_buffer_view = null;
             } else {
-                if (write.p_next != null) return;
+                if (write.p_next != null) return .p_next;
                 write.p_next = null;
                 switch (write.descriptor_type) {
                     // Sampler, combined image sampler, sampled image, storage
                     // image and input attachment all carry VkDescriptorImageInfo.
                     0, 1, 2, 3, 10 => {
-                        if (image_cursor + count > images.len) return;
+                        if (image_cursor + count > images.len) return .array_capacity;
                         const address = if (write.image_info) |pointer| @intFromPtr(pointer) else 0;
-                        if (count != 0 and address == 0) return;
-                        if (!copyGuestStructs(abi.DescriptorImageInfo, state, address, count, images[image_cursor..])) return;
+                        if (count != 0 and address == 0) return .null_array;
+                        if (!copyGuestStructs(abi.DescriptorImageInfo, state, address, count, images[image_cursor..])) return .guest_read;
                         for (images[image_cursor .. image_cursor + count]) |*image| {
-                            if (image.sampler != 0) image.sampler = self.real_vulkan.realSampler(image.sampler) orelse return;
-                            if (image.image_view != 0) image.image_view = self.real_vulkan.realImageView(image.image_view) orelse return;
+                            // Unused members are not required to contain valid
+                            // handles (sampled/storage images ignore sampler;
+                            // sampler-only descriptors ignore imageView).
+                            if (write.descriptor_type == 0 or write.descriptor_type == 1) {
+                                if (image.sampler != 0) image.sampler = self.real_vulkan.realSampler(image.sampler) orelse return .unmapped_sampler;
+                            } else image.sampler = 0;
+                            if (write.descriptor_type != 0) {
+                                if (image.image_view != 0) image.image_view = self.real_vulkan.realImageView(image.image_view) orelse return .unmapped_image_view;
+                            } else {
+                                image.image_view = 0;
+                                image.image_layout = 0;
+                            }
                         }
                         write.image_info = if (count == 0) null else images[image_cursor..].ptr;
+                        write.buffer_info = null;
+                        write.texel_buffer_view = null;
                         image_cursor += count;
                     },
                     // Uniform and storage buffer descriptors carry VkDescriptorBufferInfo.
                     6, 7, 8, 9 => {
-                        if (buffer_cursor + count > buffers.len) return;
+                        if (buffer_cursor + count > buffers.len) return .array_capacity;
                         const address = if (write.buffer_info) |pointer| @intFromPtr(pointer) else 0;
-                        if (count != 0 and address == 0) return;
-                        if (!copyGuestStructs(abi.DescriptorBufferInfo, state, address, count, buffers[buffer_cursor..])) return;
+                        if (count != 0 and address == 0) return .null_array;
+                        if (!copyGuestStructs(abi.DescriptorBufferInfo, state, address, count, buffers[buffer_cursor..])) return .guest_read;
                         for (buffers[buffer_cursor .. buffer_cursor + count]) |*buffer| {
-                            buffer.buffer = self.real_vulkan.realBuffer(buffer.buffer) orelse return;
+                            buffer.buffer = self.real_vulkan.realBuffer(buffer.buffer) orelse return .unmapped_buffer;
                         }
                         write.buffer_info = if (count == 0) null else buffers[buffer_cursor..].ptr;
+                        write.image_info = null;
+                        write.texel_buffer_view = null;
                         buffer_cursor += count;
                     },
                     // Uniform/storage texel buffers carry an array of VkBufferView.
                     4, 5 => {
-                        if (texel_cursor + count > texel_views.len) return;
+                        if (texel_cursor + count > texel_views.len) return .array_capacity;
                         const address = if (write.texel_buffer_view) |pointer| @intFromPtr(pointer) else 0;
-                        if (count != 0 and address == 0) return;
-                        if (!copyGuestStructs(u64, state, address, count, texel_views[texel_cursor..])) return;
+                        if (count != 0 and address == 0) return .null_array;
+                        if (!copyGuestStructs(u64, state, address, count, texel_views[texel_cursor..])) return .guest_read;
                         for (texel_views[texel_cursor .. texel_cursor + count]) |*view| {
-                            view.* = self.real_vulkan.realBufferView(view.*) orelse return;
+                            view.* = self.real_vulkan.realBufferView(view.*) orelse return .unmapped_buffer_view;
                         }
                         write.texel_buffer_view = if (count == 0) null else texel_views[texel_cursor..].ptr;
+                        write.image_info = null;
+                        write.buffer_info = null;
                         texel_cursor += count;
                     },
                     // Inline uniform blocks have a different pNext-shaped payload;
                     // every other descriptor type is intentionally refused rather
                     // than sent with a mismatched pointer union.
-                    else => return,
+                    else => return .descriptor_type,
                 }
             }
         }
         for (copies[0..@as(usize, @intCast(copy_count))]) |*copy| {
-            if (copy.p_next != null) return;
+            if (copy.p_next != null) return .p_next;
             copy.p_next = null;
-            copy.src_set = self.real_vulkan.realDescriptorSet(copy.src_set) orelse return;
-            copy.dst_set = self.real_vulkan.realDescriptorSet(copy.dst_set) orelse return;
+            copy.src_set = self.real_vulkan.realDescriptorSet(copy.src_set) orelse return .unmapped_set;
+            copy.dst_set = self.real_vulkan.realDescriptorSet(copy.dst_set) orelse return .unmapped_set;
         }
         self.real_vulkan.fn_ptrs.update_descriptor_sets.?(
             self.real_vulkan.device.?,
@@ -3962,40 +5412,55 @@ pub const Forwarder = struct {
             @intCast(copy_count),
             if (copy_count == 0) null else &copies,
         );
+        self.vulkan_descriptor_update_forwarded +|= 1;
+        self.vulkan_descriptor_native_writes +|= write_count;
+        self.vulkan_descriptor_native_copies +|= copy_count;
+        // Commit provenance only AFTER complete admission and the native
+        // call. A refused later write must not make earlier writes appear
+        // installed. Re-read original guest identities, not translated ones.
+        if (copyGuestStructs(abi.WriteDescriptorSet, state, state.regs.rdx, write_count, &writes) and
+            copyGuestStructs(abi.CopyDescriptorSet, state, state.regs.r8, copy_count, &copies))
+        {
+            self.trackDescriptorImageWrites(state, writes[0..@as(usize, @intCast(write_count))]);
+            self.trackTexelDescriptorWrites(state, writes[0..@as(usize, @intCast(write_count))]);
+            self.trackDescriptorSetCopies(copies[0..@as(usize, @intCast(copy_count))]);
+        }
         self.vulkan_tiers.note(.descriptor_set, .real);
+        return null;
     }
 
     fn forwardPushDescriptorSet(self: *Forwarder, state: anytype, command_buffer: abi.CommandBuffer) void {
-        const function = self.real_vulkan.fn_ptrs.cmd_push_descriptor_set orelse return;
+        const function = self.real_vulkan.fn_ptrs.cmd_push_descriptor_set orelse return self.noteVulkanCommandRefusal(@src().line);
         const count = state.regs.r8;
-        if (count > 64) return;
+        if (count > 64) return self.noteVulkanCommandRefusal(@src().line);
         var writes: [64]abi.WriteDescriptorSet = undefined;
         var images: [256]abi.DescriptorImageInfo = undefined;
         var buffers: [256]abi.DescriptorBufferInfo = undefined;
         var texel_views: [256]u64 = undefined;
         var inline_blocks: [64]abi.WriteDescriptorSetInlineUniformBlock = undefined;
         var inline_data: [64][256]u8 = undefined;
-        if (!copyGuestStructs(abi.WriteDescriptorSet, state, state.regs.r9, count, &writes)) return;
+        if (!copyGuestStructs(abi.WriteDescriptorSet, state, state.regs.r9, count, &writes)) return self.noteVulkanCommandRefusal(@src().line);
+        self.noteCommandDescriptorImages(state, state.regs.rdi, writes[0..@as(usize, @intCast(count))]);
         var image_cursor: usize = 0;
         var buffer_cursor: usize = 0;
         var texel_cursor: usize = 0;
         for (writes[0..@as(usize, @intCast(count))], 0..) |*write, write_index| {
-            if (write.s_type != abi.WriteDescriptorSet_structure_type) return;
+            if (write.s_type != abi.WriteDescriptorSet_structure_type) return self.noteVulkanCommandRefusal(@src().line);
             // The push-descriptor command supplies the destination layout/set
             // separately; dstSet in each write is ignored by Vulkan.
             write.dst_set = 0;
             const descriptor_count: usize = @intCast(write.descriptor_count);
             if (write.descriptor_type == abi.DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
-                if (write.p_next == null or descriptor_count > inline_data[write_index].len) return;
+                if (write.p_next == null or descriptor_count > inline_data[write_index].len) return self.noteVulkanCommandRefusal(@src().line);
                 var block: abi.WriteDescriptorSetInlineUniformBlock = undefined;
                 if (!copyGuestValue(abi.WriteDescriptorSetInlineUniformBlock, state, @intFromPtr(write.p_next.?), &block) or
                     block.s_type != abi.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK or
                     block.p_next != null or block.data_size != descriptor_count)
                 {
-                    return;
+                    return self.noteVulkanCommandRefusal(@src().line);
                 }
                 const data_address = if (block.data) |pointer| @intFromPtr(pointer) else 0;
-                if (!copyGuestBytes(state, data_address, descriptor_count, &inline_data[write_index])) return;
+                if (!copyGuestBytes(state, data_address, descriptor_count, &inline_data[write_index])) return self.noteVulkanCommandRefusal(@src().line);
                 block.p_next = null;
                 block.data = if (descriptor_count == 0) null else @ptrCast(@alignCast(inline_data[write_index][0..].ptr));
                 inline_blocks[write_index] = block;
@@ -4004,37 +5469,37 @@ pub const Forwarder = struct {
                 write.buffer_info = null;
                 write.texel_buffer_view = null;
             } else {
-                if (write.p_next != null) return;
+                if (write.p_next != null) return self.noteVulkanCommandRefusal(@src().line);
                 switch (write.descriptor_type) {
                     0, 1, 2, 3, 10 => {
-                        if (image_cursor + descriptor_count > images.len) return;
+                        if (image_cursor + descriptor_count > images.len) return self.noteVulkanCommandRefusal(@src().line);
                         const address = if (write.image_info) |pointer| @intFromPtr(pointer) else 0;
-                        if (descriptor_count != 0 and address == 0) return;
-                        if (!copyGuestStructs(abi.DescriptorImageInfo, state, address, descriptor_count, images[image_cursor..])) return;
+                        if (descriptor_count != 0 and address == 0) return self.noteVulkanCommandRefusal(@src().line);
+                        if (!copyGuestStructs(abi.DescriptorImageInfo, state, address, descriptor_count, images[image_cursor..])) return self.noteVulkanCommandRefusal(@src().line);
                         for (images[image_cursor .. image_cursor + descriptor_count]) |*image| {
-                            if (image.sampler != 0) image.sampler = self.real_vulkan.realSampler(image.sampler) orelse return;
-                            if (image.image_view != 0) image.image_view = self.real_vulkan.realImageView(image.image_view) orelse return;
+                            if (image.sampler != 0) image.sampler = self.real_vulkan.realSampler(image.sampler) orelse return self.noteVulkanCommandRefusal(@src().line);
+                            if (image.image_view != 0) image.image_view = self.real_vulkan.realImageView(image.image_view) orelse return self.noteVulkanCommandRefusal(@src().line);
                         }
                         write.image_info = if (descriptor_count == 0) null else images[image_cursor..].ptr;
                         image_cursor += descriptor_count;
                     },
                     4, 5 => {
-                        if (texel_cursor + descriptor_count > texel_views.len) return;
+                        if (texel_cursor + descriptor_count > texel_views.len) return self.noteVulkanCommandRefusal(@src().line);
                         const address = if (write.texel_buffer_view) |pointer| @intFromPtr(pointer) else 0;
-                        if (descriptor_count != 0 and address == 0) return;
-                        if (!copyGuestStructs(u64, state, address, descriptor_count, texel_views[texel_cursor..])) return;
+                        if (descriptor_count != 0 and address == 0) return self.noteVulkanCommandRefusal(@src().line);
+                        if (!copyGuestStructs(u64, state, address, descriptor_count, texel_views[texel_cursor..])) return self.noteVulkanCommandRefusal(@src().line);
                         for (texel_views[texel_cursor .. texel_cursor + descriptor_count]) |*view|
-                            view.* = self.real_vulkan.realBufferView(view.*) orelse return;
+                            view.* = self.real_vulkan.realBufferView(view.*) orelse return self.noteVulkanCommandRefusal(@src().line);
                         write.texel_buffer_view = if (descriptor_count == 0) null else texel_views[texel_cursor..].ptr;
                         texel_cursor += descriptor_count;
                     },
                     6, 7, 8, 9 => {
-                        if (buffer_cursor + descriptor_count > buffers.len) return;
+                        if (buffer_cursor + descriptor_count > buffers.len) return self.noteVulkanCommandRefusal(@src().line);
                         const address = if (write.buffer_info) |pointer| @intFromPtr(pointer) else 0;
-                        if (descriptor_count != 0 and address == 0) return;
-                        if (!copyGuestStructs(abi.DescriptorBufferInfo, state, address, descriptor_count, buffers[buffer_cursor..])) return;
+                        if (descriptor_count != 0 and address == 0) return self.noteVulkanCommandRefusal(@src().line);
+                        if (!copyGuestStructs(abi.DescriptorBufferInfo, state, address, descriptor_count, buffers[buffer_cursor..])) return self.noteVulkanCommandRefusal(@src().line);
                         for (buffers[buffer_cursor .. buffer_cursor + descriptor_count]) |*buffer|
-                            buffer.buffer = self.real_vulkan.realBuffer(buffer.buffer) orelse return;
+                            buffer.buffer = self.real_vulkan.realBuffer(buffer.buffer) orelse return self.noteVulkanCommandRefusal(@src().line);
                         write.buffer_info = if (descriptor_count == 0) null else buffers[buffer_cursor..].ptr;
                         buffer_cursor += descriptor_count;
                     },
@@ -4043,8 +5508,9 @@ pub const Forwarder = struct {
                 write.p_next = null;
             }
         }
-        const layout = self.real_vulkan.realPipelineLayout(state.regs.rdx) orelse return;
-        function(command_buffer, @intCast(state.regs.rsi), layout, @intCast(state.regs.rcx), @intCast(count), &writes);
+        const layout = self.real_vulkan.realPipelineLayout(state.regs.rdx) orelse return self.noteVulkanCommandRefusal(@src().line);
+        self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi), layout, @intCast(state.regs.rcx), @intCast(count), &writes });
+        self.vulkan_descriptor_push_calls +|= 1;
         self.vulkan_tiers.note(.descriptor_set, .real);
     }
 
@@ -4117,6 +5583,7 @@ pub const Forwarder = struct {
     }
 
     fn updateDescriptorSetWithTemplate(self: *Forwarder, state: anytype) void {
+        self.vulkan_descriptor_template_update_calls +|= 1;
         if (self.real_vulkan.device_lost) return;
         const function = self.real_vulkan.fn_ptrs.update_descriptor_set_with_template orelse return;
         const destination = self.real_vulkan.realDescriptorSet(state.regs.rsi) orelse return;
@@ -4147,6 +5614,7 @@ pub const Forwarder = struct {
             const guest_data = state.guestMemoryConst(state.regs.rcx, required) orelse return;
             @memcpy(host_data, guest_data);
         }
+        self.trackDescriptorTemplateImages(state, state.regs.rsi, record, state.regs.rcx);
         for (record.entries[0..record.entry_count]) |entry| {
             if (entry.descriptor_count == 0) continue;
             const element_size: usize = switch (entry.descriptor_type) {
@@ -4246,80 +5714,111 @@ pub const Forwarder = struct {
         const handle = state.regs.rsi;
         if (std.mem.eql(u8, name, "vkDestroySampler")) {
             if (self.real_vulkan.realSampler(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_sampler) |function| function(device, real, null);
-            HandleMap.remove(&self.real_vulkan.sampler_map, handle);
+            _ = self.releaseVulkanHandle(&self.real_vulkan.sampler_map, handle);
         } else if (std.mem.eql(u8, name, "vkDestroyDescriptorSetLayout")) {
             if (self.real_vulkan.realDescriptorSetLayout(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_descriptor_set_layout) |function| function(device, real, null);
-            HandleMap.remove(&self.real_vulkan.descriptor_set_layout_map, handle);
+            _ = self.releaseVulkanHandle(&self.real_vulkan.descriptor_set_layout_map, handle);
         } else if (std.mem.eql(u8, name, "vkDestroyPipelineLayout")) {
-            if (self.real_vulkan.realPipelineLayout(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_pipeline_layout) |function| function(device, real, null);
-            HandleMap.remove(&self.real_vulkan.pipeline_layout_map, handle);
+            if (self.real_vulkan.realPipelineLayout(handle)) |real| {
+                if (self.real_vulkan.fn_ptrs.destroy_pipeline_layout) |function| function(device, real, null);
+                self.forgetPipelineLayout(real);
+            }
+            _ = self.releaseVulkanHandle(&self.real_vulkan.pipeline_layout_map, handle);
         } else if (std.mem.eql(u8, name, "vkDestroyShaderModule")) {
             if (self.real_vulkan.realShaderModule(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_shader_module) |function| function(device, real, null);
-            HandleMap.remove(&self.real_vulkan.shader_module_map, handle);
+            _ = self.releaseVulkanHandle(&self.real_vulkan.shader_module_map, handle);
         } else if (std.mem.eql(u8, name, "vkDestroyRenderPass")) {
             if (self.real_vulkan.realRenderPass(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_render_pass) |function| function(device, real, null);
-            HandleMap.remove(&self.real_vulkan.render_pass_map, handle);
+            _ = self.releaseVulkanHandle(&self.real_vulkan.render_pass_map, handle);
             self.forgetRenderPass(handle);
         } else if (std.mem.eql(u8, name, "vkDestroyFramebuffer")) {
             if (self.real_vulkan.realFramebuffer(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_framebuffer) |function| function(device, real, null);
-            HandleMap.remove(&self.real_vulkan.framebuffer_map, handle);
+            _ = self.releaseVulkanHandle(&self.real_vulkan.framebuffer_map, handle);
             self.forgetFramebuffer(handle);
         } else if (std.mem.eql(u8, name, "vkDestroyPipeline")) {
-            if (self.real_vulkan.realPipeline(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_pipeline) |function| function(device, real, null);
-            HandleMap.remove(&self.real_vulkan.pipeline_map, handle);
+            if (self.real_vulkan.realPipeline(handle)) |real| {
+                if (self.trackedGraphicsPipeline(real)) |metadata| {
+                    if (metadata.repair_real != 0 and metadata.repair_real != real) {
+                        if (self.real_vulkan.fn_ptrs.destroy_pipeline) |function| function(device, metadata.repair_real, null);
+                    }
+                }
+                if (self.real_vulkan.fn_ptrs.destroy_pipeline) |function| function(device, real, null);
+                self.forgetGraphicsPipeline(real);
+            }
+            _ = self.releaseVulkanHandle(&self.real_vulkan.pipeline_map, handle);
         } else if (std.mem.eql(u8, name, "vkDestroyBuffer")) {
             if (self.real_vulkan.realBuffer(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_buffer) |function| function(device, real, null);
-            HandleMap.remove(&self.real_vulkan.buffer_map, handle);
-            if (self.findResource(handle)) |record| record.* = .{};
+            _ = self.releaseVulkanHandle(&self.real_vulkan.buffer_map, handle);
+            _ = self.releaseResource(handle);
         } else if (std.mem.eql(u8, name, "vkDestroyImage")) {
-            if (self.real_vulkan.realImage(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_image) |function| function(device, real, null);
-            HandleMap.remove(&self.real_vulkan.image_map, handle);
-            if (self.findResource(handle)) |record| record.* = .{};
+            if (self.real_vulkan.realImage(handle)) |real| {
+                if (self.real_vulkan.fn_ptrs.destroy_image) |function| function(device, real, null);
+                self.present_chain.forgetResourceImage(real);
+            }
+            _ = self.releaseVulkanHandle(&self.real_vulkan.image_map, handle);
+            _ = self.releaseResource(handle);
         } else if (std.mem.eql(u8, name, "vkDestroyImageView")) {
             if (self.real_vulkan.realImageView(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_image_view) |function| function(device, real, null);
-            HandleMap.remove(&self.real_vulkan.image_view_map, handle);
+            _ = self.releaseVulkanHandle(&self.real_vulkan.image_view_map, handle);
             self.forgetImageView(handle);
         } else if (std.mem.eql(u8, name, "vkDestroyBufferView")) {
+            for (&self.tracked_buffer_views) |*view| {
+                if (view.synthetic == handle) view.* = .{};
+            }
             if (self.real_vulkan.realBufferView(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_buffer_view) |function| function(device, real, null);
-            HandleMap.remove(&self.real_vulkan.buffer_view_map, handle);
+            _ = self.releaseVulkanHandle(&self.real_vulkan.buffer_view_map, handle);
         } else if (std.mem.eql(u8, name, "vkDestroyFence")) {
             if (self.real_vulkan.realFence(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_fence) |function| function(device, real, null);
-            HandleMap.remove(&self.real_vulkan.fence_map, handle);
+            _ = self.releaseVulkanHandle(&self.real_vulkan.fence_map, handle);
         } else if (std.mem.eql(u8, name, "vkDestroySemaphore")) {
             if (self.real_vulkan.realSemaphore(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_semaphore) |function| function(device, real, null);
-            HandleMap.remove(&self.real_vulkan.semaphore_map, handle);
+            _ = self.releaseVulkanHandle(&self.real_vulkan.semaphore_map, handle);
         } else if (std.mem.eql(u8, name, "vkDestroyCommandPool")) {
             if (self.real_vulkan.realCommandPool(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_command_pool) |function| function(device, real, null);
-            HandleMap.remove(&self.real_vulkan.command_pool_map, handle);
+            _ = self.releaseVulkanHandle(&self.real_vulkan.command_pool_map, handle);
         } else if (std.mem.eql(u8, name, "vkDestroyDescriptorPool")) {
             if (self.real_vulkan.realDescriptorPool(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_descriptor_pool) |function| function(device, real, null);
-            HandleMap.remove(&self.real_vulkan.descriptor_pool_map, handle);
+            // Vulkan pool destruction implicitly frees every descriptor set
+            // allocated from that pool.  Leaving the reverse mappings behind
+            // was the direct cause of the overnight run's 1,024-entry map
+            // exhaustion even though the guest had already destroyed its
+            // pools.
+            _ = self.reclaimDescriptorSetsForPool(handle, "destroy");
+            _ = self.releaseVulkanHandle(&self.real_vulkan.descriptor_pool_map, handle);
         } else if (std.mem.eql(u8, name, "vkDestroyQueryPool")) {
             if (self.real_vulkan.realQueryPool(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_query_pool) |function| function(device, real, null);
-            HandleMap.remove(&self.real_vulkan.query_pool_map, handle);
+            _ = self.releaseVulkanHandle(&self.real_vulkan.query_pool_map, handle);
         } else if (std.mem.eql(u8, name, "vkDestroyPipelineCache")) {
             if (self.real_vulkan.realPipelineCache(handle)) |real| {
                 self.persistPipelineCache(real);
                 if (self.real_vulkan.fn_ptrs.destroy_pipeline_cache) |function| function(device, real, null);
                 self.vulkan_real_objects_destroyed +|= 1;
             }
-            HandleMap.remove(&self.real_vulkan.pipeline_cache_map, handle);
+            _ = self.releaseVulkanHandle(&self.real_vulkan.pipeline_cache_map, handle);
         } else if (std.mem.eql(u8, name, "vkDestroyDescriptorUpdateTemplate")) {
             if (self.real_vulkan.realDescriptorUpdateTemplate(handle)) |real| {
                 if (self.real_vulkan.fn_ptrs.destroy_descriptor_update_template) |function| function(device, real, null);
                 self.vulkan_real_objects_destroyed +|= 1;
             }
             if (self.real_vulkan.descriptorUpdateTemplateIndex(handle)) |record_index| self.real_vulkan.descriptor_update_template_records[record_index] = .{};
-            HandleMap.remove(&self.real_vulkan.descriptor_update_template_map, handle);
+            _ = self.releaseVulkanHandle(&self.real_vulkan.descriptor_update_template_map, handle);
         } else if (std.mem.eql(u8, name, "vkFreeMemory")) {
+            if (self.findVulkanMemoryRecord(handle)) |record| {
+                if (comptime @hasDecl(@TypeOf(state.*), "releaseNativeMemory")) {
+                    if (record.native_alias_base != 0) state.releaseNativeMemory(record.native_alias_base);
+                }
+            }
             if (self.real_vulkan.realMemory(handle)) |real| {
                 if (self.real_vulkan.fn_ptrs.unmap_memory) |function| {
                     for (&self.vulkan_memory_records) |*record| if (record.handle == handle and record.host_mapped_ptr != null) function(device, real);
                 }
                 if (self.real_vulkan.fn_ptrs.free_memory) |function| function(device, real, null);
             }
-            HandleMap.remove(&self.real_vulkan.memory_map, handle);
-            if (self.findVulkanMemoryRecord(handle)) |record| record.* = .{};
+            _ = self.releaseVulkanHandle(&self.real_vulkan.memory_map, handle);
+            if (self.findVulkanMemoryRecord(handle)) |record| {
+                record.releaseBaseline();
+                record.* = .{};
+            }
         } else if (std.mem.eql(u8, name, "vkFreeCommandBuffers")) {
             const pool = self.real_vulkan.realCommandPool(state.regs.rsi) orelse return 0;
             const count = state.regs.rdx;
@@ -4328,7 +5827,7 @@ pub const Forwarder = struct {
             if (self.real_vulkan.fn_ptrs.free_command_buffers) |function| function(device, pool, @intCast(count), @ptrCast(&buffers));
             for (0..@as(usize, @intCast(count))) |index| {
                 const synthetic = state.read64(state.regs.rcx + @as(u64, @intCast(index)) * 8);
-                HandleMap.remove(&self.real_vulkan.command_buffer_map, synthetic);
+                _ = self.releaseVulkanHandle(&self.real_vulkan.command_buffer_map, synthetic);
                 for (&self.tracked_command_targets) |*record| {
                     if (record.synthetic == synthetic) record.* = .{};
                 }
@@ -4339,7 +5838,13 @@ pub const Forwarder = struct {
             var sets: [256]u64 = undefined;
             if (!copyGuestHandleArray(self, state, state.regs.rcx, count, &sets, .descriptor_set)) return 0;
             if (self.real_vulkan.fn_ptrs.free_descriptor_sets) |function| _ = function(device, pool, @intCast(count), &sets);
-            for (0..@as(usize, @intCast(count))) |index| HandleMap.remove(&self.real_vulkan.descriptor_set_map, state.read64(state.regs.rcx + @as(u64, @intCast(index)) * 8));
+            for (0..@as(usize, @intCast(count))) |index| {
+                const synthetic = state.read64(state.regs.rcx + @as(u64, @intCast(index)) * 8);
+                if (self.releaseVulkanHandle(&self.real_vulkan.descriptor_set_map, synthetic)) {
+                    self.vulkan_descriptor_set_free_reclaims +|= 1;
+                }
+                self.forgetDescriptorSet(synthetic);
+            }
         }
         return 0;
     }
@@ -4348,6 +5853,202 @@ pub const Forwarder = struct {
         const result = self.next_vulkan_object;
         self.next_vulkan_object +%= 0x10;
         return result;
+    }
+
+    /// Record one reverse-handle insertion without allowing a bounded table
+    /// failure to become a process-wide panic.  The map itself stays generic;
+    /// this wrapper is where the forwarder can attach an entry-point name to
+    /// the resource event and keep the end-of-run accounting complete.
+    fn mapVulkanHandle(self: *Forwarder, map: []HandleMap, synthetic: u64, real: RealHandle, entry_point: []const u8) bool {
+        return self.mapVulkanHandleOwned(map, synthetic, real, 0, entry_point);
+    }
+
+    fn mapVulkanHandleOwned(self: *Forwarder, map: []HandleMap, synthetic: u64, real: RealHandle, owner: u64, entry_point: []const u8) bool {
+        const result = HandleMap.allocOrFindOwned(map, synthetic, real, owner);
+        switch (result) {
+            .inserted => {
+                self.vulkan_handle_map_allocations +|= 1;
+                if (std.mem.eql(u8, entry_point, "vkAllocateDescriptorSets")) {
+                    self.vulkan_descriptor_set_map_high_water = @max(
+                        self.vulkan_descriptor_set_map_high_water,
+                        HandleMap.occupied(map),
+                    );
+                }
+            },
+            .existing => {},
+            .replaced => self.vulkan_handle_map_replacements +|= 1,
+            .invalid => {
+                self.vulkan_handle_map_invalid +|= 1;
+                if (self.vulkan_handle_map_invalid <= 8 or sparseVulkanSuccessLog(self.vulkan_handle_map_invalid)) {
+                    machoCapturePrint(
+                        "macho-processor: Vulkan handle mapping refused: entry={s} synthetic=0x{x} real=0x{x} owner=0x{x} reason=invalid_handle; no panic and no guest mapping was published\n",
+                        .{ entry_point, synthetic, real, owner },
+                    );
+                }
+            },
+            .exhausted => {
+                self.vulkan_handle_map_exhaustions +|= 1;
+                if (self.vulkan_handle_map_exhaustions <= 8 or sparseVulkanSuccessLog(self.vulkan_handle_map_exhaustions)) {
+                    machoCapturePrint(
+                        "macho-processor: Vulkan handle mapping exhausted: entry={s} synthetic=0x{x} real=0x{x} owner=0x{x} occupied={d} capacity={d}; returning VK_ERROR_OUT_OF_HOST_MEMORY instead of panicking\n",
+                        .{ entry_point, synthetic, real, owner, HandleMap.occupied(map), map.len },
+                    );
+                }
+            },
+        }
+        return result == .inserted or result == .existing or result == .replaced;
+    }
+
+    fn releaseVulkanHandle(self: *Forwarder, map: []HandleMap, synthetic: u64) bool {
+        if (!HandleMap.remove(map, synthetic)) return false;
+        self.vulkan_handle_map_releases +|= 1;
+        return true;
+    }
+
+    /// Return the number of free reverse-map slots for a create entry point.
+    /// A null result means that the call is modelled without this native map.
+    fn availableVulkanMapSlots(self: *const Forwarder, entry_point: []const u8) ?usize {
+        const slots = if (std.mem.eql(u8, entry_point, "vkCreateDescriptorUpdateTemplate"))
+            HandleMap.freeSlots(&self.real_vulkan.descriptor_update_template_map)
+        else if (std.mem.eql(u8, entry_point, "vkCreatePipelineCache"))
+            HandleMap.freeSlots(&self.real_vulkan.pipeline_cache_map)
+        else if (std.mem.eql(u8, entry_point, "vkCreateImage"))
+            HandleMap.freeSlots(&self.real_vulkan.image_map)
+        else if (std.mem.eql(u8, entry_point, "vkCreateBuffer"))
+            HandleMap.freeSlots(&self.real_vulkan.buffer_map)
+        else if (std.mem.eql(u8, entry_point, "vkCreateSampler"))
+            HandleMap.freeSlots(&self.real_vulkan.sampler_map)
+        else if (std.mem.eql(u8, entry_point, "vkCreateShaderModule"))
+            HandleMap.freeSlots(&self.real_vulkan.shader_module_map)
+        else if (std.mem.eql(u8, entry_point, "vkCreateRenderPass"))
+            HandleMap.freeSlots(&self.real_vulkan.render_pass_map)
+        else if (std.mem.eql(u8, entry_point, "vkCreateFramebuffer"))
+            HandleMap.freeSlots(&self.real_vulkan.framebuffer_map)
+        else if (std.mem.eql(u8, entry_point, "vkCreateDescriptorSetLayout"))
+            HandleMap.freeSlots(&self.real_vulkan.descriptor_set_layout_map)
+        else if (std.mem.eql(u8, entry_point, "vkCreatePipelineLayout"))
+            HandleMap.freeSlots(&self.real_vulkan.pipeline_layout_map)
+        else if (std.mem.eql(u8, entry_point, "vkCreateDescriptorPool"))
+            HandleMap.freeSlots(&self.real_vulkan.descriptor_pool_map)
+        else if (std.mem.eql(u8, entry_point, "vkCreateBufferView"))
+            HandleMap.freeSlots(&self.real_vulkan.buffer_view_map)
+        else if (std.mem.eql(u8, entry_point, "vkCreateImageView"))
+            HandleMap.freeSlots(&self.real_vulkan.image_view_map)
+        else if (std.mem.eql(u8, entry_point, "vkCreateCommandPool"))
+            HandleMap.freeSlots(&self.real_vulkan.command_pool_map)
+        else if (std.mem.eql(u8, entry_point, "vkCreateFence"))
+            HandleMap.freeSlots(&self.real_vulkan.fence_map)
+        else if (std.mem.eql(u8, entry_point, "vkCreateSemaphore"))
+            HandleMap.freeSlots(&self.real_vulkan.semaphore_map)
+        else if (std.mem.eql(u8, entry_point, "vkCreateQueryPool"))
+            HandleMap.freeSlots(&self.real_vulkan.query_pool_map)
+        else
+            return null;
+        return slots;
+    }
+
+    fn noteVulkanMapCapacityRefusal(self: *Forwarder, entry_point: []const u8, required: usize, available: usize) void {
+        self.vulkan_handle_map_exhaustions +|= 1;
+        if (self.vulkan_handle_map_exhaustions <= 8 or sparseVulkanSuccessLog(self.vulkan_handle_map_exhaustions)) {
+            machoCapturePrint(
+                "macho-processor: REAL {s} refused before driver: reverse handle map has available={d} required={d}; return=VK_ERROR_OUT_OF_HOST_MEMORY so the long run remains diagnosable\n",
+                .{ entry_point, available, required },
+            );
+        }
+    }
+
+    /// Descriptor-set mappings are invalidated by both vkResetDescriptorPool
+    /// and vkDestroyDescriptorPool.  Reclaim from the map's owner field first;
+    /// the provenance table is a compatibility fallback for mappings created
+    /// by older paths that predate owner tagging.
+    fn reclaimDescriptorSetsForPool(self: *Forwarder, pool: u64, reason: []const u8) usize {
+        if (pool == 0) return 0;
+        var reclaimed = HandleMap.removeOwned(&self.real_vulkan.descriptor_set_map, pool);
+        for (&self.tracked_descriptor_sets) |*record| {
+            if (record.synthetic == 0 or record.pool != pool) continue;
+            if (HandleMap.remove(&self.real_vulkan.descriptor_set_map, record.synthetic)) reclaimed += 1;
+            record.* = .{};
+        }
+        if (reclaimed != 0) {
+            self.vulkan_handle_map_releases +|= @intCast(reclaimed);
+            if (std.mem.eql(u8, reason, "reset"))
+                self.vulkan_descriptor_set_pool_reset_reclaims +|= @intCast(reclaimed)
+            else
+                self.vulkan_descriptor_set_pool_destroy_reclaims +|= @intCast(reclaimed);
+            machoCapturePrint(
+                "macho-processor: Vulkan descriptor-set mappings reclaimed: pool=0x{x} count={d} reason={s} live_after={d} free_after={d}; pool lifetime is the authoritative child lifetime\n",
+                .{ pool, reclaimed, reason, HandleMap.occupied(&self.real_vulkan.descriptor_set_map), HandleMap.freeSlots(&self.real_vulkan.descriptor_set_map) },
+            );
+        }
+        return reclaimed;
+    }
+
+    /// Recover mappings left behind by an unusual destroy ordering or by a
+    /// guest that reset the driver pool through an unrecognised alias.  A set
+    /// whose owning pool is no longer mapped cannot be submitted safely, so
+    /// retaining it only burns a slot and eventually recreates the old panic.
+    fn reclaimOrphanedDescriptorSets(self: *Forwarder) usize {
+        var reclaimed: usize = 0;
+        for (&self.real_vulkan.descriptor_set_map) |*entry| {
+            if (entry.synthetic == 0 or entry.owner == 0) continue;
+            if (HandleMap.findReal(&self.real_vulkan.descriptor_pool_map, entry.owner) != null) continue;
+            const synthetic = entry.synthetic;
+            entry.* = .{};
+            self.forgetDescriptorSet(synthetic);
+            reclaimed += 1;
+        }
+        if (reclaimed != 0) {
+            self.vulkan_handle_map_releases +|= @intCast(reclaimed);
+            self.vulkan_descriptor_set_pool_destroy_reclaims +|= @intCast(reclaimed);
+            machoCapturePrint(
+                "macho-processor: Vulkan orphaned descriptor-set mappings reclaimed: count={d} live_after={d} free_after={d}; their descriptor pools were already gone\n",
+                .{ reclaimed, HandleMap.occupied(&self.real_vulkan.descriptor_set_map), HandleMap.freeSlots(&self.real_vulkan.descriptor_set_map) },
+            );
+        }
+        return reclaimed;
+    }
+
+    fn logVulkanHandleMapState(self: *const Forwarder) void {
+        const descriptor_sets_live = HandleMap.occupied(&self.real_vulkan.descriptor_set_map);
+        const descriptor_sets_free = HandleMap.freeSlots(&self.real_vulkan.descriptor_set_map);
+        machoCapturePrint(
+            "macho-processor: VULKAN HANDLE MAPS: allocations={d} replacements={d} releases={d} invalid={d} exhaustions={d}; descriptor_sets live/free/capacity={d}/{d}/{d} high_water={d} pool_reclaims(reset/destroy/free)={d}/{d}/{d}\n",
+            .{
+                self.vulkan_handle_map_allocations,
+                self.vulkan_handle_map_replacements,
+                self.vulkan_handle_map_releases,
+                self.vulkan_handle_map_invalid,
+                self.vulkan_handle_map_exhaustions,
+                descriptor_sets_live,
+                descriptor_sets_free,
+                self.real_vulkan.descriptor_set_map.len,
+                self.vulkan_descriptor_set_map_high_water,
+                self.vulkan_descriptor_set_pool_reset_reclaims,
+                self.vulkan_descriptor_set_pool_destroy_reclaims,
+                self.vulkan_descriptor_set_free_reclaims,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: VULKAN HANDLE MAP OCCUPANCY: memory={d}/{d} buffers={d}/{d} images={d}/{d} image_views={d}/{d} samplers={d}/{d} pipelines={d}/{d} descriptor_pools={d}/{d} command_buffers={d}/{d}; live/capacity, zero free slots is a bounded bridge refusal rather than a process panic\n",
+            .{
+                HandleMap.occupied(&self.real_vulkan.memory_map),
+                self.real_vulkan.memory_map.len,
+                HandleMap.occupied(&self.real_vulkan.buffer_map),
+                self.real_vulkan.buffer_map.len,
+                HandleMap.occupied(&self.real_vulkan.image_map),
+                self.real_vulkan.image_map.len,
+                HandleMap.occupied(&self.real_vulkan.image_view_map),
+                self.real_vulkan.image_view_map.len,
+                HandleMap.occupied(&self.real_vulkan.sampler_map),
+                self.real_vulkan.sampler_map.len,
+                HandleMap.occupied(&self.real_vulkan.pipeline_map),
+                self.real_vulkan.pipeline_map.len,
+                HandleMap.occupied(&self.real_vulkan.descriptor_pool_map),
+                self.real_vulkan.descriptor_pool_map.len,
+                HandleMap.occupied(&self.real_vulkan.command_buffer_map),
+                self.real_vulkan.command_buffer_map.len,
+            },
+        );
     }
 
     fn trackedImageView(self: *const Forwarder, synthetic: u64) ?TrackedImageView {
@@ -4374,6 +6075,539 @@ pub const Forwarder = struct {
         return null;
     }
 
+    fn trackedDescriptorSet(self: *const Forwarder, synthetic: u64) ?TrackedDescriptorSet {
+        if (synthetic == 0) return null;
+        for (self.tracked_descriptor_sets) |record| {
+            if (record.synthetic == synthetic) return record;
+        }
+        return null;
+    }
+
+    fn noteTargetOverflow(self: *Forwarder, kind: TargetOverflowKind) void {
+        self.target_overflow_events +|= 1;
+        const slot = &self.target_overflow_by_kind[@intFromEnum(kind)];
+        slot.* +|= 1;
+        // The first few occurrences identify the exact bounded ledger in the
+        // live stream.  Subsequent events stay counter-only so this forensic
+        // path cannot become the graphics bottleneck it is measuring.
+        if (slot.* <= 2) {
+            machoCapturePrint(
+                "macho-processor: Vulkan provenance capacity finding: kind={s} occurrence={d}; native command admission is unaffected, but detailed image ancestry was not retained\n",
+                .{ kind.label(), slot.* },
+            );
+        }
+    }
+
+    fn mutableDescriptorSet(self: *Forwarder, synthetic: u64) ?*TrackedDescriptorSet {
+        if (synthetic == 0) return null;
+        for (&self.tracked_descriptor_sets) |*record| {
+            if (record.synthetic == synthetic) return record;
+        }
+        for (&self.tracked_descriptor_sets) |*record| {
+            if (record.synthetic == 0) {
+                record.* = .{ .synthetic = synthetic };
+                return record;
+            }
+        }
+        self.noteTargetOverflow(.descriptor_set_table);
+        return null;
+    }
+
+    fn noteDescriptorSetPool(self: *Forwarder, synthetic: u64, pool: u64) void {
+        const record = self.mutableDescriptorSet(synthetic) orelse return;
+        record.pool = pool;
+    }
+
+    fn isDescriptorImageType(descriptor_type: u32) bool {
+        return switch (descriptor_type) {
+            // A sampler-only descriptor carries image-info storage but no
+            // image identity. Its ignored imageView cannot be provenance.
+            1, 2, 3, 10 => true,
+            else => false,
+        };
+    }
+
+    fn noteDescriptorSetImage(self: *Forwarder, set: u64, binding: u32, array_element: u32, image: u64, unknown: bool) void {
+        const record = self.mutableDescriptorSet(set) orelse return;
+        for (record.images[0..@as(usize, @intCast(record.image_count))]) |*known| {
+            if (known.binding != binding or known.array_element != array_element) continue;
+            known.image = image;
+            if (unknown) record.unknown_image_views = true;
+            return;
+        }
+        if (@as(usize, @intCast(record.image_count)) == record.images.len) {
+            self.noteTargetOverflow(.descriptor_image_entries);
+            return;
+        }
+        record.images[@as(usize, @intCast(record.image_count))] = .{
+            .binding = binding,
+            .array_element = array_element,
+            .image = image,
+        };
+        record.image_count += 1;
+        if (unknown) record.unknown_image_views = true;
+    }
+
+    fn markDescriptorSetUnknown(self: *Forwarder, set: u64) void {
+        const record = self.mutableDescriptorSet(set) orelse return;
+        record.unknown_image_views = true;
+    }
+
+    fn noteDescriptorImageInfo(self: *Forwarder, set: u64, binding: u32, array_element: u32, info: abi.DescriptorImageInfo) void {
+        self.vulkan_descriptor_image_infos_observed +|= 1;
+        var image: u64 = 0;
+        var unknown = false;
+        if (info.image_view != 0) {
+            if (self.trackedImageView(info.image_view)) |view| {
+                image = view.image;
+                unknown = image == 0;
+                if (unknown) self.vulkan_descriptor_unknown_image_views +|= 1;
+            } else {
+                unknown = true;
+                self.vulkan_descriptor_unknown_image_views +|= 1;
+                self.target_unknown_events +|= 1;
+            }
+        }
+        self.noteDescriptorSetImage(set, binding, array_element, image, unknown);
+    }
+
+    fn trackDescriptorImageWrites(self: *Forwarder, state: anytype, writes: []const abi.WriteDescriptorSet) void {
+        for (writes) |write| {
+            if (!isDescriptorImageType(write.descriptor_type)) continue;
+            const count: usize = @intCast(write.descriptor_count);
+            const address = if (write.image_info) |pointer| @intFromPtr(pointer) else 0;
+            if (count != 0 and address == 0) {
+                self.target_unknown_events +|= 1;
+                self.markDescriptorSetUnknown(write.dst_set);
+                continue;
+            }
+            const observed = @min(count, MAX_TRACKED_DESCRIPTOR_IMAGES);
+            if (count > observed) self.noteTargetOverflow(.descriptor_image_array);
+            for (0..observed) |index| {
+                var info: abi.DescriptorImageInfo = undefined;
+                const offset = @as(u64, @intCast(index)) * @sizeOf(abi.DescriptorImageInfo);
+                if (!copyGuestValue(abi.DescriptorImageInfo, state, address + offset, &info)) {
+                    self.target_unknown_events +|= 1;
+                    self.markDescriptorSetUnknown(write.dst_set);
+                    break;
+                }
+                const array_element = std.math.add(u32, write.dst_array_element, @intCast(index)) catch {
+                    self.noteTargetOverflow(.descriptor_address_arithmetic);
+                    break;
+                };
+                self.noteDescriptorImageInfo(write.dst_set, write.dst_binding, array_element, info);
+            }
+        }
+    }
+
+    fn trackTexelDescriptorWrites(self: *Forwarder, state: anytype, writes: []const abi.WriteDescriptorSet) void {
+        for (writes) |write| {
+            if (write.descriptor_type != 4) continue; // uniform lookup data only
+            const record = self.mutableDescriptorSet(write.dst_set) orelse continue;
+            const address = if (write.texel_buffer_view) |pointer| @intFromPtr(pointer) else 0;
+            for (0..@min(write.descriptor_count, 8)) |index| {
+                var view: u64 = 0;
+                if (!copyGuestValue(u64, state, address + @as(u64, @intCast(index)) * 8, &view)) break;
+                const element = std.math.add(u32, write.dst_array_element, @intCast(index)) catch break;
+                var replaced = false;
+                for (record.texels[0..record.texel_count]) |*known| {
+                    if (known.binding != write.dst_binding or known.element != element) continue;
+                    known.view = view;
+                    replaced = true;
+                    break;
+                }
+                if (!replaced and record.texel_count < record.texels.len) {
+                    record.texels[record.texel_count] = .{ .binding = write.dst_binding, .element = element, .view = view };
+                    record.texel_count += 1;
+                } else if (!replaced) self.noteTargetOverflow(.texel_entries);
+            }
+            if (write.descriptor_count > 8) self.noteTargetOverflow(.texel_array);
+        }
+    }
+
+    fn auditCommandTexelCustody(self: *Forwarder, command_buffer: u64) void {
+        for (self.tracked_command_targets) |command| {
+            if (command.synthetic != command_buffer) continue;
+            for (command.bound_descriptor_sets[0..command.bound_descriptor_set_count]) |bound| {
+                const set = self.trackedDescriptorSet(bound.synthetic) orelse continue;
+                for (set.texels[0..set.texel_count]) |binding| {
+                    for (&self.tracked_buffer_views) |*view| {
+                        if (view.synthetic != binding.view or (view.format != 64 and view.format != 81) or view.range == 0 or view.range > 4096) continue;
+                        const resource = self.findResource(view.buffer) orelse continue;
+                        const memory = self.findVulkanMemoryRecord(resource.memory) orelse continue;
+                        const offset = std.math.add(u64, resource.memory_offset, view.offset) catch continue;
+                        if (memory.host_mapped_ptr == null or !rangeContains(memory.mapped_offset, memory.host_mapped_size, offset, view.range)) {
+                            self.texel_custody_missing +|= 1;
+                            if (self.texel_custody_missing == 1) machoCapturePrint("macho-processor: TEXEL CUSTODY: unavailable set=0x{x} binding={d} view=0x{x} buffer=0x{x} memory=0x{x}; no readable native mapping, not proof of a zero gamma ramp\n", .{ bound.synthetic, binding.binding, view.synthetic, view.buffer, resource.memory });
+                            continue;
+                        }
+                        const start: usize = @intCast(offset - memory.mapped_offset);
+                        const bytes = @as([*]const u8, @ptrCast(memory.host_mapped_ptr.?))[start..][0..@as(usize, @intCast(view.range))];
+                        const stats = rosette_gpu.vulkan.texel_custody.analyze(bytes, view.format) catch continue;
+                        self.texel_custody_samples +|= 1;
+                        if (stats.nonzero_bytes == 0) self.texel_custody_zero +|= 1;
+                        self.texel_custody_last_format = view.format;
+                        self.texel_custody_last_shape = stats.shape;
+                        self.texel_custody_last_out = .{ stats.out_max, stats.out_7e3_one, stats.out_mid };
+                        switch (stats.shape) {
+                            .xenia_default_linear => self.texel_custody_default_samples +|= 1,
+                            .programmed => self.texel_custody_programmed_samples +|= 1,
+                            else => {},
+                        }
+                        if ((!view.observed or view.last_hash != stats.hash) and self.texel_custody_printed < 24) {
+                            self.texel_custody_printed += 1;
+                            machoCapturePrint("macho-processor: TEXEL CUSTODY: command=0x{x} set_index={d} set=0x{x} binding={d} view=0x{x} native_view=0x{x} buffer=0x{x} native_buffer=0x{x} memory=0x{x} offset={d} format={d} bytes={d} hash=0x{x} nonzero_bytes={d} entries={d} min={d}/{d}/{d} max={d}/{d}/{d} ramp_shape={s} ramp_out(max/7e3_one/mid)={d}/{d}/{d} of 1023; native mapped lookup bytes after shadow publication, not an exposure correction. A shape of xenia_default_linear is the ramp Xenia seeds before any title write reaches DC_LUT\n", .{ command_buffer, bound.set_index, bound.synthetic, binding.binding, view.synthetic, self.real_vulkan.realBufferView(view.synthetic) orelse 0, view.buffer, self.real_vulkan.realBuffer(view.buffer) orelse 0, resource.memory, offset, view.format, view.range, stats.hash, stats.nonzero_bytes, stats.entries, stats.min[0], stats.min[1], stats.min[2], stats.max[0], stats.max[1], stats.max[2], stats.shape.label(), stats.out_max, stats.out_7e3_one, stats.out_mid });
+                        }
+                        view.observed = true;
+                        view.last_hash = stats.hash;
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    fn copyDescriptorSetImages(self: *Forwarder, copy: abi.CopyDescriptorSet) void {
+        const observed: usize = @min(@as(usize, @intCast(copy.descriptor_count)), MAX_TRACKED_DESCRIPTOR_IMAGES);
+        if (@as(usize, @intCast(copy.descriptor_count)) > observed) self.noteTargetOverflow(.descriptor_image_array);
+        const source = self.trackedDescriptorSet(copy.src_set) orelse {
+            if (copy.descriptor_count != 0) {
+                self.target_unknown_events +|= 1;
+                self.markDescriptorSetUnknown(copy.dst_set);
+            }
+            return;
+        };
+        const source_texels = source.texels;
+        const source_texel_count = source.texel_count;
+        if (self.mutableDescriptorSet(copy.dst_set)) |destination| {
+            for (destination.texels[0..destination.texel_count]) |*texel| {
+                if (texel.binding == copy.dst_binding and texel.element >= copy.dst_array_element and texel.element - copy.dst_array_element < copy.descriptor_count) texel.view = 0;
+            }
+            for (source_texels[0..source_texel_count]) |texel| {
+                if (texel.binding != copy.src_binding or texel.element < copy.src_array_element) continue;
+                const delta = texel.element - copy.src_array_element;
+                if (delta >= copy.descriptor_count) continue;
+                const element = std.math.add(u32, copy.dst_array_element, delta) catch continue;
+                var replaced = false;
+                for (destination.texels[0..destination.texel_count]) |*known| {
+                    if (known.binding == copy.dst_binding and known.element == element) {
+                        known.view = texel.view;
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced and destination.texel_count < destination.texels.len) {
+                    destination.texels[destination.texel_count] = .{ .binding = copy.dst_binding, .element = element, .view = texel.view };
+                    destination.texel_count += 1;
+                } else if (!replaced) self.noteTargetOverflow(.texel_entries);
+            }
+        }
+        if (source.unknown_image_views) self.markDescriptorSetUnknown(copy.dst_set);
+        for (0..observed) |index| {
+            const dst_array_element = std.math.add(u32, copy.dst_array_element, @intCast(index)) catch {
+                self.noteTargetOverflow(.descriptor_address_arithmetic);
+                break;
+            };
+            // Clear a destination slot before copying so a descriptor that was
+            // not previously tracked cannot leave a stale sampled image in the
+            // route ledger.
+            self.noteDescriptorSetImage(copy.dst_set, copy.dst_binding, dst_array_element, 0, false);
+        }
+        for (source.images[0..@as(usize, @intCast(source.image_count))]) |image| {
+            if (image.binding != copy.src_binding or image.array_element < copy.src_array_element) continue;
+            const delta = image.array_element - copy.src_array_element;
+            if (delta >= observed) continue;
+            const dst_array_element = std.math.add(u32, copy.dst_array_element, delta) catch {
+                self.noteTargetOverflow(.descriptor_address_arithmetic);
+                continue;
+            };
+            self.noteDescriptorSetImage(copy.dst_set, copy.dst_binding, dst_array_element, image.image, false);
+        }
+    }
+
+    fn trackDescriptorSetCopies(self: *Forwarder, copies: []const abi.CopyDescriptorSet) void {
+        for (copies) |copy| self.copyDescriptorSetImages(copy);
+    }
+
+    fn trackDescriptorTemplateImages(
+        self: *Forwarder,
+        state: anytype,
+        destination: u64,
+        record: *const DescriptorUpdateTemplateRecord,
+        guest_data: u64,
+    ) void {
+        for (record.entries[0..record.entry_count]) |entry| {
+            if (!isDescriptorImageType(entry.descriptor_type)) continue;
+            const count: usize = @intCast(entry.descriptor_count);
+            const observed = @min(count, MAX_TRACKED_DESCRIPTOR_IMAGES);
+            if (count > observed) self.noteTargetOverflow(.descriptor_image_array);
+            for (0..observed) |index| {
+                const relative = std.math.add(
+                    u64,
+                    entry.offset,
+                    std.math.mul(u64, @as(u64, @intCast(index)), entry.stride) catch {
+                        self.noteTargetOverflow(.descriptor_address_arithmetic);
+                        break;
+                    },
+                ) catch {
+                    self.noteTargetOverflow(.descriptor_address_arithmetic);
+                    break;
+                };
+                var info: abi.DescriptorImageInfo = undefined;
+                if (!copyGuestValue(abi.DescriptorImageInfo, state, guest_data + relative, &info)) {
+                    self.target_unknown_events +|= 1;
+                    self.markDescriptorSetUnknown(destination);
+                    break;
+                }
+                const array_element = std.math.add(u32, entry.dst_array_element, @intCast(index)) catch {
+                    self.noteTargetOverflow(.descriptor_address_arithmetic);
+                    break;
+                };
+                self.noteDescriptorImageInfo(destination, entry.dst_binding, array_element, info);
+            }
+        }
+    }
+
+    fn addCommandSampledImage(self: *Forwarder, command_buffer: u64, image: u64) void {
+        if (image == 0) return;
+        const record = self.mutableCommandTargets(command_buffer) orelse return;
+        for (record.sampled_images[0..@as(usize, @intCast(record.sampled_image_count))]) |known| {
+            if (known == image) return;
+        }
+        if (@as(usize, @intCast(record.sampled_image_count)) == record.sampled_images.len) {
+            self.noteTargetOverflow(.command_sampled_images);
+            return;
+        }
+        record.sampled_images[@as(usize, @intCast(record.sampled_image_count))] = image;
+        record.sampled_image_count += 1;
+        self.vulkan_descriptor_sampled_images_recorded +|= 1;
+    }
+
+    fn noteCommandSampledImageUnknown(self: *Forwarder, command_buffer: u64) void {
+        const record = self.mutableCommandTargets(command_buffer) orelse return;
+        if (!record.sampled_images_unknown) self.vulkan_descriptor_sampled_unknown +|= 1;
+        record.sampled_images_unknown = true;
+    }
+
+    fn noteCommandDescriptorSet(self: *Forwarder, command_buffer: u64, set: u64) void {
+        const record = self.trackedDescriptorSet(set) orelse {
+            self.vulkan_descriptor_sets_unknown +|= 1;
+            self.target_unknown_events +|= 1;
+            self.noteCommandSampledImageUnknown(command_buffer);
+            return;
+        };
+        self.vulkan_descriptor_sets_resolved +|= 1;
+        for (record.images[0..@as(usize, @intCast(record.image_count))]) |image| {
+            self.addCommandSampledImage(command_buffer, image.image);
+        }
+        if (record.unknown_image_views) self.noteCommandSampledImageUnknown(command_buffer);
+    }
+
+    fn noteCommandBoundDescriptorSet(self: *Forwarder, command_buffer: u64, set_index: u32, set: u64) void {
+        const record = self.mutableCommandTargets(command_buffer) orelse return;
+        self.addCommandPassEdge(record, set);
+        for (record.bound_descriptor_sets[0..@as(usize, @intCast(record.bound_descriptor_set_count))]) |*bound| {
+            if (bound.set_index != set_index) continue;
+            bound.synthetic = set;
+            return;
+        }
+        if (@as(usize, @intCast(record.bound_descriptor_set_count)) == record.bound_descriptor_sets.len) {
+            self.noteTargetOverflow(.command_bound_sets);
+            self.noteCommandSampledImageUnknown(command_buffer);
+            return;
+        }
+        record.bound_descriptor_sets[@as(usize, @intCast(record.bound_descriptor_set_count))] = .{
+            .set_index = set_index,
+            .synthetic = set,
+        };
+        record.bound_descriptor_set_count += 1;
+    }
+
+    /// The image the render pass being recorded into `command_buffer`
+    /// writes, taken as the framebuffer's first attachment. Xenia's presenter
+    /// paint and its gamma pass each have exactly one colour attachment, and
+    /// its scene passes put colour before depth.
+    fn noteCommandPassTarget(self: *Forwarder, command_buffer: u64, framebuffer: u64) void {
+        const record = self.mutableCommandTargets(command_buffer) orelse return;
+        record.current_pass_target = 0;
+        const frame = self.trackedFramebuffer(framebuffer) orelse return;
+        if (frame.attachment_count == 0) return;
+        const view = self.trackedImageView(frame.attachments[0]) orelse return;
+        record.current_pass_target = view.image;
+    }
+
+    fn clearCommandPassTarget(self: *Forwarder, command_buffer: u64) void {
+        for (&self.tracked_command_targets) |*record| {
+            if (record.synthetic == command_buffer) {
+                record.current_pass_target = 0;
+                return;
+            }
+        }
+    }
+
+    fn addCommandPassEdge(self: *Forwarder, record: *TrackedCommandTargets, set: u64) void {
+        if (record.current_pass_target == 0 or set == 0) return;
+        for (record.pass_edges[0..record.pass_edge_count]) |edge| {
+            if (edge.target == record.current_pass_target and edge.set == set) return;
+        }
+        if (record.pass_edge_count == record.pass_edges.len) {
+            self.noteTargetOverflow(.command_pass_edges);
+            return;
+        }
+        record.pass_edges[record.pass_edge_count] = .{ .target = record.current_pass_target, .set = set };
+        record.pass_edge_count += 1;
+    }
+
+    /// Resolve every (target, set) edge the command recorded to (target,
+    /// sampled image) pairs and hand them to the present chain. Runs at
+    /// submission, after descriptor writes that legally follow recording.
+    fn commitCommandPassSources(self: *Forwarder, command_buffer: u64) void {
+        var edges: [MAX_TRACKED_PASS_EDGES]TrackedPassEdge = @splat(.{});
+        var count: usize = 0;
+        for (self.tracked_command_targets) |record| {
+            if (record.synthetic != command_buffer) continue;
+            count = record.pass_edge_count;
+            if (count != 0) @memcpy(edges[0..count], record.pass_edges[0..count]);
+            break;
+        }
+        for (edges[0..count]) |edge| {
+            const real_target = self.real_vulkan.realImage(edge.target) orelse continue;
+            const set = self.trackedDescriptorSet(edge.set) orelse continue;
+            for (set.images[0..@as(usize, @intCast(set.image_count))]) |image| {
+                if (image.image == 0) continue;
+                const real_sampled = self.real_vulkan.realImage(image.image) orelse continue;
+                self.present_chain.noteRenderPassSource(real_target, real_sampled);
+                self.vulkan_pass_source_edges +|= 1;
+            }
+        }
+    }
+
+    fn rejectDescriptorBind(
+        self: *Forwarder,
+        reason: DescriptorBindRejectReason,
+        command_buffer: u64,
+        layout: u64,
+        set_count: u64,
+        sets: u64,
+        dynamic_count: u64,
+        dynamic_offsets: u64,
+        unmapped_handle: u64,
+    ) void {
+        std.debug.assert(reason != .none and reason != .count);
+        const admission = &self.vulkan_descriptor_bind_admission;
+        admission.rejected +|= 1;
+        admission.rejected_by_reason[@intFromEnum(reason)] +|= 1;
+        admission.last_reason = reason;
+        admission.last_command_buffer = command_buffer;
+        admission.last_layout = layout;
+        admission.last_set_count = set_count;
+        admission.last_sets = sets;
+        admission.last_dynamic_count = dynamic_count;
+        admission.last_dynamic_offsets = dynamic_offsets;
+        admission.last_unmapped_handle = unmapped_handle;
+
+        const reason_count = admission.rejected_by_reason[@intFromEnum(reason)];
+        if (reason_count <= 4 or (reason_count & (reason_count - 1)) == 0) {
+            machoCapturePrint(
+                "macho-processor: Vulkan descriptor bind refused before native call: reason={s} reason_count={d} entries={d} forwarded={d} command_buffer=0x{x} layout=0x{x} set_count={d} sets=0x{x} dynamic_count={d} dynamic_offsets=0x{x} unmapped_handle=0x{x}; the command was handled but is not counted as native graphics work\n",
+                .{
+                    @tagName(reason),
+                    reason_count,
+                    admission.entries,
+                    admission.forwarded,
+                    command_buffer,
+                    layout,
+                    set_count,
+                    sets,
+                    dynamic_count,
+                    dynamic_offsets,
+                    unmapped_handle,
+                },
+            );
+        }
+    }
+
+    fn noteCommandDescriptorSets(self: *Forwarder, state: anytype, command_buffer: u64, first_set: u64, guest_sets: u64, set_count: u64) void {
+        if (set_count == 0) return;
+        const observed = @min(set_count, MAX_TRACKED_DESCRIPTOR_SETS_PER_COMMAND);
+        self.vulkan_descriptor_sets_bound +|= observed;
+        if (set_count > observed) {
+            self.noteTargetOverflow(.command_set_array);
+            self.noteCommandSampledImageUnknown(command_buffer);
+        }
+        for (0..@as(usize, @intCast(observed))) |index| {
+            const set = state.read64(guest_sets + @as(u64, @intCast(index)) * 8);
+            const set_index_value = std.math.add(u64, first_set, @as(u64, @intCast(index))) catch {
+                self.noteTargetOverflow(.command_set_index);
+                self.noteCommandSampledImageUnknown(command_buffer);
+                break;
+            };
+            const set_index = std.math.cast(u32, set_index_value) orelse {
+                self.noteTargetOverflow(.command_set_index);
+                self.noteCommandSampledImageUnknown(command_buffer);
+                break;
+            };
+            self.noteCommandBoundDescriptorSet(command_buffer, set_index, set);
+        }
+    }
+
+    /// Resolve the descriptor sets named by a command only when the command
+    /// reaches queue submission. Descriptor writes are legal between command
+    /// recording and submission, and that is the interval in which the old
+    /// bind-time snapshot lost the presenter's sampled image edge.
+    fn resolveCommandDescriptorSets(self: *Forwarder, command_buffer: u64) void {
+        var bound: [MAX_TRACKED_DESCRIPTOR_SETS_PER_COMMAND]TrackedCommandDescriptorSet = [_]TrackedCommandDescriptorSet{.{}} ** MAX_TRACKED_DESCRIPTOR_SETS_PER_COMMAND;
+        var count: usize = 0;
+        for (self.tracked_command_targets) |record| {
+            if (record.synthetic != command_buffer) continue;
+            count = @as(usize, @intCast(record.bound_descriptor_set_count));
+            if (count != 0) @memcpy(bound[0..count], record.bound_descriptor_sets[0..count]);
+            break;
+        }
+        if (count == 0) return;
+        self.vulkan_descriptor_late_resolutions +|= @intCast(count);
+        for (bound[0..count]) |descriptor| {
+            self.noteCommandDescriptorSet(command_buffer, descriptor.synthetic);
+        }
+    }
+
+    fn noteCommandDescriptorImages(self: *Forwarder, state: anytype, command_buffer: u64, writes: []const abi.WriteDescriptorSet) void {
+        for (writes) |write| {
+            if (!isDescriptorImageType(write.descriptor_type)) continue;
+            const count: usize = @intCast(write.descriptor_count);
+            const address = if (write.image_info) |pointer| @intFromPtr(pointer) else 0;
+            if (count != 0 and address == 0) {
+                self.target_unknown_events +|= 1;
+                self.noteCommandSampledImageUnknown(command_buffer);
+                continue;
+            }
+            const observed = @min(count, MAX_TRACKED_DESCRIPTOR_IMAGES);
+            if (count > observed) self.noteTargetOverflow(.descriptor_image_array);
+            for (0..observed) |index| {
+                var info: abi.DescriptorImageInfo = undefined;
+                const offset = @as(u64, @intCast(index)) * @sizeOf(abi.DescriptorImageInfo);
+                if (!copyGuestValue(abi.DescriptorImageInfo, state, address + offset, &info)) {
+                    self.target_unknown_events +|= 1;
+                    self.noteCommandSampledImageUnknown(command_buffer);
+                    break;
+                }
+                self.vulkan_descriptor_image_infos_observed +|= 1;
+                if (info.image_view == 0) continue;
+                if (self.trackedImageView(info.image_view)) |view| {
+                    self.addCommandSampledImage(command_buffer, view.image);
+                    if (view.image == 0) {
+                        self.vulkan_descriptor_unknown_image_views +|= 1;
+                        self.noteCommandSampledImageUnknown(command_buffer);
+                    }
+                } else {
+                    self.vulkan_descriptor_unknown_image_views +|= 1;
+                    self.target_unknown_events +|= 1;
+                    self.noteCommandSampledImageUnknown(command_buffer);
+                }
+            }
+        }
+    }
+
     fn mutableCommandTargets(self: *Forwarder, synthetic: u64) ?*TrackedCommandTargets {
         if (synthetic == 0) return null;
         for (&self.tracked_command_targets) |*record| {
@@ -4385,15 +6619,13 @@ pub const Forwarder = struct {
                 return record;
             }
         }
-        self.target_overflow_events +|= 1;
+        self.noteTargetOverflow(.command_target_table);
         return null;
     }
 
     fn resetCommandTargets(self: *Forwarder, synthetic: u64) void {
         const record = self.mutableCommandTargets(synthetic) orelse return;
-        record.image_count = 0;
-        record.write_kind = .none;
-        @memset(&record.images, 0);
+        record.* = .{ .synthetic = synthetic };
     }
 
     fn addCommandImage(self: *Forwarder, command_buffer: u64, image: u64) void {
@@ -4406,7 +6638,7 @@ pub const Forwarder = struct {
             if (known == image) return;
         }
         if (@as(usize, @intCast(record.image_count)) == record.images.len) {
-            self.target_overflow_events +|= 1;
+            self.noteTargetOverflow(.command_images);
             return;
         }
         record.images[@as(usize, @intCast(record.image_count))] = image;
@@ -4419,6 +6651,52 @@ pub const Forwarder = struct {
             return;
         };
         self.addCommandImage(command_buffer, view.image);
+    }
+
+    fn addCommandTransfer(self: *Forwarder, command_buffer: u64, source: u64, destination: u64, kind: rosette_gpu.PresentTransferKind) void {
+        const record = self.mutableCommandTargets(command_buffer) orelse return;
+        if (@as(usize, @intCast(record.transfer_count)) == record.transfers.len) {
+            self.noteTargetOverflow(.command_transfers);
+            return;
+        }
+        record.transfers[@as(usize, @intCast(record.transfer_count))] = .{
+            .source = source,
+            .destination = destination,
+            .kind = kind,
+        };
+        record.transfer_count += 1;
+    }
+
+    fn noteCommandTransfer(self: *Forwarder, command_buffer: u64, source: u64, destination: u64, kind: rosette_gpu.PresentTransferKind) void {
+        self.noteCommandImageTarget(command_buffer, destination, .content);
+        self.addCommandTransfer(command_buffer, source, destination, kind);
+    }
+
+    fn noteCommandImageViewTransfer(
+        self: *Forwarder,
+        command_buffer: u64,
+        source_view: u64,
+        destination_view: u64,
+        kind: rosette_gpu.PresentTransferKind,
+    ) void {
+        if (source_view == 0 or destination_view == 0) return;
+        const source = self.trackedImageView(source_view) orelse {
+            self.target_unknown_events +|= 1;
+            self.addCommandTransfer(command_buffer, 0, 0, kind);
+            return;
+        };
+        const destination = self.trackedImageView(destination_view) orelse {
+            self.target_unknown_events +|= 1;
+            self.addCommandTransfer(command_buffer, source.image, 0, kind);
+            return;
+        };
+        self.addCommandImage(command_buffer, destination.image);
+        // A resolve is itself a producer of the destination image. It can be
+        // the only operation that touches the acquired image in this command
+        // buffer, so do not require a separate draw/dispatch mark before the
+        // present chain can classify it as content.
+        self.noteCommandTargets(command_buffer, .content);
+        self.addCommandTransfer(command_buffer, source.image, destination.image, kind);
     }
 
     fn noteCommandImageTarget(self: *Forwarder, command_buffer: u64, synthetic_image: u64, write: WriteKind) void {
@@ -4438,7 +6716,7 @@ pub const Forwarder = struct {
                 return;
             }
         }
-        self.target_overflow_events +|= 1;
+        self.noteTargetOverflow(.image_view_table);
     }
 
     fn trackFramebuffer(self: *Forwarder, state: anytype, synthetic: u64, create_info: u64) void {
@@ -4448,7 +6726,7 @@ pub const Forwarder = struct {
             return;
         }
         if (info.attachment_count > MAX_TRACKED_TARGET_ATTACHMENTS) {
-            self.target_overflow_events +|= 1;
+            self.noteTargetOverflow(.framebuffer_attachments);
             return;
         }
         var attachments: [MAX_TRACKED_TARGET_ATTACHMENTS]u64 = [_]u64{0} ** MAX_TRACKED_TARGET_ATTACHMENTS;
@@ -4467,7 +6745,7 @@ pub const Forwarder = struct {
                 return;
             }
         }
-        self.target_overflow_events +|= 1;
+        self.noteTargetOverflow(.framebuffer_table);
     }
 
     /// Retain only the part of VkRenderPassCreateInfo that affects whether a
@@ -4491,9 +6769,12 @@ pub const Forwarder = struct {
         }
 
         var color_load_clear = false;
+        var resolve_count: usize = 0;
+        var resolve_sources: [MAX_TRACKED_TARGET_ATTACHMENTS]u32 = [_]u32{0} ** MAX_TRACKED_TARGET_ATTACHMENTS;
+        var resolve_destinations: [MAX_TRACKED_TARGET_ATTACHMENTS]u32 = [_]u32{0} ** MAX_TRACKED_TARGET_ATTACHMENTS;
         for (subpasses[0..@as(usize, @intCast(info.subpass_count))]) |subpass| {
             if (subpass.color_attachment_count > MAX_TRACKED_TARGET_ATTACHMENTS) {
-                self.target_overflow_events +|= 1;
+                self.noteTargetOverflow(.render_pass_attachments);
                 return;
             }
             var colors: [MAX_TRACKED_TARGET_ATTACHMENTS]marshal.AttachmentReference = [_]marshal.AttachmentReference{.{}} ** MAX_TRACKED_TARGET_ATTACHMENTS;
@@ -4505,19 +6786,43 @@ pub const Forwarder = struct {
                 if (reference.attachment == 0xFFFF_FFFF or reference.attachment >= info.attachment_count) continue;
                 if (attachments[@as(usize, @intCast(reference.attachment))].load_op == VK_ATTACHMENT_LOAD_OP_CLEAR) {
                     color_load_clear = true;
-                    break;
                 }
             }
-            if (color_load_clear) break;
+            if (subpass.resolve_attachments) |pointer| {
+                var resolves: [MAX_TRACKED_TARGET_ATTACHMENTS]marshal.AttachmentReference = [_]marshal.AttachmentReference{.{}} ** MAX_TRACKED_TARGET_ATTACHMENTS;
+                if (!copyGuestStructs(marshal.AttachmentReference, state, @intFromPtr(pointer), subpass.color_attachment_count, &resolves)) {
+                    self.target_unknown_events +|= 1;
+                    return;
+                }
+                for (0..@as(usize, @intCast(subpass.color_attachment_count))) |index| {
+                    const source = colors[index].attachment;
+                    const destination = resolves[index].attachment;
+                    if (source == 0xFFFF_FFFF or destination == 0xFFFF_FFFF or
+                        source >= info.attachment_count or destination >= info.attachment_count) continue;
+                    if (resolve_count == MAX_TRACKED_TARGET_ATTACHMENTS) {
+                        self.noteTargetOverflow(.render_pass_resolves);
+                        return;
+                    }
+                    resolve_sources[resolve_count] = source;
+                    resolve_destinations[resolve_count] = destination;
+                    resolve_count += 1;
+                }
+            }
         }
 
         for (&self.tracked_render_passes) |*record| {
             if (record.synthetic == synthetic or record.synthetic == 0) {
-                record.* = .{ .synthetic = synthetic, .color_load_clear = color_load_clear };
+                record.* = .{
+                    .synthetic = synthetic,
+                    .color_load_clear = color_load_clear,
+                    .resolve_count = @intCast(resolve_count),
+                    .resolve_sources = resolve_sources,
+                    .resolve_destinations = resolve_destinations,
+                };
                 return;
             }
         }
-        self.target_overflow_events +|= 1;
+        self.noteTargetOverflow(.render_pass_table);
     }
 
     fn trackFramebufferTargets(self: *Forwarder, command_buffer: u64, framebuffer: u64) void {
@@ -4527,6 +6832,28 @@ pub const Forwarder = struct {
         };
         for (record.attachments[0..@as(usize, @intCast(record.attachment_count))]) |image_view| {
             self.addCommandImageView(command_buffer, image_view);
+        }
+    }
+
+    fn trackRenderPassTransfers(self: *Forwarder, command_buffer: u64, render_pass: u64, framebuffer: u64) void {
+        const pass = self.trackedRenderPass(render_pass) orelse return;
+        const frame = self.trackedFramebuffer(framebuffer) orelse {
+            if (pass.resolve_count != 0) self.target_unknown_events +|= 1;
+            return;
+        };
+        for (0..@as(usize, @intCast(pass.resolve_count))) |index| {
+            const source_attachment = pass.resolve_sources[index];
+            const destination_attachment = pass.resolve_destinations[index];
+            if (source_attachment >= @as(u32, @intCast(frame.attachment_count)) or destination_attachment >= @as(u32, @intCast(frame.attachment_count))) {
+                self.target_unknown_events +|= 1;
+                continue;
+            }
+            self.noteCommandImageViewTransfer(
+                command_buffer,
+                frame.attachments[@as(usize, @intCast(source_attachment))],
+                frame.attachments[@as(usize, @intCast(destination_attachment))],
+                .render_pass_resolve,
+            );
         }
     }
 
@@ -4557,17 +6884,63 @@ pub const Forwarder = struct {
     fn mergeCommandTargets(self: *Forwarder, destination: u64, source: u64) void {
         if (destination == source) return;
         var images: [MAX_TRACKED_TARGET_ATTACHMENTS]u64 = [_]u64{0} ** MAX_TRACKED_TARGET_ATTACHMENTS;
+        var sampled_images: [MAX_TRACKED_DESCRIPTOR_IMAGES]u64 = [_]u64{0} ** MAX_TRACKED_DESCRIPTOR_IMAGES;
+        var transfers: [MAX_TRACKED_RESOURCE_TRANSFERS]TrackedImageTransfer = [_]TrackedImageTransfer{.{}} ** MAX_TRACKED_RESOURCE_TRANSFERS;
+        var bound_descriptor_sets: [MAX_TRACKED_DESCRIPTOR_SETS_PER_COMMAND]TrackedCommandDescriptorSet = [_]TrackedCommandDescriptorSet{.{}} ** MAX_TRACKED_DESCRIPTOR_SETS_PER_COMMAND;
         var count: usize = 0;
+        var sampled_count: usize = 0;
+        var transfer_count: usize = 0;
+        var bound_descriptor_set_count: usize = 0;
+        var sampled_unknown = false;
         var write_kind: WriteKind = .none;
+        var graphics_state: GraphicsStateTrace = .{};
+        var graphics_state_seen = false;
         for (self.tracked_command_targets) |record| {
             if (record.synthetic != source) continue;
             count = @as(usize, @intCast(record.image_count));
             if (count != 0) @memcpy(images[0..count], record.images[0..count]);
+            sampled_count = @as(usize, @intCast(record.sampled_image_count));
+            if (sampled_count != 0) @memcpy(sampled_images[0..sampled_count], record.sampled_images[0..sampled_count]);
+            transfer_count = @as(usize, @intCast(record.transfer_count));
+            if (transfer_count != 0) @memcpy(transfers[0..transfer_count], record.transfers[0..transfer_count]);
+            bound_descriptor_set_count = @as(usize, @intCast(record.bound_descriptor_set_count));
+            if (bound_descriptor_set_count != 0) @memcpy(bound_descriptor_sets[0..bound_descriptor_set_count], record.bound_descriptor_sets[0..bound_descriptor_set_count]);
+            sampled_unknown = record.sampled_images_unknown;
             write_kind = record.write_kind;
+            graphics_state = record.graphics_state;
+            graphics_state_seen = record.graphics_state.pipeline_bound or record.graphics_state.push_constants_valid or
+                record.graphics_state.viewport_valid or record.graphics_state.scissor_valid;
             break;
         }
         for (images[0..count]) |image| self.addCommandImage(destination, image);
+        for (sampled_images[0..sampled_count]) |image| self.addCommandSampledImage(destination, image);
+        if (sampled_unknown) self.noteCommandSampledImageUnknown(destination);
+        for (bound_descriptor_sets[0..bound_descriptor_set_count]) |descriptor| {
+            self.noteCommandBoundDescriptorSet(destination, descriptor.set_index, descriptor.synthetic);
+        }
+        for (transfers[0..transfer_count]) |transfer| self.addCommandTransfer(destination, transfer.source, transfer.destination, transfer.kind);
         if (write_kind != .none) self.noteCommandTargets(destination, write_kind);
+        if (graphics_state_seen and self.graphicsStateTrackingEnabled()) {
+            if (self.mutableCommandTargets(destination)) |record| record.graphics_state = graphics_state;
+        }
+        var pass_edges: [MAX_TRACKED_PASS_EDGES]TrackedPassEdge = @splat(.{});
+        var pass_edge_count: usize = 0;
+        for (self.tracked_command_targets) |record| {
+            if (record.synthetic != source) continue;
+            pass_edge_count = record.pass_edge_count;
+            if (pass_edge_count != 0) @memcpy(pass_edges[0..pass_edge_count], record.pass_edges[0..pass_edge_count]);
+            break;
+        }
+        if (pass_edge_count != 0) {
+            if (self.mutableCommandTargets(destination)) |record| {
+                const saved_target = record.current_pass_target;
+                for (pass_edges[0..pass_edge_count]) |edge| {
+                    record.current_pass_target = edge.target;
+                    self.addCommandPassEdge(record, edge.set);
+                }
+                record.current_pass_target = saved_target;
+            }
+        }
     }
 
     /// Commit the command buffer's retained target set at submission time.
@@ -4575,24 +6948,106 @@ pub const Forwarder = struct {
     /// command call would either miss the frame or attribute it to the wrong
     /// acquired image.
     fn noteSubmittedCommandTargets(self: *Forwarder, command_buffer: u64) void {
+        self.resolveCommandDescriptorSets(command_buffer);
+        self.auditCommandTexelCustody(command_buffer);
+        self.commitCommandPassSources(command_buffer);
         var images: [MAX_TRACKED_TARGET_ATTACHMENTS]u64 = [_]u64{0} ** MAX_TRACKED_TARGET_ATTACHMENTS;
+        var sampled_images: [MAX_TRACKED_DESCRIPTOR_IMAGES]u64 = [_]u64{0} ** MAX_TRACKED_DESCRIPTOR_IMAGES;
+        var transfers: [MAX_TRACKED_RESOURCE_TRANSFERS]TrackedImageTransfer = [_]TrackedImageTransfer{.{}} ** MAX_TRACKED_RESOURCE_TRANSFERS;
         var count: usize = 0;
+        var sampled_count: usize = 0;
+        var transfer_count: usize = 0;
+        var sampled_unknown = false;
         var write_kind: WriteKind = .none;
         for (self.tracked_command_targets) |record| {
             if (record.synthetic != command_buffer) continue;
             count = @as(usize, @intCast(record.image_count));
             if (count != 0) @memcpy(images[0..count], record.images[0..count]);
+            sampled_count = @as(usize, @intCast(record.sampled_image_count));
+            if (sampled_count != 0) @memcpy(sampled_images[0..sampled_count], record.sampled_images[0..sampled_count]);
+            transfer_count = @as(usize, @intCast(record.transfer_count));
+            if (transfer_count != 0) @memcpy(transfers[0..transfer_count], record.transfers[0..transfer_count]);
+            sampled_unknown = record.sampled_images_unknown;
             write_kind = record.write_kind;
             break;
         }
         self.vulkan_target_submission_events +|= 1;
         if (sparseVulkanSuccessLog(self.vulkan_target_submission_events)) {
             machoCapturePrint(
-                "macho-processor: Vulkan target submission sample: serial={d} command_buffer=0x{x} images={d} write={s} first_image=0x{x}\n",
-                .{ self.vulkan_target_submission_events, command_buffer, count, write_kind.label(), if (count == 0) 0 else images[0] },
+                "macho-processor: Vulkan target submission sample: serial={d} command_buffer=0x{x} images={d} sampled_images={d} transfers={d} sampled_unknown={} write={s} first_image=0x{x}\n",
+                .{ self.vulkan_target_submission_events, command_buffer, count, sampled_count, transfer_count, sampled_unknown, write_kind.label(), if (count == 0) 0 else images[0] },
             );
         }
-        for (images[0..count]) |image| self.noteGuestImageTarget(image, write_kind);
+        var real_images: [MAX_TRACKED_TARGET_ATTACHMENTS]u64 = [_]u64{0} ** MAX_TRACKED_TARGET_ATTACHMENTS;
+        var real_count: usize = 0;
+        for (images[0..count]) |image| {
+            const real_image = self.real_vulkan.realImage(image) orelse {
+                self.noteGuestImageTarget(image, write_kind);
+                continue;
+            };
+            real_images[real_count] = real_image;
+            real_count += 1;
+            self.noteGuestImageTarget(image, write_kind);
+        }
+
+        var real_sampled_images: [MAX_TRACKED_DESCRIPTOR_IMAGES]u64 = [_]u64{0} ** MAX_TRACKED_DESCRIPTOR_IMAGES;
+        var real_sampled_count: usize = 0;
+        for (sampled_images[0..sampled_count]) |image| {
+            if (real_sampled_count == real_sampled_images.len) {
+                self.noteTargetOverflow(.submission_sampled_images);
+                break;
+            }
+            const real_image = self.real_vulkan.realImage(image) orelse {
+                self.target_unknown_events +|= 1;
+                sampled_unknown = true;
+                continue;
+            };
+            real_sampled_images[real_sampled_count] = real_image;
+            real_sampled_count += 1;
+        }
+        if (sampled_unknown) {
+            if (real_sampled_count < real_sampled_images.len) {
+                real_sampled_images[real_sampled_count] = 0;
+                real_sampled_count += 1;
+            } else {
+                self.noteTargetOverflow(.submission_sampled_sentinel);
+            }
+        }
+
+        var real_transfers: [MAX_TRACKED_RESOURCE_TRANSFERS]rosette_gpu.PresentResourceTransfer = [_]rosette_gpu.PresentResourceTransfer{.{}} ** MAX_TRACKED_RESOURCE_TRANSFERS;
+        var real_transfer_count: usize = 0;
+        for (transfers[0..transfer_count]) |transfer| {
+            if (real_transfer_count == real_transfers.len) {
+                self.noteTargetOverflow(.submission_transfers);
+                break;
+            }
+            const real_source = if (transfer.source == 0)
+                0
+            else
+                self.real_vulkan.realImage(transfer.source) orelse blk: {
+                    self.target_unknown_events +|= 1;
+                    break :blk 0;
+                };
+            const real_destination = if (transfer.destination == 0)
+                0
+            else
+                self.real_vulkan.realImage(transfer.destination) orelse blk: {
+                    self.target_unknown_events +|= 1;
+                    break :blk 0;
+                };
+            real_transfers[real_transfer_count] = .{
+                .source = real_source,
+                .destination = real_destination,
+                .kind = transfer.kind,
+            };
+            real_transfer_count += 1;
+        }
+        self.present_chain.noteResourceSubmission(
+            real_images[0..real_count],
+            write_kind,
+            real_sampled_images[0..real_sampled_count],
+            real_transfers[0..real_transfer_count],
+        );
     }
 
     fn noteGuestImageTarget(self: *Forwarder, synthetic_image: u64, write_kind: WriteKind) void {
@@ -4616,6 +7071,12 @@ pub const Forwarder = struct {
 
     fn forgetImageView(self: *Forwarder, synthetic: u64) void {
         for (&self.tracked_image_views) |*record| {
+            if (record.synthetic == synthetic) record.* = .{};
+        }
+    }
+
+    fn forgetDescriptorSet(self: *Forwarder, synthetic: u64) void {
+        for (&self.tracked_descriptor_sets) |*record| {
             if (record.synthetic == synthetic) record.* = .{};
         }
     }
@@ -4669,6 +7130,45 @@ pub const Forwarder = struct {
         }
     }
 
+    fn vulkanCreateLedgerHasAnomaly(self: *const Forwarder) bool {
+        for (self.vulkan_create_ledger[0..self.vulkan_create_ledger_count]) |entry| {
+            if (entry.refused_before_driver != 0 or entry.driver_failures != 0 or entry.published < entry.attempts) return true;
+        }
+        return self.vulkan_create_ledger_overflow != 0;
+    }
+
+    /// Print the distinct Vulkan create entry points and their outcomes. This
+    /// is intentionally separate from the larger state snapshot so a create
+    /// anomaly can be made visible even when the presentation chain itself is
+    /// healthy. The row order is first-seen order, which is the order that
+    /// makes a partially initialized pipeline easiest to reconcile with the
+    /// guest call trace.
+    pub fn dumpVulkanCreateLedger(self: *const Forwarder) void {
+        machoCapturePrint(
+            "macho-processor:   create_ledger: entry_points={d} overflow={d} (attempts / published / refused-before-driver / driver-failures)\n",
+            .{ self.vulkan_create_ledger_count, self.vulkan_create_ledger_overflow },
+        );
+        machoCapturePrint(
+            "macho-processor:   marshal_scratch: capacity={d} used={d} spill_reserves={d} peak_bytes={d} spill_failures={d} refusals={d}\n",
+            .{ self.vulkan_scratch.capacity(), self.vulkan_scratch.used, self.vulkan_marshal_spill_reserves, self.vulkan_marshal_spill_peak_bytes, self.vulkan_marshal_spill_failures, self.vulkan_marshal_refusals },
+        );
+        for (self.vulkan_create_ledger[0..self.vulkan_create_ledger_count]) |entry| {
+            const lost = entry.attempts -| entry.published;
+            machoCapturePrint(
+                "macho-processor:     {s}: {d} / {d} / {d} / {d} last_result={d}{s}\n",
+                .{
+                    entry.nameText(),
+                    entry.attempts,
+                    entry.published,
+                    entry.refused_before_driver,
+                    entry.driver_failures,
+                    entry.last_result,
+                    if (lost != 0) "  <- the guest read an unwritten handle this many times" else "",
+                },
+            );
+        }
+    }
+
     fn createVulkanObject(self: *Forwarder, state: anytype, create_info: u64, output: u64, name: []const u8) u64 {
         self.noteCreateAttempt(name);
         if (output == 0 or state.guestMemory(output, 8) == null) {
@@ -4698,11 +7198,26 @@ pub const Forwarder = struct {
         {
             self.vulkan_resource_overflow +|= 1;
             self.noteCreateRefusedBeforeDriver(name);
-            machoCapturePrint(
-                "macho-processor: REAL {s} refused: Vulkan resource provenance table exhausted; no synthetic handle was issued\n",
-                .{name},
-            );
+            // Keep the complete count in the ledger, but do not turn a
+            // repeated guest create loop into a second performance problem by
+            // printing the same line for every failed attempt.
+            if (sparseVulkanSuccessLog(self.vulkan_resource_overflow)) {
+                const live = self.trackedResourceCount();
+                machoCapturePrint(
+                    "macho-processor: REAL {s} refused: Vulkan resource provenance table exhausted; live={d} free={d} capacity={d} overflow={d}; no synthetic handle was issued\n",
+                    .{ name, live, self.vulkan_resources.len - live, self.vulkan_resources.len, self.vulkan_resource_overflow },
+                );
+            }
             return vkErrorOutOfHostMemory();
+        }
+        if (self.real_vulkan.hasDevice()) {
+            if (self.availableVulkanMapSlots(name)) |available| {
+                if (available == 0) {
+                    self.noteVulkanMapCapacityRefusal(name, 1, available);
+                    self.noteCreateRefusedBeforeDriver(name);
+                    return vkErrorOutOfHostMemory();
+                }
+            }
         }
         const handle = self.nextVulkanObject();
         // Phase 1: create real Vulkan objects when the device is available.
@@ -4738,6 +7253,15 @@ pub const Forwarder = struct {
         }
         if (std.mem.eql(u8, name, "vkCreateImageView")) {
             self.trackImageView(state, handle, create_info);
+        } else if (std.mem.eql(u8, name, "vkCreateBufferView")) {
+            var info: marshal.BufferViewCreateInfo = undefined;
+            if (copyGuestValue(marshal.BufferViewCreateInfo, state, create_info, &info)) {
+                for (&self.tracked_buffer_views) |*view| {
+                    if (view.synthetic != 0) continue;
+                    view.* = .{ .synthetic = handle, .buffer = info.buffer, .format = info.format, .offset = info.offset, .range = info.range };
+                    break;
+                }
+            }
         } else if (std.mem.eql(u8, name, "vkCreateRenderPass")) {
             self.trackRenderPass(state, handle, create_info);
         } else if (std.mem.eql(u8, name, "vkCreateFramebuffer")) {
@@ -4762,13 +7286,13 @@ pub const Forwarder = struct {
                     if (self.real_vulkan.fn_ptrs.destroy_image) |destroy| destroy(device, real_image, null);
                     self.vulkan_real_objects_destroyed +|= 1;
                 }
-                HandleMap.remove(&self.real_vulkan.image_map, handle);
+                _ = self.releaseVulkanHandle(&self.real_vulkan.image_map, handle);
             } else if (std.mem.eql(u8, name, "vkCreateBuffer")) {
                 if (self.real_vulkan.realBuffer(handle)) |real_buffer| {
                     if (self.real_vulkan.fn_ptrs.destroy_buffer) |destroy| destroy(device, real_buffer, null);
                     self.vulkan_real_objects_destroyed +|= 1;
                 }
-                HandleMap.remove(&self.real_vulkan.buffer_map, handle);
+                _ = self.releaseVulkanHandle(&self.real_vulkan.buffer_map, handle);
             }
             self.noteCreateRefusedBeforeDriver(name);
             machoCapturePrint(
@@ -4875,6 +7399,37 @@ pub const Forwarder = struct {
     ) ?[]u8 {
         if (create_info == 0) return null;
         self.vulkan_scratch.reset();
+
+        // Generated Xenia SPIR-V is the one create-info whose pointed-to
+        // payload can legitimately exceed the inline marshalling arena. Read
+        // its size before the generic copy so all returned pointers can live
+        // in one stable backing store; growing after the root has been handed
+        // out would leave pCode pointing at the old buffer.
+        if (std.mem.eql(u8, name, "vkCreateShaderModule")) {
+            var shader_root: marshal.ShaderModuleCreateInfo = undefined;
+            if (!copyGuestValue(marshal.ShaderModuleCreateInfo, state, create_info, &shader_root)) return null;
+            const required = std.math.add(usize, @sizeOf(marshal.ShaderModuleCreateInfo), shader_root.code_size) catch {
+                self.vulkan_marshal_spill_failures +|= 1;
+                self.vulkan_marshal_refusals +|= 1;
+                return null;
+            };
+            if (required > marshal.scratch_bytes) {
+                self.vulkan_marshal_spill_reserves +|= 1;
+                if (!self.vulkan_scratch.reserve(required)) {
+                    self.vulkan_marshal_spill_failures +|= 1;
+                    self.vulkan_marshal_refusals +|= 1;
+                    if (self.vulkan_marshal_refusals <= 16) machoCapturePrint(
+                        "macho-processor: vulkan marshal refused {s}: scratch_exhausted required={d} capacity={d} max={d}\n",
+                        .{ name, required, self.vulkan_scratch.capacity(), marshal.max_spill_bytes },
+                    );
+                    return null;
+                }
+                self.vulkan_marshal_spill_peak_bytes = @max(
+                    self.vulkan_marshal_spill_peak_bytes,
+                    @as(u64, @intCast(self.vulkan_scratch.capacity())),
+                );
+            }
+        }
 
         // `VkSemaphoreTypeCreateInfo` is the one synchronization create
         // chain Xenia commonly uses.  The generic marshaller deliberately
@@ -5020,6 +7575,15 @@ pub const Forwarder = struct {
             }
             root.p_next = @ptrCast(@alignCast(list_bytes.ptr));
         }
+        if (imageReadbackAugmentable(root.usage, root.format, root.image_type, root.samples)) {
+            // The brightness ladder reads the images the presenter samples,
+            // which the guest creates without TRANSFER_SRC. The host image
+            // gains the bit; the guest's own view of its usage is unchanged
+            // and Metal's blit path accepts any colour texture, so nothing
+            // the guest does with the image can observe the difference.
+            root.usage |= abi.IMAGE_USAGE_TRANSFER_SRC_BIT;
+            self.vulkan_image_usage_augmented +|= 1;
+        }
         return root_bytes;
     }
 
@@ -5058,7 +7622,7 @@ pub const Forwarder = struct {
             const create_fn = self.real_vulkan.fn_ptrs.create_descriptor_update_template orelse return error.MissingFn;
             const result = create_fn(device, root, null, &real_template);
             if (result == abi.SUCCESS and real_template != 0) {
-                HandleMap.allocOrFind(&self.real_vulkan.descriptor_update_template_map, synthetic_handle, real_template);
+                _ = self.mapVulkanHandle(&self.real_vulkan.descriptor_update_template_map, synthetic_handle, real_template, "vkCreateDescriptorUpdateTemplate");
                 if (self.real_vulkan.descriptorUpdateTemplateIndex(synthetic_handle)) |record_index| {
                     const record = &self.real_vulkan.descriptor_update_template_records[record_index];
                     record.entry_count = @intCast(guest_root.descriptor_update_entry_count);
@@ -5103,7 +7667,7 @@ pub const Forwarder = struct {
             const create_fn = self.real_vulkan.fn_ptrs.create_pipeline_cache orelse return error.MissingFn;
             const result = create_fn(device, root, null, &real_cache);
             if (result == abi.SUCCESS and real_cache != 0) {
-                HandleMap.allocOrFind(&self.real_vulkan.pipeline_cache_map, synthetic_handle, real_cache);
+                _ = self.mapVulkanHandle(&self.real_vulkan.pipeline_cache_map, synthetic_handle, real_cache, "vkCreatePipelineCache");
                 self.vulkan_real_objects_created +|= 1;
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreatePipelineCache synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_cache });
             } else {
@@ -5121,7 +7685,7 @@ pub const Forwarder = struct {
             var real_image: abi.Image = 0;
             const result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_image);
             if (result == 0 and real_image != 0) {
-                HandleMap.allocOrFind(&self.real_vulkan.image_map, synthetic_handle, real_image);
+                _ = self.mapVulkanHandle(&self.real_vulkan.image_map, synthetic_handle, real_image, "vkCreateImage");
                 self.vulkan_real_objects_created +|= 1;
                 self.vulkan_tiers.note(.image_object, .real);
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreateImage synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_image });
@@ -5141,7 +7705,7 @@ pub const Forwarder = struct {
             var real_buffer: abi.Buffer = 0;
             const result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_buffer);
             if (result == 0 and real_buffer != 0) {
-                HandleMap.allocOrFind(&self.real_vulkan.buffer_map, synthetic_handle, real_buffer);
+                _ = self.mapVulkanHandle(&self.real_vulkan.buffer_map, synthetic_handle, real_buffer, "vkCreateBuffer");
                 self.vulkan_real_objects_created +|= 1;
                 self.vulkan_tiers.note(.buffer_object, .real);
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreateBuffer synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_buffer });
@@ -5161,7 +7725,7 @@ pub const Forwarder = struct {
             var real_sampler: u64 = 0;
             const result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_sampler);
             if (result == 0 and real_sampler != 0) {
-                HandleMap.allocOrFind(&self.real_vulkan.sampler_map, synthetic_handle, real_sampler);
+                _ = self.mapVulkanHandle(&self.real_vulkan.sampler_map, synthetic_handle, real_sampler, "vkCreateSampler");
                 self.vulkan_real_objects_created +|= 1;
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreateSampler synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_sampler });
             } else {
@@ -5180,7 +7744,7 @@ pub const Forwarder = struct {
             var real_module: u64 = 0;
             const result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_module);
             if (result == 0 and real_module != 0) {
-                HandleMap.allocOrFind(&self.real_vulkan.shader_module_map, synthetic_handle, real_module);
+                _ = self.mapVulkanHandle(&self.real_vulkan.shader_module_map, synthetic_handle, real_module, "vkCreateShaderModule");
                 self.vulkan_real_objects_created +|= 1;
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreateShaderModule synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_module });
             } else {
@@ -5199,7 +7763,7 @@ pub const Forwarder = struct {
             var real_rp: u64 = 0;
             const result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_rp);
             if (result == 0 and real_rp != 0) {
-                HandleMap.allocOrFind(&self.real_vulkan.render_pass_map, synthetic_handle, real_rp);
+                _ = self.mapVulkanHandle(&self.real_vulkan.render_pass_map, synthetic_handle, real_rp, "vkCreateRenderPass");
                 self.vulkan_real_objects_created +|= 1;
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreateRenderPass synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_rp });
             } else {
@@ -5218,7 +7782,7 @@ pub const Forwarder = struct {
             var real_fb: u64 = 0;
             const result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_fb);
             if (result == 0 and real_fb != 0) {
-                HandleMap.allocOrFind(&self.real_vulkan.framebuffer_map, synthetic_handle, real_fb);
+                _ = self.mapVulkanHandle(&self.real_vulkan.framebuffer_map, synthetic_handle, real_fb, "vkCreateFramebuffer");
                 self.vulkan_real_objects_created +|= 1;
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreateFramebuffer synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_fb });
             } else {
@@ -5237,7 +7801,7 @@ pub const Forwarder = struct {
             var real_layout: u64 = 0;
             const result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_layout);
             if (result == 0 and real_layout != 0) {
-                HandleMap.allocOrFind(&self.real_vulkan.descriptor_set_layout_map, synthetic_handle, real_layout);
+                _ = self.mapVulkanHandle(&self.real_vulkan.descriptor_set_layout_map, synthetic_handle, real_layout, "vkCreateDescriptorSetLayout");
                 self.vulkan_real_objects_created +|= 1;
                 self.vulkan_tiers.note(.descriptor_set_layout, .real);
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreateDescriptorSetLayout synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_layout });
@@ -5257,7 +7821,8 @@ pub const Forwarder = struct {
             var real_pl: u64 = 0;
             const result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_pl);
             if (result == 0 and real_pl != 0) {
-                HandleMap.allocOrFind(&self.real_vulkan.pipeline_layout_map, synthetic_handle, real_pl);
+                _ = self.mapVulkanHandle(&self.real_vulkan.pipeline_layout_map, synthetic_handle, real_pl, "vkCreatePipelineLayout");
+                self.rememberPipelineLayout(real_pl, info);
                 self.vulkan_real_objects_created +|= 1;
                 self.vulkan_tiers.note(.pipeline_layout, .real);
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreatePipelineLayout synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_pl });
@@ -5277,7 +7842,7 @@ pub const Forwarder = struct {
             var real_pool: u64 = 0;
             const result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_pool);
             if (result == 0 and real_pool != 0) {
-                HandleMap.allocOrFind(&self.real_vulkan.descriptor_pool_map, synthetic_handle, real_pool);
+                _ = self.mapVulkanHandle(&self.real_vulkan.descriptor_pool_map, synthetic_handle, real_pool, "vkCreateDescriptorPool");
                 self.vulkan_real_objects_created +|= 1;
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreateDescriptorPool synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_pool });
             } else {
@@ -5296,7 +7861,7 @@ pub const Forwarder = struct {
             var real_bv: u64 = 0;
             const result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_bv);
             if (result == 0 and real_bv != 0) {
-                HandleMap.allocOrFind(&self.real_vulkan.buffer_view_map, synthetic_handle, real_bv);
+                _ = self.mapVulkanHandle(&self.real_vulkan.buffer_view_map, synthetic_handle, real_bv, "vkCreateBufferView");
                 self.vulkan_real_objects_created +|= 1;
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreateBufferView synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_bv });
             } else {
@@ -5315,7 +7880,7 @@ pub const Forwarder = struct {
             var real_iv: u64 = 0;
             const result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_iv);
             if (result == 0 and real_iv != 0) {
-                HandleMap.allocOrFind(&self.real_vulkan.image_view_map, synthetic_handle, real_iv);
+                _ = self.mapVulkanHandle(&self.real_vulkan.image_view_map, synthetic_handle, real_iv, "vkCreateImageView");
                 self.vulkan_real_objects_created +|= 1;
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreateImageView synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_iv });
             } else {
@@ -5334,7 +7899,7 @@ pub const Forwarder = struct {
             var real_pool: u64 = 0;
             const result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_pool);
             if (result == 0 and real_pool != 0) {
-                HandleMap.allocOrFind(&self.real_vulkan.command_pool_map, synthetic_handle, real_pool);
+                _ = self.mapVulkanHandle(&self.real_vulkan.command_pool_map, synthetic_handle, real_pool, "vkCreateCommandPool");
                 self.vulkan_real_objects_created +|= 1;
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreateCommandPool synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_pool });
             } else {
@@ -5353,7 +7918,7 @@ pub const Forwarder = struct {
             var real_fence: abi.Fence = 0;
             const result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_fence);
             if (result == 0 and real_fence != 0) {
-                HandleMap.allocOrFind(&self.real_vulkan.fence_map, synthetic_handle, real_fence);
+                _ = self.mapVulkanHandle(&self.real_vulkan.fence_map, synthetic_handle, real_fence, "vkCreateFence");
                 self.vulkan_real_objects_created +|= 1;
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreateFence synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_fence });
             } else {
@@ -5372,7 +7937,7 @@ pub const Forwarder = struct {
             var real_sem: abi.Semaphore = 0;
             const result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_sem);
             if (result == 0 and real_sem != 0) {
-                HandleMap.allocOrFind(&self.real_vulkan.semaphore_map, synthetic_handle, real_sem);
+                _ = self.mapVulkanHandle(&self.real_vulkan.semaphore_map, synthetic_handle, real_sem, "vkCreateSemaphore");
                 self.vulkan_real_objects_created +|= 1;
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreateSemaphore synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_sem });
             } else {
@@ -5387,7 +7952,7 @@ pub const Forwarder = struct {
             var real_pool: abi.QueryPool = 0;
             const result = create_fn(device, &guest_info, null, &real_pool);
             if (result == abi.SUCCESS and real_pool != 0) {
-                HandleMap.allocOrFind(&self.real_vulkan.query_pool_map, synthetic_handle, real_pool);
+                _ = self.mapVulkanHandle(&self.real_vulkan.query_pool_map, synthetic_handle, real_pool, "vkCreateQueryPool");
                 self.vulkan_real_objects_created +|= 1;
                 self.vulkan_tiers.note(.command_recording, .real);
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreateQueryPool synthetic=0x{x} real=0x{x} type={d} count={d}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_pool, guest_info.query_type, guest_info.query_count });
@@ -5396,6 +7961,32 @@ pub const Forwarder = struct {
                 self.real_create_result = if (result != abi.SUCCESS) result else abi.ERROR_INITIALIZATION_FAILED;
             }
         }
+    }
+
+    fn trackedResourceCount(self: *const Forwarder) usize {
+        var count: usize = 0;
+        for (self.vulkan_resources) |record| {
+            if (record.handle != 0) count += 1;
+        }
+        return count;
+    }
+
+    fn freeResourceSlotCount(self: *const Forwarder) usize {
+        return self.vulkan_resources.len - self.trackedResourceCount();
+    }
+
+    fn noteResourceRecordCommitted(self: *Forwarder, was_empty: bool) void {
+        if (!was_empty) return;
+        self.vulkan_resource_records_committed +|= 1;
+        const live = self.trackedResourceCount();
+        self.vulkan_resource_high_water = @max(self.vulkan_resource_high_water, @as(u64, @intCast(live)));
+    }
+
+    fn releaseResource(self: *Forwarder, handle: u64) bool {
+        const record = self.findResource(handle) orelse return false;
+        record.* = .{};
+        self.vulkan_resource_records_released +|= 1;
+        return true;
     }
 
     fn trackedImageCount(self: *const Forwarder) u64 {
@@ -5407,21 +7998,18 @@ pub const Forwarder = struct {
     }
 
     fn resourceSlot(self: *Forwarder, handle: u64) ?*VulkanResource {
+        var free: ?*VulkanResource = null;
         for (&self.vulkan_resources) |*record| {
             if (record.handle == handle) return record;
+            if (record.handle == 0 and free == null) free = record;
         }
-        for (&self.vulkan_resources) |*record| {
-            if (record.handle == 0) return record;
-        }
+        if (free) |record| return record;
         self.vulkan_resource_overflow +|= 1;
         return null;
     }
 
     fn resourceSlotAvailable(self: *const Forwarder) bool {
-        for (self.vulkan_resources) |record| {
-            if (record.handle == 0) return true;
-        }
-        return false;
+        return self.freeResourceSlotCount() != 0;
     }
 
     fn findResource(self: *Forwarder, handle: u64) ?*VulkanResource {
@@ -5435,6 +8023,7 @@ pub const Forwarder = struct {
     fn recordImage(self: *Forwarder, state: anytype, handle: u64, create_info: u64) bool {
         if (create_info == 0 or state.guestMemoryConst(create_info, VK_IMAGE_CREATE_INFO_SIZE) == null) return false;
         const record = self.resourceSlot(handle) orelse return false;
+        const was_empty = record.handle == 0;
         const format = state.read32(create_info + VK_IMAGE_CREATE_INFO_FORMAT_OFFSET);
         const width = state.read32(create_info + VK_IMAGE_CREATE_INFO_EXTENT_OFFSET);
         const height = state.read32(create_info + VK_IMAGE_CREATE_INFO_EXTENT_OFFSET + 4);
@@ -5454,18 +8043,21 @@ pub const Forwarder = struct {
             .row_pitch_bytes = row_pitch,
             .size_bytes = size_bytes,
         };
+        self.noteResourceRecordCommitted(was_empty);
         return true;
     }
 
     fn recordBuffer(self: *Forwarder, state: anytype, handle: u64, create_info: u64) bool {
         if (create_info == 0 or state.guestMemoryConst(create_info, VK_BUFFER_CREATE_INFO_SIZE) == null) return false;
         const record = self.resourceSlot(handle) orelse return false;
+        const was_empty = record.handle == 0;
         record.* = .{
             .handle = handle,
             .kind = .buffer,
             .usage = state.read32(create_info + VK_BUFFER_CREATE_INFO_USAGE_OFFSET),
             .size_bytes = state.read64(create_info + VK_BUFFER_CREATE_INFO_SIZE_OFFSET),
         };
+        self.noteResourceRecordCommitted(was_empty);
         return true;
     }
 
@@ -5818,38 +8410,31 @@ pub const Forwarder = struct {
             .{ self.vulkan_device_void_calls, self.guest_opaque_calls, self.vulkan_memory_allocations, self.vulkan_memory_maps, self.vulkan_queue_submits, self.vulkan_fence_only_queue_submits, self.vulkan_real_queue_submits, self.vulkan_presents, self.vulkan_real_presents, self.vulkan_real_present_completions, self.vulkan_modeled_command_calls, self.vulkan_real_command_calls, self.vulkan_real_objects_created, self.vulkan_real_objects_destroyed, self.vulkan_shadow_uploads, self.vulkan_shadow_upload_failures, self.vulkan_fence_completions, self.vulkan_device_lost_events, self.vulkan_pipeline_cache_loads, self.vulkan_pipeline_cache_saves },
         );
         machoCapturePrint(
+            "macho-processor:   marshal_scratch: capacity={d} used={d} spill_reserves={d} peak_bytes={d} spill_failures={d} refusals={d}; shader/module arrays are kept intact or refused, never truncated\n",
+            .{ self.vulkan_scratch.capacity(), self.vulkan_scratch.used, self.vulkan_marshal_spill_reserves, self.vulkan_marshal_spill_peak_bytes, self.vulkan_marshal_spill_failures, self.vulkan_marshal_refusals },
+        );
+        machoCapturePrint(
             "macho-processor:   success_samples: guest_object_publications={d} memory_bindings={d} command_buffer_alloc_calls={d} descriptor_set_alloc_calls={d} synthetic_object_batches={d}\n",
             .{ self.vulkan_guest_object_publications, self.vulkan_memory_bindings, self.vulkan_command_buffer_allocations, self.vulkan_descriptor_set_allocations, self.vulkan_synthetic_object_batches },
         );
+        self.logVulkanHandleMapState();
         machoCapturePrint(
             "macho-processor:   command_shape: render_begin={d} render_end={d} draw={d} dispatch={d} clear={d} copy_or_resolve={d} other={d} loadop_clear_writes={d} write_marks={d} content_marks={d} target_submissions={d}\n",
             .{ self.vulkan_command_render_begin_calls, self.vulkan_command_render_end_calls, self.vulkan_command_draw_calls, self.vulkan_command_dispatch_calls, self.vulkan_command_clear_calls, self.vulkan_command_copy_calls, self.vulkan_command_other_calls, self.vulkan_render_pass_load_clear_calls, self.vulkan_command_write_marks, self.vulkan_command_content_marks, self.vulkan_target_submission_events },
         );
         machoCapturePrint(
+            "macho-processor:   graphics_state_trace: enabled={} draws={d} push_constants={d} printed={d} missing_viewport={d} missing_scissor={d} bad_viewport={d} bad_scissor={d} rect_candidates={d} rect_non_candidates={d} bad_rect={d} topology_mismatch={d} unknown_pipeline={d} pipeline_overflow={d}\n",
+            .{ self.graphics_state_trace_enabled, self.graphics_state_trace_draws, self.graphics_state_trace_push_constants, self.graphics_state_trace_printed, self.graphics_state_trace_missing_viewport, self.graphics_state_trace_missing_scissor, self.graphics_state_trace_bad_viewport, self.graphics_state_trace_bad_scissor, self.graphics_state_trace_rect_candidates, self.graphics_state_trace_rect_non_candidates, self.graphics_state_trace_bad_rect, self.graphics_state_trace_topology_mismatch, self.graphics_state_trace_unknown_pipeline, self.graphics_state_trace_pipeline_overflow },
+        );
+        machoCapturePrint(
+            "macho-processor:   graphics_topology_repair: enabled={} candidates={d} pipeline_twins={d} twin_failures={d} draws_repaired={d} bind_failures={d}; only the Xenia 4-vertex rectangle contract can select the triangle-strip twin\n",
+            .{ self.guest_output_topology_repair_enabled, self.graphics_topology_repair_candidates, self.graphics_topology_repair_pipeline_creations, self.graphics_topology_repair_create_failures, self.graphics_topology_repairs, self.graphics_topology_repair_bind_failures },
+        );
+        machoCapturePrint(
             "macho-processor:   queues: graphics={} compute={} transfer={}\n",
             .{ self.real_vulkan.graphics_queue != null, self.real_vulkan.compute_queue != null, self.real_vulkan.transfer_queue != null },
         );
-        if (self.vulkan_create_ledger_count != 0) {
-            machoCapturePrint(
-                "macho-processor:   create_ledger: entry_points={d} overflow={d} (attempts / published / refused-before-driver / driver-failures)\n",
-                .{ self.vulkan_create_ledger_count, self.vulkan_create_ledger_overflow },
-            );
-            for (self.vulkan_create_ledger[0..self.vulkan_create_ledger_count]) |entry| {
-                const lost = entry.attempts -| entry.published;
-                machoCapturePrint(
-                    "macho-processor:     {s}: {d} / {d} / {d} / {d} last_result={d}{s}\n",
-                    .{
-                        entry.nameText(),
-                        entry.attempts,
-                        entry.published,
-                        entry.refused_before_driver,
-                        entry.driver_failures,
-                        entry.last_result,
-                        if (lost != 0) "  <- the guest read an unwritten handle this many times" else "",
-                    },
-                );
-            }
-        }
+        if (self.vulkan_create_ledger_count != 0) self.dumpVulkanCreateLedger();
         machoCapturePrint(
             "macho-processor:   memory_records: max={d}\n",
             .{MAX_VULKAN_MEMORY_ALLOCATIONS},
@@ -5937,7 +8522,13 @@ pub const Forwarder = struct {
             }
             native_queue = @intFromPtr(real_queue.?);
             queue = native_queue;
-            HandleMap.allocOrFind(&self.real_vulkan.queue_map, queue, queue);
+            _ = self.mapVulkanHandle(&self.real_vulkan.queue_map, queue, queue, "vkGetDeviceQueue");
+            for (self.real_vulkan.queue_map, 0..) |mapping, index| {
+                if (mapping.real == queue and mapping.synthetic != 0) {
+                    self.real_vulkan.queue_family_indices[index] = family_index;
+                    break;
+                }
+            }
             if (self.real_vulkan.graphics_queue == null) {
                 self.real_vulkan.graphics_queue = real_queue;
                 self.real_vulkan.graphics_queue_family_index = family_index;
@@ -6249,7 +8840,14 @@ pub const Forwarder = struct {
         const pool = self.real_vulkan.realDescriptorPool(synthetic_pool) orelse return @as(u32, @bitCast(abi.ERROR_FEATURE_NOT_PRESENT));
         const reset = self.real_vulkan.fn_ptrs.reset_descriptor_pool orelse return @as(u32, @bitCast(abi.ERROR_FEATURE_NOT_PRESENT));
         const result = reset(self.real_vulkan.device orelse return vkErrorInitializationFailed(), pool, @truncate(state.regs.rdx));
-        if (result == abi.SUCCESS) self.vulkan_tiers.note(.descriptor_set, .real);
+        if (result == abi.SUCCESS) {
+            // vkResetDescriptorPool invalidates every set from the pool.  The
+            // old path cleared only the optional provenance records, leaving
+            // the real-handle map occupied forever until the process hit its
+            // fixed capacity on a later allocation.
+            _ = self.reclaimDescriptorSetsForPool(synthetic_pool, "reset");
+            self.vulkan_tiers.note(.descriptor_set, .real);
+        }
         return @as(u32, @bitCast(result));
     }
 
@@ -6338,11 +8936,12 @@ pub const Forwarder = struct {
         return abi.SUCCESS;
     }
 
-    fn deviceWaitIdle(self: *Forwarder, _: anytype) u64 {
+    fn deviceWaitIdle(self: *Forwarder, state: anytype) u64 {
         if (self.realDeviceLostResult()) |result| return result;
         const wait = self.real_vulkan.fn_ptrs.device_wait_idle orelse return 0;
         const result = wait(self.real_vulkan.device orelse return 0);
         self.noteRealVulkanResult(result, "vkDeviceWaitIdle");
+        if (result == abi.SUCCESS) self.downloadCoherentShadowsAfterCompletion(state);
         return @as(u32, @bitCast(result));
     }
 
@@ -6352,6 +8951,8 @@ pub const Forwarder = struct {
         const queue = self.real_vulkan.realQueue(state.regs.rdi) orelse return @as(u32, @bitCast(abi.ERROR_INITIALIZATION_FAILED));
         const result = wait(queue);
         self.noteRealVulkanResult(result, "vkQueueWaitIdle");
+        // Another queue may still own writes to an unrelated shadow. Native
+        // PE aliases need no CPU copy; do not claim all memory completed here.
         return @as(u32, @bitCast(result));
     }
 
@@ -6370,15 +8971,76 @@ pub const Forwarder = struct {
         if (size == 0) return true;
         const length: usize = @intCast(size);
         const host_bytes: []u8 = @as([*]u8, @ptrCast(host_ptr))[host_offset..][0..length];
+        // The PE path exposes these very same driver bytes. In particular,
+        // never issue overlapping memcpy or apply a shadow-difference policy
+        // to coherent native aliases.
+        if (record.native_alias_base != 0) return true;
         const guest_address = std.math.add(u64, record.mapped_base, offset) catch return false;
         if (to_host) {
             const guest = state.guestMemoryConst(guest_address, size) orelse return false;
             @memcpy(host_bytes, guest[0..length]);
+            if (record.shadow_baseline) |baseline| @memcpy(baseline[host_offset..][0..length], guest[0..length]);
+            self.vulkan_shadow_upload_bytes +|= size;
         } else {
             const guest = state.guestMemory(guest_address, size) orelse return false;
             @memcpy(guest[0..length], host_bytes);
+            if (record.shadow_baseline) |baseline| @memcpy(baseline[host_offset..][0..length], host_bytes);
         }
         return true;
+    }
+
+    fn publishCoherentShadow(self: *Forwarder, state: anytype, record: *VulkanMemoryAllocation) bool {
+        if (record.native_alias_base != 0) return true;
+        if (record.memory_flags_known and (record.memory_flags & abi.MEMORY_PROPERTY_HOST_COHERENT_BIT) == 0) return true;
+        const baseline = record.shadow_baseline orelse return self.copyMappedBytes(state, record.handle, record.mapped_offset, record.host_mapped_size, true);
+        const address = std.math.add(u64, record.mapped_base, record.mapped_offset) catch return false;
+        const guest = state.guestMemoryConst(address, record.host_mapped_size) orelse return false;
+        if (guest.len < baseline.len or record.host_mapped_ptr == null) return false;
+        if (std.mem.eql(u8, guest[0..baseline.len], baseline)) {
+            self.vulkan_shadow_unchanged +|= 1;
+            return true;
+        }
+        const host: []u8 = @as([*]u8, @ptrCast(record.host_mapped_ptr.?))[0..baseline.len];
+        // Publish ONLY bytes changed by the guest. An unchanged shadow is not
+        // an instruction to erase newer GPU-produced data in native memory.
+        var start: usize = 0;
+        while (start < baseline.len) : (start += 4096) {
+            const end = @min(start + 4096, baseline.len);
+            if (std.mem.eql(u8, guest[start..end], baseline[start..end])) continue;
+            if (std.mem.eql(u8, host[start..end], baseline[start..end])) {
+                // No GPU change in this chunk: vectorized copies are safe.
+                @memcpy(host[start..end], guest[start..end]);
+                @memcpy(baseline[start..end], guest[start..end]);
+                self.vulkan_shadow_upload_bytes +|= end - start;
+                continue;
+            }
+            for (guest[start..end], baseline[start..end], start..) |byte, previous, index| {
+                if (byte == previous) continue;
+                host[index] = byte;
+                baseline[index] = byte;
+                self.vulkan_shadow_upload_bytes +|= 1;
+            }
+        }
+        return true;
+    }
+
+    fn downloadCoherentShadowsAfterCompletion(self: *Forwarder, state: anytype) void {
+        for (&self.vulkan_memory_records) |*record| {
+            if (record.native_alias_base != 0) continue;
+            if (!record.memory_flags_known or (record.memory_flags & abi.MEMORY_PROPERTY_HOST_COHERENT_BIT) == 0 or record.host_mapped_ptr == null) continue;
+            const baseline = record.shadow_baseline orelse continue;
+            const address = std.math.add(u64, record.mapped_base, record.mapped_offset) catch continue;
+            const guest = state.guestMemory(address, record.host_mapped_size) orelse continue;
+            if (guest.len < baseline.len) continue;
+            const host = @as([*]const u8, @ptrCast(record.host_mapped_ptr.?))[0..baseline.len];
+            // Three-way merge: GPU changes become CPU-visible after completion,
+            // while new CPU writes for future submissions remain pending.
+            for (baseline, 0..) |previous, index| {
+                if (guest[index] != previous) continue;
+                guest[index] = host[index];
+                baseline[index] = host[index];
+            }
+        }
     }
 
     /// Guest mappings are Rosette-owned shadow windows, not the pointer the
@@ -6387,9 +9049,15 @@ pub const Forwarder = struct {
     /// `vkFlushMappedMemoryRanges` alone loses titles that correctly omit a
     /// flush for HOST_COHERENT allocations.
     fn uploadMappedMemoryBeforeSubmit(self: *Forwarder, state: anytype) bool {
-        for (self.vulkan_memory_records) |record| {
+        const started = transport_timing.nowNs();
+        defer self.transport_cost.finish(.shadow_upload, started);
+        for (&self.vulkan_memory_records) |*record| {
+            if (record.native_alias_base != 0) continue;
             if (record.handle == 0 or record.host_mapped_ptr == null or record.host_mapped_size == 0) continue;
-            if (!self.copyMappedBytes(state, record.handle, record.mapped_offset, record.host_mapped_size, true)) {
+            // Noncoherent writes are published by explicit flush, not by a
+            // submit implicitly flushing ranges the guest never flushed.
+            if (record.memory_flags_known and (record.memory_flags & abi.MEMORY_PROPERTY_HOST_COHERENT_BIT) == 0) continue;
+            if (!self.publishCoherentShadow(state, record)) {
                 self.vulkan_shadow_upload_failures +|= 1;
                 return false;
             }
@@ -6400,7 +9068,8 @@ pub const Forwarder = struct {
 
     fn flushMappedMemoryRanges(self: *Forwarder, state: anytype) u64 {
         if (self.realDeviceLostResult()) |lost| return lost;
-        const count: u32 = @min(@as(u32, @truncate(state.regs.rsi)), 32);
+        const count: u32 = @truncate(state.regs.rsi);
+        if (count > 32) return @as(u32, @bitCast(abi.ERROR_FEATURE_NOT_PRESENT));
         if (count == 0) return abi.SUCCESS;
         if (state.regs.rdx == 0 or state.guestMemoryConst(state.regs.rdx, @as(u64, count) * @sizeOf(abi.MappedMemoryRange)) == null) return vkErrorInitializationFailed();
         var ranges: [32]abi.MappedMemoryRange = [_]abi.MappedMemoryRange{.{}} ** 32;
@@ -6412,7 +9081,7 @@ pub const Forwarder = struct {
             if (!self.copyMappedBytes(state, memory, offset, size, true)) return vkErrorInitializationFailed();
             ranges[index] = .{ .memory = self.real_vulkan.realMemory(memory) orelse return vkErrorInitializationFailed(), .offset = offset, .size = size };
         }
-        const flush = self.real_vulkan.fn_ptrs.flush_mapped_memory_ranges orelse return 0;
+        const flush = self.real_vulkan.fn_ptrs.flush_mapped_memory_ranges orelse return @as(u32, @bitCast(abi.ERROR_FEATURE_NOT_PRESENT));
         const result = flush(self.real_vulkan.device.?, count, &ranges);
         self.noteRealVulkanResult(result, "vkFlushMappedMemoryRanges");
         return @as(u32, @bitCast(result));
@@ -6420,7 +9089,8 @@ pub const Forwarder = struct {
 
     fn invalidateMappedMemoryRanges(self: *Forwarder, state: anytype) u64 {
         if (self.realDeviceLostResult()) |lost| return lost;
-        const count: u32 = @min(@as(u32, @truncate(state.regs.rsi)), 32);
+        const count: u32 = @truncate(state.regs.rsi);
+        if (count > 32) return @as(u32, @bitCast(abi.ERROR_FEATURE_NOT_PRESENT));
         if (count == 0) return abi.SUCCESS;
         if (state.regs.rdx == 0 or state.guestMemoryConst(state.regs.rdx, @as(u64, count) * @sizeOf(abi.MappedMemoryRange)) == null) return vkErrorInitializationFailed();
         var ranges: [32]abi.MappedMemoryRange = [_]abi.MappedMemoryRange{.{}} ** 32;
@@ -6431,8 +9101,8 @@ pub const Forwarder = struct {
             const size = state.read64(address + 32);
             ranges[index] = .{ .memory = self.real_vulkan.realMemory(memory) orelse return vkErrorInitializationFailed(), .offset = offset, .size = size };
         }
-        const invalidate = self.real_vulkan.fn_ptrs.invalidate_mapped_memory_ranges;
-        const result = if (invalidate) |fn_ptr| fn_ptr(self.real_vulkan.device.?, count, &ranges) else abi.SUCCESS;
+        const invalidate = self.real_vulkan.fn_ptrs.invalidate_mapped_memory_ranges orelse return @as(u32, @bitCast(abi.ERROR_FEATURE_NOT_PRESENT));
+        const result = invalidate(self.real_vulkan.device.?, count, &ranges);
         self.noteRealVulkanResult(result, "vkInvalidateMappedMemoryRanges");
         if (result != abi.SUCCESS) return @as(u32, @bitCast(result));
         for (0..count) |index| {
@@ -6446,11 +9116,20 @@ pub const Forwarder = struct {
         if (self.realDeviceLostResult()) |result| return result;
         const memory = state.regs.rsi;
         if (self.findVulkanMemoryRecord(memory)) |record| {
+            if (comptime @hasDecl(@TypeOf(state.*), "releaseNativeMemory")) {
+                if (record.native_alias_base != 0) state.releaseNativeMemory(record.native_alias_base);
+            }
             if (record.host_mapped_ptr != null) {
+                if (!self.publishCoherentShadow(state, record)) {
+                    self.vulkan_shadow_upload_failures +|= 1;
+                    machoCapturePrint("macho-processor: SHADOW MEMORY FAILURE: operation=coherent_unmap memory=0x{x}; guest writes could not be published before native unmap\n", .{memory});
+                } else if (record.native_alias_base == 0 and (!record.memory_flags_known or (record.memory_flags & abi.MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0)) self.vulkan_shadow_unmap_uploads +|= 1;
                 if (self.real_vulkan.realMemory(memory)) |real_memory| {
                     if (self.real_vulkan.fn_ptrs.unmap_memory) |unmap| unmap(self.real_vulkan.device.?, real_memory);
                 }
             }
+            record.releaseBaseline();
+            record.native_alias_base = 0;
             // A Vulkan mapping is single-use until vkUnmapMemory. Clearing
             // every shadow-range field prevents a later map from returning a
             // stale guest pointer or from treating an old native range as
@@ -7828,32 +10507,361 @@ pub const Forwarder = struct {
     /// that does not link the Objective-C bridge still compiles and simply
     /// reports the window facts as unavailable.
     fn describeHostWindow() ?rosette_gpu.WindowGeometry {
-        const Resolver = struct {
-            var describe: ?*const fn (*rosette_gpu.WindowGeometry) callconv(.c) c_int = null;
-            var resolved: bool = false;
-        };
-        if (!Resolver.resolved) {
-            Resolver.resolved = true;
-            // RTLD_DEFAULT searches every image already loaded in this
-            // process, which is where the bridge lives when it is linked.
-            const rtld_default: *anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -2))));
-            if (dlsym(rtld_default, "rosette_macho_native_window_describe")) |address| {
-                Resolver.describe = @ptrCast(@alignCast(address));
-            }
-        }
-        const describe = Resolver.describe orelse return null;
+        HostWindowDescribeResolver.resolve();
+        const describe = HostWindowDescribeResolver.describe orelse return null;
         var geometry: rosette_gpu.WindowGeometry = .{};
         if (describe(&geometry) == 0) return null;
         return geometry;
+    }
+
+    /// Convert a floating-point AppKit dimension into the integer pixel
+    /// dimension used by the Vulkan swapchain contract.  The geometry bridge
+    /// is deliberately allowed to expose fractional points, but a zero or
+    /// negative value must remain zero rather than wrapping into a huge
+    /// unsigned extent in the screen-validity report.
+    fn screenExtentDimension(value: f64) u32 {
+        if (!(value > 0.0)) return 0;
+        if (value >= @as(f64, @floatFromInt(std.math.maxInt(u32)))) return std.math.maxInt(u32);
+        return @intFromFloat(value);
+    }
+
+    fn screenValidityPixelEvidence(evidence: rosette_gpu.PresentPixelEvidence) rosette_gpu.ScreenValidityPixelEvidence {
+        return switch (evidence) {
+            .unprobed => .unknown,
+            .unavailable => .unavailable,
+            .solid_clear => .solid_clear,
+            .uniform_colour => .uniform_colour,
+            .nonzero_static => .nonzero_static,
+            .changing => .changing,
+        };
+    }
+
+    fn screenValiditySnapshot(
+        self: *const Forwarder,
+        window: ?rosette_gpu.WindowGeometry,
+    ) rosette_gpu.ScreenValiditySnapshot {
+        const chain = &self.present_chain;
+        var guest_presents: u64 = 0;
+        var guest_acquires: u64 = 0;
+        var guest_present_failures: u64 = 0;
+        var presents_with_target: u64 = 0;
+        var presents_with_content: u64 = 0;
+        var presents_clear_only: u64 = 0;
+        var presents_without_target: u64 = 0;
+        var presents_without_write: u64 = 0;
+        var presents_with_sampled_source: u64 = 0;
+        var presents_with_propagated_transfer: u64 = 0;
+        var presents_with_buffer_upload: u64 = 0;
+        var presents_with_unresolved_source: u64 = 0;
+        var expected_width: u32 = 0;
+        var expected_height: u32 = 0;
+        var selected_guest_presents: u64 = 0;
+        var latest_pixel_frame: u64 = 0;
+        var latest_pixel = rosette_gpu.ScreenValidityPixelEvidence.unknown;
+        var latest_pixel_uniform: u32 = 0;
+        var latest_pixel_hash: u64 = 0;
+        var latest_pixel_image: u64 = 0;
+        var latest_pixel_was_content = false;
+        var latest_content_pixel_frame: u64 = 0;
+        var latest_content_pixel = rosette_gpu.ScreenValidityPixelEvidence.unknown;
+        var latest_content_pixel_uniform: u32 = 0;
+        var latest_content_pixel_hash: u64 = 0;
+        var latest_content_pixel_image: u64 = 0;
+
+        // Rosette's diagnostic presenter can have its own retired history.
+        // Only guest-owned records are allowed to satisfy the guest screen
+        // contract; otherwise a diagnostic frame could make a missing guest
+        // write look valid.
+        for (chain.swapchains[0..chain.swapchain_count]) |record| {
+            if (record.owner != .guest) continue;
+            guest_presents +|= record.presents;
+            guest_acquires +|= record.acquires;
+            guest_present_failures +|= record.present_failures;
+            presents_with_target +|= record.presents_with_target;
+            presents_with_content +|= record.presents_with_content;
+            presents_clear_only +|= record.presents_clear_only;
+            presents_without_target +|= record.presents_without_target;
+            presents_without_write +|= record.presents_without_write;
+            presents_with_sampled_source +|= record.presents_with_sampled_source;
+            presents_with_propagated_transfer +|= record.presents_with_propagated_transfer;
+            presents_with_buffer_upload +|= record.presents_with_buffer_upload;
+            presents_with_unresolved_source +|= record.presents_with_unresolved_source;
+            if (record.width != 0 and record.height != 0 and
+                (expected_width == 0 or record.presents >= selected_guest_presents))
+            {
+                expected_width = record.width;
+                expected_height = record.height;
+                selected_guest_presents = record.presents;
+            }
+            if (record.pixel_probe_frame >= latest_pixel_frame and record.pixel_probe_frame != 0) {
+                latest_pixel_frame = record.pixel_probe_frame;
+                latest_pixel = screenValidityPixelEvidence(record.pixel_evidence);
+                latest_pixel_uniform = record.pixel_uniform_value;
+                latest_pixel_hash = record.pixel_hash;
+                latest_pixel_image = record.pixel_probe_image;
+                latest_pixel_was_content = record.pixel_probe_write_kind == .content;
+            }
+            if (record.pixel_content_probe_frame >= latest_content_pixel_frame and record.pixel_content_probe_frame != 0) {
+                latest_content_pixel_frame = record.pixel_content_probe_frame;
+                latest_content_pixel = screenValidityPixelEvidence(record.pixel_content_probe_evidence);
+                latest_content_pixel_uniform = record.pixel_content_probe_uniform_value;
+                latest_content_pixel_hash = record.pixel_content_probe_hash;
+                latest_content_pixel_image = record.pixel_content_probe_image;
+            }
+        }
+        // A later periodic sample can legitimately land on a clear-only
+        // image. Once a title has presented content, the screen verdict must
+        // stay anchored to the newest sample that was captured from a
+        // content-marked acquired image, not silently regress to that clear.
+        if (latest_content_pixel_frame != 0 and presents_with_content != 0) {
+            latest_pixel_frame = latest_content_pixel_frame;
+            latest_pixel = latest_content_pixel;
+            latest_pixel_uniform = latest_content_pixel_uniform;
+            latest_pixel_hash = latest_content_pixel_hash;
+            latest_pixel_image = latest_content_pixel_image;
+            latest_pixel_was_content = true;
+        }
+        if (expected_width == 0 or expected_height == 0) {
+            expected_width = self.graphics_extent_requested_width;
+            expected_height = self.graphics_extent_requested_height;
+        }
+
+        var snapshot = rosette_gpu.ScreenValiditySnapshot{
+            .step = self.guest_progress_steps,
+            .guest_presents = guest_presents,
+            .guest_acquires = guest_acquires,
+            .guest_present_failures = guest_present_failures,
+            .presents_with_target = presents_with_target,
+            .presents_with_content = presents_with_content,
+            .presents_clear_only = presents_clear_only,
+            .presents_without_target = presents_without_target,
+            .presents_without_write = presents_without_write,
+            .presents_with_sampled_source = presents_with_sampled_source,
+            .presents_with_propagated_transfer = presents_with_propagated_transfer,
+            .presents_with_buffer_upload = presents_with_buffer_upload,
+            .presents_with_unresolved_source = presents_with_unresolved_source,
+            .content_commands = self.vulkan_command_content_marks,
+            .draw_commands = self.vulkan_command_draw_calls,
+            .dispatch_commands = self.vulkan_command_dispatch_calls,
+            .target_resolved = self.target_attribution_events,
+            .target_offscreen = self.target_offscreen_events,
+            .target_unknown = self.target_unknown_events,
+            .target_overflow = self.target_overflow_events,
+            .descriptor_image_infos = self.vulkan_descriptor_image_infos_observed,
+            .descriptor_sampled_images = self.vulkan_descriptor_sampled_images_recorded,
+            .descriptor_unknown_image_views = self.vulkan_descriptor_unknown_image_views,
+            .descriptor_sets_unknown = self.vulkan_descriptor_sets_unknown,
+            .resource_transfer_events = chain.resource_transfer_events,
+            .resource_buffer_to_image = chain.resource_transfer_kind_counts[@intFromEnum(rosette_gpu.PresentTransferKind.buffer_to_image)],
+            .resource_transfer_sources_resolved = chain.resource_transfer_resolved,
+            .resource_transfer_sources_unresolved = chain.resource_transfer_unresolved,
+            .resource_graph_overflow = chain.resource_image_overflow,
+            .native_present_requests = self.vulkan_real_presents,
+            .native_present_completions = self.vulkan_real_present_completions,
+            .native_queue_submits = self.vulkan_real_queue_submits,
+            .expected_width = expected_width,
+            .expected_height = expected_height,
+            .extent_contract_failed = self.graphics_extent_contract_failed or self.graphics_extent_contract_failures != 0,
+            .drawable_owner = switch (self.drawable_owner) {
+                .window_bridge => .window_bridge,
+                .native_presenter => .native_presenter,
+                .guest_swapchain => .guest_swapchain,
+            },
+            .live_swapchains = @intCast(chain.liveSwapchains()),
+            .contested_layer = chain.contestedLayer() != null,
+            .pixel_probe_attempts = self.pixel_probe.attempts,
+            .pixel_probe_successes = self.pixel_probe.successes,
+            .pixel_probe_failures = self.pixel_probe.failures,
+            .pixel_evidence = latest_pixel,
+            .pixel_uniform_value = latest_pixel_uniform,
+            .pixel_hash = latest_pixel_hash,
+            .pixel_sample_frame = latest_pixel_frame,
+            .pixel_sample_image = latest_pixel_image,
+            .pixel_sample_was_content = latest_pixel_was_content,
+        };
+
+        if (window) |facts| {
+            const user_visible = facts.window_visible != 0 and facts.window_on_screen != 0 and
+                facts.window_miniaturized == 0 and facts.view_hidden_or_ancestor == 0 and
+                facts.layer_hidden == 0 and facts.drawable_width > 0 and facts.drawable_height > 0;
+            snapshot.drawable_width = screenExtentDimension(facts.drawable_width);
+            snapshot.drawable_height = screenExtentDimension(facts.drawable_height);
+            snapshot.layer_width = screenExtentDimension(facts.layer_width);
+            snapshot.layer_height = screenExtentDimension(facts.layer_height);
+            snapshot.extent_observed = snapshot.drawable_width != 0 and snapshot.drawable_height != 0 and
+                snapshot.layer_width != 0 and snapshot.layer_height != 0;
+            snapshot.window_available = true;
+            snapshot.window_chain_intact = facts.firstBrokenLink() == null;
+            snapshot.window_user_visible = user_visible;
+            snapshot.window_visible_fraction_percent = facts.visibleFractionPercent();
+            snapshot.window_break_reason = facts.firstBrokenLink() orelse "";
+        } else {
+            snapshot.window_break_reason = hostWindowFactsUnavailableReason();
+        }
+        return snapshot;
+    }
+
+    fn observeScreenValidity(
+        self: *Forwarder,
+        window: ?rosette_gpu.WindowGeometry,
+    ) rosette_gpu.ScreenValidityEvaluation {
+        return self.screen_validity.observe(self.screenValiditySnapshot(window));
+    }
+
+    /// Print the final-mile contract separately from PRESENT CHAIN.  It is
+    /// intentionally verbose only on a state change or a full report, while
+    /// the compact header still says exactly which stage is actionable.
+    fn printScreenValidity(self: *const Forwarder) void {
+        const snapshot = if (self.screen_validity.wasObserved())
+            self.screen_validity.snapshot()
+        else
+            self.screenValiditySnapshot(describeHostWindow());
+        const evaluation = if (self.screen_validity.wasObserved())
+            self.screen_validity.evaluation()
+        else
+            rosette_gpu.screen_validity.evaluate(snapshot);
+        const first_stage = if (evaluation.first_blocking) |stage| stage.label() else "none";
+        const first_owner = if (evaluation.first_blocking) |stage| evaluation.record(stage).owner.label() else "none";
+        machoCapturePrint(
+            "macho-processor: SCREEN VALIDITY CHAIN: verdict={s} -- {s}\n",
+            .{ evaluation.verdict.label(), evaluation.verdict.action() },
+        );
+        machoCapturePrint(
+            "macho-processor: SCREEN VALIDITY CHAIN: satisfied={d}/{d} met={d} inferred={d} unmet={d} unknown={d} observations={d} transitions={d} first_blocking={s} owner={s} action={s}\n",
+            .{
+                evaluation.satisfiedCount(),
+                rosette_gpu.screen_validity.stage_count,
+                evaluation.metCount(),
+                evaluation.inferredCount(),
+                evaluation.unmetCount(),
+                evaluation.unknownCount(),
+                self.screen_validity.observations,
+                self.screen_validity.transitions,
+                first_stage,
+                first_owner,
+                evaluation.action(),
+            },
+        );
+        for (evaluation.records) |entry| {
+            machoCapturePrint(
+                "macho-processor: SCREEN VALIDITY CHAIN:   stage={s} owner={s} status={s} evidence={s} action={s}\n",
+                .{ entry.stage.label(), entry.owner.label(), entry.status.label(), entry.evidence, entry.action },
+            );
+        }
+        machoCapturePrint(
+            "macho-processor: SCREEN VALIDITY CHAIN:   transport guest_presents={d} acquires={d} target={d} content={d} clear_only={d} without_target={d} without_write={d} failures={d}; native_present(requests/completions)={d}/{d} queue_submits={d}\n",
+            .{
+                snapshot.guest_presents,
+                snapshot.guest_acquires,
+                snapshot.presents_with_target,
+                snapshot.presents_with_content,
+                snapshot.presents_clear_only,
+                snapshot.presents_without_target,
+                snapshot.presents_without_write,
+                snapshot.guest_present_failures,
+                snapshot.native_present_requests,
+                snapshot.native_present_completions,
+                snapshot.native_queue_submits,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: SCREEN VALIDITY CHAIN:   provenance sampled_source_presents={d} propagated_transfer_presents={d} buffer_upload_presents={d} unresolved_source_presents={d}; commands(content/draw/dispatch)={d}/{d}/{d} targets(resolved/offscreen/unknown/overflow)={d}/{d}/{d}/{d}\n",
+            .{
+                snapshot.presents_with_sampled_source,
+                snapshot.presents_with_propagated_transfer,
+                snapshot.presents_with_buffer_upload,
+                snapshot.presents_with_unresolved_source,
+                snapshot.content_commands,
+                snapshot.draw_commands,
+                snapshot.dispatch_commands,
+                snapshot.target_resolved,
+                snapshot.target_offscreen,
+                snapshot.target_unknown,
+                snapshot.target_overflow,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: SCREEN VALIDITY CHAIN:   descriptor image_infos={d} sampled_images={d} unknown_views={d} unknown_sets={d}; resource_transfers={d} buffer_to_image={d} sources_resolved={d} sources_unresolved={d} graph_overflow={d}\n",
+            .{
+                snapshot.descriptor_image_infos,
+                snapshot.descriptor_sampled_images,
+                snapshot.descriptor_unknown_image_views,
+                snapshot.descriptor_sets_unknown,
+                snapshot.resource_transfer_events,
+                snapshot.resource_buffer_to_image,
+                snapshot.resource_transfer_sources_resolved,
+                snapshot.resource_transfer_sources_unresolved,
+                snapshot.resource_graph_overflow,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: SCREEN VALIDITY CHAIN:   pixel probes(attempts/successes/failures)={d}/{d}/{d} selected_sample(frame/image/write)={d}/0x{x}/{s} evidence={s} uniform_value=0x{x} hash=0x{x}; extent expected={d}x{d} drawable={d}x{d} layer={d}x{d} observed={} contract_failed={} owner={s} live_swapchains={d} contested={}\n",
+            .{
+                snapshot.pixel_probe_attempts,
+                snapshot.pixel_probe_successes,
+                snapshot.pixel_probe_failures,
+                snapshot.pixel_sample_frame,
+                snapshot.pixel_sample_image,
+                if (snapshot.pixel_sample_was_content) "content" else "non_content_or_unknown",
+                snapshot.pixel_evidence.label(),
+                snapshot.pixel_uniform_value,
+                snapshot.pixel_hash,
+                snapshot.expected_width,
+                snapshot.expected_height,
+                snapshot.drawable_width,
+                snapshot.drawable_height,
+                snapshot.layer_width,
+                snapshot.layer_height,
+                snapshot.extent_observed,
+                snapshot.extent_contract_failed,
+                snapshot.drawable_owner.label(),
+                snapshot.live_swapchains,
+                snapshot.contested_layer,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: SCREEN VALIDITY CHAIN:   window available={} intact={} user_visible={} visible_fraction={d}% break={s}\n",
+            .{
+                snapshot.window_available,
+                snapshot.window_chain_intact,
+                snapshot.window_user_visible,
+                snapshot.window_visible_fraction_percent,
+                if (snapshot.window_break_reason.len != 0) snapshot.window_break_reason else "none",
+            },
+        );
+        if (snapshot.pixel_evidence.isUniform() and snapshot.presents_with_content != 0 and
+            snapshot.presents_with_sampled_source == 0 and
+            snapshot.presents_with_propagated_transfer == 0 and
+            snapshot.presents_with_buffer_upload == 0)
+        {
+            machoCapturePrint(
+                "macho-processor: SCREEN VALIDITY CHAIN:   ACTIONABLE PROVENANCE GAP: the acquired image was marked content, but no presented frame has a resolved sampled-image, image-transfer, or buffer-upload source; inspect the command's actual shader output, descriptor image view, image layout, and render-target write before changing the window\n",
+                .{},
+            );
+        }
+        if (evaluation.first_blocking) |stage| {
+            machoCapturePrint(
+                "macho-processor: SCREEN VALIDITY CHAIN:   FIRST BLOCKING STAGE: {s} owner={s}; {s}\n",
+                .{ stage.label(), evaluation.record(stage).owner.label(), evaluation.record(stage).action },
+            );
+        }
+    }
+
+    fn hostWindowFactsUnavailableReason() []const u8 {
+        HostWindowDescribeResolver.resolve();
+        if (HostWindowDescribeResolver.describe == null) {
+            return "the AppKit geometry callback is absent from this process image (the dlsym-only export was dead-stripped or the native bridge is not linked)";
+        }
+        return "the AppKit geometry callback is linked, but it reports no NSWindow yet";
     }
 
     /// The whole presentation chain: the host window as AppKit sees it, the
     /// Vulkan topology built on it, and the first link that cannot carry a
     /// frame.
     ///
-    /// A run whose chain is healthy prints this once and then goes quiet. A
-    /// run whose verdict changes prints the new one. `full` forces the
-    /// complete report, which is what the end-of-run summary wants.
+    /// State transitions get a full inventory; counters and pixel identities
+    /// get a wall-clock-bounded progress report. `full` always forces the
+    /// complete terminal snapshot. Neither policy changes guest execution.
     fn presentChainVerdict(self: *const Forwarder) rosette_gpu.PresentChainVerdict {
         if (self.present_chain_window_break) |window_break| {
             if (window_break != null) return .host_window_broken;
@@ -7880,6 +10888,26 @@ pub const Forwarder = struct {
         }
     }
 
+    /// Return only guest-owned frame evidence. Rosette's diagnostic presenter
+    /// may have retired swapchains in the same layer history; those must never
+    /// satisfy the guest frame contract.
+    pub fn guestFrameEvidence(self: *const Forwarder) GuestFrameEvidence {
+        var evidence = GuestFrameEvidence{
+            .native_present_requests = self.vulkan_real_presents,
+            .native_present_completions = self.vulkan_real_present_completions,
+            .native_queue_submits = self.vulkan_real_queue_submits,
+        };
+        for (self.present_chain.swapchains[0..self.present_chain.swapchain_count]) |record| {
+            if (record.owner != .guest) continue;
+            evidence.presents_with_target +|= record.presents_with_target;
+            evidence.presents_with_content +|= record.presents_with_content;
+            evidence.presents_clear_only +|= record.presents_clear_only;
+            evidence.presents_without_target +|= record.presents_without_target;
+            evidence.presents_without_write +|= record.presents_without_write;
+        }
+        return evidence;
+    }
+
     pub fn reportPresentChain(self: *Forwarder, full: bool) void {
         const chain = &self.present_chain;
         if (chain.isEmpty() and !full) return;
@@ -7889,19 +10917,210 @@ pub const Forwarder = struct {
         // puts a verdict at the top of every run log that is true, useless,
         // and indistinguishable in shape from the one that matters.
         if (chain.isEmpty() and self.vulkan_loader_lookup_unique == 0) return;
-        // AppKit is only read when the window state has not been sampled yet;
-        // the periodic refresh path invalidates the logged verdict when the
-        // state changes. This keeps the evidence truthful without putting a
-        // main-thread window query on every Vulkan present.
-        if (self.present_chain_window_break == null) {
+        self.configureGraphicsReports();
+        const now = transport_timing.nowNs();
+        // describeHostWindow dispatches to AppKit's main thread. Previously
+        // the unconditional screen observation below bypassed the intended
+        // sparse window refresh and paid that rendezvous on every present.
+        // Poll once per host second, and immediately at topology/full-report
+        // boundaries, while continuing to observe GPU counters every time.
+        const topology_changed = self.present_chain_verdict_logged != self.presentChainVerdict();
+        if (self.present_chain_window_poll.choose(now, topology_changed, false, full, false) != .none) {
             self.refreshPresentChainWindow();
         }
+        // SCREEN VALIDITY is a separate contract from PRESENT CHAIN. It must
+        // observe the same report boundary after the window refresh, but it
+        // is allowed to keep a uniform-pixel finding even when Vulkan's
+        // transport verdict remains healthy.
+        _ = self.observeScreenValidity(self.present_chain_window_facts);
         const verdict = self.presentChainVerdict();
         self.notePresentChainVerdict(verdict);
-        if (!full and self.present_chain_verdict_logged == verdict) return;
-        self.present_chain_verdict_logged = verdict;
+        const report_kind = self.chooseGraphicsReport(now, verdict, full);
+        if (report_kind == .none) return;
         self.present_chain_reports +|= 1;
+        if (report_kind == .progress) {
+            self.printGraphicsProgress(now, verdict);
+            self.screen_validity.markReported();
+            return;
+        }
+        machoCapturePrint("macho-processor: GRAPHICS REPORT: kind={s} full_reports={d} progress_reports={d} checks_coalesced={d} interval_ms={d} verbose={}; all forwarding/evidence counters are retained; verbosity never gates failures or GPU work\n", .{
+            if (full) "final_or_explicit" else if (self.graphics_report_verbose) "transition_or_verbose_sample" else "state_transition",
+            self.graphics_report_cadence.full_reports,
+            self.graphics_report_cadence.progress_reports,
+            self.graphics_report_cadence.coalesced_checks,
+            self.graphics_report_cadence.interval_ns / 1_000_000,
+            self.graphics_report_verbose,
+        });
         self.printPresentChainBody(verdict);
+        // Include successful creates too in the terminal snapshot: a guest
+        // shader warning with no bridge failure needs positive publication
+        // counts, not the absence of an anomaly-only log, to locate the gap.
+        if (full and self.vulkan_create_ledger_count != 0) self.dumpVulkanCreateLedger();
+        if (full or self.pixel_probe.successes != 0) {
+            const probe = &self.pixel_probe;
+            const stats = probe.capture_last_stats;
+            machoCapturePrint(
+                "macho-processor: FRAME CAPTURE SUMMARY: enabled={} preview={} calls={d} saved={d} previewed={d} failed={d} missing_callback={d} semaphore_handoffs={d} last_frame={d} pixels={d} visible_rgb_gt16={d} bright_rgb_gt64={d} alpha_lt255={d} rgb_different={d} mean_rgb={d}/{d}/{d}; capture is independent evidence, not a Vulkan present or recognizable-title proof\n",
+                .{ probe.capture_enabled, probe.preview_enabled, probe.capture_calls, probe.capture_saved, probe.capture_previewed, probe.capture_failures, probe.capture_missing, probe.readback_wait_handoffs, probe.capture_last_frame, stats.pixel_count, stats.visible_pixels, stats.bright_pixels, stats.transparent_pixels, stats.rgb_different_pixels, stats.mean(0), stats.mean(1), stats.mean(2) },
+            );
+            self.printTransportCosts();
+            const ladder = &self.brightness_ladder;
+            machoCapturePrint("macho-processor: IMAGE SIGNAL VERDICT: near_black={} raw_pixel_variation={} recognizable_title=unverified exposure_comparison={} preview_interval_ms={d} brightness_loss_stage={s}; healthy transport does not prove image brightness or shader correctness\n", .{ stats.pixel_count != 0 and stats.visible_pixels == 0, stats.rgb_different_pixels != 0, probe.exposure_enabled, probe.preview_interval_ns / 1_000_000, ladder.last_verdict.label() });
+            if (ladder.samples != 0 or self.vulkan_image_usage_augmented != 0) {
+                machoCapturePrint("macho-processor: BRIGHTNESS LADDER SUMMARY: samples={d} readbacks={d} readback_failures={d} verdicts(unknown/before_gamma_pass/gamma_pass/present_paint/none)={d}/{d}/{d}/{d}/{d} last_frame={d} last_peaks(swap_texture/guest_output/swapchain)={d}/{d}/{d} pass_source_edges={d} host_images_given_transfer_src={d}; {s}\n", .{ ladder.samples, ladder.readbacks, ladder.readback_failures, ladder.verdict_counts[0], ladder.verdict_counts[1], ladder.verdict_counts[2], ladder.verdict_counts[3], ladder.verdict_counts[4], ladder.last_frame, ladder.last_peaks[0], ladder.last_peaks[1], ladder.last_peaks[2], self.vulkan_pass_source_edges, self.vulkan_image_usage_augmented, ladder.last_verdict.meaning() });
+            }
+        }
+        self.printScreenValidity();
+        self.screen_validity.markReported();
+    }
+
+    /// Pure report admission, separately testable without AppKit or Xenia.
+    fn chooseGraphicsReport(self: *Forwarder, now: u64, verdict: rosette_gpu.PresentChainVerdict, full: bool) transport_timing.ReportKind {
+        const anomalies = self.graphicsReportAnomalyMask();
+        const semantic_changed = self.present_chain_verdict_logged != verdict or
+            self.screen_validity.semanticChangedSinceReport() or
+            self.graphics_report_anomalies != anomalies or
+            self.graphics_report_brightness != self.brightness_ladder.last_verdict or
+            self.graphics_report_picture_started != (self.picture_sequence.frames != 0);
+        const report_kind = self.graphics_report_cadence.choose(now, semantic_changed, self.screen_validity.changedSinceReport(), full, self.graphics_report_verbose);
+        if (report_kind == .none) return .none;
+        self.present_chain_verdict_logged = verdict;
+        self.graphics_report_anomalies = anomalies;
+        self.graphics_report_brightness = self.brightness_ladder.last_verdict;
+        self.graphics_report_picture_started = self.picture_sequence.frames != 0;
+        return report_kind;
+    }
+
+    fn configureGraphicsReports(self: *Forwarder) void {
+        if (self.graphics_report_configured) return;
+        self.graphics_report_configured = true;
+        if (std.c.getenv("ROSETTE_VULKAN_REPORT_VERBOSE")) |raw| {
+            const value = std.mem.span(raw);
+            self.graphics_report_verbose = std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true");
+        }
+        if (std.c.getenv("ROSETTE_VULKAN_REPORT_INTERVAL_MS")) |raw| {
+            const milliseconds = std.fmt.parseInt(u64, std.mem.span(raw), 10) catch 5000;
+            self.graphics_report_cadence.interval_ns = std.math.clamp(milliseconds, 250, 60_000) * 1_000_000;
+        }
+    }
+
+    /// First occurrence of each anomaly class gets an immediate full report;
+    /// repeated counts ride progress/final reports. The refusal/native-error
+    /// sites still print the actual new reason when it happens.
+    fn graphicsReportAnomalyMask(self: *const Forwarder) u64 {
+        const snapshot = self.screen_validity.snapshot();
+        const flags = [_]bool{
+            self.native_vulkan_failures != 0,
+            snapshot.guest_present_failures != 0,
+            self.pixel_probe.failures != 0,
+            self.pixel_probe.capture_failures != 0,
+            self.vulkan_descriptor_bind_admission.rejected != 0,
+            self.vulkan_shadow_upload_failures != 0,
+            self.brightness_ladder.readback_failures != 0,
+            snapshot.target_unknown != 0,
+            snapshot.target_overflow != 0,
+            snapshot.resource_graph_overflow != 0,
+            self.graphics_extent_contract_failed,
+        };
+        var mask: u64 = 0;
+        for (flags, 0..) |flag, bit| {
+            if (flag) mask |= @as(u64, 1) << @intCast(bit);
+        }
+        return mask;
+    }
+
+    fn guestPresentMode(self: *const Forwarder) ?u32 {
+        var mode: ?u32 = null;
+        var most_presents: u64 = 0;
+        for (self.present_chain.swapchains[0..self.present_chain.swapchain_count]) |record| {
+            if (record.owner != .guest or record.retired or record.presents < most_presents) continue;
+            most_presents = record.presents;
+            mode = record.present_mode;
+        }
+        return mode;
+    }
+
+    fn provenanceGapLabel(self: *const Forwarder) []const u8 {
+        return if (self.vulkan_command_draw_calls != 0 or self.vulkan_command_dispatch_calls != 0 or self.present_chain.totalPresentsWithContent() != 0)
+            "ACTIONABLE PROVENANCE GAP"
+        else
+            "STARTUP RESOURCE INVENTORY (no picture work observed)";
+    }
+
+    fn printGraphicsProgress(self: *const Forwarder, now: u64, verdict: rosette_gpu.PresentChainVerdict) void {
+        const snapshot = self.screen_validity.snapshot();
+        const evaluation = self.screen_validity.evaluation();
+        const first = if (evaluation.first_blocking) |stage| stage.label() else "none";
+        machoCapturePrint("macho-processor: GRAPHICS PROGRESS: transport={s} screen={s} first_blocking={s} presents={d} content={d} fills={d} missing(target/write)={d}/{d} native(requests/completions/failures)={d}/{d}/{d} checks_coalesced={d}; complete stage inventory on transitions and exit\n", .{
+            @tagName(verdict),                evaluation.verdict.label(),          first,                            snapshot.guest_presents,
+            snapshot.presents_with_content,   snapshot.presents_clear_only,        snapshot.presents_without_target, snapshot.presents_without_write,
+            snapshot.native_present_requests, snapshot.native_present_completions, self.native_vulkan_failures,      self.graphics_report_cadence.coalesced_checks,
+        });
+        self.printFrameRates(now);
+        self.printGraphicsPacing(now);
+        machoCapturePrint("macho-processor: GRAPHICS ROUTE: descriptors(updates/native_writes/binds_forwarded/binds_rejected)={d}/{d}/{d}/{d} presented_sources(sampled/transfer/upload/unresolved)={d}/{d}/{d}/{d} pixels={s} brightness_loss={s} peaks(source/output/swapchain)={d}/{d}/{d}; offscreen targets are intermediate work, not automatically lost pixels\n", .{
+            self.vulkan_descriptor_update_calls,             self.vulkan_descriptor_native_writes,
+            self.vulkan_descriptor_bind_admission.forwarded, self.vulkan_descriptor_bind_admission.rejected,
+            snapshot.presents_with_sampled_source,           snapshot.presents_with_propagated_transfer,
+            snapshot.presents_with_buffer_upload,            snapshot.presents_with_unresolved_source,
+            snapshot.pixel_evidence.label(),                 self.brightness_ladder.last_verdict.label(),
+            self.brightness_ladder.last_peaks[0],            self.brightness_ladder.last_peaks[1],
+            self.brightness_ladder.last_peaks[2],
+        });
+    }
+
+    fn printGraphicsPacing(self: *const Forwarder, now: u64) void {
+        const snapshot = self.screen_validity.snapshot();
+        const observed_mode = self.guestPresentMode();
+        const mode = observed_mode orelse std.math.maxInt(u32);
+        const completion = self.transport_cost.costs[@intFromEnum(transport_timing.Stage.present_completion)];
+        machoCapturePrint("macho-processor: GRAPHICS PACING: classification={s} guest_present_mode={d}/{s} live_guest_mode_observed={} last_content_age_ms={d} completion_wait(calls/mean_us/max_us)={d}/{d}/{d}; immediate mode has no vblank wait; presentation rate is not title/simulation FPS; guest mode and clocks unchanged\n", .{
+            transport_timing.pacingLabel(snapshot.guest_presents, snapshot.presents_with_content, snapshot.presents_clear_only, mode),
+            mode,
+            transport_timing.presentModeLabel(mode),
+            observed_mode != null,
+            if (self.transport_cost.last_content_ns == 0) 0 else (now -| self.transport_cost.last_content_ns) / 1_000_000,
+            completion.calls,
+            if (completion.calls == 0) 0 else completion.total_ns / completion.calls / 1_000,
+            completion.max_ns / 1_000,
+        });
+    }
+
+    fn printTransportCosts(self: *const Forwarder) void {
+        const timing = &self.transport_cost;
+        const now = transport_timing.nowNs();
+        self.printFrameRates(now);
+        self.printGraphicsPacing(now);
+        machoCapturePrint("macho-processor: FRAME HOST COST: present_intervals={d} total_ms={d} mean_ms={d} max_ms={d}; ingress-to-ingress includes guest execution, waits, and delivery, not just Vulkan\n", .{ timing.intervals.calls, timing.intervals.total_ns / 1_000_000, if (timing.intervals.calls == 0) 0 else timing.intervals.total_ns / timing.intervals.calls / 1_000_000, timing.intervals.max_ns / 1_000_000 });
+        inline for (std.enums.values(transport_timing.Stage)) |stage| {
+            const cost = timing.costs[@intFromEnum(stage)];
+            machoCapturePrint("macho-processor: FRAME HOST COST: stage={s} calls={d} total_us={d} max_us={d}; readback and deferred cpu_capture are separately timed; ladder readbacks are included in readback_inclusive\n", .{ @tagName(stage), cost.calls, cost.total_ns / 1_000, cost.max_ns / 1_000 });
+        }
+        machoCapturePrint("macho-processor: SHADOW MEMORY CUSTODY: uploads={d} bytes={d} unchanged_skips={d} unmap_publications={d} failures={d}; coherent CPU changes are published without erasing unchanged GPU bytes; noncoherent ranges still require explicit flush\n", .{ self.vulkan_shadow_uploads, self.vulkan_shadow_upload_bytes, self.vulkan_shadow_unchanged, self.vulkan_shadow_unmap_uploads, self.vulkan_shadow_upload_failures });
+        machoCapturePrint("macho-processor: NATIVE MEMORY IDENTITY: mappings={d}; PE driver-owned aliases retain exact CPU/GPU byte identity, including same-value stores; flush/invalidate and synchronization remain native Vulkan obligations\n", .{self.vulkan_native_memory_aliases});
+        machoCapturePrint("macho-processor: TEXEL CUSTODY SUMMARY: samples={d} zero_tables={d} unreadable_native_ranges={d} printed={d} xenia_default_ramps={d} programmed_ramps={d} last(format/shape/out_max/out_7e3_one/out_mid)={d}/{s}/{d}/{d}/{d}; lookup bytes are checked only for bounded mapped A2B10G10R10 and R16G16_UINT uniform texel views, and a default shape means no title DC_LUT programming reached the ramp\n", .{ self.texel_custody_samples, self.texel_custody_zero, self.texel_custody_missing, self.texel_custody_printed, self.texel_custody_default_samples, self.texel_custody_programmed_samples, self.texel_custody_last_format, self.texel_custody_last_shape.label(), self.texel_custody_last_out[0], self.texel_custody_last_out[1], self.texel_custody_last_out[2] });
+    }
+
+    fn printFrameRates(self: *const Forwarder, now: u64) void {
+        const timing = &self.transport_cost;
+        const picture = &self.picture_sequence;
+        const recent_fps = timing.recent.activeFpsMilli(timing.last_present_ns, now);
+        machoCapturePrint("macho-processor: RAW PRESENT TRAFFIC: presents={d} ingress_per_second={d}.{d:0>3} accepted_content_presents={d}; transport counters, NOT picture frames or game FPS\n", .{
+            self.vulkan_presents, recent_fps / 1000, recent_fps % 1000, timing.content_frames,
+        });
+        if (picture.frames == 0) {
+            machoCapturePrint("macho-processor: CONTENT FRAME: frame=0 state=waiting_for_picture completed_content_without_fresh_detail={d}; frame 1 requires fresh acquired-image RGB detail, accepted native present and queue completion; offscreen writes/clears do not open the epoch\n", .{picture.waiting_content});
+            return;
+        }
+        const picture_fps = picture.recent.activeFpsMilli(picture.last_ns, now);
+        machoCapturePrint("macho-processor: FRAME GENERATION RATE: picture_frame={d} picture_fps={d}.{d:0>3} first_observed_picture_raw_present={d} first_observed_image=0x{x} initial_to_picture_ms={d}; counts completed content presents since first OBSERVED RGB detail, not distinct scenes or Xbox simulation FPS; UI fills excluded, black content fades retained\n", .{
+            picture.frames,                                                                              picture_fps / 1000, picture_fps % 1000, picture.first_present, picture.first_image,
+            if (picture.first_ns == 0) 0 else (picture.first_ns -| timing.first_present_ns) / 1_000_000,
+        });
+        machoCapturePrint("macho-processor: FRAME PIXEL PROGRESS: samples={d} byte_hash_changes={d} consecutive_unchanged_samples={d} last_change_age_ms={d}; repeated presents are not proof of scene advancement; sparse readback can miss changes\n", .{
+            timing.pixel_samples,                                                                          timing.pixel_changes, timing.pixel_unchanged_run,
+            if (timing.last_pixel_change_ns == 0) 0 else (now -| timing.last_pixel_change_ns) / 1_000_000,
+        });
     }
 
     /// Escalate the first no-present observation into a useful failure
@@ -8023,7 +11242,8 @@ pub const Forwarder = struct {
     /// succeeding and nothing else notices.
     fn refreshPresentChainWindow(self: *Forwarder) void {
         if (self.present_chain.isEmpty()) return;
-        const window = describeHostWindow() orelse return;
+        self.present_chain_window_facts = describeHostWindow();
+        const window = self.present_chain_window_facts orelse return;
         const break_now = window.firstBrokenLink();
         const changed = blk: {
             const previous = self.present_chain_window_break orelse break :blk true;
@@ -8072,6 +11292,7 @@ pub const Forwarder = struct {
             break :blk self.present_chain.verdict();
         };
         self.printPresentChainBody(verdict);
+        self.printScreenValidity();
     }
 
     fn printPresentChainBody(self: *const Forwarder, verdict: rosette_gpu.PresentChainVerdict) void {
@@ -8140,6 +11361,28 @@ pub const Forwarder = struct {
                     window.view_layer,
                 },
             );
+            const logical_view_width: i64 = @intFromFloat(window.view_width);
+            const logical_view_height: i64 = @intFromFloat(window.view_height);
+            const logical_layer_width: i64 = @intFromFloat(window.layer_width);
+            const logical_layer_height: i64 = @intFromFloat(window.layer_height);
+            const logical_window_locked = logical_view_width == 1280 and
+                logical_view_height == 720 and logical_layer_width == 1280 and
+                logical_layer_height == 720;
+            machoCapturePrint(
+                "macho-processor: PRESENT CHAIN:   window contract: mode=EXACT_LOGICAL_CONTENT_POINTS required=1280x720 view={d}x{d} layer_bounds={d}x{d} status={s} drawable_pixels_are_independent=true backing_scale={d:.2} action={s}\n",
+                .{
+                    logical_view_width,
+                    logical_view_height,
+                    logical_layer_width,
+                    logical_layer_height,
+                    if (logical_window_locked) "met" else "unmet",
+                    window.backing_scale,
+                    if (logical_window_locked)
+                        "keep the fixed content contract and inspect drawable pixels separately"
+                    else
+                        "repair the AppKit content/view bounds to 1280x720; do not derive them from backing scale or drawable pixels",
+                },
+            );
             machoCapturePrint(
                 "macho-processor: PRESENT CHAIN:   layer=0x{x} bounds={d}x{d} drawable={d}x{d} scale={d:.2} is_view_layer={d} hidden={d} opaque={d} device=0x{x} max_drawables={d} pixel_format={d} drawable_owner={s}\n",
                 .{
@@ -8157,6 +11400,10 @@ pub const Forwarder = struct {
                     window.layer_pixel_format,
                     if (self.metal_drawable_yielded) "vulkan_swapchain" else "rosette_window_bridge",
                 },
+            );
+            machoCapturePrint(
+                "macho-processor: PRESENT CHAIN:   drawable contract: mode=EXACT default=1280x720 pixels preflight=before_vkCreateSwapchainKHR attempts/successes/failures={d}/{d}/{d} last_prepared={d}x{d} owner={s} contract_failed={} contract_failures={d}; contentsScale={d:.2} is pinned to 1.0 during strict 720p admission (backing_scale={d:.2})\n",
+                .{ self.metal_drawable_prepare_attempts, self.metal_drawable_prepare_successes, self.metal_drawable_prepare_failures, self.metal_drawable_prepared_width, self.metal_drawable_prepared_height, @tagName(self.drawable_owner), self.graphics_extent_contract_failed, self.graphics_extent_contract_failures, window.contents_scale, window.backing_scale },
             );
             machoCapturePrint(
                 "macho-processor: PRESENT CHAIN:   screen=0x{x} count={d} visible_frame={d}x{d}@{d},{d} window_inside_it={d}%\n",
@@ -8217,8 +11464,8 @@ pub const Forwarder = struct {
             }
         } else {
             machoCapturePrint(
-                "macho-processor: PRESENT CHAIN:   host window facts unavailable (the AppKit bridge is not linked into this binary, or no window exists yet)\n",
-                .{},
+                "macho-processor: PRESENT CHAIN:   host window geometry unavailable: {s}\n",
+                .{hostWindowFactsUnavailableReason()},
             );
         }
 
@@ -8230,7 +11477,7 @@ pub const Forwarder = struct {
         }
         for (chain.swapchains[0..chain.swapchain_count]) |swapchain| {
             machoCapturePrint(
-                "macho-processor: PRESENT CHAIN:   swapchain=0x{x} surface=0x{x} layer=0x{x} owner={s}{s} extent={d}x{d} format={d} present_mode={d} images={d}/{d} requested_usage=0x{x} actual_usage=0x{x} acquires={d} presents={d} with_target={d} with_content={d} clear_only={d} without_target={d} without_write={d} failures={d} last_result={d} last_image={d} last_target=0x{x} pixel={s} pixel_uniform=0x{x} shows_detail={}\n",
+                "macho-processor: PRESENT CHAIN:   swapchain=0x{x} surface=0x{x} layer=0x{x} owner={s}{s} extent={d}x{d} format={d} present_mode={d} images={d}/{d} requested_usage=0x{x} actual_usage=0x{x} acquires={d} presents={d} with_target={d} with_content={d} clear_only={d} buffer_uploads={d} without_target={d} without_write={d} failures={d} last_result={d} last_image={d} last_target=0x{x}\n",
                 .{
                     swapchain.handle,
                     swapchain.surface,
@@ -8250,14 +11497,28 @@ pub const Forwarder = struct {
                     swapchain.presents_with_target,
                     swapchain.presents_with_content,
                     swapchain.presents_clear_only,
+                    swapchain.presents_with_buffer_upload,
                     swapchain.presents_without_target,
                     swapchain.presents_without_write,
                     swapchain.present_failures,
                     swapchain.last_present_result,
                     swapchain.last_image_index,
                     swapchain.last_target_image,
+                },
+            );
+            machoCapturePrint(
+                "macho-processor: PRESENT CHAIN:   swapchain=0x{x} last_write={s} pixel={s} pixel_uniform=0x{x} pixel_sample(frame/image/write)={d}/0x{x}/{s} content_sample(frame/image/evidence)={d}/0x{x}/{s} shows_detail={}\n",
+                .{
+                    swapchain.handle,
+                    swapchain.last_write_kind.label(),
                     swapchain.pixel_evidence.label(),
                     swapchain.pixel_uniform_value,
+                    swapchain.pixel_probe_frame,
+                    swapchain.pixel_probe_image,
+                    swapchain.pixel_probe_write_kind.label(),
+                    swapchain.pixel_content_probe_frame,
+                    swapchain.pixel_content_probe_image,
+                    swapchain.pixel_content_probe_evidence.label(),
                     swapchain.pixel_evidence.showsDetail(),
                 },
             );
@@ -8267,11 +11528,29 @@ pub const Forwarder = struct {
         if (guest_presents != 0 or self.vulkan_real_presents != 0 or self.pixel_probe.successes != 0) {
             var latest_pixel = rosette_gpu.PresentPixelEvidence.unprobed;
             var latest_pixel_frame: u64 = 0;
+            var latest_pixel_image: u64 = 0;
+            var latest_pixel_write_kind: WriteKind = .none;
+            var latest_content_pixel = rosette_gpu.PresentPixelEvidence.unprobed;
+            var latest_content_pixel_frame: u64 = 0;
+            var latest_content_pixel_image: u64 = 0;
             for (chain.swapchains[0..chain.swapchain_count]) |swapchain| {
                 if (swapchain.pixel_probe_frame >= latest_pixel_frame and swapchain.pixel_probe_frame != 0) {
                     latest_pixel = swapchain.pixel_evidence;
                     latest_pixel_frame = swapchain.pixel_probe_frame;
+                    latest_pixel_image = swapchain.pixel_probe_image;
+                    latest_pixel_write_kind = swapchain.pixel_probe_write_kind;
                 }
+                if (swapchain.pixel_content_probe_frame >= latest_content_pixel_frame and swapchain.pixel_content_probe_frame != 0) {
+                    latest_content_pixel = swapchain.pixel_content_probe_evidence;
+                    latest_content_pixel_frame = swapchain.pixel_content_probe_frame;
+                    latest_content_pixel_image = swapchain.pixel_content_probe_image;
+                }
+            }
+            if (guest_presents_with_content != 0 and latest_content_pixel_frame != 0) {
+                latest_pixel = latest_content_pixel;
+                latest_pixel_frame = latest_content_pixel_frame;
+                latest_pixel_image = latest_content_pixel_image;
+                latest_pixel_write_kind = .content;
             }
             const guest_presents_clear_only = chain.totalPresentsClearOnly();
             // `transport_observed` used to cover two states that send a
@@ -8280,8 +11559,13 @@ pub const Forwarder = struct {
             // The 2026-09-12 run was the second and was reported as the
             // first.
             const frame_status = if (guest_presents_with_content != 0 and
-                self.pixel_probe.successes != 0 and self.vulkan_real_present_completions != 0)
-                "proven_guest_content"
+                latest_content_pixel_frame != 0 and self.vulkan_real_present_completions != 0)
+                if (latest_pixel.showsDetail())
+                    "proven_guest_content"
+                else if (latest_pixel == .unavailable)
+                    "content_probe_unavailable"
+                else
+                    "proven_transport_uniform_pixels"
             else if (guest_presents_with_content != 0)
                 "transport_observed_content_not_yet_proven"
             else if (guest_presents_clear_only != 0)
@@ -8291,7 +11575,7 @@ pub const Forwarder = struct {
             else
                 "probe_only";
             machoCapturePrint(
-                "macho-processor: PRESENT CHAIN:   FRAME EVIDENCE: status={s} guest_presents={d} acquired_image_writes={d} acquired_image_fills={d} pixel_probe_successes={d} latest_pixel={s} native_present_requests={d} native_present_completions={d} native_queue_submits={d}\n",
+                "macho-processor: PRESENT CHAIN:   FRAME EVIDENCE: status={s} guest_presents={d} acquired_image_writes={d} acquired_image_fills={d} pixel_probe_successes={d} latest_pixel={s} sample_frame={d} sample_image=0x{x} sample_write={s} native_present_requests={d} native_present_completions={d} native_queue_submits={d}\n",
                 .{
                     frame_status,
                     guest_presents,
@@ -8299,6 +11583,9 @@ pub const Forwarder = struct {
                     guest_presents_clear_only,
                     self.pixel_probe.successes,
                     latest_pixel.label(),
+                    latest_pixel_frame,
+                    latest_pixel_image,
+                    latest_pixel_write_kind.label(),
                     self.vulkan_real_presents,
                     self.vulkan_real_present_completions,
                     self.vulkan_real_queue_submits,
@@ -8310,17 +11597,202 @@ pub const Forwarder = struct {
                     .{ guest_presents_clear_only, self.vulkan_command_content_marks },
                 );
             }
+            if (guest_presents_with_content != 0 and self.pixel_probe.successes != 0 and !latest_pixel.showsDetail()) {
+                machoCapturePrint(
+                    "macho-processor: PRESENT CHAIN:   FRAME EVIDENCE: native completion and acquired-image content are proven, but readback is {s}; this is transport proof without visible detail, so inspect descriptor/transfer provenance below before blaming the window\n",
+                    .{latest_pixel.label()},
+                );
+            }
         }
         if (self.target_attribution_events != 0 or self.target_offscreen_events != 0 or self.target_unknown_events != 0 or self.target_overflow_events != 0) {
             machoCapturePrint(
                 "macho-processor: PRESENT CHAIN:   target_attribution=resolved={d} offscreen={d} unknown={d} overflow={d} (a draw is content only when it names the acquired swapchain image)\n",
                 .{ self.target_attribution_events, self.target_offscreen_events, self.target_unknown_events, self.target_overflow_events },
             );
+            for (std.enums.values(TargetOverflowKind), 0..) |kind, index| {
+                const count = self.target_overflow_by_kind[index];
+                if (count == 0) continue;
+                machoCapturePrint(
+                    "macho-processor: PRESENT CHAIN:   target_overflow_kind={s} count={d}; this is provenance-ledger pressure, not a rejected Vulkan command\n",
+                    .{ kind.label(), count },
+                );
+            }
+        }
+        if (self.graphics_state_trace_configured or self.graphics_state_trace_draws != 0 or self.graphics_state_trace_push_constants != 0) {
+            machoCapturePrint(
+                "macho-processor: PRESENT CHAIN:   graphics_state_trace=enabled:{} draws={d} push_constants={d} printed={d} missing_viewport={d} missing_scissor={d} bad_viewport={d} bad_scissor={d} rect_candidates={d} rect_non_candidates={d} bad_rect={d} topology_mismatch={d} unknown_pipeline={d} pipeline_overflow={d}; bad_rect/topology only use the strict presenter-shape candidate, while rect_non_candidates are ordinary offset-zero pushes; topology 3=triangle_list 4=triangle_strip\n",
+                .{
+                    self.graphics_state_trace_enabled,
+                    self.graphics_state_trace_draws,
+                    self.graphics_state_trace_push_constants,
+                    self.graphics_state_trace_printed,
+                    self.graphics_state_trace_missing_viewport,
+                    self.graphics_state_trace_missing_scissor,
+                    self.graphics_state_trace_bad_viewport,
+                    self.graphics_state_trace_bad_scissor,
+                    self.graphics_state_trace_rect_candidates,
+                    self.graphics_state_trace_rect_non_candidates,
+                    self.graphics_state_trace_bad_rect,
+                    self.graphics_state_trace_topology_mismatch,
+                    self.graphics_state_trace_unknown_pipeline,
+                    self.graphics_state_trace_pipeline_overflow,
+                },
+            );
+        }
+        if (self.guest_output_topology_repair_configured or self.graphics_topology_repair_candidates != 0 or
+            self.graphics_topology_repairs != 0 or self.graphics_topology_repair_create_failures != 0)
+        {
+            machoCapturePrint(
+                "macho-processor: PRESENT CHAIN:   guest_output_topology_repair=enabled:{} candidates={d} pipeline_twins={d} twin_failures={d} draws_repaired={d} bind_failures={d}; a repair means a strict four-vertex/16-byte-rectangle draw was rebound from triangle_list to triangle_strip\n",
+                .{ self.guest_output_topology_repair_enabled, self.graphics_topology_repair_candidates, self.graphics_topology_repair_pipeline_creations, self.graphics_topology_repair_create_failures, self.graphics_topology_repairs, self.graphics_topology_repair_bind_failures },
+            );
+        }
+        self.printVulkanCommandAdmission();
+        if (self.vulkan_descriptor_update_calls != 0 or
+            self.vulkan_descriptor_template_update_calls != 0 or
+            self.vulkan_descriptor_push_calls != 0 or
+            self.vulkan_descriptor_bind_admission.entries != 0 or
+            self.vulkan_descriptor_bind_calls != 0 or
+            self.vulkan_descriptor_image_infos_observed != 0)
+        {
+            machoCapturePrint(
+                "macho-processor: PRESENT CHAIN:   descriptor_route=updates={d} template_updates={d} push_calls={d} image_infos={d} unknown_image_views={d} bind_forwarded={d} sets_bound={d} sets_resolved={d} sets_unknown={d} late_set_resolutions={d} sampled_images_recorded={d} sampled_unknown_commands={d}; descriptor sets are resolved again at queue submission\n",
+                .{
+                    self.vulkan_descriptor_update_calls,
+                    self.vulkan_descriptor_template_update_calls,
+                    self.vulkan_descriptor_push_calls,
+                    self.vulkan_descriptor_image_infos_observed,
+                    self.vulkan_descriptor_unknown_image_views,
+                    self.vulkan_descriptor_bind_calls,
+                    self.vulkan_descriptor_sets_bound,
+                    self.vulkan_descriptor_sets_resolved,
+                    self.vulkan_descriptor_sets_unknown,
+                    self.vulkan_descriptor_late_resolutions,
+                    self.vulkan_descriptor_sampled_images_recorded,
+                    self.vulkan_descriptor_sampled_unknown,
+                },
+            );
+            var refused_total: u64 = 0;
+            for (self.vulkan_descriptor_update_refusals) |count| refused_total +|= count;
+            machoCapturePrint("macho-processor: PRESENT CHAIN:   descriptor_update_refusals={d}", .{refused_total});
+            for (self.vulkan_descriptor_update_refusals, 0..) |count, index| {
+                if (count != 0) machoCapturePrint(" {s}={d}", .{ @tagName(@as(DescriptorUpdateRefusal, @enumFromInt(index))), count });
+            }
+            machoCapturePrint("; a refused update leaves its sets holding their previous resources, which is a uniform or stale picture with every command forwarded\n", .{});
+            machoCapturePrint("macho-processor: PRESENT CHAIN:   descriptor_update_admission=entries:{d},forwarded:{d},refused:{d},native_writes:{d},native_copies:{d}; vkUpdateDescriptorSets returns void: native invocation is not driver-validation proof\n", .{ self.vulkan_descriptor_update_calls, self.vulkan_descriptor_update_forwarded, refused_total, self.vulkan_descriptor_native_writes, self.vulkan_descriptor_native_copies });
+            const bind_admission = &self.vulkan_descriptor_bind_admission;
+            machoCapturePrint(
+                "macho-processor: PRESENT CHAIN:   descriptor_bind_admission=entries:{d},forwarded:{d},rejected:{d} rejects(device_lost/command_buffer/layout/set_count/set_array/set_handle/dynamic_count/dynamic_array/native_fn)={d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}/{d} last(reason/command_buffer/layout/set_count/sets/dynamic_count/dynamic_offsets/unmapped_handle)={s}/0x{x}/0x{x}/{d}/0x{x}/{d}/0x{x}/0x{x}; only forwarded binds reached MoltenVK\n",
+                .{
+                    bind_admission.entries,
+                    bind_admission.forwarded,
+                    bind_admission.rejected,
+                    bind_admission.rejected_by_reason[@intFromEnum(DescriptorBindRejectReason.device_lost)],
+                    bind_admission.rejected_by_reason[@intFromEnum(DescriptorBindRejectReason.command_buffer_unmapped)],
+                    bind_admission.rejected_by_reason[@intFromEnum(DescriptorBindRejectReason.pipeline_layout_unmapped)],
+                    bind_admission.rejected_by_reason[@intFromEnum(DescriptorBindRejectReason.set_count_exceeds_limit)],
+                    bind_admission.rejected_by_reason[@intFromEnum(DescriptorBindRejectReason.descriptor_set_array_unreadable)],
+                    bind_admission.rejected_by_reason[@intFromEnum(DescriptorBindRejectReason.descriptor_set_unmapped)],
+                    bind_admission.rejected_by_reason[@intFromEnum(DescriptorBindRejectReason.dynamic_offset_count_exceeds_limit)],
+                    bind_admission.rejected_by_reason[@intFromEnum(DescriptorBindRejectReason.dynamic_offset_array_unreadable)],
+                    bind_admission.rejected_by_reason[@intFromEnum(DescriptorBindRejectReason.native_entry_point_missing)],
+                    @tagName(bind_admission.last_reason),
+                    bind_admission.last_command_buffer,
+                    bind_admission.last_layout,
+                    bind_admission.last_set_count,
+                    bind_admission.last_sets,
+                    bind_admission.last_dynamic_count,
+                    bind_admission.last_dynamic_offsets,
+                    bind_admission.last_unmapped_handle,
+                },
+            );
+            if (self.vulkan_descriptor_image_infos_observed != 0 and
+                bind_admission.entries == 0 and
+                self.vulkan_descriptor_push_calls == 0 and
+                self.vulkan_descriptor_sampled_images_recorded == 0)
+            {
+                machoCapturePrint(
+                    "macho-processor: PRESENT CHAIN:   {s}: {d} image-descriptor write(s), but no vkCmdBindDescriptorSets/push-descriptor command or submitted sampled image. Unused startup resources alone are not a forwarding failure; with draw/dispatch/content work, follow the missing command edge before blaming shader output\n",
+                    .{ self.provenanceGapLabel(), self.vulkan_descriptor_image_infos_observed },
+                );
+            } else if (bind_admission.entries != 0 and
+                bind_admission.forwarded == 0 and
+                self.vulkan_descriptor_push_calls == 0)
+            {
+                machoCapturePrint(
+                    "macho-processor: PRESENT CHAIN:   ACTIONABLE DESCRIPTOR BIND WALL: {d} vkCmdBindDescriptorSets call(s) reached Rosette and all were refused before MoltenVK; last_reason={s} last_unmapped_handle=0x{x}. Repair that exact handle/pointer admission edge before investigating shader output\n",
+                    .{ bind_admission.entries, @tagName(bind_admission.last_reason), bind_admission.last_unmapped_handle },
+                );
+            } else if (bind_admission.forwarded != 0 and
+                self.vulkan_descriptor_sampled_images_recorded == 0 and
+                self.vulkan_descriptor_image_infos_observed != 0)
+            {
+                machoCapturePrint(
+                    "macho-processor: PRESENT CHAIN:   ACTIONABLE DESCRIPTOR PROVENANCE WALL: {d} descriptor bind(s) reached MoltenVK, but none resolved a sampled image for submitted work; inspect descriptor-set tracking and the late submission-time resolution edge\n",
+                    .{bind_admission.forwarded},
+                );
+            }
+        }
+        if (chain.resource_submission_events != 0 or chain.resource_transfer_events != 0 or chain.totalPresentsWithSampledSource() != 0 or chain.totalPresentsWithPropagatedTransfer() != 0 or chain.totalPresentsWithUnresolvedSource() != 0 or chain.totalPresentsWithBufferUpload() != 0) {
+            machoCapturePrint(
+                "macho-processor: PRESENT CHAIN:   resource_route=submissions={d} images={d} image_transfers={d} transfer_sources_resolved={d} transfer_sources_unresolved={d} graph_overflow={d} kinds=image_copy:{d},buffer_to_image:{d},image_blit:{d},image_resolve:{d},render_pass_resolve:{d} sampled_source_presents={d} propagated_transfer_presents={d} buffer_upload_presents={d} unresolved_source_presents={d}; descriptor identities are observed at bind/update time and committed at queue submission\n",
+                .{
+                    chain.resource_submission_events,
+                    chain.resource_image_count,
+                    chain.resource_transfer_events,
+                    chain.resource_transfer_resolved,
+                    chain.resource_transfer_unresolved,
+                    chain.resource_image_overflow,
+                    chain.resource_transfer_kind_counts[@intFromEnum(rosette_gpu.PresentTransferKind.image_copy)],
+                    chain.resource_transfer_kind_counts[@intFromEnum(rosette_gpu.PresentTransferKind.buffer_to_image)],
+                    chain.resource_transfer_kind_counts[@intFromEnum(rosette_gpu.PresentTransferKind.image_blit)],
+                    chain.resource_transfer_kind_counts[@intFromEnum(rosette_gpu.PresentTransferKind.image_resolve)],
+                    chain.resource_transfer_kind_counts[@intFromEnum(rosette_gpu.PresentTransferKind.render_pass_resolve)],
+                    chain.totalPresentsWithSampledSource(),
+                    chain.totalPresentsWithPropagatedTransfer(),
+                    chain.totalPresentsWithBufferUpload(),
+                    chain.totalPresentsWithUnresolvedSource(),
+                },
+            );
+            const buffer_to_image_count = chain.resource_transfer_kind_counts[@intFromEnum(rosette_gpu.PresentTransferKind.buffer_to_image)];
+            if (buffer_to_image_count != 0 and
+                chain.totalPresentsWithPropagatedTransfer() == 0 and
+                chain.totalPresentsWithBufferUpload() == 0 and
+                chain.totalPresentsWithSampledSource() == 0 and
+                self.target_offscreen_events != 0)
+            {
+                machoCapturePrint(
+                    "macho-processor: PRESENT CHAIN:   {s}: buffer_to_image transfers={d}, none reached the acquired presented image; offscreen target events={d}. Offscreen uploads are legitimate intermediate/startup work, not lost pixels; if picture work exists, follow its offscreen-to-acquired edge or descriptor route\n",
+                    .{ self.provenanceGapLabel(), buffer_to_image_count, self.target_offscreen_events },
+                );
+            }
+            if (buffer_to_image_count != 0 and chain.totalPresentsWithSampledSource() != 0) machoCapturePrint("macho-processor: PRESENT CHAIN:   INDIRECT IMAGE ROUTE: offscreen buffer uploads={d} sampled_source_presents={d}; shader sampling, not a direct copy into the swapchain, connects this path. No direct acquired-image upload is required; inspect source pixels, lookup tables, and shader state\n", .{ buffer_to_image_count, chain.totalPresentsWithSampledSource() });
+            for (chain.swapchains[0..chain.swapchain_count]) |swapchain| {
+                if (swapchain.presents_with_sampled_source == 0 and
+                    swapchain.presents_with_propagated_transfer == 0 and
+                    swapchain.presents_with_buffer_upload == 0 and
+                    swapchain.presents_with_unresolved_source == 0 and
+                    swapchain.last_sampled_image == 0 and
+                    swapchain.last_transfer_source == 0) continue;
+                machoCapturePrint(
+                    "macho-processor: PRESENT CHAIN:     route swapchain=0x{x} sampled_source_presents={d} propagated_transfer_presents={d} buffer_upload_presents={d} unresolved_source_presents={d} last_sampled=0x{x} last_transfer_source=0x{x} last_transfer_kind={s}\n",
+                    .{
+                        swapchain.handle,
+                        swapchain.presents_with_sampled_source,
+                        swapchain.presents_with_propagated_transfer,
+                        swapchain.presents_with_buffer_upload,
+                        swapchain.presents_with_unresolved_source,
+                        swapchain.last_sampled_image,
+                        swapchain.last_transfer_source,
+                        swapchain.last_transfer_kind.label(),
+                    },
+                );
+            }
         }
         if (self.pixel_probe.attempts != 0 or self.pixel_probe.failures != 0) {
             machoCapturePrint(
-                "macho-processor: PRESENT CHAIN:   pixel_probe=attempts={d} successes={d} failures={d} last_result={d} sample_policy=first_{d}_then_every_{d}\n",
-                .{ self.pixel_probe.attempts, self.pixel_probe.successes, self.pixel_probe.failures, self.pixel_probe.last_result, PIXEL_PROBE_INITIAL_SAMPLES, PIXEL_PROBE_INTERVAL },
+                "macho-processor: PRESENT CHAIN:   pixel_probe=attempts={d} successes={d} failures={d} content_attempts={d} detail_observed={} last_result={d} sample_policy=first_{d}+up_to_{d}_pre_detail_content_retries+first_8_picture_frames; steady_fills=1Hz steady_content=4Hz preview_interval_ms={d} clock_failure_fallback=8192_checks; readback discovery never waits for the picture epoch\n",
+                .{ self.pixel_probe.attempts, self.pixel_probe.successes, self.pixel_probe.failures, self.pixel_probe.content_probe_attempts, self.pixel_probe.detail_observed, self.pixel_probe.last_result, PIXEL_PROBE_INITIAL_SAMPLES, PIXEL_PROBE_CONTENT_SAMPLES, self.pixel_probe.preview_interval_ns / 1_000_000 },
             );
         }
         if (chain.contestedLayer()) |layer| {
@@ -8459,6 +11931,8 @@ pub const Forwarder = struct {
 
     fn noteNativeFenceComplete(self: *Forwarder, state: anytype, synthetic_fence: u64) void {
         if (synthetic_fence == 0) return;
+        // A single fence does not prove completion for every allocation (or
+        // even every fence in a waitAny call). PE aliases already share bytes.
         if (comptime @hasField(@TypeOf(state.*), "gpu_xenos_runtime")) {
             state.gpu_xenos_runtime.noteNativeFenceComplete(synthetic_fence);
         }
@@ -8466,6 +11940,7 @@ pub const Forwarder = struct {
     }
 
     fn clearRealVulkanObjectMaps(self: *Forwarder) void {
+        for (&self.vulkan_memory_records) |*record| record.releaseBaseline();
         @memset(&self.real_vulkan.memory_map, .{});
         @memset(&self.real_vulkan.buffer_map, .{});
         @memset(&self.real_vulkan.image_map, .{});
@@ -8491,17 +11966,32 @@ pub const Forwarder = struct {
         @memset(&self.real_vulkan.descriptor_update_template_map, .{});
         @memset(&self.real_vulkan.descriptor_update_template_records, .{});
         @memset(&self.real_vulkan.queue_map, .{});
+        @memset(&self.real_vulkan.queue_family_indices, abi.QUEUE_FAMILY_IGNORED);
         @memset(&self.vulkan_memory_records, .{});
         @memset(&self.vulkan_resources, .{});
+        @memset(&self.tracked_buffer_views, .{});
         @memset(&self.tracked_image_views, .{});
+        @memset(&self.tracked_descriptor_sets, .{});
         @memset(&self.tracked_render_passes, .{});
         @memset(&self.tracked_framebuffers, .{});
         @memset(&self.tracked_command_targets, .{});
+        @memset(&self.tracked_graphics_pipelines, .{});
+        @memset(&self.tracked_pipeline_layouts, .{});
+    }
+
+    fn releaseNativeMemoryAliases(self: *Forwarder, state: anytype) void {
+        if (comptime @hasDecl(@TypeOf(state.*), "releaseNativeMemory")) {
+            for (&self.vulkan_memory_records) |*record| {
+                if (record.native_alias_base != 0) state.releaseNativeMemory(record.native_alias_base);
+                record.native_alias_base = 0;
+            }
+        }
     }
 
     /// Destroy the guest's real Vulkan device and all its children.
     fn destroyRealDevice(self: *Forwarder) void {
         if (!self.real_vulkan.hasDevice()) return;
+        for (&self.vulkan_memory_records) |*record| record.releaseBaseline();
         const device = self.real_vulkan.device.?;
         // The pixel probe owns host Vulkan children outside the guest handle
         // maps.  Release them while the device function table is still live.
@@ -8587,6 +12077,13 @@ pub const Forwarder = struct {
         }
         for (self.real_vulkan.pipeline_map) |entry| {
             if (entry.real == 0) continue;
+            if (self.trackedGraphicsPipeline(entry.real)) |metadata| {
+                if (metadata.repair_real != 0 and metadata.repair_real != entry.real) {
+                    if (self.real_vulkan.fn_ptrs.destroy_pipeline) |fn_ptr| {
+                        fn_ptr(device, metadata.repair_real, null);
+                    }
+                }
+            }
             if (self.real_vulkan.fn_ptrs.destroy_pipeline) |fn_ptr| {
                 fn_ptr(device, entry.real, null);
             }
@@ -8687,12 +12184,17 @@ pub const Forwarder = struct {
         @memset(&self.real_vulkan.descriptor_update_template_map, .{});
         @memset(&self.real_vulkan.descriptor_update_template_records, .{});
         @memset(&self.real_vulkan.queue_map, .{});
+        @memset(&self.real_vulkan.queue_family_indices, abi.QUEUE_FAMILY_IGNORED);
         @memset(&self.vulkan_memory_records, .{});
         @memset(&self.vulkan_resources, .{});
+        @memset(&self.tracked_buffer_views, .{});
         @memset(&self.tracked_image_views, .{});
+        @memset(&self.tracked_descriptor_sets, .{});
         @memset(&self.tracked_render_passes, .{});
         @memset(&self.tracked_framebuffers, .{});
         @memset(&self.tracked_command_targets, .{});
+        @memset(&self.tracked_graphics_pipelines, .{});
+        @memset(&self.tracked_pipeline_layouts, .{});
         // Destroy the device.
         if (self.real_vulkan.fn_ptrs.destroy_device) |destroy| {
             destroy(device, null);
@@ -8730,12 +12232,14 @@ pub const Forwarder = struct {
         }
         if (synthetic != 0) {
             if (self.real_vulkan.mutableSwapchainRecord(synthetic)) |record| {
+                self.forgetSwapchainResourceImages(record);
                 self.real_vulkan.releaseSwapchainImageHandles(record);
                 record.* = .{};
             }
-            HandleMap.remove(&self.real_vulkan.swapchain_map, synthetic);
+            _ = self.releaseVulkanHandle(&self.real_vulkan.swapchain_map, synthetic);
         } else {
             for (self.real_vulkan.swapchain_records) |record| {
+                self.forgetSwapchainResourceImages(&record);
                 self.real_vulkan.releaseSwapchainImageHandles(&record);
             }
             @memset(&self.real_vulkan.swapchain_map, .{});
@@ -8744,6 +12248,15 @@ pub const Forwarder = struct {
         self.real_vulkan.swapchain = 0;
         self.vulkan_swapchain_image_count = 0;
         @memset(&self.vulkan_swapchain_image_handles, 0);
+    }
+
+    fn forgetSwapchainResourceImages(self: *Forwarder, record: *const SwapchainRecord) void {
+        const count = @min(@as(usize, @intCast(record.image_count)), record.image_handles.len);
+        for (record.image_handles[0..count]) |synthetic_image| {
+            if (self.real_vulkan.realImage(synthetic_image)) |real_image| {
+                self.present_chain.forgetResourceImage(real_image);
+            }
+        }
     }
 
     fn destroyRealSurface(self: *Forwarder) void {
@@ -8826,29 +12339,131 @@ pub const Forwarder = struct {
     /// device and swapchain stay modelled, while this owns a real device, a
     /// real swapchain and real images, so something other than a host clear can
     /// reach the display.
+    fn currentHostDrawableExtent() abi.Extent2D {
+        const window = describeHostWindow() orelse return .{};
+        return .{
+            .width = if (window.drawable_width > 0) @intFromFloat(window.drawable_width) else 0,
+            .height = if (window.drawable_height > 0) @intFromFloat(window.drawable_height) else 0,
+        };
+    }
+
+    /// Record and escalate an extent failure at the first boundary that can
+    /// still prevent a bad swapchain from becoming live. The generic state
+    /// hook keeps this forwarder usable by the ELF/test state, while
+    /// MachOState implements the non-bypassable process termination and crash
+    /// evidence path. No caller is allowed to downgrade this to a retry:
+    /// retrying would merely re-enter the same layer geometry disagreement.
+    fn noteGraphicsExtentContractFailure(
+        self: *Forwarder,
+        state: anytype,
+        requested_width: u32,
+        requested_height: u32,
+        observed_width: u32,
+        observed_height: u32,
+        reason: []const u8,
+    ) void {
+        self.graphics_extent_contract_failures +|= 1;
+        if (self.graphics_extent_contract_failed) return;
+        self.graphics_extent_contract_failed = true;
+        self.graphics_extent_requested_width = requested_width;
+        self.graphics_extent_requested_height = requested_height;
+        const host_extent = currentHostDrawableExtent();
+        const effective_observed_width = if (observed_width != 0) observed_width else host_extent.width;
+        const effective_observed_height = if (observed_height != 0) observed_height else host_extent.height;
+        self.graphics_extent_observed_width = effective_observed_width;
+        self.graphics_extent_observed_height = effective_observed_height;
+        machoCapturePrint(
+            "macho-processor: GRAPHICS EXTENT CONTRACT FATAL: reason={s} required={d}x{d} observed={d}x{d} host_drawable={d}x{d} preflight={d}x{d} owner={s} attempts/successes/failures={d}/{d}/{d}; no Vulkan swapchain may continue past this mismatch\n",
+            .{
+                reason,
+                requested_width,
+                requested_height,
+                effective_observed_width,
+                effective_observed_height,
+                host_extent.width,
+                host_extent.height,
+                self.metal_drawable_prepared_width,
+                self.metal_drawable_prepared_height,
+                @tagName(self.drawable_owner),
+                self.metal_drawable_prepare_attempts,
+                self.metal_drawable_prepare_successes,
+                self.metal_drawable_prepare_failures,
+            },
+        );
+        const State = @typeInfo(@TypeOf(state)).pointer.child;
+        if (@hasDecl(State, "faultOnGraphicsExtentContract")) {
+            state.faultOnGraphicsExtentContract(
+                requested_width,
+                requested_height,
+                effective_observed_width,
+                effective_observed_height,
+                reason,
+            );
+        }
+    }
+
     fn bringUpNativePresenter(self: *Forwarder, state: anytype, library_token: u64) rosette_gpu.NativePresenterStage {
         const State = @typeInfo(@TypeOf(state)).pointer.child;
-        if (self.native_presenter.stage.isReady()) return .ready;
-        if (self.native_presenter.stage == .device_lost) return .device_lost;
         if (!@hasDecl(State, "nativeMetalLayerHostPointer")) return self.native_presenter.stage;
         const layer = state.nativeMetalLayerHostPointer();
         if (layer == 0) return self.native_presenter.stage;
-        const library = self.materializeNativeVulkanLibrary(library_token) orelse return self.native_presenter.stage;
-
         const width = if (@hasDecl(State, "nativeWindowWidth")) state.nativeWindowWidth() else 1280;
         const height = if (@hasDecl(State, "nativeWindowHeight")) state.nativeWindowHeight() else 720;
+        const requested_width = @max(width, 1);
+        const requested_height = @max(height, 1);
+        if (self.native_presenter.stage.isReady()) {
+            // A layer can change underneath a live presenter when AppKit moves
+            // the window between backing stores. Re-run the owner-aware check
+            // before handing the already-ready stage to another caller; a
+            // stale ready bit is not permission to present through a changed
+            // drawable.
+            if (!self.prepareMetalDrawableForSwapchain(state, requested_width, requested_height)) {
+                return .ready;
+            }
+            const report = &self.native_presenter.report;
+            if (!rosette_gpu.vulkan.selection.extentMatches(
+                .{ .width = report.extent_width, .height = report.extent_height },
+                .{ .width = requested_width, .height = requested_height },
+            )) {
+                self.noteGraphicsExtentContractFailure(
+                    state,
+                    requested_width,
+                    requested_height,
+                    report.extent_width,
+                    report.extent_height,
+                    "native_presenter_ready_extent_changed",
+                );
+            }
+            return .ready;
+        }
+        if (self.native_presenter.stage == .device_lost) return .device_lost;
+        // The native presenter is a real Vulkan swapchain too. It must not
+        // be the first owner to observe a Retina-sized CAMetalLayer and then
+        // make the guest's later 1280x720 preflight impossible. Establish
+        // the fixed default extent before creating the native surface/device
+        // graph; if the host cannot prove it, leave the presenter unstarted
+        // so the guest path can make the authoritative attempt instead.
+        if (!self.prepareMetalDrawableForSwapchain(state, requested_width, requested_height)) {
+            machoCapturePrint(
+                "macho-processor: native Vulkan presenter deferred: CAMetalLayer drawable extent is not proven at the default {d}x{d}; no native presenter swapchain will claim the layer at another geometry\n",
+                .{ requested_width, requested_height },
+            );
+            return self.native_presenter.stage;
+        }
+        const library = self.materializeNativeVulkanLibrary(library_token) orelse return self.native_presenter.stage;
+
         self.native_presenter_attempts +|= 1;
         const stage = self.native_presenter.bringUp(
             .{ .context = library, .lookup = resolveNativeVulkanSymbol },
             layer,
-            @max(width, 1),
-            @max(height, 1),
+            requested_width,
+            requested_height,
         );
         if (self.native_presenter_stage_logged != stage) {
             self.native_presenter_stage_logged = stage;
             const report = &self.native_presenter.report;
             machoCapturePrint(
-                "macho-processor: native Vulkan presenter: attempt={d} stage={s} ({s}) VkResult={d} rejection={s} adapter={s} api=0x{x} physical_devices={d} queues(graphics/present/unified)={d}/{d}/{} portability(enumeration/subset)={}/{} swapchain(images/extent/format/colorspace/present_mode/usage)={d}/{d}x{d}/{d}/{d}/{d}/0x{x} CAMetalLayer=0x{x}\n",
+                "macho-processor: native Vulkan presenter: attempt={d} stage={s} ({s}) VkResult={d} rejection={s} adapter={s} api=0x{x} physical_devices={d} queues(graphics/present/unified)={d}/{d}/{} portability(enumeration/subset)={}/{} swapchain(images/extent/requested/format/colorspace/present_mode/usage)={d}/{d}x{d}/{d}x{d}/{d}/{d}/{d}/0x{x} CAMetalLayer=0x{x}\n",
                 .{
                     self.native_presenter_attempts,
                     @tagName(stage),
@@ -8866,6 +12481,8 @@ pub const Forwarder = struct {
                     report.swapchain_image_count,
                     report.extent_width,
                     report.extent_height,
+                    report.requested_extent_width,
+                    report.requested_extent_height,
                     report.surface_format,
                     report.surface_color_space,
                     report.present_mode,
@@ -8874,12 +12491,90 @@ pub const Forwarder = struct {
                 },
             );
         }
+        if (self.native_presenter.extentContractFailed()) {
+            const report = &self.native_presenter.report;
+            self.noteGraphicsExtentContractFailure(
+                state,
+                requested_width,
+                requested_height,
+                report.extent_width,
+                report.extent_height,
+                "native_presenter_surface_capability_extent_mismatch",
+            );
+        }
         if (stage.isReady()) {
             self.vulkan_presenter_stage = .native_drawable_ready;
+            if (@hasDecl(State, "setNativeMetalDrawableOwner")) {
+                _ = state.setNativeMetalDrawableOwner(true);
+                self.drawable_owner = .native_presenter;
+                machoCapturePrint(
+                    "macho-processor: CAMetalLayer drawable owner: native_presenter extent={d}x{d}; the native smoke swapchain is now protected from AppKit/layout writes until the guest handoff retires it\n",
+                    .{ requested_width, requested_height },
+                );
+            }
+            // The driver may update CAMetalLayer.drawableSize as part of
+            // vkCreateSwapchainKHR even after its capability query matched.
+            // Verify the post-create owner state before publishing Rosette's
+            // native objects to the present chain; a successful Vulkan result
+            // is not permission to retain a wrong-sized drawable.
+            if (!self.prepareMetalDrawableForSwapchain(state, requested_width, requested_height)) {
+                return stage;
+            }
             self.registerNativePresenterInPresentChain(state);
             self.negotiateRosetteGpuBoundary("native_presenter_ready");
         }
         return stage;
+    }
+
+    /// Prepare the drawable before Vulkan queries the surface and creates its
+    /// swapchain. The bridge owns the property during this call; the driver
+    /// takes ownership only after a successful create.
+    fn prepareMetalDrawableForSwapchain(self: *Forwarder, state: anytype, width: u32, height: u32) bool {
+        const State = @typeInfo(@TypeOf(state)).pointer.child;
+        if (!@hasDecl(State, "prepareNativeMetalDrawable")) return true;
+
+        self.metal_drawable_prepare_attempts +|= 1;
+        if (width == 0 or height == 0) {
+            self.metal_drawable_prepare_failures +|= 1;
+            machoCapturePrint(
+                "macho-processor: CAMetalLayer drawable preflight failed: invalid swapchain extent={d}x{d}\n",
+                .{ width, height },
+            );
+            self.noteGraphicsExtentContractFailure(
+                state,
+                width,
+                height,
+                0,
+                0,
+                "invalid_swapchain_extent",
+            );
+            return false;
+        }
+        if (!state.prepareNativeMetalDrawable(width, height)) {
+            self.metal_drawable_prepare_failures +|= 1;
+            machoCapturePrint(
+                "macho-processor: CAMetalLayer drawable preflight failed: requested={d}x{d} attempts={d} failures={d}; refusing to create a real swapchain with an unproven drawable extent\n",
+                .{ width, height, self.metal_drawable_prepare_attempts, self.metal_drawable_prepare_failures },
+            );
+            const observed = currentHostDrawableExtent();
+            self.noteGraphicsExtentContractFailure(
+                state,
+                width,
+                height,
+                observed.width,
+                observed.height,
+                "CAMetalLayer_preflight_refused",
+            );
+            return false;
+        }
+        self.metal_drawable_prepare_successes +|= 1;
+        self.metal_drawable_prepared_width = width;
+        self.metal_drawable_prepared_height = height;
+        machoCapturePrint(
+            "macho-processor: CAMetalLayer drawable preflight ready: extent={d}x{d} attempts={d} successes={d}; Vulkan capability negotiation and swapchain creation now use this extent\n",
+            .{ width, height, self.metal_drawable_prepare_attempts, self.metal_drawable_prepare_successes },
+        );
+        return true;
     }
 
     /// Stop writing the `CAMetalLayer`'s `drawableSize` now that a Vulkan
@@ -8896,8 +12591,26 @@ pub const Forwarder = struct {
     fn yieldMetalDrawableToSwapchain(self: *Forwarder, state: anytype, width: u32, height: u32) void {
         const State = @typeInfo(@TypeOf(state)).pointer.child;
         if (!@hasDecl(State, "setNativeMetalDrawableOwner")) return;
-        if (!state.setNativeMetalDrawableOwner(true)) return;
+        const ownership_changed = state.setNativeMetalDrawableOwner(true);
+        if (!ownership_changed) {
+            // The native presenter may already have handed this layer to
+            // MoltenVK.  A same-size preflight proves that this swapchain is
+            // using that existing owner; treating the unchanged flag as a
+            // failed handoff would make the present ledger report the layer
+            // as bridge-owned even though the driver is vending drawables.
+            if (self.metal_drawable_prepare_successes == 0 or
+                self.metal_drawable_prepared_width != width or
+                self.metal_drawable_prepared_height != height) return;
+            self.metal_drawable_yielded = true;
+            self.drawable_owner = .guest_swapchain;
+            machoCapturePrint(
+                "macho-processor: CAMetalLayer drawableSize already owned by the Vulkan driver: swapchain extent={d}x{d}; preflight verified the existing owner and the window bridge remains hands-off\n",
+                .{ width, height },
+            );
+            return;
+        }
         self.metal_drawable_yielded = true;
+        self.drawable_owner = .guest_swapchain;
         machoCapturePrint(
             "macho-processor: CAMetalLayer drawableSize handed to the Vulkan driver: swapchain extent={d}x{d}. The window bridge stops resizing the drawable from here; MoltenVK owns it while a swapchain is live, and a write it did not make reads to it as the swapchain going out of date\n",
             .{ width, height },
@@ -8959,15 +12672,14 @@ pub const Forwarder = struct {
     /// Registering Rosette's own objects is what lets Rosette be the
     /// suspect. A diagnostic that can only accuse the other side is not a
     /// diagnostic.
-    fn registerNativePresenterInPresentChain(self: *Forwarder, state: anytype) void {
-        // Rosette's presenter is a MoltenVK swapchain too, so the same
-        // handover applies: the bridge must stop resizing a drawable this
-        // swapchain is now vending.
-        self.yieldMetalDrawableToSwapchain(
-            state,
-            self.native_presenter.extent.width,
-            self.native_presenter.extent.height,
-        );
+    fn registerNativePresenterInPresentChain(self: *Forwarder, _state: anytype) void {
+        _ = _state;
+        // The caller claims the drawable immediately after the presenter has
+        // created its swapchain. Do not call the guest handoff helper here:
+        // doing so would relabel a native-presenter lease as a guest lease and
+        // would make the next guest preflight look like an unexplained owner
+        // transition. The lease remains native until the guest swapchain is
+        // created and `retireNativePresenterForGuestSwapchain` closes it.
         const presenter = &self.native_presenter;
         if (presenter.metal_layer == 0) return;
         const surface: u64 = presenter.surface;
@@ -8999,12 +12711,38 @@ pub const Forwarder = struct {
     /// pretend that a guest frame has been produced.
     pub fn preflightNativePresenter(self: *Forwarder, state: anytype) rosette_gpu.NativePresenterStage {
         const State = @typeInfo(@TypeOf(state)).pointer.child;
-        if (self.native_presenter.stage.isReady()) return .ready;
-        if (self.native_presenter.stage == .device_lost) return .device_lost;
         if (!@hasDecl(State, "nativeMetalLayerHostPointer")) return .unstarted;
 
         const layer = state.nativeMetalLayerHostPointer();
         if (layer == 0) return .unstarted;
+        const width = if (@hasDecl(State, "nativeWindowWidth")) state.nativeWindowWidth() else 1280;
+        const height = if (@hasDecl(State, "nativeWindowHeight")) state.nativeWindowHeight() else 720;
+        const requested_width = @max(width, 1);
+        const requested_height = @max(height, 1);
+        if (self.native_presenter.stage.isReady()) {
+            // The preflight is also the recurring admission check. Do not let
+            // a previous success survive a later AppKit/backing-store extent
+            // change just because the native presenter still says ready.
+            if (!self.prepareMetalDrawableForSwapchain(state, requested_width, requested_height)) {
+                return .ready;
+            }
+            const report = &self.native_presenter.report;
+            if (!rosette_gpu.vulkan.selection.extentMatches(
+                .{ .width = report.extent_width, .height = report.extent_height },
+                .{ .width = requested_width, .height = requested_height },
+            )) {
+                self.noteGraphicsExtentContractFailure(
+                    state,
+                    requested_width,
+                    requested_height,
+                    report.extent_width,
+                    report.extent_height,
+                    "native_presenter_preflight_ready_extent_changed",
+                );
+            }
+            return .ready;
+        }
+        if (self.native_presenter.stage == .device_lost) return .device_lost;
 
         var candidates = vulkanLoaderCandidates("libvulkan.1.dylib");
         var library: ?*anyopaque = null;
@@ -9041,8 +12779,17 @@ pub const Forwarder = struct {
             break;
         }
 
-        const width = if (@hasDecl(State, "nativeWindowWidth")) state.nativeWindowWidth() else 1280;
-        const height = if (@hasDecl(State, "nativeWindowHeight")) state.nativeWindowHeight() else 720;
+        // Keep the hidden admission smoke test under the same geometry
+        // contract as the guest path. Otherwise the smoke presenter can
+        // establish a 2x drawable owner before the guest ever asks for its
+        // real 1280x720 swapchain.
+        if (!self.prepareMetalDrawableForSwapchain(state, requested_width, requested_height)) {
+            machoCapturePrint(
+                "macho-processor: native Vulkan preflight deferred: CAMetalLayer drawable extent is not proven at the default {d}x{d}; no smoke-test swapchain was created\n",
+                .{ requested_width, requested_height },
+            );
+            return self.native_presenter.stage;
+        }
         self.native_presenter_attempts +|= 1;
         const stage = self.native_presenter.bringUp(
             .{
@@ -9050,18 +12797,19 @@ pub const Forwarder = struct {
                 .lookup = resolveNativeVulkanSymbol,
             },
             layer,
-            @max(width, 1),
-            @max(height, 1),
+            requested_width,
+            requested_height,
         );
         self.native_presenter_stage_logged = stage;
         machoCapturePrint(
-            "macho-processor: native Vulkan presenter preflight: attempt={d} stage={s} ({s}) loader={s} VkResult={d} adapter={s} physical_devices={d} queue={d}/{d} swapchain_images={d} extent={d}x{d} native_present_completed=NO\n",
+            "macho-processor: native Vulkan presenter preflight: attempt={d} stage={s} ({s}) loader={s} VkResult={d} rejection={s} adapter={s} physical_devices={d} queue={d}/{d} swapchain_images={d} extent={d}x{d} requested={d}x{d} native_present_completed=NO\n",
             .{
                 self.native_presenter_attempts,
                 @tagName(stage),
                 stage.label(),
                 selected_path,
                 self.native_presenter.report.last_result,
+                self.native_presenter.report.rejectionLabel(),
                 if (self.native_presenter.report.adapter_name_length != 0)
                     self.native_presenter.report.adapterName()
                 else
@@ -9072,10 +12820,38 @@ pub const Forwarder = struct {
                 self.native_presenter.report.swapchain_image_count,
                 self.native_presenter.report.extent_width,
                 self.native_presenter.report.extent_height,
+                self.native_presenter.report.requested_extent_width,
+                self.native_presenter.report.requested_extent_height,
             },
         );
+        if (self.native_presenter.extentContractFailed()) {
+            const report = &self.native_presenter.report;
+            self.noteGraphicsExtentContractFailure(
+                state,
+                requested_width,
+                requested_height,
+                report.extent_width,
+                report.extent_height,
+                "native_presenter_preflight_surface_capability_extent_mismatch",
+            );
+        }
         if (stage.isReady()) {
             self.vulkan_presenter_stage = .native_drawable_ready;
+            if (@hasDecl(State, "setNativeMetalDrawableOwner")) {
+                _ = state.setNativeMetalDrawableOwner(true);
+                self.drawable_owner = .native_presenter;
+                machoCapturePrint(
+                    "macho-processor: CAMetalLayer drawable owner: native_presenter extent={d}x{d}; the admission smoke swapchain is protected from AppKit/layout writes until the guest handoff retires it\n",
+                    .{ requested_width, requested_height },
+                );
+            }
+            // Confirm the actual owner state after the driver's swapchain
+            // creation, not only the pre-create layer write and capabilities.
+            // MoltenVK must not be allowed to turn a successful 720p admission
+            // into a Retina-sized drawable silently.
+            if (!self.prepareMetalDrawableForSwapchain(state, requested_width, requested_height)) {
+                return stage;
+            }
             self.negotiateRosetteGpuBoundary("native_presenter_preflight_ready");
         }
         return stage;
@@ -9809,6 +13585,13 @@ pub const Forwarder = struct {
             return vkErrorInitializationFailed();
         }
 
+        if (self.real_vulkan.hasDevice() and self.real_vulkan.surface != 0 and self.real_vulkan.fn_ptrs.create_swapchain != null and
+            HandleMap.freeSlots(&self.real_vulkan.swapchain_map) == 0)
+        {
+            self.noteVulkanMapCapacityRefusal("vkCreateSwapchainKHR", 1, 0);
+            return vkErrorOutOfHostMemory();
+        }
+
         // When the guest's device and Metal surface were both created on the
         // real instance, create the swapchain on that same driver object. The
         // guest still receives a stable Rosette handle, while every later
@@ -9833,6 +13616,17 @@ pub const Forwarder = struct {
             const old_synthetic = state.read64(create_info + 96);
             real_info.old_swapchain = self.real_vulkan.realSwapchain(old_synthetic) orelse 0;
 
+            // Establish the guest-requested extent before asking the native
+            // surface for capabilities. On macOS the current extent is often
+            // derived directly from CAMetalLayer.drawableSize; if the bridge
+            // is still at a Retina-sized value, querying first simply turns
+            // that disagreement into the host swapchain's official extent.
+            if (!self.prepareMetalDrawableForSwapchain(state, image_width, image_height)) {
+                self.vulkan_presenter_stage = .failed;
+                self.vulkan_presenter_bind_failures +|= 1;
+                return vkErrorInitializationFailed();
+            }
+
             // The guest's capability query and the host's surface query can
             // differ slightly (especially after a resize).  Validate the
             // request against the real surface immediately before creating
@@ -9846,11 +13640,57 @@ pub const Forwarder = struct {
             const caps_result = get_caps(self.real_vulkan.physical_device orelse return vkErrorInitializationFailed(), real_surface, &caps);
             self.noteRealVulkanResult(caps_result, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
             if (caps_result != abi.SUCCESS) return @as(u32, @bitCast(caps_result));
-            if (caps.current_extent.width != abi.extent_undefined and caps.current_extent.height != abi.extent_undefined) {
-                real_info.image_extent = caps.current_extent;
-            } else {
-                real_info.image_extent.width = @max(caps.min_image_extent.width, @min(real_info.image_extent.width, caps.max_image_extent.width));
-                real_info.image_extent.height = @max(caps.min_image_extent.height, @min(real_info.image_extent.height, caps.max_image_extent.height));
+            const requested_extent = abi.Extent2D{ .width = image_width, .height = image_height };
+            const resolved_extent = if (caps.current_extent.width != abi.extent_undefined and
+                caps.current_extent.height != abi.extent_undefined)
+                caps.current_extent
+            else
+                abi.Extent2D{
+                    .width = @max(caps.min_image_extent.width, @min(image_width, caps.max_image_extent.width)),
+                    .height = @max(caps.min_image_extent.height, @min(image_height, caps.max_image_extent.height)),
+                };
+            if (!rosette_gpu.vulkan.selection.extentMatches(resolved_extent, requested_extent)) {
+                // A fixed backing-pixel extent is not a harmless adjustment
+                // here. Xenia already asked for a precise guest surface size,
+                // and accepting the driver's 2560x1440 answer would make the
+                // real swapchain disagree with the guest's 1280x720 contract
+                // even though vkCreateSwapchainKHR may return success. Stop
+                // before any real guest swapchain is published.
+                machoCapturePrint(
+                    "macho-processor: REAL vkCreateSwapchainKHR refused: drawable extent contract mismatch requested={d}x{d} driver={d}x{d} current={d}x{d} bounds={d}x{d}..{d}x{d}; a fixed or clamped host extent may not replace the guest request\n",
+                    .{
+                        image_width,
+                        image_height,
+                        resolved_extent.width,
+                        resolved_extent.height,
+                        caps.current_extent.width,
+                        caps.current_extent.height,
+                        caps.min_image_extent.width,
+                        caps.min_image_extent.height,
+                        caps.max_image_extent.width,
+                        caps.max_image_extent.height,
+                    },
+                );
+                self.vulkan_presenter_stage = .failed;
+                self.vulkan_presenter_bind_failures +|= 1;
+                self.noteGraphicsExtentContractFailure(
+                    state,
+                    image_width,
+                    image_height,
+                    resolved_extent.width,
+                    resolved_extent.height,
+                    "guest_surface_extent_mismatch",
+                );
+                return vkErrorInitializationFailed();
+            }
+            real_info.image_extent = resolved_extent;
+            // Recheck the actual CAMetalLayer immediately before the driver
+            // create call. This catches a layout/backing-property transition
+            // between the first preflight and the capability query.
+            if (!self.prepareMetalDrawableForSwapchain(state, resolved_extent.width, resolved_extent.height)) {
+                self.vulkan_presenter_stage = .failed;
+                self.vulkan_presenter_bind_failures +|= 1;
+                return vkErrorInitializationFailed();
             }
             real_info.min_image_count = @max(real_info.min_image_count, caps.min_image_count);
             if (caps.max_image_count != abi.image_count_unbounded) real_info.min_image_count = @min(real_info.min_image_count, caps.max_image_count);
@@ -9955,8 +13795,8 @@ pub const Forwarder = struct {
             self.noteRealVulkanResult(real_result, "vkCreateSwapchainKHR");
             if (real_result != abi.SUCCESS or real_swapchain == 0) {
                 machoCapturePrint(
-                    "macho-processor: REAL vkCreateSwapchainKHR failed: VkResult={d} device=0x{x} surface=0x{x} extent={d}x{d} format={d} usage=0x{x}\n",
-                    .{ real_result, device, surface, image_width, image_height, real_info.image_format, image_usage },
+                    "macho-processor: REAL vkCreateSwapchainKHR failed: VkResult={d} device=0x{x} surface=0x{x} requested_extent={d}x{d} resolved_extent={d}x{d} format={d} usage=0x{x}\n",
+                    .{ real_result, device, surface, image_width, image_height, real_info.image_extent.width, real_info.image_extent.height, real_info.image_format, image_usage },
                 );
                 return @as(u32, @bitCast(real_result));
             }
@@ -9965,17 +13805,21 @@ pub const Forwarder = struct {
                 if (self.real_vulkan.fn_ptrs.destroy_swapchain) |destroy| destroy(real_device, real_swapchain, null);
                 return @as(u32, @bitCast(abi.ERROR_OUT_OF_HOST_MEMORY));
             }
+            if (!self.mapVulkanHandle(&self.real_vulkan.swapchain_map, synthetic_swapchain, real_swapchain, "vkCreateSwapchainKHR")) {
+                if (self.real_vulkan.mutableSwapchainRecord(synthetic_swapchain)) |record| record.* = .{};
+                if (self.real_vulkan.fn_ptrs.destroy_swapchain) |destroy| destroy(real_device, real_swapchain, null);
+                return vkErrorOutOfHostMemory();
+            }
             state.write64(output, synthetic_swapchain);
             registerOpaqueHandle(state, synthetic_swapchain, "Vulkan swapchain");
-            HandleMap.allocOrFind(&self.real_vulkan.swapchain_map, synthetic_swapchain, real_swapchain);
             self.real_vulkan.swapchain = real_swapchain;
             if (real_info.old_swapchain != 0) self.present_chain.retireSwapchain(real_info.old_swapchain);
             self.present_chain.noteSwapchain(.{
                 .handle = real_swapchain,
                 .surface = real_surface,
                 .owner = .guest,
-                .width = image_width,
-                .height = image_height,
+                .width = real_info.image_extent.width,
+                .height = real_info.image_extent.height,
                 .format = real_info.image_format,
                 .present_mode = real_info.present_mode,
                 .image_count = real_info.min_image_count,
@@ -9987,14 +13831,34 @@ pub const Forwarder = struct {
             self.vulkan_tiers.note(.swapchain, .real);
             self.vulkan_presenter_stage = .guest_swapchain_ready;
             machoCapturePrint(
-                "macho-processor: REAL vkCreateSwapchainKHR succeeded: synthetic=0x{x} real=0x{x} extent={d}x{d} format={d} usage=0x{x}\n",
-                .{ synthetic_swapchain, real_swapchain, image_width, image_height, real_info.image_format, image_usage },
+                "macho-processor: REAL vkCreateSwapchainKHR succeeded: synthetic=0x{x} real=0x{x} requested_extent={d}x{d} resolved_extent={d}x{d} format={d} usage=0x{x}\n",
+                .{ synthetic_swapchain, real_swapchain, image_width, image_height, real_info.image_extent.width, real_info.image_extent.height, real_info.image_format, image_usage },
             );
-            self.yieldMetalDrawableToSwapchain(state, image_width, image_height);
-            self.retireNativePresenterForGuestSwapchain(image_width, image_height);
+            self.yieldMetalDrawableToSwapchain(state, real_info.image_extent.width, real_info.image_extent.height);
+            // Swapchain creation alone is not picture evidence. Keep the
+            // Rosette presenter alive until the guest has either submitted a
+            // content-bearing Vulkan frame or the console front-buffer
+            // handoff succeeds; otherwise a later VdSwap has no screen owner
+            // when Xenia's RefreshGuestOutput path is absent.
+            if (self.native_presenter.stage.isReady()) {
+                machoCapturePrint(
+                    "macho-processor: native presenter retained after guest swapchain creation: extent={d}x{d}; no guest content has been proven yet, so the VdSwap/front-buffer fallback remains armed\n",
+                    .{ real_info.image_extent.width, real_info.image_extent.height },
+                );
+            }
             return 0;
         }
 
+        // The synthetic path still shares the real CAMetalLayer with the
+        // native presenter/fallback. It cannot skip the same exact-size
+        // handshake merely because no host VkSwapchainKHR is being created;
+        // otherwise its first diagnostic frame can silently establish a
+        // different drawable geometry than the guest requested.
+        if (!self.prepareMetalDrawableForSwapchain(state, image_width, image_height)) {
+            self.vulkan_presenter_stage = .failed;
+            self.vulkan_presenter_bind_failures +|= 1;
+            return vkErrorInitializationFailed();
+        }
         const handle = self.nextVulkanObject();
         state.write64(output, handle);
         registerOpaqueHandle(state, handle, "Vulkan swapchain");
@@ -10056,14 +13920,39 @@ pub const Forwarder = struct {
             self.noteRealVulkanResult(result, "vkGetSwapchainImagesKHR");
             if (result != abi.SUCCESS and result != abi.INCOMPLETE) return @as(u32, @bitCast(result));
             const actual: u32 = @min(@min(driver_count, written), exposed_count);
+            var new_image_mappings: usize = 0;
+            for (0..@as(usize, @intCast(actual))) |index| {
+                if (record.image_handles[index] == 0) new_image_mappings += 1;
+            }
+            const available_image_mappings = HandleMap.freeSlots(&self.real_vulkan.image_map);
+            if (available_image_mappings < new_image_mappings) {
+                self.noteVulkanMapCapacityRefusal("vkGetSwapchainImagesKHR", new_image_mappings, available_image_mappings);
+                return vkErrorOutOfHostMemory();
+            }
+            var newly_mapped_images: [MAX_SWAPCHAIN_IMAGES]u64 = [_]u64{0} ** MAX_SWAPCHAIN_IMAGES;
+            var newly_mapped_count: usize = 0;
             for (0..actual) |index| {
                 var synthetic = record.image_handles[index];
+                const was_new = synthetic == 0;
                 if (synthetic == 0) {
                     synthetic = self.nextVulkanObject();
                     record.image_handles[index] = synthetic;
                     registerOpaqueHandle(state, synthetic, "Vulkan swapchain image");
                 }
-                HandleMap.allocOrFind(&self.real_vulkan.image_map, synthetic, real_images[index]);
+                if (!self.mapVulkanHandle(&self.real_vulkan.image_map, synthetic, real_images[index], "vkGetSwapchainImagesKHR")) {
+                    if (was_new) record.image_handles[index] = 0;
+                    for (newly_mapped_images[0..newly_mapped_count]) |mapped| {
+                        _ = self.releaseVulkanHandle(&self.real_vulkan.image_map, mapped);
+                        for (&record.image_handles) |*image| {
+                            if (image.* == mapped) image.* = 0;
+                        }
+                    }
+                    return vkErrorOutOfHostMemory();
+                }
+                if (was_new) {
+                    newly_mapped_images[newly_mapped_count] = synthetic;
+                    newly_mapped_count += 1;
+                }
                 state.write64(state.regs.rcx + @as(u64, @intCast(index)) * 8, synthetic);
             }
             self.present_chain.noteSwapchainImages(real_swapchain, real_images[0..@as(usize, @intCast(actual))]);
@@ -10323,7 +14212,9 @@ pub const Forwarder = struct {
                         abi.ERROR_INITIALIZATION_FAILED,
                         .{ fence_synthetic, submit_count, 0 },
                     );
+                const submit_started = transport_timing.nowNs();
                 const result = submit_fn(real_queue, submit_count, &real_submits, fence_real);
+                self.transport_cost.finish(.queue_submit, submit_started);
                 self.noteRealVulkanResult(result, "vkQueueSubmit");
                 if (result != abi.SUCCESS) {
                     machoCapturePrint("macho-processor: REAL vkQueueSubmit FAILED: VkResult={d} count={d}\n", .{ result, submit_count });
@@ -10444,7 +14335,9 @@ pub const Forwarder = struct {
             submits[index].signal_semaphore_infos = if (submits[index].signal_semaphore_info_count == 0) null else &signals[index];
         }
         const fence = if (state.regs.rcx == 0) 0 else self.real_vulkan.realFence(state.regs.rcx) orelse return vkErrorInitializationFailed();
+        const submit_started = transport_timing.nowNs();
         const result = submit(queue, count, &submits, fence);
+        self.transport_cost.finish(.queue_submit, submit_started);
         self.noteRealVulkanResult(result, "vkQueueSubmit2");
         if (result == abi.SUCCESS) {
             for (0..@as(usize, @intCast(count))) |batch| {
@@ -10549,26 +14442,43 @@ pub const Forwarder = struct {
         };
     }
 
-    fn pixelProbeFailure(self: *Forwarder, swapchain: abi.SwapchainKHR, frame: u64, result: abi.Result, reason: []const u8) void {
+    fn notePixelProbeResult(
+        self: *Forwarder,
+        swapchain: abi.SwapchainKHR,
+        evidence: rosette_gpu.PresentPixelEvidence,
+        hash: u64,
+        frame: u64,
+        uniform_value: u32,
+        image: u64,
+        write_kind: WriteKind,
+    ) void {
+        if (evidence.showsDetail()) self.pixel_probe.detail_observed = true;
+        self.present_chain.notePixelProbe(swapchain, evidence, hash, frame, uniform_value);
+        self.present_chain.notePixelProbeContext(swapchain, image, write_kind);
+    }
+
+    fn pixelProbeFailure(
+        self: *Forwarder,
+        swapchain: abi.SwapchainKHR,
+        frame: u64,
+        result: abi.Result,
+        reason: []const u8,
+        image: u64,
+        write_kind: WriteKind,
+    ) void {
         self.pixel_probe.failures +|= 1;
         self.pixel_probe.last_result = result;
         self.pixel_probe.last_swapchain = swapchain;
-        self.present_chain.notePixelProbe(swapchain, .unavailable, 0, frame, 0);
+        self.notePixelProbeResult(swapchain, .unavailable, 0, frame, 0, image, write_kind);
         if (self.pixel_probe.failures <= 4) {
             machoCapturePrint(
-                "macho-processor: PIXEL PROBE failed: swapchain=0x{x} frame={d} result={d} reason={s}\n",
-                .{ swapchain, frame, result, reason },
+                "macho-processor: PIXEL PROBE failed: swapchain=0x{x} frame={d} image=0x{x} write_kind={s} result={d} reason={s}\n",
+                .{ swapchain, frame, image, write_kind.label(), result, reason },
             );
         }
     }
 
     fn destroyPixelProbeResources(self: *Forwarder) void {
-        const attempts = self.pixel_probe.attempts;
-        const successes = self.pixel_probe.successes;
-        const failures = self.pixel_probe.failures;
-        const frame = self.pixel_probe.frame;
-        const last_result = self.pixel_probe.last_result;
-        const last_swapchain = self.pixel_probe.last_swapchain;
         if (self.real_vulkan.device) |device| {
             if (!self.real_vulkan.device_lost) {
                 if (self.pixel_probe.mapped != null) {
@@ -10593,21 +14503,24 @@ pub const Forwarder = struct {
                 }
             }
         }
-        self.pixel_probe = .{
-            .frame = frame,
-            .attempts = attempts,
-            .successes = successes,
-            .failures = failures,
-            .last_result = last_result,
-            .last_swapchain = last_swapchain,
-        };
+        // Resource replacement/teardown must not erase the retained evidence,
+        // preview configuration or bounded per-run capture budget.
+        self.pixel_probe.staging_buffer = 0;
+        self.pixel_probe.staging_memory = 0;
+        self.pixel_probe.staging_size = 0;
+        self.pixel_probe.mapped_coherent = false;
+        self.pixel_probe.mapped = null;
+        self.pixel_probe.command_pool = 0;
+        self.pixel_probe.command_pool_family = abi.QUEUE_FAMILY_IGNORED;
+        self.pixel_probe.command_buffer = null;
     }
 
-    fn ensurePixelProbeResources(self: *Forwarder, size: u64) bool {
+    fn ensurePixelProbeResources(self: *Forwarder, size: u64, queue_family: u32) bool {
         if (self.pixel_probe.staging_buffer != 0 and
             self.pixel_probe.command_pool != 0 and
             self.pixel_probe.command_buffer != null and
             self.pixel_probe.mapped != null and
+            self.pixel_probe.command_pool_family == queue_family and
             self.pixel_probe.staging_size >= size)
         {
             return true;
@@ -10665,7 +14578,9 @@ pub const Forwarder = struct {
         result = bind_memory(device, buffer, memory, 0);
         if (result != abi.SUCCESS) return false;
         var mapped: ?*anyopaque = null;
-        result = map_memory(device, memory, 0, size, 0, &mapped);
+        // Map the whole allocation so WHOLE_SIZE invalidation never reaches
+        // outside the mapped range when the driver's requirements add padding.
+        result = map_memory(device, memory, 0, abi.WHOLE_SIZE, 0, &mapped);
         if (result != abi.SUCCESS or mapped == null) return false;
         self.pixel_probe.mapped = mapped;
         self.pixel_probe.mapped_coherent = mapped_coherent;
@@ -10673,12 +14588,13 @@ pub const Forwarder = struct {
 
         var pool_info = abi.CommandPoolCreateInfo{
             .flags = abi.COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-            .queue_family_index = self.real_vulkan.graphics_queue_family_index,
+            .queue_family_index = queue_family,
         };
         var command_pool: abi.CommandPool = 0;
         result = create_command_pool(device, &pool_info, null, &command_pool);
         if (result != abi.SUCCESS or command_pool == 0) return false;
         self.pixel_probe.command_pool = command_pool;
+        self.pixel_probe.command_pool_family = queue_family;
         var allocate_info_commands = abi.CommandBufferAllocateInfo{
             .command_pool = command_pool,
             .level = abi.COMMAND_BUFFER_LEVEL_PRIMARY,
@@ -10692,18 +14608,99 @@ pub const Forwarder = struct {
         return true;
     }
 
-    fn hashPixelBytes(bytes: []const u8) u64 {
-        var hash: u64 = 14_695_981_039_346_656_037;
-        for (bytes) |byte| {
-            hash ^= byte;
-            hash *%= 1_099_511_628_211;
+    fn configureFrameCapture(self: *Forwarder) void {
+        if (self.pixel_probe.capture_configured) return;
+        self.pixel_probe.capture_configured = true;
+        if (std.c.getenv("ROSETTE_VULKAN_CAPTURE")) |raw| {
+            self.pixel_probe.capture_enabled = !std.mem.eql(u8, std.mem.span(raw), "0");
         }
-        return hash;
+        if (std.c.getenv("ROSETTE_VULKAN_COCOA_PREVIEW")) |raw| {
+            self.pixel_probe.preview_enabled = std.mem.eql(u8, std.mem.span(raw), "1");
+        }
+        if (std.c.getenv("ROSETTE_VULKAN_DIAGNOSTIC_EXPOSURE")) |raw| {
+            self.pixel_probe.exposure_enabled = !std.mem.eql(u8, std.mem.span(raw), "0");
+        }
+        if (std.c.getenv("ROSETTE_VULKAN_PREVIEW_INTERVAL_MS")) |raw| {
+            const milliseconds = std.fmt.parseInt(u64, std.mem.span(raw), 10) catch 250;
+            self.pixel_probe.preview_interval_ns = @as(u64, @min(milliseconds, 60_000)) * 1_000_000;
+        }
     }
 
-    fn probeGuestSwapchainImage(self: *Forwarder, synthetic_swapchain: u64, real_swapchain: abi.SwapchainKHR, image_index: u32, frame: u64) void {
-        if (frame > PIXEL_PROBE_INITIAL_SAMPLES and frame % PIXEL_PROBE_INTERVAL != 0) return;
+    fn captureReadback(self: *Forwarder, capture: PendingReadbackCapture, picture_frame: u64) void {
+        const sample = capture.sample;
+        const stats = sample.stats;
+        const probe = &self.pixel_probe;
+        probe.capture_last_frame = sample.frame;
+        probe.capture_last_stats = stats;
+        var flags = probe.capture_policy.flags(sample.frame, capture.write_kind == .content, picture_frame, capture.preview);
+        if (!probe.capture_enabled) flags &= ~frame_capture.save_png;
+        if (flags == 0) return;
+        flags |= frame_capture.picture_numbering;
+        if (probe.exposure_enabled) flags |= frame_capture.diagnostic_exposure;
+        const callback = HostFrameCaptureResolver.resolve() orelse {
+            probe.capture_missing +|= 1;
+            if (probe.capture_missing == 1) machoCapturePrint(
+                "macho-processor: FRAME CAPTURE: native Cocoa callback missing; readback statistics remain available but no PNG/preview was delivered\n",
+                .{},
+            );
+            return;
+        };
+        const packet = frame_capture.Frame{
+            .pixels = capture.bytes.ptr,
+            .length = capture.bytes.len,
+            .frame = sample.frame,
+            .swapchain = sample.swapchain,
+            .image = sample.image,
+            .hash = stats.hash,
+            .width = sample.width,
+            .height = sample.height,
+            .format = sample.format,
+            .flags = flags,
+            .visible_pixels = stats.visible_pixels,
+            .bright_pixels = stats.bright_pixels,
+            .transparent_pixels = stats.transparent_pixels,
+            .rgb_sum = stats.rgb_sum,
+            .rgb_different_pixels = stats.rgb_different_pixels,
+            .min_rgb = stats.min_rgb,
+            .max_rgb = stats.max_rgb,
+            .content_frame = picture_frame,
+        };
+        const capture_started = transport_timing.nowNs();
+        const result = callback(&packet);
+        self.transport_cost.finish(.cpu_capture, capture_started);
+        probe.capture_calls +|= 1;
+        if (result & frame_capture.result_saved != 0) probe.capture_saved +|= 1;
+        if (result & frame_capture.result_previewed != 0) probe.capture_previewed +|= 1;
+        if (result & frame_capture.result_failed != 0) probe.capture_failures +|= 1;
+    }
+
+    fn probeGuestSwapchainImage(
+        self: *Forwarder,
+        synthetic_swapchain: u64,
+        real_swapchain: abi.SwapchainKHR,
+        image_index: u32,
+        frame: u64,
+        write_kind: WriteKind,
+        force_content_probe: bool,
+        present_queue: abi.Queue,
+        present_waits: []const abi.Semaphore,
+        waits_consumed: *bool,
+        capture: *?PendingReadbackCapture,
+        capture_bytes: *u64,
+    ) void {
+        self.configureFrameCapture();
+        const probe_now = transport_timing.nowNs();
+        const preview_due = self.pixel_probe.preview_enabled and transport_timing.previewDue(self.pixel_probe.last_preview_probe_ns, probe_now, self.pixel_probe.preview_interval_ns);
+        // Readback discovery cannot depend on an already-open picture epoch.
+        // Keep four initial proofs, eight first-content retries, then a host
+        // time cadence: 1 Hz for fills, 4 Hz for content (not every 60 clears).
+        const first_picture_probes = write_kind == .content and self.picture_sequence.frames != 0 and self.picture_sequence.frames < 8;
+        const probe_interval_ns: u64 = if (write_kind == .content) 250_000_000 else 1_000_000_000;
+        if (!self.pixel_probe.probe_schedule.choose(real_swapchain, probe_now, probe_interval_ns, frame <= PIXEL_PROBE_INITIAL_SAMPLES or force_content_probe or first_picture_probes or preview_due)) return;
+        self.pixel_probe.last_preview_probe_ns = probe_now;
+        defer self.transport_cost.finish(.readback_inclusive, probe_now);
         self.pixel_probe.attempts +|= 1;
+        if (force_content_probe and write_kind == .content) self.pixel_probe.content_probe_attempts +|= 1;
         self.pixel_probe.frame = frame;
         self.pixel_probe.last_swapchain = real_swapchain;
 
@@ -10720,84 +14717,100 @@ pub const Forwarder = struct {
             break;
         }
         if ((usage & abi.IMAGE_USAGE_TRANSFER_SRC_BIT) == 0) {
-            self.present_chain.notePixelProbe(real_swapchain, .unavailable, 0, frame, 0);
+            self.notePixelProbeResult(real_swapchain, .unavailable, 0, frame, 0, 0, write_kind);
             return;
         }
         const bytes_per_pixel = pixelProbeBytesPerPixel(format) orelse {
-            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FORMAT_NOT_SUPPORTED, "unsupported swapchain format");
+            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FORMAT_NOT_SUPPORTED, "unsupported swapchain format", 0, write_kind);
             return;
         };
         if (width == 0 or height == 0 or width > PIXEL_PROBE_MAX_BYTES / bytes_per_pixel / @as(u64, height)) {
-            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_OUT_OF_HOST_MEMORY, "bounded readback size rejected");
+            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_OUT_OF_HOST_MEMORY, "bounded readback size rejected", 0, write_kind);
             return;
         }
         const size = @as(u64, width) * @as(u64, height) * bytes_per_pixel;
         const swapchain_record = self.real_vulkan.swapchainRecord(synthetic_swapchain) orelse {
-            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_INITIALIZATION_FAILED, "swapchain image record missing");
+            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_INITIALIZATION_FAILED, "swapchain image record missing", 0, write_kind);
             return;
         };
         if (image_index >= swapchain_record.image_count) {
-            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_INITIALIZATION_FAILED, "acquired image index outside mapped record");
+            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_INITIALIZATION_FAILED, "acquired image index outside mapped record", 0, write_kind);
             return;
         }
         const synthetic_image = swapchain_record.image_handles[@as(usize, @intCast(image_index))];
         const image = self.real_vulkan.realImage(synthetic_image) orelse {
-            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_INITIALIZATION_FAILED, "acquired image has no native mapping");
+            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_INITIALIZATION_FAILED, "acquired image has no native mapping", synthetic_image, write_kind);
             return;
         };
-        if (!self.ensurePixelProbeResources(size)) {
-            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FEATURE_NOT_PRESENT, "staging resources unavailable");
+        // The image has been released to its present queue. Reading on the
+        // first graphics queue can violate exclusive queue-family ownership.
+        // Use the actual present queue and a pool created for that family.
+        var queue_family: u32 = abi.QUEUE_FAMILY_IGNORED;
+        for (self.real_vulkan.queue_map, 0..) |mapping, index| {
+            if (mapping.real == @intFromPtr(present_queue) and mapping.synthetic != 0) {
+                queue_family = self.real_vulkan.queue_family_indices[index];
+                break;
+            }
+        }
+        if (queue_family == abi.QUEUE_FAMILY_IGNORED and present_queue == self.real_vulkan.graphics_queue)
+            queue_family = self.real_vulkan.graphics_queue_family_index;
+        if (queue_family >= self.real_vulkan.queue_family_count or
+            self.real_vulkan.queue_family_properties[queue_family].queue_flags &
+                (abi.QUEUE_TRANSFER_BIT | abi.QUEUE_GRAPHICS_BIT | abi.QUEUE_COMPUTE_BIT) == 0)
+        {
+            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FEATURE_NOT_PRESENT, "present queue transfer family unknown or unsupported", synthetic_image, write_kind);
+            return;
+        }
+        if (!self.ensurePixelProbeResources(size, queue_family)) {
+            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FEATURE_NOT_PRESENT, "staging resources unavailable", synthetic_image, write_kind);
             return;
         }
         const command_buffer = self.pixel_probe.command_buffer orelse {
-            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FEATURE_NOT_PRESENT, "probe command buffer unavailable");
+            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FEATURE_NOT_PRESENT, "probe command buffer unavailable", synthetic_image, write_kind);
             return;
         };
-        const queue = self.real_vulkan.graphics_queue orelse {
-            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_INITIALIZATION_FAILED, "graphics queue unavailable");
-            return;
-        };
+        const queue = present_queue;
         const reset = self.real_vulkan.fn_ptrs.reset_command_buffer orelse {
-            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FEATURE_NOT_PRESENT, "command buffer reset unavailable");
+            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FEATURE_NOT_PRESENT, "command buffer reset unavailable", synthetic_image, write_kind);
             return;
         };
         var result = reset(command_buffer, 0);
         if (result != abi.SUCCESS) {
-            self.pixelProbeFailure(real_swapchain, frame, result, "command buffer reset failed");
+            self.pixelProbeFailure(real_swapchain, frame, result, "command buffer reset failed", synthetic_image, write_kind);
             return;
         }
         const begin = self.real_vulkan.fn_ptrs.begin_command_buffer orelse {
-            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FEATURE_NOT_PRESENT, "command buffer begin unavailable");
+            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FEATURE_NOT_PRESENT, "command buffer begin unavailable", synthetic_image, write_kind);
             return;
         };
         const end = self.real_vulkan.fn_ptrs.end_command_buffer orelse {
-            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FEATURE_NOT_PRESENT, "command buffer end unavailable");
+            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FEATURE_NOT_PRESENT, "command buffer end unavailable", synthetic_image, write_kind);
             return;
         };
         const barrier_fn = self.real_vulkan.fn_ptrs.cmd_pipeline_barrier orelse {
-            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FEATURE_NOT_PRESENT, "pipeline barrier unavailable");
+            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FEATURE_NOT_PRESENT, "pipeline barrier unavailable", synthetic_image, write_kind);
             return;
         };
         const copy_fn = self.real_vulkan.fn_ptrs.cmd_copy_image_to_buffer orelse {
-            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FEATURE_NOT_PRESENT, "image readback command unavailable");
+            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FEATURE_NOT_PRESENT, "image readback command unavailable", synthetic_image, write_kind);
             return;
         };
         const submit_fn = self.real_vulkan.fn_ptrs.queue_submit orelse {
-            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FEATURE_NOT_PRESENT, "probe queue submit unavailable");
+            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FEATURE_NOT_PRESENT, "probe queue submit unavailable", synthetic_image, write_kind);
             return;
         };
         const wait_idle = self.real_vulkan.fn_ptrs.queue_wait_idle orelse {
-            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FEATURE_NOT_PRESENT, "probe queue completion unavailable");
+            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FEATURE_NOT_PRESENT, "probe queue completion unavailable", synthetic_image, write_kind);
             return;
         };
         var begin_info = abi.CommandBufferBeginInfo{ .flags = abi.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
         result = begin(command_buffer, &begin_info);
         if (result != abi.SUCCESS) {
-            self.pixelProbeFailure(real_swapchain, frame, result, "command buffer begin failed");
+            self.pixelProbeFailure(real_swapchain, frame, result, "command buffer begin failed", synthetic_image, write_kind);
             return;
         }
         var to_transfer = [_]abi.ImageMemoryBarrier{.{
-            .src_access_mask = abi.ACCESS_MEMORY_READ_BIT,
+            .src_access_mask = abi.ACCESS_MEMORY_READ_BIT | abi.ACCESS_MEMORY_WRITE_BIT,
             .dst_access_mask = abi.ACCESS_TRANSFER_READ_BIT,
             .old_layout = abi.IMAGE_LAYOUT_PRESENT_SRC_KHR,
             .new_layout = abi.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -10805,7 +14818,7 @@ pub const Forwarder = struct {
         }};
         barrier_fn(
             command_buffer,
-            abi.PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            abi.PIPELINE_STAGE_ALL_COMMANDS_BIT,
             abi.PIPELINE_STAGE_TRANSFER_BIT,
             0,
             0,
@@ -10820,9 +14833,16 @@ pub const Forwarder = struct {
             .image_extent = .{ .width = width, .height = height, .depth = 1 },
         }};
         copy_fn(command_buffer, image, abi.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, self.pixel_probe.staging_buffer, 1, &region);
+        var to_host = [_]abi.BufferMemoryBarrier{.{
+            .src_access_mask = abi.ACCESS_TRANSFER_WRITE_BIT,
+            .dst_access_mask = abi.ACCESS_HOST_READ_BIT,
+            .buffer = self.pixel_probe.staging_buffer,
+            .size = abi.WHOLE_SIZE,
+        }};
+        barrier_fn(command_buffer, abi.PIPELINE_STAGE_TRANSFER_BIT, abi.PIPELINE_STAGE_HOST_BIT, 0, 0, null, 1, &to_host, 0, null);
         var to_present = [_]abi.ImageMemoryBarrier{.{
             .src_access_mask = abi.ACCESS_TRANSFER_READ_BIT,
-            .dst_access_mask = abi.ACCESS_MEMORY_READ_BIT,
+            .dst_access_mask = 0,
             .old_layout = abi.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             .new_layout = abi.IMAGE_LAYOUT_PRESENT_SRC_KHR,
             .image = image,
@@ -10841,66 +14861,78 @@ pub const Forwarder = struct {
         );
         result = end(command_buffer);
         if (result != abi.SUCCESS) {
-            self.pixelProbeFailure(real_swapchain, frame, result, "command buffer end failed");
+            self.pixelProbeFailure(real_swapchain, frame, result, "command buffer end failed", synthetic_image, write_kind);
             return;
         }
         var command_buffers = [_]abi.CommandBuffer{command_buffer};
-        var submits = [_]abi.SubmitInfo{.{ .command_buffer_count = 1, .command_buffers = &command_buffers }};
+        // Wait on the guest's render-finished semaphores HERE, including when
+        // their producer is another queue. Binary waits have exactly one
+        // consumer: successful submission hands that responsibility from WSI
+        // to the readback, whose host-observed completion then precedes WSI.
+        // No device-wide idle (which could wait on unrelated future work).
+        var wait_stages: [16]u32 = @splat(abi.PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        const waits = if (waits_consumed.*) present_waits[0..0] else present_waits;
+        var submits = [_]abi.SubmitInfo{.{
+            .wait_semaphore_count = @intCast(waits.len),
+            .wait_semaphores = if (waits.len == 0) null else waits.ptr,
+            .wait_dst_stage_mask = if (waits.len == 0) null else &wait_stages,
+            .command_buffer_count = 1,
+            .command_buffers = &command_buffers,
+        }};
         result = submit_fn(queue, 1, &submits, 0);
         if (result != abi.SUCCESS) {
-            self.pixelProbeFailure(real_swapchain, frame, result, "readback submit failed");
+            self.pixelProbeFailure(real_swapchain, frame, result, "readback submit failed", synthetic_image, write_kind);
             return;
+        }
+        if (waits.len != 0) {
+            waits_consumed.* = true;
+            self.pixel_probe.readback_wait_handoffs +|= 1;
         }
         result = wait_idle(queue);
         if (result != abi.SUCCESS) {
-            self.pixelProbeFailure(real_swapchain, frame, result, "readback completion failed");
+            self.pixel_probe.readback_completion_failed = true;
+            self.pixelProbeFailure(real_swapchain, frame, result, "readback completion failed", synthetic_image, write_kind);
             return;
         }
         if (!self.pixel_probe.mapped_coherent) {
-            if (self.real_vulkan.fn_ptrs.invalidate_mapped_memory_ranges) |invalidate| {
+            const invalidate = self.real_vulkan.fn_ptrs.invalidate_mapped_memory_ranges orelse {
+                self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FEATURE_NOT_PRESENT, "noncoherent readback invalidation unavailable", synthetic_image, write_kind);
+                return;
+            };
+            {
                 var ranges = [_]abi.MappedMemoryRange{.{
                     .memory = self.pixel_probe.staging_memory,
-                    .size = size,
+                    // WHOLE_SIZE satisfies nonCoherentAtomSize alignment even
+                    // when width*height*4 isn't an atom multiple.
+                    .size = abi.WHOLE_SIZE,
                 }};
                 result = invalidate(self.real_vulkan.device.?, 1, &ranges);
                 if (result != abi.SUCCESS) {
-                    self.pixelProbeFailure(real_swapchain, frame, result, "mapped readback invalidation failed");
+                    self.pixelProbeFailure(real_swapchain, frame, result, "mapped readback invalidation failed", synthetic_image, write_kind);
                     return;
                 }
             }
         }
         const mapped = self.pixel_probe.mapped orelse {
-            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_INITIALIZATION_FAILED, "mapped readback pointer missing");
+            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_INITIALIZATION_FAILED, "mapped readback pointer missing", synthetic_image, write_kind);
             return;
         };
         const bytes: []const u8 = @as([*]const u8, @ptrCast(mapped))[0..@as(usize, @intCast(size))];
-        var any_nonzero = false;
-        for (bytes) |byte| {
-            if (byte != 0) {
-                any_nonzero = true;
-                break;
-            }
-        }
-        // "Some byte is non-zero" was the whole test, and on an opaque
-        // format it is satisfied by black: 0xFF in the alpha channel of
-        // every pixel. So a window filled with opaque black read as
-        // `nonzero_static`, which is the reading a picture produces. Ask
-        // instead whether the frame holds more than one colour - a frame
-        // that does not is a fill, whatever the transport counters say.
-        var uniform_value: u32 = 0;
-        var uniform = false;
-        if (bytes.len >= 4 and bytes.len % 4 == 0) {
-            uniform = true;
-            uniform_value = std.mem.readInt(u32, bytes[0..4], .little);
-            var offset: usize = 4;
-            while (offset + 4 <= bytes.len) : (offset += 4) {
-                if (std.mem.readInt(u32, bytes[offset..][0..4], .little) != uniform_value) {
-                    uniform = false;
-                    break;
-                }
-            }
-        }
-        const hash = hashPixelBytes(bytes);
+        const stats = frame_capture.analyze(bytes, width, height, format) catch {
+            self.pixelProbeFailure(real_swapchain, frame, abi.ERROR_FORMAT_NOT_SUPPORTED, "readback analysis refused malformed frame", synthetic_image, write_kind);
+            return;
+        };
+        self.pixel_probe.last_stats = stats;
+        self.pixel_probe.last_stats_frame = frame;
+        self.pixel_probe.last_stats_format = format;
+        // Retain legacy readback-stat observations even when PNG/preview
+        // delivery is disabled. Delivery counters remain separate evidence.
+        self.pixel_probe.capture_last_frame = frame;
+        self.pixel_probe.capture_last_stats = stats;
+        const sample = ReadbackSample{ .frame = frame, .swapchain = real_swapchain, .image = synthetic_image, .width = width, .height = height, .format = format, .stats = stats };
+        self.pixel_probe.last_sample = sample;
+        const hash = stats.hash;
+        const uniform_value = stats.first_pixel;
         var previous_hash: u64 = 0;
         var previous_frame: u64 = 0;
         for (self.present_chain.swapchains[0..self.present_chain.swapchain_count]) |record| {
@@ -10910,25 +14942,301 @@ pub const Forwarder = struct {
                 break;
             }
         }
-        const evidence: rosette_gpu.PresentPixelEvidence = if (!any_nonzero)
+        const evidence: rosette_gpu.PresentPixelEvidence = if (!stats.any_nonzero)
             .solid_clear
-        else if (uniform)
+        else if (stats.uniform or stats.rgb_different_pixels == 0)
             .uniform_colour
         else if (previous_frame != 0 and previous_hash != hash)
             .changing
         else
             .nonzero_static;
-        self.present_chain.notePixelProbe(real_swapchain, evidence, hash, frame, uniform_value);
+        self.notePixelProbeResult(real_swapchain, evidence, hash, frame, uniform_value, synthetic_image, write_kind);
         self.pixel_probe.successes +|= 1;
-        if (self.pixel_probe.successes <= 4 or evidence == .changing) {
+        // WSI may reject this request, and the brightness ladder reuses the
+        // staging area. Copy only a requested capture, with one 64 MiB budget
+        // across the batch, and deliver it AFTER accepted native completion.
+        const candidate_picture = if (write_kind == .content and (self.picture_sequence.frames != 0 or stats.hasRgbDetail())) self.picture_sequence.frames +| 1 else 0;
+        const opening_preview = self.pixel_probe.preview_enabled and self.picture_sequence.frames == 0 and write_kind == .content and stats.hasRgbDetail();
+        if (preview_due or opening_preview or (self.pixel_probe.capture_enabled and self.pixel_probe.capture_policy.wantsCapture(frame, write_kind == .content, candidate_picture, false))) {
+            const owned = if (size <= frame_capture.max_bytes -| capture_bytes.*) std.heap.page_allocator.dupe(u8, bytes) catch null else null;
+            if (owned) |copy| {
+                capture.* = .{ .sample = sample, .bytes = copy, .write_kind = write_kind, .preview = preview_due or opening_preview };
+                capture_bytes.* += size;
+            } else {
+                self.pixel_probe.capture_failures +|= 1;
+                if (self.pixel_probe.capture_failures == 1) machoCapturePrint("macho-processor: FRAME CAPTURE: deferred copy unavailable or batch exceeds 64 MiB; pixel evidence retained, no unsafe staging pointer delivered\n", .{});
+            }
+        }
+        if (self.pixel_probe.successes <= 4 or force_content_probe or self.graphics_report_verbose) {
             machoCapturePrint(
-                "macho-processor: PIXEL PROBE: frame={d} swapchain=0x{x} image={d} bytes={d} evidence={s} hash=0x{x} uniform_value=0x{x} shows_detail={}\n",
-                .{ frame, real_swapchain, image_index, size, evidence.label(), hash, uniform_value, evidence.showsDetail() },
+                "macho-processor: PIXEL PROBE: frame={d} swapchain=0x{x} image_index={d} image=0x{x} write_kind={s} forced_content={} bytes={d} evidence={s} hash=0x{x} uniform_value=0x{x} shows_detail={}\n",
+                .{ frame, real_swapchain, image_index, synthetic_image, write_kind.label(), force_content_probe, size, evidence.label(), hash, uniform_value, evidence.showsDetail() },
+            );
+            machoCapturePrint(
+                "macho-processor: PIXEL CONTENT: frame={d} pixels={d} visible_rgb_gt16={d} bright_rgb_gt64={d} alpha_lt255={d} rgb_different={d} mean_rgb={d}/{d}/{d} min_rgb={d}/{d}/{d} max_rgb={d}/{d}/{d}; varying bytes alone do not prove a visible picture\n",
+                .{ frame, stats.pixel_count, stats.visible_pixels, stats.bright_pixels, stats.transparent_pixels, stats.rgb_different_pixels, stats.mean(0), stats.mean(1), stats.mean(2), stats.min_rgb[0], stats.min_rgb[1], stats.min_rgb[2], stats.max_rgb[0], stats.max_rgb[1], stats.max_rgb[2] },
+            );
+            if (write_kind == .content and stats.visible_pixels == 0) machoCapturePrint(
+                "macho-processor: FRAME CAPTURE FINDING: acquired-image RGB is entirely near-black (all channels <=16); transport and varying bytes do not establish a visible title image. Inspect saved RGB pixels and the shader/texture/source plane before blaming WSI\n",
+                .{},
+            );
+        }
+    }
+
+    /// The queue family a present queue belongs to, for a readback that must
+    /// record on the same family the image was released to.
+    fn presentQueueFamily(self: *const Forwarder, present_queue: abi.Queue) ?u32 {
+        var queue_family: u32 = abi.QUEUE_FAMILY_IGNORED;
+        for (self.real_vulkan.queue_map, 0..) |mapping, index| {
+            if (mapping.real == @intFromPtr(present_queue) and mapping.synthetic != 0) {
+                queue_family = self.real_vulkan.queue_family_indices[index];
+                break;
+            }
+        }
+        if (queue_family == abi.QUEUE_FAMILY_IGNORED and present_queue == self.real_vulkan.graphics_queue)
+            queue_family = self.real_vulkan.graphics_queue_family_index;
+        if (queue_family >= self.real_vulkan.queue_family_count or
+            self.real_vulkan.queue_family_properties[queue_family].queue_flags &
+                (abi.QUEUE_TRANSFER_BIT | abi.QUEUE_GRAPHICS_BIT | abi.QUEUE_COMPUTE_BIT) == 0)
+        {
+            return null;
+        }
+        return queue_family;
+    }
+
+    /// The guest handle behind a host image, for following a present-chain
+    /// edge (which is kept in host identities) back to the resource record
+    /// (which is kept by guest handle).
+    fn syntheticImageForReal(self: *const Forwarder, real: u64) ?u64 {
+        if (real == 0) return null;
+        for (self.real_vulkan.image_map) |entry| {
+            if (entry.synthetic != 0 and entry.real == real) return entry.synthetic;
+        }
+        return null;
+    }
+
+    /// Copy one colour image, mip 0 layer 0, into the probe's staging buffer
+    /// and return its bytes. The image is moved out of and back into
+    /// `layout`; the caller says what layout the image rests in. Completion
+    /// is the queue going idle, as for the swapchain probe, so the bytes are
+    /// valid until the next readback reuses the staging buffer.
+    fn readbackImageBytes(
+        self: *Forwarder,
+        image: abi.Image,
+        width: u32,
+        height: u32,
+        format: u32,
+        layout: u32,
+        queue: abi.Queue,
+        queue_family: u32,
+    ) ?[]const u8 {
+        const bytes_per_pixel = pixelProbeBytesPerPixel(format) orelse return null;
+        if (width == 0 or height == 0 or width > PIXEL_PROBE_MAX_BYTES / bytes_per_pixel / @as(u64, height)) return null;
+        const size = @as(u64, width) * @as(u64, height) * bytes_per_pixel;
+        if (!self.ensurePixelProbeResources(size, queue_family)) return null;
+        const command_buffer = self.pixel_probe.command_buffer orelse return null;
+        const fns = &self.real_vulkan.fn_ptrs;
+        const reset = fns.reset_command_buffer orelse return null;
+        const begin = fns.begin_command_buffer orelse return null;
+        const end = fns.end_command_buffer orelse return null;
+        const barrier_fn = fns.cmd_pipeline_barrier orelse return null;
+        const copy_fn = fns.cmd_copy_image_to_buffer orelse return null;
+        const submit_fn = fns.queue_submit orelse return null;
+        const wait_idle = fns.queue_wait_idle orelse return null;
+        if (reset(command_buffer, 0) != abi.SUCCESS) return null;
+        var begin_info = abi.CommandBufferBeginInfo{ .flags = abi.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+        if (begin(command_buffer, &begin_info) != abi.SUCCESS) return null;
+        var to_transfer = [_]abi.ImageMemoryBarrier{.{
+            .src_access_mask = abi.ACCESS_MEMORY_READ_BIT | abi.ACCESS_MEMORY_WRITE_BIT,
+            .dst_access_mask = abi.ACCESS_TRANSFER_READ_BIT,
+            .old_layout = layout,
+            .new_layout = abi.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .image = image,
+        }};
+        barrier_fn(command_buffer, abi.PIPELINE_STAGE_ALL_COMMANDS_BIT, abi.PIPELINE_STAGE_TRANSFER_BIT, 0, 0, null, 0, null, 1, &to_transfer);
+        var region = [_]abi.BufferImageCopy{.{
+            .image_subresource = .{ .aspect_mask = abi.IMAGE_ASPECT_COLOR_BIT, .layer_count = 1 },
+            .image_extent = .{ .width = width, .height = height, .depth = 1 },
+        }};
+        copy_fn(command_buffer, image, abi.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, self.pixel_probe.staging_buffer, 1, &region);
+        var to_host = [_]abi.BufferMemoryBarrier{.{
+            .src_access_mask = abi.ACCESS_TRANSFER_WRITE_BIT,
+            .dst_access_mask = abi.ACCESS_HOST_READ_BIT,
+            .buffer = self.pixel_probe.staging_buffer,
+            .size = abi.WHOLE_SIZE,
+        }};
+        barrier_fn(command_buffer, abi.PIPELINE_STAGE_TRANSFER_BIT, abi.PIPELINE_STAGE_HOST_BIT, 0, 0, null, 1, &to_host, 0, null);
+        var to_rest = [_]abi.ImageMemoryBarrier{.{
+            .src_access_mask = abi.ACCESS_TRANSFER_READ_BIT,
+            .dst_access_mask = abi.ACCESS_SHADER_READ_BIT | abi.ACCESS_MEMORY_READ_BIT,
+            .old_layout = abi.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .new_layout = layout,
+            .image = image,
+        }};
+        barrier_fn(command_buffer, abi.PIPELINE_STAGE_TRANSFER_BIT, abi.PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, null, 0, null, 1, &to_rest);
+        if (end(command_buffer) != abi.SUCCESS) return null;
+        var command_buffers = [_]abi.CommandBuffer{command_buffer};
+        var submits = [_]abi.SubmitInfo{.{
+            .command_buffer_count = 1,
+            .command_buffers = &command_buffers,
+        }};
+        if (submit_fn(queue, 1, &submits, 0) != abi.SUCCESS) return null;
+        if (wait_idle(queue) != abi.SUCCESS) return null;
+        if (!self.pixel_probe.mapped_coherent) {
+            const invalidate = fns.invalidate_mapped_memory_ranges orelse return null;
+            var ranges = [_]abi.MappedMemoryRange{.{ .memory = self.pixel_probe.staging_memory, .size = abi.WHOLE_SIZE }};
+            if (invalidate(self.real_vulkan.device.?, 1, &ranges) != abi.SUCCESS) return null;
+        }
+        const mapped = self.pixel_probe.mapped orelse return null;
+        return @as([*]const u8, @ptrCast(mapped))[0..@as(usize, @intCast(size))];
+    }
+
+    /// Fill one ladder stage from a host image identity: find its guest
+    /// record, read it back and measure it. Every failure is named in
+    /// `status` rather than dropped, because a stage that could not be read
+    /// is different from a stage that read dark.
+    fn readLadderStage(self: *Forwarder, stage: *LadderStage, real_image: u64, queue: abi.Queue, queue_family: u32) void {
+        stage.real_image = real_image;
+        if (real_image == 0) {
+            stage.status = "no_source_edge";
+            return;
+        }
+        const synthetic = self.syntheticImageForReal(real_image) orelse {
+            stage.status = "image_not_mapped";
+            return;
+        };
+        stage.synthetic_image = synthetic;
+        const resource = self.findResource(synthetic) orelse {
+            stage.status = "no_resource_record";
+            return;
+        };
+        stage.format = resource.format;
+        stage.width = resource.width;
+        stage.height = resource.height;
+        if (frame_capture.layoutFor(resource.format) == null) {
+            stage.status = "format_not_decodable";
+            return;
+        }
+        if ((resource.usage & abi.IMAGE_USAGE_TRANSFER_SRC_BIT) == 0 and
+            !imageReadbackAugmentable(resource.usage, resource.format, abi.IMAGE_TYPE_2D, abi.SAMPLE_COUNT_1_BIT))
+        {
+            stage.status = "no_transfer_src";
+            return;
+        }
+        self.brightness_ladder.readbacks +|= 1;
+        const bytes = self.readbackImageBytes(
+            @intCast(real_image),
+            resource.width,
+            resource.height,
+            resource.format,
+            abi.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            queue,
+            queue_family,
+        ) orelse {
+            self.brightness_ladder.readback_failures +|= 1;
+            stage.status = "readback_failed";
+            return;
+        };
+        stage.stats = frame_capture.analyze(bytes, resource.width, resource.height, resource.format) catch {
+            self.brightness_ladder.readback_failures +|= 1;
+            stage.status = "analysis_refused";
+            return;
+        };
+        stage.seven_e3 = frame_capture.analyzeSevenE3(bytes, resource.width, resource.height, resource.format);
+        stage.status = "read";
+    }
+
+    /// Read the two images upstream of a just-probed swapchain image and say
+    /// where the brightness went. Bounded like the swapchain probe: the first
+    /// eight content frames, then every sixtieth present.
+    fn probeBrightnessLadder(self: *Forwarder, real_swapchain: abi.SwapchainKHR, frame: u64, queue: abi.Queue, swapchain_stats: frame_capture.Stats, format: u32) void {
+        const ladder = &self.brightness_ladder;
+        const started = transport_timing.nowNs();
+        // A raw modulo-60 rule could alias with timed readback forever and
+        // stop observing gamma/source changes. Keep the first eight proofs,
+        // then one ladder per host second per swapchain, independently of
+        // raw presentation rate and batch order.
+        if (!ladder.probe_schedule.choose(real_swapchain, started, 1_000_000_000, ladder.samples < 8)) return;
+        const pending = self.present_chain.pendingFrame(real_swapchain) orelse return;
+        if (pending.write_kind != .content) return;
+        const queue_family = self.presentQueueFamily(queue) orelse return;
+        defer self.transport_cost.finish(.readback_inclusive, started);
+        ladder.samples +|= 1;
+        ladder.last_frame = frame;
+
+        var swapchain_stage = LadderStage{ .label = "swapchain", .format = format, .stats = swapchain_stats, .status = "read" };
+        var output_stage = LadderStage{ .label = "guest_output" };
+        var source_stage = LadderStage{ .label = "swap_texture" };
+        self.readLadderStage(&output_stage, pending.sampled_image, queue, queue_family);
+        const sources = self.present_chain.passSourcesOf(pending.sampled_image);
+        self.readLadderStage(&source_stage, sources[0], queue, queue_family);
+
+        const swapchain_peak: u16 = swapchain_stage.stats.?.peak();
+        const output_peak: u16 = if (output_stage.stats) |stats| stats.peak() else 256;
+        const source_peak: u16 = if (source_stage.stats) |stats| stats.peak() else 256;
+        ladder.last_peaks = .{ source_peak, output_peak, swapchain_peak };
+        // "Dark" is the swapchain probe's own threshold, 64/255, at every
+        // stage. The 2026-09-17 run read a dim swap texture (peak 36) and
+        // called it unknown because the first rule wanted 16.
+        const verdict: BrightnessLoss = if (swapchain_peak > 64)
+            .none
+        else if (source_peak != 256 and source_peak <= 64)
+            .before_gamma_pass
+        else if (source_peak != 256 and source_peak > 64 and output_peak != 256 and output_peak <= 64)
+            .gamma_pass
+        else if (output_peak != 256 and output_peak > 64)
+            .present_paint
+        else if (output_peak != 256 and output_peak <= 64 and source_peak == 256)
+            // Dark out of the gamma pass with no readable input: the loss is
+            // at or before the pass, which still clears the presenter.
+            .gamma_pass
+        else
+            .unknown;
+        ladder.verdict_counts[@intFromEnum(verdict)] +|= 1;
+        const changed = verdict != ladder.last_verdict;
+        ladder.last_verdict = verdict;
+        if (ladder.printed < 8 or changed) {
+            ladder.printed +|= 1;
+            self.printLadderStage(frame, &source_stage);
+            self.printLadderStage(frame, &output_stage);
+            self.printLadderStage(frame, &swapchain_stage);
+            machoCapturePrint(
+                "macho-processor: BRIGHTNESS LADDER: frame={d} peaks(swap_texture/guest_output/swapchain)={d}/{d}/{d} (256=unread) ramp_format={d} ramp_shape={s} ramp_out(max/7e3_one/mid)={d}/{d}/{d} verdict={s}: {s}\n",
+                .{ frame, source_peak, output_peak, swapchain_peak, self.texel_custody_last_format, self.texel_custody_last_shape.label(), self.texel_custody_last_out[0], self.texel_custody_last_out[1], self.texel_custody_last_out[2], verdict.label(), verdict.meaning() },
+            );
+            if (verdict == .before_gamma_pass and self.texel_custody_last_shape == .xenia_default_linear and self.texel_custody_last_format == 81) {
+                machoCapturePrint(
+                    "macho-processor: BRIGHTNESS LADDER: the ramp in use is Xenia's seeded linear PWL ramp, not one the title programmed. A title whose final pass renders 7e3 floating-point data and relies on DC_LUT programming to display it has not had that programming reach Xenia's command processor (MMIO DC_LUT writes are stored by GraphicsSystem::WriteRegister without updating the ramp; only PM4 type-0 writes do)\n",
+                    .{},
+                );
+            }
+        }
+    }
+
+    fn printLadderStage(self: *const Forwarder, frame: u64, stage: *const LadderStage) void {
+        _ = self;
+        if (stage.stats) |stats| {
+            machoCapturePrint(
+                "macho-processor: BRIGHTNESS LADDER:   stage={s} image=0x{x} guest=0x{x} format={d} extent={d}x{d} mean_rgb={d}/{d}/{d} max_rgb={d}/{d}/{d} visible_gt16={d} bright_gt64={d} rgb_different={d} frame={d}\n",
+                .{ stage.label, stage.real_image, stage.synthetic_image, stage.format, stage.width, stage.height, stats.mean(0), stats.mean(1), stats.mean(2), stats.max_rgb[0], stats.max_rgb[1], stats.max_rgb[2], stats.visible_pixels, stats.bright_pixels, stats.rgb_different_pixels, frame },
+            );
+            if (stage.seven_e3) |seven| {
+                machoCapturePrint(
+                    "macho-processor: BRIGHTNESS LADDER:   stage={s} as_7e3(max_milli/mean_milli)={d}/{d}/{d} / {d}/{d}/{d} over_one_pixels={d}; 1000 is 1.0 (white before tonemapping), so a UNORM max_rgb near 96 with as_7e3 near 1000 is a bright 7e3 front buffer, not a dark one\n",
+                    .{ stage.label, seven.max_milli[0], seven.max_milli[1], seven.max_milli[2], seven.mean(0), seven.mean(1), seven.mean(2), seven.over_one_pixels },
+                );
+            }
+        } else {
+            machoCapturePrint(
+                "macho-processor: BRIGHTNESS LADDER:   stage={s} image=0x{x} guest=0x{x} format={d} extent={d}x{d} status={s} frame={d}\n",
+                .{ stage.label, stage.real_image, stage.synthetic_image, stage.format, stage.width, stage.height, stage.status, frame },
             );
         }
     }
 
     fn queuePresent(self: *Forwarder, state: anytype) u64 {
+        const ingress_ns = transport_timing.nowNs();
+        self.transport_cost.ingress(ingress_ns);
         self.vulkan_presents +|= 1;
         self.frame_provenance.noteGuestVulkanCall();
         if (self.realDeviceLostResult()) |result| return result;
@@ -10946,11 +15254,22 @@ pub const Forwarder = struct {
             var swapchains: [8]abi.SwapchainKHR = [_]abi.SwapchainKHR{0} ** 8;
             var synthetic_swapchains: [8]u64 = [_]u64{0} ** 8;
             var indices: [8]u32 = [_]u32{0} ** 8;
-            var results: [8]abi.Result = [_]abi.Result{abi.SUCCESS} ** 8;
+            // NOT_READY is an unwritten sentinel, not invented success. The
+            // native pResults is supplied even when the guest omitted it.
+            var results: [8]abi.Result = [_]abi.Result{abi.NOT_READY} ** 8;
+            var captures: [8]?PendingReadbackCapture = @splat(null);
+            var capture_bytes: u64 = 0;
+            defer for (captures) |capture| {
+                if (capture) |pending| std.heap.page_allocator.free(pending.bytes);
+            };
+            var samples: [8]?ReadbackSample = @splat(null);
+            var acquired_images: [8]u64 = @splat(0);
             for (0..wait_count) |index| {
                 const synthetic = state.read64(wait_address + @as(u64, @intCast(index)) * 8);
                 waits[index] = self.real_vulkan.realSemaphore(synthetic) orelse return vkErrorInitializationFailed();
             }
+            var waits_consumed = false;
+            self.pixel_probe.readback_completion_failed = false;
             for (0..swapchain_count) |index| {
                 const synthetic = state.read64(swapchain_address + @as(u64, @intCast(index)) * 8);
                 synthetic_swapchains[index] = synthetic;
@@ -10967,29 +15286,84 @@ pub const Forwarder = struct {
             };
             const real_queue = self.real_vulkan.realQueue(state.regs.rdi) orelse return vkErrorInitializationFailed();
             // The probe is inserted after the guest's queued rendering and
-            // before WSI consumes the image.  Its second layout transition
+            // before WSI consumes the image. Its second layout transition
             // restores PRESENT_SRC_KHR, so the guest present remains the
-            // authoritative display operation.
+            // authoritative display operation. The pending ledger is read
+            // before notePresent clears it; that is what lets the first
+            // content-backed image bypass the sparse startup schedule.
+            var content_targets: [8]bool = @splat(false);
             for (0..swapchain_count) |index| {
+                const pending = self.present_chain.pendingFrame(swapchains[index]);
+                if (self.real_vulkan.swapchainRecord(synthetic_swapchains[index])) |record| {
+                    if (indices[index] < record.image_count) acquired_images[index] = record.image_handles[indices[index]];
+                }
+                const real_image = self.real_vulkan.realImage(acquired_images[index]) orelse 0;
+                // The command ledger uses native image IDs; the readback
+                // packet uses guest IDs. Prove that the presented index is
+                // precisely the acquired/written image before crediting it.
+                const write_kind: WriteKind = if (pending) |frame|
+                    (if (frame.has_target and real_image != 0 and frame.acquired_image == real_image) frame.write_kind else .none)
+                else
+                    .none;
+                content_targets[index] = write_kind == .content;
+                const force_content_probe = shouldForceContentPixelProbe(&self.pixel_probe, write_kind);
                 self.probeGuestSwapchainImage(
                     synthetic_swapchains[index],
                     swapchains[index],
                     indices[index],
                     self.vulkan_presents,
+                    write_kind,
+                    force_content_probe,
+                    real_queue,
+                    waits[0..wait_count],
+                    &waits_consumed,
+                    &captures[index],
+                    &capture_bytes,
+                );
+                if (self.pixel_probe.readback_completion_failed) {
+                    // A submitted copy without completion cannot be displayed
+                    // safely or presented with its consumed binary waits.
+                    self.noteRealVulkanResult(self.pixel_probe.last_result, "vkQueueWaitIdle(readback-completion)");
+                    return @as(u32, @bitCast(self.pixel_probe.last_result));
+                }
+                if (self.pixel_probe.last_sample) |sample| {
+                    if (sample.frame == self.vulkan_presents and sample.swapchain == swapchains[index] and sample.image == acquired_images[index]) samples[index] = sample;
+                }
+            }
+            var content_target_observed = false;
+            for (content_targets) |content_target| {
+                content_target_observed = content_target_observed or content_target;
+            }
+            if (content_target_observed and self.native_presenter.stage.isReady()) {
+                // The guest now has real work attached to its acquired image.
+                // Retire Rosette's bootstrap swapchain before the guest WSI
+                // presents so one CAMetalLayer drawable pool is not contested.
+                self.retireNativePresenterForGuestSwapchain(
+                    self.native_presenter.extent.width,
+                    self.native_presenter.extent.height,
                 );
             }
+            if (waits_consumed) {
+                // Also clear on post-submit analysis/invalidation failure:
+                // those failures do not un-consume a binary semaphore.
+                real_info.wait_semaphore_count = 0;
+                real_info.wait_semaphores = null;
+            }
+            const present_started = transport_timing.nowNs();
             const result = self.real_vulkan.fn_ptrs.queue_present.?(real_queue, &real_info);
+            self.transport_cost.finish(.wsi_present, present_started);
             self.noteRealVulkanResult(result, "vkQueuePresentKHR");
+            var accepted_content = false;
             for (0..swapchain_count) |index| {
                 // Per-swapchain results are authoritative when the driver
                 // fills them; the batch result is the fallback.
-                const per_swapchain = if (result_address != 0) results[index] else result;
-                self.present_chain.notePresent(swapchains[index], per_swapchain);
+                const per_swapchain = resolvedPresentResult(result, results[index]);
+                accepted_content = accepted_content or (content_targets[index] and (per_swapchain == abi.SUCCESS or per_swapchain == abi.SUBOPTIMAL_KHR));
             }
-            self.reportPresentChain(false);
+            if (accepted_content) self.transport_cost.content(ingress_ns);
             if (result_address != 0 and swapchain_count != 0) {
                 if (state.guestMemory(result_address, @as(u64, swapchain_count) * 4)) |guest_results| {
-                    for (0..swapchain_count) |index| std.mem.writeInt(i32, guest_results[index * 4 ..][0..4], results[index], .little);
+                    for (0..swapchain_count) |index| std.mem.writeInt(i32, guest_results[index * 4 ..][0..4], resolvedPresentResult(result, results[index]), .little);
                 }
             }
             self.frame_provenance.noteNativePresentRequest();
@@ -11002,7 +15376,9 @@ pub const Forwarder = struct {
             var completion_result: abi.Result = abi.NOT_READY;
             if (result == abi.SUCCESS or result == abi.SUBOPTIMAL_KHR) {
                 if (self.real_vulkan.fn_ptrs.queue_wait_idle) |wait_idle| {
+                    const completion_started = transport_timing.nowNs();
                     completion_result = wait_idle(real_queue);
+                    self.transport_cost.finish(.present_completion, completion_started);
                     self.noteRealVulkanResult(completion_result, "vkQueueWaitIdle(present-completion)");
                     hardware_completed = completion_result == abi.SUCCESS;
                 }
@@ -11011,6 +15387,43 @@ pub const Forwarder = struct {
             self.vulkan_tiers.note(.presentation, .real);
             if (result == abi.SUCCESS or result == abi.SUBOPTIMAL_KHR) self.vulkan_real_presents +|= 1;
             if (hardware_completed) self.vulkan_real_present_completions +|= 1;
+            const completed_ns = transport_timing.nowNs();
+            for (0..swapchain_count) |index| {
+                const per_swapchain = resolvedPresentResult(result, results[index]);
+                const accepted = per_swapchain == abi.SUCCESS or per_swapchain == abi.SUBOPTIMAL_KHR;
+                const opened = self.picture_sequence.observe(.{
+                    .present = self.vulkan_presents,
+                    .swapchain = swapchains[index],
+                    .image = acquired_images[index],
+                    .content = content_targets[index],
+                    .accepted = accepted,
+                    .completed = hardware_completed,
+                    .sample = if (samples[index]) |sample| sample.pictureEvidence() else null,
+                }, completed_ns);
+                if (opened) machoCapturePrint("macho-processor: CONTENT FRAME BEGIN: frame=1 raw_present={d} swapchain=0x{x} image=0x{x} custody=fresh_RGB_detail+native_accepted+queue_completed; first observed picture, not a game-loop or scanout claim\n", .{ self.vulkan_presents, swapchains[index], acquired_images[index] });
+            }
+            // Independent CPU preview is still not WSI/scanout evidence. A
+            // rejected or incomplete native request never receives an epoch
+            // frame number or consumes the picture PNG budget.
+            for (0..swapchain_count) |index| {
+                const per_swapchain = resolvedPresentResult(result, results[index]);
+                if (hardware_completed and (per_swapchain == abi.SUCCESS or per_swapchain == abi.SUBOPTIMAL_KHR)) {
+                    if (captures[index]) |capture| {
+                        const picture_frame = if (content_targets[index] and self.picture_sequence.last_present == self.vulkan_presents) self.picture_sequence.frames else 0;
+                        self.captureReadback(capture, picture_frame);
+                    }
+                    if (content_targets[index]) {
+                        if (samples[index]) |sample| {
+                            self.transport_cost.pixels(sample.stats.hash, completed_ns);
+                            self.probeBrightnessLadder(swapchains[index], self.vulkan_presents, real_queue, sample.stats, sample.format);
+                        }
+                    }
+                }
+                self.present_chain.notePresent(swapchains[index], per_swapchain);
+            }
+            // Report after updating completion counters, not one present
+            // behind. An accepted request alone is not completion evidence.
+            self.reportPresentChain(false);
             if (self.vulkan_real_presents <= 4) {
                 machoCapturePrint(
                     "macho-processor: REAL vkQueuePresentKHR: request={s} queue_completion={s} completion_result={d}\n",
@@ -11082,10 +15495,16 @@ pub const Forwarder = struct {
         }
 
         const record = self.freeVulkanMemoryRecord() orelse return vkErrorOutOfHostMemory();
+        if (self.real_vulkan.hasDevice() and HandleMap.freeSlots(&self.real_vulkan.memory_map) == 0) {
+            self.noteVulkanMapCapacityRefusal("vkAllocateMemory", 1, 0);
+            return vkErrorOutOfHostMemory();
+        }
         const handle = self.nextVulkanObject();
         record.* = .{
             .handle = handle,
             .requested_size = requested_size,
+            .memory_flags_known = self.real_vulkan.hasDevice() and memory_type_index < self.real_vulkan.physical_device_memory.memory_type_count,
+            .memory_flags = if (memory_type_index < self.real_vulkan.physical_device_memory.memory_type_count) self.real_vulkan.physical_device_memory.memory_types[memory_type_index].property_flags else 0,
         };
         self.vulkan_memory_allocations +|= 1;
 
@@ -11104,7 +15523,11 @@ pub const Forwarder = struct {
             const result = alloc_fn(device, &alloc_info, null, &real_memory);
             self.noteRealVulkanResult(result, "vkAllocateMemory");
             if (result == 0 and real_memory != 0) {
-                HandleMap.allocOrFind(&self.real_vulkan.memory_map, handle, real_memory);
+                if (!self.mapVulkanHandle(&self.real_vulkan.memory_map, handle, real_memory, "vkAllocateMemory")) {
+                    if (self.real_vulkan.fn_ptrs.free_memory) |free| free(device, real_memory, null);
+                    record.* = .{};
+                    return vkErrorOutOfHostMemory();
+                }
                 self.vulkan_tiers.note(.device_memory, .real);
                 if (sparseVulkanSuccessLog(self.vulkan_memory_allocations)) machoCapturePrint(
                     "macho-processor: REAL Vulkan memory sample: count={d} synthetic=0x{x} real=0x{x} size={d} type={d}\n",
@@ -11176,6 +15599,12 @@ pub const Forwarder = struct {
             }
             self.vulkan_memory_map_reuses +|= 1;
         } else if (self.real_vulkan.hasDevice()) {
+            if (comptime @hasDecl(@TypeOf(state.*), "borrowNativeMemory")) {
+                if (abi.nativeMemoryMapAlignment(&self.real_vulkan.physical_device_properties) == null) {
+                    machoCapturePrint("macho-processor: NATIVE MEMORY ALIAS REFUSED: memory=0x{x}; minMemoryMapAlignment unavailable or exceeds the validated 4-GiB address-alignment contract\n", .{memory_handle});
+                    return @as(u32, @bitCast(abi.ERROR_MEMORY_MAP_FAILED));
+                }
+            }
             // Map the native allocation first. The guest shadow is committed
             // only after the driver accepts the request, so a failed native
             // map cannot leave a record that later appears reusable.
@@ -11191,15 +15620,49 @@ pub const Forwarder = struct {
                 );
                 return @as(u32, @bitCast(if (result != abi.SUCCESS) result else abi.ERROR_MEMORY_MAP_FAILED));
             }
-            const mapped_base = state.guestAlloc(record.requested_size, 16) orelse {
-                if (self.real_vulkan.fn_ptrs.unmap_memory) |unmap| unmap(device, real_mem);
-                return vkErrorOutOfHostMemory();
-            };
-            record.mapped_base = mapped_base;
+            const host_bytes = @as([*]u8, @ptrCast(host_ptr.?))[0..@as(usize, @intCast(map_size))];
+            if (comptime @hasDecl(@TypeOf(state.*), "borrowNativeMemory")) {
+                const alias = state.borrowNativeMemory(host_bytes) orelse {
+                    if (self.real_vulkan.fn_ptrs.unmap_memory) |unmap| unmap(device, real_mem);
+                    machoCapturePrint("macho-processor: NATIVE MEMORY ALIAS REFUSED: memory=0x{x} size={d}; native map rolled back, not silently downgraded to incoherent shadow\n", .{ memory_handle, map_size });
+                    return vkErrorOutOfHostMemory();
+                };
+                record.native_alias_base = alias;
+                record.mapped_base = alias - offset;
+                self.vulkan_native_memory_aliases +|= 1;
+            } else {
+                record.mapped_base = state.guestAlloc(record.requested_size, 16) orelse {
+                    if (self.real_vulkan.fn_ptrs.unmap_memory) |unmap| unmap(device, real_mem);
+                    return vkErrorOutOfHostMemory();
+                };
+            }
             record.mapped_size = record.requested_size;
             record.mapped_offset = offset;
             record.host_mapped_ptr = host_ptr;
             record.host_mapped_size = map_size;
+            if (record.native_alias_base == 0) {
+                record.shadow_baseline = std.heap.c_allocator.dupe(u8, host_bytes) catch {
+                    if (self.real_vulkan.fn_ptrs.unmap_memory) |unmap| unmap(device, real_mem);
+                    record.mapped_base = 0;
+                    record.mapped_size = 0;
+                    record.mapped_offset = 0;
+                    record.host_mapped_ptr = null;
+                    record.host_mapped_size = 0;
+                    return vkErrorOutOfHostMemory();
+                };
+                // Mapping an existing allocation exposes its current bytes, not
+                // the zero-filled guest allocator window. No completion is
+                // invented: the guest still owes the usual fence/invalidate edge.
+                if (!self.copyMappedBytes(state, memory_handle, offset, map_size, false)) {
+                    if (self.real_vulkan.fn_ptrs.unmap_memory) |unmap| unmap(device, real_mem);
+                    record.releaseBaseline();
+                    record.mapped_base = 0;
+                    record.mapped_size = 0;
+                    record.host_mapped_ptr = null;
+                    record.host_mapped_size = 0;
+                    return vkErrorInitializationFailed();
+                }
+            }
             self.vulkan_tiers.note(.memory_mapping, .real);
             if (sparseVulkanSuccessLog(self.vulkan_memory_maps + 1)) machoCapturePrint(
                 "macho-processor: REAL Vulkan map sample: count={d} synthetic=0x{x} real=0x{x} host_ptr=0x{x} size={d}\n",
@@ -11224,11 +15687,16 @@ pub const Forwarder = struct {
                     if (self.real_vulkan.fn_ptrs.unmap_memory) |unmap| unmap(self.real_vulkan.device.?, real_memory);
                 }
             }
+            if (comptime @hasDecl(@TypeOf(state.*), "releaseNativeMemory")) {
+                if (record.native_alias_base != 0) state.releaseNativeMemory(record.native_alias_base);
+            }
+            record.native_alias_base = 0;
             record.mapped_base = 0;
             record.mapped_size = 0;
             record.mapped_offset = 0;
             record.host_mapped_ptr = null;
             record.host_mapped_size = 0;
+            record.releaseBaseline();
             return vkErrorInitializationFailed();
         };
         state.write64(output, mapped_address);
@@ -11275,7 +15743,20 @@ pub const Forwarder = struct {
         if (std.mem.eql(u8, name, "vkAllocateCommandBuffers") and self.real_vulkan.hasDevice() and self.real_vulkan.fn_ptrs.allocate_command_buffers != null) {
             const pool_synthetic = state.read64(info + 16);
             const pool = self.real_vulkan.realCommandPool(pool_synthetic) orelse return vkErrorInitializationFailed();
-            const real_count: u32 = @min(count, 256);
+            if (count > 256) {
+                return self.refuseVulkanCall(
+                    name,
+                    "native command-buffer batch exceeds the bridge's bounded output storage",
+                    abi.ERROR_OUT_OF_HOST_MEMORY,
+                    .{ count, 256, output },
+                );
+            }
+            const real_count: u32 = @intCast(count);
+            const available = HandleMap.freeSlots(&self.real_vulkan.command_buffer_map);
+            if (available < @as(usize, @intCast(real_count))) {
+                self.noteVulkanMapCapacityRefusal(name, @intCast(real_count), available);
+                return vkErrorOutOfHostMemory();
+            }
             var real_info = abi.CommandBufferAllocateInfo{
                 .command_pool = pool,
                 .level = state.read32(info + 24),
@@ -11285,11 +15766,28 @@ pub const Forwarder = struct {
             const result = self.real_vulkan.fn_ptrs.allocate_command_buffers.?(self.real_vulkan.device.?, &real_info, &real_buffers);
             self.noteRealVulkanResult(result, "vkAllocateCommandBuffers");
             if (result != abi.SUCCESS) return @as(u32, @bitCast(result));
+            var synthetic_buffers: [256]u64 = [_]u64{0} ** 256;
+            var mapped_count: usize = 0;
             for (0..real_count) |index| {
                 const synthetic = self.nextVulkanObject();
+                const real = real_buffers[index] orelse {
+                    for (synthetic_buffers[0..mapped_count]) |mapped| {
+                        _ = self.releaseVulkanHandle(&self.real_vulkan.command_buffer_map, mapped);
+                    }
+                    if (self.real_vulkan.fn_ptrs.free_command_buffers) |free| free(self.real_vulkan.device.?, pool, real_count, &real_buffers);
+                    return vkErrorInitializationFailed();
+                };
+                if (!self.mapVulkanHandle(&self.real_vulkan.command_buffer_map, synthetic, @intFromPtr(real), name)) {
+                    for (synthetic_buffers[0..mapped_count]) |mapped| {
+                        _ = self.releaseVulkanHandle(&self.real_vulkan.command_buffer_map, mapped);
+                    }
+                    if (self.real_vulkan.fn_ptrs.free_command_buffers) |free| free(self.real_vulkan.device.?, pool, real_count, &real_buffers);
+                    return vkErrorOutOfHostMemory();
+                }
+                synthetic_buffers[mapped_count] = synthetic;
+                mapped_count += 1;
                 state.write64(output + @as(u64, @intCast(index)) * 8, synthetic);
                 registerOpaqueHandle(state, synthetic, name);
-                HandleMap.allocOrFind(&self.real_vulkan.command_buffer_map, synthetic, @intFromPtr(real_buffers[index].?));
             }
             self.vulkan_tiers.note(.command_buffer, .real);
             self.vulkan_command_buffer_allocations +|= 1;
@@ -11302,7 +15800,21 @@ pub const Forwarder = struct {
         if (std.mem.eql(u8, name, "vkAllocateDescriptorSets") and self.real_vulkan.hasDevice() and self.real_vulkan.fn_ptrs.allocate_descriptor_sets != null) {
             const pool_synthetic = state.read64(info + 16);
             const pool = self.real_vulkan.realDescriptorPool(pool_synthetic) orelse return vkErrorInitializationFailed();
-            const real_count: u32 = @min(count, 256);
+            if (count > 256) {
+                return self.refuseVulkanCall(
+                    name,
+                    "native descriptor-set batch exceeds the bridge's bounded output storage",
+                    abi.ERROR_OUT_OF_HOST_MEMORY,
+                    .{ count, 256, output },
+                );
+            }
+            _ = self.reclaimOrphanedDescriptorSets();
+            const real_count: u32 = @intCast(count);
+            const available = HandleMap.freeSlots(&self.real_vulkan.descriptor_set_map);
+            if (available < @as(usize, @intCast(real_count))) {
+                self.noteVulkanMapCapacityRefusal(name, @intCast(real_count), available);
+                return vkErrorOutOfHostMemory();
+            }
             const layouts_address = state.read64(info + 32);
             if (layouts_address == 0 or state.guestMemoryConst(layouts_address, @as(u64, real_count) * 8) == null) return vkErrorInitializationFailed();
             var layouts: [256]u64 = [_]u64{0} ** 256;
@@ -11319,11 +15831,23 @@ pub const Forwarder = struct {
             const result = self.real_vulkan.fn_ptrs.allocate_descriptor_sets.?(self.real_vulkan.device.?, &real_info, &real_sets);
             self.noteRealVulkanResult(result, "vkAllocateDescriptorSets");
             if (result != abi.SUCCESS) return @as(u32, @bitCast(result));
+            var synthetic_sets: [256]u64 = [_]u64{0} ** 256;
+            var mapped_count: usize = 0;
             for (0..real_count) |index| {
                 const synthetic = self.nextVulkanObject();
+                if (!self.mapVulkanHandleOwned(&self.real_vulkan.descriptor_set_map, synthetic, real_sets[index], pool_synthetic, name)) {
+                    for (synthetic_sets[0..mapped_count]) |mapped| {
+                        _ = self.releaseVulkanHandle(&self.real_vulkan.descriptor_set_map, mapped);
+                        self.forgetDescriptorSet(mapped);
+                    }
+                    if (self.real_vulkan.fn_ptrs.free_descriptor_sets) |free| _ = free(self.real_vulkan.device.?, pool, real_count, &real_sets);
+                    return vkErrorOutOfHostMemory();
+                }
+                synthetic_sets[mapped_count] = synthetic;
+                mapped_count += 1;
                 state.write64(output + @as(u64, @intCast(index)) * 8, synthetic);
                 registerOpaqueHandle(state, synthetic, name);
-                HandleMap.allocOrFind(&self.real_vulkan.descriptor_set_map, synthetic, real_sets[index]);
+                self.noteDescriptorSetPool(synthetic, pool_synthetic);
             }
             self.vulkan_tiers.note(.descriptor_set, .real);
             self.vulkan_descriptor_set_allocations +|= 1;
@@ -11673,8 +16197,37 @@ pub const Forwarder = struct {
 
         var real_pipeline: u64 = 0;
         const result = function(self.real_vulkan.device.?, real_cache, 1, @ptrCast(&root), null, @ptrCast(&real_pipeline));
+        var repair_pipeline: u64 = 0;
+        const guest_output_candidate = result == abi.SUCCESS and self.isGuestOutputPaintPipeline(&root);
+        if (guest_output_candidate) {
+            self.graphics_topology_repair_candidates +|= 1;
+            const original_topology = input_assembly.topology;
+            input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+            var repair_result: i32 = abi.ERROR_INITIALIZATION_FAILED;
+            repair_result = function(self.real_vulkan.device.?, real_cache, 1, @ptrCast(&root), null, @ptrCast(&repair_pipeline));
+            input_assembly.topology = original_topology;
+            if (repair_result == abi.SUCCESS and repair_pipeline != 0) {
+                self.graphics_topology_repair_pipeline_creations +|= 1;
+                if (sparseVulkanSuccessLog(self.graphics_topology_repair_pipeline_creations)) {
+                    machoCapturePrint(
+                        "macho-processor: Vulkan guest-output topology twin created: original=0x{x} repair=0x{x} layout=0x{x} candidate={d}\n",
+                        .{ real_pipeline, repair_pipeline, root.layout, self.graphics_topology_repair_candidates },
+                    );
+                }
+            } else {
+                self.graphics_topology_repair_create_failures +|= 1;
+                if (self.graphics_topology_repair_create_failures <= 8) {
+                    machoCapturePrint(
+                        "macho-processor: Vulkan guest-output topology twin unavailable: original=0x{x} result={d} repair=0x{x}; original pipeline remains active\n",
+                        .{ real_pipeline, repair_result, repair_pipeline },
+                    );
+                }
+                repair_pipeline = 0;
+            }
+        }
         result_output.* = result;
         real_output.* = real_pipeline;
+        if (result == abi.SUCCESS) self.rememberGraphicsPipeline(real_pipeline, &root, repair_pipeline, guest_output_candidate);
     }
 
     fn createRealComputePipeline(
@@ -11725,6 +16278,25 @@ pub const Forwarder = struct {
         real_output.* = real_pipeline;
     }
 
+    /// A vkCreate*Pipelines call is atomic from the guest's perspective even
+    /// though the bridge forwards one pipeline at a time so each create-info
+    /// can be translated independently.  If a later item fails, dispose of
+    /// every earlier native pipeline and its reverse mapping before returning
+    /// the failure.  Otherwise a title that retries a partially failed batch
+    /// would leak one native object per retry and eventually hit the same
+    /// long-run resource wall as the old descriptor-set map.
+    fn rollbackCreatedVulkanPipelines(self: *Forwarder, synthetic_pipelines: []const u64) void {
+        const device = self.real_vulkan.device orelse return;
+        for (synthetic_pipelines) |synthetic| {
+            if (synthetic == 0) continue;
+            if (self.real_vulkan.realPipeline(synthetic)) |real| {
+                if (self.real_vulkan.fn_ptrs.destroy_pipeline) |destroy| destroy(device, real, null);
+                self.vulkan_real_objects_destroyed +|= 1;
+            }
+            _ = self.releaseVulkanHandle(&self.real_vulkan.pipeline_map, synthetic);
+        }
+    }
+
     fn createMultipleVulkanObjects(self: *Forwarder, state: anytype, count: u64, output: u64, name: []const u8) u64 {
         if (count == 0) return 0;
         if (output == 0 or state.guestMemory(output, count * 8) == null) return vkErrorInitializationFailed();
@@ -11732,6 +16304,13 @@ pub const Forwarder = struct {
         if (self.real_vulkan.hasDevice() and (std.mem.eql(u8, name, "vkCreateGraphicsPipelines") or std.mem.eql(u8, name, "vkCreateComputePipelines"))) {
             const info_size: usize = if (std.mem.eql(u8, name, "vkCreateGraphicsPipelines")) @sizeOf(abi.GraphicsPipelineCreateInfo) else @sizeOf(abi.ComputePipelineCreateInfo);
             if (count > 64 or state.guestMemoryConst(state.regs.rcx, count * info_size) == null) return vkErrorInitializationFailed();
+            const available = HandleMap.freeSlots(&self.real_vulkan.pipeline_map);
+            if (available < @as(usize, @intCast(count))) {
+                self.noteVulkanMapCapacityRefusal(name, @intCast(count), available);
+                return vkErrorOutOfHostMemory();
+            }
+            var created_synthetic: [64]u64 = [_]u64{0} ** 64;
+            var created_count: usize = 0;
             for (0..@as(usize, @intCast(count))) |index| {
                 const guest_info = state.regs.rcx + @as(u64, @intCast(index)) * info_size;
                 var real_pipeline: u64 = 0;
@@ -11743,11 +16322,27 @@ pub const Forwarder = struct {
                     self.createRealComputePipeline(state, state.regs.rsi, guest_info, &real_pipeline, &result, &reason);
                 if (forwarded) {
                     self.noteRealVulkanResult(result, name);
-                    if (result != abi.SUCCESS) return @as(u32, @bitCast(result));
+                    if (result != abi.SUCCESS) {
+                        if (real_pipeline != 0) {
+                            if (self.real_vulkan.fn_ptrs.destroy_pipeline) |destroy| destroy(self.real_vulkan.device.?, real_pipeline, null);
+                            self.vulkan_real_objects_destroyed +|= 1;
+                        }
+                        self.rollbackCreatedVulkanPipelines(created_synthetic[0..created_count]);
+                        return @as(u32, @bitCast(result));
+                    }
                     const synthetic = self.nextVulkanObject();
+                    if (!self.mapVulkanHandle(&self.real_vulkan.pipeline_map, synthetic, real_pipeline, name)) {
+                        if (real_pipeline != 0) {
+                            if (self.real_vulkan.fn_ptrs.destroy_pipeline) |destroy| destroy(self.real_vulkan.device.?, real_pipeline, null);
+                            self.vulkan_real_objects_destroyed +|= 1;
+                        }
+                        self.rollbackCreatedVulkanPipelines(created_synthetic[0..created_count]);
+                        return vkErrorOutOfHostMemory();
+                    }
+                    created_synthetic[created_count] = synthetic;
+                    created_count += 1;
                     state.write64(output + @as(u64, @intCast(index)) * 8, synthetic);
                     registerOpaqueHandle(state, synthetic, name);
-                    HandleMap.allocOrFind(&self.real_vulkan.pipeline_map, synthetic, real_pipeline);
                     self.vulkan_real_objects_created +|= 1;
                     self.vulkan_tiers.note(.pipeline, .real);
                 } else {
@@ -11756,6 +16351,7 @@ pub const Forwarder = struct {
                     // have no host object and the command stream would be
                     // silently discarded. Refuse the create instead so the
                     // guest sees the actual bridge limitation at this call.
+                    self.rollbackCreatedVulkanPipelines(created_synthetic[0..created_count]);
                     machoCapturePrint(
                         "macho-processor: REAL {s}: could not marshal pipeline index={d} ({s}); refusing synthetic fallback\n",
                         .{ name, index, reason },
@@ -12001,27 +16597,39 @@ pub const Forwarder = struct {
         height: u32,
         tiled: bool,
         endian: rosette_gpu.xenos_texture.Endian,
+        format: rosette_gpu.xenos_texture.Format,
         harness_supplied: bool,
     ) void {
         const surface = rosette_gpu.XenosSurface{
             .width = width,
             .height = height,
+            .format = format,
             .endian = endian,
             .tiled = tiled,
         };
-        if (!surface.presentable()) return;
+        // Retain an unsupported format as evidence instead of dropping the
+        // front-buffer offer.  A raw fetch value such as 26 is exactly the
+        // information needed to add a converter; silently defaulting it to
+        // RGBA8 makes a malformed image look like a GPU failure.
+        if (width < 64 or height < 64 or width > 4096 or height > 4096) return;
         // A surface a source named always displaces one Rosette supplied. The
         // reverse would let the harness's own fallback hide the console's real
         // framebuffer the moment a swap finally names it.
         if (self.guest_frontbuffer_harness_supplied != harness_supplied and
             self.guest_frontbuffer_source != 0 and harness_supplied) return;
         self.guest_frontbuffer_source = source;
-        self.guest_frontbuffer_bytes = surface.requiredBytes();
         self.guest_frontbuffer_width = width;
         self.guest_frontbuffer_height = height;
         self.guest_frontbuffer_tiled = tiled;
         self.guest_frontbuffer_endian = endian;
+        self.guest_frontbuffer_format = format;
         self.guest_frontbuffer_harness_supplied = harness_supplied;
+        if (!surface.format.supported()) {
+            self.guest_frontbuffer_bytes = 0;
+            self.guest_frontbuffer_last_failure = .unsupported_format;
+            return;
+        }
+        self.guest_frontbuffer_bytes = surface.requiredBytes();
     }
 
     /// Convert the console front buffer into pixels the presenter can copy, and
@@ -12040,6 +16648,7 @@ pub const Forwarder = struct {
         const surface = rosette_gpu.XenosSurface{
             .width = self.guest_frontbuffer_width,
             .height = self.guest_frontbuffer_height,
+            .format = self.guest_frontbuffer_format,
             .endian = self.guest_frontbuffer_endian,
             .tiled = self.guest_frontbuffer_tiled,
         };
@@ -12095,7 +16704,10 @@ pub const Forwarder = struct {
             // consults to find out whether the emulator produced a picture.
             .producer = if (self.guest_frontbuffer_harness_supplied) .diagnostic else .xenia_host,
             // Set by the swap observation, never by a frame having arrived.
-            .guest_swap_observed = false,
+            // The pending generation is what lets the PE/Xenia path publish
+            // its console surface even when Xenia never reaches
+            // RefreshGuestOutput.
+            .guest_swap_observed = self.guest_frontbuffer_swap_pending,
         }, self.guest_frontbuffer_source, content.digest);
         if (publication.disposition == .rejected) return false;
         if (publication.disposition == .unchanged) return true;
@@ -12119,7 +16731,97 @@ pub const Forwarder = struct {
     /// discovered afterwards may be classified as guest output. Kept separate
     /// from frame delivery because a frame arriving is not a swap happening,
     /// and merging them is exactly how a host frame becomes mislabelled.
+    /// Present the console-owned front buffer immediately after the PE route
+    /// observes VdSwap. This is the fallback for the Xenia path whose GPU
+    /// thread can consume PM4 and perform IssueSwap without entering the
+    /// exported RefreshGuestOutput symbol.
+    pub fn presentGuestFrontBuffer(
+        self: *Forwarder,
+        state: anytype,
+        source: u64,
+        width: u32,
+        height: u32,
+        tiled: bool,
+        endian: rosette_gpu.xenos_texture.Endian,
+        format: rosette_gpu.xenos_texture.Format,
+        guest_swap_observed: bool,
+    ) bool {
+        self.guest_frontbuffer_present_attempts +|= 1;
+        if (guest_swap_observed) self.noteGuestSwapObserved();
+        self.noteGuestFrontBuffer(source, width, height, tiled, endian, format, false);
+
+        if (!self.native_presenter.stage.isReady()) {
+            self.guest_frontbuffer_present_failures +|= 1;
+            return false;
+        }
+        if (!self.publishGuestFrontBuffer(state)) {
+            self.guest_frontbuffer_present_failures +|= 1;
+            return false;
+        }
+        const descriptor = self.frame_inbox.acquire() orelse {
+            self.guest_frontbuffer_present_failures +|= 1;
+            return false;
+        };
+        if (descriptor.producer != .xenia_host or !descriptor.guest_swap_observed) {
+            self.frame_inbox.release(false);
+            self.guest_frontbuffer_present_failures +|= 1;
+            return false;
+        }
+        const pixels = state.guestMemoryConst(descriptor.source_address, descriptor.source_length) orelse {
+            self.frame_inbox.release(false);
+            self.frame_inbox.noteUnusable(.source_unmapped);
+            self.guest_frontbuffer_present_failures +|= 1;
+            return false;
+        };
+        const report = self.native_presenter.present(.{ .cpu_image = .{
+            .pixels = pixels,
+            .width = descriptor.width,
+            .height = descriptor.height,
+            .format = if (self.native_presenter.surface_format.format != 0)
+                self.native_presenter.surface_format.format
+            else
+                44,
+            .row_pitch_bytes = descriptor.row_pitch_bytes,
+            .orientation = descriptor.orientation,
+            .fit = descriptor.fit,
+            .producer = descriptor.producer,
+            .guest_swap_observed = descriptor.guest_swap_observed,
+        } });
+        self.observeNativePresenterReport(report);
+        const consumed = report.presented and report.source_copied;
+        self.frame_inbox.release(consumed);
+        if (!consumed) {
+            self.guest_frontbuffer_present_failures +|= 1;
+            return false;
+        }
+
+        self.guest_frontbuffer_presented_generation = self.guest_frontbuffer_swap_generation;
+        self.guest_frontbuffer_swap_pending = false;
+        self.guest_frontbuffer_present_successes +|= 1;
+        const count = self.guest_frontbuffer_present_successes;
+        if (count <= 4 or (count & (count - 1)) == 0) {
+            machoCapturePrint(
+                "macho-processor: PE64 GUEST FRONT BUFFER PRESENT: success={d} attempt={d} generation={d} extent={d}x{d} format={s}(raw={d}) native_present={} source_copied={} classification={s}; VdSwap-owned console pixels reached the drawable\n",
+                .{
+                    count,
+                    self.guest_frontbuffer_present_attempts,
+                    self.guest_frontbuffer_swap_generation,
+                    descriptor.width,
+                    descriptor.height,
+                    self.guest_frontbuffer_format.label(),
+                    @intFromEnum(self.guest_frontbuffer_format),
+                    report.presented,
+                    report.source_copied,
+                    report.classification.label(),
+                },
+            );
+        }
+        return true;
+    }
+
     pub fn noteGuestSwapObserved(self: *Forwarder) void {
+        self.guest_frontbuffer_swap_generation +|= 1;
+        self.guest_frontbuffer_swap_pending = true;
         self.frame_provenance.noteGuestRingPacket();
         self.native_presenter.ledger.noteGuestRingPacket();
     }
@@ -12376,6 +17078,19 @@ pub const Forwarder = struct {
                 self.virtual_sleep_repairs,
             },
         );
+        if (self.graphics_extent_contract_failures != 0) {
+            machoCapturePrint(
+                "macho-processor: GRAPHICS EXTENT CONTRACT: failed={} failures={d} required={d}x{d} observed={d}x{d}; extent admission is non-bypassable and a failed bridge/presenter handshake must terminate the Mach-O process\n",
+                .{
+                    self.graphics_extent_contract_failed,
+                    self.graphics_extent_contract_failures,
+                    self.graphics_extent_requested_width,
+                    self.graphics_extent_requested_height,
+                    self.graphics_extent_observed_width,
+                    self.graphics_extent_observed_height,
+                },
+            );
+        }
         self.printVulkanRefusals(true);
         self.reportVulkanAbsentEntryPoints();
         self.printPresentChain();
@@ -12465,6 +17180,8 @@ pub const Forwarder = struct {
                     self.vulkan_device_void_calls,
                 },
             );
+            self.logVulkanHandleMapState();
+            self.logGuestFrontBuffer();
             self.logGraphicsProvenance();
             machoCapturePrint("macho-processor: Vulkan proc inventory:\n", .{});
             for (&self.guest_symbols) |*entry| {
@@ -12598,6 +17315,17 @@ pub const Forwarder = struct {
     }
 
     pub fn logGuestFrontBuffer(self: *const Forwarder) void {
+        machoCapturePrint(
+            "macho-processor: PE64 GUEST FRONT BUFFER HANDOFF: swap_generation={d} presented_generation={d} pending={} present_attempts={d} present_successes={d} present_failures={d}\n",
+            .{
+                self.guest_frontbuffer_swap_generation,
+                self.guest_frontbuffer_presented_generation,
+                self.guest_frontbuffer_swap_pending,
+                self.guest_frontbuffer_present_attempts,
+                self.guest_frontbuffer_present_successes,
+                self.guest_frontbuffer_present_failures,
+            },
+        );
         if (self.guest_frontbuffer_source == 0) {
             machoCapturePrint(
                 "macho-processor: GUEST FRONT BUFFER: never offered. No swap packet has named a front buffer, so the console's framebuffer address is unknown and nothing but a diagnostic frame can reach the window\n",
@@ -12606,12 +17334,14 @@ pub const Forwarder = struct {
             return;
         }
         machoCapturePrint(
-            "macho-processor: GUEST FRONT BUFFER: source=0x{x} bytes={d} extent={d}x{d} tiled={s} endian={s} conversions={d} failures={d} unique_nonzero_generations={d} retained_observations={d} last_failure={s}; {s}\n",
+            "macho-processor: GUEST FRONT BUFFER: source=0x{x} bytes={d} extent={d}x{d} format={s}(raw={d}) tiled={s} endian={s} conversions={d} failures={d} unique_nonzero_generations={d} retained_observations={d} last_failure={s}; {s}\n",
             .{
                 self.guest_frontbuffer_source,
                 self.guest_frontbuffer_bytes,
                 self.guest_frontbuffer_width,
                 self.guest_frontbuffer_height,
+                self.guest_frontbuffer_format.label(),
+                @intFromEnum(self.guest_frontbuffer_format),
                 if (self.guest_frontbuffer_tiled) "YES" else "NO",
                 self.guest_frontbuffer_endian.label(),
                 self.guest_frontbuffer_conversions,
@@ -12658,10 +17388,16 @@ pub const Forwarder = struct {
             // The Phase 5 handoff, reported as a chain so the first broken link
             // is visible rather than inferred from a frame count of zero.
             machoCapturePrint(
-                "macho-processor: GUEST FRAME SOURCE: images_tracked={d} image_bindings={d} resource_overflow={d} scans={d} discoveries={d} content_observations={d} published_generations={d} unchanged_observations={d} content_changes={d} source_changes={d} consumed={d} dropped={d} cocoa_fallback(attempts/successes/failures)={d}/{d}/{d} blit_supported={s} filter={d} absence={s}\n",
+                "macho-processor: GUEST FRAME SOURCE: resources_live/free/capacity={d}/{d}/{d} images_tracked={d} image_bindings={d} resource_records(committed/released/high_water)={d}/{d}/{d} resource_overflow={d} scans={d} discoveries={d} content_observations={d} published_generations={d} unchanged_observations={d} content_changes={d} source_changes={d} consumed={d} dropped={d} cocoa_fallback(attempts/successes/failures)={d}/{d}/{d} blit_supported={s} filter={d} absence={s}\n",
                 .{
+                    self.trackedResourceCount(),
+                    self.freeResourceSlotCount(),
+                    self.vulkan_resources.len,
                     self.trackedImageCount(),
                     self.vulkan_image_bindings,
+                    self.vulkan_resource_records_committed,
+                    self.vulkan_resource_records_released,
+                    self.vulkan_resource_high_water,
                     self.vulkan_resource_overflow,
                     self.frame_source_scans,
                     self.frame_source_discoveries,
@@ -13075,7 +17811,102 @@ fn guestSymbolKind(symbol: []const u8) GuestSymbolKind {
 /// symbol.  Windows PE imports use this query before handing a name across
 /// the Microsoft-x64/SysV adapter; an opaque name must remain visible to the
 /// caller instead of being mistaken for a successful native call.
+fn canonicalVulkanCommand(name: []const u8) []const u8 {
+    // EXT spellings share the core ABI; the function table already resolves
+    // either spelling, so dispatch must use the same alias contract.
+    if (std.mem.eql(u8, name, "vkCmdSetDepthTestEnableEXT")) return "vkCmdSetDepthTestEnable";
+    if (std.mem.eql(u8, name, "vkCmdSetDepthWriteEnableEXT")) return "vkCmdSetDepthWriteEnable";
+    if (std.mem.eql(u8, name, "vkCmdSetDepthCompareOpEXT")) return "vkCmdSetDepthCompareOp";
+    if (std.mem.eql(u8, name, "vkCmdSetStencilTestEnableEXT")) return "vkCmdSetStencilTestEnable";
+    if (std.mem.eql(u8, name, "vkCmdSetStencilOpEXT")) return "vkCmdSetStencilOp";
+    if (std.mem.eql(u8, name, "vkCmdSetPrimitiveRestartEnableEXT")) return "vkCmdSetPrimitiveRestartEnable";
+    return name;
+}
+
+const forwarded_vulkan_commands = [_][]const u8{
+    "vkCmdBeginConditionalRenderingEXT",
+    "vkCmdBeginQuery",
+    "vkCmdBeginRenderPass",
+    "vkCmdBeginRenderPass2",
+    "vkCmdBeginRenderPass2KHR",
+    "vkCmdBeginRendering",
+    "vkCmdBeginRenderingKHR",
+    "vkCmdBindDescriptorSets",
+    "vkCmdBindIndexBuffer",
+    "vkCmdBindPipeline",
+    "vkCmdBindVertexBuffers",
+    "vkCmdBlitImage",
+    "vkCmdClearAttachments",
+    "vkCmdClearColorImage",
+    "vkCmdClearDepthStencilImage",
+    "vkCmdCopyBuffer",
+    "vkCmdCopyBufferToImage",
+    "vkCmdCopyImage",
+    "vkCmdCopyImageToBuffer",
+    "vkCmdCopyQueryPoolResults",
+    "vkCmdDispatch",
+    "vkCmdDispatchBase",
+    "vkCmdDispatchIndirect",
+    "vkCmdDraw",
+    "vkCmdDrawIndexed",
+    "vkCmdDrawIndexedIndirect",
+    "vkCmdDrawIndexedIndirectCount",
+    "vkCmdDrawIndirect",
+    "vkCmdDrawIndirectCount",
+    "vkCmdEndConditionalRenderingEXT",
+    "vkCmdEndQuery",
+    "vkCmdEndRenderPass",
+    "vkCmdEndRenderPass2",
+    "vkCmdEndRenderPass2KHR",
+    "vkCmdEndRendering",
+    "vkCmdEndRenderingKHR",
+    "vkCmdExecuteCommands",
+    "vkCmdFillBuffer",
+    "vkCmdNextSubpass",
+    "vkCmdNextSubpass2",
+    "vkCmdNextSubpass2KHR",
+    "vkCmdPipelineBarrier",
+    "vkCmdPipelineBarrier2",
+    "vkCmdPipelineBarrier2KHR",
+    "vkCmdPushConstants",
+    "vkCmdPushDescriptorSetKHR",
+    "vkCmdResetQueryPool",
+    "vkCmdResolveImage",
+    "vkCmdSetBlendConstants",
+    "vkCmdSetDepthBias",
+    "vkCmdSetDepthBounds",
+    "vkCmdSetDepthCompareOp",
+    "vkCmdSetDepthTestEnable",
+    "vkCmdSetDepthWriteEnable",
+    "vkCmdSetPrimitiveRestartEnable",
+    "vkCmdSetScissor",
+    "vkCmdSetStencilCompareMask",
+    "vkCmdSetStencilOp",
+    "vkCmdSetStencilReference",
+    "vkCmdSetStencilTestEnable",
+    "vkCmdSetStencilWriteMask",
+    "vkCmdSetViewport",
+    "vkCmdUpdateBuffer",
+};
+
+fn forwardedVulkanCommandIndex(name: []const u8) ?usize {
+    const indices = comptime blk: {
+        var entries: [forwarded_vulkan_commands.len]struct { []const u8, usize } = undefined;
+        for (forwarded_vulkan_commands, 0..) |command, index| entries[index] = .{ command, index };
+        break :blk std.StaticStringMap(usize).initComptime(entries);
+    };
+    return indices.get(name);
+}
+
 pub fn isForwardableVulkanSymbol(symbol: []const u8) bool {
+    if (!std.mem.startsWith(u8, symbol, "vk")) return false;
+    if (std.mem.startsWith(u8, symbol, "vkCmd")) {
+        const canonical = canonicalVulkanCommand(symbol);
+        for (forwarded_vulkan_commands) |name| {
+            if (std.mem.eql(u8, canonical, name)) return true;
+        }
+        return false;
+    }
     return guestSymbolKind(symbol) != .@"opaque";
 }
 
@@ -13827,8 +18658,8 @@ test "Vulkan swapchain teardown releases its synthetic image ownership" {
     const record = forwarder.real_vulkan.mutableSwapchainRecord(synthetic_swapchain) orelse unreachable;
     record.image_handles[0] = synthetic_image;
     record.image_count = 1;
-    HandleMap.allocOrFind(&forwarder.real_vulkan.swapchain_map, synthetic_swapchain, real_swapchain);
-    HandleMap.allocOrFind(&forwarder.real_vulkan.image_map, synthetic_image, real_image);
+    _ = HandleMap.allocOrFind(&forwarder.real_vulkan.swapchain_map, synthetic_swapchain, real_swapchain);
+    _ = HandleMap.allocOrFind(&forwarder.real_vulkan.image_map, synthetic_image, real_image);
     forwarder.destroyRealSwapchain(synthetic_swapchain);
     try std.testing.expect(forwarder.real_vulkan.realSwapchain(synthetic_swapchain) == null);
     try std.testing.expect(forwarder.real_vulkan.realImage(synthetic_image) == null);
@@ -13878,6 +18709,7 @@ fn nulTerminate(buffer: []u8, value: []const u8) ?[*:0]const u8 {
 }
 
 const TestState = struct {
+    xmm: [16][16]u8 = @splat(@splat(0)),
     mem: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024),
     regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0, r8: u64 = 0, r9: u64 = 0, rsp: u64 = 0, rax: u64 = 0 } = .{},
     executed_steps: u64 = 10,
@@ -14127,6 +18959,101 @@ test "mapped guest shadow is uploaded before native submission" {
     try std.testing.expectEqualSlices(u8, &expected, &host_bytes);
     try std.testing.expectEqual(@as(u64, 1), forwarder.vulkan_shadow_uploads);
     try std.testing.expectEqual(@as(u64, 0), forwarder.vulkan_shadow_upload_failures);
+}
+
+test "lookup custody follows descriptor copies to bound native gamma bytes" {
+    var forwarder = Forwarder{};
+    var state = TestState{};
+    var host: [8]u8 = @splat(0);
+    std.mem.writeInt(u32, host[4..8], 1023 | (1023 << 10) | (1023 << 20), .little);
+    forwarder.tracked_buffer_views[0] = .{ .synthetic = 0x201, .buffer = 0x101, .format = 64, .offset = 128, .range = 8 };
+    forwarder.vulkan_resources[0] = .{ .handle = 0x101, .kind = .buffer, .memory = 0x401, .memory_offset = 256 };
+    forwarder.vulkan_memory_records[0] = .{ .handle = 0x401, .requested_size = 392, .mapped_offset = 384, .host_mapped_ptr = &host, .host_mapped_size = 8 };
+    state.write64(128, 0x201);
+    const write = abi.WriteDescriptorSet{ .dst_set = 0x301, .dst_binding = 2, .descriptor_type = 4, .descriptor_count = 1, .texel_buffer_view = @ptrFromInt(128) };
+    forwarder.trackTexelDescriptorWrites(&state, &.{write});
+    forwarder.copyDescriptorSetImages(.{ .src_set = 0x301, .src_binding = 2, .dst_set = 0x302, .dst_binding = 3, .descriptor_count = 1 });
+    forwarder.tracked_command_targets[0] = .{ .synthetic = 0x501, .bound_descriptor_set_count = 1 };
+    forwarder.tracked_command_targets[0].bound_descriptor_sets[0] = .{ .synthetic = 0x302, .set_index = 0 };
+    forwarder.auditCommandTexelCustody(0x501);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.texel_custody_samples);
+    try std.testing.expectEqual(@as(u64, 0), forwarder.texel_custody_zero);
+    @memset(&host, 0);
+    forwarder.auditCommandTexelCustody(0x501);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.texel_custody_zero);
+    forwarder.vulkan_memory_records[0].host_mapped_size = 7;
+    forwarder.auditCommandTexelCustody(0x501);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.texel_custody_missing);
+}
+
+test "coherent shadow publication preserves GPU bytes and publishes writes on unmap" {
+    var forwarder = Forwarder{};
+    var state = TestState{};
+    var host = [_]u8{ 10, 20, 30, 40 };
+    @memcpy(state.mem[128..132], &host);
+    const record = &forwarder.vulkan_memory_records[0];
+    record.* = .{
+        .handle = 0x100,
+        .requested_size = 4,
+        .mapped_base = 128,
+        .mapped_size = 4,
+        .host_mapped_size = 4,
+        .host_mapped_ptr = &host,
+        .memory_flags_known = true,
+        .memory_flags = abi.MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        .shadow_baseline = try std.heap.c_allocator.dupe(u8, &host),
+    };
+    defer record.releaseBaseline();
+    host[1] = 99; // newer GPU data; guest did not write this byte
+    state.mem[128] = 11;
+    try std.testing.expect(forwarder.uploadMappedMemoryBeforeSubmit(&state));
+    try std.testing.expectEqualSlices(u8, &.{ 11, 99, 30, 40 }, &host);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.vulkan_shadow_upload_bytes);
+    forwarder.downloadCoherentShadowsAfterCompletion(&state);
+    try std.testing.expectEqualSlices(u8, &.{ 11, 99, 30, 40 }, state.mem[128..132]);
+    state.mem[130] = 31; // written after the last submission
+    state.regs.rsi = 0x100;
+    _ = forwarder.unmapMemory(&state);
+    try std.testing.expectEqual(@as(u8, 31), host[2]);
+    try std.testing.expect(record.shadow_baseline == null and record.host_mapped_ptr == null);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.vulkan_shadow_unmap_uploads);
+}
+
+test "coherent completion merge does not erase CPU changes for a future submission" {
+    var forwarder = Forwarder{};
+    var state = TestState{};
+    var host = [_]u8{ 1, 2, 3, 4 };
+    @memcpy(state.mem[128..132], &host);
+    const record = &forwarder.vulkan_memory_records[0];
+    record.* = .{ .handle = 0x100, .requested_size = 4, .mapped_base = 128, .mapped_size = 4, .host_mapped_size = 4, .host_mapped_ptr = &host, .memory_flags_known = true, .memory_flags = abi.MEMORY_PROPERTY_HOST_COHERENT_BIT, .shadow_baseline = try std.heap.c_allocator.dupe(u8, &host) };
+    defer record.releaseBaseline();
+    state.mem[128] = 9;
+    host[1] = 8;
+    forwarder.downloadCoherentShadowsAfterCompletion(&state);
+    try std.testing.expectEqualSlices(u8, &.{ 9, 8, 3, 4 }, state.mem[128..132]);
+    try std.testing.expectEqual(@as(u8, 1), record.shadow_baseline.?[0]);
+    try std.testing.expect(forwarder.uploadMappedMemoryBeforeSubmit(&state));
+    try std.testing.expectEqualSlices(u8, &.{ 9, 8, 3, 4 }, &host);
+    try std.testing.expect(forwarder.uploadMappedMemoryBeforeSubmit(&state));
+    try std.testing.expectEqual(@as(u64, 1), forwarder.vulkan_shadow_unchanged);
+}
+
+test "noncoherent shadow is not implicitly flushed by submission or unmap" {
+    var forwarder = Forwarder{};
+    var state = TestState{};
+    var host = [_]u8{ 1, 2, 3, 4 };
+    const record = &forwarder.vulkan_memory_records[0];
+    record.* = .{ .handle = 0x100, .requested_size = 4, .mapped_base = 128, .mapped_size = 4, .host_mapped_size = 4, .host_mapped_ptr = &host, .memory_flags_known = true, .memory_flags = abi.MEMORY_PROPERTY_HOST_VISIBLE_BIT, .shadow_baseline = try std.heap.c_allocator.dupe(u8, &host) };
+    defer record.releaseBaseline();
+    @memset(state.mem[128..132], 9);
+    try std.testing.expect(forwarder.uploadMappedMemoryBeforeSubmit(&state));
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, &host);
+    try std.testing.expect(forwarder.copyMappedBytes(&state, 0x100, 1, 2, true));
+    try std.testing.expectEqualSlices(u8, &.{ 1, 9, 9, 4 }, &host);
+    state.mem[128] = 7;
+    state.regs.rsi = 0x100;
+    _ = forwarder.unmapMemory(&state);
+    try std.testing.expectEqual(@as(u8, 1), host[0]);
 }
 
 test "Vulkan presenter lifecycle requires UI surface before swapchain" {
@@ -14842,6 +19769,60 @@ test "specialization constants are copied out of guest memory before a stage is 
     );
 }
 
+test "guest output topology repair classifier is strict" {
+    var forwarder = Forwarder{};
+    defer forwarder.deinit();
+    const layout_real: u64 = 0x101;
+    forwarder.tracked_pipeline_layouts[0] = .{
+        .real = layout_real,
+        .has_vertex_rect_push_constants = true,
+    };
+
+    var stages: [2]abi.PipelineShaderStageCreateInfo = .{ .{}, .{} };
+    var input_assembly: abi.PipelineInputAssemblyStateCreateInfo = .{ .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
+    var vertex_input: abi.PipelineVertexInputStateCreateInfo = .{};
+    var viewport: abi.PipelineViewportStateCreateInfo = .{ .viewport_count = 1, .scissor_count = 1 };
+    var rasterization: abi.PipelineRasterizationStateCreateInfo = .{};
+    var multisample: abi.PipelineMultisampleStateCreateInfo = .{};
+    var depth_stencil: abi.PipelineDepthStencilStateCreateInfo = .{};
+    var color_attachments: [1]abi.PipelineColorBlendAttachmentState = .{.{}};
+    var color_blend: abi.PipelineColorBlendStateCreateInfo = .{
+        .attachment_count = 1,
+        .attachments = &color_attachments,
+    };
+    var dynamic_states = [_]u32{ VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    var dynamic: abi.PipelineDynamicStateCreateInfo = .{
+        .dynamic_state_count = dynamic_states.len,
+        .dynamic_states = &dynamic_states,
+    };
+    var root: abi.GraphicsPipelineCreateInfo = .{
+        .stage_count = 2,
+        .stages = &stages,
+        .vertex_input_state = &vertex_input,
+        .input_assembly_state = &input_assembly,
+        .viewport_state = &viewport,
+        .rasterization_state = &rasterization,
+        .multisample_state = &multisample,
+        .depth_stencil_state = &depth_stencil,
+        .color_blend_state = &color_blend,
+        .dynamic_state = &dynamic,
+        .layout = layout_real,
+    };
+
+    try std.testing.expect(forwarder.isGuestOutputPaintPipeline(&root));
+    input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    try std.testing.expect(!forwarder.isGuestOutputPaintPipeline(&root));
+    input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    vertex_input.vertex_binding_description_count = 1;
+    try std.testing.expect(!forwarder.isGuestOutputPaintPipeline(&root));
+    vertex_input.vertex_binding_description_count = 0;
+    color_blend.attachment_count = 2;
+    try std.testing.expect(!forwarder.isGuestOutputPaintPipeline(&root));
+    color_blend.attachment_count = 1;
+    forwarder.tracked_pipeline_layouts[0].has_vertex_rect_push_constants = false;
+    try std.testing.expect(!forwarder.isGuestOutputPaintPipeline(&root));
+}
+
 test "a refusal ledger names what was refused and why, and stays quiet when nothing was" {
     var ledger = VulkanRefusalLedger{};
     try std.testing.expect(ledger.isEmpty());
@@ -15053,4 +20034,330 @@ test "a surface enumeration is bounded to what the fill can deliver" {
     try std.testing.expect(forwarder.surface_enumeration_bound_reported);
     try std.testing.expectEqual(MAX_SURFACE_ENUMERATION, forwarder.boundSurfaceEnumeration(4096, "surface formats"));
     try std.testing.expect(MAX_SURFACE_ENUMERATION >= 60);
+}
+
+test "Vulkan procedure availability requires an implemented command ABI" {
+    try std.testing.expect(!isForwardableVulkanSymbol("vkCmdUnknownRosetteCommand"));
+    try std.testing.expect(isForwardableVulkanSymbol("vkCmdSetDepthTestEnableEXT"));
+    try std.testing.expectEqualStrings("vkCmdSetDepthTestEnable", canonicalVulkanCommand("vkCmdSetDepthTestEnableEXT"));
+    try std.testing.expect(!isForwardableVulkanSymbol("rosette_xenia_launch_assist_query"));
+}
+
+test "native command dispatch forwards EXT aliases and scalar depth state" {
+    const Capture = struct {
+        var enabled: u32 = 0;
+        var depth: [3]f32 = @splat(0);
+        fn setEnable(_: abi.CommandBuffer, value: u32) callconv(.c) void {
+            enabled = value;
+        }
+        fn setBias(_: abi.CommandBuffer, a: f32, b: f32, c: f32) callconv(.c) void {
+            depth = .{ a, b, c };
+        }
+    };
+    var forwarder = Forwarder{};
+    var state = TestState{};
+    _ = HandleMap.alloc(&forwarder.real_vulkan.command_buffer_map, 0x111, 0x222);
+    forwarder.real_vulkan.fn_ptrs.cmd_set_depth_test_enable = Capture.setEnable;
+    forwarder.real_vulkan.fn_ptrs.cmd_set_depth_bias = Capture.setBias;
+    state.regs.rdi = 0x111;
+    state.regs.rsi = 1;
+    const alias = "vkCmdSetDepthTestEnableEXT";
+    forwarder.forwardVulkanCommand(&state, vulkanNameHash(alias), alias);
+    try std.testing.expectEqual(@as(u32, 1), Capture.enabled);
+    const values = [_]f32{ 1.5, -0.5, 2.0 };
+    for (values, 0..) |value, index| std.mem.writeInt(u32, state.xmm[index][0..4], @bitCast(value), .little);
+    forwarder.forwardVulkanCommand(&state, vulkanNameHash("vkCmdSetDepthBias"), "vkCmdSetDepthBias");
+    try std.testing.expectEqualDeep(values, Capture.depth);
+}
+
+test "content pixel probing retries until detail or its bounded budget" {
+    var probe = PixelProbeState{};
+    try std.testing.expect(!shouldForceContentPixelProbe(&probe, .uniform_fill));
+    try std.testing.expect(shouldForceContentPixelProbe(&probe, .content));
+    probe.content_probe_attempts = PIXEL_PROBE_CONTENT_SAMPLES - 1;
+    try std.testing.expect(shouldForceContentPixelProbe(&probe, .content));
+    probe.content_probe_attempts = PIXEL_PROBE_CONTENT_SAMPLES;
+    try std.testing.expect(!shouldForceContentPixelProbe(&probe, .content));
+    probe.content_probe_attempts = 1;
+    probe.detail_observed = true;
+    try std.testing.expect(!shouldForceContentPixelProbe(&probe, .content));
+}
+
+test "Vulkan handle maps turn capacity pressure into a recoverable result" {
+    var map: [2]HandleMap = [_]HandleMap{.{}} ** 2;
+    try std.testing.expectEqual(HandleMap.InsertResult.inserted, HandleMap.allocOrFind(&map, 0x11, 0x21));
+    try std.testing.expectEqual(HandleMap.InsertResult.inserted, HandleMap.allocOrFind(&map, 0x12, 0x22));
+    try std.testing.expectEqual(@as(usize, 0), HandleMap.freeSlots(&map));
+    try std.testing.expectEqual(HandleMap.InsertResult.exhausted, HandleMap.allocOrFind(&map, 0x13, 0x23));
+    // Exhaustion is observable and non-destructive: the two live mappings
+    // remain resolvable for the caller that is still using them.
+    try std.testing.expectEqual(@as(?u64, 0x21), HandleMap.findReal(&map, 0x11));
+    try std.testing.expectEqual(@as(usize, 2), HandleMap.occupied(&map));
+    try std.testing.expect(HandleMap.remove(&map, 0x11));
+    try std.testing.expectEqual(@as(usize, 1), HandleMap.freeSlots(&map));
+    try std.testing.expectEqual(HandleMap.InsertResult.inserted, HandleMap.allocOrFind(&map, 0x13, 0x23));
+}
+
+test "Vulkan resource provenance records reuse destroyed slots and expose pressure" {
+    var forwarder = Forwarder{};
+    defer forwarder.deinit();
+
+    for (&forwarder.vulkan_resources, 0..) |*record, index| {
+        record.* = .{ .handle = @as(u64, @intCast(index)) + 1, .kind = .image };
+    }
+    try std.testing.expectEqual(@as(usize, MAX_VULKAN_RESOURCES), forwarder.trackedResourceCount());
+    try std.testing.expectEqual(@as(usize, 0), forwarder.freeResourceSlotCount());
+    try std.testing.expect(!forwarder.resourceSlotAvailable());
+    try std.testing.expect(forwarder.resourceSlot(0xDEAD) == null);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.vulkan_resource_overflow);
+
+    try std.testing.expect(forwarder.releaseResource(1));
+    try std.testing.expectEqual(@as(usize, 1), forwarder.freeResourceSlotCount());
+    const reused = forwarder.resourceSlot(0xDEAD) orelse return error.TestUnexpectedResult;
+    reused.* = .{ .handle = 0xDEAD, .kind = .image };
+    try std.testing.expectEqual(@as(usize, MAX_VULKAN_RESOURCES), forwarder.trackedResourceCount());
+    try std.testing.expectEqual(@as(u64, 1), forwarder.vulkan_resource_records_released);
+}
+
+test "render pass sources are attributed to the pass target and committed at submission" {
+    var forwarder = Forwarder{};
+    defer forwarder.deinit();
+    // Guest image 0x901 is the gamma pass's output, 0x902 the swap texture it
+    // samples; the framebuffer attaches a view of 0x901 and descriptor set
+    // 0xB001 holds a view of 0x902.
+    _ = HandleMap.alloc(&forwarder.real_vulkan.image_map, 0x901, 0x1901);
+    _ = HandleMap.alloc(&forwarder.real_vulkan.image_map, 0x902, 0x1902);
+    forwarder.tracked_image_views[0] = .{ .synthetic = 0x801, .image = 0x901 };
+    forwarder.tracked_image_views[1] = .{ .synthetic = 0x802, .image = 0x902 };
+    forwarder.tracked_framebuffers[0] = .{ .synthetic = 0x701, .attachment_count = 1 };
+    forwarder.tracked_framebuffers[0].attachments[0] = 0x801;
+    forwarder.noteDescriptorSetImage(0xB001, 0, 0, 0x902, false);
+    const command: u64 = 0x501;
+    forwarder.noteCommandPassTarget(command, 0x701);
+    forwarder.noteCommandBoundDescriptorSet(command, 1, 0xB001);
+    forwarder.noteCommandBoundDescriptorSet(command, 1, 0xB001);
+    forwarder.clearCommandPassTarget(command);
+    // A set bound outside any render pass has no target to be an edge of.
+    forwarder.noteCommandBoundDescriptorSet(command, 0, 0xB001);
+    try std.testing.expectEqual(@as(u8, 1), forwarder.mutableCommandTargets(command).?.pass_edge_count);
+    forwarder.commitCommandPassSources(command);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.vulkan_pass_source_edges);
+    try std.testing.expectEqual(@as(u64, 0x1902), forwarder.present_chain.passSourcesOf(0x1901)[0]);
+    try std.testing.expectEqual(@as(?u64, 0x902), forwarder.syntheticImageForReal(0x1902));
+    try std.testing.expectEqual(@as(?u64, null), forwarder.syntheticImageForReal(0x1999));
+    // Only a single-sampled 2D colour image the probe can decode gains
+    // TRANSFER_SRC on the host, and one that already has it is left alone.
+    try std.testing.expect(imageReadbackAugmentable(abi.IMAGE_USAGE_SAMPLED_BIT, abi.FORMAT_A2B10G10R10_UNORM_PACK32, abi.IMAGE_TYPE_2D, abi.SAMPLE_COUNT_1_BIT));
+    try std.testing.expect(!imageReadbackAugmentable(abi.IMAGE_USAGE_SAMPLED_BIT | abi.IMAGE_USAGE_TRANSFER_SRC_BIT, abi.FORMAT_A2B10G10R10_UNORM_PACK32, abi.IMAGE_TYPE_2D, abi.SAMPLE_COUNT_1_BIT));
+    try std.testing.expect(!imageReadbackAugmentable(abi.IMAGE_USAGE_SAMPLED_BIT, abi.FORMAT_A2B10G10R10_UNORM_PACK32, abi.IMAGE_TYPE_2D, 4));
+    try std.testing.expect(!imageReadbackAugmentable(abi.IMAGE_USAGE_TRANSFER_DST_BIT, abi.FORMAT_B8G8R8A8_UNORM, abi.IMAGE_TYPE_2D, abi.SAMPLE_COUNT_1_BIT));
+    try std.testing.expect(!imageReadbackAugmentable(abi.IMAGE_USAGE_SAMPLED_BIT, 126, abi.IMAGE_TYPE_2D, abi.SAMPLE_COUNT_1_BIT));
+}
+
+test "descriptor-set mappings are reclaimed by pool lifetime" {
+    var forwarder = Forwarder{};
+    defer forwarder.deinit();
+    const pool: u64 = 0xA001;
+    _ = HandleMap.allocOrFindOwned(&forwarder.real_vulkan.descriptor_set_map, 0xB001, 0xC001, pool);
+    _ = HandleMap.allocOrFindOwned(&forwarder.real_vulkan.descriptor_set_map, 0xB002, 0xC002, pool);
+    forwarder.noteDescriptorSetPool(0xB001, pool);
+    try std.testing.expectEqual(@as(usize, 2), HandleMap.occupied(&forwarder.real_vulkan.descriptor_set_map));
+    try std.testing.expectEqual(@as(usize, 2), forwarder.reclaimDescriptorSetsForPool(pool, "reset"));
+    try std.testing.expectEqual(@as(usize, 0), HandleMap.occupied(&forwarder.real_vulkan.descriptor_set_map));
+    try std.testing.expect(forwarder.trackedDescriptorSet(0xB001) == null);
+    try std.testing.expectEqual(@as(u64, 2), forwarder.vulkan_descriptor_set_pool_reset_reclaims);
+}
+
+test "graphics report admission coalesces fast samples but preserves content and failures" {
+    var forwarder = Forwarder{};
+    var snapshot = rosette_gpu.ScreenValiditySnapshot{
+        .guest_presents = 1,
+        .guest_acquires = 1,
+        .presents_with_target = 1,
+        .presents_clear_only = 1,
+        .native_present_requests = 1,
+        .native_present_completions = 1,
+        .native_queue_submits = 1,
+        .pixel_evidence = .uniform_colour,
+    };
+    for (0..17641) |frame| {
+        snapshot.guest_presents = frame + 1;
+        snapshot.guest_acquires = frame + 1;
+        snapshot.presents_with_target = frame + 1;
+        snapshot.presents_clear_only = frame + 1;
+        snapshot.native_present_requests = frame + 1;
+        snapshot.native_present_completions = frame + 1;
+        if (frame % 34 == 0) {
+            snapshot.pixel_sample_frame = frame + 1;
+            snapshot.pixel_sample_image = frame % 3;
+            snapshot.pixel_hash = frame;
+        }
+        _ = forwarder.screen_validity.observe(snapshot);
+        const kind = forwarder.chooseGraphicsReport(1 + @as(u64, @intCast(frame)) * 4_550_000, .presenting_clear_only_frames, false);
+        if (kind != .none) forwarder.screen_validity.markReported();
+    }
+    try std.testing.expectEqual(@as(u64, 1), forwarder.graphics_report_cadence.full_reports);
+    try std.testing.expectEqual(@as(u64, 16), forwarder.graphics_report_cadence.progress_reports);
+    try std.testing.expectEqual(@as(u64, 17641), forwarder.screen_validity.snapshot().guest_presents);
+    forwarder.vulkan_descriptor_bind_admission.rejected = 1;
+    try std.testing.expectEqual(transport_timing.ReportKind.full, forwarder.chooseGraphicsReport(80_400_000_000, .presenting_clear_only_frames, false));
+    forwarder.screen_validity.markReported();
+    forwarder.vulkan_descriptor_bind_admission.rejected = 2;
+    try std.testing.expectEqual(transport_timing.ReportKind.none, forwarder.chooseGraphicsReport(80_400_000_001, .presenting_clear_only_frames, false));
+    forwarder.brightness_ladder.last_verdict = .gamma_pass;
+    try std.testing.expectEqual(transport_timing.ReportKind.full, forwarder.chooseGraphicsReport(80_400_000_002, .presenting_clear_only_frames, false));
+    forwarder.screen_validity.markReported();
+    snapshot.presents_with_content = 1;
+    snapshot.pixel_sample_was_content = true;
+    _ = forwarder.screen_validity.observe(snapshot);
+    try std.testing.expectEqual(transport_timing.ReportKind.full, forwarder.chooseGraphicsReport(80_400_000_003, .healthy, false));
+    forwarder.screen_validity.markReported();
+    try std.testing.expectEqual(transport_timing.ReportKind.full, forwarder.chooseGraphicsReport(80_400_000_004, .healthy, true));
+}
+
+test "pacing report selects the live guest swapchain, not diagnostic or retired history" {
+    var forwarder = Forwarder{};
+    forwarder.present_chain.swapchain_count = 3;
+    forwarder.present_chain.swapchains[0] = .{ .owner = .guest, .retired = true, .present_mode = 0, .presents = 17641 };
+    forwarder.present_chain.swapchains[1] = .{ .owner = .rosette, .present_mode = 2, .presents = 20000 };
+    forwarder.present_chain.swapchains[2] = .{ .owner = .guest, .present_mode = 1, .presents = 2 };
+    try std.testing.expectEqual(@as(?u32, 1), forwarder.guestPresentMode());
+    forwarder.present_chain.swapchains[2].retired = true;
+    try std.testing.expectEqual(@as(?u32, null), forwarder.guestPresentMode());
+}
+
+test "native per-swapchain results are authoritative without guest pResults" {
+    try std.testing.expectEqual(abi.SUCCESS, resolvedPresentResult(abi.SUCCESS, abi.NOT_READY));
+    try std.testing.expectEqual(abi.ERROR_OUT_OF_DATE_KHR, resolvedPresentResult(abi.ERROR_OUT_OF_DATE_KHR, abi.NOT_READY));
+    try std.testing.expectEqual(abi.ERROR_OUT_OF_DATE_KHR, resolvedPresentResult(abi.SUCCESS, abi.ERROR_OUT_OF_DATE_KHR));
+    try std.testing.expectEqual(abi.SUBOPTIMAL_KHR, resolvedPresentResult(abi.SUCCESS, abi.SUBOPTIMAL_KHR));
+}
+
+test "first observed picture escalates reporting even without a transport verdict change" {
+    var forwarder = Forwarder{};
+    _ = forwarder.chooseGraphicsReport(1, .healthy, false);
+    forwarder.screen_validity.markReported();
+    forwarder.picture_sequence.frames = 1;
+    try std.testing.expectEqual(transport_timing.ReportKind.full, forwarder.chooseGraphicsReport(2, .healthy, false));
+    forwarder.screen_validity.markReported();
+    forwarder.picture_sequence.frames = 2;
+    try std.testing.expectEqual(transport_timing.ReportKind.none, forwarder.chooseGraphicsReport(3, .healthy, false));
+}
+
+test "unused startup descriptors and offscreen uploads are inventory not a picture gap" {
+    var forwarder = Forwarder{};
+    forwarder.vulkan_descriptor_image_infos_observed = 8;
+    forwarder.target_offscreen_events = 8;
+    try std.testing.expectEqualStrings("STARTUP RESOURCE INVENTORY (no picture work observed)", forwarder.provenanceGapLabel());
+    forwarder.vulkan_command_draw_calls = 1;
+    try std.testing.expectEqualStrings("ACTIONABLE PROVENANCE GAP", forwarder.provenanceGapLabel());
+    forwarder.vulkan_command_draw_calls = 0;
+    forwarder.vulkan_command_dispatch_calls = 1;
+    try std.testing.expectEqualStrings("ACTIONABLE PROVENANCE GAP", forwarder.provenanceGapLabel());
+}
+
+test "picture capture follows native completion and owns pixels across staging reuse" {
+    const Capture = struct {
+        const original = [_]u8{ 0, 0, 0, 255, 1, 0, 0, 255, 0, 2, 0, 255, 0, 0, 3, 255 };
+        var staging: [16]u8 = original;
+        var presented: bool = false;
+        var completed: bool = false;
+        var delivered: u32 = 0;
+        fn reset(_: abi.CommandBuffer, _: u32) callconv(.c) abi.Result {
+            return abi.SUCCESS;
+        }
+        fn begin(_: abi.CommandBuffer, _: *const abi.CommandBufferBeginInfo) callconv(.c) abi.Result {
+            return abi.SUCCESS;
+        }
+        fn end(_: abi.CommandBuffer) callconv(.c) abi.Result {
+            return abi.SUCCESS;
+        }
+        fn barrier(_: abi.CommandBuffer, _: u32, _: u32, _: u32, _: u32, _: ?*const anyopaque, _: u32, _: ?*const anyopaque, _: u32, _: ?[*]const abi.ImageMemoryBarrier) callconv(.c) void {}
+        fn copy(_: abi.CommandBuffer, _: abi.Image, _: u32, _: abi.Buffer, _: u32, _: [*]const abi.BufferImageCopy) callconv(.c) void {}
+        fn submit(_: abi.Queue, _: u32, _: ?[*]const abi.SubmitInfo, _: abi.Fence) callconv(.c) abi.Result {
+            return abi.SUCCESS;
+        }
+        fn idle(_: abi.Queue) callconv(.c) abi.Result {
+            if (presented) completed = true;
+            return abi.SUCCESS;
+        }
+        fn present(_: abi.Queue, info: *const abi.PresentInfoKHR) callconv(.c) abi.Result {
+            presented = true;
+            @memset(&staging, 0); // native work/staging reuse cannot erase the copied capture
+            info.results.?[0] = abi.SUCCESS;
+            return abi.SUCCESS;
+        }
+        fn capture(packet: *const frame_capture.Frame) callconv(.c) u32 {
+            std.debug.assert(presented and completed);
+            std.debug.assert(packet.frame == 200001 and packet.content_frame == 1);
+            std.debug.assert(packet.flags & frame_capture.picture_numbering != 0);
+            std.debug.assert(packet.flags & frame_capture.show_preview != 0);
+            std.debug.assert(std.mem.eql(u8, packet.pixels[0..16], &original));
+            delivered += 1;
+            return frame_capture.result_previewed | frame_capture.result_saved;
+        }
+    };
+    Capture.staging = Capture.original;
+    Capture.presented = false;
+    Capture.completed = false;
+    Capture.delivered = 0;
+    const previous_callback = HostFrameCaptureResolver.callback;
+    const previous_resolved = HostFrameCaptureResolver.resolved;
+    defer {
+        HostFrameCaptureResolver.callback = previous_callback;
+        HostFrameCaptureResolver.resolved = previous_resolved;
+    }
+    HostFrameCaptureResolver.callback = Capture.capture;
+    HostFrameCaptureResolver.resolved = true;
+    var forwarder = Forwarder{};
+    defer forwarder.deinit();
+    var state = TestState{};
+    forwarder.vulkan_presents = 200000;
+    forwarder.real_vulkan.device = @ptrFromInt(0x100);
+    forwarder.real_vulkan.queue_map[0] = .{ .synthetic = 0x301, .real = 0x302 };
+    forwarder.real_vulkan.queue_family_indices[0] = 0;
+    forwarder.real_vulkan.queue_family_count = 1;
+    forwarder.real_vulkan.queue_family_properties[0] = .{ .queue_flags = abi.QUEUE_GRAPHICS_BIT, .queue_count = 1 };
+    forwarder.real_vulkan.swapchain_map[0] = .{ .synthetic = 0x601, .real = 0x701 };
+    forwarder.real_vulkan.image_map[0] = .{ .synthetic = 0xa01, .real = 0xb01 };
+    forwarder.real_vulkan.swapchain_records[0] = .{ .synthetic = 0x601, .real = 0x701, .image_count = 1 };
+    forwarder.real_vulkan.swapchain_records[0].image_handles[0] = 0xa01;
+    forwarder.pixel_probe.staging_buffer = 0x501;
+    forwarder.pixel_probe.staging_memory = 0x502;
+    forwarder.pixel_probe.staging_size = 16;
+    forwarder.pixel_probe.mapped = &Capture.staging;
+    forwarder.pixel_probe.mapped_coherent = true;
+    forwarder.pixel_probe.command_pool = 0x503;
+    forwarder.pixel_probe.command_pool_family = 0;
+    forwarder.pixel_probe.command_buffer = @ptrFromInt(0x504);
+    forwarder.pixel_probe.capture_configured = true;
+    forwarder.pixel_probe.preview_enabled = true;
+    // First picture delivery bypasses an otherwise-not-due preview timer.
+    forwarder.pixel_probe.last_preview_probe_ns = transport_timing.nowNs();
+    forwarder.pixel_probe.preview_interval_ns = 60_000_000_000;
+    const fns = &forwarder.real_vulkan.fn_ptrs;
+    fns.reset_command_buffer = Capture.reset;
+    fns.begin_command_buffer = Capture.begin;
+    fns.end_command_buffer = Capture.end;
+    fns.cmd_pipeline_barrier = Capture.barrier;
+    fns.cmd_copy_image_to_buffer = Capture.copy;
+    fns.queue_submit = Capture.submit;
+    fns.queue_wait_idle = Capture.idle;
+    fns.queue_present = Capture.present;
+    forwarder.present_chain.noteSwapchain(.{ .handle = 0x701, .width = 2, .height = 2, .format = 37, .image_count = 1, .image_usage = abi.IMAGE_USAGE_TRANSFER_SRC_BIT });
+    forwarder.present_chain.noteSwapchainImages(0x701, &.{0xb01});
+    forwarder.present_chain.noteAcquire(0x701, 0);
+    forwarder.present_chain.noteContent(0x701);
+    state.regs.rdi = 0x301;
+    state.regs.rsi = 0x100;
+    state.write32(0x100 + 32, 1);
+    state.write64(0x100 + 40, 0x300);
+    state.write64(0x100 + 48, 0x310);
+    state.write64(0x300, 0x601);
+    state.write32(0x310, 0);
+    try std.testing.expectEqual(@as(u64, 0), forwarder.queuePresent(&state));
+    try std.testing.expectEqual(@as(u32, 1), Capture.delivered);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.picture_sequence.frames);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.pixel_probe.capture_policy.picture_saved);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.pixel_probe.capture_previewed);
 }
