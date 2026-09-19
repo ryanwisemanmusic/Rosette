@@ -26,6 +26,12 @@ static void RosetteMachOUpdateMetalDrawable(void);
 @interface RosetteMachOInputWindow : NSWindow
 @end
 
+// Intercept key events at the window boundary.  A guest-driven window can
+// change first responder as AppKit processes clicks and menus; handling keys
+// only in the metal view or in the polling loop therefore leaves a gap where
+// AppKit beeps and discards the event before the virtual controller sees it.
+static void RosetteMachOApplyKeyboardEvent(NSEvent *event, BOOL down);
+
 @implementation RosetteMachOInputWindow
 
 - (BOOL)canBecomeKeyWindow {
@@ -34,6 +40,18 @@ static void RosetteMachOUpdateMetalDrawable(void);
 
 - (BOOL)canBecomeMainWindow {
   return YES;
+}
+
+- (void)sendEvent:(NSEvent *)event {
+  if (event.window == self &&
+      (event.type == NSEventTypeKeyDown || event.type == NSEventTypeKeyUp)) {
+    RosetteMachOApplyKeyboardEvent(event, event.type == NSEventTypeKeyDown);
+    // The keyboard is a virtual XInput device, not an AppKit text target.
+    // Consuming the event here prevents NSResponder's unhandled-key beep and
+    // makes the result independent of which content view is first responder.
+    return;
+  }
+  [super sendEvent:event];
 }
 
 @end
@@ -69,7 +87,12 @@ static void RosetteMachOUpdateMetalDrawable(void);
     // another application, but clicking it must behave like any normal Cocoa
     // window and make keyboard delivery possible.
     if (!window.isKeyWindow) {
-      [NSApp activateIgnoringOtherApps:NO];
+      // This is an explicit user gesture.  Passing NO leaves a background
+      // Rosetta process inactive on macOS, so AppKit can play its blocked
+      // action sound while the window still appears to have been clicked.
+      // Do not use this during creation: the launch path is intentionally
+      // allowed to start behind another application.
+      [NSApp activateIgnoringOtherApps:YES];
       [window makeKeyAndOrderFront:nil];
     }
     [window makeFirstResponder:self];
@@ -1307,11 +1330,6 @@ uint32_t rosette_macho_native_window_pump_events(void) {
                            dequeue:YES];
         if (!event) {
           break;
-        }
-        if (event.type == NSEventTypeKeyDown) {
-          RosetteMachOApplyKeyboardEvent(event, YES);
-        } else if (event.type == NSEventTypeKeyUp) {
-          RosetteMachOApplyKeyboardEvent(event, NO);
         }
         [g_application sendEvent:event];
         RosetteMachOUpdateKeyboardFocusOnMainThread();
