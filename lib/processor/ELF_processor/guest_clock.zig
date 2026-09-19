@@ -48,16 +48,22 @@ pub const Source = enum {
     /// The host's monotonic clock. A guest millisecond is a real
     /// millisecond.
     host_monotonic,
-    /// One tick per interpreted instruction. Selected by
-    /// `ROSETTE_GUEST_CLOCK=instructions`; kept because the trade-off is
-    /// real - this source is immune to host scheduling jitter, the other is
-    /// immune to how fast the interpreter happens to be.
+    /// One tick per `instructions_per_tick` interpreted instructions.
+    /// Selected by `ROSETTE_GUEST_CLOCK=instructions`; kept because the
+    /// trade-off is real - this source is immune to host scheduling jitter,
+    /// the other is immune to how fast the interpreter happens to be. With
+    /// `ROSETTE_GUEST_CLOCK_INSTRUCTIONS_PER_TICK` set to the few thousand
+    /// instructions a console retires per microsecond it becomes a dilated
+    /// clock: guest time advances at the interpreter's pace, so the audio
+    /// pump, the frame limiter and every fade run per unit of guest work
+    /// instead of per wall second, which is what a run one hundred times
+    /// slower than the console needs to stay internally consistent.
     retired_instructions,
 
     pub fn label(self: Source) []const u8 {
         return switch (self) {
             .host_monotonic => "host monotonic clock: a guest millisecond is a real millisecond, so guest timers fire at the rate they were written for",
-            .retired_instructions => "retired instructions (ROSETTE_GUEST_CLOCK=instructions): a guest millisecond is a thousand instructions, so every guest timer fires far more often per unit of work than on hardware",
+            .retired_instructions => "retired instructions (ROSETTE_GUEST_CLOCK=instructions): guest time advances per interpreted instruction at instructions_per_tick per microsecond, so guest timers fire per unit of work rather than per wall second",
         };
     }
 };
@@ -66,6 +72,11 @@ pub const Clock = struct {
     /// What the guest reads from `QueryPerformanceCounter`.
     ticks: u64 = 0,
     source: Source = .host_monotonic,
+    /// Under `.retired_instructions`, how many interpreted instructions make
+    /// one tick (one microsecond). One is the historical 1-MIPS machine.
+    instructions_per_tick: u64 = 1,
+    /// Instructions retired since the last tick under `.retired_instructions`.
+    retired: u64 = 0,
     /// Host monotonic nanoseconds at the first sample, so the counter starts
     /// near zero rather than at the machine's uptime.
     base_nanos: u64 = 0,
@@ -80,9 +91,32 @@ pub const Clock = struct {
     /// `now_nanos` is the host's monotonic clock, or zero when it could not
     /// be read. Passed in rather than read here so this file has no clock
     /// syscall in it and stays testable without one.
+    /// Retire `count` instructions at once on the instruction-derived clock:
+    /// what a translated block does at its exit instead of ticking per
+    /// instruction. Same arithmetic as `advance`, so the two agree.
+    pub fn advanceRetired(self: *Clock, count: u64) void {
+        if (self.instructions_per_tick <= 1) {
+            self.ticks +|= count;
+            return;
+        }
+        self.retired +|= count;
+        while (self.retired >= self.instructions_per_tick) {
+            self.retired -= self.instructions_per_tick;
+            self.ticks +|= 1;
+        }
+    }
+
     pub fn advance(self: *Clock, now_nanos: u64) void {
         if (self.source == .retired_instructions) {
-            self.ticks +|= 1;
+            if (self.instructions_per_tick <= 1) {
+                self.ticks +|= 1;
+                return;
+            }
+            self.retired += 1;
+            if (self.retired >= self.instructions_per_tick) {
+                self.retired = 0;
+                self.ticks +|= 1;
+            }
             return;
         }
         self.stride +|= 1;
@@ -221,6 +255,19 @@ test "the instruction-derived source is exactly one tick a step and ignores the 
     clock.refresh(999_999_999_999);
     try std.testing.expectEqual(@as(u64, 12_345), clock.ticks);
     try std.testing.expect(std.mem.indexOf(u8, clock.sourceLabel(), "retired instructions") != null);
+}
+
+test "a calibrated instruction clock advances one tick per ratio instructions" {
+    var clock = Clock{ .source = .retired_instructions, .instructions_per_tick = 2000 };
+    for (0..1999) |_| clock.advance(0);
+    try std.testing.expectEqual(@as(u64, 0), clock.ticks);
+    clock.advance(0);
+    try std.testing.expectEqual(@as(u64, 1), clock.ticks);
+    // Two million instructions is one guest millisecond at this ratio, and
+    // a millisecond deadline set now expires exactly there.
+    const deadline = clock.deadlineAfterMilliseconds(1);
+    for (0..2000 * ticks_per_millisecond) |_| clock.advance(0);
+    try std.testing.expectEqual(deadline, clock.ticks);
 }
 
 test "dilation reports guest time against real time" {

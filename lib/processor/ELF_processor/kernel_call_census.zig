@@ -278,6 +278,24 @@ pub const Census = struct {
         return 0;
     }
 
+    /// O(1) lookup of an armed export by entry address without changing its
+    /// counters.  Export-trampoline shims that need to complete a small
+    /// contract at the boundary use this after `note` has already accounted
+    /// for the call; scanning all 4096 slots there would make input and other
+    /// high-frequency exports part of the guest instruction hot path.
+    pub fn exportAt(self: *const Census, address: u64) ?*const Slot {
+        if (self.slots.len == 0 or address < self.low or address > self.high) return null;
+        var index = indexOf(address);
+        var probes: usize = 0;
+        while (probes < slot_count) : (probes += 1) {
+            const slot = &self.slots[index];
+            if (slot.address == 0) return null;
+            if (slot.address == address) return slot;
+            index = (index + 1) & @as(usize, slot_mask);
+        }
+        return null;
+    }
+
     /// The armed slot for an export name, or null when the image did not name
     /// it. Linear: called a handful of times at report time and never on the
     /// interpreter's path.

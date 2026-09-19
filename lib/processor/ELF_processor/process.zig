@@ -38,10 +38,12 @@ const guest_output_governor = @import("guest_output_governor.zig");
 const windows_registry_model = @import("windows_registry.zig");
 const mapped_ranges = @import("mapped_ranges.zig");
 const xenia_clock_probe = @import("xenia_clock_probe.zig");
+const ui_draw_evidence = @import("ui_draw_evidence.zig");
 
 test {
     _ = mapped_ranges;
     _ = xenia_clock_probe;
+    _ = ui_draw_evidence;
     // Sibling files' tests only run when something roots them.
     _ = guest_page_protection;
     _ = guest_output_governor;
@@ -995,6 +997,91 @@ const SYNTHETIC_WINDOWS_CRT_EXIT_RETURN: u64 = 0xFFFF_FFFF_FFFF_FF58;
 /// hand one thread's exception to another.
 const SYNTHETIC_WINDOWS_EXCEPTION_RETURN: u64 = 0xFFFF_FFFF_FFFF_FF50;
 
+/// Every synthetic return address the PE route recognises sits in the top
+/// 256 bytes of the address space. `step` asks one comparison against this
+/// floor before paying for `handleSyntheticRip`'s chain of eleven; the
+/// comptime check below is what keeps a new synthetic address from being
+/// added below the floor and silently never handled.
+const SYNTHETIC_RIP_FLOOR: u64 = 0xFFFF_FFFF_FFFF_FF00;
+comptime {
+    for ([_]u64{
+        SYNTHETIC_INIT_RETURN,
+        SYNTHETIC_MAIN_RETURN,
+        SYNTHETIC_WINDOWS_THREAD_RETURN,
+        SYNTHETIC_WINDOWS_MESSAGE_RETURN,
+        SYNTHETIC_WINDOWS_AUDIO_RETURN,
+        SYNTHETIC_WINDOWS_CRT_EXIT_RETURN,
+        SYNTHETIC_WINDOWS_EXCEPTION_RETURN,
+        x64_linux_runtime.SYNTHETIC_PTHREAD_ONCE_RETURN,
+        x64_linux_runtime.SYNTHETIC_INITTERM_RETURN,
+        x64_linux_runtime.SYNTHETIC_QSORT_RETURN,
+    }) |address| {
+        if (address < SYNTHETIC_RIP_FLOOR) @compileError("a synthetic return address sits below SYNTHETIC_RIP_FLOOR, so step would never reach its handler");
+    }
+}
+
+/// A half-open address box `[low, low + span)` kept as two words so that
+/// membership is one wrapping subtraction and one compare on the
+/// per-instruction path. `span == 0` is the empty box.
+const HookBox = struct {
+    low: u64 = 0,
+    span: u64 = 0,
+
+    pub inline fn contains(self: HookBox, address: u64) bool {
+        return address -% self.low < self.span;
+    }
+
+    pub fn widen(self: *HookBox, address: u64) void {
+        if (self.span == 0) {
+            self.low = address;
+            self.span = 1;
+            return;
+        }
+        const old_high = self.low +| self.span;
+        const new_low = @min(self.low, address);
+        const new_high = @max(old_high, address +| 1);
+        self.low = new_low;
+        self.span = new_high -| new_low;
+    }
+
+    pub fn widenRange(self: *HookBox, base: u64, length: u64) void {
+        if (length == 0) return;
+        self.widen(base);
+        self.widen(base +| (length - 1));
+    }
+
+    /// Whether `[address, address + count)` shares any byte with the box.
+    pub inline fn overlaps(self: HookBox, address: u64, count: u64) bool {
+        return address < self.low +| self.span and address +| count > self.low;
+    }
+};
+
+test "hook boxes admit every recorded address and reject the rest cheaply" {
+    var box: HookBox = .{};
+    try std.testing.expect(!box.contains(0));
+    try std.testing.expect(!box.overlaps(0, 16));
+    box.widen(0x1000);
+    try std.testing.expect(box.contains(0x1000));
+    try std.testing.expect(!box.contains(0x0fff));
+    try std.testing.expect(!box.contains(0x1001));
+    box.widen(0x0800);
+    box.widen(0x2000);
+    try std.testing.expect(box.contains(0x0800) and box.contains(0x1000) and box.contains(0x2000));
+    try std.testing.expect(box.contains(0x1234));
+    try std.testing.expect(!box.contains(0x2001) and !box.contains(0x07ff));
+    var ranges: HookBox = .{};
+    ranges.widenRange(0x14000_1000, 0x1000);
+    ranges.widenRange(0x14001_0000, 0x2000);
+    try std.testing.expect(ranges.overlaps(0x14000_0ff8, 16));
+    try std.testing.expect(ranges.overlaps(0x14001_1fff, 8));
+    try std.testing.expect(!ranges.overlaps(0x14001_2000, 8));
+    try std.testing.expect(!ranges.overlaps(0x14000_0000, 0x1000));
+    // A store wider than the whole box still overlaps it.
+    try std.testing.expect(ranges.overlaps(0x14000_0000, 0x10_0000));
+    try std.testing.expect(ranges.widenRange(0, 0) == {});
+    try std.testing.expect(!ranges.contains(0));
+}
+
 const GUEST_ACCESS_VIOLATION_SITE_CAPACITY: usize = 32;
 
 /// The first protected access an instruction made, held until the
@@ -1023,6 +1110,255 @@ const GuestAccessViolationSite = struct {
     last_offset: u64 = 0,
     last_value: u64 = 0,
 };
+/// Which XMA (APU) registers the title touched, read from the faults its
+/// stores to Xenia's no-access aperture at guest 0x7FEA0000 raise.
+///
+/// Xenia serves the audio decoder's registers the same way as the GPU's:
+/// the page is committed no-access, the store faults, and the vectored
+/// handler decodes the instruction and calls `XmaDecoder::WriteRegister`.
+/// Rosette raises that fault, so it sees every register write with its value
+/// before Xenia does - which makes this census independent of whether the
+/// build inlined `WriteRegister` into its MMIO thunk. A `Kick` register write
+/// is the title asking the decoder for work; without one, no XMA context ever
+/// decodes and the mixer has only silence to submit.
+const GuestXmaRegisterCensus = struct {
+    const capacity: usize = 24;
+    const Entry = struct {
+        index: u16 = 0,
+        writes: u64 = 0,
+        reads: u64 = 0,
+        first_step: u64 = 0,
+        last_step: u64 = 0,
+        /// The last value written, byte-swapped to the decoder's view.
+        last_value: u32 = 0,
+        /// Bits set across every value written to a kick/lock/clear
+        /// register: each bit is one hardware context.
+        value_union: u32 = 0,
+    };
+    entries: [capacity]Entry = @splat(.{}),
+    count: usize = 0,
+    overflow: u64 = 0,
+    faults: u64 = 0,
+    /// Writes to a `ContextN_Kick` register with at least one bit set.
+    kicks: u64 = 0,
+    /// Distinct hardware contexts kicked, from the union of kick bits.
+    kicked_contexts: u32 = 0,
+    locks: u64 = 0,
+    clears: u64 = 0,
+    context_array_address: u32 = 0,
+
+    /// Register indices from Xenia's `xma_register_table.inc`, dword units.
+    pub const context_array_address_index: u16 = 0x0600;
+    pub const current_context_index: u16 = 0x0606;
+    pub const next_context_index: u16 = 0x0607;
+    pub const kick_first: u16 = 0x0650;
+    pub const lock_first: u16 = 0x0690;
+    pub const clear_first: u16 = 0x06A0;
+    pub const contexts_per_register: u32 = 32;
+
+    pub fn registerName(index: u16) []const u8 {
+        return switch (index) {
+            context_array_address_index => "ContextArrayAddress",
+            current_context_index => "CurrentContextIndex",
+            next_context_index => "NextContextIndex",
+            0x0610...0x0619 => "Unknown610",
+            0x0620...0x0629 => "Unknown620",
+            kick_first...kick_first + 9 => "Kick",
+            0x0660...0x0669 => "Unknown660",
+            lock_first...lock_first + 9 => "Lock",
+            clear_first...clear_first + 9 => "Clear",
+            else => "unnamed",
+        };
+    }
+
+    /// Record one faulting access. `value` is the raw little-endian dword the
+    /// guest stored; the decoder byte-swaps it, so this does too.
+    pub fn note(self: *GuestXmaRegisterCensus, index: u16, is_write: bool, value: u32, step: u64) void {
+        self.faults +|= 1;
+        const swapped = @byteSwap(value);
+        if (is_write) {
+            if (index >= kick_first and index < kick_first + 10) {
+                if (swapped != 0) self.kicks +|= 1;
+            } else if (index >= lock_first and index < lock_first + 10) {
+                self.locks +|= 1;
+            } else if (index >= clear_first and index < clear_first + 10) {
+                self.clears +|= 1;
+            } else if (index == context_array_address_index) {
+                self.context_array_address = swapped;
+            }
+        }
+        var slot: ?*Entry = null;
+        for (self.entries[0..self.count]) |*entry| {
+            if (entry.index == index) {
+                slot = entry;
+                break;
+            }
+        }
+        if (slot == null) {
+            if (self.count == capacity) {
+                self.overflow +|= 1;
+                return;
+            }
+            self.entries[self.count] = .{ .index = index, .first_step = step };
+            slot = &self.entries[self.count];
+            self.count += 1;
+        }
+        const entry = slot.?;
+        entry.last_step = step;
+        if (is_write) {
+            entry.writes +|= 1;
+            entry.last_value = swapped;
+            entry.value_union |= swapped;
+            if (index >= kick_first and index < kick_first + 10) {
+                self.kicked_contexts = self.countKickedContexts();
+            }
+        } else {
+            entry.reads +|= 1;
+        }
+    }
+
+    fn countKickedContexts(self: *const GuestXmaRegisterCensus) u32 {
+        var total: u32 = 0;
+        for (self.entries[0..self.count]) |entry| {
+            if (entry.index >= kick_first and entry.index < kick_first + 10) total += @popCount(entry.value_union);
+        }
+        return total;
+    }
+};
+
+/// What a presented frame costs in interpreted instructions, and who spends
+/// them, sampled at each `VulkanCommandProcessor::IssueSwap`.
+///
+/// The frame rate this route reaches is the interpreter's rate divided by
+/// this number. Neither half was reported before: the STEP BUDGET line gives
+/// the rate, the present chain gives frames per second, and the reader was
+/// left to divide. The per-thread split is what says whether the cost is the
+/// title's own frame or work running beside it - on 2026-09-17 a third of
+/// every frame's budget went to the audio path mixing silence at wall-clock
+/// rate while the picture advanced at a third of a frame per second.
+const GuestFrameCost = struct {
+    const window: usize = 32;
+    const Thread = struct {
+        handle: u64 = 0,
+        /// The thread's step counter when it was last sampled.
+        snapshot: u64 = 0,
+        /// Instructions the thread ran between the first swap and the last.
+        since_first_swap: u64 = 0,
+    };
+    swaps: u64 = 0,
+    first_swap_step: u64 = 0,
+    last_swap_step: u64 = 0,
+    /// Owner-loop steps at the last swap, so the owner's share is measured
+    /// on the same edges as the workers'.
+    owner_snapshot: u64 = 0,
+    owner_since_first_swap: u64 = 0,
+    audio_frames_snapshot: u64 = 0,
+    recent: [window]u64 = @splat(0),
+    recent_count: usize = 0,
+    recent_next: usize = 0,
+    min_interval: u64 = std.math.maxInt(u64),
+    max_interval: u64 = 0,
+    audio_frames_since_first_swap: u64 = 0,
+    threads: [MAX_WINDOWS_GUEST_THREADS]Thread = @splat(.{}),
+
+    pub fn noteInterval(self: *GuestFrameCost, interval: u64) void {
+        self.recent[self.recent_next] = interval;
+        self.recent_next = (self.recent_next + 1) % window;
+        if (self.recent_count < window) self.recent_count += 1;
+        self.min_interval = @min(self.min_interval, interval);
+        self.max_interval = @max(self.max_interval, interval);
+    }
+
+    pub fn meanRecentInterval(self: *const GuestFrameCost) u64 {
+        if (self.recent_count == 0) return 0;
+        var total: u64 = 0;
+        for (self.recent[0..self.recent_count]) |interval| total +|= interval;
+        return total / self.recent_count;
+    }
+
+    pub fn totalSinceFirstSwap(self: *const GuestFrameCost) u64 {
+        return self.last_swap_step -| self.first_swap_step;
+    }
+};
+
+/// The front buffer the title asks Xenia to show, as `VdSwap` describes it.
+///
+/// `VdSwap` copies the Direct3D texture header's fetch constant into the ring
+/// as a type-0 write to SHADER_CONSTANT_FETCH_00_0 and follows it with the
+/// XE_SWAP packet; `IssueSwap` reads that constant back to pick the front
+/// buffer's format, and the format decides which gamma ramp the swap applies:
+/// the 256-entry table for 8-bit-per-channel buffers, the piecewise-linear
+/// ramp for 10-bit ones. A 10-bit front buffer whose title draws its final
+/// pass as 7e3 floating point relies on that ramp to turn bit patterns into
+/// intensities, and the ramp is programmed through the DC_LUT registers -
+/// which Xenia applies only from type-0 packets, never from the MMIO
+/// aperture. So this record answers, from the title's own words, whether the
+/// swap is on the ramp-dependent path and whether any ramp write it made
+/// could have been applied.
+const GuestFrontBuffer = struct {
+    pub const dc_lut_first: u32 = 0x1921; // DC_LUT_RW_MODE
+    pub const dc_lut_last: u32 = 0x1930; // DC_LUTA_CONTROL
+    swaps: u64 = 0,
+    fetch: [6]u32 = @splat(0),
+    frontbuffer: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    /// Distinct fetch formats seen, as a bitmask over the 6-bit field.
+    formats_seen: u64 = 0,
+    dc_lut_type0_writes: u64 = 0,
+
+    pub fn note(self: *GuestFrontBuffer, window: *const GpuRingWindow) void {
+        self.dc_lut_type0_writes +|= window.dc_lut_type0_writes;
+        if (!window.swap_fetch_seen) return;
+        self.swaps +|= 1;
+        self.fetch = window.swap_fetch;
+        if (window.swap_packets != 0) {
+            self.frontbuffer = window.swap_frontbuffer;
+            self.width = window.swap_width;
+            self.height = window.swap_height;
+        }
+        self.formats_seen |= @as(u64, 1) << @intCast(self.format());
+    }
+
+    /// `xe_gpu_texture_fetch_t.format`, dword 1 bits 0-5.
+    pub fn format(self: *const GuestFrontBuffer) u6 {
+        return @truncate(self.fetch[1]);
+    }
+    pub fn endianness(self: *const GuestFrontBuffer) u2 {
+        return @truncate(self.fetch[1] >> 6);
+    }
+    pub fn baseAddress(self: *const GuestFrontBuffer) u32 {
+        return (self.fetch[1] >> 12) << 12;
+    }
+    pub fn tiled(self: *const GuestFrontBuffer) bool {
+        return (self.fetch[0] >> 31) != 0;
+    }
+    pub fn pitch(self: *const GuestFrontBuffer) u32 {
+        return (self.fetch[0] >> 22) & 0x1FF;
+    }
+    pub fn fetchWidth(self: *const GuestFrontBuffer) u32 {
+        return (self.fetch[2] & 0x1FFF) + 1;
+    }
+    pub fn fetchHeight(self: *const GuestFrontBuffer) u32 {
+        return ((self.fetch[2] >> 13) & 0x1FFF) + 1;
+    }
+
+    pub fn formatName(value: u6) []const u8 {
+        return switch (value) {
+            6 => "k_8_8_8_8",
+            7 => "k_2_10_10_10",
+            50 => "k_8_8_8_8_AS_16_16_16_16",
+            54 => "k_2_10_10_10_AS_16_16_16_16",
+            else => "other",
+        };
+    }
+
+    /// Whether `IssueSwap` takes the piecewise-linear ramp for this format.
+    pub fn usesPwlRamp(value: u6) bool {
+        return value == 7 or value == 54;
+    }
+};
+
 const MAX_WINDOWS_WINDOW_CLASSES: usize = 64;
 const MAX_WINDOWS_WINDOWS: usize = 128;
 const MAX_WINDOWS_MESSAGES: usize = 512;
@@ -1093,6 +1429,8 @@ pub const WindowsUnresolvedImport = struct {
 const WINDOWS_GUEST_OUTPUT_LINE_CAPACITY: usize = 4096;
 const WINDOWS_GUEST_FAILURE_POINT_CAPACITY: usize = 32;
 const WINDOWS_GUEST_WARNING_POINT_CAPACITY: usize = 25;
+const DECODE_CACHE_MISS_SITE_CAPACITY: usize = 32;
+const GPU_DRAW_FAILURE_CAPACITY: usize = 64;
 
 /// A bounded copy of an emulator warning that crossed the PE stdout/stderr
 /// boundary. Xenia owns the original logger, so Rosette cannot assume that a
@@ -1140,6 +1478,139 @@ const WindowsGuestWarningPoint = struct {
         return self.line[0..self.line_len];
     }
 };
+
+/// A bounded attribution for one PM4_DRAW_INDX refusal.  Xenia's warning
+/// names the packet tuple but not the state that made IssueDraw reject it;
+/// retaining the tuple and the execution frontier turns a repeated rendering
+/// symptom into a reproducible class instead of one generic warning string.
+const GpuDrawFailure = struct {
+    index_count: u32 = 0,
+    primitive_type: u32 = 0,
+    source_select: u32 = 0,
+    occurrences: u64 = 0,
+    first_step: u64 = 0,
+    last_step: u64 = 0,
+    first_rip: u64 = 0,
+    last_rip: u64 = 0,
+};
+
+const GpuDrawTuple = struct {
+    index_count: u32,
+    primitive_type: u32,
+    source_select: u32,
+};
+
+/// The PM4 warning only prints the numeric primitive field.  Keep the Xenia
+/// names and the first useful next question beside the ledger so a run does
+/// not collapse every IssueDraw refusal into "backend unexplained".  The
+/// values intentionally mirror `lib/gpu/xenos_registers.zig` and Xenia's
+/// `PrimitiveType`; this parser may consume a native Xenia line before the
+/// Rosetta PM4 executor has seen the corresponding packet.
+const GpuPrimitiveFinding = struct {
+    name: []const u8,
+    classification: []const u8,
+    action: []const u8,
+};
+
+fn gpuPrimitiveFinding(raw: u32) GpuPrimitiveFinding {
+    return switch (raw) {
+        0x00 => .{
+            .name = "none",
+            .classification = "invalid-or-empty-primitive",
+            .action = "inspect the PM4 producer: a draw with PrimitiveType::kNone should not reach IssueDraw",
+        },
+        0x01 => .{
+            .name = "point-list",
+            .classification = "point-list-pipeline-or-geometry-shader",
+            .action = "inspect the active vertex shader, point-list geometry expansion, host point topology, and pipeline creation result",
+        },
+        0x02 => .{
+            .name = "line-list",
+            .classification = "line-list-pipeline-or-shader",
+            .action = "inspect the active vertex shader, line-list host topology, index/vertex bindings, and pipeline creation result",
+        },
+        0x03 => .{
+            .name = "line-strip",
+            .classification = "line-strip-pipeline-or-shader",
+            .action = "inspect the active vertex shader, line-strip host topology, index/vertex bindings, and pipeline creation result",
+        },
+        0x04 => .{
+            .name = "triangle-list",
+            .classification = "triangle-list-pipeline-or-resource",
+            .action = "capture the active shaders, index/vertex bindings, render targets, and pipeline creation result",
+        },
+        0x05 => .{
+            .name = "triangle-fan",
+            .classification = "triangle-fan-pipeline-or-resource",
+            .action = "inspect the triangle-fan lowering and the active shader/index/vertex bindings",
+        },
+        0x06 => .{
+            .name = "triangle-strip",
+            .classification = "triangle-strip-pipeline-or-resource",
+            .action = "capture the active shaders, index/vertex bindings, render targets, and pipeline creation result",
+        },
+        0x07 => .{
+            .name = "triangle-with-w-flags",
+            .classification = "triangle-w-flags-lowering",
+            .action = "inspect W-flag handling and whether the host pipeline has a supported lowering for this primitive",
+        },
+        0x08 => .{
+            .name = "rectangle-list",
+            .classification = "rectangle-list-geometry-shader-compatibility",
+            .action = "inspect the rectangle-list fallback and geometry-shader/pipeline compatibility",
+        },
+        0x09, 0x0A, 0x0B => .{
+            .name = "unused-primitive-value",
+            .classification = "unsupported-or-corrupt-primitive",
+            .action = "inspect the PM4 producer and packet decode: this primitive value is reserved by Xenos",
+        },
+        0x0C => .{
+            .name = "line-loop",
+            .classification = "line-loop-lowering",
+            .action = "inspect line-loop lowering and the host topology selected for the draw",
+        },
+        0x0D => .{
+            .name = "quad-list",
+            .classification = "quad-list-lowering",
+            .action = "inspect quad-list lowering and whether the host pipeline has a supported topology",
+        },
+        0x0E => .{
+            .name = "quad-strip",
+            .classification = "quad-strip-lowering",
+            .action = "inspect quad-strip lowering and whether the host pipeline has a supported topology",
+        },
+        0x0F => .{
+            .name = "polygon",
+            .classification = "polygon-lowering",
+            .action = "inspect polygon lowering and the active host topology/pipeline result",
+        },
+        0x10...0x13 => .{
+            .name = "2d-copy-rect-list",
+            .classification = "2d-copy-primitive-lowering",
+            .action = "inspect the 2D copy-rectangle lowering, source/destination surfaces, and copy pipeline result",
+        },
+        0x14 => .{
+            .name = "2d-fill-rect-list",
+            .classification = "2d-fill-primitive-lowering",
+            .action = "inspect the 2D fill-rectangle lowering, render target state, and pipeline result",
+        },
+        0x15 => .{
+            .name = "2d-line-strip",
+            .classification = "2d-line-primitive-lowering",
+            .action = "inspect the 2D line lowering and the host line topology/pipeline result",
+        },
+        0x16 => .{
+            .name = "2d-triangle-strip",
+            .classification = "2d-triangle-primitive-lowering",
+            .action = "inspect the 2D triangle lowering, render target state, and pipeline result",
+        },
+        else => .{
+            .name = "unknown",
+            .classification = "unsupported-or-corrupt-primitive",
+            .action = "inspect the raw PM4 packet and Xenos primitive table before changing resource mappings",
+        },
+    };
+}
 
 /// Host file resources owned by a PE run. The guest sees only the synthetic
 /// handle; the native descriptor remains behind the Rosetta boundary and is
@@ -1970,6 +2441,9 @@ const GuestReturnCaptureKind = enum(u8) {
     none,
     gpu_register_read,
     vfs_resolve,
+    ui_font_rgba,
+    ui_scissor,
+    ui_pipelines,
 };
 
 /// A call whose return value Rosette wants, recorded at the call and
@@ -1981,6 +2455,9 @@ const GuestReturnCapture = struct {
     kind: GuestReturnCaptureKind = .none,
     return_rsp: u64 = 0,
     tag: u32 = 0,
+    /// Guest output references. Kept in the thread's capture, not a shared
+    /// pending record that a cooperative worker could overwrite.
+    outputs: [4]u64 = .{ 0, 0, 0, 0 },
 };
 
 const GPU_REGISTER_TRAFFIC_CAPACITY: usize = 64;
@@ -2142,6 +2619,19 @@ const GpuRingWindow = struct {
     draw_packets: u32 = 0,
     /// XE_SWAP, the packet Xenia's own swap path writes for a frame.
     swap_packets: u32 = 0,
+    /// The front-buffer texture fetch constant `VdSwap` writes as a type-0
+    /// packet to SHADER_CONSTANT_FETCH_00_0 immediately before XE_SWAP, and
+    /// the XE_SWAP payload itself. This is the title's own description of
+    /// what it is asking to be shown: format, tiling, endianness and size.
+    swap_fetch_seen: bool = false,
+    swap_fetch: [6]u32 = @splat(0),
+    swap_frontbuffer: u32 = 0,
+    swap_width: u32 = 0,
+    swap_height: u32 = 0,
+    /// Type-0 writes that land in the DC_LUT register range. These are the
+    /// only gamma-ramp writes Xenia's command processor applies; the same
+    /// registers written through the MMIO aperture are stored and ignored.
+    dc_lut_type0_writes: u32 = 0,
     /// INDIRECT_BUFFER and INDIRECT_BUFFER_PFD targets as Xenia reads them:
     /// the address through GpuToCpu and the length masked to 20 bits.
     indirect_buffers: u8 = 0,
@@ -2275,6 +2765,42 @@ pub const WindowsGraphicsHooks = struct {
     native_metal_drawable_prepare: ?*const fn (?*anyopaque, u32, u32) callconv(.c) c_int = null,
 };
 
+/// A host-neutral virtual controller snapshot. The first sixteen bytes match
+/// XINPUT_STATE; the remaining fields are Rosetta diagnostics and focus
+/// state. The macOS bridge fills it from keyboard events, while the PE state
+/// owns serialization into either the little-endian Win32 ABI or Xenia's
+/// big-endian PowerPC guest ABI.
+pub const WindowsInputState = extern struct {
+    packet_number: u32 = 0,
+    buttons: u16 = 0,
+    left_trigger: u8 = 0,
+    right_trigger: u8 = 0,
+    thumb_lx: i16 = 0,
+    thumb_ly: i16 = 0,
+    thumb_rx: i16 = 0,
+    thumb_ry: i16 = 0,
+    connected: u32 = 0,
+    focused: u32 = 0,
+    key_down_events: u64 = 0,
+    key_up_events: u64 = 0,
+    snapshot_reads: u64 = 0,
+    focus_gain_events: u64 = 0,
+    focus_loss_events: u64 = 0,
+    rejected_key_events: u64 = 0,
+    last_key_code: u32 = 0,
+    input_contract_version: u32 = 0,
+};
+
+pub const WindowsInputHooks = struct {
+    context: ?*anyopaque = null,
+    read_controller_state: ?*const fn (?*anyopaque, *WindowsInputState) callconv(.c) c_int = null,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(WindowsInputState) == 80);
+    std.debug.assert(@offsetOf(WindowsInputState, "connected") == 16);
+}
+
 /// The host audio device, reached the same way the window is: optional C-ABI
 /// callbacks installed by the runner.
 ///
@@ -2379,6 +2905,9 @@ pub const WindowsGraphicsSnapshot = struct {
     swapchain_image_queries: u64 = 0,
     image_acquires: u64 = 0,
     command_calls: u64 = 0,
+    draw_commands: u64 = 0,
+    dispatch_commands: u64 = 0,
+    transfer_commands: u64 = 0,
     /// Commands whose output can depend on data the title supplied - a draw,
     /// a dispatch, a copy, a blit, a resolve. Counted apart from
     /// `command_calls` because a run can record commands and still put
@@ -2389,6 +2918,14 @@ pub const WindowsGraphicsSnapshot = struct {
     fill_commands: u64 = 0,
     queue_submits: u64 = 0,
     presents: u64 = 0,
+    guest_presents_with_target: u64 = 0,
+    guest_presents_with_content: u64 = 0,
+    guest_presents_clear_only: u64 = 0,
+    guest_presents_without_target: u64 = 0,
+    guest_presents_without_write: u64 = 0,
+    native_present_requests_observed: u64 = 0,
+    native_present_completions_observed: u64 = 0,
+    native_queue_submits_observed: u64 = 0,
     ordering_violations: u64 = 0,
     unmodeled_calls: u64 = 0,
     window_width: u32 = 1280,
@@ -2467,6 +3004,9 @@ pub const WindowsGraphicsState = struct {
     swapchain_image_queries: u64 = 0,
     image_acquires: u64 = 0,
     command_calls: u64 = 0,
+    draw_commands: u64 = 0,
+    dispatch_commands: u64 = 0,
+    transfer_commands: u64 = 0,
     /// Commands whose output can depend on data the title supplied - a draw,
     /// a dispatch, a copy, a blit, a resolve. Counted apart from
     /// `command_calls` because a run can record commands and still put
@@ -2477,6 +3017,14 @@ pub const WindowsGraphicsState = struct {
     fill_commands: u64 = 0,
     queue_submits: u64 = 0,
     presents: u64 = 0,
+    guest_presents_with_target: u64 = 0,
+    guest_presents_with_content: u64 = 0,
+    guest_presents_clear_only: u64 = 0,
+    guest_presents_without_target: u64 = 0,
+    guest_presents_without_write: u64 = 0,
+    native_present_requests_observed: u64 = 0,
+    native_present_completions_observed: u64 = 0,
+    native_queue_submits_observed: u64 = 0,
     ordering_violations: u64 = 0,
     unmodeled_calls: u64 = 0,
     window_width: u32 = 1280,
@@ -2762,6 +3310,16 @@ pub const WindowsGraphicsState = struct {
 
     pub fn noteCommand(self: *WindowsGraphicsState, name: []const u8) void {
         self.command_calls +|= 1;
+        if (std.mem.startsWith(u8, name, "vkCmdDraw")) {
+            self.draw_commands +|= 1;
+        } else if (std.mem.startsWith(u8, name, "vkCmdDispatch")) {
+            self.dispatch_commands +|= 1;
+        } else if (std.mem.startsWith(u8, name, "vkCmdCopy") or
+            std.mem.startsWith(u8, name, "vkCmdBlit") or
+            std.mem.startsWith(u8, name, "vkCmdResolve"))
+        {
+            self.transfer_commands +|= 1;
+        }
         // A command count alone cannot separate a frame with a picture in it
         // from a frame that was cleared and presented. The contract package
         // draws that line once, and both this state and the Vulkan forwarder
@@ -2772,6 +3330,31 @@ pub const WindowsGraphicsState = struct {
             .none => {},
         }
         self.noteCall(name);
+    }
+
+    /// Copy the forwarder's guest-owned frame attribution into the PE-side
+    /// ledger. The Windows adapter sees Vulkan entry points, but only the
+    /// native forwarder knows whether a command actually touched the acquired
+    /// guest swapchain image and whether MoltenVK completed the present.
+    pub fn noteForwarderFrameEvidence(
+        self: *WindowsGraphicsState,
+        guest_presents_with_target: u64,
+        guest_presents_with_content: u64,
+        guest_presents_clear_only: u64,
+        guest_presents_without_target: u64,
+        guest_presents_without_write: u64,
+        native_present_requests: u64,
+        native_present_completions: u64,
+        native_queue_submits: u64,
+    ) void {
+        self.guest_presents_with_target = @max(self.guest_presents_with_target, guest_presents_with_target);
+        self.guest_presents_with_content = @max(self.guest_presents_with_content, guest_presents_with_content);
+        self.guest_presents_clear_only = @max(self.guest_presents_clear_only, guest_presents_clear_only);
+        self.guest_presents_without_target = @max(self.guest_presents_without_target, guest_presents_without_target);
+        self.guest_presents_without_write = @max(self.guest_presents_without_write, guest_presents_without_write);
+        self.native_present_requests_observed = @max(self.native_present_requests_observed, native_present_requests);
+        self.native_present_completions_observed = @max(self.native_present_completions_observed, native_present_completions);
+        self.native_queue_submits_observed = @max(self.native_queue_submits_observed, native_queue_submits);
     }
 
     pub fn noteQueueSubmit(self: *WindowsGraphicsState, ok: bool) bool {
@@ -2868,10 +3451,21 @@ pub const WindowsGraphicsState = struct {
             .swapchain_image_queries = self.swapchain_image_queries,
             .image_acquires = self.image_acquires,
             .command_calls = self.command_calls,
+            .draw_commands = self.draw_commands,
+            .dispatch_commands = self.dispatch_commands,
+            .transfer_commands = self.transfer_commands,
             .content_commands = self.content_commands,
             .fill_commands = self.fill_commands,
             .queue_submits = self.queue_submits,
             .presents = self.presents,
+            .guest_presents_with_target = self.guest_presents_with_target,
+            .guest_presents_with_content = self.guest_presents_with_content,
+            .guest_presents_clear_only = self.guest_presents_clear_only,
+            .guest_presents_without_target = self.guest_presents_without_target,
+            .guest_presents_without_write = self.guest_presents_without_write,
+            .native_present_requests_observed = self.native_present_requests_observed,
+            .native_present_completions_observed = self.native_present_completions_observed,
+            .native_queue_submits_observed = self.native_queue_submits_observed,
             .ordering_violations = self.ordering_violations,
             .unmodeled_calls = self.unmodeled_calls,
             .window_width = self.window_width,
@@ -2912,13 +3506,63 @@ const BitScanKind = x64_decoder.BitScanKind;
 const X87Raw = [10]u8;
 
 const PE_MAX_INSTRUCTION_LENGTH: usize = 15;
-const PE_DECODE_CACHE_ENTRIES: usize = 1 << 13;
+/// The PE route used to use one direct-mapped slot per hash bucket. That made
+/// two unrelated Xenia code-cache addresses sharing a bucket evict each other
+/// on every return, so a cache *collision* looked like an ordinary miss and
+/// could burn a large part of the interpreter. Keep the number of buckets at
+/// 65,536 (the old table's lookup spread) and then expanded to four ways
+/// across 262,144 sets. A first-touch fill remains normal; a full set is a
+/// correctness/performance failure and is reported separately.
+///
+/// The first expanded layout's four-way geometry gave a large address-space
+/// spread, but a normal ~188K-instruction working set still had a measurable
+/// Poisson tail of five-address sets. The eight-way follow-up pushed that tail
+/// out, but a longer font-atlas run eventually filled one set at step 50M.
+/// Keep the same one-million-entry memory budget and move two more bits of
+/// capacity from the set index into associativity: sixteen ways across 65,536
+/// sets. This preserves the bounded allocation while making the observed
+/// instruction working set robust over a long run; a seventeenth resident is
+/// still an explicit fatal contract violation.
+const PE_DECODE_CACHE_WAYS: usize = 16;
+const PE_DECODE_CACHE_SETS: usize = 1 << 16;
+const PE_DECODE_CACHE_ENTRIES: usize = PE_DECODE_CACHE_SETS * PE_DECODE_CACHE_WAYS;
+/// A small, set-associative victim bank catches the short-lived eviction
+/// bursts that still occur in a long Xenia run without weakening the primary
+/// cache's full-set diagnostic. Four ways keeps a victim probe bounded: a
+/// linear 4096-entry scan would cost more than the decode it is meant to save.
+const PE_DECODE_CACHE_VICTIM_WAYS: usize = 4;
+const PE_DECODE_CACHE_VICTIM_SETS: usize = 1 << 10;
+const PE_DECODE_CACHE_VICTIM_ENTRIES: usize =
+    PE_DECODE_CACHE_VICTIM_SETS * PE_DECODE_CACHE_VICTIM_WAYS;
 
+fn peDecodeCacheSetIndex(address: u64) usize {
+    // Instruction starts are not necessarily aligned: a valid x86
+    // instruction may begin at the byte immediately after another one. Keep
+    // the low address bit in the set hash; dropping it aliases adjacent
+    // instructions and turns ordinary sequential execution into artificial
+    // set pressure. A multiplicative mix folded with its high half spreads
+    // both nearby bytes and high image/JIT bits; the older XOR folds let
+    // unrelated Xenia functions cancel into one set. The full address
+    // remains the cache identity check.
+    const mixed = address *% 0x9E3779B97F4A7C15;
+    return @intCast((mixed ^ (mixed >> 32)) & (PE_DECODE_CACHE_SETS - 1));
+}
+
+/// Return the first way of a cache set. Keeping this as the public indexing
+/// helper for the local tests makes the flat allocation layout explicit:
+/// `peDecodeCacheIndex(address) .. + PE_DECODE_CACHE_WAYS` is one set.
 fn peDecodeCacheIndex(address: u64) usize {
-    // JIT functions are aligned and repeatedly reuse the same page offsets.
-    // Low bits alone make different guest functions evict each other on
-    // every call. Fold page bits while retaining full-address equality.
-    return @intCast(((address >> 1) ^ (address >> 14) ^ (address >> 27)) & (PE_DECODE_CACHE_ENTRIES - 1));
+    return peDecodeCacheSetIndex(address) * PE_DECODE_CACHE_WAYS;
+}
+
+fn peDecodeCacheVictimIndex(address: u64) usize {
+    // Use the primary set hash here as well: every displaced resident from a
+    // primary set has a bounded, predictable victim neighborhood. The victim
+    // bank has fewer sets, so fold the high set bits rather than simply
+    // truncating the primary index.
+    const primary = peDecodeCacheSetIndex(address);
+    const mixed = primary ^ (primary >> 10) ^ (primary >> 20);
+    return (mixed & (PE_DECODE_CACHE_VICTIM_SETS - 1)) * PE_DECODE_CACHE_VICTIM_WAYS;
 }
 
 // Relocations are limited to the final CALL displacement. All stack-object
@@ -2935,8 +3579,8 @@ const xenia_sha1_kernel_feed_body = [_]u8{
     0,    0,    0,    0,    0x48, 0x89, 0xf9, 0xe8,
 };
 
-/// A small direct-mapped cache for the raw instruction decode used by the
-/// PE64 runner.  The resolved effective address is deliberately not cached:
+/// A small set-associative cache for the raw instruction decode used by the
+/// PE64 runner. The resolved effective address is deliberately not cached:
 /// it depends on the live register file, while the opcode/prefix/operand
 /// description does not. A validated executable-image or backing-mapping
 /// generation admits a hit; otherwise source bytes are compared. Data writes
@@ -2951,6 +3595,10 @@ const DecodeCacheEntry = struct {
     source_kind: mapped_ranges.Kind = .memory_view,
     source_index: usize = 0,
     source_generation: u64 = 0,
+    /// Monotonic replacement age. This is only consulted after every way in
+    /// the set is occupied; it keeps a hot instruction from being evicted by
+    /// a short-lived generated-code burst.
+    last_used: u64 = 0,
     bytes: [PE_MAX_INSTRUCTION_LENGTH]u8 = [_]u8{0} ** PE_MAX_INSTRUCTION_LENGTH,
     /// Segment selection depends only on the decoded prefix and addressing
     /// form, not on live register values. Retain it with the decode so cache
@@ -2959,6 +3607,202 @@ const DecodeCacheEntry = struct {
     segment: x64_decoder.Segment = .ds,
     decoded: DecodedInsn = .{},
 };
+
+const DecodeCacheMissCause = enum {
+    vacant_fill,
+    capacity_conflict,
+    stale_bytes,
+
+    fn label(self: DecodeCacheMissCause) []const u8 {
+        return switch (self) {
+            .vacant_fill => "vacant-fill",
+            .capacity_conflict => "capacity-conflict",
+            .stale_bytes => "stale-bytes",
+        };
+    }
+
+    fn fatalLabel(self: DecodeCacheMissCause) []const u8 {
+        return switch (self) {
+            .vacant_fill => "",
+            .capacity_conflict => "decode-cache-conflict",
+            .stale_bytes => "decode-cache-stale-bytes",
+        };
+    }
+};
+
+/// One bounded cache-miss site.  The hot path only increments the aggregate
+/// counters and records a site when a miss occurs; cache hits never touch this
+/// table.  `mapped_source` distinguishes image code from Xenia-generated code
+/// so a capacity conflict in the JIT working set cannot be mistaken for a
+/// self-modifying image write.
+const DecodeCacheMissSite = struct {
+    cause: DecodeCacheMissCause = .vacant_fill,
+    fetch_address: u64 = 0,
+    set_index: usize = 0,
+    mapped_source: bool = false,
+    source_kind: WindowsMappedCodeKind = .memory_view,
+    source_index: usize = 0,
+    source_generation: u64 = 0,
+    resident_addresses: [PE_DECODE_CACHE_WAYS]u64 = @splat(0),
+    resident_count: usize = 0,
+    occurrences: u64 = 0,
+    first_step: u64 = 0,
+    last_step: u64 = 0,
+    first_rip: u64 = 0,
+    last_rip: u64 = 0,
+};
+
+/// One remembered CLEO routing decision per (op, operand width). The router's
+/// answer is a pure function of the mnemonic, the host's constant feature
+/// set and the width, so a module-level memo is correct for every state
+/// sharing this binary; it is filled lazily and idempotently.
+const CleoRoutingDecision = @typeInfo(@TypeOf(cleo_routing.CleoRouter.route)).@"fn".return_type.?;
+const CleoRouteMemo = struct {
+    decided: bool = false,
+    decision: CleoRoutingDecision = .{ .can_route = false, .meta = null, .features = undefined },
+};
+var cleo_route_memo: [ElfState.op_value_limit][2]CleoRouteMemo = [_][2]CleoRouteMemo{[_]CleoRouteMemo{.{}} ** 2} ** ElfState.op_value_limit;
+
+// ─── Block translation ───
+//
+// The second execution tier. `block_jit.zig` turns a straight-line run of
+// guest instructions into one ARM64 function; this section owns discovery
+// (which addresses are hot), the block cache and its invalidation, the
+// helpers the emitted code calls back into, the accounting that keeps every
+// per-instruction counter honest, and the cross-check that runs a
+// register-only block through the interpreter once before trusting it.
+
+const block_jit = @import("block_jit.zig");
+
+/// Direct-mapped block and hotness tables, indexed by a hash of the RIP.
+const BLOCK_JIT_TABLE_ENTRIES: usize = 1 << 16;
+/// Executions of a start address before it is compiled. Most addresses run
+/// once; compiling on first sight would spend more on cold code than the
+/// interpreter would have.
+const BLOCK_JIT_DEFAULT_HOT_THRESHOLD: u16 = 16;
+/// The most guest instructions one block covers.
+const BLOCK_JIT_MAX_INSTRUCTIONS: usize = 48;
+/// Executable memory for translated code. Exhaustion drops every block and
+/// starts over; it is counted, not hidden.
+const BLOCK_JIT_CODE_BYTES: usize = 64 << 20;
+
+fn blockJitIndex(rip: u64) usize {
+    return @intCast(((rip >> 1) ^ (rip >> 17) ^ (rip >> 29)) & (BLOCK_JIT_TABLE_ENTRIES - 1));
+}
+
+const BlockHotness = struct {
+    rip: u64 = 0,
+    count: u16 = 0,
+    /// Compilation was tried and produced nothing worth running, or a
+    /// cross-check failed: stay with the interpreter for this address.
+    refused: bool = false,
+};
+
+const BlockJitState = struct {
+    memory: block_jit.CodeMemory,
+    blocks: []?*block_jit.Block,
+    hotness: []BlockHotness,
+    hot_threshold: u16 = BLOCK_JIT_DEFAULT_HOT_THRESHOLD,
+    compiled: u64 = 0,
+    compile_refusals: u64 = 0,
+    compile_failures: u64 = 0,
+    native_instructions_compiled: u64 = 0,
+    fallback_instructions_compiled: u64 = 0,
+    executions: u64 = 0,
+    instructions_retired: u64 = 0,
+    fallback_calls: u64 = 0,
+    aborts: u64 = 0,
+    continuation_write_aborts: u64 = 0,
+    revalidations: u64 = 0,
+    invalidations: u64 = 0,
+    slot_evictions: u64 = 0,
+    resets: u64 = 0,
+    verified: u64 = 0,
+    mismatches: u64 = 0,
+
+    fn create(allocator: std.mem.Allocator) ?*BlockJitState {
+        const memory = block_jit.CodeMemory.init(BLOCK_JIT_CODE_BYTES) catch return null;
+        const self = allocator.create(BlockJitState) catch return null;
+        const blocks = allocator.alloc(?*block_jit.Block, BLOCK_JIT_TABLE_ENTRIES) catch {
+            allocator.destroy(self);
+            return null;
+        };
+        const hotness = allocator.alloc(BlockHotness, BLOCK_JIT_TABLE_ENTRIES) catch {
+            allocator.free(blocks);
+            allocator.destroy(self);
+            return null;
+        };
+        @memset(blocks, null);
+        @memset(hotness, .{});
+        self.* = .{ .memory = memory, .blocks = blocks, .hotness = hotness };
+        return self;
+    }
+
+    fn destroy(self: *BlockJitState, allocator: std.mem.Allocator) void {
+        for (self.blocks) |*slot| {
+            if (slot.*) |block| freeBlock(allocator, block);
+            slot.* = null;
+        }
+        allocator.free(self.blocks);
+        allocator.free(self.hotness);
+        self.memory.deinit();
+        allocator.destroy(self);
+    }
+
+    fn liveBlocks(self: *const BlockJitState) usize {
+        var count: usize = 0;
+        for (self.blocks) |slot| {
+            if (slot != null) count += 1;
+        }
+        return count;
+    }
+
+    fn freeBlock(allocator: std.mem.Allocator, block: *block_jit.Block) void {
+        allocator.free(block.insns);
+        allocator.free(block.bytes);
+        allocator.destroy(block);
+    }
+};
+
+/// `readMemVal` for emitted code. The scratch record names the instruction
+/// so faults and diagnostics see the same RIP the interpreter would have set.
+fn blockJitRead(state_ptr: *anyopaque, address: u64, size: u8) callconv(.c) u64 {
+    const self: *ElfState = @ptrCast(@alignCast(state_ptr));
+    self.blockJitNameCurrentInstruction();
+    const value = self.readMemVal(address, @enumFromInt(size));
+    if (self.guest_access_violation_pending or self.terminated) self.blockJitRequestAbort();
+    return value;
+}
+
+fn blockJitWrite(state_ptr: *anyopaque, address: u64, size: u8, value: u64) callconv(.c) void {
+    const self: *ElfState = @ptrCast(@alignCast(state_ptr));
+    self.blockJitNameCurrentInstruction();
+    self.writeMemVal(address, @enumFromInt(size), value);
+    if (self.guest_access_violation_pending or self.terminated or self.blockJitContinuationChanged()) self.blockJitRequestAbort();
+}
+
+/// One instruction through the interpreter, in the middle of a block.
+/// Returns nonzero when the block must stop: the interpreter moved RIP
+/// somewhere other than the next instruction, ended the run, left a fault
+/// pending, switched guest threads, or asked for the slice to end.
+fn blockJitInterpret(state_ptr: *anyopaque, block: *const block_jit.Block, index: u32) callconv(.c) u32 {
+    const self: *ElfState = @ptrCast(@alignCast(state_ptr));
+    if (self.block_jit) |jit| jit.fallback_calls +|= 1;
+    const slot_before = self.windows_active_guest_thread_slot;
+    const insn = block.insns[index];
+    self.blockJitExecuteInsn(block, index);
+    if (self.terminated or self.guest_access_violation_pending) return 1;
+    if (self.regs.rip != insn.rip +% insn.len) return 1;
+    if (self.windows_active_guest_thread_slot != slot_before) return 1;
+    if (self.windows_guest_slice_yield_requested) return 1;
+    // A vector/string fallback can write executable bytes just as the native
+    // scalar write helper can. Never execute the old decoded continuation.
+    if (self.blockJitContinuationChanged()) {
+        self.blockJitRequestAbort();
+        return 1;
+    }
+    return 0;
+}
 
 // ─── ELF state ───
 
@@ -3021,10 +3865,60 @@ pub const ElfState = struct {
     // Stable heap storage avoids multiplying this cache across value-return
     // initialization temporaries and guest exception frames.
     decode_cache: []DecodeCacheEntry = &.{},
+    decode_cache_victims: []DecodeCacheEntry = &.{},
     decode_cache_hits: u64 = 0,
     decode_cache_rearms: u64 = 0,
     decode_cache_misses: u64 = 0,
     decode_cache_collisions: u64 = 0,
+    decode_cache_vacant_fills: u64 = 0,
+    decode_cache_conflict_fills: u64 = 0,
+    decode_cache_stale_refills: u64 = 0,
+    decode_cache_replacements: u64 = 0,
+    decode_cache_victim_hits: u64 = 0,
+    decode_cache_victim_fills: u64 = 0,
+    decode_cache_victim_stale_rejections: u64 = 0,
+    decode_cache_clock: u64 = 0,
+    decode_cache_miss_sites: [DECODE_CACHE_MISS_SITE_CAPACITY]DecodeCacheMissSite = [_]DecodeCacheMissSite{.{}} ** DECODE_CACHE_MISS_SITE_CAPACITY,
+    decode_cache_miss_site_count: usize = 0,
+    decode_cache_miss_site_overflow: u64 = 0,
+    /// The addresses `step` must intercept before decoding, as boxes so the
+    /// per-instruction question is a compare, not a call. The 2026-09-17
+    /// profile of the PE64 route put `windowsImportStubAt` alone at 3.6% of
+    /// the run, called on every instruction to say "not a stub".
+    ///
+    /// Stubs: every address `registerWindowsImportStubAt` recorded, which is
+    /// the only way an address becomes a stub (both branches of
+    /// `windowsImportStubAt` require `stub.address == address`).
+    windows_stub_box: HookBox = .{},
+    /// Compatibility hooks: the PE-local pthread condition entries and the
+    /// utf8 find_any_of entry, the only addresses
+    /// `tryWindowsGuestCompatibility` acts on. Rebuilt by the two setters
+    /// that assign those fields.
+    windows_compat_hook_box: HookBox = .{},
+    /// How often the boxes admitted an address that no handler then claimed.
+    /// A count near the instruction count means a box has degenerated into
+    /// covering everything and should be split.
+    step_hook_box_false_positives: u64 = 0,
+    /// The executable PE ranges as one box, asked before the per-write scan
+    /// in `bumpWindowsImageCodeGeneration`; and the range that answered the
+    /// last fetch-generation query, asked first in
+    /// `windowsImageCodeGenerationFor` (straight-line code stays in one
+    /// section).
+    windows_executable_box: HookBox = .{},
+    windows_executable_range_hint: usize = 0,
+    /// The block translator, created at the first step when enabled; null
+    /// while disabled or after executable memory was refused.
+    block_jit: ?*BlockJitState = null,
+    block_jit_enabled: bool = true,
+    block_jit_unavailable: bool = false,
+    block_jit_disabled_reason: []const u8 = "",
+    block_jit_hot_threshold: u16 = BLOCK_JIT_DEFAULT_HOT_THRESHOLD,
+    /// Shared with the emitted code; see `block_jit.Scratch`.
+    block_jit_scratch: block_jit.Scratch = .{},
+    /// How many guest instructions the last `step` retired: one for an
+    /// interpreted instruction, a block's completed count otherwise. The
+    /// two execution loops add it to every per-instruction counter.
+    step_retired: u32 = 1,
     libc_start_main_trampolined: bool = false,
     dynamic_relocations: []const elf_loader.DynamicRelocation = &.{},
     local_symbols: []const elf_loader.Symbol = &.{},
@@ -3179,6 +4073,9 @@ pub const ElfState = struct {
     windows_guest_warning_point_count: usize = 0,
     windows_guest_warning_point_overflow: u64 = 0,
     windows_guest_warning_lines: u64 = 0,
+    gpu_draw_failures: [GPU_DRAW_FAILURE_CAPACITY]GpuDrawFailure = [_]GpuDrawFailure{.{}} ** GPU_DRAW_FAILURE_CAPACITY,
+    gpu_draw_failure_count: usize = 0,
+    gpu_draw_failure_overflow: u64 = 0,
     /// Warning-level lines Xenia prints while nothing is wrong.
     windows_guest_informational_lines: u64 = 0,
     /// Bare module names Xenia's module lookup printed `device not found`
@@ -3674,6 +4571,9 @@ pub const ElfState = struct {
     guest_access_violation_sites: [GUEST_ACCESS_VIOLATION_SITE_CAPACITY]GuestAccessViolationSite = [_]GuestAccessViolationSite{.{}} ** GUEST_ACCESS_VIOLATION_SITE_CAPACITY,
     guest_access_violation_site_count: usize = 0,
     guest_access_violation_site_overflow: u64 = 0,
+    xma_registers: GuestXmaRegisterCensus = .{},
+    frame_cost: GuestFrameCost = .{},
+    gpu_front_buffer: GuestFrontBuffer = .{},
     windows_wait_objects: [MAX_WINDOWS_WAIT_OBJECTS]WindowsWaitObject = [_]WindowsWaitObject{.{}} ** MAX_WINDOWS_WAIT_OBJECTS,
     windows_active_guest_thread_slot: ?usize = null,
     windows_last_serviced_guest_thread_slot: ?usize = null,
@@ -3699,6 +4599,7 @@ pub const ElfState = struct {
     owner_return_capture: GuestReturnCapture = .{},
     guest_return_captures_completed: u64 = 0,
     guest_return_captures_replaced: u64 = 0,
+    ui_evidence: ui_draw_evidence.Evidence = .{},
     /// Xenos registers the title reached through Xenia's MMIO thunks.
     gpu_register_traffic: [GPU_REGISTER_TRAFFIC_CAPACITY]GpuRegisterTraffic = [_]GpuRegisterTraffic{.{}} ** GPU_REGISTER_TRAFFIC_CAPACITY,
     gpu_register_traffic_count: usize = 0,
@@ -3931,6 +4832,21 @@ pub const ElfState = struct {
     windows_direct_stub_count: usize = 0,
     windows_dynamic_stub_start: usize = 0,
     windows_graphics: WindowsGraphicsState = .{},
+    windows_input_hooks: WindowsInputHooks = .{},
+    windows_input_polls: u64 = 0,
+    windows_input_bridged_polls: u64 = 0,
+    windows_input_invalid_polls: u64 = 0,
+    windows_input_last_packet: u32 = 0,
+    windows_input_last_buttons: u16 = 0,
+    windows_input_last_focused: bool = false,
+    windows_input_focus_gains: u64 = 0,
+    windows_input_focus_losses: u64 = 0,
+    windows_input_rejected_events: u64 = 0,
+    windows_input_last_key_code: u32 = 0,
+    windows_input_contract_version: u32 = 0,
+    windows_input_xinput_successes: u64 = 0,
+    windows_input_xam_shims: u64 = 0,
+    windows_input_xam_refusals: u64 = 0,
     /// Rosetta's local screen verdict is deliberately stricter than a
     /// successful Vulkan call. The native bridge may have richer pixel
     /// evidence, but this state must never call transport-only traffic a
@@ -3963,6 +4879,8 @@ pub const ElfState = struct {
     pub fn initWithMemory(allocator: std.mem.Allocator, memory_size: u64) ElfState {
         const decode_cache = allocator.alloc(DecodeCacheEntry, PE_DECODE_CACHE_ENTRIES) catch unreachable;
         @memset(decode_cache, .{});
+        const decode_cache_victims = allocator.alloc(DecodeCacheEntry, PE_DECODE_CACHE_VICTIM_ENTRIES) catch unreachable;
+        @memset(decode_cache_victims, .{});
         const memory_len: usize = @intCast(memory_size);
         const mem = allocator.alloc(u8, memory_len) catch unreachable;
         const trace_storage = allocator.alloc(ElfTraceEntry, TRACE_BUFFER_LEN) catch unreachable;
@@ -3975,6 +4893,7 @@ pub const ElfState = struct {
         var state: ElfState = .{
             .allocator = allocator,
             .decode_cache = decode_cache,
+            .decode_cache_victims = decode_cache_victims,
             .mem = mem,
             .mem_base = MEM_BASE,
             .mem_size = memory_size,
@@ -4026,6 +4945,12 @@ pub const ElfState = struct {
         state.xenia_sha1_feed_enabled = !envPresentAndFalse("ROSETTE_PE64_XENIA_SHA1_FEED_ACCELERATOR");
         state.xenia_tabulate_accelerator_enabled = envFlag("ROSETTE_PE64_XENIA_TABULATE_ACCELERATOR");
         state.windows_scheduler.enabled = !envPresentAndFalse("ROSETTE_PE64_GUEST_SCHEDULER");
+        // The block translator is on unless refused by name. The threshold
+        // is how many times a start address runs before it is compiled.
+        state.block_jit_enabled = !envPresentAndFalse("ROSETTE_X64_BLOCK_JIT");
+        if (envU64("ROSETTE_X64_BLOCK_JIT_HOT_THRESHOLD")) |threshold| {
+            if (threshold != 0 and threshold <= std.math.maxInt(u16)) state.block_jit_hot_threshold = @intCast(threshold);
+        }
         if (envU64("ROSETTE_PE64_GUEST_SCHEDULER_QUANTUM")) |quantum| {
             if (quantum != 0) state.windows_scheduler.quantum = quantum;
         }
@@ -4044,6 +4969,14 @@ pub const ElfState = struct {
         // every guest timer fire three thousand times too often per unit of
         // work. See `WINDOWS_GUEST_CLOCK_SAMPLE_STRIDE`.
         state.guest_clock.source = if (envEquals("ROSETTE_GUEST_CLOCK", "instructions")) .retired_instructions else .host_monotonic;
+        // How many interpreted instructions one microsecond of guest time
+        // costs under the instruction-derived source. One reproduces the
+        // 1-MIPS machine; a few thousand describes the console, and dilates
+        // guest time to the interpreter's pace so audio pumps, frame limiters
+        // and fades advance per unit of work rather than per wall second.
+        if (envU64("ROSETTE_GUEST_CLOCK_INSTRUCTIONS_PER_TICK")) |ratio| {
+            if (ratio != 0) state.guest_clock.instructions_per_tick = ratio;
+        }
         if (envU64("ROSETTE_PE64_STALL_SAMPLE_STEPS")) |interval| {
             if (interval != 0) state.windows_progress.interval = interval;
         }
@@ -4060,8 +4993,14 @@ pub const ElfState = struct {
     }
 
     pub fn deinit(self: *ElfState) void {
+        if (self.block_jit) |jit| {
+            jit.destroy(self.allocator);
+            self.block_jit = null;
+        }
         if (self.decode_cache.len != 0) self.allocator.free(self.decode_cache);
         self.decode_cache = &.{};
+        if (self.decode_cache_victims.len != 0) self.allocator.free(self.decode_cache_victims);
+        self.decode_cache_victims = &.{};
         self.guest_kernel_calls.deinit(self.allocator);
         self.guest_page_protection.deinit(self.allocator);
         self.windows_registry.deinit(self.allocator);
@@ -5597,6 +6536,27 @@ pub const ElfState = struct {
         }
     }
 
+    /// Publish the utf8 find_any_of entry the loader found. A setter rather
+    /// than a bare field store because the address also has to enter the box
+    /// `step` consults before calling `tryWindowsGuestCompatibility`.
+    pub fn configureWindowsUtf8FindAnyOfEntry(self: *ElfState, entry: ?u64) void {
+        self.windows_utf8_find_any_of_entry = entry;
+        self.rebuildWindowsCompatHookBox();
+    }
+
+    /// Recompute the compatibility-hook box from every address
+    /// `tryWindowsGuestCompatibility` compares RIP against. Called by the
+    /// setters that assign those fields; a field assigned any other way
+    /// would leave its hook unreachable, which is why there are setters.
+    fn rebuildWindowsCompatHookBox(self: *ElfState) void {
+        var box: HookBox = .{};
+        if (self.windows_pthread_cond_wait_entry) |entry| box.widen(entry);
+        if (self.windows_pthread_cond_signal_entry) |entry| box.widen(entry);
+        if (self.windows_pthread_cond_broadcast_entry) |entry| box.widen(entry);
+        if (self.windows_utf8_find_any_of_entry) |entry| box.widen(entry);
+        self.windows_compat_hook_box = box;
+    }
+
     /// Publish the PE-local pthread condition-variable entry points that the
     /// loader found in executable bytes.  Keeping discovery in the PE intake
     /// and policy in the executor means a rebuilt Xenia image can move these
@@ -5610,6 +6570,7 @@ pub const ElfState = struct {
         self.windows_pthread_cond_wait_entry = wait_entry;
         self.windows_pthread_cond_signal_entry = signal_entry;
         self.windows_pthread_cond_broadcast_entry = broadcast_entry;
+        self.rebuildWindowsCompatHookBox();
         if (wait_entry != null or signal_entry != null or broadcast_entry != null) {
             log.info("PE64 guest synchronization hooks: pthread_cond_wait=0x{x} pthread_cond_signal=0x{x} pthread_cond_broadcast=0x{x} source=executable-signature", .{
                 wait_entry orelse 0,
@@ -6590,14 +7551,22 @@ pub const ElfState = struct {
         const slice_kernel_calls = self.windows_guest_threads[index].kernel_calls;
         var spin_probe_rip: u64 = 0;
         var spin_probe_state: u64 = 0;
+        var spin_probe_at: u64 = 0;
+        var spin_probe_taken = false;
         var slice_repeated_state = false;
-        while (!self.terminated and self.windows_active_guest_thread_slot != null and executed < max_steps) : (executed += 1) {
+        var next_code_sample: u64 = 0;
+        // A step retires one interpreted instruction or a whole translated
+        // block, so `executed` moves in strides and every threshold below is
+        // a `>=`, never an `==`.
+        while (!self.terminated and self.windows_active_guest_thread_slot != null and executed < max_steps) : (executed += self.step_retired) {
             const continue_running = self.step();
-            if (executed == WINDOWS_GUEST_SPIN_PROBE_AT) {
+            if (!spin_probe_taken and executed >= WINDOWS_GUEST_SPIN_PROBE_AT) {
+                spin_probe_taken = true;
+                spin_probe_at = executed;
                 spin_probe_rip = self.regs.rip;
                 spin_probe_state = self.windowsGuestRegisterDigest();
-            } else if (!slice_repeated_state and executed > WINDOWS_GUEST_SPIN_PROBE_AT and
-                executed <= WINDOWS_GUEST_SPIN_PROBE_AT + WINDOWS_GUEST_SPIN_PROBE_SPAN and
+            } else if (spin_probe_taken and !slice_repeated_state and executed > spin_probe_at and
+                executed <= spin_probe_at + WINDOWS_GUEST_SPIN_PROBE_SPAN and
                 self.regs.rip == spin_probe_rip and self.windowsGuestRegisterDigest() == spin_probe_state)
             {
                 slice_repeated_state = true;
@@ -6616,13 +7585,14 @@ pub const ElfState = struct {
                 self.windows_guest_slice_yield_requested = false;
                 break;
             }
-            self.windows_thread_service_steps +|= 1;
-            self.windows_guest_threads[index].executed_steps +|= 1;
-            self.windows_worker_executed_steps +|= 1;
+            self.windows_thread_service_steps +|= self.step_retired;
+            self.windows_guest_threads[index].executed_steps +|= self.step_retired;
+            self.windows_worker_executed_steps +|= self.step_retired;
             // Every sixty-fourth instruction, note where this thread is. See
             // `code_low` for why a per-thread code window is the measurement
             // and a per-thread rip is not.
-            if ((executed & 0x3F) == 0) {
+            if (executed >= next_code_sample) {
+                next_code_sample = executed + 64;
                 self.windows_guest_threads[index].code.sample(self.regs.rip);
             }
             if (self.regs.rip == 0) {
@@ -7333,6 +8303,7 @@ pub const ElfState = struct {
             site.last_offset = fault.address - page;
             site.last_value = fault.value;
         }
+        self.noteApuRegisterFault(fault);
         if (self.windows_vectored_exception_handler == 0) {
             self.guest_access_violations_without_handler +|= 1;
             self.completeSuppressedGuestAccess(fault.address, fault.width, fault.is_write, fault.value);
@@ -7893,12 +8864,16 @@ pub const ElfState = struct {
         ranges: []const WindowsExecutableRange,
     ) void {
         self.windows_executable_range_count = @min(ranges.len, self.windows_executable_ranges.len);
+        var box: HookBox = .{};
         for (self.windows_executable_ranges[0..self.windows_executable_range_count], 0..) |*destination, index| {
             destination.* = ranges[index];
+            box.widenRange(ranges[index].guest_base, ranges[index].length);
         }
         for (self.windows_executable_ranges[self.windows_executable_range_count..]) |*destination| {
             destination.* = .{};
         }
+        self.windows_executable_box = box;
+        self.windows_executable_range_hint = 0;
     }
 
     pub fn windowsVirtualAllocationContains(self: *const ElfState, address: u64, count: u64) bool {
@@ -8508,7 +9483,9 @@ pub const ElfState = struct {
         // Their old decodes must not survive that lifetime boundary.
         for (self.decode_cache) |*entry| if (entry.mapped_source) {
             entry.valid = false;
+            entry.last_used = 0;
         };
+        self.blockJitDropMapped();
     }
 
     fn indexWindowsMappedRange(self: *ElfState, range: mapped_ranges.Range) bool {
@@ -8549,6 +9526,10 @@ pub const ElfState = struct {
     /// re-read and compare its instruction bytes.
     fn bumpWindowsImageCodeGeneration(self: *ElfState, address: u64, count: u64) void {
         if (count == 0 or self.windows_executable_range_count == 0) return;
+        // Every guest store reaches this point. A store that touches no
+        // executable byte, which is nearly all of them, is answered by the
+        // box before the per-range scan.
+        if (!self.windows_executable_box.overlaps(address, count)) return;
         const end = std.math.add(u64, address, count) catch return;
         for (self.windows_executable_ranges[0..self.windows_executable_range_count]) |range| {
             if (range.length == 0) continue;
@@ -8560,7 +9541,11 @@ pub const ElfState = struct {
             // or very long-lived PE session.
             if (self.windows_image_code_generation == std.math.maxInt(u64)) {
                 self.windows_image_code_generation = 1;
-                for (self.decode_cache) |*entry| entry.valid = false;
+                for (self.decode_cache) |*entry| {
+                    entry.valid = false;
+                    entry.last_used = 0;
+                }
+                self.blockJitDropAll();
             } else {
                 self.windows_image_code_generation += 1;
             }
@@ -8573,13 +9558,27 @@ pub const ElfState = struct {
     /// transfer into `.data` remains on the conservative byte-checked path;
     /// the generation proof must never turn an invalid/non-executable fetch
     /// into a stale decode.
-    fn windowsImageCodeGenerationFor(self: *const ElfState, address: u64, count: usize) ?u64 {
+    fn windowsImageCodeGenerationFor(self: *ElfState, address: u64, count: usize) ?u64 {
         if (!self.windows_runtime_enabled or self.windows_executable_range_count == 0) return null;
         const end = std.math.add(u64, address, @as(u64, @intCast(count))) catch return null;
-        for (self.windows_executable_ranges[0..self.windows_executable_range_count]) |range| {
+        // Straight-line code stays inside one section, so the range that
+        // answered the previous fetch answers this one almost always.
+        const hint = self.windows_executable_range_hint;
+        if (hint < self.windows_executable_range_count) {
+            const range = self.windows_executable_ranges[hint];
+            if (range.length != 0 and address >= range.guest_base) {
+                if (std.math.add(u64, range.guest_base, range.length)) |range_end| {
+                    if (end <= range_end) return self.windows_image_code_generation;
+                } else |_| {}
+            }
+        }
+        for (self.windows_executable_ranges[0..self.windows_executable_range_count], 0..) |range, index| {
             if (range.length == 0 or address < range.guest_base) continue;
             const range_end = std.math.add(u64, range.guest_base, range.length) catch continue;
-            if (end <= range_end) return self.windows_image_code_generation;
+            if (end <= range_end) {
+                self.windows_executable_range_hint = index;
+                return self.windows_image_code_generation;
+            }
         }
         return null;
     }
@@ -8671,8 +9670,13 @@ pub const ElfState = struct {
         }
     }
 
-    fn traceWindowsMappedWrite(self: *ElfState, address: u64, width: u8, value: u64) void {
-        if (!self.trace_windows_memory or address < 0x40_0000_0000 or self.addrToOffset(address) != null or
+    inline fn traceWindowsMappedWrite(self: *ElfState, address: u64, width: u8, value: u64) void {
+        if (!self.trace_windows_memory) return;
+        self.traceWindowsMappedWriteEnabled(address, width, value);
+    }
+
+    fn traceWindowsMappedWriteEnabled(self: *ElfState, address: u64, width: u8, value: u64) void {
+        if (address < 0x40_0000_0000 or self.addrToOffset(address) != null or
             self.windows_memory_trace_events >= 64)
         {
             return;
@@ -8691,7 +9695,15 @@ pub const ElfState = struct {
         });
     }
 
-    fn traceGuestWrite(self: *const ElfState, vaddr: u64, width: u8, value: u64) void {
+    /// Every guest store passes through here. The gate is inline so the
+    /// common case (no watch address) is a load and a branch at the store
+    /// site, and the formatting stays out of line.
+    inline fn traceGuestWrite(self: *const ElfState, vaddr: u64, width: u8, value: u64) void {
+        if (self.trace_write_address == null) return;
+        self.traceGuestWriteWatched(vaddr, width, value);
+    }
+
+    fn traceGuestWriteWatched(self: *const ElfState, vaddr: u64, width: u8, value: u64) void {
         const watch = self.trace_write_address orelse return;
         const write_end = vaddr +| @as(u64, width);
         const watch_end = watch +| 8;
@@ -9733,7 +10745,123 @@ pub const ElfState = struct {
             std.mem.indexOf(u8, origin, "last_kernel_call=xboxkrnl.exe!RtlImageXexHeaderField") != null;
     }
 
+    fn parsePm4DrawFailure(line: []const u8) ?GpuDrawTuple {
+        const marker = "PM4_DRAW_INDX(";
+        const marker_start = std.mem.indexOf(u8, line, marker) orelse return null;
+        var cursor = marker_start + marker.len;
+        var values: [3]u32 = undefined;
+        for (&values, 0..) |*value, index| {
+            while (cursor < line.len and (line[cursor] == ' ' or line[cursor] == '\t')) cursor += 1;
+            const start = cursor;
+            while (cursor < line.len and std.ascii.isDigit(line[cursor])) cursor += 1;
+            if (start == cursor) return null;
+            value.* = std.fmt.parseInt(u32, line[start..cursor], 10) catch return null;
+            while (cursor < line.len and (line[cursor] == ' ' or line[cursor] == '\t')) cursor += 1;
+            if (index != values.len - 1) {
+                if (cursor >= line.len or line[cursor] != ',') return null;
+                cursor += 1;
+            }
+        }
+        while (cursor < line.len and (line[cursor] == ' ' or line[cursor] == '\t')) cursor += 1;
+        if (cursor >= line.len or line[cursor] != ')') return null;
+        return .{
+            .index_count = values[0],
+            .primitive_type = values[1],
+            .source_select = values[2],
+        };
+    }
+
+    fn noteGpuDrawFailure(self: *ElfState, tuple: GpuDrawTuple) void {
+        var entry: ?*GpuDrawFailure = null;
+        for (self.gpu_draw_failures[0..self.gpu_draw_failure_count]) |*candidate| {
+            if (candidate.index_count == tuple.index_count and
+                candidate.primitive_type == tuple.primitive_type and
+                candidate.source_select == tuple.source_select)
+            {
+                entry = candidate;
+                break;
+            }
+        }
+        if (entry == null and self.gpu_draw_failure_count < self.gpu_draw_failures.len) {
+            entry = &self.gpu_draw_failures[self.gpu_draw_failure_count];
+            self.gpu_draw_failure_count += 1;
+            entry.?.* = .{
+                .index_count = tuple.index_count,
+                .primitive_type = tuple.primitive_type,
+                .source_select = tuple.source_select,
+                .first_step = self.executed_steps,
+                .first_rip = self.regs.rip,
+            };
+        } else if (entry == null) {
+            self.gpu_draw_failure_overflow +|= 1;
+            return;
+        }
+
+        const record = entry.?;
+        record.occurrences +|= 1;
+        record.last_step = self.executed_steps;
+        record.last_rip = self.regs.rip;
+        if (!shouldReportWindowsPointOccurrence(record.occurrences)) return;
+
+        const stream_mapping_complete = self.gpu_ring_initialized and
+            self.gpu_ring_unreadable_updates == 0 and
+            self.gpu_ring_alias_mismatches == 0 and
+            self.gpu_indirect_buffers_unreadable == 0;
+        const primitive = gpuPrimitiveFinding(tuple.primitive_type);
+        log.warn("PE64 GPU DRAW FINDING: tuple=({d},{d},{d}) primitive={s} occurrence={d} step={d} rip=0x{x} classification={s} command_stream_mapping={s} ring_updates={d} indirect_buffers={d} action={s}", .{
+            tuple.index_count,
+            tuple.primitive_type,
+            tuple.source_select,
+            primitive.name,
+            record.occurrences,
+            self.executed_steps,
+            self.regs.rip,
+            primitive.classification,
+            if (stream_mapping_complete) "readable-and-alias-consistent" else "incomplete-or-conflicted",
+            self.gpu_ring_updates,
+            self.gpu_indirect_buffers_seen,
+            if (stream_mapping_complete)
+                primitive.action
+            else
+                "first repair command-stream mapping evidence, then capture the active pipeline, index/vertex bindings, and guest resource addresses",
+        });
+    }
+
+    fn reportGpuDrawFailures(self: *const ElfState) void {
+        if (self.gpu_draw_failure_count == 0 and self.gpu_draw_failure_overflow == 0) return;
+        const stream_mapping_complete = self.gpu_ring_initialized and
+            self.gpu_ring_unreadable_updates == 0 and
+            self.gpu_ring_alias_mismatches == 0 and
+            self.gpu_indirect_buffers_unreadable == 0;
+        log.info("PE64 GPU DRAW FINDINGS: distinct={d} overflow={d} command_stream_mapping={s} ring_updates={d} alias_mismatches={d} unreadable_updates={d} indirect_unreadable={d}; this ledger classifies backend refusals without pretending command-memory proof covers per-draw resources", .{
+            self.gpu_draw_failure_count,
+            self.gpu_draw_failure_overflow,
+            if (stream_mapping_complete) "readable-and-alias-consistent" else "incomplete-or-conflicted",
+            self.gpu_ring_updates,
+            self.gpu_ring_alias_mismatches,
+            self.gpu_ring_unreadable_updates,
+            self.gpu_indirect_buffers_unreadable,
+        });
+        for (self.gpu_draw_failures[0..self.gpu_draw_failure_count]) |record| {
+            const primitive = gpuPrimitiveFinding(record.primitive_type);
+            log.info("PE64 GPU DRAW FINDING: tuple=({d},{d},{d}) primitive={s} occurrences={d} first_step={d} last_step={d} first_rip=0x{x} last_rip=0x{x} classification={s} action={s}", .{
+                record.index_count,
+                record.primitive_type,
+                record.source_select,
+                primitive.name,
+                record.occurrences,
+                record.first_step,
+                record.last_step,
+                record.first_rip,
+                record.last_rip,
+                primitive.classification,
+                primitive.action,
+            });
+        }
+    }
+
     fn noteWindowsGuestWarning(self: *ElfState, line: []const u8) void {
+        if (parsePm4DrawFailure(line)) |tuple| self.noteGpuDrawFailure(tuple);
         self.windows_guest_warning_lines +|= 1;
         // Xenia prints its adapter list, its chosen device and its capability
         // narration at warning level. Recording those as fatal points with
@@ -10431,13 +11559,11 @@ pub const ElfState = struct {
     /// unmet one as a problem would be reporting a consequence.
     fn firstFrameChainStages(self: *const ElfState) [FIRST_FRAME_STAGE_COUNT]ChainStage {
         const graphics = &self.windows_graphics;
-        const font_samples = self.fontAtlasFrontierSamples();
-        // The atlas build is a stage rather than a footnote: it sits on the
-        // UI thread between "the presenter has a surface" and "the window
-        // paints", so no amount of GPU readiness gets past it. Rosette's own
-        // font mapping decides how much work it is.
-        const font_atlas_left = font_samples == 0 or
-            !self.classifyGuestFrontier(self.regs.rip).workload.isBoundedComputation();
+        // A checkpoint outside a builder (or no checkpoint at all) is not
+        // completion. Readiness requires the real CPU atlas outputs on return.
+        // Normal text layout cannot revoke it; a later invalid return can.
+        const font_observable = self.ui_evidence.font_returns != 0 or
+            self.guestMilestoneStageObservable(ui_draw_evidence.font_rgba_symbol);
         // Samples that prove the title's own code has run at all, as opposed
         // to Xenia still preparing to run it.
         const title_running_samples = self.frontierSamplesFor(.cpu_execution) +|
@@ -10491,9 +11617,11 @@ pub const ElfState = struct {
             .{
                 .name = "ui_font_atlas",
                 .owner = "xenia:ui-thread",
-                .met = font_atlas_left,
-                .evidence = "frontier_samples_in_atlas_build",
-                .value = font_samples,
+                .met = self.ui_evidence.font_last_valid,
+                .observable = font_observable,
+                .unobservable_reason = self.guestMilestoneUnobservableReason(ui_draw_evidence.font_rgba_symbol),
+                .evidence = "valid_cpu_RGBA_atlas_returns_not_GPU_upload",
+                .value = self.ui_evidence.font_valid_returns,
             },
             .{
                 // Include worker-local code-cache execution. A UI-thread
@@ -10567,9 +11695,11 @@ pub const ElfState = struct {
     pub fn reportFirstFrameChain(self: *const ElfState) void {
         const stages = self.firstFrameChainStages();
         var met_count: usize = 0;
+        var observable_count: usize = 0;
         var first_unmet: ?usize = null;
         for (stages, 0..) |stage, index| {
             if (!stage.observable) continue;
+            observable_count += 1;
             if (stage.met) {
                 met_count += 1;
             } else if (first_unmet == null) {
@@ -10577,9 +11707,10 @@ pub const ElfState = struct {
             }
         }
 
-        log.info("PE64 FIRST FRAME CHAIN: {d}/{d} preconditions met; stages are ordered by dependency, so only the first unmet one is a finding. This chain measures transport only: every stage of it can be met by a window showing one colour, and PE64 GUEST OUTPUT CHAIN is the one that asks whether a picture exists", .{
+        log.info("PE64 FIRST FRAME CHAIN: {d}/{d} observable preconditions met ({d} unobservable); stages are ordered by dependency, so only the first unmet one is a finding. This chain measures transport and CPU readiness only: every stage of it can be met by a window showing one colour, and PE64 GUEST OUTPUT CHAIN is the one that asks whether a picture exists", .{
             met_count,
-            stages.len,
+            observable_count,
+            stages.len - observable_count,
         });
         for (stages, 0..) |stage, index| {
             var unobservable_text: [224]u8 = undefined;
@@ -10626,8 +11757,60 @@ pub const ElfState = struct {
                 stages[index].owner,
             });
         } else {
-            log.info("PE64 FIRST FRAME CHAIN:   verdict: every precondition for a first frame was met", .{});
+            log.info("PE64 FIRST FRAME CHAIN:   verdict: every observable precondition for a first frame was met; unobservable stages are not completion proof", .{});
         }
+        self.reportUiDrawEvidence();
+    }
+
+    fn reportUiDrawEvidence(self: *const ElfState) void {
+        const e = &self.ui_evidence;
+        log.info("PE64 UI DRAW EVIDENCE: CPU atlas returns(valid/invalid/unreadable)={d}/{d}/{d} latest_valid={} pixels=0x{x} extent={d}x{d}; current text drawing is not atlas rebuilding and these bytes are not GPU-upload proof", .{
+            e.font_valid_returns, e.font_invalid_returns, e.font_unreadable_returns,
+            e.font_last_valid,    e.font_pixels,          e.font_width,
+            e.font_height,
+        });
+        log.info("PE64 UI DRAW EVIDENCE: lists(entries/empty/invalid/unreadable)={d}/{d}/{d}/{d} latest(valid/lists/vertices/indices)={}/{d}/{d}/{d} display_pos={d},{d} display_size={d}x{d} framebuffer_scale={d},{d} owner_viewport=0x{x}", .{
+            e.lists_entries,        e.lists_empty,          e.lists_invalid,   e.lists_unreadable,
+            e.draw_data_valid,      e.list_count,           e.vertex_count,    e.index_count,
+            e.display_pos[0],       e.display_pos[1],       e.display_size[0], e.display_size[1],
+            e.framebuffer_scale[0], e.framebuffer_scale[1], e.owner_viewport,
+        });
+        log.info("PE64 UI DRAW EVIDENCE: raw(first_list/cmd/vertex/readable)=(0x{x}/0x{x}/0x{x}/{}) raw(counts/cmd/vertex)={d}/{d} raw_clip={d},{d},{d},{d} raw_vertex={d},{d}", .{
+            e.first_list,      e.first_cmd,        e.first_vertex,        e.raw_buffers_readable,
+            e.raw_cmd_count,   e.raw_vertex_count, e.raw_cmd_clip[0],     e.raw_cmd_clip[1],
+            e.raw_cmd_clip[2], e.raw_cmd_clip[3],  e.raw_first_vertex[0], e.raw_first_vertex[1],
+        });
+        log.info("PE64 UI DRAW EVIDENCE: raw-internals(readable/list_flags/shared_data/clip_stack_size)={}/0x{x}/0x{x}/{d} cmd_header_clip={d},{d},{d},{d} shared_fullscreen_clip={d},{d},{d},{d}; this separates bad ImGui state from a bridge-side scissor mutation", .{
+            e.raw_list_internals_readable,
+            e.raw_list_flags,
+            e.raw_shared_data,
+            e.raw_clip_stack_size,
+            e.raw_cmd_header_clip[0],
+            e.raw_cmd_header_clip[1],
+            e.raw_cmd_header_clip[2],
+            e.raw_cmd_header_clip[3],
+            e.raw_shared_clip[0],
+            e.raw_shared_clip[1],
+            e.raw_shared_clip[2],
+            e.raw_shared_clip[3],
+        });
+        log.info("PE64 UI DRAW EVIDENCE: clip-stack(data/readable/first)=(0x{x}/{}) {d},{d},{d},{d}; compare this guest-owned push with the command header", .{
+            e.raw_clip_stack_data,
+            e.raw_clip_stack_first_readable,
+            e.raw_clip_stack_first[0],
+            e.raw_clip_stack_first[1],
+            e.raw_clip_stack_first[2],
+            e.raw_clip_stack_first[3],
+        });
+        log.info("PE64 UI DRAW EVIDENCE: draw(entries/empty/invalid_clip/unreadable)={d}/{d}/{d}/{d} latest(primitive/count/texture/scissor)={d}/{d}/0x{x}/{} clip={d},{d},{d},{d}", .{
+            e.draw_entries, e.draw_empty, e.draw_invalid_clip, e.draw_unreadable,
+            e.primitive,    e.draw_count, e.texture,           e.scissor_enabled,
+            e.clip[0],      e.clip[1],    e.clip[2],           e.clip[3],
+        });
+        log.info("PE64 UI DRAW EVIDENCE: pipeline returns(true/false)={d}/{d} scissor returns(true/false/unreadable_outputs)={d}/{d}/{d} latest_valid_rect={d},{d},{d},{d}; zero entries may be unresolved or inlined, see qualified PE64 GUEST MILESTONES; no Vulkan draw means an upstream exit, not a bridge rejection", .{
+            e.pipeline_true,   e.pipeline_false,  e.scissor_true,    e.scissor_false,   e.scissor_unreadable,
+            e.scissor_rect[0], e.scissor_rect[1], e.scissor_rect[2], e.scissor_rect[3],
+        });
     }
 
     /// The export shims whose entry proves a milestone, joined into a label.
@@ -10960,11 +12143,11 @@ pub const ElfState = struct {
                 // or a copy is the only Vulkan traffic that can carry a
                 // picture; a render pass that clears and ends carries a
                 // colour.
-                .name = "frame_carried_a_draw",
+                .name = "guest_present_carried_content",
                 .owner = "rosette:vulkan-bridge",
-                .met = graphics.content_commands != 0,
-                .evidence = "content_commands",
-                .value = graphics.content_commands,
+                .met = graphics.guest_presents_with_content != 0,
+                .evidence = "guest_swapchain_presents_with_content",
+                .value = graphics.guest_presents_with_content,
                 .when_unmet = "frames reached Rosette's bridge but none of them carried a draw, a dispatch or a copy. A render pass that clears and ends is a colour, not a picture; this is the stage that separates the two and it is the only one that can",
             },
             .{
@@ -11035,6 +12218,19 @@ pub const ElfState = struct {
                 stage.evidence,
                 stage.value,
             });
+            if (std.mem.eql(u8, stage.name, "guest_present_carried_content")) {
+                log.info("PE64 GUEST OUTPUT CHAIN:     forwarder attribution: guest_acquired_target={d} guest_content={d} guest_clear_only={d} guest_without_target={d} guest_without_write={d} command_shape(draw/dispatch/transfer/other)={d}/{d}/{d}/{d}; offscreen transfers never satisfy this stage", .{
+                    self.windows_graphics.guest_presents_with_target,
+                    self.windows_graphics.guest_presents_with_content,
+                    self.windows_graphics.guest_presents_clear_only,
+                    self.windows_graphics.guest_presents_without_target,
+                    self.windows_graphics.guest_presents_without_write,
+                    self.windows_graphics.draw_commands,
+                    self.windows_graphics.dispatch_commands,
+                    self.windows_graphics.transfer_commands,
+                    self.windows_graphics.command_calls -| self.windows_graphics.draw_commands -| self.windows_graphics.dispatch_commands -| self.windows_graphics.transfer_commands,
+                });
+            }
             // The second witness, from the guest side of the boundary. It is
             // printed for every stage that has one, met or not, because the
             // interesting cases are the ones where the two disagree.
@@ -11083,6 +12279,8 @@ pub const ElfState = struct {
                 publishes,
             });
         }
+        self.reportFrontBuffer();
+        self.reportFrameCost();
         if (first_unmet) |index| {
             log.info("PE64 GUEST OUTPUT CHAIN:   verdict: '{s}' is the earliest stage the title has not reached and it belongs to {s}", .{
                 stages[index].name,
@@ -13884,6 +15082,9 @@ pub const ElfState = struct {
         }
         self.guest_milestone_hits[index] +|= 1;
         self.guest_milestone_last_step[index] = accounting_step;
+        if (index == comptime xenia_guest_milestone_map.indexOf("_ZN2xe3gpu6vulkan22VulkanCommandProcessor9IssueSwapEjjj").?) {
+            self.noteFrameCostSwap(accounting_step);
+        }
         // Arguments first: the wake repair below signals objects and must not
         // be what a ring decode reads its write pointer from.
         if (self.windows_runtime_enabled) self.noteGuestMilestoneArguments(index);
@@ -13925,7 +15126,73 @@ pub const ElfState = struct {
         } else if (index == comptime map.indexOf("_ZN2xe3apu11AudioSystem11SubmitFrameEyPf").?) {
             // SubmitFrame(this, index, samples)
             self.noteAudioTitleFrame(self.regs.r8);
+        } else if (index == comptime map.indexOf(ui_draw_evidence.font_rgba_symbol).?) {
+            self.armGuestReturnCapture(.ui_font_rgba, 0);
+            self.activeReturnCapture().outputs = .{ self.regs.rdx, self.regs.r8, self.regs.r9, 0 };
+        } else if (index == comptime map.indexOf(ui_draw_evidence.lists_symbol).?) {
+            self.ui_evidence.noteLists(self.guestMemoryConst(self.regs.rdx, 64));
+            self.noteUiDrawDataBuffers(self.regs.rdx);
+        } else if (index == comptime map.indexOf(ui_draw_evidence.draw_symbol).?) {
+            self.ui_evidence.noteDraw(self.guestMemoryConst(self.regs.rdx, 44));
+        } else if (index == comptime map.indexOf(ui_draw_evidence.scissor_symbol).?) {
+            // Before CALL pushes the return: fifth/sixth args follow the
+            // caller's 32-byte Windows x64 shadow space.
+            const stack_args = self.guestMemoryConst(self.regs.rsp +| 32, 16);
+            self.armGuestReturnCapture(.ui_scissor, 0);
+            self.activeReturnCapture().outputs = .{
+                self.regs.r8,                                                      self.regs.r9,
+                if (stack_args) |b| std.mem.readInt(u64, b[0..8], .little) else 0, if (stack_args) |b| std.mem.readInt(u64, b[8..16], .little) else 0,
+            };
+        } else if (index == comptime map.indexOf(ui_draw_evidence.pipelines_symbol).?) {
+            self.armGuestReturnCapture(.ui_pipelines, 0);
         }
+    }
+
+    /// Snapshot the first ImDrawList's public buffers at RenderDrawLists.
+    /// ImDrawData only exposes the aggregate counts; following the documented
+    /// ImVector pointers lets the report distinguish a command whose clip was
+    /// born degenerate from one whose vertices were already outside the
+    /// viewport. Counts are used only as labels; the reads remain bounded to
+    /// one command and one vertex.
+    fn noteUiDrawDataBuffers(self: *ElfState, draw_data: u64) void {
+        const draw_data_bytes = self.guestMemoryConst(draw_data, 64) orelse return;
+        // ImDrawData::CmdLists is an ImVector at +16. Xenia's ImVector is
+        // laid out as { Size: i32, Capacity: i32, Data: pointer }; the
+        // pointer is therefore at +24, not +16. Following the size as a
+        // pointer turns a valid list into an unrelated guest address and
+        // makes the diagnostic itself report fabricated counts.
+        const command_lists = std.mem.readInt(u64, draw_data_bytes[24..32], .little);
+        if (command_lists == 0) return;
+        const first_list_bytes = self.guestMemoryConst(command_lists, 8) orelse return;
+        const first_list = std.mem.readInt(u64, first_list_bytes[0..8], .little);
+        if (first_list == 0) return;
+        const list_bytes = self.guestMemoryConst(first_list, 168) orelse return;
+        // ImDrawList stores three ImVector values before Flags. Each vector
+        // is { Size: i32, Capacity: i32, Data: pointer } on this 64-bit
+        // build: CmdBuffer at +0 (Data +8), IdxBuffer at +16 (Data +24),
+        // and VtxBuffer at +32 (Data +40).
+        const command_count = std.mem.readInt(u32, list_bytes[0..4], .little);
+        const command_data = std.mem.readInt(u64, list_bytes[8..16], .little);
+        const vertex_count = std.mem.readInt(u32, list_bytes[32..36], .little);
+        const vertex_data = std.mem.readInt(u64, list_bytes[40..48], .little);
+        const shared_data = std.mem.readInt(u64, list_bytes[56..64], .little);
+        self.ui_evidence.noteRawBuffers(
+            first_list,
+            command_data,
+            vertex_data,
+            command_count,
+            vertex_count,
+            if (command_data != 0 and command_count != 0) self.guestMemoryConst(command_data, 16) else null,
+            if (vertex_data != 0 and vertex_count != 0) self.guestMemoryConst(vertex_data, 8) else null,
+        );
+        self.ui_evidence.noteRawListInternals(
+            list_bytes,
+            self.guestMemoryConst(shared_data +| 48, 16),
+            if (std.mem.readInt(i32, list_bytes[152..156], .little) > 0)
+                self.guestMemoryConst(std.mem.readInt(u64, list_bytes[160..168], .little), 16)
+            else
+                null,
+        );
     }
 
     fn activeReturnCapture(self: *ElfState) *GuestReturnCapture {
@@ -13955,6 +15222,39 @@ pub const ElfState = struct {
         self.guest_return_captures_completed +|= 1;
         switch (finished.kind) {
             .none => {},
+            .ui_font_rgba => {
+                const p = self.guestMemoryConst(finished.outputs[0], 8);
+                const w = self.guestMemoryConst(finished.outputs[1], 4);
+                const h = self.guestMemoryConst(finished.outputs[2], 4);
+                if (p == null or w == null or h == null) {
+                    self.ui_evidence.font_returns +|= 1;
+                    self.ui_evidence.font_unreadable_returns +|= 1;
+                    self.ui_evidence.font_last_valid = false;
+                    return;
+                }
+                const pixels = std.mem.readInt(u64, p.?[0..8], .little);
+                const width = std.mem.readInt(i32, w.?[0..4], .little);
+                const height = std.mem.readInt(i32, h.?[0..4], .little);
+                const readable = if (ui_draw_evidence.Evidence.atlasByteCount(width, height)) |n|
+                    self.guestMemoryConst(pixels, n) != null
+                else
+                    false;
+                self.ui_evidence.noteFontReturn(pixels, width, height, readable);
+            },
+            .ui_scissor => {
+                const accepted = @as(u8, @truncate(self.regs.rax)) != 0;
+                var rect: [4]u32 = undefined;
+                var readable = accepted;
+                if (accepted) for (finished.outputs, 0..) |address, index| {
+                    if (self.guestMemoryConst(address, 4)) |b| {
+                        rect[index] = std.mem.readInt(u32, b[0..4], .little);
+                    } else readable = false;
+                };
+                self.ui_evidence.noteScissorReturn(accepted, if (readable) rect else null);
+            },
+            .ui_pipelines => {
+                if (@as(u8, @truncate(self.regs.rax)) != 0) self.ui_evidence.pipeline_true +|= 1 else self.ui_evidence.pipeline_false +|= 1;
+            },
             .gpu_register_read => {
                 if (finished.tag >= self.gpu_register_traffic_count) return;
                 const entry = &self.gpu_register_traffic[finished.tag];
@@ -14098,6 +15398,24 @@ pub const ElfState = struct {
                 0 => {
                     window.type0 += 1;
                     payload = ((dword >> 16) & 0x3FFF) + 1;
+                    const base_register: u32 = dword & 0x7FFF;
+                    if (base_register == 0x4800 and payload == 6) {
+                        var fetch: [6]u32 = @splat(0);
+                        var complete = true;
+                        for (&fetch, 1..) |*slot, offset| {
+                            slot.* = source.readDword((from + cursor + offset) % ring_dwords) orelse {
+                                complete = false;
+                                break;
+                            };
+                        }
+                        if (complete) {
+                            window.swap_fetch = fetch;
+                            window.swap_fetch_seen = true;
+                        }
+                    }
+                    if (base_register <= GuestFrontBuffer.dc_lut_last and base_register + payload > GuestFrontBuffer.dc_lut_first) {
+                        window.dc_lut_type0_writes += 1;
+                    }
                 },
                 1 => {
                     window.type1 += 1;
@@ -14113,7 +15431,14 @@ pub const ElfState = struct {
                     }
                     switch (opcode) {
                         0x22, 0x34, 0x35, 0x36 => window.draw_packets += 1,
-                        0x64 => window.swap_packets += 1,
+                        0x64 => {
+                            window.swap_packets += 1;
+                            // XE_SWAP payload: signature, front buffer
+                            // physical address, width, height.
+                            if (source.readDword((from + cursor + 2) % ring_dwords)) |frontbuffer| window.swap_frontbuffer = frontbuffer;
+                            if (source.readDword((from + cursor + 3) % ring_dwords)) |width| window.swap_width = width;
+                            if (source.readDword((from + cursor + 4) % ring_dwords)) |height| window.swap_height = height;
+                        },
                         0x37, 0x3F => if (window.indirect_buffers < GPU_RING_WINDOW_INDIRECT_BUFFERS) {
                             // ExecutePacketType3_INDIRECT_BUFFER reads the
                             // list pointer and its length as the next two
@@ -14166,6 +15491,7 @@ pub const ElfState = struct {
         self.gpu_ring_alias_mismatches +|= window.alias_mismatches;
         self.gpu_ring_draw_packets +|= window.draw_packets;
         self.gpu_ring_swap_packets +|= window.swap_packets;
+        self.gpu_front_buffer.note(&window);
         // Keep the first windows, and let the last slot track the newest.
         const slot = @min(self.gpu_ring_window_count, GPU_RING_WINDOW_CAPACITY - 1);
         self.gpu_ring_windows[slot] = window;
@@ -14189,6 +15515,7 @@ pub const ElfState = struct {
         self.gpu_indirect_type3_packets +|= window.type3;
         self.gpu_indirect_draw_packets +|= window.draw_packets;
         self.gpu_indirect_swap_packets +|= window.swap_packets;
+        self.gpu_front_buffer.note(&window);
         const slot = @min(self.gpu_indirect_buffer_count, GPU_INDIRECT_BUFFER_CAPACITY - 1);
         self.gpu_indirect_buffers[slot] = window;
         if (self.gpu_indirect_buffer_count < GPU_INDIRECT_BUFFER_CAPACITY) self.gpu_indirect_buffer_count += 1;
@@ -14347,6 +15674,210 @@ pub const ElfState = struct {
         const thread = &self.windows_guest_threads[slot_plus_one - 1];
         if (thread.status == .vacant) return "<exited>";
         return if (thread.name_len != 0) thread.nameText() else "<unnamed by the guest>";
+    }
+
+    /// A faulting access that landed in Xenia's XMA register aperture.
+    fn noteApuRegisterFault(self: *ElfState, fault: GuestAccessViolation) void {
+        const membase = self.xeniaVirtualMembase() orelse return;
+        if (fault.address < membase) return;
+        const offset = fault.address - membase;
+        if (offset < 0x7FEA_0000 or offset >= 0x7FEB_0000) return;
+        self.xma_registers.note(@truncate((offset & 0xFFFF) / 4), fault.is_write, @truncate(fault.value), self.totalInterpretedSteps());
+    }
+
+    fn reportXmaRegisters(self: *const ElfState) void {
+        const census = &self.xma_registers;
+        if (census.faults == 0) {
+            log.info("PE64 XMA REGISTERS: no title access to the XMA aperture at guest 0x7FEA0000 has faulted; the title has not addressed the audio decoder, so there is no compressed audio for it to be decoding", .{});
+            return;
+        }
+        log.info("PE64 XMA REGISTERS: faults={d} kick_writes={d} contexts_kicked={d} lock_writes={d} clear_writes={d} context_array_address=0x{x} registers={d} overflow={d}; read from Rosette's own fault delivery, so independent of whether XmaDecoder::WriteRegister was inlined into its MMIO thunk", .{
+            census.faults,
+            census.kicks,
+            census.kicked_contexts,
+            census.locks,
+            census.clears,
+            census.context_array_address,
+            census.count,
+            census.overflow,
+        });
+        for (census.entries[0..census.count]) |entry| {
+            log.info("PE64 XMA REGISTERS:   reg=0x{x:0>4} {s:<20} writes={d} reads={d} last_value=0x{x:0>8} bits_union=0x{x:0>8} first_step={d} last_step={d}", .{
+                entry.index,
+                GuestXmaRegisterCensus.registerName(entry.index),
+                entry.writes,
+                entry.reads,
+                entry.last_value,
+                entry.value_union,
+                entry.first_step,
+                entry.last_step,
+            });
+        }
+        if (census.kicks == 0) {
+            log.info("PE64 XMA REGISTERS:   verdict: the title has cleared and locked contexts but never kicked one, so the decoder has been asked for no work and the mixer has no decoded source; silence at this phase is the title's own state, not a lost Rosette signal", .{});
+        } else {
+            log.info("PE64 XMA REGISTERS:   verdict: the title kicked {d} context(s); if XmaContext::Work stays at zero the request reached the register and the decoder did not run it, which is Xenia's decoder thread or its work event", .{census.kicked_contexts});
+        }
+    }
+
+    /// Sample every thread's step counter at a swap so the cost of the frame
+    /// just presented can be split by who spent it.
+    fn noteFrameCostSwap(self: *ElfState, swap_step: u64) void {
+        const cost = &self.frame_cost;
+        cost.swaps +|= 1;
+        const audio_frames = self.guestMilestoneHitsNamed("_ZN2xe3apu11AudioSystem11SubmitFrameEyPf");
+        if (cost.swaps == 1) {
+            cost.first_swap_step = swap_step;
+        } else {
+            cost.noteInterval(swap_step -| cost.last_swap_step);
+            cost.owner_since_first_swap +|= self.executed_steps -| cost.owner_snapshot;
+            cost.audio_frames_since_first_swap +|= audio_frames -| cost.audio_frames_snapshot;
+        }
+        cost.last_swap_step = swap_step;
+        cost.owner_snapshot = self.executed_steps;
+        cost.audio_frames_snapshot = audio_frames;
+        for (&self.windows_guest_threads, &cost.threads) |*thread, *sample| {
+            if (!isLiveWindowsGuestThread(thread.status)) continue;
+            if (sample.handle != thread.handle) {
+                // A slot reused by a new thread starts from its own zero.
+                sample.* = .{ .handle = thread.handle, .snapshot = thread.executed_steps };
+                continue;
+            }
+            if (cost.swaps != 1) sample.since_first_swap +|= thread.executed_steps -| sample.snapshot;
+            sample.snapshot = thread.executed_steps;
+        }
+    }
+
+    fn frameCostRole(name: []const u8) []const u8 {
+        if (std.mem.startsWith(u8, name, "Audio Worker")) return "xenia audio pump running the title's mixer callback";
+        if (std.mem.startsWith(u8, name, "GPU Commands")) return "xenia GPU command processor";
+        if (std.mem.startsWith(u8, name, "GPU Frame limiter")) return "xenia vblank pacing";
+        if (std.mem.startsWith(u8, name, "MAIN_THREAD")) return "title main thread";
+        if (std.mem.startsWith(u8, name, "RENDER")) return "title render thread";
+        if (std.mem.startsWith(u8, name, "AUDIO")) return "title audio thread";
+        if (std.mem.startsWith(u8, name, "XThread")) return "title thread";
+        if (std.mem.startsWith(u8, name, "xe::threading::TimerQueue") or std.mem.startsWith(u8, name, "Logging Writer") or std.mem.startsWith(u8, name, "XMA Decoder")) return "xenia service thread";
+        return "other";
+    }
+
+    /// The front buffer the title presents, from the fetch constant VdSwap
+    /// put in the ring, and whether the gamma ramp that path depends on could
+    /// have been programmed.
+    fn reportFrontBuffer(self: *const ElfState) void {
+        const front = &self.gpu_front_buffer;
+        if (front.swaps == 0) return;
+        var dc_lut_mmio_writes: u64 = 0;
+        var dc_lut_mmio_registers: u32 = 0;
+        for (self.gpu_register_traffic[0..self.gpu_register_traffic_count]) |entry| {
+            if (entry.index >= GuestFrontBuffer.dc_lut_first and entry.index <= GuestFrontBuffer.dc_lut_last and entry.writes != 0) {
+                dc_lut_mmio_writes +|= entry.writes;
+                dc_lut_mmio_registers += 1;
+            }
+        }
+        const format = front.format();
+        log.info("PE64 FRONT BUFFER: swaps_described={d} format={s} (raw {d}) endianness={d} tiled={} pitch={d} base=0x{x} fetch_size={d}x{d} xe_swap(frontbuffer=0x{x} {d}x{d}) formats_seen=0x{x} fetch=[{x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8}]; the title's own description of what it asks Xenia to show, read from the type-0 SHADER_CONSTANT_FETCH_00_0 write VdSwap places before XE_SWAP", .{
+            front.swaps,
+            GuestFrontBuffer.formatName(format),
+            @as(u32, format),
+            @as(u32, front.endianness()),
+            front.tiled(),
+            front.pitch(),
+            front.baseAddress(),
+            front.fetchWidth(),
+            front.fetchHeight(),
+            front.frontbuffer,
+            front.width,
+            front.height,
+            front.formats_seen,
+            front.fetch[0],
+            front.fetch[1],
+            front.fetch[2],
+            front.fetch[3],
+            front.fetch[4],
+            front.fetch[5],
+        });
+        log.info("PE64 FRONT BUFFER:   gamma ramp path={s}; DC_LUT writes: type0_in_ring={d} (applied by CommandProcessor::HandleSpecialRegisterWrite) mmio_aperture={d} across {d} register(s) (stored by GraphicsSystem::WriteRegister and never applied to the ramp)", .{
+            if (GuestFrontBuffer.usesPwlRamp(format)) "piecewise-linear (10-bit front buffer)" else "256-entry table (8-bit front buffer)",
+            front.dc_lut_type0_writes,
+            dc_lut_mmio_writes,
+            dc_lut_mmio_registers,
+        });
+        if (GuestFrontBuffer.usesPwlRamp(format) and front.dc_lut_type0_writes == 0) {
+            if (dc_lut_mmio_writes != 0) {
+                log.info("PE64 FRONT BUFFER:   verdict: the title programmed its gamma ramp through the MMIO aperture ({d} write(s)) and Xenia applies DC_LUT only from PM4 type-0 packets, so the swap runs with Xenia's seeded linear PWL ramp. A title that resolves 7e3 floating-point data into a 10-bit front buffer displays its bit patterns as fixed point through that ramp: white (0x180) shows as 37% grey and everything below 0.25 at half brightness. This is an emulator-side gap; TEXEL CUSTODY's ramp_shape and the BRIGHTNESS LADDER say whether it is the loss on screen", .{dc_lut_mmio_writes});
+            } else {
+                log.info("PE64 FRONT BUFFER:   verdict: a 10-bit front buffer with no DC_LUT programming observed on either path, so the swap runs with Xenia's seeded linear PWL ramp; if the title renders 7e3 floating point into this buffer its picture is displayed as fixed-point bit patterns (white at 37% grey). Read TEXEL CUSTODY ramp_shape and the BRIGHTNESS LADDER before concluding", .{});
+            }
+        }
+    }
+
+    /// Instructions per presented frame and who spent them, with the frame
+    /// rate that cost implies at this run's interpreter rate.
+    fn reportFrameCost(self: *const ElfState) void {
+        const cost = &self.frame_cost;
+        if (cost.swaps < 2) return;
+        const mean = cost.meanRecentInterval();
+        const total = cost.totalSinceFirstSwap();
+        const intervals = cost.swaps - 1;
+        const now = monotonicNanoseconds();
+        const elapsed_nanos = if (now == 0 or self.run_first_checkpoint_nanos == 0) 0 else now -| self.run_first_checkpoint_nanos;
+        const rate = if (elapsed_nanos == 0) 0 else instructionRate(self.totalInterpretedSteps(), elapsed_nanos);
+        // Swaps per second at this rate, in thousandths, and the rate 30 of
+        // them would take. Both are integer so the line cannot round a
+        // hundredfold shortfall into a plausible one.
+        const swaps_per_second_milli: u64 = if (mean == 0) 0 else @intCast(@min(@as(u128, rate) * 1000 / mean, std.math.maxInt(u64)));
+        const needed_rate: u64 = mean *| 30;
+        const shortfall: u64 = if (rate == 0) 0 else needed_rate / rate;
+        log.info("PE64 FRAME COST: swaps={d} instructions_per_swap(mean_last_{d}/min/max/lifetime_mean)={d}/{d}/{d}/{d} interpreter_rate={d} instructions/s -> {d}.{d:0>3} swaps/s possible; 30 swaps/s needs {d} instructions/s ({d}x this run). audio_frames_per_swap={d} (a console mixes about 6 per 30 Hz frame); the frame rate is this cost divided by the rate, and neither the ramp nor the present can change it", .{
+            cost.swaps,
+            GuestFrameCost.window,
+            mean,
+            if (cost.min_interval == std.math.maxInt(u64)) 0 else cost.min_interval,
+            cost.max_interval,
+            total / intervals,
+            rate,
+            swaps_per_second_milli / 1000,
+            swaps_per_second_milli % 1000,
+            needed_rate,
+            shortfall,
+            cost.audio_frames_since_first_swap / intervals,
+        });
+        // Top spenders since the first swap, largest first, bounded.
+        var order: [MAX_WINDOWS_GUEST_THREADS]usize = undefined;
+        var order_count: usize = 0;
+        for (cost.threads, 0..) |sample, slot| {
+            if (sample.since_first_swap == 0) continue;
+            order[order_count] = slot;
+            order_count += 1;
+        }
+        var sorted: usize = 0;
+        while (sorted < order_count) : (sorted += 1) {
+            var best = sorted;
+            var candidate = sorted + 1;
+            while (candidate < order_count) : (candidate += 1) {
+                if (cost.threads[order[candidate]].since_first_swap > cost.threads[order[best]].since_first_swap) best = candidate;
+            }
+            if (best != sorted) std.mem.swap(usize, &order[sorted], &order[best]);
+        }
+        const denominator = if (total == 0) 1 else total;
+        var printed: usize = 0;
+        for (order[0..order_count]) |slot| {
+            if (printed == 6) break;
+            printed += 1;
+            const sample = cost.threads[slot];
+            const thread = &self.windows_guest_threads[slot];
+            const name = if (thread.handle == sample.handle and thread.name_len != 0) thread.nameText() else "<exited or unnamed>";
+            log.info("PE64 FRAME COST:   thread='{s}' role={s} instructions_since_first_swap={d} share={d}% per_swap={d}", .{
+                name,
+                frameCostRole(name),
+                sample.since_first_swap,
+                @divTrunc(sample.since_first_swap *| 100, denominator),
+                sample.since_first_swap / intervals,
+            });
+        }
+        if (cost.owner_since_first_swap != 0) {
+            log.info("PE64 FRAME COST:   owner loop instructions_since_first_swap={d} share={d}%", .{ cost.owner_since_first_swap, @divTrunc(cost.owner_since_first_swap *| 100, denominator) });
+        }
     }
 
     /// Whether the PCM the title submits is silence.
@@ -14939,9 +16470,152 @@ pub const ElfState = struct {
         return self.guestMemoryConst(membase + guest_address + adjust, count);
     }
 
+    fn xeniaGuestBytesMut(self: *ElfState, membase: u64, guest_address: u32, count: u64) ?[]u8 {
+        const adjust: u64 = if (guest_address >= 0xE000_0000) 0x1000 else 0;
+        return self.guestMemory(membase + guest_address + adjust, count);
+    }
+
     fn readHostU64(self: *const ElfState, address: u64) ?u64 {
         const bytes = self.guestMemoryConst(address, 8) orelse return null;
         return std.mem.readInt(u64, bytes[0..8], .little);
+    }
+
+    fn readWindowsInputState(self: *ElfState) ?WindowsInputState {
+        const callback = self.windows_input_hooks.read_controller_state orelse return null;
+        var value: WindowsInputState = .{};
+        self.windows_input_polls +|= 1;
+        if (callback(self.windows_input_hooks.context, &value) == 0 or value.connected == 0) {
+            self.windows_input_invalid_polls +|= 1;
+            return null;
+        }
+        self.windows_input_bridged_polls +|= 1;
+        self.windows_input_last_packet = value.packet_number;
+        self.windows_input_last_buttons = value.buttons;
+        self.windows_input_last_focused = value.focused != 0;
+        self.windows_input_focus_gains = value.focus_gain_events;
+        self.windows_input_focus_losses = value.focus_loss_events;
+        self.windows_input_rejected_events = value.rejected_key_events;
+        self.windows_input_last_key_code = value.last_key_code;
+        self.windows_input_contract_version = value.input_contract_version;
+        return value;
+    }
+
+    /// Complete the little-endian Windows XInput state when a native virtual
+    /// controller is available. Returning false keeps the old explicit
+    /// ERROR_DEVICE_NOT_CONNECTED path for tests and non-macOS runners with
+    /// no input hook.
+    pub fn writeWindowsXInputState(self: *ElfState, output: u64) bool {
+        const value = self.readWindowsInputState() orelse return false;
+        if (output == 0 or self.guestMemory(output, 16) == null) return false;
+        self.write32(output, value.packet_number);
+        self.write16(output + 4, value.buttons);
+        self.write8(output + 6, value.left_trigger);
+        self.write8(output + 7, value.right_trigger);
+        self.write16(output + 8, @bitCast(value.thumb_lx));
+        self.write16(output + 10, @bitCast(value.thumb_ly));
+        self.write16(output + 12, @bitCast(value.thumb_rx));
+        self.write16(output + 14, @bitCast(value.thumb_ry));
+        self.windows_input_xinput_successes +|= 1;
+        return true;
+    }
+
+    /// Xenia's Xam input exports receive a PPC context, not the Win32 XInput
+    /// ABI. Complete the small input contract at the export trampoline when
+    /// the macOS virtual controller is installed. This keeps keyboard input
+    /// usable even when Xenia's optional Win32 keyboard HID driver is absent.
+    fn tryXeniaKeyboardInputShim(self: *ElfState, target: u64, next_rip: u64) bool {
+        if (self.windows_input_hooks.read_controller_state == null) return false;
+        const slot = self.guest_kernel_calls.exportAt(target) orelse return false;
+        if (slot.kind != .trampoline) return false;
+        const name = slot.export_name;
+        const is_state = std.mem.eql(u8, name, "XamInputGetState");
+        const is_caps = std.mem.eql(u8, name, "XamInputGetCapabilities");
+        const is_caps_ex = std.mem.eql(u8, name, "XamInputGetCapabilitiesEx");
+        const is_set_state = std.mem.eql(u8, name, "XamInputSetState");
+        if (!is_state and !is_caps and !is_caps_ex and !is_set_state) return false;
+
+        const context = self.regs.rcx;
+        const membase = self.readHostU64(context + PPC_CONTEXT_VIRTUAL_MEMBASE) orelse {
+            self.windows_input_xam_refusals +|= 1;
+            return false;
+        };
+        const state = self.readWindowsInputState() orelse return false;
+        const user_index: u64 = if (is_caps_ex)
+            self.readHostU64(context + ppcContextGpr(4)) orelse {
+                self.windows_input_xam_refusals +|= 1;
+                return false;
+            }
+        else
+            self.readHostU64(context + ppcContextGpr(3)) orelse {
+                self.windows_input_xam_refusals +|= 1;
+                return false;
+            };
+        const valid_user = user_index < 4 or user_index == 0xFF;
+        const result: u32 = if (!valid_user)
+            1167 // ERROR_DEVICE_NOT_CONNECTED
+        else if (is_set_state)
+            0
+        else if (is_state) blk: {
+            const output = self.readHostU64(context + ppcContextGpr(5)) orelse {
+                self.windows_input_xam_refusals +|= 1;
+                break :blk 87; // ERROR_INVALID_PARAMETER
+            };
+            if (output != 0) {
+                const bytes = self.xeniaGuestBytesMut(membase, @truncate(output), 16) orelse {
+                    self.windows_input_xam_refusals +|= 1;
+                    break :blk 87;
+                };
+                std.mem.writeInt(u32, bytes[0..4], state.packet_number, .big);
+                std.mem.writeInt(u16, bytes[4..6], state.buttons, .big);
+                bytes[6] = state.left_trigger;
+                bytes[7] = state.right_trigger;
+                std.mem.writeInt(i16, bytes[8..10], state.thumb_lx, .big);
+                std.mem.writeInt(i16, bytes[10..12], state.thumb_ly, .big);
+                std.mem.writeInt(i16, bytes[12..14], state.thumb_rx, .big);
+                std.mem.writeInt(i16, bytes[14..16], state.thumb_ry, .big);
+            }
+            break :blk 0;
+        } else blk: {
+            const output_arg: u6 = if (is_caps_ex) 6 else 5;
+            const output = self.readHostU64(context + ppcContextGpr(output_arg)) orelse {
+                self.windows_input_xam_refusals +|= 1;
+                break :blk 87;
+            };
+            if (output == 0) break :blk 87;
+            const bytes = self.xeniaGuestBytesMut(membase, @truncate(output), 20) orelse {
+                self.windows_input_xam_refusals +|= 1;
+                break :blk 87;
+            };
+            @memset(bytes, 0);
+            bytes[0] = 1; // X_INPUT_CAPABILITIES_TYPE_GAMEPAD
+            bytes[1] = 1; // X_INPUT_DEVSUBTYPE_GAMEPAD
+            std.mem.writeInt(u16, bytes[4..6], 0xffff, .big); // buttons
+            bytes[6] = 0xff;
+            bytes[7] = 0xff;
+            std.mem.writeInt(i16, bytes[8..10], std.math.maxInt(i16), .big);
+            std.mem.writeInt(i16, bytes[10..12], std.math.maxInt(i16), .big);
+            std.mem.writeInt(i16, bytes[12..14], std.math.maxInt(i16), .big);
+            std.mem.writeInt(i16, bytes[14..16], std.math.maxInt(i16), .big);
+            break :blk 0;
+        };
+
+        self.write64(context + ppcContextGpr(3), result);
+        self.regs.rax = result;
+        self.regs.rip = next_rip;
+        self.windows_input_xam_shims +|= 1;
+        if (shouldReportWindowsPointOccurrence(self.windows_input_xam_shims)) {
+            log.info("PE64 INPUT BRIDGE: export={s} xam_shims={d} user_index={d} result={d} connected={} focused={} packet={d} buttons=0x{x} virtual_keyboard_pad=true; mapping=WASD:left-stick arrows:dpad space:A C:B X:X Y:Y return:Start delete:Back", .{
+                name,
+                self.windows_input_xam_shims,
+                user_index,
+                result,
+                state.connected != 0,
+                state.focused != 0,
+                state.packet_number,
+                state.buttons,
+            });
+        }
+        return true;
     }
 
     /// Read `NtCreateFile`/`NtOpenFile`'s object name from the PPC context.
@@ -15413,21 +17087,30 @@ pub const ElfState = struct {
     fn windowsScreenValiditySnapshot(self: *const ElfState) screen_validity.Snapshot {
         const graphics = &self.windows_graphics;
         const guest_presents = if (graphics.guest_present_observed) graphics.presents else 0;
-        const has_content_command = graphics.content_commands != 0;
-        const has_present = guest_presents != 0;
         return .{
             .step = self.totalInterpretedSteps(),
             .guest_presents = guest_presents,
             .guest_acquires = graphics.image_acquires,
-            .presents_with_target = if (has_present and graphics.image_acquires != 0) 1 else 0,
-            .presents_with_content = if (has_present and has_content_command) 1 else 0,
-            .presents_clear_only = if (has_present and !has_content_command and graphics.fill_commands != 0) 1 else 0,
-            .presents_without_target = if (has_present and graphics.image_acquires == 0) 1 else 0,
-            .presents_without_write = if (has_present and !has_content_command and graphics.fill_commands == 0) 1 else 0,
-            .content_commands = graphics.content_commands,
-            .native_present_requests = if (graphics.native_vulkan_forwarding) 0 else graphics.native_diagnostic_attempts,
-            .native_present_completions = if (graphics.native_vulkan_forwarding) 0 else graphics.native_diagnostic_frames,
-            .native_queue_submits = if (graphics.native_vulkan_forwarding) graphics.queue_submits else 0,
+            .presents_with_target = graphics.guest_presents_with_target,
+            .presents_with_content = graphics.guest_presents_with_content,
+            .presents_clear_only = graphics.guest_presents_clear_only,
+            .presents_without_target = graphics.guest_presents_without_target,
+            .presents_without_write = graphics.guest_presents_without_write,
+            .content_commands = graphics.guest_presents_with_content,
+            .draw_commands = graphics.draw_commands,
+            .dispatch_commands = graphics.dispatch_commands,
+            .native_present_requests = if (graphics.native_vulkan_forwarding)
+                graphics.native_present_requests_observed
+            else
+                graphics.native_diagnostic_attempts,
+            .native_present_completions = if (graphics.native_vulkan_forwarding)
+                graphics.native_present_completions_observed
+            else
+                graphics.native_diagnostic_frames,
+            .native_queue_submits = if (graphics.native_vulkan_forwarding)
+                graphics.native_queue_submits_observed
+            else
+                0,
             .expected_width = graphics.window_width,
             .expected_height = graphics.window_height,
             // The ELF state owns the logical extent, but it does not own a
@@ -15459,13 +17142,15 @@ pub const ElfState = struct {
         const snapshot = self.windowsScreenValiditySnapshot();
         const evaluation = self.windows_screen_validity.observe(snapshot);
         const first_blocking = if (evaluation.first_blocking) |stage| stage.label() else "none";
-        const content_class = if (snapshot.content_commands != 0)
-            "content_commands_observed"
-        else if (self.windows_graphics.fill_commands != 0)
+        const content_class = if (snapshot.presents_with_content != 0)
+            "guest_content_reached_acquired_image"
+        else if (snapshot.presents_clear_only != 0)
             "clear_or_uniform_only"
+        else if (self.windows_graphics.content_commands != 0)
+            "commands_observed_but_not_presented_content"
         else
             "no_content_or_fill_commands";
-        log.info("PE64 SCREEN VALIDITY: verdict={s} first_blocking={s} screen_stage={s} content_class={s} guest_presents={d} acquires={d} content_commands={d} fill_commands={d} native_forwarding={} native_diagnostic_frames={d} pixel_evidence={s} pixel_probe_successes={d} window_visible={} visible_fraction={d}% observations={d}; valid_on_screen is fail-closed until detailed pixel evidence and source provenance are observed", .{
+        log.info("PE64 SCREEN VALIDITY: verdict={s} first_blocking={s} screen_stage={s} content_class={s} guest_presents={d} acquires={d} presented_content={d} bridge_commands={d} fill_commands={d} native_forwarding={} native_present(requests/completions/queue_submits)={d}/{d}/{d} pixel_evidence={s} pixel_probe_successes={d} window_visible={} visible_fraction={d}% observations={d}; valid_on_screen is fail-closed until detailed pixel evidence and source provenance are observed", .{
             evaluation.verdict.label(),
             first_blocking,
             evaluation.record(.screen_valid).status.label(),
@@ -15473,9 +17158,12 @@ pub const ElfState = struct {
             snapshot.guest_presents,
             snapshot.guest_acquires,
             snapshot.content_commands,
+            self.windows_graphics.content_commands,
             self.windows_graphics.fill_commands,
             self.windows_graphics.native_vulkan_forwarding,
-            self.windows_graphics.native_diagnostic_frames,
+            snapshot.native_present_requests,
+            snapshot.native_present_completions,
+            snapshot.native_queue_submits,
             snapshot.pixel_evidence.label(),
             snapshot.pixel_probe_successes,
             snapshot.window_user_visible,
@@ -15489,6 +17177,27 @@ pub const ElfState = struct {
                 evaluation.record(stage).owner.label(),
             });
         }
+    }
+
+    pub fn reportWindowsInputBridge(self: *const ElfState) void {
+        const installed = self.windows_input_hooks.read_controller_state != null;
+        log.info("PE64 INPUT BRIDGE: installed={} contract_version={d} polls={d} bridged={d} invalid_or_disconnected={d} xinput_successes={d} xam_shims={d} xam_refusals={d} last_packet={d} last_buttons=0x{x} last_focused={} focus_gains={d} focus_losses={d} rejected_key_events={d} last_key_code={d} mapping=WASD:left-stick IJKL:right-stick arrows:dpad space:A C:B X:X Y:Y return:Start delete:Back Q:LB R:RB F:left-thumb V:right-thumb Z/LT E/RT escape:Guide; connected is a virtual keyboard pad, and an unfocused window reports zero state; a nonzero packet with zero buttons is actionable only when focus transitions or key events explain it", .{
+            installed,
+            self.windows_input_contract_version,
+            self.windows_input_polls,
+            self.windows_input_bridged_polls,
+            self.windows_input_invalid_polls,
+            self.windows_input_xinput_successes,
+            self.windows_input_xam_shims,
+            self.windows_input_xam_refusals,
+            self.windows_input_last_packet,
+            self.windows_input_last_buttons,
+            self.windows_input_last_focused,
+            self.windows_input_focus_gains,
+            self.windows_input_focus_losses,
+            self.windows_input_rejected_events,
+            self.windows_input_last_key_code,
+        });
     }
 
     /// Record which import raised a file failure and with what error.
@@ -16427,6 +18136,9 @@ pub const ElfState = struct {
             .function_name = function_name,
         };
         self.windows_stub_count += 1;
+        // The box `step` asks before `windowsImportStubAt`. This is the one
+        // place a stub address is recorded, so widening here is complete.
+        self.windows_stub_box.widen(address);
         // Keep the address decodable if a caller inspects the thunk outside
         // the fast dispatcher check. F4 is the PE route's explicit import
         // sentinel and is intercepted before normal instruction execution.
@@ -16633,12 +18345,18 @@ pub const ElfState = struct {
     /// not establish this stage. This proves entry into translated execution,
     /// not a swap or a picture (those retain independent evidence).
     fn noteWindowsTitleCodeFetch(self: *ElfState, address: u64) void {
+        self.noteWindowsTitleCodeFetches(address, 1);
+    }
+
+    /// The same for `count` instructions fetched from one place, which is
+    /// how a translated block reports its run.
+    fn noteWindowsTitleCodeFetches(self: *ElfState, address: u64, count: u64) void {
         const slot = self.windows_active_guest_thread_slot orelse return;
         if (!self.windows_guest_threads[slot].entered_xenia_title) return;
         const index = self.windows_code_cache_view orelse return;
         const view = self.windows_memory_views[index];
         if (address >= view.guest_base and address - view.guest_base < view.length) {
-            self.windows_title_code_fetches +|= 1;
+            self.windows_title_code_fetches +|= count;
         }
     }
 
@@ -16661,6 +18379,266 @@ pub const ElfState = struct {
             }
         }
         return buffer[0..0];
+    }
+
+    fn touchDecodeCacheEntry(self: *ElfState, entry: *DecodeCacheEntry) void {
+        // The counter is per state rather than per entry. It gives the
+        // replacement policy a cheap, monotonic age without putting a host
+        // timestamp or a branchy clock read in the PE hot path.
+        if (self.decode_cache_clock == std.math.maxInt(u64)) {
+            for (self.decode_cache) |*candidate| candidate.last_used = 0;
+            for (self.decode_cache_victims) |*candidate| candidate.last_used = 0;
+            self.decode_cache_clock = 1;
+        } else {
+            self.decode_cache_clock += 1;
+        }
+        entry.last_used = self.decode_cache_clock;
+    }
+
+    fn decodeCacheEntryHasIdentity(
+        entry: *const DecodeCacheEntry,
+        fetch_address: u64,
+        mapped_code: ?WindowsMappedCodeSlice,
+    ) bool {
+        if (!entry.valid or entry.fetch_address != fetch_address or entry.mapped_source != (mapped_code != null)) return false;
+        if (mapped_code) |generated| {
+            return entry.source_index == generated.source_index and entry.source_kind == generated.kind;
+        }
+        return true;
+    }
+
+    /// Save a displaced primary entry in the bounded victim neighborhood for
+    /// its address. This is deliberately independent from the fatal primary
+    /// cache contract: the seventeenth live address still records (and, in a
+    /// strict PE run, terminates on) a capacity conflict. The victim bank only
+    /// makes a later return to an evicted address cheap when the policy is in
+    /// diagnostic/continue mode or when a caller explicitly allows recovery.
+    fn saveDecodeCacheVictim(self: *ElfState, evicted: *const DecodeCacheEntry) void {
+        if (!evicted.valid) return;
+        const set_base = peDecodeCacheVictimIndex(evicted.fetch_address);
+        const ways = self.decode_cache_victims[set_base..][0..PE_DECODE_CACHE_VICTIM_WAYS];
+        var selected: ?*DecodeCacheEntry = null;
+        var oldest: u64 = std.math.maxInt(u64);
+        for (ways) |*candidate| {
+            if (!candidate.valid or candidate.fetch_address == evicted.fetch_address) {
+                selected = candidate;
+                break;
+            }
+            if (candidate.last_used < oldest) {
+                oldest = candidate.last_used;
+                selected = candidate;
+            }
+        }
+        selected.?.* = evicted.*;
+        self.touchDecodeCacheEntry(selected.?);
+        self.decode_cache_victim_fills +|= 1;
+    }
+
+    const DecodeCacheVictimHit = struct {
+        entry: *DecodeCacheEntry,
+        rearmed: bool,
+    };
+
+    /// Probe only the four victim ways selected by the address hash. A victim
+    /// is still generation/byte checked; it is a cache tier, not a permission
+    /// to execute stale generated code. Stale victims are invalidated here so
+    /// repeated returns do not pay for the same dead entry forever.
+    fn findDecodeCacheVictim(
+        self: *ElfState,
+        fetch_address: u64,
+        bytes: []const u8,
+        remaining: usize,
+        mapped_code: ?WindowsMappedCodeSlice,
+    ) ?DecodeCacheVictimHit {
+        const set_base = peDecodeCacheVictimIndex(fetch_address);
+        const ways = self.decode_cache_victims[set_base..][0..PE_DECODE_CACHE_VICTIM_WAYS];
+        for (ways) |*candidate| {
+            if (!decodeCacheEntryHasIdentity(candidate, fetch_address, mapped_code)) continue;
+            const cached_len = @as(usize, candidate.decoded.len);
+            const same_source = cached_len != 0 and cached_len <= remaining and
+                cached_len <= PE_MAX_INSTRUCTION_LENGTH;
+            if (!same_source) continue;
+            const image_generation: ?u64 = if (mapped_code == null)
+                self.windowsImageCodeGenerationFor(fetch_address, cached_len)
+            else
+                null;
+            const generation_matches = if (mapped_code) |generated|
+                candidate.source_generation == generated.generation
+            else if (image_generation) |generation|
+                candidate.source_generation == generation
+            else
+                false;
+            const bytes_match = std.mem.eql(u8, candidate.bytes[0..cached_len], bytes[0..cached_len]);
+            if (generation_matches or bytes_match) {
+                const rearmed = !generation_matches and bytes_match;
+                if (mapped_code) |generated| candidate.source_generation = generated.generation;
+                if (mapped_code == null) {
+                    if (image_generation) |generation| candidate.source_generation = generation;
+                }
+                return .{ .entry = candidate, .rearmed = rearmed };
+            }
+            candidate.valid = false;
+            self.decode_cache_victim_stale_rejections +|= 1;
+        }
+        return null;
+    }
+
+    fn noteDecodeCacheMiss(
+        self: *ElfState,
+        cause: DecodeCacheMissCause,
+        fetch_address: u64,
+        set_index: usize,
+        resident_addresses: [PE_DECODE_CACHE_WAYS]u64,
+        resident_count: usize,
+        mapped_code: ?WindowsMappedCodeSlice,
+    ) void {
+        switch (cause) {
+            .vacant_fill => self.decode_cache_vacant_fills +|= 1,
+            .capacity_conflict => {
+                self.decode_cache_conflict_fills +|= 1;
+                self.decode_cache_collisions +|= 1;
+            },
+            .stale_bytes => self.decode_cache_stale_refills +|= 1,
+        }
+
+        // A compulsory fill is expected. A full-set replacement or a source
+        // byte change is not: both mean an instruction that was already in
+        // the execution stream could not be reused safely. Keep the warning
+        // sparse, but route every decisive event through the same fatal-point
+        // policy used by the PE wait/import/memory diagnostics.
+        const occurrence = switch (cause) {
+            .vacant_fill => self.decode_cache_vacant_fills,
+            .capacity_conflict => self.decode_cache_conflict_fills,
+            .stale_bytes => self.decode_cache_stale_refills,
+        };
+
+        const source_index = if (mapped_code) |source| source.source_index else 0;
+        const source_kind = if (mapped_code) |source| source.kind else .memory_view;
+        const source_generation = if (mapped_code) |source| source.generation else 0;
+        var site: ?*DecodeCacheMissSite = null;
+        for (self.decode_cache_miss_sites[0..self.decode_cache_miss_site_count]) |*candidate| {
+            if (candidate.cause == cause and candidate.fetch_address == fetch_address and
+                candidate.set_index == set_index and candidate.mapped_source == (mapped_code != null) and
+                candidate.source_kind == source_kind and candidate.source_index == source_index)
+            {
+                site = candidate;
+                break;
+            }
+        }
+        if (site == null and self.decode_cache_miss_site_count < self.decode_cache_miss_sites.len) {
+            site = &self.decode_cache_miss_sites[self.decode_cache_miss_site_count];
+            self.decode_cache_miss_site_count += 1;
+            site.?.* = .{
+                .cause = cause,
+                .fetch_address = fetch_address,
+                .set_index = set_index,
+                .mapped_source = mapped_code != null,
+                .source_kind = source_kind,
+                .source_index = source_index,
+                .source_generation = source_generation,
+                .resident_addresses = resident_addresses,
+                .resident_count = resident_count,
+                .occurrences = 0,
+                .first_step = self.executed_steps,
+                .first_rip = self.regs.rip,
+            };
+        } else if (site == null) {
+            self.decode_cache_miss_site_overflow +|= 1;
+        }
+        if (site) |entry| {
+            entry.occurrences +|= 1;
+            entry.last_step = self.executed_steps;
+            entry.last_rip = self.regs.rip;
+            entry.source_generation = source_generation;
+        }
+
+        if (self.windows_runtime_enabled and shouldReportWindowsPointOccurrence(occurrence)) {
+            var resident_text: [PE_DECODE_CACHE_WAYS * 24 + 1]u8 = undefined;
+            var resident_text_len: usize = 0;
+            for (resident_addresses[0..resident_count], 0..) |address, index| {
+                const piece = std.fmt.bufPrint(
+                    resident_text[resident_text_len..],
+                    "{s}{d}:0x{x}",
+                    .{ if (index == 0) "" else "/", index, address },
+                ) catch break;
+                resident_text_len += piece.len;
+            }
+            const classification = switch (cause) {
+                .vacant_fill => "compulsory-first-touch",
+                .capacity_conflict => if (mapped_code != null) "capacity-conflict-generated-code" else "capacity-conflict-image-code",
+                .stale_bytes => "stale-executable-bytes",
+            };
+            const action = switch (cause) {
+                .vacant_fill => "no action unless the same address repeats unexpectedly",
+                .capacity_conflict => "inspect generated-code working-set pressure and cache-set residency",
+                .stale_bytes => "inspect executable-write invalidation and self-modifying-code ownership",
+            };
+            log.warn("PE64 DECODE CACHE FINDING: cause={s} classification={s} source={s} kind={s} source_index={d} generation={d} step={d} rip=0x{x} fetch=0x{x} set={d} ways={d} residents={s} policy={s} action={s}", .{
+                cause.label(),
+                classification,
+                if (mapped_code != null) "generated-code" else "image-code",
+                @tagName(source_kind),
+                source_index,
+                source_generation,
+                self.executed_steps,
+                self.regs.rip,
+                fetch_address,
+                set_index,
+                PE_DECODE_CACHE_WAYS,
+                resident_text[0..resident_text_len],
+                if (self.windows_fatal_point_terminate and cause.fatalLabel().len != 0) "terminate-on-fatal" else "record-only",
+                action,
+            });
+        }
+        const fatal_label = cause.fatalLabel();
+        if (self.windows_runtime_enabled and fatal_label.len != 0) {
+            self.terminateForWindowsFatalPointWith(fatal_label, .runtime_invariant_failure, 126);
+        }
+    }
+
+    fn reportDecodeCacheMissSites(self: *const ElfState) void {
+        if (self.decode_cache_misses == 0) return;
+        log.info("PE64 DECODE CACHE FINDINGS: distinct_sites={d} overflow={d} totals(vacant/conflict/stale)={d}/{d}/{d}; conflicts and stale-byte refills are fatal when the PE fatal-point policy is armed", .{
+            self.decode_cache_miss_site_count,
+            self.decode_cache_miss_site_overflow,
+            self.decode_cache_vacant_fills,
+            self.decode_cache_conflict_fills,
+            self.decode_cache_stale_refills,
+        });
+        for (self.decode_cache_miss_sites[0..self.decode_cache_miss_site_count]) |site| {
+            const classification = switch (site.cause) {
+                .vacant_fill => "compulsory-first-touch",
+                .capacity_conflict => if (site.mapped_source) "capacity-conflict-generated-code" else "capacity-conflict-image-code",
+                .stale_bytes => "stale-executable-bytes",
+            };
+            const action = switch (site.cause) {
+                .vacant_fill => "no action unless the address repeats unexpectedly",
+                .capacity_conflict => "inspect generated-code set pressure; raising the cache is not a mapping fix",
+                .stale_bytes => "inspect executable write invalidation and code-generation ownership",
+            };
+            var residents: [PE_DECODE_CACHE_WAYS * 24 + 1]u8 = undefined;
+            var used: usize = 0;
+            for (site.resident_addresses[0..site.resident_count], 0..) |address, index| {
+                const piece = std.fmt.bufPrint(residents[used..], "{s}0x{x}", .{ if (index == 0) "" else "/", address }) catch break;
+                used += piece.len;
+            }
+            log.info("PE64 DECODE CACHE FINDING: cause={s} classification={s} source={s} kind={s} source_index={d} generation={d} occurrences={d} first_step={d} last_step={d} first_rip=0x{x} last_rip=0x{x} set={d} residents={s} action={s}", .{
+                site.cause.label(),
+                classification,
+                if (site.mapped_source) "generated-code" else "image-code",
+                @tagName(site.source_kind),
+                site.source_index,
+                site.source_generation,
+                site.occurrences,
+                site.first_step,
+                site.last_step,
+                site.first_rip,
+                site.last_rip,
+                site.set_index,
+                residents[0..used],
+                action,
+            });
+        }
     }
 
     fn decodeAt(self: *ElfState) ?DecodedInsn {
@@ -16717,74 +18695,148 @@ pub const ElfState = struct {
             }
             return null;
         }
+        const cache_set = peDecodeCacheSetIndex(fetch_address);
         const cache_index = peDecodeCacheIndex(fetch_address);
-        const cache_entry = &self.decode_cache[cache_index];
-        var d: DecodedInsn = undefined;
+        var d: DecodedInsn = .{};
         var decoded_segment: x64_decoder.Segment = .ds;
-        const cached_len = @as(usize, cache_entry.decoded.len);
-        const same_source = cache_entry.valid and cache_entry.fetch_address == fetch_address and
-            cache_entry.mapped_source == (mapped_code != null) and
-            (if (mapped_code) |generated|
-                cache_entry.source_index == generated.source_index and cache_entry.source_kind == generated.kind
+        var cache_entry: ?*DecodeCacheEntry = null;
+        var rearmed = false;
+        var victim_restored = false;
+        var victim_rearmed = false;
+        var stale_entry: ?*DecodeCacheEntry = null;
+        var vacant_entry: ?*DecodeCacheEntry = null;
+        var oldest_entry: ?*DecodeCacheEntry = null;
+        var oldest_use: u64 = std.math.maxInt(u64);
+        var resident_addresses: [PE_DECODE_CACHE_WAYS]u64 = @splat(0);
+        var resident_count: usize = 0;
+
+        // Only an image fetch has an image generation; a mapped-code fetch
+        // carries its mapping's generation and never consults this table.
+        const resident_set = self.decode_cache[cache_index..][0..PE_DECODE_CACHE_WAYS];
+        for (resident_set) |*candidate| {
+            if (!candidate.valid) {
+                if (vacant_entry == null) vacant_entry = candidate;
+                continue;
+            }
+            if (resident_count < resident_addresses.len) {
+                resident_addresses[resident_count] = candidate.fetch_address;
+                resident_count += 1;
+            }
+            if (oldest_entry == null or candidate.last_used < oldest_use) {
+                oldest_entry = candidate;
+                oldest_use = candidate.last_used;
+            }
+            if (!decodeCacheEntryHasIdentity(candidate, fetch_address, mapped_code)) continue;
+
+            const cached_len = @as(usize, candidate.decoded.len);
+            const same_source = cached_len != 0 and cached_len <= remaining and
+                cached_len <= PE_MAX_INSTRUCTION_LENGTH;
+            const image_generation: ?u64 = if (mapped_code == null and same_source)
+                self.windowsImageCodeGenerationFor(fetch_address, cached_len)
             else
-                true) and
-            cached_len != 0 and cached_len <= remaining and
-            cached_len <= PE_MAX_INSTRUCTION_LENGTH;
-        const image_generation = self.windowsImageCodeGenerationFor(fetch_address, cached_len);
-        const cache_hit = same_source and
-            (if (mapped_code) |generated|
-                cache_entry.source_generation == generated.generation
+                null;
+            const cache_hit = same_source and (if (mapped_code) |generated|
+                candidate.source_generation == generated.generation
             else if (image_generation) |generation|
-                cache_entry.source_generation == generation
+                candidate.source_generation == generation
             else
-                std.mem.eql(u8, cache_entry.bytes[0..cached_len], bytes[0..cached_len]));
-        if (cache_hit) {
-            self.decode_cache_hits +|= 1;
-            d = cache_entry.decoded;
-            decoded_segment = cache_entry.segment;
-        } else {
+                std.mem.eql(u8, candidate.bytes[0..cached_len], bytes[0..cached_len]));
+            if (cache_hit) {
+                cache_entry = candidate;
+                d = candidate.decoded;
+                decoded_segment = candidate.segment;
+                break;
+            }
+
             // A mapping-wide generation can move because another JIT
             // function was emitted. Re-check the old bytes before paying for
             // a fresh decode: most such changes are unrelated to this entry,
             // so the old decode can simply be re-armed for the new generation.
             const bytes_match = same_source and
-                std.mem.eql(u8, cache_entry.bytes[0..cached_len], bytes[0..cached_len]);
+                std.mem.eql(u8, candidate.bytes[0..cached_len], bytes[0..cached_len]);
             if (bytes_match) {
-                self.decode_cache_rearms +|= 1;
-                d = cache_entry.decoded;
-                decoded_segment = cache_entry.segment;
-                if (mapped_code) |generated| cache_entry.source_generation = generated.generation;
+                cache_entry = candidate;
+                rearmed = true;
+                d = candidate.decoded;
+                decoded_segment = candidate.segment;
+                if (mapped_code) |generated| candidate.source_generation = generated.generation;
                 if (mapped_code == null) {
                     if (self.windowsImageCodeGenerationFor(fetch_address, cached_len)) |generation| {
-                        cache_entry.source_generation = generation;
+                        candidate.source_generation = generation;
                     }
                 }
-            } else {
-                self.decode_cache_misses +|= 1;
-                if (cache_entry.valid and cache_entry.fetch_address != fetch_address) self.decode_cache_collisions +|= 1;
-                d = decodeInsn(bytes);
-                const decoded_len = @as(usize, d.len);
-                if (decoded_len != 0 and decoded_len <= remaining and decoded_len <= PE_MAX_INSTRUCTION_LENGTH) {
-                    const prefixes = x64_decoder.decodeLegacyPrefixes(bytes);
-                    const base: ?RegId = if (d.sib_has_base) d.sib_base_reg else null;
-                    decoded_segment = x64_decoder.selectSegment(.explicit_data, base, prefixes.segment_override);
-                    cache_entry.* = .{
-                        .valid = true,
-                        .fetch_address = fetch_address,
-                        .mapped_source = mapped_code != null,
-                        .source_kind = if (mapped_code) |generated| generated.kind else .memory_view,
-                        .source_index = if (mapped_code) |generated| generated.source_index else 0,
-                        .source_generation = if (mapped_code) |generated|
-                            generated.generation
-                        else if (self.windowsImageCodeGenerationFor(fetch_address, decoded_len)) |generation|
-                            generation
-                        else
-                            0,
-                        .segment = decoded_segment,
-                        .decoded = d,
-                    };
-                    @memcpy(cache_entry.bytes[0..decoded_len], bytes[0..decoded_len]);
+                break;
+            }
+            // The same source address is resident but its bytes no longer
+            // match. Preserve that slot for the refill instead of creating a
+            // duplicate copy in a vacant way.
+            if (stale_entry == null) stale_entry = candidate;
+        }
+
+        if (cache_entry == null) {
+            // A primary miss is not necessarily a fresh decode. A recent
+            // conflict may have displaced this exact instruction into the
+            // bounded victim bank. Restore it into the same primary set so
+            // the next access is back on the normal fast path.
+            if (self.findDecodeCacheVictim(fetch_address, bytes, remaining, mapped_code)) |victim| {
+                const selected_entry = stale_entry orelse vacant_entry orelse oldest_entry;
+                if (selected_entry) |selected| {
+                    selected.* = victim.entry.*;
+                    victim.entry.valid = false;
+                    cache_entry = selected;
+                    d = selected.decoded;
+                    decoded_segment = selected.segment;
+                    victim_restored = true;
+                    victim_rearmed = victim.rearmed;
                 }
+            }
+        }
+
+        if (cache_entry) |entry| {
+            if (victim_restored) self.decode_cache_victim_hits +|= 1;
+            if (rearmed or victim_rearmed) {
+                self.decode_cache_rearms +|= 1;
+            } else {
+                self.decode_cache_hits +|= 1;
+            }
+            self.touchDecodeCacheEntry(entry);
+        } else {
+            self.decode_cache_misses +|= 1;
+            const selected_entry = stale_entry orelse vacant_entry orelse oldest_entry orelse return null;
+            const cause: DecodeCacheMissCause = if (stale_entry != null)
+                .stale_bytes
+            else if (vacant_entry != null)
+                .vacant_fill
+            else
+                .capacity_conflict;
+            if (cause == .capacity_conflict) self.decode_cache_replacements +|= 1;
+            if (cause == .capacity_conflict) self.saveDecodeCacheVictim(selected_entry);
+            self.noteDecodeCacheMiss(cause, fetch_address, cache_set, resident_addresses, resident_count, mapped_code);
+            if (self.terminated) return null;
+
+            d = decodeInsn(bytes);
+            const decoded_len = @as(usize, d.len);
+            if (decoded_len != 0 and decoded_len <= remaining and decoded_len <= PE_MAX_INSTRUCTION_LENGTH) {
+                const prefixes = x64_decoder.decodeLegacyPrefixes(bytes);
+                const base: ?RegId = if (d.sib_has_base) d.sib_base_reg else null;
+                decoded_segment = x64_decoder.selectSegment(.explicit_data, base, prefixes.segment_override);
+                selected_entry.* = .{
+                    .valid = true,
+                    .fetch_address = fetch_address,
+                    .mapped_source = mapped_code != null,
+                    .source_kind = if (mapped_code) |generated| generated.kind else .memory_view,
+                    .source_index = if (mapped_code) |generated| generated.source_index else 0,
+                    .source_generation = if (mapped_code) |generated|
+                        generated.generation
+                    else if (self.windowsImageCodeGenerationFor(fetch_address, decoded_len)) |generation|
+                        generation
+                    else
+                        0,
+                    .segment = decoded_segment,
+                    .decoded = d,
+                };
+                @memcpy(selected_entry.bytes[0..decoded_len], bytes[0..decoded_len]);
+                self.touchDecodeCacheEntry(selected_entry);
             }
         }
         // The shared decoder records the address-size bit in `d`, but the
@@ -16858,16 +18910,535 @@ pub const ElfState = struct {
         self.guest_clock.refresh(monotonicNanoseconds());
     }
 
+    /// `advanceWindowsGuestClock` for `count` instructions retired at once by
+    /// a translated block; `step` already counted the first.
+    fn advanceWindowsGuestClockBy(self: *ElfState, count: u64) void {
+        if (count == 0) return;
+        if (self.guest_clock.source == .retired_instructions) {
+            self.guest_clock.advanceRetired(count);
+            return;
+        }
+        self.guest_clock.stride +|= count;
+        if (self.guest_clock.stride < WINDOWS_GUEST_CLOCK_SAMPLE_STRIDE) return;
+        self.guest_clock.refresh(monotonicNanoseconds());
+    }
+
+    // ─── Block translation glue ───
+
+    const block_jit_layout = block_jit.Layout{
+        .regs_offset = @offsetOf(ElfState, "regs"),
+        .scratch_offset = @offsetOf(ElfState, "block_jit_scratch"),
+    };
+
+    /// Per-instruction tracing reads state the translator does not write
+    /// between instructions; the translator stays off while any of it is on.
+    fn blockJitTracingActive(self: *const ElfState) bool {
+        return self.trace_rip_start != null or self.trace_ring_enabled or self.trace_string_memory or
+            self.trace_formatter or self.trace_vector or self.trace_utf8;
+    }
+
+    /// The translator, created on first use so a state that never steps
+    /// (most tests) never maps executable memory.
+    fn blockJitActive(self: *ElfState) ?*BlockJitState {
+        if (self.block_jit) |jit| return jit;
+        if (!self.block_jit_enabled or self.block_jit_unavailable) return null;
+        if (self.blockJitTracingActive()) {
+            self.block_jit_unavailable = true;
+            self.block_jit_disabled_reason = "per-instruction tracing is on";
+            return null;
+        }
+        const jit = BlockJitState.create(self.allocator) orelse {
+            self.block_jit_unavailable = true;
+            self.block_jit_disabled_reason = "executable memory could not be mapped (MAP_JIT refused or out of memory)";
+            log.info("PE64 BLOCK JIT: disabled, {s}; the interpreter runs everything", .{self.block_jit_disabled_reason});
+            return null;
+        };
+        jit.hot_threshold = self.block_jit_hot_threshold;
+        self.block_jit = jit;
+        return jit;
+    }
+
+    fn blockJitRequestAbort(self: *ElfState) void {
+        self.block_jit_scratch.abort = 1;
+        if (self.block_jit) |jit| jit.aborts +|= 1;
+    }
+
+    /// Set the diagnostic RIP and op to the instruction the emitted code
+    /// named before calling a helper, so a fault raised inside the helper
+    /// carries the same `instruction_rip` the interpreter would have.
+    fn blockJitNameCurrentInstruction(self: *ElfState) void {
+        const block = self.block_jit_scratch.block orelse return;
+        const index = self.block_jit_scratch.index;
+        if (index >= block.insns.len) return;
+        const insn = block.insns[index];
+        self.regs.rip = insn.rip;
+        self.last_instruction_rip = insn.rip;
+        self.last_decoded_op = insn.decoded.op;
+        self.last_decoded_len = insn.len;
+    }
+
+    /// Run instruction `index` of `block` through the interpreter: the same
+    /// address resolution `decodeAt` performs, then `execute`.
+    fn blockJitExecuteInsn(self: *ElfState, block: *const block_jit.Block, index: u32) void {
+        const insn = block.insns[index];
+        self.regs.rip = insn.rip;
+        var d = insn.decoded;
+        d.segment = insn.segment;
+        const addr_size: Size = if (d.has_0x67) .bits32 else .bits64;
+        const relative_control = switch (d.op) {
+            .call_rel32, .jmp_rel8, .jcc_rel8, .jcc_rel32 => true,
+            else => false,
+        };
+        if (!relative_control and !d.is_reg_form) {
+            d.addr = x64_decoder.resolveMemoryAddress(&self.regs, .{
+                .displacement = d.addr,
+                .has_index = d.sib_has_index,
+                .index_reg = d.sib_index_reg,
+                .scale = d.sib_scale,
+                .has_base = d.sib_has_base,
+                .base_reg = d.sib_base_reg,
+                .rip_relative = d.rip_relative,
+                .segment = d.segment,
+            }, self.regs.rip +% d.len, addr_size, .long64, d.op != .lea_reg_mem);
+        }
+        self.last_decoded_op = d.op;
+        self.last_decoded_len = d.len;
+        self.last_instruction_rip = insn.rip;
+        x64_interpreter.execute(self, d);
+    }
+
+    const InstructionSource = struct {
+        bytes: []const u8,
+        mapped: ?WindowsMappedCodeSlice,
+    };
+
+    /// Up to fifteen instruction bytes at `address`, from the image or a
+    /// code mapping, with the mapping's identity when it came from one.
+    fn fetchInstructionSource(self: *ElfState, address: u64) ?InstructionSource {
+        if (self.addrToOffset(address)) |off| {
+            const offset: usize = @intCast(off);
+            if (offset >= self.mem.len) return null;
+            const remaining = self.mem.len - offset;
+            return .{ .bytes = self.mem[offset..][0..@min(remaining, PE_MAX_INSTRUCTION_LENGTH)], .mapped = null };
+        }
+        if (self.windowsMappedCodeMemoryConst(address, PE_MAX_INSTRUCTION_LENGTH)) |generated| {
+            return .{ .bytes = generated.bytes, .mapped = generated };
+        }
+        return null;
+    }
+
+    /// The bytes a compiled block covers, as they are now.
+    fn fetchCodeRange(self: *ElfState, address: u64, count: usize) ?[]const u8 {
+        if (self.addrToOffset(address)) |off| {
+            const offset: usize = @intCast(off);
+            if (offset >= self.mem.len or count > self.mem.len - offset) return null;
+            return self.mem[offset..][0..count];
+        }
+        return self.windowsMappedMemoryConst(address, count);
+    }
+
+    /// Whether a jump to `target` is one the interpreter's arm intercepts
+    /// (a condition-variable shim, an import stub, a synthetic return).
+    fn blockJitTargetHooked(self: *const ElfState, target: u64) bool {
+        if (target >= SYNTHETIC_RIP_FLOOR) return true;
+        if (self.windows_stub_box.contains(target) or self.windows_compat_hook_box.contains(target)) return true;
+        if (self.windows_pthread_cond_timedwait_entry) |entry| {
+            if (target == entry) return true;
+        }
+        return false;
+    }
+
+    /// The generation the block's source currently carries, or null when the
+    /// source has no generation and bytes must be compared.
+    fn blockJitSourceGeneration(self: *ElfState, block: *const block_jit.Block) ?u64 {
+        if (!block.source_mapped) return self.windowsImageCodeGenerationFor(block.start_rip, block.bytes.len);
+        const kind: mapped_ranges.Kind = @enumFromInt(block.source_kind);
+        return switch (kind) {
+            .memory_view => if (block.source_index < self.windows_file_mappings.len) self.windows_file_mappings[block.source_index].code_generation else null,
+            .virtual_allocation => if (block.source_index < self.windows_virtual_allocations.len) self.windows_virtual_allocations[block.source_index].code_generation else null,
+        };
+    }
+
+    /// A block-entry generation check cannot protect a block that rewrites
+    /// its own *upcoming* instructions. Retire the completed store, then
+    /// resume at the next RIP through the authoritative decode path. Writes
+    /// to ordinary data or already-consumed instructions don't force an exit.
+    fn blockJitContinuationChanged(self: *ElfState) bool {
+        const block = self.block_jit_scratch.block orelse return false;
+        const index = self.block_jit_scratch.index;
+        if (index + 1 >= block.insns.len) return false;
+        const current = self.blockJitSourceGeneration(block);
+        if (current != null and block.source_generation != null and current.? == block.source_generation.?) return false;
+        const next = block.insns[index + 1].rip;
+        const offset: usize = @intCast(next - block.start_rip);
+        const now = self.fetchCodeRange(next, block.bytes.len - offset);
+        const changed = now == null or !std.mem.eql(u8, now.?, block.bytes[offset..]);
+        if (changed) if (self.block_jit) |jit| {
+            jit.continuation_write_aborts +|= 1;
+        };
+        return changed;
+    }
+
+    /// A block stays valid while its source generation is unchanged; when
+    /// the generation moved (Xenia's code cache is written constantly) the
+    /// bytes decide, exactly as the decode cache's rearm path does.
+    fn blockJitValidate(self: *ElfState, jit: *BlockJitState, block: *block_jit.Block) bool {
+        const current = self.blockJitSourceGeneration(block);
+        if (block.source_generation != null and current != null and block.source_generation.? == current.?) return true;
+        const now = self.fetchCodeRange(block.start_rip, block.bytes.len) orelse return false;
+        if (!std.mem.eql(u8, now, block.bytes)) return false;
+        block.source_generation = current;
+        jit.revalidations +|= 1;
+        return true;
+    }
+
+    fn dropBlockJitSlot(self: *ElfState, jit: *BlockJitState, index: usize) void {
+        if (jit.blocks[index]) |block| {
+            BlockJitState.freeBlock(self.allocator, block);
+            jit.blocks[index] = null;
+            jit.invalidations +|= 1;
+        }
+    }
+
+    /// Drop every block; the code memory starts over.
+    fn resetBlockJit(self: *ElfState, jit: *BlockJitState) void {
+        for (jit.blocks, 0..) |slot, index| {
+            if (slot != null) self.dropBlockJitSlot(jit, index);
+        }
+        @memset(jit.hotness, .{});
+        jit.memory.reset();
+        jit.resets +|= 1;
+    }
+
+    /// Mapped code was unmapped or replaced: its blocks must not outlive
+    /// the mapping, whatever their generation says (a recreated mapping can
+    /// reuse both slot and generation 1). Called beside the decode cache's
+    /// own mapped invalidation.
+    fn blockJitDropMapped(self: *ElfState) void {
+        const jit = self.block_jit orelse return;
+        for (jit.blocks, 0..) |slot, index| {
+            if (slot) |block| if (block.source_mapped) self.dropBlockJitSlot(jit, index);
+        }
+    }
+
+    fn blockJitDropAll(self: *ElfState) void {
+        const jit = self.block_jit orelse return;
+        for (jit.blocks, 0..) |slot, index| {
+            if (slot != null) self.dropBlockJitSlot(jit, index);
+        }
+    }
+
+    /// Decode the straight-line run at `rip` and compile it. Null when there
+    /// is nothing worth compiling there; the caller records the refusal.
+    fn compileBlockJit(self: *ElfState, jit: *BlockJitState, rip: u64) ?*block_jit.Block {
+        var insns: std.ArrayList(block_jit.Insn) = .empty;
+        defer insns.deinit(self.allocator);
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(self.allocator);
+
+        var address = rip;
+        var source_mapped = false;
+        var source_kind: u8 = 0;
+        var source_index: usize = 0;
+        var source_generation: ?u64 = null;
+        while (insns.items.len < BLOCK_JIT_MAX_INSTRUCTIONS) {
+            const fetch = self.fetchInstructionSource(address) orelse break;
+            const mapped = fetch.mapped != null;
+            const kind: u8 = if (fetch.mapped) |generated| @intFromEnum(generated.kind) else 0;
+            const index: usize = if (fetch.mapped) |generated| generated.source_index else 0;
+            if (insns.items.len == 0) {
+                source_mapped = mapped;
+                source_kind = kind;
+                source_index = index;
+                source_generation = if (fetch.mapped) |generated| generated.generation else self.windowsImageCodeGenerationFor(address, 1);
+            } else if (mapped != source_mapped or kind != source_kind or index != source_index) {
+                break;
+            }
+            const d = decodeInsn(fetch.bytes);
+            const decoded_len: usize = d.len;
+            if (decoded_len == 0 or decoded_len > fetch.bytes.len or decoded_len > PE_MAX_INSTRUCTION_LENGTH) break;
+            if (block_jit.endsBlockBefore(d)) break;
+            const prefixes = x64_decoder.decodeLegacyPrefixes(fetch.bytes);
+            const base: ?RegId = if (d.sib_has_base) d.sib_base_reg else null;
+            var insn = block_jit.Insn{
+                .rip = address,
+                .len = d.len,
+                .decoded = d,
+                .segment = x64_decoder.selectSegment(.explicit_data, base, prefixes.segment_override),
+            };
+            if (d.op == .jmp_rel8) {
+                const target = address +% d.len +% d.imm;
+                if (self.blockJitTargetHooked(target)) insn.force_fallback = true;
+            }
+            insns.append(self.allocator, insn) catch return null;
+            bytes.appendSlice(self.allocator, fetch.bytes[0..decoded_len]) catch return null;
+            address +%= d.len;
+            if (block_jit.isTerminator(d.op)) break;
+        }
+        if (insns.items.len == 0) return null;
+        // The image generation covers the whole block only if every byte of
+        // it lies in executable ranges; otherwise the bytes decide.
+        if (!source_mapped) source_generation = self.windowsImageCodeGenerationFor(rip, bytes.items.len);
+
+        var compiled = block_jit.compile(self.allocator, &jit.memory, block_jit_layout, insns.items, address) catch |err| switch (err) {
+            error.NothingToCompile => return null,
+            error.OutOfCodeSpace => blk: {
+                self.resetBlockJit(jit);
+                break :blk block_jit.compile(self.allocator, &jit.memory, block_jit_layout, insns.items, address) catch {
+                    jit.compile_failures +|= 1;
+                    return null;
+                };
+            },
+            else => {
+                jit.compile_failures +|= 1;
+                return null;
+            },
+        };
+        const block = self.allocator.create(block_jit.Block) catch return null;
+        const owned_insns = insns.toOwnedSlice(self.allocator) catch {
+            self.allocator.destroy(block);
+            return null;
+        };
+        const owned_bytes = bytes.toOwnedSlice(self.allocator) catch {
+            self.allocator.free(owned_insns);
+            self.allocator.destroy(block);
+            return null;
+        };
+        block.* = .{
+            .helpers = .{ .read = blockJitRead, .write = blockJitWrite, .interpret = blockJitInterpret, .block = block },
+            .start_rip = rip,
+            .end_rip = address,
+            .insns = owned_insns,
+            .bytes = owned_bytes,
+            .code = compiled.code,
+            .native_count = compiled.native_count,
+            .fallback_count = compiled.fallback_count,
+            .register_only = compiled.register_only,
+            .source_mapped = source_mapped,
+            .source_kind = source_kind,
+            .source_index = source_index,
+            .source_generation = source_generation,
+        };
+        compiled.code = &.{};
+        jit.compiled +|= 1;
+        jit.native_instructions_compiled +|= block.native_count;
+        jit.fallback_instructions_compiled +|= block.fallback_count;
+        return block;
+    }
+
+    /// Account a block's execution the way `step` and its loops account an
+    /// interpreted instruction, then raise any fault left pending.
+    fn accountBlockJit(self: *ElfState, jit: *BlockJitState, block: *block_jit.Block, completed: u32) void {
+        const retired: u32 = @max(completed, 1);
+        self.step_retired = retired;
+        jit.executions +|= 1;
+        jit.instructions_retired +|= retired;
+        block.executions +|= 1;
+        block.instructions_retired +|= retired;
+        const last = block.insns[@min(retired, @as(u32, @intCast(block.insns.len))) - 1];
+        self.last_instruction_rip = last.rip;
+        self.last_decoded_op = last.decoded.op;
+        self.last_decoded_len = last.len;
+        // `step` advanced the clock once for this call; the block retired
+        // the rest.
+        self.advanceWindowsGuestClockBy(retired - 1);
+        if (block.source_mapped) {
+            self.windows_generated_code_fetches +|= retired;
+            self.noteWindowsTitleCodeFetches(block.start_rip, retired);
+        }
+    }
+
+    /// Execute a valid block from the current RIP. Returns `step`'s result.
+    fn executeBlockJit(self: *ElfState, jit: *BlockJitState, block: *block_jit.Block, slot_index: usize) bool {
+        if (block.register_only and !block.verified) {
+            // The cross-check runs the block itself (once) and accounts it;
+            // whichever way it went, this step is done.
+            _ = self.verifyBlockJit(jit, block, slot_index);
+            return !self.terminated;
+        }
+        self.block_jit_scratch = .{ .block = block };
+        const completed = block.entry()(self, &block.helpers);
+        self.block_jit_scratch.block = null;
+        self.accountBlockJit(jit, block, completed);
+        if (self.guest_access_violation_pending) self.raiseGuestAccessViolation();
+        return !self.terminated;
+    }
+
+    /// Run a register-only block through the interpreter and through its
+    /// translation from the same register file, and compare every register,
+    /// RIP and the flags. On agreement the block is trusted from then on; on
+    /// disagreement the interpreter's result stands, the block is dropped,
+    /// its address is never compiled again, and the run says so.
+    fn verifyBlockJit(self: *ElfState, jit: *BlockJitState, block: *block_jit.Block, slot_index: usize) bool {
+        const before = self.regs;
+        var interpreted: u32 = 0;
+        while (interpreted < block.insns.len) {
+            if (self.regs.rip != block.insns[interpreted].rip) break;
+            self.blockJitExecuteInsn(block, interpreted);
+            interpreted += 1;
+            if (self.terminated or self.guest_access_violation_pending) break;
+        }
+        const reference = self.regs;
+        block.verified = true;
+        if (self.terminated or self.guest_access_violation_pending) {
+            // The interpreter's run is the result; nothing to compare.
+            self.step_retired = @max(interpreted, 1);
+            self.advanceWindowsGuestClockBy(self.step_retired - 1);
+            return false;
+        }
+        self.regs = before;
+        self.block_jit_scratch = .{ .block = block };
+        const completed = block.entry()(self, &block.helpers);
+        self.block_jit_scratch.block = null;
+        const translated = self.regs;
+
+        var mismatch: ?[]const u8 = null;
+        inline for (.{ "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip" }) |name| {
+            if (mismatch == null and @field(reference, name) != @field(translated, name)) mismatch = name;
+        }
+        if (mismatch == null and reference.rflags != translated.rflags) mismatch = "rflags";
+        if (mismatch == null and completed != interpreted) mismatch = "retired count";
+        if (mismatch) |name| {
+            jit.mismatches +|= 1;
+            if (jit.mismatches <= 8 or (jit.mismatches & (jit.mismatches - 1)) == 0) {
+                var symbol_text: [guest_symbol_text_bytes]u8 = undefined;
+                log.warn("PE64 BLOCK JIT MISMATCH: block=0x{x} at={s} instructions={d} first_op={s} last_op={s} differs_in={s} interpreter(rip=0x{x} rflags=0x{x} rax=0x{x}) translated(rip=0x{x} rflags=0x{x} rax=0x{x}) retired(interpreter/translated)={d}/{d} mismatches={d}; the interpreter's result stands, the block is dropped and this address stays interpreted", .{
+                    block.start_rip,
+                    self.describeGuestAddressOrUnnamed(block.start_rip, &symbol_text),
+                    block.insns.len,
+                    @tagName(block.insns[0].decoded.op),
+                    @tagName(block.insns[block.insns.len - 1].decoded.op),
+                    name,
+                    reference.rip,
+                    reference.rflags,
+                    reference.rax,
+                    translated.rip,
+                    translated.rflags,
+                    translated.rax,
+                    interpreted,
+                    completed,
+                    jit.mismatches,
+                });
+            }
+            self.regs = reference;
+            self.step_retired = @max(interpreted, 1);
+            self.advanceWindowsGuestClockBy(self.step_retired - 1);
+            jit.hotness[blockJitIndex(block.start_rip)] = .{ .rip = block.start_rip, .count = 0, .refused = true };
+            self.dropBlockJitSlot(jit, slot_index);
+            return false;
+        }
+        jit.verified +|= 1;
+        // The translation's result is the one that stands (it is identical);
+        // account it as a normal execution.
+        self.accountBlockJit(jit, block, completed);
+        return true;
+    }
+
+    /// The translator's entry from `step`: run the block for the current RIP
+    /// when there is a valid one, otherwise count the address towards
+    /// compilation. Null means "interpret this instruction".
+    fn runBlockJit(self: *ElfState) ?bool {
+        const jit = self.blockJitActive() orelse return null;
+        const rip = self.regs.rip;
+        const index = blockJitIndex(rip);
+        if (jit.blocks[index]) |block| {
+            if (block.start_rip == rip) {
+                if (self.blockJitValidate(jit, block)) return self.executeBlockJit(jit, block, index);
+                self.dropBlockJitSlot(jit, index);
+            }
+        }
+        const hot = &jit.hotness[index];
+        if (hot.rip != rip) {
+            hot.* = .{ .rip = rip, .count = 1 };
+            return null;
+        }
+        if (hot.refused) return null;
+        hot.count +|= 1;
+        if (hot.count < jit.hot_threshold) return null;
+        const block = self.compileBlockJit(jit, rip) orelse {
+            hot.refused = true;
+            jit.compile_refusals +|= 1;
+            return null;
+        };
+        if (jit.blocks[index] != null) {
+            jit.slot_evictions +|= 1;
+            self.dropBlockJitSlot(jit, index);
+        }
+        jit.blocks[index] = block;
+        return self.executeBlockJit(jit, block, index);
+    }
+
+    fn reportBlockJit(self: *ElfState) void {
+        const jit = self.block_jit orelse {
+            log.info("PE64 BLOCK JIT: active=false enabled={} reason={s}; every instruction was interpreted", .{
+                self.block_jit_enabled and !self.block_jit_unavailable,
+                if (self.block_jit_unavailable) self.block_jit_disabled_reason else if (self.block_jit_enabled) "no instruction has stepped yet" else "ROSETTE_X64_BLOCK_JIT=0",
+            });
+            return;
+        };
+        const interpreted = self.totalInterpretedSteps();
+        const translated_percent = if (interpreted == 0) 0 else @divTrunc(jit.instructions_retired *| 100, interpreted);
+        const mean_block = if (jit.executions == 0) 0 else @divTrunc(jit.instructions_retired, jit.executions);
+        log.info("PE64 BLOCK JIT: active=true hot_threshold={d} blocks(live/compiled/refused/failed/dropped/evicted/resets)={d}/{d}/{d}/{d}/{d}/{d}/{d} compiled_instructions(native/fallback)={d}/{d} executions={d} retired={d} ({d}% of the run) mean_block_len={d} fallback_calls={d} aborts={d} continuation_write_aborts={d} revalidations={d} verified={d} mismatches={d} code_bytes(used/capacity)={d}/{d}; retired counts the block-JIT lane including interpreter fallback helpers, not exclusively native instructions; integer/register verification does not cover all vector or memory effects; mismatches must read zero", .{
+            jit.hot_threshold,
+            jit.liveBlocks(),
+            jit.compiled,
+            jit.compile_refusals,
+            jit.compile_failures,
+            jit.invalidations,
+            jit.slot_evictions,
+            jit.resets,
+            jit.native_instructions_compiled,
+            jit.fallback_instructions_compiled,
+            jit.executions,
+            jit.instructions_retired,
+            translated_percent,
+            mean_block,
+            jit.fallback_calls,
+            jit.aborts,
+            jit.continuation_write_aborts,
+            jit.revalidations,
+            jit.verified,
+            jit.mismatches,
+            jit.memory.used,
+            jit.memory.capacity(),
+        });
+    }
+
     fn step(self: *ElfState) bool {
         // `step` is the one boundary shared by the owner loop and every
         // cooperative Windows worker. Advancing the Windows performance
         // counter here keeps Xenia's worker-owned frame limiter progressing
         // even while the owner is parked in a wait service loop.
+        self.step_retired = 1;
         self.advanceWindowsGuestClock();
-        if (self.handleSyntheticRip()) return !self.terminated;
-        if (self.handleWindowsImportStub()) return !self.terminated;
-        if (x64_linux_runtime.tryWindowsGuestCompatibility(self)) return !self.terminated;
+        // Three handlers used to run on every instruction to answer "is this
+        // RIP one of ours" by comparison chains and table walks. Each set of
+        // addresses they can act on is now a box, and the handler runs only
+        // when its box admits the RIP. A box is a superset, so a false
+        // positive costs the old path and a miss is impossible as long as
+        // every address enters its box where it is recorded.
+        const step_rip = self.regs.rip;
+        if (step_rip >= SYNTHETIC_RIP_FLOOR) {
+            if (self.handleSyntheticRip()) return !self.terminated;
+            self.step_hook_box_false_positives +|= 1;
+        }
+        if (self.windows_stub_box.contains(step_rip)) {
+            if (self.handleWindowsImportStub()) return !self.terminated;
+            self.step_hook_box_false_positives +|= 1;
+        }
+        if (self.windows_compat_hook_box.contains(step_rip)) {
+            if (x64_linux_runtime.tryWindowsGuestCompatibility(self)) return !self.terminated;
+            self.step_hook_box_false_positives +|= 1;
+        }
+        // The second tier: a translated block for this RIP, or a count
+        // towards one. Past the hooks above on purpose, so an address they
+        // own is never the start of a block.
+        if (self.block_jit_enabled and !self.block_jit_unavailable) {
+            if (self.runBlockJit()) |continued| return continued;
+        }
         const decoded = self.decodeAt() orelse {
+            if (self.terminated) return false;
             self.faulted = true;
             self.exit_code = 127;
             self.termination_reason = .decode_failed;
@@ -17047,6 +19618,63 @@ pub const ElfState = struct {
                     self.regs.rsp,
                 });
             }
+            // ImDrawList::PushClipRect receives two ImVec2 pointers in rdx
+            // and r8.  The invalid 1280,720,1280,720 rectangle is present in
+            // the guest-owned clip stack, so capture these inputs at the
+            // function boundary before any vector instruction can transform
+            // them.  This keeps the diagnosis honest: bad inputs identify a
+            // caller/window-geometry problem, while good inputs move the
+            // investigation into Rosette's VEX/SSE semantics.
+            if (self.regs.rip == 0x140419fc0) {
+                const min_bytes = self.guestMemoryConst(self.regs.rdx, 8);
+                const max_bytes = self.guestMemoryConst(self.regs.r8, 8);
+                const current_clip = self.guestMemoryConst(self.regs.rcx +| 96, 16);
+                const min_x_bits: u32 = if (min_bytes) |bytes| std.mem.readInt(u32, bytes[0..4], .little) else 0;
+                const min_y_bits: u32 = if (min_bytes) |bytes| std.mem.readInt(u32, bytes[4..8], .little) else 0;
+                const max_x_bits: u32 = if (max_bytes) |bytes| std.mem.readInt(u32, bytes[0..4], .little) else 0;
+                const max_y_bits: u32 = if (max_bytes) |bytes| std.mem.readInt(u32, bytes[4..8], .little) else 0;
+                log.info("trace PushClipRect args this=0x{x} min=0x{x} readable={} ({d},{d}) max=0x{x} readable={} ({d},{d}) intersect={} current_clip_addr=0x{x} current_clip={any}", .{
+                    self.regs.rcx,
+                    self.regs.rdx,
+                    min_bytes != null,
+                    @as(f32, @bitCast(min_x_bits)),
+                    @as(f32, @bitCast(min_y_bits)),
+                    self.regs.r8,
+                    max_bytes != null,
+                    @as(f32, @bitCast(max_x_bits)),
+                    @as(f32, @bitCast(max_y_bits)),
+                    @as(u8, @truncate(self.regs.r9)) != 0,
+                    self.regs.rcx +| 96,
+                    current_clip orelse &[_]u8{},
+                });
+                // In ImGuiWindow, these fields are the position/size state
+                // consumed by Begin() while it builds OuterRectClipped and
+                // the local clip vectors.  Keep them beside the call inputs
+                // so a bad window rectangle can be attributed to the state
+                // producer instead of guessed from the final ImDrawCmd.
+                const viewport = self.read64(self.regs.r14 +| 0x40);
+                log.info("trace PushClipRect window window=0x{x} pos={any} size={any} size_full={any} outer_rect_clipped={any} inner_rect={any} inner_clip_rect={any} work_rect={any} clip={any} draw_list=0x{x}", .{
+                    self.regs.r14,
+                    self.guestMemoryConst(self.regs.r14 +| 0x58, 8) orelse &[_]u8{},
+                    self.guestMemoryConst(self.regs.r14 +| 0x60, 8) orelse &[_]u8{},
+                    self.guestMemoryConst(self.regs.r14 +| 0x68, 8) orelse &[_]u8{},
+                    self.guestMemoryConst(self.regs.r14 +| 0x258, 16) orelse &[_]u8{},
+                    self.guestMemoryConst(self.regs.r14 +| 0x268, 16) orelse &[_]u8{},
+                    self.guestMemoryConst(self.regs.r14 +| 0x278, 16) orelse &[_]u8{},
+                    self.guestMemoryConst(self.regs.r14 +| 0x288, 16) orelse &[_]u8{},
+                    self.guestMemoryConst(self.regs.r14 +| 0x2a8, 16) orelse &[_]u8{},
+                    self.read64(self.regs.r14 +| 0x318),
+                });
+                log.info("trace PushClipRect viewport viewport=0x{x} pos={any} size={any} work_pos={any} work_size={any} dpi={any} flags={any}", .{
+                    viewport,
+                    self.guestMemoryConst(viewport +| 8, 8) orelse &[_]u8{},
+                    self.guestMemoryConst(viewport +| 0x10, 8) orelse &[_]u8{},
+                    self.guestMemoryConst(viewport +| 0x18, 8) orelse &[_]u8{},
+                    self.guestMemoryConst(viewport +| 0x20, 8) orelse &[_]u8{},
+                    self.guestMemoryConst(viewport +| 0x28, 4) orelse &[_]u8{},
+                    self.guestMemoryConst(viewport +| 4, 4) orelse &[_]u8{},
+                });
+            }
             if (self.regs.rip == 0x1405b953e) {
                 const address_object = self.regs.rsi;
                 log.info("trace Xbyak opAddr displacement read before address_object=0x{x} displacement_address=0x{x} value=0x{x} bytes={any}", .{
@@ -17085,6 +19713,20 @@ pub const ElfState = struct {
                         std.mem.readInt(u64, self.xmm[7][0..8], .little),
                     }),
                     else => {},
+                }
+                if ((self.regs.rip >= 0x14048ae80 and self.regs.rip <= 0x14048ae96) or
+                    (self.regs.rip >= 0x14048b10c and self.regs.rip <= 0x14048b119))
+                {
+                    log.info("trace ImGui rect-vector before rip=0x{x} op={s} xmm0={any} xmm1={any} xmm2={any} xmm3={any} xmm7={any} mem={any}", .{
+                        self.regs.rip,
+                        @tagName(decoded.op),
+                        self.xmm[0],
+                        self.xmm[1],
+                        self.xmm[2],
+                        self.xmm[3],
+                        self.xmm[7],
+                        self.guestMemoryConst(decoded.addr, 16) orelse &[_]u8{},
+                    });
                 }
             }
             if (self.trace_utf8) {
@@ -17264,6 +19906,20 @@ pub const ElfState = struct {
                         self.regs.rflags,
                     }),
                     else => {},
+                }
+                if ((trace_rip >= 0x14048ae80 and trace_rip <= 0x14048ae96) or
+                    (trace_rip >= 0x14048b10c and trace_rip <= 0x14048b119))
+                {
+                    log.info("trace ImGui rect-vector after rip=0x{x} op={s} xmm0={any} xmm1={any} xmm2={any} xmm3={any} xmm7={any} mem={any}", .{
+                        trace_rip,
+                        @tagName(decoded.op),
+                        self.xmm[0],
+                        self.xmm[1],
+                        self.xmm[2],
+                        self.xmm[3],
+                        self.xmm[7],
+                        self.guestMemoryConst(decoded.addr, 16) orelse &[_]u8{},
+                    });
                 }
             }
             switch (decoded.op) {
@@ -17517,6 +20173,16 @@ pub const ElfState = struct {
         }
     }
 
+    /// Return the work charged to one invocation of `runWithLimit`.
+    ///
+    /// `runWithLimit` may be called more than once on a state by tests and by
+    /// diagnostic harnesses. The worker counter is state-lifetime cumulative,
+    /// while the owner's local `steps` counter starts at zero for each run, so
+    /// a per-run deadline must subtract the worker baseline captured at entry.
+    fn runBudgetSteps(owner_steps: u64, worker_steps_at_start: u64, worker_steps: u64) u64 {
+        return owner_steps +| (worker_steps -| worker_steps_at_start);
+    }
+
     /// Every guest instruction this run has interpreted, owner and workers.
     ///
     /// `runWithLimit` counts its own loop iterations, and every worker step
@@ -17547,6 +20213,10 @@ pub const ElfState = struct {
     /// ~90% of it. A denominator that measures one thread of a cooperative
     /// scheduler is not a denominator.
     fn logStepBudget(self: *ElfState, steps: u64) void {
+        self.printStepBudget(steps, true);
+    }
+
+    fn printStepBudget(self: *ElfState, steps: u64, include_jit: bool) void {
         _ = steps;
         const now = monotonicNanoseconds();
         if (now == 0) return;
@@ -17576,7 +20246,7 @@ pub const ElfState = struct {
         const pump_percent = if (total_nanos == 0) 0 else @divTrunc(pump_nanos *| 100, total_nanos);
         const guest_nanos = @divTrunc(self.guest_clock.ticks *| nanos_per_second, WINDOWS_GUEST_CLOCK_HZ);
         const dilation_tenths = if (total_nanos == 0) 0 else @divTrunc(guest_nanos *| 10, total_nanos);
-        log.info("PE64 STEP BUDGET: interpreted={d} (owner={d} workers={d}, {d}% of the run is worker threads) elapsed={d}s window={d} in {d}ms rate(window/run)={d}/{d} instructions/s host_event_pump=serviced={d} requests={d} stride_declined={d} {d}ms ({d}%); guest_clock={d}s of {d}s real (x{d}.{d} dilation, source={s}); the owner's own step counter is not the run's work, so read this rate and not the checkpoint's steps=", .{
+        log.info("PE64 STEP BUDGET: interpreted={d} (owner={d} workers={d}, {d}% of the run is worker threads) elapsed={d}s window={d} in {d}ms rate(window/run)={d}/{d} instructions/s host_event_pump=serviced={d} requests={d} stride_declined={d} {d}ms ({d}%); guest_clock={d}s of {d}s real (x{d}.{d} dilation, source={s}, instructions_per_tick={d}); the owner's own step counter is not the run's work, so read this rate and not the checkpoint's steps=", .{
             interpreted,
             self.executed_steps,
             worker_steps,
@@ -17602,14 +20272,38 @@ pub const ElfState = struct {
             // multiplier on how often every repeating guest timer runs.
             @divTrunc(dilation_tenths, 10),
             dilation_tenths % 10,
-            if ((self.guest_clock.source == .retired_instructions))
-                "retired instructions (ROSETTE_GUEST_CLOCK=instructions): a guest millisecond is a thousand instructions, so every guest timer fires far more often per unit of work than on hardware"
-            else if (self.guest_clock.host_unavailable)
-                "host monotonic clock, with gaps filled from instruction count because the host clock could not be read"
-            else
-                "host monotonic clock: a guest millisecond is a real millisecond, so guest timers fire at the rate they were written for",
+            self.guest_clock.sourceLabel(),
+            self.guest_clock.instructions_per_tick,
         });
         self.reportXeniaClock(now);
+        // What the per-instruction machinery cost the run: the decode cache
+        // (a miss is a fresh decode, a rearm is a byte comparison after a
+        // generation moved) and how often the RIP boxes admitted an address
+        // no handler then claimed.
+        const decode_total = self.decode_cache_hits +| self.decode_cache_rearms +| self.decode_cache_misses;
+        log.info("PE64 STEP OVERHEAD: decode_cache(entries/sets/ways hits/rearms/misses/collisions)={d}/{d}/{d} {d}/{d}/{d}/{d} miss_causes(vacant/conflict/stale)={d}/{d}/{d} replacements={d} victim(entries/sets/ways hits/fills/stale)={d}/{d}/{d}/{d}/{d}/{d} hit_percent={d} hook_box_false_positives={d} generated_code_fetches={d}; victim hits recover short eviction bursts, while primary full-set conflicts and stale-byte refills remain visible and fatal under the default PE policy", .{
+            PE_DECODE_CACHE_ENTRIES,
+            PE_DECODE_CACHE_SETS,
+            PE_DECODE_CACHE_WAYS,
+            self.decode_cache_hits,
+            self.decode_cache_rearms,
+            self.decode_cache_misses,
+            self.decode_cache_collisions,
+            self.decode_cache_vacant_fills,
+            self.decode_cache_conflict_fills,
+            self.decode_cache_stale_refills,
+            self.decode_cache_replacements,
+            PE_DECODE_CACHE_VICTIM_ENTRIES,
+            PE_DECODE_CACHE_VICTIM_SETS,
+            PE_DECODE_CACHE_VICTIM_WAYS,
+            self.decode_cache_victim_hits,
+            self.decode_cache_victim_fills,
+            self.decode_cache_victim_stale_rejections,
+            windowsTimedWaitPercent(self.decode_cache_hits +| self.decode_cache_rearms, decode_total),
+            self.step_hook_box_false_positives,
+            self.windows_generated_code_fetches,
+        });
+        if (include_jit) self.reportBlockJit();
     }
 
     fn reportXeniaClock(self: *ElfState, now: u64) void {
@@ -17658,7 +20352,10 @@ pub const ElfState = struct {
     /// copies stop at the last checkpoint, and a run ended from its window
     /// never reaches another one.
     pub fn reportRunThroughput(self: *ElfState) void {
-        self.logStepBudget(self.executed_steps);
+        self.printStepBudget(self.executed_steps, false);
+        // The budget line returns early on a run too short to have two
+        // checkpoints; the translator's account is printed regardless.
+        self.reportBlockJit();
         self.logGuestThreadShare();
         self.logGuestSchedulingHealth();
         self.reportWindowsTimedWaitSites(WINDOWS_TIMED_WAIT_SITE_CAPACITY);
@@ -17669,6 +20366,9 @@ pub const ElfState = struct {
         self.reportWindowsWaitCost();
         self.reportWindowsWaitFindings();
         self.reportWindowsUpstreamWaitPriority();
+        self.reportWindowsInputBridge();
+        self.reportGpuDrawFailures();
+        self.reportDecodeCacheMissSites();
     }
 
     /// The boundaries that decide whether a worker's turn is work or waste,
@@ -17977,10 +20677,27 @@ pub const ElfState = struct {
             self.xenia_sha1_kernel_feed_bytes *| 11,
         });
         log.info("PE64 generated code: instruction_fetches={d}", .{self.windows_generated_code_fetches});
-        log.info("PE64 DECODE CACHE: entries={d} hits={d} generation_rearms={d} fresh_decodes={d} address_collisions={d} hit_percent={d}; full source address/kind/index/generation checked; mapped_ranges={d} range_mutations={d} lookup=max_8_base_comparisons", .{
-            PE_DECODE_CACHE_ENTRIES,          self.decode_cache_hits,               self.decode_cache_rearms,
-            self.decode_cache_misses,         self.decode_cache_collisions,         windowsTimedWaitPercent(self.decode_cache_hits +| self.decode_cache_rearms, self.decode_cache_hits +| self.decode_cache_rearms +| self.decode_cache_misses),
-            self.windows_mapped_ranges.count, self.windows_mapped_ranges.mutations,
+        log.info("PE64 DECODE CACHE: entries={d} sets={d} ways={d} hits={d} generation_rearms={d} fresh_decodes={d} address_collisions={d} miss_causes(vacant/conflict/stale)={d}/{d}/{d} replacements={d} victim(entries/sets/ways hits/fills/stale)={d}/{d}/{d}/{d}/{d}/{d} hit_percent={d}; full source address/kind/index/generation checked; victim recovery is bounded and does not suppress a primary capacity finding; mapped_ranges={d} range_mutations={d} lookup=set_scan", .{
+            PE_DECODE_CACHE_ENTRIES,
+            PE_DECODE_CACHE_SETS,
+            PE_DECODE_CACHE_WAYS,
+            self.decode_cache_hits,
+            self.decode_cache_rearms,
+            self.decode_cache_misses,
+            self.decode_cache_collisions,
+            self.decode_cache_vacant_fills,
+            self.decode_cache_conflict_fills,
+            self.decode_cache_stale_refills,
+            self.decode_cache_replacements,
+            PE_DECODE_CACHE_VICTIM_ENTRIES,
+            PE_DECODE_CACHE_VICTIM_SETS,
+            PE_DECODE_CACHE_VICTIM_WAYS,
+            self.decode_cache_victim_hits,
+            self.decode_cache_victim_fills,
+            self.decode_cache_victim_stale_rejections,
+            windowsTimedWaitPercent(self.decode_cache_hits +| self.decode_cache_rearms, self.decode_cache_hits +| self.decode_cache_rearms +| self.decode_cache_misses),
+            self.windows_mapped_ranges.count,
+            self.windows_mapped_ranges.mutations,
         });
         log.info("PE64 guest scheduler: enabled={} quantum={d} slice={d} explicit_stride={d} scheduler_calls={d} scheduler_steps={d} explicit_calls={d} explicit_steps={d} explicit_skips={d} worker_calls={d} worker_yields={d} backstop_calls={d} blocked={d} unblocked={d}", .{
             self.windows_scheduler.enabled,
@@ -18267,14 +20984,20 @@ pub const ElfState = struct {
             self.windows_audio_pacing_waits,
             self.windows_audio_pacing_wait_ms,
         });
-        const xma_writes = self.guestMilestoneHitsNamed("_ZN2xe3apu10XmaDecoder13WriteRegisterEjj");
+        // The milestone count can read zero when the build inlined
+        // WriteRegister into its MMIO thunk; the fault census cannot, because
+        // Rosette raises the fault that delivers every register write.
+        const xma_writes = @max(self.guestMilestoneHitsNamed("_ZN2xe3apu10XmaDecoder13WriteRegisterEjj"), self.xma_registers.faults);
         const xma_work = self.guestMilestoneHitsNamed("_ZN2xe3apu10XmaContext4WorkEv");
+        const xma_kicks = self.xma_registers.kicks;
         const title_signal_verdict: []const u8 = if (self.audio_title_frames_checked == 0)
             "no frame the title submitted was readable, so the title's side of the signal is unmeasured"
         else if (self.audio_title_frames_nonzero == 0 and xma_writes == 0)
             "all sampled readable title frames are silence and no XMA decoder register entry was observed; nonsilent title audio has not been proven, not a lost host-device signal"
+        else if (self.audio_title_frames_nonzero == 0 and xma_kicks == 0)
+            "all sampled readable title frames are silence and the title has touched XMA registers without kicking a context (PE64 XMA REGISTERS): it has given the decoder nothing to decode, so its mixer has only silence to submit and this stage moves when the title starts a sound"
         else if (self.audio_title_frames_nonzero == 0 and xma_work == 0)
-            "the title wrote XMA decoder registers and no XMA context ever did work, so its compressed audio is not being decoded and its frames are silence"
+            "the title kicked XMA contexts and no XMA context ever did work, so its compressed audio is not being decoded and its frames are silence"
         else if (self.audio_title_frames_nonzero == 0)
             "XMA contexts decode, and all sampled readable title frames are still silence"
         else if (self.windows_audio_nonzero_buffers == 0)
@@ -18293,6 +21016,7 @@ pub const ElfState = struct {
             self.windows_audio_environment_queries,
             audio_policy,
         });
+        self.reportXmaRegisters();
         for (stages, 0..) |stage, index| {
             const marker: []const u8 = if (!stage.observable)
                 "unobservable (this image does not name the symbol)"
@@ -18400,11 +21124,12 @@ pub const ElfState = struct {
     /// forever during bring-up.
     pub fn runWithLimit(self: *ElfState, max_steps: u64) void {
         var steps: u64 = 0;
+        const worker_steps_at_start = self.windows_worker_executed_steps;
         const watch_progress = self.windows_runtime_enabled and self.windows_progress.enabled;
         if (watch_progress) self.windows_progress.next_sample_step = self.windows_progress.interval;
         const checkpoint_interval: u64 = 50_000_000;
         var next_checkpoint_step: u64 = 0;
-        while (!self.terminated and (max_steps == 0 or steps < max_steps)) : (steps +|= 1) {
+        while (!self.terminated and (max_steps == 0 or runBudgetSteps(steps, worker_steps_at_start, self.windows_worker_executed_steps) < max_steps)) : (steps +|= self.step_retired) {
             self.executed_steps = steps;
             if (self.windows_runtime_enabled and
                 steps +| self.windows_worker_executed_steps >= self.run_next_heartbeat_instructions)
@@ -18486,8 +21211,14 @@ pub const ElfState = struct {
             if (self.terminated) break;
             if (!self.step()) break;
         }
-        if (max_steps != 0 and steps >= max_steps) {
-            log.warn("reached max steps ({d})", .{max_steps});
+        const consumed_steps = runBudgetSteps(steps, worker_steps_at_start, self.windows_worker_executed_steps);
+        if (max_steps != 0 and consumed_steps >= max_steps) {
+            log.warn("reached max steps ({d}) total={d} owner={d} workers={d}; the bound includes cooperative worker execution", .{
+                max_steps,
+                consumed_steps,
+                steps,
+                self.windows_worker_executed_steps -| worker_steps_at_start,
+            });
             self.logRegs();
             self.faulted = true;
             self.exit_code = 124;
@@ -18527,6 +21258,9 @@ pub const ElfState = struct {
             self.reportWindowsUpstreamWaitPriority();
             self.reportWindowsScreenValidity();
             self.reportWindowsMemoryContract();
+            self.reportWindowsInputBridge();
+            self.reportGpuDrawFailures();
+            self.reportDecodeCacheMissSites();
         }
         if (self.faulted) self.logExitDiagnostics();
     }
@@ -19752,9 +22486,95 @@ pub const ElfState = struct {
         return true;
     }
 
-    fn isVectorOperationRuntime(op: Op) bool {
+    /// The vector routing chain, in its original order. Returns true when
+    /// the instruction was handled (or the run was terminated for an
+    /// unimplemented vector form) and false when the op is a legacy
+    /// vector transfer that the main switch executes.
+    fn executeVectorRouted(self: *ElfState, d: DecodedInsn) bool {
+        if (d.is_evex or d.op == .movdir64b or evexHandles(d.op)) {
+            // The EVEX register write clears everything above the operand,
+            // which is the VEX rule. Legacy SSE forms routed here (PSHUFD,
+            // SHUFPS/SHUFPD) must leave the destination's upper YMM lane as
+            // it was, and a legacy instruction never changes it otherwise.
+            const preserved_upper: ?[16]u8 = if (d.legacy_sse and !d.is_evex) self.ymm_hi[d.xmm_dst] else null;
+            evex.execute(self, d);
+            if (preserved_upper) |upper| self.ymm_hi[d.xmm_dst] = upper;
+            self.advanceAfterHandled(d);
+            return true;
+        }
+
+        // Keep vector moves and VEX.128 upper-lane clearing outside the
+        // arithmetic router. These operations have architectural state
+        // effects that a generic CLEO arithmetic call cannot express.
+        if (self.executeCleoVectorMove(d)) {
+            self.advanceAfterHandled(d);
+            return true;
+        }
+        if (d.op == .vzeroupper) {
+            for (&self.ymm_hi) |*upper| @memset(upper, 0);
+            self.advanceAfterHandled(d);
+            return true;
+        }
+        if (self.executeSharedVex(d)) {
+            self.advanceAfterHandled(d);
+            return true;
+        }
+        if (self.executeVectorSpecial(d)) {
+            self.advanceAfterHandled(d);
+            return true;
+        }
+        if (self.tryExecuteCleo(d)) {
+            self.advanceAfterHandled(d);
+            return true;
+        }
+        if (isVectorOperationRuntime(d.op) and !isLegacyVectorTransfer(d.op)) {
+            self.terminateUnimplemented(d);
+            return true;
+        }
+        return false;
+    }
+
+    /// One bit per `Op`, indexed by the enum's integer value.
+    const OpBitset = [(op_value_limit + 63) / 64]u64;
+    const op_value_limit: usize = blk: {
+        var limit: usize = 0;
+        for (@typeInfo(Op).@"enum".fields) |field| limit = @max(limit, @as(usize, field.value) + 1);
+        break :blk limit;
+    };
+
+    /// Evaluate a pure predicate over every `Op` once, at compile time, so
+    /// the per-instruction question becomes a shift and a mask.
+    fn opBitsetFrom(comptime predicate: fn (Op) bool) OpBitset {
+        @setEvalBranchQuota(200_000);
+        var bits: OpBitset = @splat(0);
+        for (@typeInfo(Op).@"enum".fields) |field| {
+            const op: Op = @enumFromInt(field.value);
+            if (predicate(op)) bits[field.value / 64] |= @as(u64, 1) << @intCast(field.value % 64);
+        }
+        return bits;
+    }
+
+    inline fn opBitsetHas(comptime bits: *const OpBitset, op: Op) bool {
+        const index: usize = @intFromEnum(op);
+        return (bits[index / 64] >> @intCast(index % 64)) & 1 != 0;
+    }
+
+    /// The name-based rule, evaluated at compile time only: the mnemonic
+    /// starts with `v`, or the op is `pmovmskb`.
+    fn vectorOperationByName(op: Op) bool {
         const name = @tagName(op);
         return (name.len != 0 and name[0] == 'v') or op == .pmovmskb;
+    }
+
+    const vector_operation_bits: OpBitset = opBitsetFrom(vectorOperationByName);
+    const evex_handled_bits: OpBitset = opBitsetFrom(evex.handles);
+
+    fn isVectorOperationRuntime(op: Op) bool {
+        return opBitsetHas(&vector_operation_bits, op);
+    }
+
+    fn evexHandles(op: Op) bool {
+        return opBitsetHas(&evex_handled_bits, op);
     }
 
     fn isLegacyVectorTransfer(op: Op) bool {
@@ -20127,12 +22947,39 @@ pub const ElfState = struct {
                 return true;
             },
             .vmovhlps => {
-                @memcpy(self.xmm[d.xmm_dst][0..8], self.xmm[d.xmm_src][8..16]);
+                if (d.legacy_sse) {
+                    // Legacy MOVHLPS is a two-operand merge: the source's
+                    // high quadword replaces the destination's low one and
+                    // the destination high quadword is preserved.
+                    @memcpy(self.xmm[d.xmm_dst][0..8], self.xmm[d.xmm_src][8..16]);
+                } else {
+                    // VEX VMOVHLPS is three-source.  The low quadword comes
+                    // from the high half of SRC2 (ModR/M.r/m), while the
+                    // high quadword comes from the high half of SRC1
+                    // (VEX.vvvv). Snapshot both sources before writing DST.
+                    const source1 = self.xmm[d.xmm_src];
+                    const source2 = self.xmm[d.xmm_src2];
+                    var result = source1;
+                    @memcpy(result[0..8], source2[8..16]);
+                    self.xmm[d.xmm_dst] = result;
+                }
                 if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
                 return true;
             },
             .vmovlhps => {
-                @memcpy(self.xmm[d.xmm_dst][8..16], self.xmm[d.xmm_src][0..8]);
+                if (d.legacy_sse) {
+                    // Legacy MOVLHPS preserves the destination low quadword
+                    // and takes the source low quadword for the high half.
+                    @memcpy(self.xmm[d.xmm_dst][8..16], self.xmm[d.xmm_src][0..8]);
+                } else {
+                    // VEX VMOVLHPS takes the low half from SRC1
+                    // (VEX.vvvv) and the low half of SRC2 for the high half.
+                    const source1 = self.xmm[d.xmm_src];
+                    const source2 = self.xmm[d.xmm_src2];
+                    var result = source1;
+                    @memcpy(result[8..16], source2[0..8]);
+                    self.xmm[d.xmm_dst] = result;
+                }
                 if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
                 return true;
             },
@@ -20211,11 +23058,20 @@ pub const ElfState = struct {
         // route to its registry, so keep them out of this hot path. Legacy
         // scalar-vector move tags are handled by the explicit executor.
         if (!isVectorOperationRuntime(d.op)) return false;
-        const route = cleo_routing.CleoRouter.route(
-            @tagName(d.op),
-            cleo_routing.types.FeatureSet.cleoEmulated(),
-            if (d.vector_256) 256 else 128,
-        );
+        // The router matches the mnemonic against its registry by string.
+        // Its answer depends only on the op and the operand width (the
+        // feature set is a constant of this host), so it is asked once per
+        // (op, width) and remembered.
+        const memo = &cleo_route_memo[@intFromEnum(d.op)][@intFromBool(d.vector_256)];
+        if (!memo.decided) {
+            memo.decision = cleo_routing.CleoRouter.route(
+                @tagName(d.op),
+                cleo_routing.types.FeatureSet.cleoEmulated(),
+                if (d.vector_256) 256 else 128,
+            );
+            memo.decided = true;
+        }
+        const route = memo.decision;
         const meta = route.meta orelse return false;
         if (!route.can_route) return false;
         if (!cleoIsFma(meta.operation) and !cleoIsUnary(meta.operation) and
@@ -21513,45 +24369,17 @@ pub const ElfState = struct {
     }
 
     pub fn execute(self: *ElfState, d: DecodedInsn) void {
-        if (d.is_evex or d.op == .movdir64b or evex.handles(d.op)) {
-            // The EVEX register write clears everything above the operand,
-            // which is the VEX rule. Legacy SSE forms routed here (PSHUFD,
-            // SHUFPS/SHUFPD) must leave the destination's upper YMM lane as
-            // it was, and a legacy instruction never changes it otherwise.
-            const preserved_upper: ?[16]u8 = if (d.legacy_sse and !d.is_evex) self.ymm_hi[d.xmm_dst] else null;
-            evex.execute(self, d);
-            if (preserved_upper) |upper| self.ymm_hi[d.xmm_dst] = upper;
-            self.advanceAfterHandled(d);
-            return;
-        }
-
-        // Keep vector moves and VEX.128 upper-lane clearing outside the
-        // arithmetic router. These operations have architectural state
-        // effects that a generic CLEO arithmetic call cannot express.
-        if (self.executeCleoVectorMove(d)) {
-            self.advanceAfterHandled(d);
-            return;
-        }
-        if (d.op == .vzeroupper) {
-            for (&self.ymm_hi) |*upper| @memset(upper, 0);
-            self.advanceAfterHandled(d);
-            return;
-        }
-        if (self.executeSharedVex(d)) {
-            self.advanceAfterHandled(d);
-            return;
-        }
-        if (self.executeVectorSpecial(d)) {
-            self.advanceAfterHandled(d);
-            return;
-        }
-        if (self.tryExecuteCleo(d)) {
-            self.advanceAfterHandled(d);
-            return;
-        }
-        if (isVectorOperationRuntime(d.op) and !isLegacyVectorTransfer(d.op)) {
-            self.terminateUnimplemented(d);
-            return;
+        // The vector routing chain below is six dispatches deep, and every
+        // op it can claim is either EVEX-encoded, `movdir64b`, or an op
+        // `isVectorOperationRuntime` names (the lists in `evex.handles`,
+        // `executeCleoVectorMove`, `executeSharedVex` and
+        // `executeVectorSpecial` are all `v*` forms plus `pmovmskb`, which
+        // that predicate includes). A scalar instruction therefore answers
+        // one bit test here instead of walking the chain: on the 2026-09-17
+        // profile the chain, including two `@tagName` lookups per
+        // instruction, was a fifth of the interpreter.
+        if (d.is_evex or d.op == .movdir64b or isVectorOperationRuntime(d.op)) {
+            if (self.executeVectorRouted(d)) return;
         }
 
         // Accumulator-immediate forms are scalar Group-1 operations. Handle
@@ -22841,6 +25669,7 @@ pub const ElfState = struct {
                 if (self.tryXeniaRijndaelAccelerator(target_rip, next_rip)) return;
                 self.noteGuestMilestoneEntry(target_rip);
                 self.noteGuestKernelCall(target_rip);
+                if (self.tryXeniaKeyboardInputShim(target_rip, next_rip)) return;
                 self.traceWindowsCallbackCall("direct", target_rip, self.regs.rip, next_rip);
                 if (self.trace_windows_threads and target_rip == 0x1405151af) {
                     log.info("Windows thread call target pthread_self: source_rip=0x{x} rsp_before=0x{x} return_rip=0x{x} stack_before=0x{x}", .{
@@ -22935,6 +25764,7 @@ pub const ElfState = struct {
                 }
                 self.noteGuestMilestoneEntry(target);
                 self.noteGuestKernelCall(target);
+                if (self.tryXeniaKeyboardInputShim(target, next_rip)) return;
                 self.noteGuestCall(.indirect, target, next_rip);
                 self.push(next_rip);
                 self.regs.rip = target;
@@ -23666,7 +26496,14 @@ fn linuxOpenFlagsToHost(flags_raw: u64) std.c.O {
     return flags;
 }
 
-fn shouldTraceRip(self: *ElfState, rip: u64) bool {
+/// Asked on every instruction and on every traced arm; the absent-window
+/// answer is one load at the call site.
+inline fn shouldTraceRip(self: *ElfState, rip: u64) bool {
+    if (self.trace_rip_start == null) return false;
+    return shouldTraceRipInWindow(self, rip);
+}
+
+fn shouldTraceRipInWindow(self: *ElfState, rip: u64) bool {
     const start = self.trace_rip_start orelse return false;
     const end = self.trace_rip_end orelse start;
     if (rip < start or rip > end) return false;
@@ -24964,7 +27801,7 @@ test "a resolver with no address lookup arms no milestones and says so" {
     }
     try testing.expectEqual(@as(usize, 1), observable);
     const wall = state.guestOutputWall() orelse return error.ExpectedWall;
-    try testing.expectEqualStrings("frame_carried_a_draw", wall.name);
+    try testing.expectEqualStrings("guest_present_carried_content", wall.name);
     try testing.expectEqualStrings("rosette:vulkan-bridge", wall.owner);
 }
 
@@ -25175,7 +28012,7 @@ test "the guest output chain resolves GPU bring-up on both sides of the ring" {
         "ring_carried_pm4",
         "title_requested_swap",
         "guest_output_published",
-        "frame_carried_a_draw",
+        "guest_present_carried_content",
         "paints_are_repeating",
     };
     var state = ElfState.init(testing.allocator);
@@ -25621,7 +28458,7 @@ test "the guest output chain names the title, not the bridge, when nothing was d
     state.noteGuestMilestoneEntry(0x140003000);
     state.noteGuestMilestoneEntry(0x140004000);
     const next = state.guestOutputWall() orelse return error.ExpectedWall;
-    try testing.expectEqualStrings("frame_carried_a_draw", next.name);
+    try testing.expectEqualStrings("guest_present_carried_content", next.name);
 }
 
 test "polling the guest-output mailbox is never a chain stage" {
@@ -25644,6 +28481,13 @@ test "polling the guest-output mailbox is never a chain stage" {
         try testing.expect(!std.mem.eql(u8, stage.evidence, "ConsumeGuestOutput_entries"));
     }
     try testing.expectEqual(GUEST_OUTPUT_STAGE_COUNT, state.guestOutputChainStages().len);
+}
+
+test "run step deadline includes worker work and resets its worker baseline" {
+    try testing.expectEqual(@as(u64, 100), ElfState.runBudgetSteps(40, 10, 70));
+    try testing.expectEqual(@as(u64, 40), ElfState.runBudgetSteps(40, 70, 10));
+    try testing.expect(ElfState.runBudgetSteps(40, 10, 70) >= 100);
+    try testing.expect(ElfState.runBudgetSteps(40, 10, 70) < 101);
 }
 
 test "the busiest worker is named, because the frontier only ever sees the owner" {
@@ -25952,12 +28796,14 @@ test "the first-frame chain names the earliest unmet precondition and its owner"
     graphics.surface_ready = true;
     graphics.swapchain_ready = true;
 
-    // With the guest frontier inside the font atlas build, the wall is the
-    // atlas - not the presenter, and not the title.
+    // A callable atlas-output witness is present. No samples (including
+    // cold zero samples) can stand in for its returned bytes.
+    const font_index = comptime xenia_guest_milestone_map.indexOf(ui_draw_evidence.font_rgba_symbol).?;
     var table = TestSymbolTable{ .entries = &.{
         .{ .address = 0x140001000, .name = "stbtt__run_charstring" },
     } };
     state.installGuestSymbolResolver(table.resolver(), 1, 99);
+    state.guest_milestone_addresses[font_index] = 0x140009000;
     state.regs.rip = 0x140001010;
     state.sampleGuestFrontier();
 
@@ -25965,11 +28811,11 @@ test "the first-frame chain names the earliest unmet precondition and its owner"
     try testing.expectEqualStrings("ui_font_atlas", atlas.name);
     try testing.expectEqualStrings("xenia:ui-thread", atlas.owner);
 
-    // Once the guest leaves the atlas, the wall moves on to the next real
-    // precondition rather than staying put - and the next one is the title
-    // itself, not a paint stage: a paint with no guest output is an empty
-    // frame, and the emulator thread is still bringing the module in.
+    // Leaving the sampled builder does NOT prove completion. A valid
+    // returned atlas advances the wall and subsequent text drawing keeps it.
     state.regs.rip = 0x0;
+    try testing.expectEqualStrings("ui_font_atlas", state.firstFrameWall().?.name);
+    state.ui_evidence.noteFontReturn(MEM_BASE + 0x4000, 8, 8, true);
     const after_atlas = state.firstFrameWall().?;
     try testing.expectEqualStrings("title_code_running", after_atlas.name);
     try testing.expectEqualStrings("xenia:emulator-thread", after_atlas.owner);
@@ -25992,6 +28838,54 @@ test "the first-frame chain names the earliest unmet precondition and its owner"
     try testing.expectEqualStrings("present", state.firstFrameWall().?.name);
     graphics.presents = 1;
     try testing.expect(state.firstFrameWall() == null);
+}
+
+test "UI return evidence follows the actual return and keeps pending pointers thread-local" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    const outputs = MEM_BASE + 0x2000;
+    const pixels = MEM_BASE + 0x4000;
+    state.regs.rsp = MEM_BASE + 0x30000;
+    state.regs.rdx = outputs;
+    state.regs.r8 = outputs + 8;
+    state.regs.r9 = outputs + 12;
+    state.noteGuestMilestoneArguments(comptime xenia_guest_milestone_map.indexOf(ui_draw_evidence.font_rgba_symbol).?);
+    state.write64(outputs, pixels);
+    state.write32(outputs + 8, 8);
+    state.write32(outputs + 12, 8);
+    // A nested return must not complete the outer function.
+    state.regs.rsp -= 8;
+    state.completeGuestReturnCapture();
+    try testing.expectEqual(@as(u64, 0), state.ui_evidence.font_returns);
+    // Another cooperative thread captures its own pipeline result.
+    state.windows_active_guest_thread_slot = 0;
+    state.regs.rsp = MEM_BASE + 0x31000;
+    state.noteGuestMilestoneArguments(comptime xenia_guest_milestone_map.indexOf(ui_draw_evidence.pipelines_symbol).?);
+    state.regs.rax = 0x100; // only AL holds a C++ bool result
+    state.completeGuestReturnCapture();
+    try testing.expectEqual(@as(u64, 1), state.ui_evidence.pipeline_false);
+    try testing.expectEqual(@as(u64, 0), state.ui_evidence.font_returns);
+    state.windows_active_guest_thread_slot = null;
+    state.regs.rsp = MEM_BASE + 0x30000;
+    state.completeGuestReturnCapture();
+    try testing.expect(state.ui_evidence.font_last_valid);
+    try testing.expectEqual(@as(u64, 1), state.ui_evidence.font_valid_returns);
+    try testing.expectEqual(@as(u32, 0), state.guest_return_captures_armed);
+
+    // Scissor fifth/sixth reference arguments live after caller shadow space.
+    state.regs.r8 = outputs;
+    state.regs.r9 = outputs + 4;
+    state.write64(state.regs.rsp + 32, outputs + 8);
+    state.write64(state.regs.rsp + 40, outputs + 12);
+    inline for (0..4) |i| state.write32(outputs + i * 4, 10 + i);
+    state.noteGuestMilestoneArguments(comptime xenia_guest_milestone_map.indexOf(ui_draw_evidence.scissor_symbol).?);
+    state.regs.rax = 1;
+    state.completeGuestReturnCapture();
+    try testing.expectEqual([4]u32{ 10, 11, 12, 13 }, state.ui_evidence.scissor_rect);
+    state.regs.rdx = 0xffff_ffff_ffff_f000; // inaccessible, not fabricated zero geometry
+    state.noteGuestMilestoneArguments(comptime xenia_guest_milestone_map.indexOf(ui_draw_evidence.lists_symbol).?);
+    try testing.expectEqual(@as(u64, 1), state.ui_evidence.lists_unreadable);
+    try testing.expect(!state.faulted);
 }
 
 test "the SHA1 feed loop is recognized by its own bytes and stops one byte short" {
@@ -26088,6 +28982,9 @@ test "kernel SHA1 feed fast path preserves the interpreted digest tail and live 
     seedKernelSha1FeedFixture(fast, length);
     seedKernelSha1FeedFixture(reference, length);
     reference.xenia_sha1_feed_enabled = false;
+    // This measures the accelerator against the interpreter proper; the block
+    // translator has its own lockstep test over the same loop.
+    reference.block_jit_enabled = false;
     fast.tryXeniaSha1FeedLoop(fast.regs.rip);
     const stop = fast.mem_base + 0x2000 + 78;
     var fast_steps: usize = 0;
@@ -28941,6 +31838,10 @@ test "every instruction form Xenia's x64 JIT can emit under Rosette's CPUID deco
     // such form; this names all of them before a run has to find one.
     const corpus = @embedFile("xenia_jit_corpus.txt");
     var state = ElfState.init(testing.allocator);
+    // One form per step: this drives the decoder and executor one
+    // instruction at a time at one address, and a translated block there
+    // would run on into whatever bytes follow the form.
+    state.block_jit_enabled = false;
     defer state.deinit();
     const code = MEM_BASE + 0x1000;
     const data = MEM_BASE + 0x40000;
@@ -29122,6 +32023,10 @@ test "indexed Windows mappings preserve scalar SIMD CRT and offset-alias byte id
 test "decode cache observes alias stores bulk writes rollover and mapping-kind lifetime replacement" {
     var state = ElfState.initWithMemory(testing.allocator, 0x10000);
     defer state.deinit();
+    // This test deliberately exercises source-byte refills. Production PE
+    // runs keep the default fatal policy, while the unit test opts into the
+    // diagnostic/continue mode so it can inspect the post-refill value.
+    state.windows_fatal_point_terminate = false;
     const mapping: u64 = 0xFFFF_F000_0000_0F10;
     const base: u64 = 0x6000_0000;
     const alias: u64 = 0x7000_0000;
@@ -29171,17 +32076,25 @@ test "decode cache observes alias stores bulk writes rollover and mapping-kind l
     try testing.expect(!state.decode_cache[peDecodeCacheIndex(base)].valid);
 }
 
-test "decode cache folds aligned JIT page addresses while retaining collision source checks" {
-    var seen: [PE_DECODE_CACHE_ENTRIES]bool = @splat(false);
+test "decode cache keeps aligned JIT page addresses spread across sets" {
+    var seen: [PE_DECODE_CACHE_SETS]bool = @splat(false);
     var distinct: usize = 0;
     for (0..128) |page| {
         const index = peDecodeCacheIndex(0xa000_0000 + @as(u64, @intCast(page)) * 0x10000);
-        if (!seen[index]) distinct += 1;
-        seen[index] = true;
+        const set = index / PE_DECODE_CACHE_WAYS;
+        if (!seen[set]) distinct += 1;
+        seen[set] = true;
     }
     try testing.expectEqual(@as(usize, 128), distinct);
-    var state = ElfState.initWithMemory(testing.allocator, 0x10000);
+    // Two addresses sharing a set now occupy separate ways instead of
+    // evicting each other. This is the ordinary collision that used to make
+    // the direct-mapped cache look like it was continually missing.
+    var state = ElfState.initWithMemory(testing.allocator, 0x400000);
     defer state.deinit();
+    // The test also drives executable-byte changes to prove the stale-byte
+    // recovery path. Strict PE runs leave this on; this unit test needs to
+    // continue after recording the diagnosed condition.
+    state.windows_fatal_point_terminate = false;
     const first = state.mem_base + 0x100;
     var second = first + 16;
     while (second < state.mem_base + state.mem.len - 16 and peDecodeCacheIndex(second) != peDecodeCacheIndex(first)) : (second += 1) {}
@@ -29196,7 +32109,7 @@ test "decode cache folds aligned JIT page addresses while retaining collision so
     try testing.expectEqual(@as(u64, 22), state.decodeAt().?.imm);
     state.regs.rip = first;
     try testing.expectEqual(@as(u64, 11), state.decodeAt().?.imm);
-    try testing.expectEqual(@as(u64, 2), state.decode_cache_collisions);
+    try testing.expectEqual(@as(u64, 0), state.decode_cache_collisions);
     // The image generation fast path has the same bulk/SIMD obligations.
     state.windows_runtime_enabled = true;
     state.configureWindowsExecutableRanges(&.{.{ .guest_base = first, .length = 0x100 }});
@@ -29216,6 +32129,90 @@ test "decode cache folds aligned JIT page addresses while retaining collision so
     try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ucrtbase.dll", "memcpy", state.mem_base + 0x1000));
     state.regs.rip = first;
     try testing.expectEqual(@as(u64, 55), state.decodeAt().?.imm);
+}
+
+test "decode cache makes a full set an explicit fatal point" {
+    var state = ElfState.initWithMemory(testing.allocator, 0x400000);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    state.windows_fatal_point_terminate = true;
+
+    const first = state.mem_base + 0x100;
+    const target_set = peDecodeCacheSetIndex(first);
+    var addresses: [PE_DECODE_CACHE_WAYS + 1]u64 = undefined;
+    var found: usize = 0;
+    var candidate = first;
+    while (candidate < state.mem_base + state.mem.len - 16 and found < addresses.len) : (candidate += 1) {
+        if (peDecodeCacheSetIndex(candidate) != target_set) continue;
+        var separated = true;
+        for (addresses[0..found]) |previous| {
+            const distance = if (candidate >= previous) candidate - previous else previous - candidate;
+            if (distance < 16) {
+                separated = false;
+                break;
+            }
+        }
+        if (!separated) continue;
+        addresses[found] = candidate;
+        found += 1;
+    }
+    try testing.expectEqual(addresses.len, found);
+
+    for (addresses, 0..) |address, index| {
+        state.write8(address, 0xb8);
+        state.write32(address + 1, @intCast(index + 1));
+        state.regs.rip = address;
+        if (index + 1 == addresses.len) {
+            try testing.expect(state.decodeAt() == null);
+        } else {
+            try testing.expectEqual(@as(u64, @intCast(index + 1)), state.decodeAt().?.imm);
+        }
+    }
+    try testing.expect(state.terminated);
+    try testing.expect(state.faulted);
+    try testing.expectEqual(exit_diagnostics.TerminationReason.runtime_invariant_failure, state.termination_reason);
+    try testing.expectEqual(@as(u64, 1), state.decode_cache_collisions);
+    try testing.expectEqual(@as(u64, 1), state.decode_cache_conflict_fills);
+}
+
+test "decode cache victim bank recovers a recently displaced instruction" {
+    var state = ElfState.initWithMemory(testing.allocator, 0x400000);
+    defer state.deinit();
+    state.windows_fatal_point_terminate = false;
+
+    const first = state.mem_base + 0x100;
+    const target_set = peDecodeCacheSetIndex(first);
+    var addresses: [PE_DECODE_CACHE_WAYS + 1]u64 = undefined;
+    var found: usize = 0;
+    var candidate = first;
+    while (candidate < state.mem_base + state.mem.len - 16 and found < addresses.len) : (candidate += 1) {
+        if (peDecodeCacheSetIndex(candidate) != target_set) continue;
+        var separated = true;
+        for (addresses[0..found]) |previous| {
+            if (@abs(@as(i64, @intCast(candidate)) - @as(i64, @intCast(previous))) < 16) {
+                separated = false;
+                break;
+            }
+        }
+        if (!separated) continue;
+        addresses[found] = candidate;
+        found += 1;
+    }
+    try testing.expectEqual(addresses.len, found);
+
+    for (addresses, 0..) |address, index| {
+        state.write8(address, 0xb8);
+        state.write32(address + 1, @intCast(index + 1));
+        state.regs.rip = address;
+        try testing.expectEqual(@as(u64, @intCast(index + 1)), state.decodeAt().?.imm);
+    }
+    try testing.expectEqual(@as(u64, 1), state.decode_cache_collisions);
+    try testing.expectEqual(@as(u64, 1), state.decode_cache_victim_fills);
+
+    state.regs.rip = addresses[0];
+    try testing.expectEqual(@as(u64, 1), state.decodeAt().?.imm);
+    try testing.expectEqual(@as(u64, 1), state.decode_cache_victim_hits);
+    try testing.expectEqual(@as(u64, addresses.len), state.decode_cache_misses);
 }
 
 test "a file failure is classified by what it means, and only an actionable one warns" {
@@ -29559,4 +32556,670 @@ test "a worker slice that repeats its exact state without a kernel call backs of
     state.noteWindowsGuestSliceShape(0, true, 5);
     try testing.expectEqual(@as(u8, 0), state.windows_guest_threads[0].spin_backoff);
     try testing.expectEqual(@as(u64, 5), state.windows_spin_slices);
+}
+
+test "the XMA register census names kicks, locks and clears from the faults that deliver them" {
+    var census = GuestXmaRegisterCensus{};
+    // The title stores big-endian: 0x80000000 to Context5Clear arrives as the
+    // little-endian dword 0x00000080, and the decoder byte-swaps it back.
+    census.note(GuestXmaRegisterCensus.clear_first + 5, true, 0x0000_0080, 10);
+    try testing.expectEqual(@as(u64, 1), census.clears);
+    try testing.expectEqual(@as(u64, 0), census.kicks);
+    try testing.expectEqual(@as(u32, 0x8000_0000), census.entries[0].last_value);
+    census.note(GuestXmaRegisterCensus.kick_first, true, 0x0100_0000, 11);
+    census.note(GuestXmaRegisterCensus.kick_first, true, 0x0300_0000, 12);
+    // A zero kick asks for nothing.
+    census.note(GuestXmaRegisterCensus.kick_first + 1, true, 0, 13);
+    try testing.expectEqual(@as(u64, 2), census.kicks);
+    try testing.expectEqual(@as(u32, 2), census.kicked_contexts);
+    census.note(GuestXmaRegisterCensus.current_context_index, false, 0, 14);
+    try testing.expectEqual(@as(u64, 5), census.faults);
+    try testing.expectEqual(@as(usize, 4), census.count);
+    try testing.expectEqualStrings("Kick", GuestXmaRegisterCensus.registerName(0x0653));
+    try testing.expectEqualStrings("Clear", GuestXmaRegisterCensus.registerName(0x06A9));
+    try testing.expectEqualStrings("ContextArrayAddress", GuestXmaRegisterCensus.registerName(0x0600));
+}
+
+test "frame cost keeps a bounded window of swap intervals and per-thread shares" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_guest_threads[0] = .{ .status = .runnable, .handle = 0xA01, .executed_steps = 1000 };
+    state.windows_guest_threads[1] = .{ .status = .runnable, .handle = 0xA02, .executed_steps = 500 };
+    state.noteFrameCostSwap(10_000);
+    state.windows_guest_threads[0].executed_steps = 7000;
+    state.windows_guest_threads[1].executed_steps = 1500;
+    state.noteFrameCostSwap(17_000);
+    try testing.expectEqual(@as(u64, 2), state.frame_cost.swaps);
+    try testing.expectEqual(@as(u64, 7000), state.frame_cost.meanRecentInterval());
+    try testing.expectEqual(@as(u64, 6000), state.frame_cost.threads[0].since_first_swap);
+    try testing.expectEqual(@as(u64, 1000), state.frame_cost.threads[1].since_first_swap);
+    // A slot reused by another thread starts from its own zero rather than
+    // inheriting the previous thread's snapshot.
+    state.windows_guest_threads[1] = .{ .status = .runnable, .handle = 0xA03, .executed_steps = 90 };
+    state.noteFrameCostSwap(20_000);
+    try testing.expectEqual(@as(u64, 0), state.frame_cost.threads[1].since_first_swap);
+    try testing.expectEqual(@as(u64, 0xA03), state.frame_cost.threads[1].handle);
+    try testing.expectEqual(@as(u64, 5000), state.frame_cost.meanRecentInterval());
+    try testing.expectEqual(@as(u64, 3000), state.frame_cost.min_interval);
+    try testing.expectEqual(@as(u64, 7000), state.frame_cost.max_interval);
+    try testing.expectEqual(@as(u64, 10_000), state.frame_cost.totalSinceFirstSwap());
+    var cost = GuestFrameCost{};
+    for (0..GuestFrameCost.window + 4) |i| cost.noteInterval(@intCast(i + 1));
+    try testing.expectEqual(GuestFrameCost.window, cost.recent_count);
+    // The oldest four intervals fell out: the mean of 5..36 is 20.5.
+    try testing.expectEqual(@as(u64, 20), cost.meanRecentInterval());
+}
+
+test "the front buffer record decodes the fetch constant VdSwap places before XE_SWAP" {
+    var window = GpuRingWindow{};
+    // dword_0: tiled, pitch 20 (in 32-pixel units); dword_1: format 54
+    // (k_2_10_10_10_AS_16_16_16_16), endianness 1, base 0x1FC00000 >> 12;
+    // dword_2: 1280x720 as (width - 1, height - 1).
+    window.swap_fetch = .{ (1 << 31) | (20 << 22), 54 | (1 << 6) | ((0x1FC0_0000 >> 12) << 12), 1279 | (719 << 13), 0, 0, 0 };
+    window.swap_fetch_seen = true;
+    window.swap_packets = 1;
+    window.swap_frontbuffer = 0x1FC0_0000;
+    window.swap_width = 1280;
+    window.swap_height = 720;
+    window.dc_lut_type0_writes = 3;
+    var front = GuestFrontBuffer{};
+    front.note(&window);
+    try testing.expectEqual(@as(u64, 1), front.swaps);
+    try testing.expectEqual(@as(u6, 54), front.format());
+    try testing.expectEqualStrings("k_2_10_10_10_AS_16_16_16_16", GuestFrontBuffer.formatName(front.format()));
+    try testing.expect(GuestFrontBuffer.usesPwlRamp(front.format()));
+    try testing.expect(!GuestFrontBuffer.usesPwlRamp(6));
+    try testing.expectEqual(@as(u2, 1), front.endianness());
+    try testing.expect(front.tiled());
+    try testing.expectEqual(@as(u32, 20), front.pitch());
+    try testing.expectEqual(@as(u32, 0x1FC0_0000), front.baseAddress());
+    try testing.expectEqual(@as(u32, 1280), front.fetchWidth());
+    try testing.expectEqual(@as(u32, 720), front.fetchHeight());
+    try testing.expectEqual(@as(u32, 1280), front.width);
+    try testing.expectEqual(@as(u64, 3), front.dc_lut_type0_writes);
+    try testing.expectEqual(@as(u64, 1) << 54, front.formats_seen);
+    // A window without the fetch constant still contributes its DC_LUT count
+    // and nothing else.
+    var bare = GpuRingWindow{ .dc_lut_type0_writes = 2 };
+    front.note(&bare);
+    try testing.expectEqual(@as(u64, 1), front.swaps);
+    try testing.expectEqual(@as(u64, 5), front.dc_lut_type0_writes);
+}
+
+test "the ring decoder captures the swap fetch constant and the XE_SWAP payload" {
+    // A ring holding VdSwap's output: a type-0 write of six dwords to 0x4800,
+    // then XE_SWAP with its four payload dwords, then type-2 filler.
+    const Source = struct {
+        dwords: []const u32,
+        pub fn readDword(self: @This(), ring_index: u64) ?u32 {
+            return if (ring_index < self.dwords.len) self.dwords[ring_index] else null;
+        }
+        pub fn aliasCheck(self: @This(), ring_index: u64, physical_value: u32) struct { checked: u16, mismatched: u16 } {
+            _ = self;
+            _ = ring_index;
+            _ = physical_value;
+            return .{ .checked = 0, .mismatched = 0 };
+        }
+    };
+    const dwords = [_]u32{
+        (5 << 16) | 0x4800,                    0x8000_0000, 54 | (0x1FC00 << 12), 1279 | (719 << 13), 0,   0,                  0,
+        0xC000_0000 | (3 << 16) | (0x64 << 8), 0x5357_4150, 0x1FC0_0000,          1280,               720, (1 << 16) | 0x1925, 0x3FFF_FFFF,
+        0x3FBF_EFFB,                           0x8000_0000,
+    };
+    var window = GpuRingWindow{};
+    ElfState.decodeGpuRingWindow(Source{ .dwords = &dwords }, &window, 0, dwords.len, dwords.len);
+    try testing.expect(window.swap_fetch_seen);
+    try testing.expectEqual(@as(u32, 54 | (0x1FC00 << 12)), window.swap_fetch[1]);
+    try testing.expectEqual(@as(u32, 1), window.swap_packets);
+    try testing.expectEqual(@as(u32, 0x1FC0_0000), window.swap_frontbuffer);
+    try testing.expectEqual(@as(u32, 1280), window.swap_width);
+    try testing.expectEqual(@as(u32, 720), window.swap_height);
+    // The two-dword DC_LUT_30_COLOR write counts once as a ramp write.
+    try testing.expectEqual(@as(u32, 1), window.dc_lut_type0_writes);
+    try testing.expectEqual(@as(u32, 2), window.type0);
+}
+
+// ─── Block translation: interpreter-versus-translation differential ───
+
+/// A small x86-64 assembler for the differential tests below: enough of the
+/// integer core to build random straight-line bodies whose every instruction
+/// the block translator has a template for, plus the loop and halt around
+/// them. Registers are numbered 0..15 as the hardware does.
+const DifferentialAssembler = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *DifferentialAssembler) void {
+        self.bytes.deinit(self.allocator);
+    }
+
+    fn put(self: *DifferentialAssembler, slice: []const u8) void {
+        self.bytes.appendSlice(self.allocator, slice) catch unreachable;
+    }
+
+    fn rexW(reg: u8, rm: u8) u8 {
+        return 0x48 | (if (reg >= 8) @as(u8, 4) else 0) | (if (rm >= 8) @as(u8, 1) else 0);
+    }
+
+    fn modrmReg(reg: u8, rm: u8) u8 {
+        return 0xC0 | ((reg & 7) << 3) | (rm & 7);
+    }
+
+    fn imm32(self: *DifferentialAssembler, value: u32) void {
+        var buffer: [4]u8 = undefined;
+        std.mem.writeInt(u32, &buffer, value, .little);
+        self.put(&buffer);
+    }
+
+    /// mov r64, simm32
+    fn movImm(self: *DifferentialAssembler, dst: u8, value: i32) void {
+        self.put(&.{ rexW(0, dst), 0xC7, modrmReg(0, dst) });
+        self.imm32(@bitCast(value));
+    }
+
+    /// add/sub/and/or/xor/cmp/test r64, r64 by primary opcode.
+    fn aluRegReg(self: *DifferentialAssembler, opcode: u8, dst: u8, src: u8) void {
+        self.put(&.{ rexW(src, dst), opcode, modrmReg(src, dst) });
+    }
+
+    /// Group 1 with an imm8: opcode 0x83 /ext.
+    fn aluImm8(self: *DifferentialAssembler, ext: u8, dst: u8, value: i8) void {
+        self.put(&.{ rexW(0, dst), 0x83, modrmReg(ext, dst), @bitCast(value) });
+    }
+
+    /// Group 1 with an imm32: opcode 0x81 /ext.
+    fn aluImm32(self: *DifferentialAssembler, ext: u8, dst: u8, value: i32) void {
+        self.put(&.{ rexW(0, dst), 0x81, modrmReg(ext, dst) });
+        self.imm32(@bitCast(value));
+    }
+
+    fn imulRegReg(self: *DifferentialAssembler, dst: u8, src: u8) void {
+        self.put(&.{ rexW(dst, src), 0x0F, 0xAF, modrmReg(dst, src) });
+    }
+
+    fn imulImm8(self: *DifferentialAssembler, dst: u8, src: u8, value: i8) void {
+        self.put(&.{ rexW(dst, src), 0x6B, modrmReg(dst, src), @bitCast(value) });
+    }
+
+    /// shl (4), shr (5), sar (7) r64, imm8
+    fn shiftImm(self: *DifferentialAssembler, ext: u8, dst: u8, count: u8) void {
+        self.put(&.{ rexW(0, dst), 0xC1, modrmReg(ext, dst), count });
+    }
+
+    /// inc (0) / dec (1) r64
+    fn incDec(self: *DifferentialAssembler, ext: u8, dst: u8) void {
+        self.put(&.{ rexW(0, dst), 0xFF, modrmReg(ext, dst) });
+    }
+
+    /// not (2) / neg (3) r64
+    fn notNeg(self: *DifferentialAssembler, ext: u8, dst: u8) void {
+        self.put(&.{ rexW(0, dst), 0xF7, modrmReg(ext, dst) });
+    }
+
+    /// lea r64, [base + disp32]; base must not be rsp/r12.
+    fn lea(self: *DifferentialAssembler, dst: u8, base: u8, disp: i32) void {
+        self.put(&.{ rexW(dst, base), 0x8D, 0x80 | ((dst & 7) << 3) | (base & 7) });
+        self.imm32(@bitCast(disp));
+    }
+
+    /// mov r64, [base + disp32]
+    fn load(self: *DifferentialAssembler, dst: u8, base: u8, disp: i32) void {
+        self.put(&.{ rexW(dst, base), 0x8B, 0x80 | ((dst & 7) << 3) | (base & 7) });
+        self.imm32(@bitCast(disp));
+    }
+
+    /// mov [base + disp32], r64
+    fn store(self: *DifferentialAssembler, src: u8, base: u8, disp: i32) void {
+        self.put(&.{ rexW(src, base), 0x89, 0x80 | ((src & 7) << 3) | (base & 7) });
+        self.imm32(@bitCast(disp));
+    }
+
+    /// movzx r64, byte [base + disp32]
+    fn movzxByte(self: *DifferentialAssembler, dst: u8, base: u8, disp: i32) void {
+        self.put(&.{ rexW(dst, base), 0x0F, 0xB6, 0x80 | ((dst & 7) << 3) | (base & 7) });
+        self.imm32(@bitCast(disp));
+    }
+
+    /// movsxd r64, dword [base + disp32]
+    fn movsxd(self: *DifferentialAssembler, dst: u8, base: u8, disp: i32) void {
+        self.put(&.{ rexW(dst, base), 0x63, 0x80 | ((dst & 7) << 3) | (base & 7) });
+        self.imm32(@bitCast(disp));
+    }
+
+    fn cmov(self: *DifferentialAssembler, cond: u8, dst: u8, src: u8) void {
+        self.put(&.{ rexW(dst, src), 0x0F, 0x40 | cond, modrmReg(dst, src) });
+    }
+
+    fn setcc(self: *DifferentialAssembler, cond: u8, dst: u8) void {
+        self.put(&.{ 0x40 | (if (dst >= 8) @as(u8, 1) else 0), 0x0F, 0x90 | cond, modrmReg(0, dst) });
+    }
+
+    fn push(self: *DifferentialAssembler, reg: u8) void {
+        if (reg >= 8) self.put(&.{0x41});
+        self.put(&.{0x50 | (reg & 7)});
+    }
+
+    fn pop(self: *DifferentialAssembler, reg: u8) void {
+        if (reg >= 8) self.put(&.{0x41});
+        self.put(&.{0x58 | (reg & 7)});
+    }
+
+    /// jcc rel8 forward over `skip` bytes.
+    fn jccOver(self: *DifferentialAssembler, cond: u8, skip: u8) void {
+        self.put(&.{ 0x70 | cond, skip });
+    }
+
+    /// jnz rel32 backwards to `target` (an offset into `bytes`).
+    fn jnzBack(self: *DifferentialAssembler, target: usize) void {
+        const next: i64 = @intCast(self.bytes.items.len + 6);
+        const rel: i32 = @intCast(@as(i64, @intCast(target)) - next);
+        self.put(&.{ 0x0F, 0x85 });
+        self.imm32(@bitCast(rel));
+    }
+
+    fn hlt(self: *DifferentialAssembler) void {
+        self.put(&.{0xF4});
+    }
+};
+
+/// Build one random loop body: instructions the translator compiles, over
+/// registers that leave the loop counter (r15), the data base (rbx) and the
+/// stack (rsp) alone. Memory operands stay inside the data region.
+fn buildDifferentialBody(asm_: *DifferentialAssembler, random: std.Random, count: usize) void {
+    const usable = [_]u8{ 0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 13, 14 };
+    var emitted: usize = 0;
+    while (emitted < count) : (emitted += 1) {
+        const dst = usable[random.uintLessThan(usize, usable.len)];
+        const src = usable[random.uintLessThan(usize, usable.len)];
+        const disp: i32 = @intCast(random.uintLessThan(u32, 0x200) * 8);
+        switch (random.uintLessThan(u8, 20)) {
+            0 => asm_.movImm(dst, random.int(i32)),
+            1 => asm_.aluRegReg(0x01, dst, src), // add
+            2 => asm_.aluRegReg(0x29, dst, src), // sub
+            3 => asm_.aluRegReg(0x21, dst, src), // and
+            4 => asm_.aluRegReg(0x09, dst, src), // or
+            5 => asm_.aluRegReg(0x31, dst, src), // xor
+            6 => asm_.aluRegReg(0x39, dst, src), // cmp
+            7 => asm_.aluRegReg(0x85, dst, src), // test
+            8 => asm_.aluImm8(random.uintLessThan(u8, 8), dst, random.int(i8)),
+            9 => asm_.aluImm32(random.uintLessThan(u8, 8), dst, random.int(i32)),
+            10 => asm_.imulRegReg(dst, src),
+            11 => asm_.shiftImm(([_]u8{ 4, 5, 7 })[random.uintLessThan(usize, 3)], dst, random.uintLessThan(u8, 64)),
+            12 => asm_.incDec(random.uintLessThan(u8, 2), dst),
+            13 => asm_.notNeg(2 + random.uintLessThan(u8, 2), dst),
+            14 => asm_.lea(dst, 3, disp),
+            15 => asm_.load(dst, 3, disp),
+            16 => asm_.store(src, 3, disp),
+            17 => if (random.boolean()) asm_.movzxByte(dst, 3, disp) else asm_.movsxd(dst, 3, disp),
+            18 => asm_.cmov(random.uintLessThan(u8, 16), dst, src),
+            else => {
+                asm_.setcc(random.uintLessThan(u8, 16), dst);
+                asm_.push(src);
+                asm_.pop(dst);
+            },
+        }
+        // Occasionally a forward conditional skip over one register move,
+        // so blocks end on branches that are taken and not taken.
+        if (random.uintLessThan(u8, 4) == 0) {
+            asm_.jccOver(random.uintLessThan(u8, 16), 3);
+            asm_.aluRegReg(0x01, dst, src);
+        }
+    }
+}
+
+const DifferentialOutcome = struct {
+    regs: ElfRegs,
+    exit_code: u64,
+    terminated: bool,
+    faulted: bool,
+    data: [0x1000]u8,
+    translated_instructions: u64,
+    compiled_blocks: u64,
+    verified_blocks: u64,
+    mismatches: u64,
+};
+
+fn runDifferentialProgram(program: []const u8, seed: u64, translate: bool) DifferentialOutcome {
+    var state = ElfState.initWithMemory(std.testing.allocator, 0x80000);
+    defer state.deinit();
+    const code = MEM_BASE + 0x1000;
+    const data = MEM_BASE + 0x20000;
+    const stack = MEM_BASE + 0x40000;
+    @memcpy(state.mem[0x1000..][0..program.len], program);
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+    random.bytes(state.mem[0x20000..][0..0x1000]);
+    inline for (.{ "rax", "rcx", "rdx", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14" }) |name| {
+        @field(state.regs, name) = random.int(u64);
+    }
+    state.regs.rbx = data;
+    state.regs.rsp = stack;
+    state.regs.r15 = 40;
+    state.regs.rip = code;
+    state.regs.rflags = 0x2;
+    state.block_jit_enabled = translate;
+    state.block_jit_hot_threshold = 2;
+    state.runWithLimit(400_000);
+    var outcome = DifferentialOutcome{
+        .regs = state.regs,
+        .exit_code = state.exit_code,
+        .terminated = state.terminated,
+        .faulted = state.faulted,
+        .data = undefined,
+        .translated_instructions = 0,
+        .compiled_blocks = 0,
+        .verified_blocks = 0,
+        .mismatches = 0,
+    };
+    @memcpy(&outcome.data, state.mem[0x20000..][0..0x1000]);
+    if (state.block_jit) |jit| {
+        outcome.translated_instructions = jit.instructions_retired;
+        outcome.compiled_blocks = jit.compiled;
+        outcome.verified_blocks = jit.verified;
+        outcome.mismatches = jit.mismatches;
+    }
+    return outcome;
+}
+
+test "translated blocks retire the same state as the interpreter over random integer programs" {
+    if (!block_jit.CodeMemory.available()) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0x7E57_B10C);
+    const random = prng.random();
+    var total_translated: u64 = 0;
+    var total_verified: u64 = 0;
+    for (0..24) |trial| {
+        var asm_ = DifferentialAssembler{ .allocator = std.testing.allocator };
+        defer asm_.deinit();
+        const body_start = asm_.bytes.items.len;
+        buildDifferentialBody(&asm_, random, 4 + random.uintLessThan(usize, 10));
+        asm_.incDec(1, 15); // dec r15
+        asm_.jnzBack(body_start);
+        asm_.hlt();
+        const seed = 0x1000 + trial;
+        const interpreted = runDifferentialProgram(asm_.bytes.items, seed, false);
+        const translated = runDifferentialProgram(asm_.bytes.items, seed, true);
+        try std.testing.expect(interpreted.terminated and translated.terminated);
+        try std.testing.expectEqual(interpreted.faulted, translated.faulted);
+        try std.testing.expectEqual(interpreted.exit_code, translated.exit_code);
+        inline for (.{ "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip" }) |name| {
+            if (@field(interpreted.regs, name) != @field(translated.regs, name)) {
+                std.debug.print("trial {d}: {s} differs interpreter=0x{x} translated=0x{x} program={any}\n", .{ trial, name, @field(interpreted.regs, name), @field(translated.regs, name), asm_.bytes.items });
+                return error.TestUnexpectedResult;
+            }
+        }
+        try std.testing.expectEqual(interpreted.regs.rflags, translated.regs.rflags);
+        try std.testing.expectEqualSlices(u8, &interpreted.data, &translated.data);
+        try std.testing.expectEqual(@as(u64, 0), translated.mismatches);
+        try std.testing.expect(translated.compiled_blocks > 0);
+        total_translated += translated.translated_instructions;
+        total_verified += translated.verified_blocks;
+    }
+    // The loops ran forty times each; the second pass and every later one
+    // ran as ARM64, so most of the work was translated.
+    try std.testing.expect(total_translated > 1000);
+    try std.testing.expect(total_verified > 0);
+}
+
+test "a translated block is dropped when its bytes change and recompiled from the new bytes" {
+    if (!block_jit.CodeMemory.available()) return error.SkipZigTest;
+    var asm_ = DifferentialAssembler{ .allocator = std.testing.allocator };
+    defer asm_.deinit();
+    // loop: add rax, 1 ; dec r15 ; jnz loop ; hlt
+    asm_.aluImm8(0, 0, 1);
+    asm_.incDec(1, 15);
+    asm_.jnzBack(0);
+    asm_.hlt();
+    var state = ElfState.initWithMemory(std.testing.allocator, 0x80000);
+    defer state.deinit();
+    @memcpy(state.mem[0x1000..][0..asm_.bytes.items.len], asm_.bytes.items);
+    state.regs.rip = MEM_BASE + 0x1000;
+    state.regs.rsp = MEM_BASE + 0x40000;
+    state.regs.r15 = 8;
+    state.block_jit_hot_threshold = 2;
+    state.runWithLimit(1000);
+    try std.testing.expect(state.terminated);
+    try std.testing.expectEqual(@as(u64, 8), state.regs.rax);
+    const jit = state.block_jit.?;
+    try std.testing.expect(jit.compiled >= 1);
+    const compiled_before = jit.compiled;
+    // Patch `add rax, 1` into `add rax, 2` in place and run the loop again.
+    state.mem[0x1000 + 3] = 2;
+    state.terminated = false;
+    state.regs.rip = MEM_BASE + 0x1000;
+    state.regs.rax = 0;
+    state.regs.r15 = 8;
+    state.runWithLimit(1000);
+    try std.testing.expect(state.terminated);
+    try std.testing.expectEqual(@as(u64, 16), state.regs.rax);
+    try std.testing.expect(jit.invalidations >= 1);
+    try std.testing.expect(jit.compiled > compiled_before);
+    try std.testing.expectEqual(@as(u64, 0), jit.mismatches);
+}
+
+test "continuation validation ignores data and retired bytes but detects future bytes" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    const code = MEM_BASE + 0x1000;
+    var bytes = [_]u8{ 0x90, 0x90, 0x90 };
+    @memcpy(state.mem[0x1000..][0..bytes.len], &bytes);
+    var insns: [3]block_jit.Insn = undefined;
+    for (&insns, 0..) |*insn, index| insn.* = .{
+        .rip = code + index,
+        .len = 1,
+        .decoded = decodeInsn(&.{0x90}),
+        .segment = .ds,
+    };
+    const block = block_jit.Block{
+        .helpers = undefined, // never executed: this tests only source admission
+        .start_rip = code,
+        .end_rip = code + bytes.len,
+        .insns = &insns,
+        .bytes = &bytes,
+        .code = &.{},
+        .native_count = 3,
+        .fallback_count = 0,
+        .register_only = true,
+    };
+    state.block_jit_scratch = .{ .block = &block, .index = 0 };
+    state.write8(MEM_BASE + 0x8000, 0xcc);
+    try testing.expect(!state.blockJitContinuationChanged());
+    state.write8(code, 0xcc); // consumed instruction, not the continuation
+    try testing.expect(!state.blockJitContinuationChanged());
+    state.write8(code + 1, 0xcc);
+    try testing.expect(state.blockJitContinuationChanged());
+    state.block_jit_scratch.index = 2;
+    try testing.expect(!state.blockJitContinuationChanged()); // no remaining instruction
+}
+
+test "translated stores stop before a rewritten continuation in native and fallback lanes" {
+    if (!block_jit.CodeMemory.available()) return error.SkipZigTest;
+    for ([_]bool{ false, true }) |vector_store| {
+        var state = ElfState.initWithMemory(testing.allocator, 0x80000);
+        defer state.deinit();
+        const code = MEM_BASE + 0x1000;
+        const prefix: []const u8 = if (vector_store)
+            &.{ 0x48, 0x89, 0xdb, 0xc5, 0xfa, 0x7f, 0x03 } // mov rbx,rbx; vmovdqu xmm0,[rbx]
+        else
+            &.{ 0x48, 0x89, 0xdb, 0x89, 0x0b }; // mov rbx,rbx; mov ecx,[rbx]
+        @memcpy(state.mem[0x1000..][0..prefix.len], prefix);
+        const suffix = [_]u8{ 0x48, 0xc7, 0xc0, 1, 0, 0, 0, 0xf4, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+        @memcpy(state.mem[0x1000 + prefix.len ..][0..suffix.len], &suffix);
+        state.block_jit_hot_threshold = 2;
+        for (1..9) |value| {
+            state.terminated = false;
+            state.regs.rip = code;
+            state.regs.rsp = MEM_BASE + 0x40000;
+            state.regs.rbx = code + prefix.len + (if (vector_store) @as(u64, 0) else 3);
+            state.regs.rcx = value;
+            state.xmm[0] = suffix;
+            state.xmm[0][3] = @intCast(value);
+            state.runWithLimit(1000);
+            try testing.expect(state.terminated and !state.faulted);
+            try testing.expectEqual(@as(u64, @intCast(value)), state.regs.rax);
+        }
+        try testing.expect(state.block_jit.?.instructions_retired > 0);
+        try testing.expect(state.block_jit.?.aborts > 0);
+        try testing.expect(state.block_jit.?.continuation_write_aborts > 0);
+        try testing.expectEqual(@as(u64, 0), state.block_jit.?.mismatches);
+    }
+}
+
+test "UI scissor packed AVX conversion and clamping retain a nonempty rectangle in both tiers" {
+    // Isolated instruction fixture for the unsigned-extent conversion and
+    // clipping sequence. No PE is loaded and no Xenia code is launched.
+    const program = [_]u8{
+        0x48, 0x89, 0xdb, // mov rbx, rbx: one native template among fallbacks
+        0xc5, 0xfa, 0x7e, 0x40, 0x10, // vmovq [rax+16], xmm0
+        0xc4, 0xe2, 0x79, 0x35, 0xc0, // vpmovzxdq xmm0, xmm0
+        0xc5, 0xfb, 0x12, 0x0b, // vmovddup [rbx], xmm1
+        0xc5, 0xf9, 0xeb, 0xc1, // vpor xmm0, xmm0, xmm1
+        0xc5, 0xf9, 0x5c, 0xc1, // vsubpd xmm0, xmm0, xmm1
+        0xc5, 0xf9, 0x5a, 0xc0, // vcvtpd2ps xmm0, xmm0
+        0xc5, 0xfb, 0x10, 0x49, 0x18, // vmovsd [rcx+24], xmm1
+        0xc5, 0xf8, 0x5e, 0xc9, // vdivps xmm1, xmm0, xmm1
+        0xc5, 0xfb, 0x10, 0x52, 0x1c, // vmovsd [rdx+28], xmm2
+        0xc5, 0xfb, 0x10, 0x5a, 0x24, // vmovsd [rdx+36], xmm3
+        0xc5, 0xf0, 0x59, 0xd2, // vmulps xmm2, xmm1, xmm2
+        0xc5, 0xd8, 0x57, 0xe4, // vxorps xmm4, xmm4, xmm4
+        0xc5, 0xe8, 0x5f, 0xd4, // vmaxps xmm2, xmm2, xmm4
+        0xc5, 0x68, 0x5d, 0xc0, // vminps xmm8, xmm2, xmm0
+        0xc5, 0xf0, 0x59, 0xcb, // vmulps xmm1, xmm1, xmm3
+        0xc4, 0xc1, 0x70, 0x5f, 0xc8, // vmaxps xmm1, xmm1, xmm8
+        0xc5, 0xf0, 0xc2, 0xd0, 0x01, // vcmpltps xmm2, xmm1, xmm0
+        0xc5, 0xe8, 0xc6, 0xd2, 0x50, // vshufps xmm2, xmm2, xmm2, 0x50
+        0xc5, 0xf9, 0x50, 0xc2, // vmovmskpd eax, xmm2
+        0xf4,
+    };
+    for ([_]bool{ false, true }) |translate| {
+        if (translate and !block_jit.CodeMemory.available()) continue;
+        var state = ElfState.initWithMemory(testing.allocator, 0x80000);
+        defer state.deinit();
+        @memcpy(state.mem[0x1000..][0..program.len], &program);
+        const data = MEM_BASE + 0x20000;
+        state.write64(data, 0x4330_0000_0000_0000); // double 2^52
+        state.write32(data + 0x110, 1280);
+        state.write32(data + 0x114, 720);
+        state.write32(data + 0x218, @bitCast(@as(f32, 1280)));
+        state.write32(data + 0x21c, @bitCast(@as(f32, 720)));
+        state.write32(data + 0x31c, @bitCast(@as(f32, 10)));
+        state.write32(data + 0x320, @bitCast(@as(f32, 20)));
+        state.write32(data + 0x324, @bitCast(@as(f32, 640)));
+        state.write32(data + 0x328, @bitCast(@as(f32, 480)));
+        state.block_jit_enabled = translate;
+        state.block_jit_hot_threshold = 2;
+        for (0..8) |_| {
+            state.terminated = false;
+            state.regs.rip = MEM_BASE + 0x1000;
+            state.regs.rax = data + 0x100;
+            state.regs.rbx = data;
+            state.regs.rcx = data + 0x200;
+            state.regs.rdx = data + 0x300;
+            state.regs.rsp = MEM_BASE + 0x40000;
+            state.runWithLimit(1000);
+            try testing.expect(!state.faulted);
+            try testing.expectEqual(@as(u64, 3), state.regs.rax);
+            try testing.expectEqual(@as(f32, 10), @as(f32, @bitCast(std.mem.readInt(u32, state.xmm[8][0..4], .little))));
+            try testing.expectEqual(@as(f32, 20), @as(f32, @bitCast(std.mem.readInt(u32, state.xmm[8][4..8], .little))));
+            try testing.expectEqual(@as(f32, 640), @as(f32, @bitCast(std.mem.readInt(u32, state.xmm[1][0..4], .little))));
+            try testing.expectEqual(@as(f32, 480), @as(f32, @bitCast(std.mem.readInt(u32, state.xmm[1][4..8], .little))));
+        }
+        if (translate) try testing.expect(state.block_jit.?.instructions_retired != 0);
+    }
+}
+
+test "the translator stays off under per-instruction tracing and when refused by name" {
+    var traced = ElfState.initWithMemory(std.testing.allocator, 0x80000);
+    defer traced.deinit();
+    traced.trace_rip_start = MEM_BASE;
+    try std.testing.expect(traced.blockJitActive() == null);
+    try std.testing.expect(traced.block_jit_unavailable);
+    var refused = ElfState.initWithMemory(std.testing.allocator, 0x80000);
+    defer refused.deinit();
+    refused.block_jit_enabled = false;
+    try std.testing.expect(refused.blockJitActive() == null);
+    try std.testing.expect(refused.block_jit == null);
+}
+
+test {
+    _ = block_jit;
+}
+
+/// Interpreter and translator side by side over the same program: the
+/// translating state takes one step (one instruction or one block), the
+/// interpreting state takes as many instructions as that retired, and every
+/// register is compared. The first disagreement names the block and the
+/// register, which is how a template defect is found in minutes rather than
+/// from a digest that came out wrong.
+const LockstepDivergence = struct {
+    step: usize,
+    register: []const u8,
+    interpreted: u64,
+    translated: u64,
+    block_start: u64,
+    block_ops: [8]Op,
+    block_len: usize,
+};
+
+fn lockstepDivergence(interpreting: *ElfState, translating: *ElfState, max_steps: usize, stop_rip: ?u64) ?LockstepDivergence {
+    interpreting.block_jit_enabled = false;
+    translating.block_jit_hot_threshold = 2;
+    var step_index: usize = 0;
+    while (step_index < max_steps and !translating.terminated) : (step_index += 1) {
+        if (stop_rip) |stop| if (translating.regs.rip == stop) break;
+        const rip_before = translating.regs.rip;
+        _ = translating.step();
+        var retired = translating.step_retired;
+        while (retired > 0 and !interpreting.terminated) : (retired -= 1) _ = interpreting.step();
+        var divergence: ?LockstepDivergence = null;
+        inline for (.{ "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip" }) |name| {
+            if (divergence == null and @field(interpreting.regs, name) != @field(translating.regs, name)) {
+                divergence = .{ .step = step_index, .register = name, .interpreted = @field(interpreting.regs, name), .translated = @field(translating.regs, name), .block_start = rip_before, .block_ops = undefined, .block_len = 0 };
+            }
+        }
+        if (divergence == null and interpreting.regs.rflags != translating.regs.rflags) {
+            divergence = .{ .step = step_index, .register = "rflags", .interpreted = interpreting.regs.rflags, .translated = translating.regs.rflags, .block_start = rip_before, .block_ops = undefined, .block_len = 0 };
+        }
+        if (divergence) |*found| {
+            if (translating.block_jit) |jit| {
+                if (jit.blocks[blockJitIndex(rip_before)]) |block| {
+                    if (block.start_rip == rip_before) {
+                        found.block_len = @min(block.insns.len, found.block_ops.len);
+                        for (block.insns[0..found.block_len], 0..) |insn, i| found.block_ops[i] = insn.decoded.op;
+                    }
+                }
+            }
+            return found.*;
+        }
+    }
+    return null;
+}
+
+fn expectNoLockstepDivergence(interpreting: *ElfState, translating: *ElfState, max_steps: usize, stop_rip: ?u64) !void {
+    if (lockstepDivergence(interpreting, translating, max_steps, stop_rip)) |found| {
+        std.debug.print("lockstep divergence at step {d}: {s} interpreter=0x{x} translated=0x{x} block=0x{x} ops:", .{ found.step, found.register, found.interpreted, found.translated, found.block_start });
+        for (found.block_ops[0..found.block_len]) |op| std.debug.print(" {s}", .{@tagName(op)});
+        std.debug.print("\n", .{});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "lockstep: the SHA1 feed loop translates identically to its interpretation" {
+    if (!block_jit.CodeMemory.available()) return error.SkipZigTest;
+    const interpreting = try testing.allocator.create(ElfState);
+    defer testing.allocator.destroy(interpreting);
+    interpreting.* = ElfState.init(testing.allocator);
+    defer interpreting.deinit();
+    const translating = try testing.allocator.create(ElfState);
+    defer testing.allocator.destroy(translating);
+    translating.* = ElfState.init(testing.allocator);
+    defer translating.deinit();
+    seedKernelSha1FeedFixture(interpreting, 0x4001);
+    seedKernelSha1FeedFixture(translating, 0x4001);
+    interpreting.xenia_sha1_feed_enabled = false;
+    translating.xenia_sha1_feed_enabled = false;
+    const stop = translating.mem_base + 0x2000 + 78;
+    try expectNoLockstepDivergence(interpreting, translating, 200_000, stop);
+    try testing.expectEqual(stop, translating.regs.rip);
+    try testing.expectEqualSlices(u8, interpreting.guestMemoryConst(interpreting.regs.rdi, 0x70).?, translating.guestMemoryConst(translating.regs.rdi, 0x70).?);
+    try testing.expect(translating.block_jit.?.instructions_retired > 100_000);
 }
