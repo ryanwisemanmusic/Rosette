@@ -418,6 +418,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // The shared code memory maps MAP_JIT pages through libc.
+    arm64_encode_module.link_libc = true;
     const ppc_instruction_routing_mod = b.createModule(.{
         .root_source_file = b.path("../pkg/PPC/xenia/runtime/instruction-routing/src/root.zig"),
         .target = target,
@@ -460,6 +462,22 @@ pub fn build(b: *std.Build) void {
     // picture in it.
     const frame_content_contract_mod = b.createModule(.{
         .root_source_file = b.path("../pkg/common/rosette/frame-content-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // Final screen validity is a pure, fail-closed evaluation over the
+    // forwarder's bounded snapshot. Keep it as a named module so the PE
+    // processor and the native graphics path share the same verdict table.
+    const screen_validity_mod = b.createModule(.{
+        .root_source_file = b.path("../lib/gpu/screen_validity.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // What a guest address is when no symbol names it: the image the loader
+    // mapped, a thunk Rosette synthesised, a block the guest allocated
+    // executable and jumped into.
+    const address_region_map_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/rosette/address-region-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -571,6 +589,24 @@ pub fn build(b: *std.Build) void {
     // ever asked for a swap, ever registered an audio client.
     const xenia_guest_milestone_map_mod = b.createModule(.{
         .root_source_file = b.path("../pkg/common/xenia/guest-milestone-map/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Xenia's own kernel export shims: `xe::kernel::xboxkrnl::VdSwap_entry`
+    // and its 691 siblings. Entry into one is the translated PowerPC asking
+    // the emulated kernel for something, which is the only event in the whole
+    // program that proves the title acted.
+    const xenia_kernel_shim_map_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/kernel-shim-map/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // The console's own export ordinal tables, joined against the shims above
+    // to say what this Xenia build does not implement.
+    const xenia_kernel_export_map_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/kernel-export-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1995,6 +2031,20 @@ pub fn build(b: *std.Build) void {
     // what a name's ABI defines for a refusal; the library inventory says
     // which DLLs are the Windows surface; and one package per DLL owns the
     // degraded names. The catalogue only links those facts for the runtime.
+    // What a declined Windows DLL would have to gain before Rosette could
+    // serve it, and what the guest loses meanwhile.
+    const dll_win32_capability_gap_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/dll/win32/capability-gap/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // The shape every per-DLL package uses to declare one export: its arity,
+    // the convention its return value follows, and what Rosette does about it.
+    const dll_win32_export_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/dll/win32/export-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const dll_win32_catalogue_mod = b.createModule(.{
         .root_source_file = b.path("../pkg/dll/win32/catalogue/src/root.zig"),
         .target = target,
@@ -2021,6 +2071,7 @@ pub fn build(b: *std.Build) void {
         .{ .import_name = "dll_win32_cfgmgr32", .root_source_file = "../pkg/dll/win32/cfgmgr32/src/root.zig" },
         .{ .import_name = "dll_win32_dwmapi", .root_source_file = "../pkg/dll/win32/dwmapi/src/root.zig" },
         .{ .import_name = "dll_win32_dxgi", .root_source_file = "../pkg/dll/win32/dxgi/src/root.zig" },
+        .{ .import_name = "dll_win32_vulkan_1", .root_source_file = "../pkg/dll/win32/vulkan-1/src/root.zig" },
         .{ .import_name = "dll_win32_dynamic", .root_source_file = "../pkg/dll/win32/dynamic/src/root.zig" },
         .{ .import_name = "dll_win32_gdi32", .root_source_file = "../pkg/dll/win32/gdi32/src/root.zig" },
         .{ .import_name = "dll_win32_hid", .root_source_file = "../pkg/dll/win32/hid/src/root.zig" },
@@ -2046,6 +2097,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        package_mod.addImport("dll_win32_export_contract", dll_win32_export_contract_mod);
         dll_win32_catalogue_mod.addImport(spec.import_name, package_mod);
         const package_test = b.addTest(.{ .root_module = package_mod });
         check_step.dependOn(&b.addRunArtifact(package_test).step);
@@ -2063,7 +2115,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    dll_win32_catalogue_mod.addImport("dll_win32_export_contract", dll_win32_export_contract_mod);
     dll_win32_library_inventory_mod.addImport("dll_win32_catalogue", dll_win32_catalogue_mod);
+    dll_win32_library_inventory_mod.addImport("dll_win32_capability_gap", dll_win32_capability_gap_mod);
+    const dll_win32_capability_gap_test = b.addTest(.{ .root_module = dll_win32_capability_gap_mod });
+    check_step.dependOn(&b.addRunArtifact(dll_win32_capability_gap_test).step);
+    const dll_win32_export_contract_test = b.addTest(.{ .root_module = dll_win32_export_contract_mod });
+    check_step.dependOn(&b.addRunArtifact(dll_win32_export_contract_test).step);
+    // The export contract borrows the return contract's convention vocabulary
+    // rather than declaring a second one, so the two halves of a refusal - the
+    // value chosen and the value judged - can never disagree.
+    dll_win32_export_contract_mod.addImport("dll_win32_return_contract", dll_win32_return_contract_mod);
     const dll_win32_return_contract_test = b.addTest(.{ .root_module = dll_win32_return_contract_mod });
     check_step.dependOn(&b.addRunArtifact(dll_win32_return_contract_test).step);
     const dll_win32_library_inventory_test = b.addTest(.{ .root_module = dll_win32_library_inventory_mod });
@@ -2083,6 +2145,7 @@ pub fn build(b: *std.Build) void {
     const windows_runtime_test = b.addTest(.{ .root_module = windows_runtime_mod });
     check_step.dependOn(&b.addRunArtifact(windows_runtime_test).step);
 
+    var windows_graphics_state_test_mod: *std.Build.Module = undefined;
     // ELF processor (x86-64 ELF binary loader/emulator)
     {
         const x64_linux_runtime_mod = b.createModule(.{
@@ -2121,8 +2184,13 @@ pub fn build(b: *std.Build) void {
         elf_processor_mod.addImport("xenia_guest_frontier_map", xenia_guest_frontier_map_mod);
         elf_processor_mod.addImport("xenia_warning_severity_map", xenia_warning_severity_map_mod);
         elf_processor_mod.addImport("xenia_guest_milestone_map", xenia_guest_milestone_map_mod);
+        elf_processor_mod.addImport("xenia_kernel_shim_map", xenia_kernel_shim_map_mod);
+        elf_processor_mod.addImport("xenia_kernel_export_map", xenia_kernel_export_map_mod);
         elf_processor_mod.addImport("xenia_guest_address_map", xenia_guest_address_map_mod);
         elf_processor_mod.addImport("frame_content_contract", frame_content_contract_mod);
+        elf_processor_mod.addImport("screen_validity", screen_validity_mod);
+        elf_processor_mod.addImport("address_region_map", address_region_map_mod);
+        elf_processor_mod.addImport("arm64_encode", arm64_encode_module);
         const elf_processor = b.addExecutable(.{
             .name = "elf_processor",
             .root_module = elf_processor_mod,
@@ -2148,8 +2216,13 @@ pub fn build(b: *std.Build) void {
         elf_processor_test_mod.addImport("xenia_guest_frontier_map", xenia_guest_frontier_map_mod);
         elf_processor_test_mod.addImport("xenia_warning_severity_map", xenia_warning_severity_map_mod);
         elf_processor_test_mod.addImport("xenia_guest_milestone_map", xenia_guest_milestone_map_mod);
+        elf_processor_test_mod.addImport("xenia_kernel_shim_map", xenia_kernel_shim_map_mod);
+        elf_processor_test_mod.addImport("xenia_kernel_export_map", xenia_kernel_export_map_mod);
         elf_processor_test_mod.addImport("xenia_guest_address_map", xenia_guest_address_map_mod);
         elf_processor_test_mod.addImport("frame_content_contract", frame_content_contract_mod);
+        elf_processor_test_mod.addImport("screen_validity", screen_validity_mod);
+        elf_processor_test_mod.addImport("address_region_map", address_region_map_mod);
+        elf_processor_test_mod.addImport("arm64_encode", arm64_encode_module);
         // Rooted so the frontier classification rules execute rather than
         // only compile as the ELF processor's dependency. A shadowed rule is
         // invisible at runtime and only shows up as a workload nobody names.
@@ -2159,6 +2232,13 @@ pub fn build(b: *std.Build) void {
         check_step.dependOn(&b.addRunArtifact(xenia_warning_severity_map_test).step);
         const xenia_guest_milestone_map_test = b.addTest(.{ .root_module = xenia_guest_milestone_map_mod });
         check_step.dependOn(&b.addRunArtifact(xenia_guest_milestone_map_test).step);
+        windows_graphics_state_test_mod = elf_processor_test_mod;
+        const windows_graphics_contract_test = b.addTest(.{
+            .root_module = elf_processor_test_mod,
+            .filters = &.{ "title worker code-cache", "native Vulkan refusal", "first-frame chain" },
+        });
+        const windows_graphics_contract_check = b.step("windows-graphics-check", "Run PE graphics evidence and native routing regression tests");
+        windows_graphics_contract_check.dependOn(&b.addRunArtifact(windows_graphics_contract_test).step);
         const elf_processor_test = b.addTest(.{ .root_module = elf_processor_test_mod });
         check_step.dependOn(&b.addRunArtifact(elf_processor_test).step);
 
@@ -2418,6 +2498,7 @@ pub fn build(b: *std.Build) void {
             // describe the console and its kernel, so they are route
             // independent like the rest of this list.
             "../pkg/common/xenia/kernel-export-map/src/root.zig",
+            "../pkg/common/xenia/kernel-shim-map/src/root.zig",
             "../pkg/common/xenia/vd-ring-contract/src/root.zig",
             "../pkg/common/xenia/vd-swap-contract/src/root.zig",
             "../pkg/common/xenia/provisioning-contract/src/root.zig",
@@ -2607,11 +2688,6 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        const xenia_kernel_export_map_mod = b.createModule(.{
-            .root_source_file = b.path("../pkg/common/xenia/kernel-export-map/src/root.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
         const gpu_mod = b.createModule(.{
             .root_source_file = b.path("../lib/gpu/root.zig"),
             .target = target,
@@ -2619,10 +2695,15 @@ pub fn build(b: *std.Build) void {
         });
         gpu_mod.addImport("window_geometry", window_geometry_mod);
         gpu_mod.addImport("frame_content_contract", frame_content_contract_mod);
+        gpu_mod.addImport("screen_validity", screen_validity_mod);
         const window_geometry_test = b.addTest(.{ .root_module = window_geometry_mod });
         check_step.dependOn(&b.addRunArtifact(window_geometry_test).step);
         const frame_content_contract_test = b.addTest(.{ .root_module = frame_content_contract_mod });
         check_step.dependOn(&b.addRunArtifact(frame_content_contract_test).step);
+        const screen_validity_test = b.addTest(.{ .root_module = screen_validity_mod });
+        check_step.dependOn(&b.addRunArtifact(screen_validity_test).step);
+        const address_region_map_test = b.addTest(.{ .root_module = address_region_map_mod });
+        check_step.dependOn(&b.addRunArtifact(address_region_map_test).step);
         gpu_mod.addImport("device_tree", device_tree_mod);
         gpu_mod.addImport("xenos_register_map", xenos_register_map_mod);
         gpu_mod.addImport("xenia_vd_swap_contract", xenia_vd_swap_contract_mod);
@@ -2725,6 +2806,30 @@ pub fn build(b: *std.Build) void {
         // loader bridge lives in this module, and its enumeration and
         // create-info offsets are exactly the kind of rule that is silent at
         // runtime and only visible as a guest failure many calls later.
+        const windows_vulkan_adapter_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/gpu/vulkan/windows_guest_forwarder.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        windows_vulkan_adapter_mod.addImport("dyld", dyld_mod);
+        windows_vulkan_adapter_mod.addImport("dll_win32_catalogue", dll_win32_catalogue_mod);
+        const windows_vulkan_adapter_test = b.addTest(.{ .root_module = windows_vulkan_adapter_mod });
+        const windows_vulkan_adapter_check = b.step("windows-vulkan-check", "Run Windows Vulkan ABI adapter tests");
+        const run_windows_vulkan_adapter_test = b.addRunArtifact(windows_vulkan_adapter_test);
+        windows_vulkan_adapter_check.dependOn(&run_windows_vulkan_adapter_test.step);
+        const windows_vulkan_integration_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/gpu/vulkan/windows_guest_forwarder_integration_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        windows_vulkan_integration_mod.addImport("windows_guest_forwarder", windows_vulkan_adapter_mod);
+        windows_vulkan_integration_mod.addImport("gpu", gpu_mod);
+        windows_vulkan_integration_mod.addImport("elf_processor_state", windows_graphics_state_test_mod);
+        const windows_vulkan_integration_test = b.addTest(.{ .root_module = windows_vulkan_integration_mod });
+        const run_windows_vulkan_integration_test = b.addRunArtifact(windows_vulkan_integration_test);
+        windows_vulkan_adapter_check.dependOn(&run_windows_vulkan_integration_test.step);
+        check_step.dependOn(&run_windows_vulkan_integration_test.step);
+        check_step.dependOn(&run_windows_vulkan_adapter_test.step);
         const dyld_test = b.addTest(.{ .root_module = dyld_mod });
         const run_dyld_test = b.addRunArtifact(dyld_test);
         const dyld_check = b.step("dyld-check", "Run the dynamic linker and Vulkan loader bridge tests");
@@ -3520,7 +3625,7 @@ pub fn build(b: *std.Build) void {
 
     {
         const transpiler_mod = b.createModule(.{
-            .root_source_file = b.path("../lib/transpiler/c_fix.zig"),
+            .root_source_file = b.path("../lib/transpiler/root.zig"),
             .target = target,
             .optimize = optimize,
         });
