@@ -4910,12 +4910,14 @@ pub fn decodeVexHalfMove(
     var pos = modrm_pos;
     const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
     if (decoded.is_reg_form) {
-        // The register forms of 0x12/0x16 are VMOVHLPS/VMOVLHPS. Unlike the
-        // memory half-moves, ModR/M.r/m supplies the vector source and the
-        // VEX.vvvv field is not an additional executor operand.
+        // The register forms of 0x12/0x16 are the three-source
+        // VMOVHLPS/VMOVLHPS forms.  VEX.vvvv is the first source and
+        // ModR/M.r/m is the second source; dropping vvvv here leaves the
+        // executor with only the destination's stale low half.
         if (opcode != 0x12 and opcode != 0x16) return .{};
         decoded.xmm_dst = @intFromEnum(rm.reg);
-        decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
         decoded.is_reg_form = true;
         decoded.op = if (opcode == 0x12 and prefix == 0) .vmovhlps else .vmovlhps;
         decoded.len = @intCast(pos);

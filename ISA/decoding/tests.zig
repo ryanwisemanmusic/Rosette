@@ -185,19 +185,34 @@ test "VEX move-mask decodes through the production legacy dispatch" {
 }
 
 test "VEX register half-move decodes through the production legacy dispatch" {
-    // VMOVLHPS xmm1, xmm1 — C5 E8 16 C9. The register form is distinct from
-    // the memory VMOVHPS form that shares opcode 0x16.
+    // VMOVLHPS xmm1, xmm2, xmm1 — C5 E8 16 C9. The register form is a
+    // three-source instruction: VEX.vvvv supplies xmm2 and ModR/M.r/m
+    // supplies the second xmm1 source. It is distinct from the memory
+    // VMOVHPS form that shares opcode 0x16.
     const bytes = [_]u8{ 0xC5, 0xE8, 0x16, 0xC9 };
     const decoded = vex.decodeVex2(&bytes, 0);
     try std.testing.expectEqual(types.Op.vmovlhps, decoded.op);
     try std.testing.expectEqual(@as(u8, 1), decoded.xmm_dst);
-    try std.testing.expectEqual(@as(u8, 1), decoded.xmm_src);
+    try std.testing.expectEqual(@as(u8, 2), decoded.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), decoded.xmm_src2);
     try std.testing.expect(decoded.is_reg_form);
     try std.testing.expectEqual(@as(u8, 4), decoded.len);
 
     const dispatched = legacy.decodeLegacyInstruction(&bytes, .long64);
     try std.testing.expectEqual(types.Op.vmovlhps, dispatched.op);
     try std.testing.expectEqual(@as(u8, 4), dispatched.len);
+}
+
+test "VEX VMOVHLPS preserves both explicit source roles" {
+    // VMOVHLPS xmm0, xmm1, xmm2: low <- xmm2.high, high <- xmm1.high.
+    const bytes = [_]u8{ 0xC5, 0xF0, 0x12, 0xC2 };
+    const decoded = vex.decodeVex2(&bytes, 0);
+    try std.testing.expectEqual(types.Op.vmovhlps, decoded.op);
+    try std.testing.expectEqual(@as(u8, 0), decoded.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 1), decoded.xmm_src);
+    try std.testing.expectEqual(@as(u8, 2), decoded.xmm_src2);
+    try std.testing.expect(decoded.is_reg_form);
+    try std.testing.expectEqual(types.Op.vmovhlps, legacy.decodeLegacyInstruction(&bytes, .long64).op);
 }
 
 test "VEX packed single/double conversions decode through both production forms" {
