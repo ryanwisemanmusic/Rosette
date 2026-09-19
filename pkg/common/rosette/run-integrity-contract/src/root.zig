@@ -329,6 +329,7 @@ pub const Invariant = enum(u8) {
     /// A negative this load-bearing needs two observers. Without one the run is
     /// about to spend its next week on a frontier it cannot substantiate.
     frontier_boundary_corroborated,
+    no_stalled_run_horizon,
 
     pub fn label(self: Invariant) []const u8 {
         return switch (self) {
@@ -369,6 +370,7 @@ pub const Invariant = enum(u8) {
             .no_contested_claim => "no-contested-claim",
             .no_settled_unknown_mapping => "no-settled-unknown-mapping",
             .frontier_boundary_corroborated => "frontier-boundary-corroborated",
+            .no_stalled_run_horizon => "no-stalled-run-horizon",
         };
     }
 
@@ -426,6 +428,10 @@ pub const Invariant = enum(u8) {
             // critical-gap list names it and its layer — a genuine host-driver
             // defect surfaces as a Vulkan or Metal failure elsewhere, not here.
             .no_unsatisfied_capability,
+            // The horizon measures whether the emulator's own pipeline is
+            // still reaching contract stages. Rosette's reading of it is
+            // correct; what stopped is the producer.
+            .no_stalled_run_horizon,
             // Same reasoning as `wait_receives_signals`: Rosette observed the
             // poll correctly; what is missing is the signaller.
             .bounded_poll_receives_signals,
@@ -475,6 +481,7 @@ pub const Invariant = enum(u8) {
             .no_contested_claim => .ownership,
             .no_settled_unknown_mapping => .ownership,
             .frontier_boundary_corroborated => .ownership,
+            .no_stalled_run_horizon => .liveness,
         };
     }
 
@@ -492,7 +499,7 @@ pub const Invariant = enum(u8) {
             .wait_receives_signals => "a wait subject has only ever timed out; it is not a pump, it is a signal that never arrives — find the intended signaller",
             .no_unsatisfied_capability => "a capability was exercised and did not work; the critical-gap list names it and its layer",
             .no_harness_substitution => "the run advanced on Rosette's own output rather than the application's; every conclusion drawn past this point describes Rosette. Disable the substitution or accept that the run is measuring the harness",
-            .translation_cache_converges => "the decode cache lost actionable reusable work. Read TRANSLATION ECONOMICS: compulsory first-touch fills are unavoidable, cold evictions are deferred working-set evidence, and the recurring actionable classes are reusable conflicts, stale bytes, or coarse-flush collateral. The cache-pressure page list names the addresses; the fix is capacity, a better mapping, or separating immutable image code from mutable JIT code",
+            .translation_cache_converges => "the decode cache lost work it had already done. Read TRANSLATION FAIL-FAST CONTEXT for the exact instruction, then TRANSLATION ECONOMICS for the class: reusable conflicts, stale bytes and coarse-flush collateral are recurring loss, and a cold eviction is a decode performed and discarded during warming. Compulsory first-touch fills are counted there but never stop the run. The fix is capacity, a better mapping, or separating immutable image code from mutable JIT code",
             .no_recorded_anomaly => "the anomaly ledger or pause-causality ledger recorded a defect; read the exact ledger entry before continuing",
             .every_waiter_has_a_notifier => "a thread is waiting on an object no code has ever raised. Waiters chose that object, so something intended to signal it — find that code and confirm it ran at all, rather than waiting for a signal that is not late but absent",
             .every_park_has_a_reason => "a thread is parked and Rosette cannot say why. That is a hole in Rosette's model of the wait, not a defect in the thread: teach the scheduler to name this wait before drawing any conclusion from it",
@@ -516,6 +523,7 @@ pub const Invariant = enum(u8) {
             .no_run_budget_deficit => "the settled run is below its declared guest-millisecond throughput budget. Read RUN BUDGET and the phase table, fix the dominant host-time consumer, and do not let a watchdog turn a measured reachability failure into an apparent hang",
             .no_proven_deadlock => "the deadlock predictor has a causal deadlock finding after the guest boundary. Read DEADLOCK PREDICTOR for the exact object, waiter and notifier roster; repair the producer or wait-for edge, and do not inject a synthetic wake to hide it",
             .no_unproven_essential_component => "an essential component was used before its readiness proof, or its proof failed. Read COMPONENT READINESS for the component, first-use step and proof obligation; repair that boundary before trusting any downstream GPU or scheduler result",
+            .no_stalled_run_horizon => "the run reached no new contract milestone across half its length while the producer's own publication axis stayed frozen, which is the definition of a run a longer run does not fix. Read RUN HORIZON for the newest milestone and the projection beside it: the frontier named there is where the work is. Stopping here is the point — every step past it costs host time and produces no evidence that was not already on the page",
             .frontier_boundary_corroborated => "the boundary the frontier blames is armed, was reached on none of its armed addresses, and nothing else agrees it never happened. Read the gpu-boundary row for addresses(armed/reached): reached=0 on every armed address means either the title never called it or Rosette armed addresses the call does not pass through, and a tracepoint cannot tell those apart. Add a second observer for this boundary — the emulator's own breadcrumb is usually already in the log — before spending another day downstream of this frontier",
             .no_settled_unknown_mapping => "a classifier has repeatedly declined a raw value that something downstream needed. Read UNKNOWN INVENTORY: the blocking rows name the exact value and the table it belongs in, and the domain's remedy names the file. This is not a condition further running resolves — the run will reach this same frontier for this same reason every time until the case is added, which is what being stuck is",
             .no_contested_claim => "two live observers of the same claim disagree about the present, and the losing one is still repeating its value after being contradicted. Read CLAIM RECONCILIATION for the subject, both sources and their last steps. When the two sit on opposite sides of the host/guest boundary this is a model split rather than a race, and neither reading may be quoted until it is resolved. A superseded claim is not this: there the losing source went quiet and the newest reading is current",
@@ -765,12 +773,14 @@ pub const Observation = struct {
     // Translation pressure.
     /// Runtime-selected evidence mode. The ordinary contract keeps cache
     /// pressure and never-notified parks behind their settling windows so a
-    /// warm-up burst or idle worker does not stop a run. The fault-policy
-    /// runtime may select this stricter mode after the relevant observer is
-    /// armed: proven reusable eviction, executable-byte changes and proven
-    /// liveness contradictions are then faults even when an unrelated counter
-    /// is still advancing. Cold evictions remain separately observable because
-    /// they do not prove reusable work was lost.
+    /// warm-up burst or idle worker does not stop a run. In strict fault mode
+    /// the fill hook is miss-intolerant: a proven reusable eviction, an
+    /// executable-byte change, coarse-flush collateral or a cold eviction is a
+    /// fault at the fill site even when an unrelated counter is still
+    /// advancing. Compulsory first-touch fills stay out of that set — an
+    /// address decoded for the first time could not have been cached — and
+    /// remain separately observable so the report still explains what the
+    /// warming cost.
     strict_fail_fast: bool = false,
     translation_cache_entries: u64 = 0,
     translation_vacant_fills: u64 = 0,
@@ -876,6 +886,30 @@ pub const Observation = struct {
     /// True only when a guest wait, a classified synchronization object, or a
     /// genuinely frozen run proves that the raw silence is causally relevant.
     liveness_obligation_proven: bool = false,
+    /// The run-horizon verdict, which is the only progress reading in this
+    /// contract that a spinning guest cannot forge.
+    ///
+    /// Every other liveness gate here is suppressed by an axis a busy loop
+    /// keeps moving: `run_execution_frozen` needs identical step counts
+    /// between checkpoints, and `external_progress_fresh` counts the host
+    /// still servicing allocations and translations. An emulator whose main
+    /// loop spins satisfies both forever while its pipeline is dead — the
+    /// 2026-09-08 run held 22 armed invariants at satisfied for 7.5 billion
+    /// steps with the swap ladder frozen at the same rung throughout.
+    ///
+    /// The horizon is different because its axis is the producer's own
+    /// publication counter and its threshold is scale-free: half the run
+    /// elapsed with no new contract milestone. `stalled` is defined as "a
+    /// longer run will not help", and until now nothing acted on it.
+    run_horizon_stalled: bool = false,
+    /// Milestones the horizon has recorded. Zero means it has nothing to say.
+    run_horizon_milestones: u64 = 0,
+    /// True only when this integrity checkpoint observed the same executed
+    /// guest step as the previous checkpoint. A flat subsystem-progress
+    /// witness is not enough: a translating guest can retire instructions
+    /// without moving any of those witnesses, and its idle host workers must
+    /// remain diagnostic rather than becoming a fatal liveness cause.
+    run_execution_frozen: bool = false,
     /// Threads parked with no reason Rosette can name.
     parks_without_a_reason: u64 = 0,
     /// Framework events whose master/subowner pair the contract refuses.
@@ -1266,20 +1300,20 @@ pub fn judge(invariant: Invariant, observation: Observation) Judgement {
                 observation.translation_flush_refills;
             if (fills == 0) break :blk .{};
 
-            // A strict diagnostic run is explicitly trying to catch the
-            // first reusable eviction, not decide whether the aggregate hit
-            // rate made it expensive. `capacity_conflict` is already proved
-            // at the cache fill site: a non-empty entry with a non-zero reuse
-            // count was displaced. Stale-byte and coarse-flush refills are
-            // equally strong integrity evidence. Do not let nominal cache
-            // occupancy or a 99% hit rate turn those facts back into a
-            // “warming” report.
+            // Strict fault mode is miss-intolerant, and the process-side
+            // fill hook normally stops earlier — at the exact instruction
+            // that missed. Keep the contract equally strict for replayed or
+            // externally assembled observations, in the same order the cache
+            // contract's `requiresFailFast` uses, so each violation names the
+            // count that proved it rather than a summed total.
             //
-            // Cold evictions deliberately do not enter this branch. Their
-            // victim had never been reused, and the active victim/static-L2
-            // tiers may recover it without another decode. A cold stream is
-            // valuable evidence for cache sizing, but this event alone does
-            // not prove that reusable work was lost.
+            // `translation_vacant_fills` is deliberately absent. A first
+            // touch is compulsory: the address had never been decoded, so no
+            // cache size or replacement policy could have held it, and the
+            // cache is empty at step zero. Arming it here would violate this
+            // invariant on the first fill of every run, which is not a
+            // stricter gate but an unsatisfiable one. It stays visible in
+            // TRANSLATION ECONOMICS and in the warm-up occupancy gate below.
             if (observation.strict_fail_fast) {
                 if (observation.translation_conflict_fills != 0) break :blk .{
                     .state = .violated,
@@ -1292,6 +1326,10 @@ pub fn judge(invariant: Invariant, observation: Observation) Judgement {
                 if (observation.translation_flush_refills != 0) break :blk .{
                     .state = .violated,
                     .detail = observation.translation_flush_refills,
+                };
+                if (observation.translation_cold_evictions != 0) break :blk .{
+                    .state = .violated,
+                    .detail = observation.translation_cold_evictions,
                 };
             }
 
@@ -1612,6 +1650,17 @@ pub fn judge(invariant: Invariant, observation: Observation) Judgement {
         // that there is no negative being asserted, and a gate that fired on a
         // run which had not yet armed its tracepoints would say nothing about
         // the observers.
+        .no_stalled_run_horizon => blk: {
+            // The horizon owns both halves of the arming decision: it will not
+            // return `stalled` without a milestone to measure from, a quiet
+            // tail covering half the run, and a frozen producer axis. Re-deriving
+            // any of that here would give the contract a second opinion about a
+            // question the horizon already answers, and two readings of one fact
+            // is how they drift.
+            if (observation.run_horizon_milestones == 0) break :blk .{};
+            if (!observation.run_horizon_stalled) break :blk .{ .state = .satisfied };
+            break :blk .{ .state = .violated, .detail = observation.run_horizon_milestones };
+        },
         .frontier_boundary_corroborated => blk: {
             if (!observation.frontier_boundary_armed) break :blk .{};
             // Nothing on this surface has ever been crossed: the phase has not
@@ -2784,11 +2833,14 @@ test "an unprobed reachable stage is fatal only once the probe driver has run" {
 }
 
 // A 99% hit rate is not a cache diagnosis by itself. The fill-site distinction
-// matters: compulsory fills are unavoidable, cold evictions are non-empty but
-// never-reused working-set evidence, and conflicts/stale/flush are actionable
-// recurring loss. The observed `miss(vacant/conflict/cold)=908548/0/2602`
-// stream therefore remains visible without being mistaken for hot conflict.
-test "reusable translation loss is fatal and compulsory or cold work is not" {
+// still matters: compulsory fills are unavoidable, cold evictions are
+// non-empty but never-reused working-set evidence, and conflicts/stale/flush
+// are actionable recurring loss. Strict fault mode is stronger than the
+// economics verdict — it stops on the cold eviction the verdict calls warming
+// — but not stronger than arithmetic, so the observed
+// `miss(vacant/conflict/cold)=908548/0/2602` stream stops on the 2602 and
+// never on the 908548.
+test "strict translation mode stops on cold fills but not compulsory ones" {
     // Compulsory fills alone never arm the gate: an instruction must be
     // decoded once and no cache policy makes a first touch free.
     try std.testing.expectEqual(
@@ -2801,7 +2853,9 @@ test "reusable translation loss is fatal and compulsory or cold work is not" {
             .translation_misses = 908_548,
         }).state,
     );
-    // Cold evictions stay observable but are not enough to prove reusable loss.
+    // A cold eviction is a decode the cache performed and discarded, so it
+    // stops strict fault mode at the first checkpoint that sees one — and it
+    // names the 2602, not the compulsory stream it arrived beside.
     const cold = judge(.translation_cache_converges, .{
         .translation_cache_entries = 262_144,
         .strict_fail_fast = true,
@@ -2810,8 +2864,8 @@ test "reusable translation loss is fatal and compulsory or cold work is not" {
         .translation_hits = 2_807_391_687,
         .translation_misses = 911_150,
     });
-    try std.testing.expectEqual(State.satisfied, cold.state);
-    try std.testing.expectEqual(@as(u64, 99), cold.detail);
+    try std.testing.expectEqual(State.violated, cold.state);
+    try std.testing.expectEqual(@as(u64, 2_602), cold.detail);
     // The three that were already fatal stay fatal, and each names its own count.
     try std.testing.expectEqual(
         State.violated,
@@ -3136,4 +3190,53 @@ test "every invariant states a label, a remedy and a class" {
         const judgement = judge(invariant, .{});
         try std.testing.expect(!judgement.violated());
     }
+}
+
+// The 2026-09-08 run: 7.5 billion steps, 2,384 host seconds, the swap ladder
+// frozen at the same rung throughout, and `armed=22 satisfied=22 violated=0`
+// on every checkpoint. Nothing in this contract could see it, because every
+// liveness gate it owns is suppressed by an axis a spinning main loop keeps
+// moving.
+test "a stalled horizon is the one liveness reading a spin cannot forge" {
+    // The exact shape of that run: the guest is executing, the host is still
+    // servicing it, and no wait looks unusual. Every existing liveness gate
+    // reads healthy.
+    const spinning = Observation{
+        .strict_fail_fast = true,
+        .run_execution_frozen = false,
+        .external_progress_fresh = true,
+        .liveness_scope = .gpu_activity,
+        .run_horizon_milestones = 10,
+        .run_horizon_stalled = true,
+    };
+    const judgement = judge(.no_stalled_run_horizon, spinning);
+    try std.testing.expectEqual(State.violated, judgement.state);
+    try std.testing.expectEqual(@as(u64, 10), judgement.detail);
+
+    // And it is the *only* one that fires on that shape, which is the point:
+    // instruction retirement and host servicing both continue.
+    try std.testing.expect(!judge(.no_never_notified_park, spinning).violated());
+    try std.testing.expect(!judge(.no_proven_deadlock, spinning).violated());
+
+    // A run still reaching milestones is not stalled, and says so rather than
+    // staying unarmed.
+    var advancing = spinning;
+    advancing.run_horizon_stalled = false;
+    try std.testing.expectEqual(State.satisfied, judge(.no_stalled_run_horizon, advancing).state);
+
+    // Before the first milestone the horizon has nothing to measure from, so
+    // this is unobserved rather than passing — a run that never started must
+    // not be reported as one that is progressing.
+    var cold = spinning;
+    cold.run_horizon_milestones = 0;
+    cold.run_horizon_stalled = false;
+    try std.testing.expectEqual(State.not_armed, judge(.no_stalled_run_horizon, cold).state);
+
+    // The owner is the emulator: Rosette read the axis correctly and the
+    // producer is what stopped.
+    try std.testing.expectEqual(Owner.emulator_host, Invariant.no_stalled_run_horizon.owner());
+    try std.testing.expectEqual(Class.liveness, Invariant.no_stalled_run_horizon.class());
+    // Steppable, like the other observation-debt stops: an operator who knows
+    // why the pipeline is quiet may want the rest of the run anyway.
+    try std.testing.expect(!Invariant.no_stalled_run_horizon.nonBypassable());
 }
