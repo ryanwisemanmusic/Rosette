@@ -2811,6 +2811,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        windows_vulkan_adapter_mod.addImport("gpu", gpu_mod);
         windows_vulkan_adapter_mod.addImport("dyld", dyld_mod);
         windows_vulkan_adapter_mod.addImport("dll_win32_catalogue", dll_win32_catalogue_mod);
         const windows_vulkan_adapter_test = b.addTest(.{ .root_module = windows_vulkan_adapter_mod });
