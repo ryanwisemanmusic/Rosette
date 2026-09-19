@@ -1056,6 +1056,31 @@ const HookBox = struct {
     }
 };
 
+/// A small exact-address set for sparse hooks.  A HookBox is the right
+/// representation for an executable range, but it is a very poor fit for a
+/// handful of entry points that live far apart: widening the box turns every
+/// instruction between the first and last entry point into a false positive.
+/// Keep this bounded because the compatibility layer deliberately exposes a
+/// fixed, audited set of entry points.
+const HookPoints = struct {
+    addresses: [4]u64 = @splat(0),
+    count: u8 = 0,
+
+    pub inline fn contains(self: HookPoints, address: u64) bool {
+        return (self.count >= 1 and self.addresses[0] == address) or
+            (self.count >= 2 and self.addresses[1] == address) or
+            (self.count >= 3 and self.addresses[2] == address) or
+            (self.count >= 4 and self.addresses[3] == address);
+    }
+
+    pub fn add(self: *HookPoints, address: u64) void {
+        if (address == 0 or self.contains(address)) return;
+        if (@as(usize, self.count) >= self.addresses.len) return;
+        self.addresses[@as(usize, self.count)] = address;
+        self.count += 1;
+    }
+};
+
 test "hook boxes admit every recorded address and reject the rest cheaply" {
     var box: HookBox = .{};
     try std.testing.expect(!box.contains(0));
@@ -1080,6 +1105,22 @@ test "hook boxes admit every recorded address and reject the rest cheaply" {
     try std.testing.expect(ranges.overlaps(0x14000_0000, 0x10_0000));
     try std.testing.expect(ranges.widenRange(0, 0) == {});
     try std.testing.expect(!ranges.contains(0));
+}
+
+test "sparse hook points do not admit the space between entries" {
+    var points: HookPoints = .{};
+    points.add(0x14011b6f0);
+    points.add(0x140513a10);
+    points.add(0x140513914);
+    points.add(0x140513b07);
+    points.add(0x140513b07);
+    try std.testing.expectEqual(@as(u8, 4), points.count);
+    try std.testing.expect(points.contains(0x14011b6f0));
+    try std.testing.expect(points.contains(0x140513a10));
+    try std.testing.expect(points.contains(0x140513914));
+    try std.testing.expect(points.contains(0x140513b07));
+    try std.testing.expect(!points.contains(0x140300000));
+    try std.testing.expect(!points.contains(0));
 }
 
 const GUEST_ACCESS_VIOLATION_SITE_CAPACITY: usize = 32;
@@ -1429,7 +1470,11 @@ pub const WindowsUnresolvedImport = struct {
 const WINDOWS_GUEST_OUTPUT_LINE_CAPACITY: usize = 4096;
 const WINDOWS_GUEST_FAILURE_POINT_CAPACITY: usize = 32;
 const WINDOWS_GUEST_WARNING_POINT_CAPACITY: usize = 25;
-const DECODE_CACHE_MISS_SITE_CAPACITY: usize = 32;
+// The old 32-site cap saturated on long PE runs, leaving millions of misses
+// in `overflow` with no representative address.  This is still bounded (the
+// state grows by only a few dozen KiB) but gives an overnight run enough
+// room to distinguish one hot conflict from many unrelated cold fills.
+const DECODE_CACHE_MISS_SITE_CAPACITY: usize = 256;
 const GPU_DRAW_FAILURE_CAPACITY: usize = 64;
 
 /// A bounded copy of an emulator warning that crossed the PE stdout/stderr
@@ -2625,6 +2670,12 @@ const GpuRingWindow = struct {
     /// what it is asking to be shown: format, tiling, endianness and size.
     swap_fetch_seen: bool = false,
     swap_fetch: [6]u32 = @splat(0),
+    /// A fetch written to the conventional texture slot is not necessarily
+    /// the front buffer. Titles reuse that register for ordinary textures,
+    /// so keep a candidate pending until the following packet proves that it
+    /// is the fetch VdSwap paired with the swap packet.
+    pending_swap_fetch_valid: bool = false,
+    pending_swap_fetch: [6]u32 = @splat(0),
     swap_frontbuffer: u32 = 0,
     swap_width: u32 = 0,
     swap_height: u32 = 0,
@@ -2745,6 +2796,12 @@ pub const WindowsGraphicsHooks = struct {
     native_presenter_stage: ?*const fn (?*anyopaque) callconv(.c) u32 = null,
     native_presenter_is_ready: ?*const fn (?*anyopaque) callconv(.c) c_int = null,
     native_presenter_present_diagnostic: ?*const fn (?*anyopaque, u64, u32, u32, u32) callconv(.c) u64 = null,
+    /// Offer the console's own front buffer after a guest VdSwap.  The PE
+    /// processor owns the Xenia address-space translation; the host graphics
+    /// owner owns conversion and presentation.  Keeping this as a callback
+    /// prevents a guest address or a host Vulkan object from crossing the ABI
+    /// boundary accidentally.
+    native_present_guest_frontbuffer: ?*const fn (?*anyopaque, *anyopaque, u64, u32, u32, c_int, u32, u32, c_int) callconv(.c) c_int = null,
     /// Optional real Vulkan dispatch supplied by the host-side Windows route.
     /// The callback receives the PE state as an opaque pointer and a bounded
     /// function-name slice. It may adapt the Microsoft x64 call into a native
@@ -3675,7 +3732,11 @@ var cleo_route_memo: [ElfState.op_value_limit][2]CleoRouteMemo = [_][2]CleoRoute
 const block_jit = @import("block_jit.zig");
 
 /// Direct-mapped block and hotness tables, indexed by a hash of the RIP.
-const BLOCK_JIT_TABLE_ENTRIES: usize = 1 << 16;
+/// The 64K table produced millions of slot evictions in long PE runs while
+/// only a small fraction of the slots were live at exit.  Four times the
+/// slots keeps the same lookup semantics and sharply lowers address aliasing
+/// without making the code cache itself unbounded.
+const BLOCK_JIT_TABLE_ENTRIES: usize = 1 << 18;
 /// Executions of a start address before it is compiled. Most addresses run
 /// once; compiling on first sight would spend more on cold code than the
 /// interpreter would have.
@@ -3872,6 +3933,8 @@ pub const ElfState = struct {
     decode_cache_collisions: u64 = 0,
     decode_cache_vacant_fills: u64 = 0,
     decode_cache_conflict_fills: u64 = 0,
+    decode_cache_generated_conflict_fills: u64 = 0,
+    decode_cache_image_conflict_fills: u64 = 0,
     decode_cache_stale_refills: u64 = 0,
     decode_cache_replacements: u64 = 0,
     decode_cache_victim_hits: u64 = 0,
@@ -3892,13 +3955,17 @@ pub const ElfState = struct {
     windows_stub_box: HookBox = .{},
     /// Compatibility hooks: the PE-local pthread condition entries and the
     /// utf8 find_any_of entry, the only addresses
-    /// `tryWindowsGuestCompatibility` acts on. Rebuilt by the two setters
-    /// that assign those fields.
-    windows_compat_hook_box: HookBox = .{},
-    /// How often the boxes admitted an address that no handler then claimed.
-    /// A count near the instruction count means a box has degenerated into
-    /// covering everything and should be split.
+    /// `tryWindowsGuestCompatibility` acts on. This is an exact sparse set;
+    /// using a range here admitted millions of unrelated instructions between
+    /// the far-apart Xenia entry points.
+    windows_compat_hook_points: HookPoints = .{},
+    /// Aggregate and per-hook-class false positives. The aggregate remains
+    /// for compatibility with existing reports; the split counters identify
+    /// which admission structure needs attention on the next run.
     step_hook_box_false_positives: u64 = 0,
+    step_synthetic_hook_false_positives: u64 = 0,
+    step_windows_stub_false_positives: u64 = 0,
+    step_windows_compat_hook_false_positives: u64 = 0,
     /// The executable PE ranges as one box, asked before the per-write scan
     /// in `bumpWindowsImageCodeGeneration`; and the range that answered the
     /// last fetch-generation query, asked first in
@@ -4574,6 +4641,16 @@ pub const ElfState = struct {
     xma_registers: GuestXmaRegisterCensus = .{},
     frame_cost: GuestFrameCost = .{},
     gpu_front_buffer: GuestFrontBuffer = .{},
+    /// The ring and the VdSwap shim are observed on separate guest edges.  A
+    /// swap can therefore be entered before the indirect buffer containing its
+    /// fetch constant is readable.  Keep the last successful handoff so the
+    /// checkpoint retry is cheap and a single swap cannot repaint forever.
+    guest_frontbuffer_last_handoff_swap: u64 = 0,
+    guest_frontbuffer_last_handoff_attempt_swap: u64 = 0,
+    guest_frontbuffer_last_handoff_attempt_step: u64 = 0,
+    guest_frontbuffer_handoff_attempts: u64 = 0,
+    guest_frontbuffer_handoff_successes: u64 = 0,
+    guest_frontbuffer_handoff_failures: u64 = 0,
     windows_wait_objects: [MAX_WINDOWS_WAIT_OBJECTS]WindowsWaitObject = [_]WindowsWaitObject{.{}} ** MAX_WINDOWS_WAIT_OBJECTS,
     windows_active_guest_thread_slot: ?usize = null,
     windows_last_serviced_guest_thread_slot: ?usize = null,
@@ -4839,6 +4916,11 @@ pub const ElfState = struct {
     windows_input_last_packet: u32 = 0,
     windows_input_last_buttons: u16 = 0,
     windows_input_last_focused: bool = false,
+    windows_input_key_down_events: u64 = 0,
+    windows_input_key_up_events: u64 = 0,
+    windows_input_snapshot_reads: u64 = 0,
+    windows_input_nonzero_samples: u64 = 0,
+    windows_input_focused_zero_samples: u64 = 0,
     windows_input_focus_gains: u64 = 0,
     windows_input_focus_losses: u64 = 0,
     windows_input_rejected_events: u64 = 0,
@@ -6544,17 +6626,17 @@ pub const ElfState = struct {
         self.rebuildWindowsCompatHookBox();
     }
 
-    /// Recompute the compatibility-hook box from every address
+    /// Recompute the compatibility-hook set from every address
     /// `tryWindowsGuestCompatibility` compares RIP against. Called by the
     /// setters that assign those fields; a field assigned any other way
     /// would leave its hook unreachable, which is why there are setters.
     fn rebuildWindowsCompatHookBox(self: *ElfState) void {
-        var box: HookBox = .{};
-        if (self.windows_pthread_cond_wait_entry) |entry| box.widen(entry);
-        if (self.windows_pthread_cond_signal_entry) |entry| box.widen(entry);
-        if (self.windows_pthread_cond_broadcast_entry) |entry| box.widen(entry);
-        if (self.windows_utf8_find_any_of_entry) |entry| box.widen(entry);
-        self.windows_compat_hook_box = box;
+        var points: HookPoints = .{};
+        if (self.windows_pthread_cond_wait_entry) |entry| points.add(entry);
+        if (self.windows_pthread_cond_signal_entry) |entry| points.add(entry);
+        if (self.windows_pthread_cond_broadcast_entry) |entry| points.add(entry);
+        if (self.windows_utf8_find_any_of_entry) |entry| points.add(entry);
+        self.windows_compat_hook_points = points;
     }
 
     /// Publish the PE-local pthread condition-variable entry points that the
@@ -15331,6 +15413,99 @@ pub const ElfState = struct {
         return null;
     }
 
+    /// Hand Xenia's console front buffer to the host presenter once the guest
+    /// has both named it and crossed VdSwap.
+    ///
+    /// The two observations are intentionally joined here instead of in the
+    /// Vulkan forwarder. The PE route knows how Xenia's physical view is
+    /// projected into Rosette memory; the presenter must only receive a
+    /// readable host address plus the fetch description. A VdSwap can arrive
+    /// before its indirect buffer is decoded, so callers invoke this on the
+    /// kernel edge, on ring decode, and at checkpoints. Failed attempts are
+    /// retried with a bounded cadence rather than turning a temporary ordering
+    /// difference into a permanent no-frame verdict.
+    fn offerGuestFrontBufferToNativePresenter(self: *ElfState) bool {
+        const callback = self.windows_graphics.hooks.native_present_guest_frontbuffer orelse return false;
+        const front = &self.gpu_front_buffer;
+        if (front.swaps == 0 or front.width == 0 or front.height == 0) return false;
+
+        const attempt_step = self.executed_steps;
+        const new_swap = front.swaps != self.guest_frontbuffer_last_handoff_attempt_swap;
+        if (front.swaps == self.guest_frontbuffer_last_handoff_swap) return true;
+        if (self.guest_frontbuffer_last_handoff_attempt_swap == front.swaps and
+            attempt_step -| self.guest_frontbuffer_last_handoff_attempt_step < 1_000_000)
+        {
+            return false;
+        }
+        self.guest_frontbuffer_last_handoff_attempt_swap = front.swaps;
+        self.guest_frontbuffer_last_handoff_attempt_step = attempt_step;
+        self.guest_frontbuffer_handoff_attempts +|= 1;
+
+        const membase = self.xeniaVirtualMembase() orelse {
+            self.guest_frontbuffer_handoff_failures +|= 1;
+            return false;
+        };
+        // XE_SWAP names the physical surface explicitly. The fetch base is a
+        // useful fallback for a partially decoded packet, and both values are
+        // retained in the final PE64 FRONT BUFFER report for diagnosis.
+        const physical_address = if (front.frontbuffer != 0)
+            front.frontbuffer
+        else
+            front.baseAddress();
+        if (physical_address == 0) {
+            self.guest_frontbuffer_handoff_failures +|= 1;
+            return false;
+        }
+        const physical_view_address = std.math.add(
+            u64,
+            0x1_0000_0000,
+            @as(u64, physical_address & 0x1FFF_FFFF),
+        ) catch {
+            self.guest_frontbuffer_handoff_failures +|= 1;
+            return false;
+        };
+        const source = std.math.add(u64, membase, physical_view_address) catch {
+            self.guest_frontbuffer_handoff_failures +|= 1;
+            return false;
+        };
+        const accepted = callback(
+            self.windows_graphics.hooks.native_context,
+            @ptrCast(self),
+            source,
+            front.width,
+            front.height,
+            @intFromBool(front.tiled()),
+            @as(u32, front.endianness()),
+            @as(u32, front.format()),
+            @intFromBool(new_swap),
+        ) != 0;
+        if (accepted) {
+            self.guest_frontbuffer_last_handoff_swap = front.swaps;
+            self.guest_frontbuffer_handoff_successes +|= 1;
+        } else {
+            self.guest_frontbuffer_handoff_failures +|= 1;
+        }
+        const count = self.guest_frontbuffer_handoff_attempts;
+        if (count <= 4 or (count & (count - 1)) == 0) {
+            log.info("PE64 GUEST FRONT BUFFER HANDOFF: attempt={d} accepted={} swaps={d} source=0x{x} physical=0x{x} extent={d}x{d} format={d} endian={d} tiled={} success={d} failures={d}; {s}", .{
+                count,
+                accepted,
+                front.swaps,
+                source,
+                physical_address,
+                front.width,
+                front.height,
+                front.format(),
+                front.endianness(),
+                front.tiled(),
+                self.guest_frontbuffer_handoff_successes,
+                self.guest_frontbuffer_handoff_failures,
+                if (accepted) "the host presenter accepted the console surface" else "the host presenter declined it; the next readable checkpoint may retry",
+            });
+        }
+        return accepted;
+    }
+
     /// Reads ring dwords through Xenia's physical view, and checks them
     /// against the title's virtual aliases of the same pages.
     const GpuRingSource = struct {
@@ -15409,9 +15584,18 @@ pub const ElfState = struct {
                             };
                         }
                         if (complete) {
-                            window.swap_fetch = fetch;
-                            window.swap_fetch_seen = true;
+                            // 0x4800 is a reused shader-fetch slot, not a
+                            // front-buffer-only register. Do not publish the
+                            // value until an immediately following XE_SWAP
+                            // proves that this write describes the display
+                            // surface.
+                            window.pending_swap_fetch = fetch;
+                            window.pending_swap_fetch_valid = true;
+                        } else {
+                            window.pending_swap_fetch_valid = false;
                         }
+                    } else {
+                        window.pending_swap_fetch_valid = false;
                     }
                     if (base_register <= GuestFrontBuffer.dc_lut_last and base_register + payload > GuestFrontBuffer.dc_lut_first) {
                         window.dc_lut_type0_writes += 1;
@@ -15419,9 +15603,13 @@ pub const ElfState = struct {
                 },
                 1 => {
                     window.type1 += 1;
+                    window.pending_swap_fetch_valid = false;
                     payload = 2;
                 },
-                2 => window.type2 += 1,
+                2 => {
+                    window.type2 += 1;
+                    window.pending_swap_fetch_valid = false;
+                },
                 else => {
                     window.type3 += 1;
                     const opcode: u8 = @truncate((dword >> 8) & 0x7F);
@@ -15433,11 +15621,19 @@ pub const ElfState = struct {
                         0x22, 0x34, 0x35, 0x36 => window.draw_packets += 1,
                         0x64 => {
                             window.swap_packets += 1;
+                            // Pair the front-buffer description with the
+                            // swap that consumes it. A later ordinary texture
+                            // fetch must never replace it in this window.
+                            window.swap_fetch_seen = window.pending_swap_fetch_valid;
+                            if (window.pending_swap_fetch_valid) {
+                                window.swap_fetch = window.pending_swap_fetch;
+                            }
                             // XE_SWAP payload: signature, front buffer
                             // physical address, width, height.
                             if (source.readDword((from + cursor + 2) % ring_dwords)) |frontbuffer| window.swap_frontbuffer = frontbuffer;
                             if (source.readDword((from + cursor + 3) % ring_dwords)) |width| window.swap_width = width;
                             if (source.readDword((from + cursor + 4) % ring_dwords)) |height| window.swap_height = height;
+                            window.pending_swap_fetch_valid = false;
                         },
                         0x37, 0x3F => if (window.indirect_buffers < GPU_RING_WINDOW_INDIRECT_BUFFERS) {
                             // ExecutePacketType3_INDIRECT_BUFFER reads the
@@ -15453,6 +15649,7 @@ pub const ElfState = struct {
                         },
                         else => {},
                     }
+                    if (opcode != 0x64) window.pending_swap_fetch_valid = false;
                     payload = ((dword >> 16) & 0x3FFF) + 1;
                 },
             }
@@ -15492,6 +15689,9 @@ pub const ElfState = struct {
         self.gpu_ring_draw_packets +|= window.draw_packets;
         self.gpu_ring_swap_packets +|= window.swap_packets;
         self.gpu_front_buffer.note(&window);
+        if (self.guest_kernel_calls.hitsFor("VdSwap") != 0) {
+            _ = self.offerGuestFrontBufferToNativePresenter();
+        }
         // Keep the first windows, and let the last slot track the newest.
         const slot = @min(self.gpu_ring_window_count, GPU_RING_WINDOW_CAPACITY - 1);
         self.gpu_ring_windows[slot] = window;
@@ -15516,6 +15716,9 @@ pub const ElfState = struct {
         self.gpu_indirect_draw_packets +|= window.draw_packets;
         self.gpu_indirect_swap_packets +|= window.swap_packets;
         self.gpu_front_buffer.note(&window);
+        if (self.guest_kernel_calls.hitsFor("VdSwap") != 0) {
+            _ = self.offerGuestFrontBufferToNativePresenter();
+        }
         const slot = @min(self.gpu_indirect_buffer_count, GPU_INDIRECT_BUFFER_CAPACITY - 1);
         self.gpu_indirect_buffers[slot] = window;
         if (self.gpu_indirect_buffer_count < GPU_INDIRECT_BUFFER_CAPACITY) self.gpu_indirect_buffer_count += 1;
@@ -16444,6 +16647,13 @@ pub const ElfState = struct {
         if (via_jump) self.guest_kernel_calls.tail_jump_entries +|= 1;
         if (self.guest_kernel_calls.slotAt(slot_index)) |slot| {
             if (slot.kind == .trampoline and isGuestFileRequestExport(slot.export_name)) self.captureGuestFileRequest(slot_index);
+            if (slot.kind == .trampoline and std.mem.eql(u8, slot.export_name, "VdSwap")) {
+                // VdSwap is the guest-owned presentation boundary. The ring
+                // decoder may not have consumed the matching XE_SWAP yet, so
+                // this first attempt is deliberately paired with retries from
+                // the ring and checkpoint paths below.
+                _ = self.offerGuestFrontBufferToNativePresenter();
+            }
         }
         if (self.windows_active_guest_thread_slot) |slot| {
             const thread = &self.windows_guest_threads[slot];
@@ -16492,6 +16702,15 @@ pub const ElfState = struct {
         self.windows_input_last_packet = value.packet_number;
         self.windows_input_last_buttons = value.buttons;
         self.windows_input_last_focused = value.focused != 0;
+        self.windows_input_key_down_events = value.key_down_events;
+        self.windows_input_key_up_events = value.key_up_events;
+        self.windows_input_snapshot_reads = value.snapshot_reads;
+        const nonzero = value.buttons != 0 or value.left_trigger != 0 or value.right_trigger != 0 or
+            value.thumb_lx != 0 or value.thumb_ly != 0 or value.thumb_rx != 0 or value.thumb_ry != 0;
+        if (nonzero)
+            self.windows_input_nonzero_samples +|= 1
+        else if (value.focused != 0)
+            self.windows_input_focused_zero_samples +|= 1;
         self.windows_input_focus_gains = value.focus_gain_events;
         self.windows_input_focus_losses = value.focus_loss_events;
         self.windows_input_rejected_events = value.rejected_key_events;
@@ -17044,6 +17263,13 @@ pub const ElfState = struct {
     }
 
     fn reportPresentChainCheckpoint(self: *ElfState) void {
+        // VdSwap and ring decoding are separate guest edges. If the swap was
+        // observed but its front-buffer packet became readable later, give the
+        // host presenter one bounded retry before declaring the output mailbox
+        // empty again.
+        if (self.guest_kernel_calls.hitsFor("VdSwap") != 0) {
+            _ = self.offerGuestFrontBufferToNativePresenter();
+        }
         const progress_callback = self.windows_graphics.hooks.update_present_diagnostics;
         if (progress_callback) |callback| {
             // The forwarder's `guest_progress` line is the first thing a
@@ -17181,7 +17407,7 @@ pub const ElfState = struct {
 
     pub fn reportWindowsInputBridge(self: *const ElfState) void {
         const installed = self.windows_input_hooks.read_controller_state != null;
-        log.info("PE64 INPUT BRIDGE: installed={} contract_version={d} polls={d} bridged={d} invalid_or_disconnected={d} xinput_successes={d} xam_shims={d} xam_refusals={d} last_packet={d} last_buttons=0x{x} last_focused={} focus_gains={d} focus_losses={d} rejected_key_events={d} last_key_code={d} mapping=WASD:left-stick IJKL:right-stick arrows:dpad space:A C:B X:X Y:Y return:Start delete:Back Q:LB R:RB F:left-thumb V:right-thumb Z/LT E/RT escape:Guide; connected is a virtual keyboard pad, and an unfocused window reports zero state; a nonzero packet with zero buttons is actionable only when focus transitions or key events explain it", .{
+        log.info("PE64 INPUT BRIDGE: installed={} contract_version={d} polls={d} bridged={d} invalid_or_disconnected={d} xinput_successes={d} xam_shims={d} xam_refusals={d} last_packet={d} last_buttons=0x{x} last_focused={} key_events(down/up)={d}/{d} snapshots={d} nonzero_samples={d} focused_zero_samples={d} focus_gains={d} focus_losses={d} rejected_key_events={d} last_key_code={d} mapping=WASD:left-stick IJKL:right-stick arrows:dpad space:A C:B X:X Y:Y return:Start delete:Back Q:LB R:RB F:left-thumb V:right-thumb Z/LT E/RT escape:Guide; connected is a virtual keyboard pad and an unfocused window reports zero state; compare key transitions, focus, and nonzero samples to distinguish AppKit delivery from guest polling", .{
             installed,
             self.windows_input_contract_version,
             self.windows_input_polls,
@@ -17193,6 +17419,11 @@ pub const ElfState = struct {
             self.windows_input_last_packet,
             self.windows_input_last_buttons,
             self.windows_input_last_focused,
+            self.windows_input_key_down_events,
+            self.windows_input_key_up_events,
+            self.windows_input_snapshot_reads,
+            self.windows_input_nonzero_samples,
+            self.windows_input_focused_zero_samples,
             self.windows_input_focus_gains,
             self.windows_input_focus_losses,
             self.windows_input_rejected_events,
@@ -18497,6 +18728,11 @@ pub const ElfState = struct {
             .capacity_conflict => {
                 self.decode_cache_conflict_fills +|= 1;
                 self.decode_cache_collisions +|= 1;
+                if (mapped_code != null) {
+                    self.decode_cache_generated_conflict_fills +|= 1;
+                } else {
+                    self.decode_cache_image_conflict_fills +|= 1;
+                }
             },
             .stale_bytes => self.decode_cache_stale_refills +|= 1,
         }
@@ -18570,7 +18806,10 @@ pub const ElfState = struct {
             };
             const action = switch (cause) {
                 .vacant_fill => "no action unless the same address repeats unexpectedly",
-                .capacity_conflict => "inspect generated-code working-set pressure and cache-set residency",
+                .capacity_conflict => if (mapped_code != null)
+                    "inspect generated-code working-set pressure and cache-set residency"
+                else
+                    "inspect image-code working-set pressure and cache-set residency",
                 .stale_bytes => "inspect executable-write invalidation and self-modifying-code ownership",
             };
             log.warn("PE64 DECODE CACHE FINDING: cause={s} classification={s} source={s} kind={s} source_index={d} generation={d} step={d} rip=0x{x} fetch=0x{x} set={d} ways={d} residents={s} policy={s} action={s}", .{
@@ -18598,12 +18837,20 @@ pub const ElfState = struct {
 
     fn reportDecodeCacheMissSites(self: *const ElfState) void {
         if (self.decode_cache_misses == 0) return;
-        log.info("PE64 DECODE CACHE FINDINGS: distinct_sites={d} overflow={d} totals(vacant/conflict/stale)={d}/{d}/{d}; conflicts and stale-byte refills are fatal when the PE fatal-point policy is armed", .{
+        const lookups = self.decode_cache_hits +| self.decode_cache_rearms +| self.decode_cache_misses;
+        const miss_rate_ppm = if (lookups == 0) 0 else @divTrunc(self.decode_cache_misses *| 1_000_000, lookups);
+        const conflict_rate_ppm = if (lookups == 0) 0 else @divTrunc(self.decode_cache_conflict_fills *| 1_000_000, lookups);
+        log.info("PE64 DECODE CACHE FINDINGS: distinct_sites={d} overflow={d} lookups={d} miss_rate_ppm={d} conflict_rate_ppm={d} totals(vacant/conflict/stale)={d}/{d}/{d} conflict_sources(generated/image)={d}/{d}; conflicts and stale-byte refills are fatal when the PE fatal-point policy is armed", .{
             self.decode_cache_miss_site_count,
             self.decode_cache_miss_site_overflow,
+            lookups,
+            miss_rate_ppm,
+            conflict_rate_ppm,
             self.decode_cache_vacant_fills,
             self.decode_cache_conflict_fills,
             self.decode_cache_stale_refills,
+            self.decode_cache_generated_conflict_fills,
+            self.decode_cache_image_conflict_fills,
         });
         for (self.decode_cache_miss_sites[0..self.decode_cache_miss_site_count]) |site| {
             const classification = switch (site.cause) {
@@ -18613,7 +18860,10 @@ pub const ElfState = struct {
             };
             const action = switch (site.cause) {
                 .vacant_fill => "no action unless the address repeats unexpectedly",
-                .capacity_conflict => "inspect generated-code set pressure; raising the cache is not a mapping fix",
+                .capacity_conflict => if (site.mapped_source)
+                    "inspect generated-code set pressure; raising the cache is not a mapping fix"
+                else
+                    "inspect image-code set pressure; raising the cache is not a mapping fix",
                 .stale_bytes => "inspect executable write invalidation and code-generation ownership",
             };
             var residents: [PE_DECODE_CACHE_WAYS * 24 + 1]u8 = undefined;
@@ -19041,7 +19291,7 @@ pub const ElfState = struct {
     /// (a condition-variable shim, an import stub, a synthetic return).
     fn blockJitTargetHooked(self: *const ElfState, target: u64) bool {
         if (target >= SYNTHETIC_RIP_FLOOR) return true;
-        if (self.windows_stub_box.contains(target) or self.windows_compat_hook_box.contains(target)) return true;
+        if (self.windows_stub_box.contains(target) or self.windows_compat_hook_points.contains(target)) return true;
         if (self.windows_pthread_cond_timedwait_entry) |entry| {
             if (target == entry) return true;
         }
@@ -19379,8 +19629,18 @@ pub const ElfState = struct {
         const interpreted = self.totalInterpretedSteps();
         const translated_percent = if (interpreted == 0) 0 else @divTrunc(jit.instructions_retired *| 100, interpreted);
         const mean_block = if (jit.executions == 0) 0 else @divTrunc(jit.instructions_retired, jit.executions);
-        log.info("PE64 BLOCK JIT: active=true hot_threshold={d} blocks(live/compiled/refused/failed/dropped/evicted/resets)={d}/{d}/{d}/{d}/{d}/{d}/{d} compiled_instructions(native/fallback)={d}/{d} executions={d} retired={d} ({d}% of the run) mean_block_len={d} fallback_calls={d} aborts={d} continuation_write_aborts={d} revalidations={d} verified={d} mismatches={d} code_bytes(used/capacity)={d}/{d}; retired counts the block-JIT lane including interpreter fallback helpers, not exclusively native instructions; integer/register verification does not cover all vector or memory effects; mismatches must read zero", .{
+        const table_load_percent = @divTrunc(jit.liveBlocks() *| 100, BLOCK_JIT_TABLE_ENTRIES);
+        const eviction_per_compile = if (jit.compiled == 0) 0 else @divTrunc(jit.slot_evictions *| 100, jit.compiled);
+        const reset_per_compile = if (jit.compiled == 0) 0 else @divTrunc(jit.resets *| 100, jit.compiled);
+        log.info("PE64 BLOCK JIT: active=true table(entries/live/load_percent)={d}/{d}/{d} hot_threshold={d} churn(evictions/compiles_percent/resets/compiles_percent)={d}/{d}/{d}/{d} blocks(live/compiled/refused/failed/dropped/evicted/resets)={d}/{d}/{d}/{d}/{d}/{d}/{d} compiled_instructions(native/fallback)={d}/{d} executions={d} retired={d} ({d}% of the run) mean_block_len={d} fallback_calls={d} aborts={d} continuation_write_aborts={d} revalidations={d} verified={d} mismatches={d} code_bytes(used/capacity)={d}/{d}; high eviction or reset ratios indicate translation-cache churn, while high fallback_calls indicate blocks are not buying native work; retired counts the block-JIT lane including interpreter fallback helpers, not exclusively native instructions; integer/register verification does not cover all vector or memory effects; mismatches must read zero", .{
+            BLOCK_JIT_TABLE_ENTRIES,
+            jit.liveBlocks(),
+            table_load_percent,
             jit.hot_threshold,
+            jit.slot_evictions,
+            eviction_per_compile,
+            jit.resets,
+            reset_per_compile,
             jit.liveBlocks(),
             jit.compiled,
             jit.compile_refusals,
@@ -19412,24 +19672,25 @@ pub const ElfState = struct {
         // even while the owner is parked in a wait service loop.
         self.step_retired = 1;
         self.advanceWindowsGuestClock();
-        // Three handlers used to run on every instruction to answer "is this
-        // RIP one of ours" by comparison chains and table walks. Each set of
-        // addresses they can act on is now a box, and the handler runs only
-        // when its box admits the RIP. A box is a superset, so a false
-        // positive costs the old path and a miss is impossible as long as
-        // every address enters its box where it is recorded.
+        // The hook checks happen before decoding so an intercepted entry
+        // never becomes a translated block. Executable ranges use a box;
+        // sparse compatibility entry points use exact membership so the
+        // space between far-apart hooks is not treated as executable work.
         const step_rip = self.regs.rip;
         if (step_rip >= SYNTHETIC_RIP_FLOOR) {
             if (self.handleSyntheticRip()) return !self.terminated;
             self.step_hook_box_false_positives +|= 1;
+            self.step_synthetic_hook_false_positives +|= 1;
         }
         if (self.windows_stub_box.contains(step_rip)) {
             if (self.handleWindowsImportStub()) return !self.terminated;
             self.step_hook_box_false_positives +|= 1;
+            self.step_windows_stub_false_positives +|= 1;
         }
-        if (self.windows_compat_hook_box.contains(step_rip)) {
+        if (self.windows_compat_hook_points.contains(step_rip)) {
             if (x64_linux_runtime.tryWindowsGuestCompatibility(self)) return !self.terminated;
             self.step_hook_box_false_positives +|= 1;
+            self.step_windows_compat_hook_false_positives +|= 1;
         }
         // The second tier: a translated block for this RIP, or a count
         // towards one. Past the hooks above on purpose, so an address they
@@ -20281,7 +20542,9 @@ pub const ElfState = struct {
         // generation moved) and how often the RIP boxes admitted an address
         // no handler then claimed.
         const decode_total = self.decode_cache_hits +| self.decode_cache_rearms +| self.decode_cache_misses;
-        log.info("PE64 STEP OVERHEAD: decode_cache(entries/sets/ways hits/rearms/misses/collisions)={d}/{d}/{d} {d}/{d}/{d}/{d} miss_causes(vacant/conflict/stale)={d}/{d}/{d} replacements={d} victim(entries/sets/ways hits/fills/stale)={d}/{d}/{d}/{d}/{d}/{d} hit_percent={d} hook_box_false_positives={d} generated_code_fetches={d}; victim hits recover short eviction bursts, while primary full-set conflicts and stale-byte refills remain visible and fatal under the default PE policy", .{
+        const decode_miss_rate_ppm = if (decode_total == 0) 0 else @divTrunc(self.decode_cache_misses *| 1_000_000, decode_total);
+        const decode_conflict_rate_ppm = if (decode_total == 0) 0 else @divTrunc(self.decode_cache_conflict_fills *| 1_000_000, decode_total);
+        log.info("PE64 STEP OVERHEAD: decode_cache(entries/sets/ways hits/rearms/misses/collisions)={d}/{d}/{d} {d}/{d}/{d}/{d} miss_causes(vacant/conflict/stale)={d}/{d}/{d} conflict_sources(generated/image)={d}/{d} rates(lookups/miss_ppm/conflict_ppm)={d}/{d}/{d} replacements={d} victim(entries/sets/ways hits/fills/stale)={d}/{d}/{d}/{d}/{d}/{d} hit_percent={d} hook_false_positives(total/synthetic/stub/compat)={d}/{d}/{d}/{d} generated_code_fetches={d}; victim hits recover short eviction bursts, while primary full-set conflicts and stale-byte refills remain visible and fatal under the default PE policy", .{
             PE_DECODE_CACHE_ENTRIES,
             PE_DECODE_CACHE_SETS,
             PE_DECODE_CACHE_WAYS,
@@ -20292,6 +20555,11 @@ pub const ElfState = struct {
             self.decode_cache_vacant_fills,
             self.decode_cache_conflict_fills,
             self.decode_cache_stale_refills,
+            self.decode_cache_generated_conflict_fills,
+            self.decode_cache_image_conflict_fills,
+            decode_total,
+            decode_miss_rate_ppm,
+            decode_conflict_rate_ppm,
             self.decode_cache_replacements,
             PE_DECODE_CACHE_VICTIM_ENTRIES,
             PE_DECODE_CACHE_VICTIM_SETS,
@@ -20301,6 +20569,9 @@ pub const ElfState = struct {
             self.decode_cache_victim_stale_rejections,
             windowsTimedWaitPercent(self.decode_cache_hits +| self.decode_cache_rearms, decode_total),
             self.step_hook_box_false_positives,
+            self.step_synthetic_hook_false_positives,
+            self.step_windows_stub_false_positives,
+            self.step_windows_compat_hook_false_positives,
             self.windows_generated_code_fetches,
         });
         if (include_jit) self.reportBlockJit();
@@ -20677,17 +20948,25 @@ pub const ElfState = struct {
             self.xenia_sha1_kernel_feed_bytes *| 11,
         });
         log.info("PE64 generated code: instruction_fetches={d}", .{self.windows_generated_code_fetches});
-        log.info("PE64 DECODE CACHE: entries={d} sets={d} ways={d} hits={d} generation_rearms={d} fresh_decodes={d} address_collisions={d} miss_causes(vacant/conflict/stale)={d}/{d}/{d} replacements={d} victim(entries/sets/ways hits/fills/stale)={d}/{d}/{d}/{d}/{d}/{d} hit_percent={d}; full source address/kind/index/generation checked; victim recovery is bounded and does not suppress a primary capacity finding; mapped_ranges={d} range_mutations={d} lookup=set_scan", .{
+        const decode_lookups = self.decode_cache_hits +| self.decode_cache_rearms +| self.decode_cache_misses;
+        const decode_miss_rate_ppm = if (decode_lookups == 0) 0 else @divTrunc(self.decode_cache_misses *| 1_000_000, decode_lookups);
+        const decode_conflict_rate_ppm = if (decode_lookups == 0) 0 else @divTrunc(self.decode_cache_conflict_fills *| 1_000_000, decode_lookups);
+        log.info("PE64 DECODE CACHE: entries={d} sets={d} ways={d} lookups={d} hits={d} generation_rearms={d} fresh_decodes={d} address_collisions={d} rates(miss_ppm/conflict_ppm)={d}/{d} miss_causes(vacant/conflict/stale)={d}/{d}/{d} conflict_sources(generated/image)={d}/{d} replacements={d} victim(entries/sets/ways hits/fills/stale)={d}/{d}/{d}/{d}/{d}/{d} hit_percent={d}; full source address/kind/index/generation checked; victim recovery is bounded and does not suppress a primary capacity finding; mapped_ranges={d} range_mutations={d} lookup=set_scan", .{
             PE_DECODE_CACHE_ENTRIES,
             PE_DECODE_CACHE_SETS,
             PE_DECODE_CACHE_WAYS,
+            decode_lookups,
             self.decode_cache_hits,
             self.decode_cache_rearms,
             self.decode_cache_misses,
             self.decode_cache_collisions,
+            decode_miss_rate_ppm,
+            decode_conflict_rate_ppm,
             self.decode_cache_vacant_fills,
             self.decode_cache_conflict_fills,
             self.decode_cache_stale_refills,
+            self.decode_cache_generated_conflict_fills,
+            self.decode_cache_image_conflict_fills,
             self.decode_cache_replacements,
             PE_DECODE_CACHE_VICTIM_ENTRIES,
             PE_DECODE_CACHE_VICTIM_SETS,
@@ -32677,6 +32956,45 @@ test "the ring decoder captures the swap fetch constant and the XE_SWAP payload"
     // The two-dword DC_LUT_30_COLOR write counts once as a ramp write.
     try testing.expectEqual(@as(u32, 1), window.dc_lut_type0_writes);
     try testing.expectEqual(@as(u32, 2), window.type0);
+}
+
+test "the ring decoder does not let a later texture fetch masquerade as the front buffer" {
+    const ArraySource = struct {
+        dwords: []const u32,
+
+        pub fn readDword(self: @This(), index: u64) ?u32 {
+            return if (index < self.dwords.len) self.dwords[@intCast(index)] else null;
+        }
+
+        pub fn aliasCheck(self: @This(), index: u64, value: u32) struct { checked: u16, mismatched: u16 } {
+            _ = self;
+            _ = index;
+            _ = value;
+            return .{ .checked = 0, .mismatched = 0 };
+        }
+    };
+
+    const front = [6]u32{ (1 << 31) | (36 << 22), 54 | (1 << 6), 1151 | (639 << 13), 0, 0, 0 };
+    const later_texture = [6]u32{ (1 << 31) | (8 << 22), 53 | (1 << 6), 255 | (255 << 13), 0, 0, 0 };
+    var ring: [27]u32 = undefined;
+    @memset(&ring, 0);
+    ring[0] = (5 << 16) | 0x4800;
+    @memcpy(ring[1..7], &front);
+    ring[7] = 0xC000_0000 | (3 << 16) | (0x64 << 8);
+    ring[8] = 0x5357_4150;
+    ring[9] = 0x4E20_0000;
+    ring[10] = 1152;
+    ring[11] = 640;
+    ring[12] = (5 << 16) | 0x4800;
+    @memcpy(ring[13..19], &later_texture);
+
+    var window = GpuRingWindow{};
+    ElfState.decodeGpuRingWindow(ArraySource{ .dwords = &ring }, &window, 0, ring.len, ring.len);
+    try testing.expectEqual(@as(u32, 1), window.swap_packets);
+    try testing.expect(window.swap_fetch_seen);
+    try testing.expectEqual(@as(u32, 54), window.swap_fetch[1] & 0x3F);
+    try testing.expectEqual(@as(u32, 1152), window.swap_width);
+    try testing.expectEqual(@as(u32, 640), window.swap_height);
 }
 
 // ─── Block translation: interpreter-versus-translation differential ───
