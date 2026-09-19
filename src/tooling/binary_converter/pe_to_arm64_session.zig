@@ -36,7 +36,7 @@ pub const Session = struct {
 };
 
 test "session enforces PE machine gate" {
-    var bytes = [_]u8{0} ** 0x200;
+    var bytes = [_]u8{0} ** 0x600;
     std.mem.writeInt(u16, bytes[0x00..0x02], fmt.dos.signature, .little);
     std.mem.writeInt(u32, bytes[0x3C..0x40], 0x80, .little);
     std.mem.writeInt(u32, bytes[0x80..0x84], fmt.coff.signature, .little);
@@ -44,6 +44,10 @@ test "session enforces PE machine gate" {
     std.mem.writeInt(u16, bytes[0x86..0x88], 0, .little);
     std.mem.writeInt(u16, bytes[0x94..0x96], 0xE0, .little);
     std.mem.writeInt(u16, bytes[0x98..0x9A], fmt.coff.optional_magic_pe32, .little);
+    std.mem.writeInt(u32, bytes[0xB8..0xBC], 0x1000, .little);
+    std.mem.writeInt(u32, bytes[0xBC..0xC0], 0x200, .little);
+    std.mem.writeInt(u32, bytes[0xD0..0xD4], 0x1000, .little);
+    std.mem.writeInt(u32, bytes[0xD4..0xD8], 0x400, .little);
 
     const session = Session.init(std.testing.allocator, "pe-session.log");
     const image = try session.begin(&bytes);
