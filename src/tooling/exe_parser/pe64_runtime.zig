@@ -391,6 +391,7 @@ pub const RunOptions = struct {
     max_steps: u64 = 0,
     load_base: ?u64 = null,
     graphics_hooks: elf.WindowsGraphicsHooks = .{},
+    input_hooks: elf.WindowsInputHooks = .{},
     /// Optional host audio device. Absent leaves the guest's wave device on
     /// the clocked null sink, which is a working audio path that nobody can
     /// hear rather than a broken one.
@@ -1315,8 +1316,9 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
     state.windows_launch_arguments = options.windows_arguments;
     state.windows_host_media_path = options.windows_media_path;
     state.windows_graphics.hooks = options.graphics_hooks;
+    state.windows_input_hooks = options.input_hooks;
     state.windows_audio_hooks = options.audio_hooks;
-    state.windows_utf8_find_any_of_entry = locateUtf8FindAnyOfEntry(image, bytes, load_base);
+    state.configureWindowsUtf8FindAnyOfEntry(locateUtf8FindAnyOfEntry(image, bytes, load_base));
     if (state.windows_utf8_find_any_of_entry) |entry| {
         log.info("PE64 guest compatibility: recognized UTF-8 find_any_of entry=0x{x}; empty character sets will return npos", .{entry});
     }

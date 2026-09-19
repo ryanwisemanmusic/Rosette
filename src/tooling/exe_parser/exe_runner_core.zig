@@ -28,6 +28,7 @@ extern fn rosette_macho_native_application_ensure() c_int;
 extern fn rosette_macho_native_window_ensure(width: u32, height: u32, title: [*:0]const u8) c_int;
 extern fn rosette_macho_native_window_show() c_int;
 extern fn rosette_macho_native_window_pump_events() u32;
+extern fn rosette_macho_native_window_read_controller_state(out: *elf_processor_state.WindowsInputState) c_int;
 extern fn rosette_macho_native_window_set_drawable_owner(owned_by_swapchain: c_int) c_int;
 extern fn rosette_macho_native_window_prepare_drawable_size(width: u32, height: u32) c_int;
 
@@ -49,6 +50,11 @@ fn nativeShowWindow(_: ?*anyopaque) callconv(.c) c_int {
 fn nativePumpEvents(_: ?*anyopaque) callconv(.c) u32 {
     if (comptime builtin.target.os.tag != .macos) return 0;
     return rosette_macho_native_window_pump_events();
+}
+
+fn nativeReadControllerState(_: ?*anyopaque, out: *elf_processor_state.WindowsInputState) callconv(.c) c_int {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    return rosette_macho_native_window_read_controller_state(out);
 }
 
 fn nativeGraphics(context: ?*anyopaque) ?*native_windows_graphics.NativeWindowsGraphics {
@@ -222,6 +228,11 @@ fn windowsGraphicsHooks(native_context: ?*anyopaque) pe64_runtime.GraphicsHooks 
         .report_present_chain_full = nativeReportPresentChainFull,
         .update_present_diagnostics = nativeUpdatePresentDiagnostics,
     };
+}
+
+fn windowsInputHooks() elf_processor_state.WindowsInputHooks {
+    if (comptime builtin.target.os.tag != .macos) return .{};
+    return .{ .read_controller_state = nativeReadControllerState };
 }
 
 fn machineName(machine: u16) []const u8 {
@@ -885,6 +896,7 @@ pub fn runWithArguments(
             .windows_arguments = windows_args,
             .windows_media_path = absolute_media_path,
             .graphics_hooks = windowsGraphicsHooks(&native_graphics),
+            .input_hooks = windowsInputHooks(),
             .audio_hooks = windowsAudioHooks(&native_audio),
         }) catch |err| {
             var error_buf: [256]u8 = undefined;
