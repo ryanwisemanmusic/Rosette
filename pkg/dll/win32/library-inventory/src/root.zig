@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const catalogue = @import("dll_win32_catalogue");
+const capability_gap = @import("dll_win32_capability_gap");
 
 /// The capability a Windows library provides, as far as a guest is concerned.
 ///
@@ -57,6 +58,11 @@ pub const Subsystem = enum {
     networking,
     /// Audio, timers and the multimedia surface.
     multimedia,
+    /// Game controllers: XInput and the libraries a controller stack loads
+    /// dynamically. Separate from `device_enumeration` because losing this is
+    /// "no controller" while losing that is "no device list", and a title
+    /// notices the two at completely different points.
+    game_input,
     /// Input method editors and text services.
     text_input,
     /// Shell paths, file dialogs and drag-and-drop.
@@ -81,6 +87,7 @@ pub const Subsystem = enum {
             .graphics_stack => "Direct3D/DXGI",
             .networking => "sockets",
             .multimedia => "audio and timers",
+            .game_input => "game controllers",
             .text_input => "text input",
             .shell => "shell and file dialogs",
             .device_enumeration => "device enumeration",
@@ -106,6 +113,7 @@ pub const Subsystem = enum {
             .graphics_stack,
             .networking,
             .multimedia,
+            .game_input,
             .text_input,
             .shell,
             .device_enumeration,
@@ -154,6 +162,10 @@ const libraries = [_]LibraryEntry{
     .{ .stem = "d3dcompiler_47", .subsystem = .graphics_stack },
     .{ .stem = "dwmapi", .subsystem = .graphics_stack },
     .{ .stem = "opengl32", .subsystem = .graphics_stack },
+    // Rosetta virtualizes the Vulkan loader itself: a guest that loads this
+    // library reaches Rosetta's typed forwarder, not a host DLL. Refusing it
+    // would end the graphics path at its first call.
+    .{ .stem = "vulkan-1", .subsystem = .graphics_stack },
 
     .{ .stem = "ws2_32", .subsystem = .networking },
     .{ .stem = "wsock32", .subsystem = .networking },
@@ -163,6 +175,15 @@ const libraries = [_]LibraryEntry{
     .{ .stem = "winmm", .subsystem = .multimedia },
     .{ .stem = "avrt", .subsystem = .multimedia },
     .{ .stem = "mmdevapi", .subsystem = .multimedia },
+
+    // Every XInput spelling a controller stack tries in turn. Rosetta serves
+    // the XInput entry points, including the ordinal-100 `XInputGetStateEx`
+    // that Xenia uses for the guide button.
+    .{ .stem = "xinput1_4", .subsystem = .game_input },
+    .{ .stem = "xinput1_3", .subsystem = .game_input },
+    .{ .stem = "xinput1_2", .subsystem = .game_input },
+    .{ .stem = "xinput1_1", .subsystem = .game_input },
+    .{ .stem = "xinput9_1_0", .subsystem = .game_input },
 
     .{ .stem = "imm32", .subsystem = .text_input },
     .{ .stem = "msctf", .subsystem = .text_input },
@@ -176,6 +197,7 @@ const libraries = [_]LibraryEntry{
     .{ .stem = "cfgmgr32", .subsystem = .device_enumeration },
     .{ .stem = "hid", .subsystem = .device_enumeration },
     .{ .stem = "winusb", .subsystem = .device_enumeration },
+    .{ .stem = "libusbk", .subsystem = .device_enumeration },
 
     .{ .stem = "dbghelp", .subsystem = .diagnostics },
     .{ .stem = "version", .subsystem = .diagnostics },
@@ -234,14 +256,135 @@ pub fn isWindowsSurface(dll_name: []const u8) bool {
     return subsystemFor(dll_name) != .unrecognized;
 }
 
+/// Whether a dynamic load of this library can be honoured, and if not, why.
+///
+/// A `LoadLibrary` that succeeds is a promise the caller will immediately
+/// collect on. Two different situations produce a broken promise and they
+/// send a reader to opposite places, so a run has to name which one it hit:
+///
+/// * `no_backend` - the library is part of the Windows surface Rosetta
+///   models, and Rosetta still has nothing to put behind it. Direct3D is the
+///   whole of this set: the names have return contracts, but there is no
+///   device, and a guest that loads D3D12 proceeds straight to creating one.
+///   This is a *decision*, not a gap, and every caller of these has a
+///   documented fallback because they are all runtime-probed.
+/// * `outside_modelled_surface` - Rosetta does not model the library at all.
+///   This is where a genuine gap shows up, so a run that reports one is
+///   telling you a package may be missing.
+pub const ModuleAvailability = enum {
+    served,
+    no_backend,
+    outside_modelled_surface,
+
+    pub fn label(self: ModuleAvailability) []const u8 {
+        return switch (self) {
+            .served => "served",
+            .no_backend => "no-backend-behind-a-modelled-name",
+            .outside_modelled_surface => "outside-the-modelled-Win32-surface",
+        };
+    }
+
+    /// Whether a run should read this refusal as something to fix.
+    ///
+    /// A deliberate refusal is evidence the policy worked. Treating the two
+    /// the same is how a log full of correct decisions hides the one library
+    /// nobody has written yet.
+    pub fn isGap(self: ModuleAvailability) bool {
+        return self == .outside_modelled_surface;
+    }
+};
+
+/// Libraries Rosetta deliberately will not load.
+///
+/// Two kinds live here. Direct3D is named and contracted but has no device
+/// behind it. A graphics debugger's injected DLL is different: it is only
+/// ever present when a human attached the debugger, and reporting it absent
+/// is the *correct* answer on every machine where nobody did. Neither is a
+/// gap, and a run that reports them as gaps buries the library that is one.
+const no_backend_libraries = [_][]const u8{
+    "d3d11",
+    "d3d12",
+    "dxgi",
+    "d3dcompiler_47",
+    "opengl32",
+    // Injected by RenderDoc when a capture session is attached. Xenia probes
+    // for it with `GetModuleHandleW` and proceeds without it, which is what
+    // happens on any machine that is not running a capture.
+    "renderdoc",
+    // Xenia probes this third-party USB backend opportunistically. Rosetta
+    // has no Windows USB kernel driver to put behind it, so the honest result
+    // is a deliberate no-backend policy rather than an inventory gap.
+    "libusbk",
+    // SDL tries DirectSound before WinMM and takes WinMM when DirectSound is
+    // absent. WinMM is the audio path Rosetta models end to end into
+    // CoreAudio, and the launcher selects SDL for exactly that reason; a
+    // DirectSound name with no device behind it would move SDL onto an API
+    // that cannot make a sound. Absence is the decision here, not a hole.
+    "dsound",
+};
+
+pub fn moduleAvailability(dll_name: []const u8) ModuleAvailability {
+    if (dll_name.len == 0) return .outside_modelled_surface;
+    for (no_backend_libraries) |stem| {
+        if (matchesStem(dll_name, stem)) return .no_backend;
+    }
+    if (!isWindowsSurface(dll_name)) return .outside_modelled_surface;
+    return .served;
+}
+
+/// The path a deliberate dynamic-module refusal leaves the caller on.
+///
+/// This is intentionally a short, stable token rather than a prose diagnosis:
+/// the runtime includes it in the source-of-truth log, and tooling can group
+/// several spellings of the same optional probe without parsing a sentence.
+/// An unavailable library outside Rosetta's model has no safe fallback; that
+/// distinction must remain visible instead of being hidden behind a fake
+/// handle.
+pub fn moduleFallback(dll_name: []const u8) []const u8 {
+    if (matchesStem(dll_name, "d3d11") or
+        matchesStem(dll_name, "d3d12") or
+        matchesStem(dll_name, "dxgi") or
+        matchesStem(dll_name, "d3dcompiler_47") or
+        matchesStem(dll_name, "opengl32"))
+    {
+        return "vulkan-graphics-path";
+    }
+    if (matchesStem(dll_name, "dsound")) return "winmm-coreaudio-path";
+    if (matchesStem(dll_name, "renderdoc")) return "no-capture-session";
+    if (matchesStem(dll_name, "libusbk")) return "no-windows-usb-backend";
+    return switch (moduleAvailability(dll_name)) {
+        .served => "served",
+        .no_backend => "no-backend-fallback-unclassified",
+        .outside_modelled_surface => "none-outside-modelled-surface",
+    };
+}
+
 /// Classify only the names owned by the per-DLL packages. An empty DLL name
 /// is the GetProcAddress case: the catalogue deliberately permits its
 /// name-only dynamic bucket. A non-empty unknown DLL still fails the surface
 /// gate before it can borrow a familiar Win32 answer.
-pub fn isDegradedImport(dll_name: []const u8, function_name: []const u8) bool {
+pub fn isContractImport(dll_name: []const u8, function_name: []const u8) bool {
     if (dll_name.len != 0 and !isWindowsSurface(dll_name)) return false;
-    return catalogue.isDegradedImport(dll_name, function_name);
+    return catalogue.isContractImport(dll_name, function_name);
 }
+
+/// Compatibility spelling retained for package tests and older integrations.
+pub const isDegradedImport = isContractImport;
+
+/// An export Rosette declines on purpose. Distinct from a degraded import:
+/// that is a name Rosette serves with a refusal value, this is a name Rosette
+/// refuses to resolve at all, deliberately.
+pub const isDeliberateExportRefusal = catalogue.isDeliberateExportRefusal;
+
+/// What a declined library would have to gain before Rosette could serve it.
+/// Re-exported here so a caller that already knows the inventory of names can
+/// reach the inventory of missing conditions without a second dependency.
+pub const capabilityGapFor = capability_gap.inventoryFor;
+
+/// The declared ABI for one export, from the package that owns it.
+pub const declaredExport = catalogue.declaredExport;
+pub const CapabilityGap = capability_gap.Inventory;
+pub const CapabilityCondition = capability_gap.Condition;
 
 pub const degraded_package_count = catalogue.package_count;
 
@@ -257,6 +400,70 @@ test "a library is recognized with or without its suffix, and case does not matt
     try std.testing.expectEqual(Subsystem.legacy_drawing, subsystemFor("GDI32.dll"));
     try std.testing.expectEqual(Subsystem.windowing, subsystemFor("USER32.dll"));
     try std.testing.expectEqual(Subsystem.component_object, subsystemFor("ole32.dll"));
+}
+
+test "the libraries a guest loads dynamically to reach graphics and input are on the surface" {
+    // `LoadLibrary` is an allow-list: a module outside this inventory is
+    // reported absent, and every caller then takes its own missing-library
+    // path. Two of those paths end a run rather than degrading it, so they
+    // are pinned here rather than left to a reader to rediscover from a log.
+    //
+    // Vulkan: Xenia reaches its entire graphics stack through
+    // `LoadLibraryW(L"vulkan-1.dll")` and gives up immediately if it fails.
+    try std.testing.expect(isWindowsSurface("vulkan-1.dll"));
+    try std.testing.expectEqual(Subsystem.graphics_stack, subsystemFor("vulkan-1.dll"));
+    // XInput: the controller stack tries each spelling in turn, and the
+    // driver returns X_STATUS_DLL_NOT_FOUND when the first one is absent.
+    try std.testing.expect(isWindowsSurface("xinput1_4.dll"));
+    try std.testing.expect(isWindowsSurface("XInput1_3.dll"));
+    try std.testing.expect(isWindowsSurface("XInput9_1_0.dll"));
+    try std.testing.expectEqual(Subsystem.game_input, subsystemFor("xinput1_4"));
+}
+
+test "a deliberate refusal and a missing package are different findings" {
+    // Direct3D is named, contracted, and still unloadable: there is no device
+    // behind it. That is the policy working, not a gap.
+    try std.testing.expectEqual(ModuleAvailability.no_backend, moduleAvailability("D3D12.dll"));
+    try std.testing.expectEqual(ModuleAvailability.no_backend, moduleAvailability("dxgi.dll"));
+    try std.testing.expect(!moduleAvailability("D3D12.dll").isGap());
+    // A debugger's injected DLL is absent on every machine without the
+    // debugger attached, so reporting it absent is the right answer, not a
+    // missing package.
+    try std.testing.expectEqual(ModuleAvailability.no_backend, moduleAvailability("renderdoc.dll"));
+    try std.testing.expect(!moduleAvailability("renderdoc.dll").isGap());
+
+    // A library nobody has written a package for is a gap, and a run that
+    // reports one is telling you what to add.
+    try std.testing.expectEqual(
+        ModuleAvailability.outside_modelled_surface,
+        moduleAvailability("XAudio2_8.dll"),
+    );
+    try std.testing.expect(moduleAvailability("XAudio2_8.dll").isGap());
+
+    try std.testing.expectEqual(ModuleAvailability.served, moduleAvailability("vulkan-1.dll"));
+    try std.testing.expectEqual(ModuleAvailability.served, moduleAvailability("SHCore.dll"));
+    try std.testing.expectEqual(ModuleAvailability.served, moduleAvailability("hid.dll"));
+    try std.testing.expectEqual(ModuleAvailability.no_backend, moduleAvailability("libusbK.dll"));
+    try std.testing.expect(!moduleAvailability("libusbK.dll").isGap());
+    // An empty name is not a library.
+    try std.testing.expectEqual(ModuleAvailability.outside_modelled_surface, moduleAvailability(""));
+}
+
+test "libraries Rosetta cannot serve stay off the surface so a load reports absent" {
+    // XAudio2 is the case that motivated the allow-list. Rosetta has no
+    // XAudio2 implementation, and letting the load succeed made Xenia's audio
+    // driver call `XAudio2Create`, whose unimplemented return is zero - which
+    // is S_OK for an HRESULT - and then dereference an interface pointer it
+    // was never given.
+    try std.testing.expect(!isWindowsSurface("XAudio2_8.dll"));
+    try std.testing.expect(!isWindowsSurface("XAudio2_9.dll"));
+    // Direct3D's shader compilers and DirectSound are optional everywhere
+    // they are used, so an absent report sends each caller down a path it
+    // already handles.
+    try std.testing.expect(!isWindowsSurface("dxcompiler.dll"));
+    try std.testing.expect(!isWindowsSurface("dxilconv.dll"));
+    try std.testing.expect(!isWindowsSurface("DSOUND.DLL"));
+    try std.testing.expect(!isWindowsSurface("dinput8.dll"));
 }
 
 test "an unrecognized library is refused rather than given the Win32 surface" {
@@ -319,4 +526,19 @@ test "every named library and API set has a label" {
     }
     try std.testing.expect(named_library_count > 40);
     try std.testing.expectEqual(api_sets.len, api_set_prefix_count);
+}
+
+test "DirectSound is refused on purpose, because WinMM is the modelled audio path" {
+    try std.testing.expectEqual(ModuleAvailability.no_backend, moduleAvailability("DSOUND.DLL"));
+    try std.testing.expectEqual(ModuleAvailability.no_backend, moduleAvailability("dsound"));
+    try std.testing.expect(!moduleAvailability("DSOUND.DLL").isGap());
+}
+
+test "deliberate module refusals name the safe path left for the caller" {
+    try std.testing.expectEqualStrings("vulkan-graphics-path", moduleFallback("D3D12.dll"));
+    try std.testing.expectEqualStrings("vulkan-graphics-path", moduleFallback("dxgi"));
+    try std.testing.expectEqualStrings("winmm-coreaudio-path", moduleFallback("DSOUND.DLL"));
+    try std.testing.expectEqualStrings("no-capture-session", moduleFallback("renderdoc.dll"));
+    try std.testing.expectEqualStrings("no-windows-usb-backend", moduleFallback("libusbK.dll"));
+    try std.testing.expectEqualStrings("none-outside-modelled-surface", moduleFallback("XAudio2_8.dll"));
 }
