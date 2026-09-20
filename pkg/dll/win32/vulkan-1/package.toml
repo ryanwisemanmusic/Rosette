@@ -1,0 +1,6 @@
+name = "dll-win32-vulkan-1"
+version = "0.1.0-local"
+kind = "windows-dll-surface"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
