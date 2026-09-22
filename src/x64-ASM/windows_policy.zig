@@ -38,7 +38,6 @@ pub const refusals = [_][]const u8{
     "MoveFileExW",
     "OpenProcess",
     "PeekNamedPipe",
-    "QueueUserAPC",
     "RemoveDirectoryW",
     "RtlCaptureStackBackTrace",
     "RtlDeleteFunctionTable",

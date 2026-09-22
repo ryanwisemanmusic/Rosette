@@ -236,7 +236,8 @@ pub fn tryGuestCompatibility(state: anytype) bool {
                 }
                 switch (result) {
                     .blocked => return true,
-                    .resumed, .invalid => {
+                    // Relock is offered only to the native pthread shim.
+                    .resumed, .invalid, .relock => {
                         completeGuestConditionCall(state);
                         return true;
                     },
@@ -1330,6 +1331,14 @@ fn returnZero(state: anytype, direct_return_rip: ?u64) void {
     state.regs.rax = 0;
     finish(state, direct_return_rip);
 }
+
+/// NTSTATUS values the ntdll memory entry points answer with. They are
+/// negative when read as a signed 32-bit status, which is how every caller -
+/// `xe::memory::Protect` included - tells failure from success.
+const windows_status_access_violation: u64 = 0xC000_0005;
+const windows_status_invalid_parameter: u64 = 0xC000_000D;
+const windows_status_info_length_mismatch: u64 = 0xC000_0004;
+const windows_status_invalid_info_class: u64 = 0xC000_0003;
 
 const winmm_noerror: u64 = 0;
 const winmm_not_supported: u64 = 8; // MMSYSERR_NOTSUPPORTED
@@ -7315,11 +7324,27 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         finish(state, direct_return_rip);
         return true;
     }
+    if (std.mem.eql(u8, name, "QueueUserAPC")) {
+        const State = @TypeOf(state.*);
+        const routine = arg(state, 0, direct_return_rip);
+        const thread = arg(state, 1, direct_return_rip);
+        const parameter = arg(state, 2, direct_return_rip);
+        const queued = if (comptime @hasDecl(State, "queueWindowsApc")) state.queueWindowsApc(thread, routine, parameter) else false;
+        state.regs.rax = @intFromBool(queued);
+        state.windows_last_error = if (queued) 0 else 6; // ERROR_INVALID_HANDLE
+        finish(state, direct_return_rip);
+        return true;
+    }
     if (std.mem.eql(u8, name, "GetThreadId")) {
         const handle = arg(state, 0, direct_return_rip);
         const current = std.math.maxInt(u64) - 1;
         if (handle == current) {
-            state.regs.rax = 1;
+            // The pseudo-handle names whichever thread asks. Xenia's
+            // Win32Thread keeps it for every thread it did not create and
+            // reads its id back through here; 1 for all of them made every
+            // such thread claim the same id.
+            const State = @TypeOf(state.*);
+            state.regs.rax = if (comptime @hasDecl(State, "currentWindowsThreadId")) state.currentWindowsThreadId() else 1;
         } else {
             state.regs.rax = 0;
             for (state.windows_guest_threads) |thread| {
@@ -8045,8 +8070,10 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
     }
     if (std.mem.eql(u8, name, "XInputGetState") or std.mem.eql(u8, name, "XInputGetStateEx")) {
         const output = arg(state, 1, direct_return_rip);
+        // The keyboard pad lives in slot 0 only, matching the Xam shim.
+        const keyboard_slot = arg(state, 0, direct_return_rip) == 0;
         const bridged = if (comptime @hasDecl(@TypeOf(state.*), "writeWindowsXInputState"))
-            state.writeWindowsXInputState(output)
+            keyboard_slot and state.writeWindowsXInputState(output)
         else
             false;
         if (!bridged) {
@@ -8125,7 +8152,9 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
                 break :blk requested_base;
             }
             break :blk @as(u64, 0);
-        } else state.guestAlloc(size, 0x1000) orelse 0;
+        } else state.guestAlloc(std.mem.alignForward(u64, @max(size, 1), 0x1000), 0x1000) orelse 0;
+        // Whole pages: a protection the guest later puts on this block must
+        // not reach into the next heap allocation's bytes.
         state.regs.rax = address;
         // An allocation the guest is allowed to execute is where a program
         // with a translator puts the code it generates. Recording it is the
@@ -8352,6 +8381,150 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         state.write32(buffer + 44, 0); // __alignment2
         state.windows_last_error = 0;
         state.regs.rax = information_bytes;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    // `NtProtectVirtualMemory` and `NtQueryVirtualMemory` are ntdll's
+    // spellings of `VirtualProtect` and `VirtualQuery`, and on a Xenia image
+    // they are the only ones that ever run: `base/platform_win.h` defines
+    // `XE_USE_NTDLL_FUNCTIONS 1`, so `xe::memory::Protect` resolves
+    // `NtProtectVirtualMemory` through `GetProcAddress("ntdll.dll", ...)`
+    // and calls it directly, because "ntdll versions of functions often skip
+    // through a lot of extra garbage in KernelBase".
+    //
+    // Until this pair existed both names fell through to the generic
+    // `Nt`/`Zw` arm below, which returns STATUS_SUCCESS and does nothing.
+    // STATUS_SUCCESS is the worst answer available here.
+    // `PhysicalHeap::EnableAccessCallbacksInner` is how Xenia learns that a
+    // title rewrote a texture, a vertex buffer or an index buffer: it raises
+    // the page to PAGE_READONLY, ignores the return value, and has already
+    // set its own `notify_on_invalidation` bit. So every write watch in the
+    // emulator was armed on Xenia's side and absent on Rosette's - no store
+    // ever faulted, `PhysicalHeap::TriggerCallbacks` never ran, and the GPU
+    // kept drawing out of the copy of guest memory it had uploaded once.
+    // The 2026-09-19 Halo 3 run protected 80 no-access pages and *zero*
+    // read-only ones across 1708 seconds and 1588 frames, and its picture
+    // was torn into bands of stale geometry.
+    if (std.mem.eql(u8, name, "NtProtectVirtualMemory") or
+        std.mem.eql(u8, name, "ZwProtectVirtualMemory"))
+    {
+        const State = @TypeOf(state.*);
+        const base_pointer = arg(state, 1, direct_return_rip);
+        const size_pointer = arg(state, 2, direct_return_rip);
+        const requested: u32 = @truncate(arg(state, 3, direct_return_rip));
+        const old_protection_out = arg(state, 4, direct_return_rip);
+        // The two in/out parameters and the old-protection slot are all
+        // mandatory; ntdll answers STATUS_ACCESS_VIOLATION for a bad one
+        // rather than protecting a range it could not read back.
+        if (base_pointer == 0 or size_pointer == 0 or old_protection_out == 0 or
+            state.guestMemory(base_pointer, 8) == null or
+            state.guestMemory(size_pointer, 8) == null or
+            state.guestMemory(old_protection_out, 4) == null)
+        {
+            state.regs.rax = windows_status_access_violation;
+            finish(state, direct_return_rip);
+            return true;
+        }
+        const requested_base = state.read64(base_pointer);
+        const requested_length = state.read64(size_pointer);
+        // The kernel rounds the base down and the end up, and writes both
+        // back. A caller that protects the same range twice must see the
+        // same pages covered either way, so do the rounding here and record
+        // the rounded span rather than the request.
+        const page: u64 = 0x1000;
+        const rounded_base = requested_base & ~(page - 1);
+        const rounded_end = (requested_base +| @max(requested_length, 1) +| (page - 1)) & ~(page - 1);
+        const rounded_length = @max(rounded_end -| rounded_base, page);
+        const old_protection: u32 = if (comptime @hasDecl(State, "guestPageProtectionFlags"))
+            state.guestPageProtectionFlags(rounded_base)
+        else
+            0x40;
+        state.write32(old_protection_out, old_protection);
+        if (comptime @hasDecl(State, "noteGuestPageProtection")) {
+            state.noteGuestPageProtection(
+                rounded_base,
+                rounded_length,
+                requested,
+                name,
+                direct_return_rip orelse state.read64(state.regs.rsp),
+            );
+        }
+        if (comptime @hasDecl(State, "noteGuestExecutableAllocation")) {
+            state.noteGuestExecutableAllocation(rounded_base, rounded_length, requested);
+        }
+        state.write64(base_pointer, rounded_base);
+        state.write64(size_pointer, rounded_length);
+        state.windows_last_error = 0;
+        state.regs.rax = 0; // STATUS_SUCCESS
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "NtQueryVirtualMemory") or
+        std.mem.eql(u8, name, "ZwQueryVirtualMemory"))
+    {
+        // `MemoryBasicInformation` (class 0) is the only class Xenia asks
+        // for, through `xe::memory::QueryProtect`. Note that Xenia passes
+        // its own region length as `MemoryInformationLength` rather than
+        // `sizeof(MEMORY_BASIC_INFORMATION)`, so the length is checked as a
+        // lower bound and never for equality.
+        const State = @TypeOf(state.*);
+        const address = arg(state, 1, direct_return_rip);
+        const information_class = arg(state, 2, direct_return_rip);
+        const buffer = arg(state, 3, direct_return_rip);
+        const buffer_length = arg(state, 4, direct_return_rip);
+        const result_length_out = arg(state, 5, direct_return_rip);
+        const information_bytes: u64 = 48; // sizeof(MEMORY_BASIC_INFORMATION) on x64
+        if (information_class != 0) {
+            state.regs.rax = windows_status_invalid_info_class;
+            finish(state, direct_return_rip);
+            return true;
+        }
+        if (buffer == 0 or buffer_length < information_bytes or
+            state.guestMemory(buffer, information_bytes) == null)
+        {
+            state.regs.rax = windows_status_info_length_mismatch;
+            finish(state, direct_return_rip);
+            return true;
+        }
+        if (!state.windowsGuestRangeContains(address, 1)) {
+            state.regs.rax = windows_status_invalid_parameter;
+            finish(state, direct_return_rip);
+            return true;
+        }
+        const page: u64 = 0x1000;
+        const base = address & ~(page - 1);
+        // Report the protection this run recorded, and extend the region
+        // over the neighbouring pages that share it, which is what a caller
+        // walking the address space by `RegionSize` expects. The walk is
+        // bounded so a uniformly accessible address space cannot make one
+        // query scan the whole window.
+        const protection: u32 = if (comptime @hasDecl(State, "guestPageProtectionFlags"))
+            state.guestPageProtectionFlags(base)
+        else
+            0x40;
+        const region_page_limit: u64 = 4096; // 16 MiB of 4 KiB pages
+        var region_pages: u64 = 1;
+        if (comptime @hasDecl(State, "guestPageProtectionFlags")) {
+            while (region_pages < region_page_limit) : (region_pages += 1) {
+                const next = base +| (region_pages * page);
+                if (next < base) break;
+                if (state.guestPageProtectionFlags(next) != protection) break;
+            }
+        }
+        state.write64(buffer + 0, base); // BaseAddress
+        state.write64(buffer + 8, base); // AllocationBase
+        state.write32(buffer + 16, 0x40); // AllocationProtect = PAGE_EXECUTE_READWRITE
+        state.write32(buffer + 20, 0); // __alignment1
+        state.write64(buffer + 24, region_pages * page); // RegionSize
+        state.write32(buffer + 32, 0x1000); // State = MEM_COMMIT
+        state.write32(buffer + 36, protection); // Protect
+        state.write32(buffer + 40, 0x20000); // Type = MEM_PRIVATE
+        state.write32(buffer + 44, 0); // __alignment2
+        if (result_length_out != 0 and state.guestMemory(result_length_out, 8) != null) {
+            state.write64(result_length_out, information_bytes);
+        }
+        state.windows_last_error = 0;
+        state.regs.rax = 0; // STATUS_SUCCESS
         finish(state, direct_return_rip);
         return true;
     }
@@ -8788,6 +8961,22 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
     {
         const is_multiple = std.mem.eql(u8, name, "WaitForMultipleObjects") or
             std.mem.eql(u8, name, "WaitForMultipleObjectsEx");
+        // bAlertable: third argument of WaitForSingleObjectEx, fifth of
+        // WaitForMultipleObjectsEx. Queued APCs run here, before any wait,
+        // and the call answers WAIT_IO_COMPLETION.
+        const alertable = if (std.mem.eql(u8, name, "WaitForSingleObjectEx"))
+            (arg(state, 2, direct_return_rip) & 0xFFFF_FFFF) != 0
+        else if (std.mem.eql(u8, name, "WaitForMultipleObjectsEx"))
+            (arg(state, 4, direct_return_rip) & 0xFFFF_FFFF) != 0
+        else
+            false;
+        {
+            const AlertState = @TypeOf(state.*);
+            if (comptime @hasDecl(AlertState, "beginWindowsApcDelivery")) {
+                if (alertable and state.beginWindowsApcDelivery(direct_return_rip)) return true;
+                state.setWindowsWaitAlertable(alertable);
+            }
+        }
         if (!is_multiple) {
             const wait_handle = arg(state, 0, direct_return_rip);
             const timeout = arg(state, 1, direct_return_rip);
@@ -8802,10 +8991,15 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
                     },
                     .yielded => {
                         // The owner context is the cooperative UI executor.
-                        // A bounded worker turn has already been serviced, so
-                        // complete this wait boundary and let the owner pump
-                        // its deferred UI work before retrying if necessary.
-                        state.regs.rax = 0; // WAIT_OBJECT_0
+                        // A bounded worker turn has already been serviced.
+                        // The object is still not signalled, so this must not
+                        // answer WAIT_OBJECT_0: a caller joining a thread or
+                        // waiting before it frees shared state would go on as
+                        // if the other side were done. An infinite wait stays
+                        // at its call site and is retried after the owner
+                        // loop pumps its UI work; a finite one times out.
+                        if ((timeout & 0xFFFF_FFFF) == 0xFFFF_FFFF) return true;
+                        state.regs.rax = 0x102; // WAIT_TIMEOUT
                         finish(state, direct_return_rip);
                         return true;
                     },
@@ -8871,8 +9065,10 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
                     },
                     .yielded => {
                         // The owner is the cooperative UI executor and cannot
-                        // park; this is the single-object owner rule.
-                        state.regs.rax = 0;
+                        // park; this is the single-object owner rule, and like
+                        // it never claims an object that was not signalled.
+                        if (timeout == 0xFFFF_FFFF) return true;
+                        state.regs.rax = 0x102; // WAIT_TIMEOUT
                         finish(state, direct_return_rip);
                         return true;
                     },
@@ -8925,7 +9121,7 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         if (comptime @hasDecl(State, "waitWindowsGuestCondition")) {
             switch (state.waitWindowsGuestCondition(condition, arg(state, 1, direct_return_rip))) {
                 .blocked => return true,
-                .resumed, .invalid => {},
+                .resumed, .invalid, .relock => {},
             }
         }
         // The ordinary fallback remains a successful no-op only for states
@@ -8951,6 +9147,13 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         const State = @TypeOf(state.*);
         const is_sleep = std.mem.eql(u8, name, "Sleep") or std.mem.eql(u8, name, "SleepEx");
         const milliseconds: u64 = if (is_sleep) arg(state, 0, direct_return_rip) else 0;
+        const alertable_sleep = std.mem.eql(u8, name, "SleepEx") and (arg(state, 1, direct_return_rip) & 0xFFFF_FFFF) != 0;
+        if (comptime @hasDecl(State, "beginWindowsApcDelivery")) {
+            // SleepEx(ms, TRUE) runs queued APCs instead of sleeping and
+            // answers WAIT_IO_COMPLETION.
+            if (alertable_sleep and state.beginWindowsApcDelivery(direct_return_rip)) return true;
+            state.setWindowsWaitAlertable(alertable_sleep);
+        }
         // Return first: the worker resumes at the instruction after the call,
         // so its saved context has to be the post-return one.
         returnZero(state, direct_return_rip);
