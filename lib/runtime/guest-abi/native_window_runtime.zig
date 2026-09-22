@@ -25,6 +25,12 @@ pub const WINDOW_TOKEN: u64 = 0xFFFF_F400_0000_0021;
 pub const VIEW_TOKEN: u64 = 0xFFFF_F400_0000_0031;
 pub const METAL_LAYER_TOKEN: u64 = 0xFFFF_F400_0000_0041;
 
+/// The temporary logical window contract. These are AppKit content points,
+/// not drawable pixels: a Retina backing scale and a Vulkan swapchain extent
+/// are observed/negotiated independently and must not resize this window.
+pub const LOCKED_WINDOW_WIDTH: u32 = 1280;
+pub const LOCKED_WINDOW_HEIGHT: u32 = 720;
+
 /// The Vulkan format equivalent of the `CAMetalLayer` Rosette creates, which
 /// `native_window_bridge.m` fixes at `MTLPixelFormatBGRA8Unorm`.
 ///
@@ -94,6 +100,8 @@ extern fn rosette_macho_native_window_present_frame(
 extern fn rosette_macho_native_window_pump_events() u32;
 extern fn rosette_macho_native_window_status() NativeStatus;
 extern fn rosette_macho_native_window_shutdown() void;
+extern fn rosette_macho_native_window_set_drawable_owner(owned_by_swapchain: c_int) c_int;
+extern fn rosette_macho_native_window_prepare_drawable_size(width: u32, height: u32) c_int;
 
 pub const ObjcResult = struct {
     value: u64,
@@ -130,6 +138,8 @@ pub const Runtime = struct {
     guest_frame_failures: u64 = 0,
     event_pump_calls: u64 = 0,
     objc_messages: u64 = 0,
+    window_size_lock_refusals: u64 = 0,
+    fullscreen_lock_refusals: u64 = 0,
     window_ready_logged: bool = false,
     requested_width: u32 = 1280,
     requested_height: u32 = 720,
@@ -165,8 +175,8 @@ pub const Runtime = struct {
         const copied = @min(title.len, title_buffer.len - 1);
         @memcpy(title_buffer[0..copied], title[0..copied]);
         const ok = rosette_macho_native_window_ensure(
-            @max(self.requested_width, 1),
-            @max(self.requested_height, 1),
+            LOCKED_WINDOW_WIDTH,
+            LOCKED_WINDOW_HEIGHT,
             &title_buffer,
         ) != 0;
         if (!ok) {
@@ -181,8 +191,8 @@ pub const Runtime = struct {
         if (!self.window_ready_logged) {
             self.window_ready_logged = true;
             machoCapturePrint(
-                "macho-processor: native AppKit window ready: NSApplication=0x{x} NSWindow=0x{x} NSView=0x{x} CAMetalLayer=0x{x} MTLDevice=0x{x} drawable={d}x{d} main_thread={} attached={}\n",
-                .{ status.application, status.window, status.view, status.metal_layer, status.metal_device, status.width, status.height, status.on_main_thread != 0, status.layer_attached != 0 },
+                "macho-processor: native AppKit window ready: NSApplication=0x{x} NSWindow=0x{x} NSView=0x{x} CAMetalLayer=0x{x} MTLDevice=0x{x} window_contract=EXACT_LOGICAL_{d}x{d} drawable_pixels={d}x{d} main_thread={} attached={}\n",
+                .{ status.application, status.window, status.view, status.metal_layer, status.metal_device, LOCKED_WINDOW_WIDTH, LOCKED_WINDOW_HEIGHT, status.width, status.height, status.on_main_thread != 0, status.layer_attached != 0 },
             );
         }
         return status.application_ready != 0 and status.window_ready != 0 and
@@ -199,8 +209,18 @@ pub const Runtime = struct {
 
     pub fn setSize(self: *Runtime, new_width: i64, new_height: i64) bool {
         if (new_width <= 0 or new_height <= 0) return false;
-        self.requested_width = @intCast(@min(new_width, std.math.maxInt(u32)));
-        self.requested_height = @intCast(@min(new_height, std.math.maxInt(u32)));
+        const requested_width: u32 = @intCast(@min(new_width, std.math.maxInt(u32)));
+        const requested_height: u32 = @intCast(@min(new_height, std.math.maxInt(u32)));
+        if (requested_width != LOCKED_WINDOW_WIDTH or requested_height != LOCKED_WINDOW_HEIGHT) {
+            self.window_size_lock_refusals +|= 1;
+            machoCapturePrint(
+                "macho-processor: WINDOW SIZE LOCK: decision=refused operation=set_size requested={d}x{d} locked={d}x{d} refusal_count={d} action=logical AppKit content remains fixed; drawable pixels and backing scale are independent\n",
+                .{ requested_width, requested_height, LOCKED_WINDOW_WIDTH, LOCKED_WINDOW_HEIGHT, self.window_size_lock_refusals },
+            );
+            return false;
+        }
+        self.requested_width = LOCKED_WINDOW_WIDTH;
+        self.requested_height = LOCKED_WINDOW_HEIGHT;
         if (!self.ensureWindow()) return false;
         return rosette_macho_native_window_set_size(self.requested_width, self.requested_height) != 0;
     }
@@ -221,6 +241,14 @@ pub const Runtime = struct {
 
     pub fn setFullscreen(self: *Runtime, fullscreen: bool) bool {
         if (!self.ensureWindow()) return false;
+        if (fullscreen) {
+            self.fullscreen_lock_refusals +|= 1;
+            machoCapturePrint(
+                "macho-processor: WINDOW SIZE LOCK: decision=refused operation=fullscreen requested=true locked={d}x{d} refusal_count={d} action=fullscreen is disabled until the fixed-size presentation contract is lifted\n",
+                .{ LOCKED_WINDOW_WIDTH, LOCKED_WINDOW_HEIGHT, self.fullscreen_lock_refusals },
+            );
+            return false;
+        }
         return rosette_macho_native_window_set_fullscreen(@intFromBool(fullscreen)) != 0;
     }
 
@@ -285,6 +313,22 @@ pub const Runtime = struct {
     pub fn hostMetalLayer(self: *Runtime) usize {
         if (!self.validateLayerToken(METAL_LAYER_TOKEN)) return 0;
         return rosette_macho_native_window_status().metal_layer;
+    }
+
+    /// Prepare the exact pixel extent that the next native Vulkan swapchain
+    /// will use. This does not resize the NSWindow; on a Retina display the
+    /// contents scale remains independent from this drawable extent.
+    pub fn prepareDrawableSize(self: *Runtime, requested_width: u32, requested_height: u32) bool {
+        if (requested_width == 0 or requested_height == 0 or !self.ensureWindow()) return false;
+        return rosette_macho_native_window_prepare_drawable_size(requested_width, requested_height) != 0;
+    }
+
+    /// Transfer drawableSize ownership to or from the native Vulkan driver.
+    /// The C bridge marshals this state transition to AppKit's main thread so
+    /// event pumping and swapchain creation cannot race the ownership flag.
+    pub fn setDrawableOwner(self: *Runtime, owned_by_swapchain: bool) bool {
+        _ = self;
+        return rosette_macho_native_window_set_drawable_owner(@intFromBool(owned_by_swapchain)) != 0;
     }
 
     pub fn noteSurfaceBound(self: *Runtime, layer_token: u64, guest_surface: u64, host_surface: u64) void {
@@ -405,13 +449,13 @@ pub const Runtime = struct {
     }
 
     pub fn width(self: *Runtime) u32 {
-        const status = rosette_macho_native_window_status();
-        return if (status.window_ready != 0) status.width else self.requested_width;
+        _ = self;
+        return LOCKED_WINDOW_WIDTH;
     }
 
     pub fn height(self: *Runtime) u32 {
-        const status = rosette_macho_native_window_status();
-        return if (status.window_ready != 0) status.height else self.requested_height;
+        _ = self;
+        return LOCKED_WINDOW_HEIGHT;
     }
 
     pub fn handleObjcMessage(
@@ -561,8 +605,12 @@ pub const Runtime = struct {
         if (self.application_ensure_attempts == 0 and self.window_ensure_attempts == 0) return;
         const status = rosette_macho_native_window_status();
         machoCapturePrint(
-            "macho-processor: native window bridge: app_attempts={d} window_attempts={d} failures={d} objc={d} view_requests={d} layer(requests/attached/failures)={d}/{d}/{d} surface_bindings={d} diagnostic_metal_frames(attempts/presented/failures)={d}/{d}/{d} verified_guest_frames(attempts/presented/failures)={d}/{d}/{d} event_pumps={d} host(app/window/view/layer/device)=0x{x}/0x{x}/0x{x}/0x{x}/0x{x} drawable={d}x{d} ready(app/window/layer/visible/main)={}/{}/{}/{}/{} events={d}\n",
-            .{ self.application_ensure_attempts, self.window_ensure_attempts, self.window_ensure_failures, self.objc_messages, self.view_requests, self.layer_requests, self.layer_attachments, self.layer_attachment_failures, self.surface_bindings, self.diagnostic_frame_attempts, self.diagnostic_frames_presented, self.diagnostic_frame_failures, self.guest_frame_attempts, self.guest_frames_presented, self.guest_frame_failures, self.event_pump_calls, status.application, status.window, status.view, status.metal_layer, status.metal_device, status.width, status.height, status.application_ready != 0, status.window_ready != 0, status.layer_attached != 0, status.visible != 0, status.on_main_thread != 0, status.events_pumped },
+            "macho-processor: native window bridge: app_attempts={d} window_attempts={d} failures={d} objc={d} view_requests={d} layer(requests/attached/failures)={d}/{d}/{d} surface_bindings={d} diagnostic_metal_frames(attempts/presented/failures)={d}/{d}/{d} verified_guest_frames(attempts/presented/failures)={d}/{d}/{d} event_pumps={d}\n",
+            .{ self.application_ensure_attempts, self.window_ensure_attempts, self.window_ensure_failures, self.objc_messages, self.view_requests, self.layer_requests, self.layer_attachments, self.layer_attachment_failures, self.surface_bindings, self.diagnostic_frame_attempts, self.diagnostic_frames_presented, self.diagnostic_frame_failures, self.guest_frame_attempts, self.guest_frames_presented, self.guest_frame_failures, self.event_pump_calls },
+        );
+        machoCapturePrint(
+            "macho-processor: native window bridge: window_contract=EXACT_LOGICAL_{d}x{d} size_refusals={d} fullscreen_refusals={d} host(app/window/view/layer/device)=0x{x}/0x{x}/0x{x}/0x{x}/0x{x} drawable_pixels={d}x{d} ready(app/window/layer/visible/main)={}/{}/{}/{}/{} events={d}\n",
+            .{ LOCKED_WINDOW_WIDTH, LOCKED_WINDOW_HEIGHT, self.window_size_lock_refusals, self.fullscreen_lock_refusals, status.application, status.window, status.view, status.metal_layer, status.metal_device, status.width, status.height, status.application_ready != 0, status.window_ready != 0, status.layer_attached != 0, status.visible != 0, status.on_main_thread != 0, status.events_pumped },
         );
     }
 };

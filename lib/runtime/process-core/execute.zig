@@ -2456,11 +2456,13 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         .xchg_mem32_reg32 => {
             // XCHG with memory is architecturally always atomic (implicit LOCK#)
             // Acquire+release semantics via full barrier (XCHG implies LOCK)
+            // The 32-bit op also carries the 66-prefixed 16-bit form.
+            const sz: Size = if (d.size == .bits16) .bits16 else .bits32;
             releaseBarrier();
-            const a = self.readMemVal(d.addr, .bits32);
-            const b = self.regVal(d.src_reg, .bits32);
-            self.writeMemVal(d.addr, .bits32, b);
-            self.setReg(d.src_reg, .bits32, a);
+            const a = self.readMemVal(d.addr, sz);
+            const b = self.regVal(d.src_reg, sz);
+            self.writeMemVal(d.addr, sz, b);
+            self.setReg(d.src_reg, sz, a);
             releaseBarrier();
         },
         .xchg_mem64_reg64 => {
@@ -2472,10 +2474,11 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             releaseBarrier();
         },
         .xchg_reg32_reg32 => {
-            const a = self.regVal(d.dst_reg, .bits32);
-            const b = self.regVal(d.src_reg, .bits32);
-            self.setReg(d.dst_reg, .bits32, b);
-            self.setReg(d.src_reg, .bits32, a);
+            const sz: Size = if (d.size == .bits16) .bits16 else .bits32;
+            const a = self.regVal(d.dst_reg, sz);
+            const b = self.regVal(d.src_reg, sz);
+            self.setReg(d.dst_reg, sz, b);
+            self.setReg(d.src_reg, sz, a);
         },
         .xchg_reg64_reg64 => {
             const a = self.regVal(d.dst_reg, .bits64);
@@ -2484,7 +2487,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             self.setReg(d.src_reg, .bits64, a);
         },
         .xadd_mem8_reg8, .xadd_mem32_reg32, .xadd_mem64_reg64 => {
-            const sz: Size = if (d.op == .xadd_mem64_reg64) .bits64 else if (d.op == .xadd_mem8_reg8) .bits8 else .bits32;
+            const sz: Size = if (d.op == .xadd_mem64_reg64) .bits64 else if (d.op == .xadd_mem8_reg8) .bits8 else if (d.size == .bits16) .bits16 else .bits32;
             const old_mem = self.readMemVal(d.addr, sz);
             const old_reg = self.regVal(d.src_reg, sz);
             const result = old_mem +% old_reg;
