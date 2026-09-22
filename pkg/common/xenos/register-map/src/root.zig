@@ -547,6 +547,62 @@ pub fn blockOf(register: Register) Block {
     return blockForIndex(register) orelse .unclassified;
 }
 
+/// How a command-stream register write is classified for defect accounting.
+///
+/// This exists because two independently implemented PM4 decoders have to
+/// reach the same verdict about the same dword, and they were not. The
+/// structural walker counted `blockForIndex(...) == .unclassified` as a
+/// defect; the stateful executor exempted an exact Xenia-table entry first.
+/// On the 2026-09-07 run that produced accounts agreeing on all 235 dwords,
+/// 72 packets, 5 indirect references, 57 register intents, 24 draws and 2
+/// event writes, and disagreeing 20-vs-0 on defects — which failed acceptance
+/// gate G3 and made every gate above it not-reached.
+///
+/// The executor's rule is the correct one, for the reason `exactTableBlock`
+/// already states: exact hardware identity and functional ownership are
+/// separate facts. A register Xenia's own table names is *known*; that
+/// Rosette declines to guess which block owns it is a gap in the block map,
+/// not an unrecognised register in the title's command stream. Both counts
+/// stay visible — `known_hardware` is reported beside the defect, so the gap
+/// in the block map does not disappear just because it stopped being a fault.
+pub const CommandRegisterClass = enum(u8) {
+    /// Outside the retained aperture. A write here reaches no register file.
+    out_of_range,
+    /// A functional block owns it.
+    owned,
+    /// No functional block owns it, but it is an exact Xenia-table entry: the
+    /// hardware register is known even though its owner is not guessed.
+    known_hardware,
+    /// In the aperture, unowned, and absent from the table. Nothing knows what
+    /// this index is, so continuing past it is guessing.
+    unclassified,
+
+    pub fn label(self: CommandRegisterClass) []const u8 {
+        return switch (self) {
+            .out_of_range => "out-of-range",
+            .owned => "owned",
+            .known_hardware => "known-hardware",
+            .unclassified => "unclassified",
+        };
+    }
+
+    /// Whether this class is a defect in the command stream, as opposed to a
+    /// gap in Rosette's block map.
+    pub fn isDefect(self: CommandRegisterClass) bool {
+        return self == .out_of_range or self == .unclassified;
+    }
+};
+
+/// The single rule. Every decoder that accounts for a command-stream register
+/// write must call this rather than composing `blockForIndex` and
+/// `isKnownHardwareRegister` itself.
+pub fn classifyCommandRegister(register: u32) CommandRegisterClass {
+    const block = blockForIndex(register) orelse return .out_of_range;
+    if (block != .unclassified) return .owned;
+    if (isKnownHardwareRegister(register)) return .known_hardware;
+    return .unclassified;
+}
+
 /// Whether an index falls inside the retained register aperture.
 ///
 /// Bounds only. A true answer means a store to this index would be dispatched
@@ -728,4 +784,65 @@ test "the named table covers a register from every block it claims" {
     // named index, so they stay with the ranges.
     try std.testing.expectEqual(Block.shader_constants, blockOf(shader_constant_alu_base));
     try std.testing.expectEqual(Block.fetch_constants, blockOf(shader_constant_fetch_base));
+}
+
+// The 2026-09-07 acceptance-gate G3 failure. Two PM4 decoders read one batch,
+// agreed on every structural count, and disagreed 20-vs-0 on defects because
+// each composed its own rule out of `blockForIndex` and
+// `isKnownHardwareRegister`. The rule is now one function; these pin what it
+// decides so the two cannot drift apart again.
+test "one rule decides whether a command register write is a defect" {
+    // A register an exact Xenia-table entry names, with no functional owner in
+    // the block map, is known hardware and not a defect. This is the class
+    // that was being counted 20 times as unclassified.
+    var known_hardware: usize = 0;
+    var unclassified: usize = 0;
+    var owned: usize = 0;
+    var register: u32 = 0;
+    while (register < register_count) : (register += 1) {
+        switch (classifyCommandRegister(register)) {
+            .owned => owned += 1,
+            .known_hardware => known_hardware += 1,
+            .unclassified => unclassified += 1,
+            .out_of_range => return error.ApertureDisagreesWithItself,
+        }
+    }
+    try std.testing.expect(owned != 0);
+    try std.testing.expect(known_hardware != 0);
+
+    // Out of range is decided by the aperture and nothing else.
+    try std.testing.expectEqual(CommandRegisterClass.out_of_range, classifyCommandRegister(register_count));
+    try std.testing.expectEqual(
+        CommandRegisterClass.out_of_range,
+        classifyCommandRegister(std.math.maxInt(u32)),
+    );
+
+    // The two defect classes are exactly the two a decoder may count, and the
+    // two non-defect classes are exactly the two it may not.
+    try std.testing.expect(CommandRegisterClass.out_of_range.isDefect());
+    try std.testing.expect(CommandRegisterClass.unclassified.isDefect());
+    try std.testing.expect(!CommandRegisterClass.owned.isDefect());
+    try std.testing.expect(!CommandRegisterClass.known_hardware.isDefect());
+}
+
+// The property the decoders' two hand-written rules had to share and did not.
+test "a named or table-known register is never a command-stream defect" {
+    var register: u32 = 0;
+    while (register < register_count) : (register += 1) {
+        const class = classifyCommandRegister(register);
+        if (classifiedByName(register)) {
+            try std.testing.expect(!class.isDefect());
+        }
+        // And the converse: a defect classification means nothing names it.
+        if (class == .unclassified) {
+            try std.testing.expect(!classifiedByName(register));
+            try std.testing.expect(!isKnownHardwareRegister(register));
+        }
+        // `known_hardware` is only ever reached through the table, never
+        // through a coarse range that happened to fall through.
+        if (class == .known_hardware) {
+            try std.testing.expect(isKnownHardwareRegister(register));
+            try std.testing.expectEqual(Block.unclassified, blockForIndex(register).?);
+        }
+    }
 }

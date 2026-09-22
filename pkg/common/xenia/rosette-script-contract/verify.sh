@@ -36,10 +36,41 @@ for adapter in \
     rosette-xenia-orchestration.sh \
     rosette-xenia-project.sh \
     rosette-xenia-signing.sh \
+    rosette-xenia-windows.sh \
     rosette-xenia-script.sh; do
     test -f "${repo_root}/tools/xenia/scripts/${adapter}"
     bash -n "${repo_root}/tools/xenia/scripts/${adapter}"
 done
+
+windows_template_dir="${repo_root}/tools/xenia/windows"
+for template in \
+    CMakeLists.windows.in \
+    windows-toolchain.cmake.in \
+    clang-c-wrapper.sh.in \
+    clang-cxx-wrapper.sh.in \
+    windres-wrapper.sh.in \
+    wine.in \
+    xenia_windows_compat.h \
+    xenia_cxx_compat.h.in \
+    intrin.h.in \
+    mm3dnow.h \
+    libusb-config.h \
+    DXProgrammableCapture.h \
+    ShlObj_core.h \
+    README.md; do
+    test -f "${windows_template_dir}/${template}"
+done
+for template in "${windows_template_dir}"/*.sh.in; do
+    bash -n "${template}"
+done
+bash "${repo_root}/tools/xenia/scripts/rosette-xenia-windows.sh" --help >/dev/null
+if rg -n '/tmp/xenia-canary|/Users/ryanwiseman' \
+    "${windows_template_dir}" \
+    "${repo_root}/tools/xenia/scripts/rosette-xenia-windows.sh"; then
+    echo "ERROR: Windows build capsule contains disposable or machine-specific paths" >&2
+    exit 1
+fi
+echo "rosette Xenia Windows build capsule: template coverage PASS"
 
 # The Xenia adapter must publish the same canonical architecture fact as the
 # generic source adapter before it delegates to the shared verifier. Keep this

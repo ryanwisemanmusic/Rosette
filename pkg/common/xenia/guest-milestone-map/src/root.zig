@@ -82,11 +82,14 @@ pub const Chain = enum {
     guest_output,
     /// From "the title asked for sound" to "bytes left the host device".
     audio,
+    /// Public UI boundaries, independent of the title's output chain.
+    ui_output,
 
     pub fn label(self: Chain) []const u8 {
         return switch (self) {
             .guest_output => "guest_output",
             .audio => "audio",
+            .ui_output => "ui_output",
         };
     }
 };
@@ -101,6 +104,35 @@ pub const Milestone = struct {
     /// What its first entry proves. Not what the function does - what a
     /// reader learns from the fact that it ran at all.
     proves: []const u8,
+    /// Another row in this table whose entry proves the same thing when this
+    /// symbol's body has been inlined into its callers.
+    ///
+    /// An out-of-line copy of a function exists in the COFF table whether or
+    /// not anything calls it, so arming its address measures calls, and an
+    /// optimizer that inlined the only call site makes a live function read
+    /// zero. On the 2026-09-12 image `GraphicsSystem::MarkVblank` is exactly
+    /// that: its four-instruction body was inlined into the frame limiter
+    /// lambda in `GraphicsSystem::Setup`, the out-of-line copy at
+    /// `0x1401b7380` is unreachable, and the chain called the display clock
+    /// stopped while it was running.
+    ///
+    /// The proxy has to be a function the inlined body still *calls*, so it
+    /// survives being inlined into. `MarkVblank`'s is
+    /// `KernelState::EmulateCPInterruptDPC`: it is the vblank's whole
+    /// observable effect, and the inlined copy calls it at the same place
+    /// the out-of-line one does.
+    ///
+    /// Empty when the row stands alone. Never a symbol outside this table -
+    /// a proxy that is not itself armed cannot be counted.
+    inline_proxy: []const u8 = "",
+    /// Whether this row exists only to back another row's `inline_proxy`.
+    ///
+    /// A proxy is armed and counted like any other milestone, but it is not
+    /// a stage of its own: `EmulateCPInterruptDPC` is also reached from
+    /// `DispatchInterruptCallback`, so its count answers "did a CP interrupt
+    /// reach the guest", not "which one". Reports list it; chains read it
+    /// only through the row that names it.
+    proxy_only: bool = false,
 };
 
 /// Ordered by dependency within each chain, so a report can walk the table
@@ -115,11 +147,37 @@ pub const milestones = [_]Milestone{
         .proves = "the Vulkan GPU backend was the one selected and came up; a title cannot draw through a backend that was never set up",
     },
     .{
+        .mangled = "_ZN2xe3gpu16CommandProcessor10InitializeEv",
+        .readable = "CommandProcessor::Initialize",
+        .owner = .xenia_emulator,
+        .chain = .guest_output,
+        .proves = "Xenia's command processor came up and started its worker thread; until this happens there is nothing on the other end of the ring for a title to write to",
+    },
+    .{
+        .mangled = "_ZN2xe3gpu16CommandProcessor16WorkerThreadMainEv",
+        .readable = "CommandProcessor::WorkerThreadMain",
+        .owner = .xenia_gpu_thread,
+        .chain = .guest_output,
+        .proves = "the GPU thread entered its read loop and is waiting on the ring's write pointer. A run where this is met and ExecutePrimaryBuffer is not has a consumer with nothing to consume, which points at the title rather than at Xenia",
+    },
+    .{
         .mangled = "_ZN2xe3gpu14GraphicsSystem10MarkVblankEv",
         .readable = "GraphicsSystem::MarkVblank",
         .owner = .xenia_emulator,
         .chain = .guest_output,
         .proves = "the emulated display clock is ticking; a title that waits on vblank before drawing cannot progress while this is zero",
+        .inline_proxy = "_ZN2xe6kernel11KernelState21EmulateCPInterruptDPCEjjjj",
+    },
+    .{
+        // Not a stage. It is what `MarkVblank` does, and the reason the
+        // vblank is observable at all once `MarkVblank` itself has been
+        // inlined out of existence.
+        .mangled = "_ZN2xe6kernel11KernelState21EmulateCPInterruptDPCEjjjj",
+        .readable = "KernelState::EmulateCPInterruptDPC",
+        .owner = .xenia_emulator,
+        .chain = .guest_output,
+        .proxy_only = true,
+        .proves = "a command-processor interrupt was delivered to the guest. The frame limiter raises one on every vertical blank, so this counts vblanks even in an image where MarkVblank was inlined away",
     },
     .{
         .mangled = "_ZN2xe8Emulator14CompleteLaunchERKNSt10filesystem7__cxx114pathESt17basic_string_viewIcSt11char_traitsIcEE",
@@ -136,11 +194,35 @@ pub const milestones = [_]Milestone{
         .proves = "a guest thread began running translated PowerPC; without this no title code has executed at all",
     },
     .{
+        .mangled = "_ZN2xe6kernel8xboxkrnl16VdQueryVideoModeEPNS0_12X_VIDEO_MODEEb",
+        .readable = "xboxkrnl::VdQueryVideoMode",
+        .owner = .guest_title,
+        .chain = .guest_output,
+        .proves = "the title asked the kernel what display it has. This is usually a title's first graphics-related act, so a zero here places it before GPU bring-up entirely rather than stuck inside it",
+    },
+    .{
+        .mangled = "_ZN2xe3gpu14GraphicsSystem20SetInterruptCallbackEjj",
+        .readable = "GraphicsSystem::SetInterruptCallback",
+        .owner = .guest_title,
+        .chain = .guest_output,
+        .proves = "the title registered its GPU interrupt handler through VdSetGraphicsInterruptCallback. Vertical blanks are delivered to that handler, so a title that never registers one is not waiting on vblank however many the emulator raises",
+    },
+    .{
         .mangled = "_ZN2xe3gpu14GraphicsSystem20InitializeRingBufferEjj",
         .readable = "GraphicsSystem::InitializeRingBuffer",
         .owner = .guest_title,
         .chain = .guest_output,
         .proves = "the title called VdInitializeRingBuffer and handed Xenia the address of its command ring; this is the title's first GPU act",
+    },
+    .{
+        // Not a chain stage. Titles that poll the read pointer instead of
+        // having it written back never call this, so making it a stage would
+        // put a wall in front of a title doing nothing wrong.
+        .mangled = "_ZN2xe3gpu14GraphicsSystem26EnableReadPointerWriteBackEjj",
+        .readable = "GraphicsSystem::EnableReadPointerWriteBack",
+        .owner = .guest_title,
+        .chain = .guest_output,
+        .proves = "the title asked for the ring's read pointer to be written back into its own memory. Optional, and its absence is not a fault - but paired with a ring that never advances it says which of the two ways the title is watching the GPU",
     },
     .{
         .mangled = "_ZN2xe3gpu16CommandProcessor20ExecutePrimaryBufferEjj",
@@ -155,6 +237,30 @@ pub const milestones = [_]Milestone{
         .owner = .xenia_gpu_thread,
         .chain = .guest_output,
         .proves = "the ring carried real PM4 work rather than padding; draws, state and swaps are all type 3 packets",
+    },
+    .{
+        // `ExecutePrimaryBuffer` is virtual. The PE image's Vulkan command
+        // processor dispatches through this override, so the base symbol can
+        // be present, armed and still remain at zero while real ring work is
+        // executing. This row is a witness for the same chain stage, not a
+        // sixteenth stage of its own.
+        .mangled = "_ZN2xe3gpu6vulkan22VulkanCommandProcessor20ExecutePrimaryBufferEjj",
+        .readable = "VulkanCommandProcessor::ExecutePrimaryBuffer",
+        .owner = .xenia_gpu_thread,
+        .chain = .guest_output,
+        .proxy_only = true,
+        .proves = "the Vulkan command processor's virtual override consumed ring work. C++ virtual dispatch can bypass the base CommandProcessor symbol, so this is the implementation-level witness for ring_carried_work",
+    },
+    .{
+        // As with the primary-buffer override, PM4 dispatch lands in the
+        // Vulkan implementation in a Vulkan-backed image. Keep it paired
+        // with the base row so the chain observes either legal virtual route.
+        .mangled = "_ZN2xe3gpu6vulkan22VulkanCommandProcessor18ExecutePacketType3Ej",
+        .readable = "VulkanCommandProcessor::ExecutePacketType3",
+        .owner = .xenia_gpu_thread,
+        .chain = .guest_output,
+        .proxy_only = true,
+        .proves = "the Vulkan command processor's virtual override decoded a type 3 PM4 packet; the base symbol alone is not sufficient evidence when the vtable selects this implementation",
     },
     .{
         .mangled = "_ZN2xe3gpu6vulkan22VulkanCommandProcessor9IssueSwapEjjj",
@@ -197,6 +303,185 @@ pub const milestones = [_]Milestone{
         .proves = "the window's paint handler ran; the count is the number of frames Xenia actually attempted, whatever the swapchain counters say",
     },
 
+    // ---- the title's own code: is it being translated, and does it trap? ----
+    //
+    // Every row above measures something the title *asked Xenia for*. None of
+    // them can tell a title working steadily through its own start-up from a
+    // title spinning on one branch, because between two kernel calls the
+    // title executes translated PowerPC that Rosette cannot name: on the
+    // 2026-09-12 run `Main XThread` held 22% of the interpreter at an address
+    // inside Xenia's JIT cache and the report could say nothing else about
+    // it. These four are witnesses, never stages - a title that is running
+    // correctly and a title that is stuck both reach them.
+    .{
+        .mangled = "_ZN2xe3cpu3ppc11PPCFrontend14DefineFunctionEPNS0_13GuestFunctionEj",
+        .readable = "PPCFrontend::DefineFunction",
+        .owner = .guest_title,
+        .chain = .guest_output,
+        .proxy_only = true,
+        .proves = "one more of the title's own PowerPC functions was translated to host code. This is the title's progress axis: a count that keeps rising is a title walking through its program, and a count that stopped while the thread still burns instructions is a title looping inside code it already has",
+    },
+    .{
+        .mangled = "_ZN2xe3cpu9Processor15ResolveFunctionEj",
+        .readable = "Processor::ResolveFunction",
+        .owner = .guest_title,
+        .chain = .guest_output,
+        .proxy_only = true,
+        .proves = "translated code branched to a guest address the JIT had not seen before. Compared against DefineFunction it separates a title reaching new code from a title re-entering code it has already run",
+    },
+    .{
+        .mangled = "_ZN2xe3cpu7backend3x6414TrapDebugBreakEPvy",
+        .readable = "x64::TrapDebugBreak",
+        .owner = .guest_title,
+        .chain = .guest_output,
+        .proxy_only = true,
+        .proves = "the title executed a PowerPC trap instruction, which is what its own assertions compile to. A non-zero count here is the title reporting a failure of its own, and it is the one witness in this table whose zero is the good outcome",
+    },
+    .{
+        .mangled = "_ZN2xe3gpu16CommandProcessor22HitUnimplementedOpcodeEjj",
+        .readable = "CommandProcessor::HitUnimplementedOpcode",
+        .owner = .xenia_gpu_thread,
+        .chain = .guest_output,
+        .proxy_only = true,
+        .proves = "the ring carried a PM4 packet this build of Xenia cannot decode. Reached only after ExecutePacketType3, so a zero while that stage is unmet says nothing; a non-zero is Xenia's gap and not the title's",
+    },
+
+    // ---- GPU register delivery: how a title's register write reaches the ring ----
+    //
+    // A title talks to the GPU by reading and writing registers at guest
+    // 0x7FC80000. Xenia commits that block no-access and serves every access
+    // from an access violation: the vectored handler hands the fault to the
+    // MMIO handler, which decodes the instruction and calls the register
+    // callback. On the 2026-09-13 run the title handed Xenia its ring and
+    // `ExecutePrimaryBuffer` never ran, and nothing could say whether the
+    // title had written the write pointer, because Rosette raised no fault
+    // and none of these five had ever been counted. Witnesses, not stages:
+    // the chain's `ring_carried_work` stage reads them through its guidance.
+    .{
+        .mangled = "_ZN2xe24ExceptionHandlerCallbackEP19_EXCEPTION_POINTERS",
+        .readable = "ExceptionHandlerCallback",
+        .owner = .xenia_emulator,
+        .chain = .guest_output,
+        .proxy_only = true,
+        .proves = "Rosette delivered an access violation to Xenia's vectored exception handler. Registered by address, so it cannot be inlined away; zero here while register pages are protected means no GPU register access has ever reached Xenia",
+    },
+    .{
+        .mangled = "_ZN2xe3cpu11MMIOHandler17ExceptionCallbackEPNS_9ExceptionE",
+        .readable = "MMIOHandler::ExceptionCallback",
+        .owner = .xenia_emulator,
+        .chain = .guest_output,
+        .proxy_only = true,
+        .proves = "the fault was offered to the MMIO handler, which decodes the faulting mov or movbe and calls the register callback for its range",
+    },
+    .{
+        .mangled = "_ZN2xe3gpu14GraphicsSystem18WriteRegisterThunkEPvPS1_jj",
+        .readable = "GraphicsSystem::WriteRegisterThunk",
+        .owner = .guest_title,
+        .chain = .guest_output,
+        .proxy_only = true,
+        .proves = "a GPU register store from the title arrived at the graphics system. Installed as the MMIO write callback by address, so its count is every delivered store",
+    },
+    .{
+        .mangled = "_ZN2xe3gpu14GraphicsSystem17ReadRegisterThunkEPvPS1_j",
+        .readable = "GraphicsSystem::ReadRegisterThunk",
+        .owner = .guest_title,
+        .chain = .guest_output,
+        .proxy_only = true,
+        .proves = "a GPU register read from the title was answered by the emulated GPU rather than by whatever bytes sat in plain memory - a title polling a status register reads zero forever without this",
+    },
+    .{
+        .mangled = "_ZN2xe3gpu16CommandProcessor18UpdateWritePointerEj",
+        .readable = "CommandProcessor::UpdateWritePointer",
+        .owner = .guest_title,
+        .chain = .guest_output,
+        .proves = "the title moved the ring's write pointer and the command processor was told. This is the event ExecutePrimaryBuffer waits for",
+        .proxy_only = true,
+    },
+
+    // ---- What the ring actually carried ----
+    //
+    // On the 2026-09-13 run `ExecutePrimaryBuffer` ran twice and
+    // `ExecutePacketType3` never did, and the chain's guidance said "padding
+    // or type 0 register writes". Nothing had counted type 0. Xenia's
+    // `ExecutePacket` skips a header of 0, 0x0BADF00D or 0xCDCDCDCD without
+    // calling any executor, so a ring page that reads as zeros where the
+    // write pointer says commands are looks exactly like a title that asked
+    // for nothing. These rows separate the cases.
+    .{
+        .mangled = "_ZN2xe3gpu6vulkan22VulkanCommandProcessor13ExecutePacketEv",
+        .readable = "VulkanCommandProcessor::ExecutePacket",
+        .owner = .xenia_gpu_thread,
+        .chain = .guest_output,
+        .proxy_only = true,
+        .proves = "the command processor read one ring dword as a packet header. With Type0, Type1 and Type3 all at zero while this is not, every header it read was 0, 0x0BADF00D or 0xCDCDCDCD: the dwords the write pointer covered held no commands",
+    },
+    .{
+        .mangled = "_ZN2xe3gpu6vulkan22VulkanCommandProcessor18ExecutePacketType0Ej",
+        .readable = "VulkanCommandProcessor::ExecutePacketType0",
+        .owner = .xenia_gpu_thread,
+        .chain = .guest_output,
+        .proxy_only = true,
+        .proves = "the ring carried a type 0 packet: a run of register writes. A title that writes registers through the ring is configuring the GPU, not yet asking it to draw",
+    },
+    .{
+        .mangled = "_ZN2xe3gpu6vulkan22VulkanCommandProcessor18ExecutePacketType1Ej",
+        .readable = "VulkanCommandProcessor::ExecutePacketType1",
+        .owner = .xenia_gpu_thread,
+        .chain = .guest_output,
+        .proxy_only = true,
+        .proves = "the ring carried a type 1 packet: two register writes in one header",
+    },
+    .{
+        .mangled = "_ZN2xe3gpu6vulkan22VulkanCommandProcessor26ExecutePacketType3_ME_INITEjj",
+        .readable = "VulkanCommandProcessor::ExecutePacketType3_ME_INIT",
+        .owner = .guest_title,
+        .chain = .guest_output,
+        .proxy_only = true,
+        .proves = "the title initialised the GPU micro-engine: the first type 3 packet a Direct3D device puts on a fresh ring",
+    },
+    .{
+        .mangled = "_ZN2xe3gpu6vulkan22VulkanCommandProcessor34ExecutePacketType3_INDIRECT_BUFFEREjj",
+        .readable = "VulkanCommandProcessor::ExecutePacketType3_INDIRECT_BUFFER",
+        .owner = .guest_title,
+        .chain = .guest_output,
+        .proxy_only = true,
+        .proves = "the ring pointed the processor at a title command buffer. Draws live in indirect buffers, so a title that renders reaches this every frame",
+    },
+    .{
+        .mangled = "_ZN2xe3gpu6vulkan22VulkanCommandProcessor21ExecuteIndirectBufferEjj",
+        .readable = "VulkanCommandProcessor::ExecuteIndirectBuffer",
+        .owner = .xenia_gpu_thread,
+        .chain = .guest_output,
+        .proxy_only = true,
+        .proves = "an indirect buffer was walked. Non-zero here with INDIRECT_BUFFER at zero means another packet (a primary-ring IB2) reached it",
+    },
+    .{
+        .mangled = "_ZN2xe3gpu6vulkan22VulkanCommandProcessor31ExecutePacketType3_WAIT_REG_MEMEjj",
+        .readable = "VulkanCommandProcessor::ExecutePacketType3_WAIT_REG_MEM",
+        .owner = .guest_title,
+        .chain = .guest_output,
+        .proxy_only = true,
+        .proves = "the title asked the GPU to wait on a register or memory value, usually vsync or its own read pointer; a stall inside this packet is a wait the emulated GPU has to satisfy",
+    },
+    .{
+        .mangled = "_ZN2xe3gpu6vulkan22VulkanCommandProcessor28ExecutePacketType3_INTERRUPTEjj",
+        .readable = "VulkanCommandProcessor::ExecutePacketType3_INTERRUPT",
+        .owner = .guest_title,
+        .chain = .guest_output,
+        .proxy_only = true,
+        .proves = "the title asked the GPU to raise an interrupt back to it, which is how a Direct3D driver learns a command batch finished",
+    },
+
+    // ---- Module and file lookups the title's loader makes ----
+    .{
+        .mangled = "_ZN2xe3vfs17VirtualFileSystem11ResolvePathESt17basic_string_viewIcSt11char_traitsIcEE",
+        .readable = "VirtualFileSystem::ResolvePath",
+        .owner = .xenia_emulator,
+        .chain = .guest_output,
+        .proxy_only = true,
+        .proves = "Xenia resolved a guest path against its mounted devices. Rosette records the path at entry and the result at return, so a 'device not found' line is joined to the exact path, caller and kernel export that asked, rather than to whatever the thread did by the time the asynchronous logger printed it",
+    },
+
     // ---- audio: from the title asking for sound to the host device ----
     .{
         .mangled = "_ZN2xe3apu11AudioSystem5SetupEPNS_6kernel11KernelStateE",
@@ -226,10 +511,96 @@ pub const milestones = [_]Milestone{
         .chain = .audio,
         .proves = "the title produced PCM. Frames can still be silent, but nothing before this point can be",
     },
+
+    // ---- XMA: the title's compressed audio ----
+    //
+    // A title's music and most of its effects are XMA. The title writes an
+    // XMA context into physical memory and kicks it through the APU register
+    // block; Xenia's decoder thread wakes, decodes, and the title mixes the
+    // result into the frames it submits. With none of these, every submitted
+    // frame can be silence while every stage above reads met.
+    .{
+        .mangled = "_ZN2xe3apu10XmaDecoder13WriteRegisterEjj",
+        .readable = "XmaDecoder::WriteRegister",
+        .owner = .guest_title,
+        .chain = .audio,
+        .proxy_only = true,
+        .proves = "the title wrote an XMA decoder register - a context kick, lock or clear. Zero here means the title has not asked for compressed audio to be decoded",
+    },
+    .{
+        .mangled = "_ZN2xe3apu10XmaDecoder16WorkerThreadMainEv",
+        .readable = "XmaDecoder::WorkerThreadMain",
+        .owner = .xenia_audio,
+        .chain = .audio,
+        .proxy_only = true,
+        .proves = "Xenia's XMA decoder thread started",
+    },
+    .{
+        .mangled = "_ZN2xe3apu10XmaContext4WorkEv",
+        .readable = "XmaContext::Work",
+        .owner = .xenia_audio,
+        .chain = .audio,
+        .proxy_only = true,
+        .proves = "an XMA context had work: the decoder was kicked and ran for a context the title enabled",
+    },
+    // ---- UI: entry is not completion; the processor captures selected returns ----
+    .{
+        .mangled = "_ZN11ImFontAtlas18GetTexDataAsRGBA32EPPhPiS2_S2_",
+        .readable = "ImFontAtlas::GetTexDataAsRGBA32",
+        .owner = .xenia_ui_thread,
+        .chain = .ui_output,
+        .proxy_only = true,
+        .proves = "the UI requested CPU atlas bytes; only its returned output pointers and dimensions prove availability, not GPU upload or font visibility",
+    },
+    .{
+        .mangled = "_ZN2xe2ui11ImGuiDrawer15RenderDrawListsEP10ImDrawDataRNS0_13UIDrawContextE",
+        .readable = "ImGuiDrawer::RenderDrawLists",
+        .owner = .xenia_ui_thread,
+        .chain = .ui_output,
+        .proxy_only = true,
+        .proves = "ImGui handed its public geometry and display-size snapshot to the drawer; an empty or invalid snapshot is reported separately",
+    },
+    .{
+        .mangled = "_ZN2xe2ui6vulkan21VulkanImmediateDrawer42EnsurePipelinesCreatedForCurrentRenderPassEv",
+        .readable = "VulkanImmediateDrawer::EnsurePipelinesCreatedForCurrentRenderPass",
+        .owner = .xenia_ui_thread,
+        .chain = .ui_output,
+        .proxy_only = true,
+        .proves = "the drawer checked its pipelines; its boolean return distinguishes readiness from an early return",
+    },
+    .{
+        .mangled = "_ZN2xe2ui6vulkan21VulkanImmediateDrawer4DrawERKNS0_13ImmediateDrawE",
+        .readable = "VulkanImmediateDrawer::Draw",
+        .owner = .xenia_ui_thread,
+        .chain = .ui_output,
+        .proxy_only = true,
+        .proves = "the UI requested a draw; public count, primitive, texture and clip are read without modifying Xenia",
+    },
+    .{
+        .mangled = "_ZN2xe2ui15ImmediateDrawer21ScissorToRenderTargetERKNS0_13ImmediateDrawERjS5_S5_S5_",
+        .readable = "ImmediateDrawer::ScissorToRenderTarget",
+        .owner = .xenia_ui_thread,
+        .chain = .ui_output,
+        .proxy_only = true,
+        .proves = "the draw reached clipping; its boolean return and successful output rectangle show whether clipping rejected it before vkCmdSetScissor",
+    },
 };
 
 pub fn count() usize {
     return milestones.len;
+}
+
+/// The row that still proves `mangled`'s stage when `mangled` was inlined
+/// away, or an empty slice when the row stands alone.
+pub fn inlineProxyOf(mangled: []const u8) []const u8 {
+    const milestone = find(mangled) orelse return "";
+    return milestone.inline_proxy;
+}
+
+/// Whether a row is a stage in its own right, or only a witness for another.
+pub fn isStageRow(mangled: []const u8) bool {
+    const milestone = find(mangled) orelse return false;
+    return !milestone.proxy_only;
 }
 
 /// How many milestones belong to one chain, so a report can size its own
@@ -266,7 +637,7 @@ test "the table names exactly one function per row" {
         try std.testing.expect(milestone.proves.len != 0);
         // Itanium mangling, not a simplified name: a simplified name cannot
         // separate overloads, and `IssueSwap` has four of them in this image.
-        try std.testing.expect(std.mem.startsWith(u8, milestone.mangled, "_ZN2xe"));
+        try std.testing.expect(std.mem.startsWith(u8, milestone.mangled, "_ZN"));
         for (milestones[0..index]) |earlier| {
             try std.testing.expect(!std.mem.eql(u8, earlier.mangled, milestone.mangled));
             try std.testing.expect(!std.mem.eql(u8, earlier.readable, milestone.readable));
@@ -279,15 +650,20 @@ test "each chain is contiguous and ordered by dependency" {
     // A report walks the table once. If a chain's rows were interleaved with
     // another's, walking in order would print the stages out of sequence.
     var seen_audio = false;
+    var seen_ui = false;
     for (milestones) |milestone| {
         switch (milestone.chain) {
-            .audio => seen_audio = true,
-            .guest_output => try std.testing.expect(!seen_audio),
+            .audio => {
+                try std.testing.expect(!seen_ui);
+                seen_audio = true;
+            },
+            .ui_output => seen_ui = true,
+            .guest_output => try std.testing.expect(!seen_audio and !seen_ui),
         }
     }
     try std.testing.expect(countFor(.guest_output) >= 10);
     try std.testing.expect(countFor(.audio) >= 4);
-    try std.testing.expectEqual(count(), countFor(.guest_output) + countFor(.audio));
+    try std.testing.expectEqual(count(), countFor(.guest_output) + countFor(.audio) + countFor(.ui_output));
 }
 
 test "a poll of the guest-output mailbox is not a frame" {
@@ -330,6 +706,80 @@ test "the audio chain starts with the title, not with the backend" {
         if (std.mem.eql(u8, milestone.readable, "SDLAudioDriver::Initialize")) driver_index = index;
     }
     try std.testing.expect(register_index < driver_index);
+}
+
+test "a milestone that can be inlined away names a witness that cannot" {
+    // The 2026-09-12 image inlined `GraphicsSystem::MarkVblank` into the
+    // frame limiter lambda: the out-of-line body at 0x1401b7380 has no call
+    // site anywhere in the 18 MB of .text, so its armed entry count stayed
+    // zero for 4.6 billion instructions while the loop that contains its
+    // inlined copy held twenty percent of the run. The chain read that zero
+    // as "the display clock is stopped" and made it the wall.
+    const vblank = find("_ZN2xe3gpu14GraphicsSystem10MarkVblankEv").?;
+    try std.testing.expect(vblank.inline_proxy.len != 0);
+    try std.testing.expect(!vblank.proxy_only);
+
+    // The proxy has to be in the table, or nothing arms it.
+    const proxy = find(vblank.inline_proxy).?;
+    try std.testing.expect(proxy.proxy_only);
+    try std.testing.expectEqual(vblank.chain, proxy.chain);
+    try std.testing.expectEqualStrings(vblank.inline_proxy, inlineProxyOf("_ZN2xe3gpu14GraphicsSystem10MarkVblankEv"));
+
+    // A proxy is a witness, never a stage: `EmulateCPInterruptDPC` is also
+    // reached from `DispatchInterruptCallback`.
+    try std.testing.expect(!isStageRow(vblank.inline_proxy));
+    try std.testing.expect(isStageRow("_ZN2xe3gpu14GraphicsSystem10MarkVblankEv"));
+}
+
+test "every declared proxy resolves to a proxy row, and no row proxies itself" {
+    for (milestones) |milestone| {
+        if (milestone.inline_proxy.len == 0) continue;
+        try std.testing.expect(!std.mem.eql(u8, milestone.inline_proxy, milestone.mangled));
+        const proxy = find(milestone.inline_proxy) orelse {
+            // A proxy outside the table would never be armed, so a row
+            // naming one is a hole that reads as evidence.
+            try std.testing.expect(false);
+            unreachable;
+        };
+        try std.testing.expect(proxy.proxy_only);
+        try std.testing.expect(proxy.inline_proxy.len == 0);
+    }
+}
+
+test "Vulkan virtual command-processor overrides are witnesses, not extra stages" {
+    const primary = find("_ZN2xe3gpu16CommandProcessor20ExecutePrimaryBufferEjj").?;
+    const primary_vulkan = find("_ZN2xe3gpu6vulkan22VulkanCommandProcessor20ExecutePrimaryBufferEjj").?;
+    const packet = find("_ZN2xe3gpu16CommandProcessor18ExecutePacketType3Ej").?;
+    const packet_vulkan = find("_ZN2xe3gpu6vulkan22VulkanCommandProcessor18ExecutePacketType3Ej").?;
+
+    try std.testing.expect(!primary.proxy_only);
+    try std.testing.expect(!packet.proxy_only);
+    try std.testing.expect(primary_vulkan.proxy_only);
+    try std.testing.expect(packet_vulkan.proxy_only);
+    try std.testing.expectEqual(Chain.guest_output, primary_vulkan.chain);
+    try std.testing.expectEqual(Chain.guest_output, packet_vulkan.chain);
+    try std.testing.expect(std.mem.indexOf(u8, primary_vulkan.proves, "virtual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, packet_vulkan.proves, "vtable") != null);
+}
+
+test "the ring's packet witnesses and the VFS ledger row are witnesses, not stages" {
+    const names = [_][]const u8{
+        "_ZN2xe3gpu6vulkan22VulkanCommandProcessor13ExecutePacketEv",
+        "_ZN2xe3gpu6vulkan22VulkanCommandProcessor18ExecutePacketType0Ej",
+        "_ZN2xe3gpu6vulkan22VulkanCommandProcessor18ExecutePacketType1Ej",
+        "_ZN2xe3gpu6vulkan22VulkanCommandProcessor26ExecutePacketType3_ME_INITEjj",
+        "_ZN2xe3gpu6vulkan22VulkanCommandProcessor34ExecutePacketType3_INDIRECT_BUFFEREjj",
+        "_ZN2xe3vfs17VirtualFileSystem11ResolvePathESt17basic_string_viewIcSt11char_traitsIcEE",
+        "_ZN2xe3apu10XmaDecoder13WriteRegisterEjj",
+        "_ZN2xe3apu10XmaContext4WorkEv",
+    };
+    for (names) |name| {
+        const row = find(name).?;
+        try std.testing.expect(row.proxy_only);
+        try std.testing.expect(!isStageRow(name));
+    }
+    // A header Xenia skips is the case the whole block exists to expose.
+    try std.testing.expect(std.mem.indexOf(u8, find(names[0]).?.proves, "0x0BADF00D") != null);
 }
 
 test "an unlisted symbol is not invented" {

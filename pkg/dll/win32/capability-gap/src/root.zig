@@ -127,7 +127,148 @@ pub const winusb = Inventory{
     },
 };
 
-pub const inventories = [_]Inventory{ dxgi, d3d12, winusb };
+/// The registry, service-control, and security surface. The current Xenia
+/// image only probes the registry for optional profile values; a missing key
+/// is deliberately reported as data rather than converted into a fabricated
+/// default handle.
+pub const advapi32 = Inventory{
+    .dll_name = "ADVAPI32.dll",
+    .summary = "Windows registry, service-control, security-token, and event-log APIs used by optional process setup and diagnostics.",
+    .conditions = &[_]Condition{
+        .{
+            .requirement = "A confined guest registry with key, value, type, and last-error state, rooted in the PE profile rather than the host registry.",
+            .blocked_by = "Rosette serves a confined guest registry for the run: keys and values the guest creates are visible to its later calls, a key it never created reads ERROR_FILE_NOT_FOUND, and no host registry key is exposed. Persistence across runs, security descriptors, enumeration and change notification are not modelled.",
+            .consequence = "Optional profile and graphics-driver settings are absent, so the title follows its built-in defaults.",
+        },
+        .{
+            .requirement = "Guest-owned security tokens, service handles, and event-log records with Windows access-mask semantics.",
+            .blocked_by = "The host has no safe one-to-one object for a Windows token or service-manager handle, and no title-owned service contract has been observed.",
+            .consequence = "Service discovery and privileged diagnostics cannot create or query those Windows objects; the audited title does not use them for its first frame.",
+        },
+    },
+};
+
+/// The classic COM activation and marshaling surface. Xenia's SDL input
+/// probe may ask for this library even when it later selects XInput.
+pub const ole32 = Inventory{
+    .dll_name = "ole32.dll",
+    .summary = "Classic COM apartment, activation, storage, and marshaling services used by optional Windows input and shell integrations.",
+    .conditions = &[_]Condition{
+        .{
+            .requirement = "A guest-visible COM apartment and lifetime model, including IUnknown identity, QueryInterface, AddRef/Release, activation, and marshaling boundaries.",
+            .blocked_by = "Rosette's guest-only DXGI model is local to the graphics contract; a general COM object graph and class registry are not yet a shared runtime service.",
+            .consequence = "SDL's optional DirectInput/COM probe receives E_NOINTERFACE and falls back; no Xenia video or Vulkan boundary is blocked.",
+        },
+    },
+};
+
+/// The newer Windows Runtime-flavoured COM surface. It is kept separate from
+/// ole32 because HSTRING and activation-factory ownership have different
+/// guest state and error contracts.
+pub const combase = Inventory{
+    .dll_name = "combase.dll",
+    .summary = "Windows Runtime string, activation-factory, and apartment services used by optional input-device discovery.",
+    .conditions = &[_]Condition{
+        .{
+            .requirement = "Guest-owned HSTRING buffers, Windows Runtime activation factories, and apartment/error-state semantics.",
+            .blocked_by = "No general WinRT class registry or HSTRING lifetime table is shared by the PE runtime; host Foundation objects cannot be placed in guest memory.",
+            .consequence = "The WGI probe receives E_NOTIMPL/E_NOINTERFACE and contributes no controller devices; the audited title continues through its neutral input path.",
+        },
+    },
+};
+
+/// Kernel32 is already broadly modelled. This inventory covers the remaining
+/// optional names that are intentionally not success-valued stubs: volume and
+/// console queries, process/thread control, named-pipe/APC operations, and
+/// unwind metadata that has no guest-owned Windows kernel behind it.
+pub const kernel32 = Inventory{
+    .dll_name = "KERNEL32.dll",
+    .summary = "The primary Windows process, file, memory, synchronization, console, and loader API surface; only the audited optional names remain declined.",
+    .conditions = &[_]Condition{
+        .{
+            .requirement = "Guest-stateful volume, console, power, locale, and file-information objects with exact Windows structure layouts and last-error behavior.",
+            .blocked_by = "The current PE bridge models the confined filesystem and core process services, but it has no guest volume/console device layer and does not turn host-only metadata into Windows objects.",
+            .consequence = "Optional diagnostics and environment probes receive their documented unavailable/empty result; Xenia's graphics initialization does not depend on them.",
+        },
+        .{
+            .requirement = "Safe guest thread/APC/process suspension and dynamic unwind-table services.",
+            .blocked_by = "Suspending or terminating a host thread would violate Rosette's cooperative executor, while Windows unwind callbacks require a guest module registration table not present in the audited image.",
+            .consequence = "Those optional control and crash-reporting paths remain unavailable instead of corrupting the scheduler; the title's live worker set and waits use Rosette-owned services.",
+        },
+    },
+};
+
+/// SetupAPI and Configuration Manager enumerate physical Windows devices.
+/// The Xenia path uses a neutral input fallback when those probes are absent.
+pub const setupapi = Inventory{
+    .dll_name = "SetupAPI.dll",
+    .summary = "Windows device-installation and device-interface enumeration used by optional HID/controller discovery.",
+    .conditions = &[_]Condition{
+        .{
+            .requirement = "A guest-owned device-information set with interface detail, property, parent, and stable device-ID records.",
+            .blocked_by = "Rosette has no Windows device-installation database; forwarding IOKit objects would expose host pointers and host lifetime rules to the PE guest.",
+            .consequence = "The optional HID enumeration returns an empty/unavailable set and Xenia uses its neutral input path; no first-frame graphics boundary is blocked.",
+        },
+    },
+};
+
+/// USER32's remaining names are optional message, input, clipboard, timer,
+/// monitor, and icon helpers. The core hidden-window/message bridge used by
+/// the audited Xenia run is modelled separately in the Windows runtime.
+pub const user32 = Inventory{
+    .dll_name = "USER32.dll",
+    .summary = "Windows window-manager, message, monitor, raw-input, clipboard, timer, and resource helpers.",
+    .conditions = &[_]Condition{
+        .{
+            .requirement = "Guest-owned window/message/input/resource state for the remaining dialog, monitor, clipboard, timer, and raw-input entry points.",
+            .blocked_by = "The PE bridge currently provides the Xenia message-window and graphics geometry subset, but does not emulate every desktop resource and input-device object.",
+            .consequence = "Optional dialogs, clipboard operations, raw-input details, and display enumeration return neutral or unavailable results; Xenia's guest-only DXGI output remains sufficient for the audited first-frame transport.",
+        },
+    },
+};
+
+/// API-set runtime names are aliases exposed by the Universal CRT. The
+/// audited image's fixed-width refusal ledger truncates the final `l` of this
+/// DLL name in one record, so inventoryFor accepts that evidence spelling too.
+pub const api_ms_win_crt_runtime = Inventory{
+    .dll_name = "api-ms-win-crt-runtime-l1-1-0.dll",
+    .summary = "Universal CRT process-runtime helpers, including guest-owned executable-path, errno, callback, and termination state.",
+    .conditions = &[_]Condition{
+        .{
+            .requirement = "No additional capability for the audited CRT exports: Rosetta must own the path globals, thread-local errno pointers, bounded normal/quick-exit tables, TLS-exit callback, and return/termination sequencing.",
+            .blocked_by = "None for the audited path. The state and callback protocol are implemented in the PE executor; any future export without a package row is a new capability gap and must fail closed.",
+            .consequence = "None for the audited path. Process-path probes write guest-owned storage, errno is thread-local, and exit callbacks cannot be silently skipped or replaced with a host pointer.",
+        },
+    },
+};
+
+/// API-set stdio names are kept separate from the runtime package because
+/// FILE*/descriptor ownership and read/write modes are stateful.
+pub const api_ms_win_crt_stdio = Inventory{
+    .dll_name = "api-ms-win-crt-stdio-l1-1-0.dll",
+    .summary = "Universal CRT stdio and descriptor helpers used by optional text/file streams.",
+    .conditions = &[_]Condition{
+        .{
+            .requirement = "A complete guest FILE and descriptor table with mode, position, buffering, EOF/error flags, errno, and wide-character conversion state.",
+            .blocked_by = "Rosette models the confined file operations reached by Xenia, but the remaining stdio names include stream modes and descriptor adoption that cannot be represented by a bare host FILE pointer.",
+            .consequence = "Optional stdio calls fail with their typed CRT result rather than fabricating a stream; the audited title's graphics path does not require them.",
+        },
+    },
+};
+
+pub const inventories = [_]Inventory{
+    dxgi,
+    d3d12,
+    winusb,
+    advapi32,
+    ole32,
+    combase,
+    kernel32,
+    setupapi,
+    user32,
+    api_ms_win_crt_runtime,
+    api_ms_win_crt_stdio,
+};
 
 /// The inventory for a DLL, if one has been written.
 pub fn inventoryFor(dll_name: []const u8) ?Inventory {
@@ -137,6 +278,12 @@ pub fn inventoryFor(dll_name: []const u8) ?Inventory {
         // asked, so match the stem too.
         const stem_length = std.mem.lastIndexOfScalar(u8, inventory.dll_name, '.') orelse continue;
         if (std.ascii.eqlIgnoreCase(inventory.dll_name[0..stem_length], dll_name)) return inventory;
+    }
+    // The bounded refusal ledger has one historical fixed-width spelling for
+    // the runtime API-set DLL. Preserve that evidence without weakening the
+    // exact inventory names used by the package catalogue.
+    if (std.ascii.eqlIgnoreCase(dll_name, "api-ms-win-crt-runtime-l1-1-0.dl")) {
+        return api_ms_win_crt_runtime;
     }
     return null;
 }
@@ -188,7 +335,9 @@ test "a refusal that is the right answer says so instead of listing work" {
 }
 
 test "a library nobody has enumerated is not a library that needs nothing" {
-    try std.testing.expectEqual(@as(?Inventory, null), inventoryFor("kernel32.dll"));
+    try std.testing.expect(inventoryFor("kernel32.dll") != null);
+    try std.testing.expectEqualStrings("api-ms-win-crt-runtime-l1-1-0.dll", inventoryFor("api-ms-win-crt-runtime-l1-1-0.dl").?.dll_name);
+    try std.testing.expectEqual(@as(?Inventory, null), inventoryFor("unwritten.dll"));
     try std.testing.expectEqual(@as(?Inventory, null), inventoryFor(""));
     // The distinction matters enough to be a method rather than a comment.
     const empty = Inventory{ .dll_name = "x.dll", .summary = "s", .conditions = &[_]Condition{} };

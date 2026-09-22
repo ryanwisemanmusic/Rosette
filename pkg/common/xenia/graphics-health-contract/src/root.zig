@@ -68,6 +68,29 @@ pub const Layer = enum(u8) {
     }
 };
 
+/// Which kind of evidence can answer a stage. The distinction is part of the
+/// contract because a guest-owned stage cannot be made green by a host smoke
+/// test, and a static symbol census cannot stand in for a runtime effect.
+pub const PreflightPhase = enum(u8) {
+    image_static,
+    host_smoke,
+    guest_runtime,
+    guest_output,
+
+    pub fn label(self: PreflightPhase) []const u8 {
+        return switch (self) {
+            .image_static => "image-static",
+            .host_smoke => "host-smoke",
+            .guest_runtime => "guest-runtime",
+            .guest_output => "guest-output",
+        };
+    }
+
+    pub fn canRunBeforeGuest(self: PreflightPhase) bool {
+        return self == .image_static or self == .host_smoke;
+    }
+};
+
 /// A stage is an observable fact, not an optimistic capability.  For
 /// example, `guest_vulkan_commands_forwarded` means that a real guest call
 /// reached a native driver entry point; the existence of a plausible handle
@@ -310,6 +333,55 @@ pub const Stage = enum(u8) {
             .native_present_completed => "guest output did not complete a native presentation",
         };
     }
+
+    /// The phase whose evidence is authoritative for this stage. A stage may
+    /// have supporting static facts, but its phase names the evidence that is
+    /// allowed to close the stage.
+    pub fn preflightPhase(self: Stage) PreflightPhase {
+        return switch (self) {
+            .application_started, .guest_image_mapped => .image_static,
+            .native_application_ready,
+            .native_window_ready,
+            .native_layer_attached,
+            .vulkan_loader_resolved,
+            .vulkan_instance_ready,
+            .vulkan_surface_ready,
+            .physical_adapter_ready,
+            .logical_device_ready,
+            .graphics_queue_ready,
+            .swapchain_ready,
+            .frame_resources_ready,
+            => .host_smoke,
+            .guest_output_refreshed, .native_present_completed => .guest_output,
+            else => .guest_runtime,
+        };
+    }
+
+    /// Stable probe identifiers make a deferred or failed row actionable for
+    /// tooling as well as for a human reading the log. They are deliberately
+    /// not function names: the owner may change implementation without
+    /// changing the evidence contract.
+    pub fn preflightProbe(self: Stage) []const u8 {
+        return switch (self) {
+            .application_started => "run-identity",
+            .guest_image_mapped => "translated-image-map",
+            .guest_scheduler_running => "guest-scheduler-observer",
+            .kernel_graphics_exports_resolved => "graphics-export-resolution",
+            .kernel_graphics_variables_populated => "graphics-variable-provisioning",
+            .native_application_ready, .native_window_ready, .native_layer_attached => "hidden-cocoa-smoke",
+            .vulkan_loader_resolved, .vulkan_instance_ready, .vulkan_surface_ready, .physical_adapter_ready, .logical_device_ready, .graphics_queue_ready, .swapchain_ready, .frame_resources_ready => "native-vulkan-smoke",
+            .guest_vulkan_activity_observed, .guest_vulkan_commands_forwarded, .guest_vulkan_submission_forwarded => "guest-vulkan-forwarding",
+            .xenos_engines_initialized, .xenos_interrupt_callback_registered, .xenos_ring_initialized => "xenos-bootstrap-observer",
+            .ring_publication_observed, .ring_geometry_observed => "ring-publication-round-trip",
+            .pm4_stream_observed, .pm4_stream_validated, .pm4_indirects_resolved, .pm4_state_programmed => "pm4-semantic-probe",
+            .draw_submitted, .draw_consumed, .render_target_state_observed, .render_target_memory_observed => "draw-target-transaction",
+            .draw_completion_signaled, .draw_completion_dispatched => "draw-completion-callback",
+            .guest_wait_progressed, .guest_producer_progressed => "guest-wait-producer-liveness",
+            .guest_vdswap_entered, .guest_swap_encoded, .authentic_swap_consumed => "guest-vdswap-transaction",
+            .issue_swap_entered, .guest_output_refreshed => "guest-present-transaction",
+            .native_present_completed => "guest-frame-custody",
+        };
+    }
 };
 
 pub const stage_count: usize = @typeInfo(Stage).@"enum".fields.len;
@@ -455,6 +527,7 @@ pub fn contractIsWellFormed() bool {
         const stage: Stage = @enumFromInt(field.value);
         if (stage.label().len == 0 or stage.guidance().len == 0 or stage.owner().label().len == 0) return false;
         if (stage.layer().label().len == 0) return false;
+        if (stage.preflightPhase().label().len == 0 or stage.preflightProbe().len == 0) return false;
     }
     const paths = .{ host_presenter_path, guest_vulkan_path, xenos_pm4_path, vdswap_path, scheduler_path };
     inline for (paths) |path| {
@@ -506,4 +579,16 @@ test "the schema has explicit labels and guidance for the full surface" {
         try std.testing.expect(stage.label().len > 3);
         try std.testing.expect(stage.guidance().len > 8);
     }
+}
+
+test "every stage has an explicit preflight owner and probe" {
+    inline for (@typeInfo(Stage).@"enum".fields) |field| {
+        const stage: Stage = @enumFromInt(field.value);
+        try std.testing.expect(stage.preflightPhase().label().len > 3);
+        try std.testing.expect(stage.preflightProbe().len > 3);
+    }
+    try std.testing.expect(PreflightPhase.image_static.canRunBeforeGuest());
+    try std.testing.expect(PreflightPhase.host_smoke.canRunBeforeGuest());
+    try std.testing.expect(!PreflightPhase.guest_runtime.canRunBeforeGuest());
+    try std.testing.expect(!PreflightPhase.guest_output.canRunBeforeGuest());
 }

@@ -212,7 +212,11 @@ const rules = [_]Rule{
     .{ .prefix = "stbrp_", .workload = .font_atlas_packing, .owner = .ui_thread },
     .{ .prefix = "rect_height_compare", .workload = .font_atlas_packing, .owner = .ui_thread },
     .{ .prefix = "ImFontAtlas", .workload = .font_atlas_build, .owner = .ui_thread },
-    .{ .prefix = "ImFont", .workload = .font_atlas_build, .owner = .ui_thread },
+    // ImFont::CalcTextSizeA / RenderText are per-frame consumers of an
+    // existing atlas, not builders. Calling them a build made the startup
+    // wall oscillate throughout the September 18 run.
+    .{ .prefix = "ImFont::Build", .workload = .font_atlas_build, .owner = .ui_thread },
+    .{ .prefix = "ImFont", .workload = .ui_drawing, .owner = .ui_thread },
     .{ .prefix = "ImGui_ImplX", .workload = .ui_drawing, .owner = .ui_thread },
     .{ .prefix = "ImDrawList", .workload = .ui_drawing, .owner = .ui_thread },
     .{ .prefix = "ImGui", .workload = .ui_drawing, .owner = .ui_thread },
@@ -324,6 +328,17 @@ test "an unnamed address is not classified as unrecognized work" {
     // this table, the other is a gap in the image's symbols.
     try std.testing.expectEqual(Workload.unnamed, classify("").workload);
     try std.testing.expectEqual(Workload.unclassified, classify("SomeFunctionNobodyMapped").workload);
+}
+
+test "font layout and rendering do not reopen the bounded atlas startup wall" {
+    for ([_][]const u8{ "ImFont::CalcTextSizeA", "ImFont::RenderText", "ImFont::RenderChar", "ImFont::FindGlyph" }) |symbol| {
+        const result = classify(symbol);
+        try std.testing.expectEqual(Workload.ui_drawing, result.workload);
+        try std.testing.expect(!result.isBoundedComputation());
+        try std.testing.expect(result.workload.isFrameWork());
+    }
+    try std.testing.expectEqual(Workload.font_atlas_build, classify("ImFontAtlasBuildWithStbTruetype").workload);
+    try std.testing.expectEqual(Workload.font_atlas_build, classify("ImFont::BuildLookupTable").workload);
 }
 
 test "a specific graphics rule outranks the general one" {

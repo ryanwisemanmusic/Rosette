@@ -187,10 +187,25 @@ pub const Provider = enum {
     }
 };
 
+/// How many example names to keep per stage.
+///
+/// Four is enough to recognise a stage at a glance and few enough that ten of
+/// them still fit in a log a person will read.
+pub const example_names_per_stage: usize = 4;
+
 /// What was found for one stage.
 pub const StageFacts = struct {
     stage: Stage = .unclassified,
     symbols: u32 = 0,
+    /// A few of the stage's shortest symbol names.
+    ///
+    /// Shortest, not first: a mangled C++ name grows with everything enclosing
+    /// it, so `VdSwap` and a two-hundred-character template instantiation that
+    /// merely mentions `VdSwap` are both in this stage and only one of them
+    /// tells a reader what is here. The existing tracepoint resolver ranks
+    /// candidates the same way and for the same reason.
+    examples: [example_names_per_stage][]const u8 = [_][]const u8{""} ** example_names_per_stage,
+    example_count: u8 = 0,
     /// Commutative mix of the stage's symbol names. Order- and
     /// address-independent by design.
     fingerprint: u64 = 0,
@@ -210,8 +225,66 @@ pub const StageFacts = struct {
             if (self.lowest_address == 0 or address < self.lowest_address) self.lowest_address = address;
             if (address > self.highest_address) self.highest_address = address;
         }
+        self.rememberExample(symbol_name);
+    }
+
+    /// Keep the most representative names seen so far.
+    ///
+    /// Code first, then shortest. Ranking on length alone fills every stage
+    /// with `__ZTV`/`__ZTI`/`__ZTS` entries, because a vtable's mangled name is
+    /// shorter than any method on the class it belongs to — so the reader is
+    /// shown that `CommandProcessor` has a vtable rather than that it has an
+    /// `ExecutePacket`.
+    fn rememberExample(self: *StageFacts, symbol_name: []const u8) void {
+        if (symbol_name.len == 0) return;
+        if (self.example_count < self.examples.len) {
+            self.examples[self.example_count] = symbol_name;
+            self.example_count += 1;
+            return;
+        }
+        const candidate_is_metadata = isTypeMetadataName(symbol_name);
+        var weakest: usize = 0;
+        for (self.examples[1..], 1..) |held, index| {
+            if (exampleIsWeakerThan(held, self.examples[weakest])) weakest = index;
+        }
+        const held_is_metadata = isTypeMetadataName(self.examples[weakest]);
+        // A code name displaces metadata whatever its length; otherwise the
+        // shorter of two like-for-like wins.
+        if (held_is_metadata and !candidate_is_metadata) {
+            self.examples[weakest] = symbol_name;
+            return;
+        }
+        if (!held_is_metadata and candidate_is_metadata) return;
+        if (symbol_name.len < self.examples[weakest].len) self.examples[weakest] = symbol_name;
+    }
+
+    pub fn exampleNames(self: *const StageFacts) []const []const u8 {
+        return self.examples[0..self.example_count];
     }
 };
+
+/// Whether a mangled name is Itanium type metadata rather than code.
+///
+/// `__ZTV` vtable, `__ZTI` typeinfo, `__ZTS` typeinfo name, `__ZTT` VTT,
+/// `__ZTC` construction vtable, `__ZGV` guard variable. Every one of these is
+/// shorter than the methods of the class it describes, so without this the
+/// examples are all metadata and none of them is a function.
+pub fn isTypeMetadataName(symbol_name: []const u8) bool {
+    const prefixes = [_][]const u8{ "__ZTV", "__ZTI", "__ZTS", "__ZTT", "__ZTC", "__ZGV" };
+    for (prefixes) |prefix| {
+        if (std.mem.startsWith(u8, symbol_name, prefix)) return true;
+    }
+    return false;
+}
+
+/// Whether `candidate` is a worse example than `against`: metadata loses to
+/// code, and among equals the longer name loses.
+fn exampleIsWeakerThan(candidate: []const u8, against: []const u8) bool {
+    const candidate_metadata = isTypeMetadataName(candidate);
+    const against_metadata = isTypeMetadataName(against);
+    if (candidate_metadata != against_metadata) return candidate_metadata;
+    return candidate.len > against.len;
+}
 
 /// FNV-1a over a symbol name.
 pub fn nameHash(name: []const u8) u64 {
@@ -475,4 +548,94 @@ test "the required environment names are the ones the guest cannot start without
     try std.testing.expect(environmentNameIsRequired("ROSETTE_BACKEND"));
     try std.testing.expect(!environmentNameIsRequired("HOME"));
     try std.testing.expect(!environmentNameIsRequired(""));
+}
+
+test "a stage keeps its shortest names, not the first ones it saw" {
+    var facts = StageFacts{ .stage = .swap };
+    // A template instantiation that merely mentions the method is in the same
+    // stage and says nothing about it.
+    facts.observe("__ZNSt3__110__function12__alloc_funcIZN2xe3gpu16CommandProcessor9IssueSwapEvE3$_2EE", 0x1000);
+    facts.observe("__ZN2xe3gpu16CommandProcessor9IssueSwapEv", 0x1010);
+    facts.observe("VdSwap", 0x1020);
+    facts.observe("__ZN2xe6kernel8xboxkrnl6VdSwapEPNS_3cpu10ppc_contextE", 0x1030);
+    facts.observe("XE_SWAP", 0x1040);
+
+    const names = facts.exampleNames();
+    try std.testing.expectEqual(example_names_per_stage, names.len);
+    // The two shortest must both survive the eviction.
+    var saw_short = false;
+    var saw_swap = false;
+    var saw_longest = false;
+    for (names) |name| {
+        if (std.mem.eql(u8, name, "VdSwap")) saw_short = true;
+        if (std.mem.eql(u8, name, "XE_SWAP")) saw_swap = true;
+        if (std.mem.indexOf(u8, name, "__alloc_func") != null) saw_longest = true;
+    }
+    try std.testing.expect(saw_short);
+    try std.testing.expect(saw_swap);
+    try std.testing.expect(!saw_longest);
+    // Examples are a view, never a second count.
+    try std.testing.expectEqual(@as(u32, 5), facts.symbols);
+}
+
+test "a stage with fewer symbols than slots keeps all of them" {
+    var facts = StageFacts{ .stage = .ring };
+    facts.observe("RingBufferA", 0x1000);
+    facts.observe("RingBufferB", 0x1010);
+    try std.testing.expectEqual(@as(usize, 2), facts.exampleNames().len);
+    try std.testing.expectEqualStrings("RingBufferA", facts.exampleNames()[0]);
+}
+
+test "examples do not disturb the fingerprint or the address range" {
+    var with_examples = StageFacts{ .stage = .ring };
+    with_examples.observe("RingBufferShort", 0x2000);
+    with_examples.observe("RingBufferAVeryMuchLongerNameIndeed", 0x1000);
+
+    // The fingerprint is still order- and length-independent.
+    var reversed = StageFacts{ .stage = .ring };
+    reversed.observe("RingBufferAVeryMuchLongerNameIndeed", 0x1000);
+    reversed.observe("RingBufferShort", 0x2000);
+    try std.testing.expectEqual(with_examples.fingerprint, reversed.fingerprint);
+    try std.testing.expectEqual(@as(u64, 0x1000), with_examples.lowest_address);
+    try std.testing.expectEqual(@as(u64, 0x2000), with_examples.highest_address);
+}
+
+test "code displaces type metadata however long the code name is" {
+    var facts = StageFacts{ .stage = .command_processor };
+    // Fill every slot with metadata, which is what a length-only ranking
+    // produces on a real image.
+    facts.observe("__ZTVN2xe3gpu16CommandProcessorE", 0x1000);
+    facts.observe("__ZTIN2xe3gpu16CommandProcessorE", 0x1010);
+    facts.observe("__ZTSN2xe3gpu16CommandProcessorE", 0x1020);
+    facts.observe("__ZGVN2xe3gpu16CommandProcessorE", 0x1030);
+    // A much longer code name is still the better example.
+    facts.observe("__ZN2xe3gpu16CommandProcessor13ExecutePacketEPNS_10RingBufferEjRj", 0x1040);
+
+    var saw_code = false;
+    for (facts.exampleNames()) |name| {
+        if (std.mem.indexOf(u8, name, "ExecutePacket") != null) saw_code = true;
+    }
+    try std.testing.expect(saw_code);
+}
+
+test "metadata never displaces code" {
+    var facts = StageFacts{ .stage = .ring };
+    facts.observe("RingBufferRead", 0x1000);
+    facts.observe("RingBufferWrite", 0x1010);
+    facts.observe("RingBufferEmpty", 0x1020);
+    facts.observe("RingBufferFull", 0x1030);
+    // Shorter, but metadata, so it must not evict any of the four above.
+    facts.observe("__ZTV2Rb", 0x1040);
+    for (facts.exampleNames()) |name| {
+        try std.testing.expect(!isTypeMetadataName(name));
+    }
+}
+
+test "type metadata is recognised by its Itanium prefix" {
+    try std.testing.expect(isTypeMetadataName("__ZTVN2xe3gpu16CommandProcessorE"));
+    try std.testing.expect(isTypeMetadataName("__ZTIN2xe3gpu12SharedMemoryE"));
+    try std.testing.expect(isTypeMetadataName("__ZGVZN2xe4castEvE1x"));
+    try std.testing.expect(!isTypeMetadataName("__ZN2xe3gpu16CommandProcessor9IssueSwapEjjj"));
+    try std.testing.expect(!isTypeMetadataName("VdSwap"));
+    try std.testing.expect(!isTypeMetadataName(""));
 }

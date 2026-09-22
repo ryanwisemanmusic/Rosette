@@ -10,6 +10,8 @@ pub const host_pointer_bits: u8 = 64;
 
 pub const PrimitiveFamily = enum(u8) {
     strlen,
+    strchr,
+    strtoull,
     memcmp,
     memcpy,
     strcmp,
@@ -25,6 +27,8 @@ pub const PrimitiveFamily = enum(u8) {
 /// handler relative to the general registry path.
 pub fn lookup(symbol_name: []const u8) ?PrimitiveFamily {
     if (std.mem.indexOf(u8, symbol_name, "strlen") != null) return .strlen;
+    if (std.mem.indexOf(u8, symbol_name, "strchr") != null) return .strchr;
+    if (std.mem.indexOf(u8, symbol_name, "strtoull") != null) return .strtoull;
     if (std.mem.indexOf(u8, symbol_name, "memcmp") != null) return .memcmp;
     if (std.mem.indexOf(u8, symbol_name, "memcpy") != null) return .memcpy;
     if (std.mem.indexOf(u8, symbol_name, "strcmp") != null) return .strcmp;
@@ -45,6 +49,8 @@ pub fn contractIsWellFormed() bool {
 test "hot primitive names select only existing route families" {
     try std.testing.expectEqual(PrimitiveFamily.strcmp, lookup("_strcmp") orelse return error.TestUnexpectedResult);
     try std.testing.expectEqual(PrimitiveFamily.strlen, lookup("_strlen") orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(PrimitiveFamily.strchr, lookup("_strchr") orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(PrimitiveFamily.strtoull, lookup("_strtoull") orelse return error.TestUnexpectedResult);
     try std.testing.expectEqual(PrimitiveFamily.memcmp, lookup("_memcmp") orelse return error.TestUnexpectedResult);
     try std.testing.expectEqual(PrimitiveFamily.memcpy, lookup("_memcpy") orelse return error.TestUnexpectedResult);
     try std.testing.expectEqual(PrimitiveFamily.cxa_guard_acquire, lookup("___cxa_guard_acquire") orelse return error.TestUnexpectedResult);

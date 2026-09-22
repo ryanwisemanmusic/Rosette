@@ -68,6 +68,182 @@ pub const ReturnConvention = enum {
     }
 };
 
+/// Whether a value a handler actually returned spells failure in this ABI.
+///
+/// The contract until now described what Rosette *would* answer if a name
+/// fell through to the generic fallback. Most names do not: they are answered
+/// by hand, and a hand-written handler that refuses is invisible unless it
+/// remembers to say so. On the 2026-09-12 run the whole refusal ledger held
+/// one line, for the one handler that had been wired by hand, while several
+/// hundred imports were answered without anyone recording what they said.
+///
+/// This inverts it. A refusal is a property of the value against the name's
+/// convention, not of the code path that produced it, so classifying the
+/// value catches every handler - including ones written after this comment.
+///
+/// The conventions with no failure value say so rather than guessing. A
+/// `zero_count` of zero is a legitimate answer ("no items"), a `void_call`
+/// has no answer at all, and calling either a refusal would bury the real
+/// ones under noise.
+pub fn valueIsRefusal(convention: ReturnConvention, value: u64) bool {
+    return switch (convention) {
+        // No answer, or an answer where zero is ordinary.
+        .void_call, .zero_count => false,
+        .bool32 => (value & 0xFFFF_FFFF) == 0,
+        .handle => value == 0,
+        // Documented as INVALID_HANDLE_VALUE; a 32-bit handler may have left
+        // only the low word set, so both widths count.
+        .invalid_handle => value == 0 or
+            value == 0xFFFF_FFFF_FFFF_FFFF or
+            (value & 0xFFFF_FFFF) == 0xFFFF_FFFF,
+        // Zero is success for all four of these.
+        .lstatus, .winsock_status => (value & 0xFFFF_FFFF) != 0,
+        // FAILED(hr): the sign bit of the 32-bit HRESULT. A positive non-zero
+        // HRESULT (S_FALSE) is a success the guest acts on, not a refusal.
+        .hresult => (value & 0x8000_0000) != 0,
+        // NTSTATUS severity 3 is error; 0 success, 1 informational,
+        // 2 warning. Only an error is a refusal.
+        .ntstatus => ((value >> 30) & 0x3) == 3,
+    };
+}
+
+/// Whether a value under this convention can be judged without knowing what
+/// the function does.
+///
+/// `valueIsRefusal` answers the question the convention poses. This answers
+/// whether the question is worth asking, and the two are not the same,
+/// because `returnConvention` assigns some conventions from an explicit rule
+/// and others from a name-shaped guess.
+///
+/// The four error-code conventions are explicit: a name reaches `.hresult`,
+/// `.ntstatus`, `.lstatus` or `.winsock_status` only through a registry
+/// prefix, an NTSTATUS prefix, a named HRESULT shape, an HRESULT-dominated
+/// DLL, or a `WSA` prefix. For all four, zero is success and any failing
+/// value is an error code the guest branches on. Judging those is sound.
+///
+/// `.bool32`, `.handle` and `.zero_count` are the fallthrough. They exist to
+/// decide what value to *hand back* when Rosette has nothing to produce, and
+/// as a success/failure oracle they are wrong in the most common cases in the
+/// run: `WaitForSingleObject` lands on `.bool32` and returns `WAIT_OBJECT_0`,
+/// which is zero and is success; `vkCreateInstance` lands on `.handle`
+/// through the `Create` prefix and returns `VK_SUCCESS`, which is zero and is
+/// success; `memcmp` on equal buffers returns zero. Classifying those would
+/// bury every real refusal under the most frequent successful calls Rosette
+/// makes.
+///
+/// `.invalid_handle` is decisive because nothing reaches it except the
+/// explicit override table, and `INVALID_HANDLE_VALUE` is unambiguous.
+///
+/// The cost of this narrowing is honest and worth stating in a report: a NULL
+/// handle or a FALSE that really was a refusal is not counted here.
+pub fn conventionIsDecisive(convention: ReturnConvention) bool {
+    return switch (convention) {
+        .hresult, .ntstatus, .lstatus, .winsock_status, .invalid_handle => true,
+        .bool32, .handle, .zero_count, .void_call => false,
+    };
+}
+
+test "only conventions assigned by an explicit rule are judged" {
+    // These four are reached only through explicit name or DLL rules.
+    try std.testing.expect(conventionIsDecisive(.hresult));
+    try std.testing.expect(conventionIsDecisive(.ntstatus));
+    try std.testing.expect(conventionIsDecisive(.lstatus));
+    try std.testing.expect(conventionIsDecisive(.winsock_status));
+
+    // These are the fallthrough, and their zero is success far more often
+    // than it is failure. The two calls that prove it:
+    try std.testing.expectEqual(ReturnConvention.bool32, returnConvention("kernel32.dll", "WaitForSingleObject"));
+    try std.testing.expect(!conventionIsDecisive(returnConvention("kernel32.dll", "WaitForSingleObject")));
+    // Vulkan returns VkResult, where VK_SUCCESS is zero. Nothing in this
+    // table understands VkResult, so nothing may judge it.
+    try std.testing.expect(!conventionIsDecisive(returnConvention("vulkan-1.dll", "vkCreateInstance")));
+    try std.testing.expect(!conventionIsDecisive(returnConvention("vulkan-1.dll", "vkQueueSubmit")));
+    // And a Win32 `Create*` reached by the name prefix alone is a handle
+    // whose zero really is failure - still not judged, because the rule that
+    // got there is a guess. (`CreateFileW` is in the explicit override table
+    // as `invalid_handle`, which is why it is not the example here.)
+    try std.testing.expectEqual(ReturnConvention.handle, returnConvention("kernel32.dll", "CreateSomethingUnplanned"));
+    try std.testing.expect(!conventionIsDecisive(returnConvention("kernel32.dll", "CreateSomethingUnplanned")));
+    try std.testing.expect(conventionIsDecisive(returnConvention("kernel32.dll", "CreateFileW")));
+
+    // WAIT_OBJECT_0 and VK_SUCCESS are both zero, and both would be reported
+    // as refusals if the fallthrough conventions were judged.
+    try std.testing.expect(valueIsRefusal(.bool32, 0));
+    try std.testing.expect(valueIsRefusal(.handle, 0));
+
+    // The one Xenia actually asks about stays decisive.
+    const dxgi = returnConvention("dxgi.dll", "CreateDXGIFactory1");
+    try std.testing.expectEqual(ReturnConvention.hresult, dxgi);
+    try std.testing.expect(conventionIsDecisive(dxgi));
+    try std.testing.expect(valueIsRefusal(dxgi, 0x8000_4002));
+}
+
+/// How serious a refusal is for the caller, given only the convention.
+///
+/// Used to order a report: an HRESULT or NTSTATUS failure is a hard "this did
+/// not happen" that the guest branches on, while a NULL handle is very often
+/// a probe whose absence the guest expects.
+pub fn refusalIsHard(convention: ReturnConvention) bool {
+    return switch (convention) {
+        .hresult, .ntstatus, .lstatus, .winsock_status => true,
+        .bool32, .handle, .invalid_handle, .zero_count, .void_call => false,
+    };
+}
+
+test "a refusal is decided by the value against the convention" {
+    // HRESULT: only FAILED(hr).
+    try std.testing.expect(valueIsRefusal(.hresult, 0x8000_4002)); // E_NOINTERFACE
+    try std.testing.expect(valueIsRefusal(.hresult, 0x8000_4001)); // E_NOTIMPL
+    try std.testing.expect(!valueIsRefusal(.hresult, 0)); // S_OK
+    try std.testing.expect(!valueIsRefusal(.hresult, 1)); // S_FALSE is a real answer
+
+    // NTSTATUS: severity 3 only.
+    try std.testing.expect(valueIsRefusal(.ntstatus, 0xC000_0002)); // STATUS_NOT_IMPLEMENTED
+    try std.testing.expect(!valueIsRefusal(.ntstatus, 0)); // STATUS_SUCCESS
+    try std.testing.expect(!valueIsRefusal(.ntstatus, 0x4000_0000)); // informational
+    try std.testing.expect(!valueIsRefusal(.ntstatus, 0x8000_000A)); // warning, not an error
+
+    // Zero is success for the error-code conventions.
+    try std.testing.expect(valueIsRefusal(.lstatus, 2)); // ERROR_FILE_NOT_FOUND
+    try std.testing.expect(!valueIsRefusal(.lstatus, 0));
+    try std.testing.expect(valueIsRefusal(.winsock_status, 0x276D));
+    try std.testing.expect(!valueIsRefusal(.winsock_status, 0));
+
+    // Zero is failure for the value conventions.
+    try std.testing.expect(valueIsRefusal(.bool32, 0));
+    try std.testing.expect(!valueIsRefusal(.bool32, 1));
+    // A BOOL is 32 bits: a handler that left garbage in the high half still
+    // returned FALSE.
+    try std.testing.expect(valueIsRefusal(.bool32, 0xDEAD_BEEF_0000_0000));
+    try std.testing.expect(valueIsRefusal(.handle, 0));
+    try std.testing.expect(!valueIsRefusal(.handle, 0x1000));
+    try std.testing.expect(valueIsRefusal(.invalid_handle, 0xFFFF_FFFF_FFFF_FFFF));
+    try std.testing.expect(valueIsRefusal(.invalid_handle, 0xFFFF_FFFF));
+    try std.testing.expect(!valueIsRefusal(.invalid_handle, 0x40));
+
+    // And the two where zero is an ordinary answer are never refusals: a
+    // count of none and a void return are not failures, and reporting them
+    // as such would bury every real one.
+    try std.testing.expect(!valueIsRefusal(.zero_count, 0));
+    try std.testing.expect(!valueIsRefusal(.void_call, 0));
+}
+
+test "the fallback the contract chooses is one its own predicate calls a refusal" {
+    // The two halves have to agree, or a name answered by the generic path
+    // would be recorded differently from the same name answered by hand.
+    for ([_][2][]const u8{
+        .{ "ADVAPI32.dll", "RegOpenKeyExW" },
+        .{ "ole32.dll", "CoCreateInstance" },
+        .{ "dxgi.dll", "CreateDXGIFactory1" },
+        .{ "SETUPAPI.dll", "CM_Get_Parent" },
+        .{ "WSOCK32.dll", "WSAGetLastError" },
+    }) |pair| {
+        const fallback = fallbackFor(pair[0], pair[1]);
+        if (fallback.outcome != .refused) continue;
+        try std.testing.expect(valueIsRefusal(fallback.convention, fallback.value));
+    }
+}
+
 /// What the fallback claimed.  A refusal is the normal case; a success is
 /// reserved for calls with no output parameter and no state to produce, where
 /// claiming failure would be the dishonest answer instead.
@@ -160,6 +336,31 @@ const convention_overrides = [_]ConventionOverride{
     .{ .name = "RegisterClassW", .convention = .zero_count },
     .{ .name = "RegisterClassExA", .convention = .zero_count },
     .{ .name = "RegisterClassExW", .convention = .zero_count },
+    // `HidP_MaxDataListLength` and `HidP_MaxUsageListLength` are the two
+    // members of the HidP family that return a count, not an NTSTATUS.
+    // Zero is the correct refusal for both, but the convention has to say so
+    // or the NTSTATUS rule would hand back STATUS_NOT_IMPLEMENTED as a length.
+    .{ .name = "HidP_MaxDataListLength", .convention = .zero_count },
+    .{ .name = "HidP_MaxUsageListLength", .convention = .zero_count },
+    // `HidD_*` returns BOOLEAN; the `Get`/`Set` shape rules below would
+    // otherwise place several of them in the neutral count bucket, which
+    // reads the same but describes the call wrongly in a report.
+    .{ .name = "HidD_GetAttributes", .convention = .bool32 },
+    .{ .name = "HidD_GetManufacturerString", .convention = .bool32 },
+    .{ .name = "HidD_GetProductString", .convention = .bool32 },
+    .{ .name = "HidD_GetSerialNumberString", .convention = .bool32 },
+    .{ .name = "HidD_GetIndexedString", .convention = .bool32 },
+    .{ .name = "HidD_GetPreparsedData", .convention = .bool32 },
+    .{ .name = "HidD_FreePreparsedData", .convention = .bool32 },
+    .{ .name = "HidD_GetFeature", .convention = .bool32 },
+    .{ .name = "HidD_SetFeature", .convention = .bool32 },
+    .{ .name = "HidD_GetInputReport", .convention = .bool32 },
+    .{ .name = "HidD_SetOutputReport", .convention = .bool32 },
+    .{ .name = "HidD_SetNumInputBuffers", .convention = .bool32 },
+    .{ .name = "HidD_FlushQueue", .convention = .bool32 },
+    // The one Configuration Manager routine that is not a CONFIGRET: it
+    // converts one and hands back a Win32 error code.
+    .{ .name = "CM_MapCrToWin32Err", .convention = .zero_count },
 };
 
 /// Initializers with no output parameter, where a guest expects to be able to
@@ -241,6 +442,13 @@ fn isHresultName(name: []const u8) bool {
     if (std.mem.eql(u8, name, "SetThreadDescription")) return true;
     if (std.mem.startsWith(u8, name, "SHGetKnownFolderPath")) return true;
     if (std.mem.startsWith(u8, name, "SHCreateItem")) return true;
+    // SHCore's per-monitor DPI surface. `GetDpiForMonitor` returns an HRESULT
+    // and writes its two answers through out-parameters, so a zero return
+    // with nothing written is `S_OK` plus whatever was on the caller's stack.
+    if (std.mem.eql(u8, name, "GetDpiForMonitor")) return true;
+    if (std.mem.eql(u8, name, "GetScaleFactorForMonitor")) return true;
+    if (std.mem.eql(u8, name, "SetProcessDpiAwareness")) return true;
+    if (std.mem.eql(u8, name, "GetProcessDpiAwareness")) return true;
     return false;
 }
 
@@ -249,6 +457,18 @@ fn isNtStatusName(name: []const u8) bool {
     if (std.mem.startsWith(u8, name, "Zw") and name.len > 2 and std.ascii.isUpper(name[2])) return true;
     if (std.mem.startsWith(u8, name, "BCrypt")) return true;
     if (std.mem.startsWith(u8, name, "NCrypt")) return true;
+    // The HID parsing surface returns NTSTATUS, and its success value is
+    // `HIDP_STATUS_SUCCESS` = 0. A caller that reads zero as success then
+    // trusts a capability structure Rosetta never wrote. `HidD_*` is the
+    // other half of the same library and returns BOOLEAN, where zero is the
+    // refusal - so the two prefixes must be separated, not lumped together.
+    if (std.mem.startsWith(u8, name, "HidP_")) return true;
+    // Configuration Manager routines return CONFIGRET, whose success value
+    // is zero. A caller told CR_SUCCESS then reads a devinst handle, a
+    // device-id string or a list size that nothing wrote. The refusal is
+    // CR_FAILURE (0x13), which is not an NTSTATUS but shares the property
+    // this convention exists for: non-zero means it did not happen.
+    if (std.mem.startsWith(u8, name, "CM_")) return true;
     return false;
 }
 
@@ -454,6 +674,41 @@ pub fn advice(fallback: Fallback) []const u8 {
         .bool32 => "returns FALSE with ERROR_CALL_NOT_IMPLEMENTED; implement if the guest depends on the effect",
         .void_call, .zero_count => "no observable result; safe to leave unimplemented",
     };
+}
+
+test "the HID library's two return conventions are kept apart" {
+    // HidP_* is NTSTATUS, where zero is HIDP_STATUS_SUCCESS: a guest told
+    // "success" then reads a capability structure Rosetta never wrote.
+    const caps = fallbackFor("hid.dll", "HidP_GetCaps");
+    try std.testing.expectEqual(ReturnConvention.ntstatus, caps.convention);
+    try std.testing.expectEqual(Outcome.refused, caps.outcome);
+    try std.testing.expect(caps.value != 0);
+
+    // HidD_* is BOOLEAN, where zero *is* the refusal.
+    const attributes = fallbackFor("hid.dll", "HidD_GetAttributes");
+    try std.testing.expectEqual(ReturnConvention.bool32, attributes.convention);
+    try std.testing.expectEqual(@as(u64, 0), attributes.value);
+
+    // The two counting members of HidP are neither.
+    const length = fallbackFor("hid.dll", "HidP_MaxDataListLength");
+    try std.testing.expectEqual(ReturnConvention.zero_count, length.convention);
+    try std.testing.expectEqual(@as(u64, 0), length.value);
+}
+
+test "a Configuration Manager refusal is never spelled with CR_SUCCESS" {
+    const parent = fallbackFor("cfgmgr32.dll", "CM_Get_Parent");
+    try std.testing.expectEqual(Outcome.refused, parent.outcome);
+    try std.testing.expect(parent.value != 0);
+    // The converter is not a CONFIGRET and must stay a plain count.
+    const mapper = fallbackFor("cfgmgr32.dll", "CM_MapCrToWin32Err");
+    try std.testing.expectEqual(ReturnConvention.zero_count, mapper.convention);
+}
+
+test "SHCore's DPI surface is an HRESULT with out-parameters, not a neutral count" {
+    const dpi = fallbackFor("SHCore.dll", "GetDpiForMonitor");
+    try std.testing.expectEqual(ReturnConvention.hresult, dpi.convention);
+    try std.testing.expectEqual(Outcome.refused, dpi.outcome);
+    try std.testing.expect(dpi.value != 0);
 }
 
 test "zero is only a refusal for the conventions that spell failure with it" {

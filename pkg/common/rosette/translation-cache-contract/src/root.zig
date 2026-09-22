@@ -74,44 +74,67 @@ pub const BankRange = struct {
     end: usize,
 };
 
-/// A cache layout expressed in total set count, not entry count. For a banked
-/// layout, `total_set_count` includes every domain bank. For an unbanked
-/// layout, all sets belong to the one owner selected by the caller.
+/// Local set count per ownership bank.
+///
+/// Banks are sized by measured demand, not by symmetry. An equal split reads
+/// as fair and is not: it hands every domain the same capacity regardless of
+/// how much code that domain actually contains, so the busiest bank runs out
+/// while the others hold nothing. Index order matches `Domain.bank()`.
+pub const BankSets = [domain_count]usize;
+
+/// A cache layout expressed in per-bank set counts, not entry count. An
+/// unbanked layout keeps all of its sets in index 0 and leaves the rest zero.
 pub const Layout = struct {
     name: []const u8,
-    total_set_count: usize,
+    bank_sets: BankSets,
     ways: usize,
     banked: bool,
     kind: LayoutKind,
 
-    pub fn entryCount(self: Layout) usize {
-        return self.total_set_count * self.ways;
+    pub fn totalSetCount(self: Layout) usize {
+        if (!self.banked) return self.bank_sets[0];
+        var total: usize = 0;
+        for (self.bank_sets) |sets| total += sets;
+        return total;
     }
 
-    pub fn localSetCount(self: Layout) usize {
-        if (!self.banked) return self.total_set_count;
-        std.debug.assert(self.total_set_count >= domain_count);
-        std.debug.assert(self.total_set_count % domain_count == 0);
-        return self.total_set_count / domain_count;
+    pub fn entryCount(self: Layout) usize {
+        return self.totalSetCount() * self.ways;
+    }
+
+    pub fn localSetCount(self: Layout, domain: Domain) usize {
+        if (!self.banked) return self.bank_sets[0];
+        return self.bank_sets[domain.bank()];
+    }
+
+    /// The first *set* of a bank, in whole-table set coordinates. With unequal
+    /// banks this is a running sum rather than `bank * localSetCount`, and
+    /// reproducing the old product anywhere would land a lookup in the wrong
+    /// domain's memory.
+    pub fn bankFirstSet(self: Layout, domain: Domain) usize {
+        if (!self.banked) return 0;
+        var first: usize = 0;
+        for (self.bank_sets[0..domain.bank()]) |sets| first += sets;
+        return first;
     }
 
     /// Return the local set number before the domain-bank offset is applied.
     /// Keeping this separate makes it possible to compare two domains' set
     /// coordinates without accidentally comparing their global slot bases.
-    pub fn setIndex(self: Layout, address: u64) usize {
-        return self.setIndexChoice(address, 0);
+    pub fn setIndex(self: Layout, address: u64, domain: Domain) usize {
+        return self.setIndexChoice(address, domain, 0);
     }
 
     /// Return a local set using one of the bounded primary hash choices.
     /// Non-primary layouts have one canonical choice; callers should use their
     /// ordinary `setIndex`/`setBase` methods for those layouts.
-    pub fn setIndexChoice(self: Layout, address: u64, choice: usize) usize {
+    pub fn setIndexChoice(self: Layout, address: u64, domain: Domain, choice: usize) usize {
         // Only the primary table has sibling placements. Silently accepting
         // choice 1 for the victim or static-L2 tables would make a caller's
         // lookup and invalidation disagree about which secondary entry is
         // authoritative.
         if (self.kind != .primary) std.debug.assert(choice == 0);
-        const local_sets = self.localSetCount();
+        const local_sets = self.localSetCount(domain);
         std.debug.assert(local_sets != 0);
         const mixed = mixAddress(address, self.kind, choice);
         return @intCast(mixed % local_sets);
@@ -124,39 +147,65 @@ pub const Layout = struct {
     }
 
     pub fn setBaseChoice(self: Layout, address: u64, domain: Domain, choice: usize) usize {
-        const local_set = self.setIndexChoice(address, choice);
-        const bank = if (self.banked) domain.bank() else 0;
-        return (bank * self.localSetCount() + local_set) * self.ways;
+        const local_set = self.setIndexChoice(address, domain, choice);
+        return (self.bankFirstSet(domain) + local_set) * self.ways;
     }
 
     pub fn bankRange(self: Layout, domain: Domain) BankRange {
         if (!self.banked) {
             return .{ .start = 0, .end = self.entryCount() };
         }
-        const bank_entries = self.localSetCount() * self.ways;
-        const start = domain.bank() * bank_entries;
-        return .{ .start = start, .end = start + bank_entries };
+        const start = self.bankFirstSet(domain) * self.ways;
+        return .{ .start = start, .end = start + self.localSetCount(domain) * self.ways };
     }
 
     pub fn wellFormed(self: Layout) bool {
-        if (self.total_set_count == 0 or self.ways == 0) return false;
-        if (self.banked and self.total_set_count % domain_count != 0) return false;
+        if (self.ways == 0) return false;
+        if (!self.banked) return self.bank_sets[0] != 0 and self.entryCount() != 0;
+        // Every bank has to be able to hold something. A zero-set bank makes
+        // `mixed % local_sets` divide by zero for any address routed to it,
+        // and a domain that looks unused today is one classifier change away
+        // from being used tomorrow.
+        for (self.bank_sets) |sets| {
+            if (sets == 0) return false;
+        }
         return self.entryCount() != 0;
     }
 };
 
 pub const primary_layout = Layout{
     .name = "primary",
-    // Give every ownership bank 65,536 local sets. The previous 32,768-set
-    // budget was enough for static initialization, but a later graphics setup
-    // burst produced a genuine reused-only 17th resident in one static set.
-    // Doubling the set budget lowers dispersed occupancy without weakening the
-    // strict response to a set that is still genuinely over capacity.
-    .total_set_count = (1 << 16) * domain_count,
+    // Sized from the 2026-09-07 run's own domain census at 3.8 billion steps:
+    //
+    //   static(h/m/f)=3704998956/903034/903034
+    //   dynamic      = 101986938/156999/156999
+    //   thunk        = 0/0/0
+    //   unknown      = 0/0/0
+    //
+    // Under the previous equal split every domain held 65,536 sets, so the
+    // static-image bank was 86% full and evicting while the thunk and unknown
+    // banks — 2,097,152 entries between them, 208 MiB — had never held a
+    // single decode. That is what the split costs when it is chosen for
+    // symmetry: the one bank doing the work runs out while three quarters of
+    // the table is untouched, and the run stops on a capacity fault raised by
+    // a cache that is 25% utilised.
+    //
+    // Static image code is the dominant and slowest-growing consumer (+1,000
+    // fills per 100M steps at this point, essentially converged), so it gets
+    // the room. Generated JIT code is an order of magnitude smaller but grows
+    // ten times faster (+10,000 per 100M steps), so it keeps a full bank.
+    // Thunks and the unclassified fallback are bounded by construction and
+    // get enough to never be the reason a run stops.
+    .bank_sets = .{
+        1 << 17, // static_image      2,097,152 entries — 903K observed, 43%
+        1 << 16, // dynamic_generated 1,048,576 entries — 157K observed, 15%
+        1 << 12, // thunk_bridge         65,536 entries
+        1 << 12, // unknown              65,536 entries
+    },
     // Keep sixteen ways so a local working set still has substantial
-    // associativity after the set-budget increase. The replacement contract
-    // chooses cold entries first and continues to fail fast when every
-    // resident is reused.
+    // associativity. The replacement contract chooses cold entries first and
+    // continues to fail fast when every resident is reused, and `chooseSet`
+    // balances across the two hashed choices before depth becomes an issue.
     .ways = 16,
     .banked = true,
     .kind = .primary,
@@ -164,11 +213,16 @@ pub const primary_layout = Layout{
 
 pub const victim_layout = Layout{
     .name = "victim",
-    // Keep the former 1,024-set victim budget in each bank as well. A victim
-    // table is smaller than primary, but reducing it fourfold per domain
-    // would make its protection dependent on which address class won the
-    // bank partition.
-    .total_set_count = (1 << 10) * domain_count,
+    // The victim tier holds what the primary drops, so it is scaled to the
+    // same demand ratio rather than split evenly. It stays far smaller than
+    // primary in every bank: its job is to absorb a short-lived burst, not to
+    // be a second copy of the working set.
+    .bank_sets = .{
+        1 << 12, // static_image
+        1 << 10, // dynamic_generated
+        1 << 8, // thunk_bridge
+        1 << 8, // unknown
+    },
     .ways = 4,
     .banked = true,
     .kind = .victim,
@@ -176,7 +230,12 @@ pub const victim_layout = Layout{
 
 pub const static_l2_layout = Layout{
     .name = "static-l2",
-    .total_set_count = 1 << 15,
+    // Only ever holds static-image decodes evicted from the primary, so it is
+    // sized against that eviction stream rather than against the whole image.
+    // See `saveStaticDecodeL2`: filling it on every primary fill instead made
+    // it a write-only table — the 2026-09-07 run recorded 903,034 fills and
+    // zero hits.
+    .bank_sets = .{ 1 << 15, 0, 0, 0 },
     .ways = 4,
     .banked = false,
     .kind = .static_l2,
@@ -364,9 +423,78 @@ pub fn chooseReplacement(states: []const ReplacementState) ?ReplacementChoice {
     };
 }
 
+/// One hashed set choice, summarised for a placement decision.
+///
+/// The runtime passes a count rather than the ways themselves so this decision
+/// stays free of entry layout, and so a caller can compute occupancy with a
+/// side-effect-free scan instead of running the replacement policy — which
+/// clears reference bits — on a set it is not going to use.
+pub const SetOccupancy = struct {
+    occupied: usize,
+    ways: usize,
+    /// Only read when the set is full: the reuse count and reference bit of
+    /// the resident `chooseReplacement` would evict from it.
+    victim_reuse_count: u16 = 0,
+    victim_recently_used: bool = false,
+
+    pub fn hasFreeWay(self: SetOccupancy) bool {
+        return self.occupied < self.ways;
+    }
+};
+
+/// Choose which hashed set a fill goes into.
+///
+/// The two independently seeded set choices exist to balance load, and that
+/// only happens if placement actually compares them. Filling the first choice
+/// until it is *completely* full and consulting the second only then is
+/// first-fit, not two-choice: it leaves placement statistically single-choice,
+/// so set depth follows the plain balls-in-bins tail instead of the doubly
+/// logarithmic one that two choices buy.
+///
+/// Measured on the 2026-09-07 run's own numbers — 470,192 static-image fills
+/// across 65,536 sets of 16 ways, replayed through `mixAddress` — first fit
+/// drove 226 fills into a completely full first choice and left exactly one
+/// with both choices full, which is the single `cold-eviction` that run
+/// reported. Comparing the two choices holds the deepest set at 10 of 16 for
+/// the same stream, so no set fills and no eviction happens at all.
+///
+/// When every choice is full the decision falls back to the victim comparison,
+/// which is the point at which the working set genuinely does not fit and
+/// strict policy is supposed to say so.
+pub fn chooseSet(candidates: []const SetOccupancy) ?usize {
+    if (candidates.len == 0) return null;
+    var selected: usize = 0;
+    var found_free = candidates[0].hasFreeWay();
+    for (candidates[1..], 1..) |candidate, index| {
+        const current = candidates[selected];
+        if (candidate.hasFreeWay()) {
+            // Prefer a free way, then the shallower set. Depth is what the
+            // second choice is for; ties keep the first choice so placement
+            // stays deterministic and reproducible across runs.
+            if (!found_free or candidate.occupied < current.occupied) {
+                selected = index;
+                found_free = true;
+            }
+            continue;
+        }
+        if (found_free) continue;
+        // Every choice so far is full: evict the least valuable resident.
+        if (candidate.victim_reuse_count < current.victim_reuse_count or
+            (candidate.victim_reuse_count == current.victim_reuse_count and
+                !candidate.victim_recently_used and current.victim_recently_used))
+        {
+            selected = index;
+        }
+    }
+    return selected;
+}
+
 /// A fill's cause is part of the cache boundary, not a post-hoc interpretation
-/// of a page counter. In particular, a vacant fill and a cold eviction are
-/// legitimate warming work; they must not be promoted into a fail-fast fault.
+/// of a page counter. A strict fault run is deliberately miss-intolerant, but
+/// it can only be intolerant of misses a cache was ever in a position to
+/// avoid: a cold eviction and every recurring class stop at the exact
+/// instruction that paid for them, while a compulsory first touch is the one
+/// permanent carve-out.
 pub const Cause = enum(u8) {
     vacant_fill,
     capacity_conflict,
@@ -393,21 +521,29 @@ pub const Cause = enum(u8) {
 
     /// Whether a run configured to fail fast must stop on this cause.
     ///
-    /// A cold eviction stays out of this predicate for the same reason it is
-    /// out of `recurring()`: the displaced entry had never been reused. It is
-    /// evidence that the cache saw a non-empty working set during warm-up, not
-    /// evidence that a useful translation was repeatedly lost. The victim and
-    /// static-image L2 caches can also recover that entry without another
-    /// decode. A later address-specific refetch can make cold loss actionable,
-    /// but this fill-site fact alone cannot prove that.
+    /// Strict fault mode is intentionally stronger than the economics
+    /// verdict. A cold eviction stops the run even though `recurring()` says
+    /// it proves no hot conflict, because it is a decode the cache performed
+    /// and then discarded, and it will be performed again if the address is
+    /// reached twice.
     ///
-    /// `vacant_fill` stays out as well: an instruction has to be decoded once,
-    /// and no cache policy makes a first touch free. The report keeps both
-    /// classes visible instead of conflating either one with reusable conflict.
+    /// `vacant_fill` is the one permanent carve-out, and it is not a matter
+    /// of taste. An instruction has to be decoded once; no cache size,
+    /// associativity or replacement policy makes a first touch free. Arming
+    /// this cause stops the very first guest instruction of every run — at
+    /// step zero the cache is empty, so the first fill is necessarily vacant
+    /// — which leaves the invariant unsatisfiable and an allow-list that
+    /// disables it outright as the only usable configuration. `compulsory()`
+    /// keeps the distinction visible and the economics report still counts
+    /// every first touch, so the miss is observed rather than excused.
     pub fn requiresFailFast(self: Cause) bool {
         return switch (self) {
-            .capacity_conflict, .stale_bytes, .flush_collateral => true,
-            .vacant_fill, .cold_eviction => false,
+            .capacity_conflict,
+            .cold_eviction,
+            .stale_bytes,
+            .flush_collateral,
+            => true,
+            .vacant_fill => false,
         };
     }
 
@@ -422,7 +558,7 @@ pub const Cause = enum(u8) {
         return switch (self) {
             .vacant_fill => "COMPULSORY: a first touch of an address never decoded before. No cache can avoid it, so it never stops the run — but it must converge, and a steady rate late in a run means the working set is still growing",
             .capacity_conflict => "FATAL: a live, reused decode was displaced. The work is lost and will be redone",
-            .cold_eviction => "DEFERRED: a non-empty, never-reused decode was displaced during warming; retain it as working-set evidence and require an address-specific refetch before calling it lost reusable work",
+            .cold_eviction => "FATAL/DEFERRED: a non-empty, never-reused decode was displaced during warming; strict fault mode stops at the miss while retaining it as cold working-set evidence",
             .stale_bytes => "FATAL: the cached bytes changed under the cached RIP. Executable mutation is proven for this address",
             .flush_collateral => "FATAL: a coarse invalidation discarded a decode without proving overlap. The refill is avoidable",
         };
@@ -453,11 +589,11 @@ pub inline fn shouldFailFast(cause: Cause, gate: FailFastGate) bool {
 }
 
 // A cold eviction proves no hot conflict — the entry it displaced was never
-// reused. It remains visible as warming/working-set evidence, but the fill site
-// has not proved that the cache discarded useful reusable work.
-test "a cold eviction is observed without becoming fail-fast evidence" {
+// reused. It stays out of `recurring()` for that reason and still stops a
+// strict run, because the decode itself was performed and thrown away.
+test "a cold eviction is fail-fast evidence and a compulsory fill is not" {
     try std.testing.expect(!Cause.cold_eviction.recurring());
-    try std.testing.expect(!Cause.cold_eviction.requiresFailFast());
+    try std.testing.expect(Cause.cold_eviction.requiresFailFast());
     try std.testing.expect(!Cause.cold_eviction.compulsory());
 
     // The one carve-out, and it is permanent.
@@ -486,9 +622,58 @@ test "the fail-fast gate still needs strict mode and a fault policy" {
     try std.testing.expect(!shouldFailFast(cause, .{ .strict = true }));
     try std.testing.expect(shouldFailFast(cause, .{ .strict = true, .fault_policy = true }));
     try std.testing.expect(!shouldFailFast(cause, .{ .strict = true, .fault_policy = true, .allowlisted = true }));
-    try std.testing.expect(!shouldFailFast(.cold_eviction, .{ .strict = true, .fault_policy = true }));
+    try std.testing.expect(shouldFailFast(.cold_eviction, .{ .strict = true, .fault_policy = true }));
     // And a compulsory miss never fails fast, whatever the gate says.
     try std.testing.expect(!shouldFailFast(.vacant_fill, .{ .strict = true, .fault_policy = true }));
+}
+
+// Banks are sized by measured demand, so the properties that used to follow
+// from symmetry now have to be asserted. The 2026-09-07 census is the input:
+// static 903,034 fills, dynamic 156,999, thunk 0, unknown 0, against an equal
+// split that gave every domain 65,536 sets.
+test "bank capacity follows demand and every bank can still hold a decode" {
+    // The busiest domain gets the most room, and the two that recorded no
+    // fills at all are no longer holding a quarter of the table each.
+    try std.testing.expect(
+        primary_layout.localSetCount(.static_image) > primary_layout.localSetCount(.dynamic_generated),
+    );
+    try std.testing.expect(
+        primary_layout.localSetCount(.dynamic_generated) > primary_layout.localSetCount(.thunk_bridge),
+    );
+
+    // The observed working sets fit with room to grow. Occupancy is what the
+    // eviction tail is driven by, so these are the numbers that matter, not
+    // the absolute entry count.
+    const static_occupancy = 903_034 * 100 /
+        (primary_layout.localSetCount(.static_image) * primary_layout.ways);
+    const dynamic_occupancy = 156_999 * 100 /
+        (primary_layout.localSetCount(.dynamic_generated) * primary_layout.ways);
+    try std.testing.expect(static_occupancy < 50);
+    try std.testing.expect(dynamic_occupancy < 50);
+
+    // No bank may be empty: `setIndexChoice` reduces modulo the bank's set
+    // count, so a zero-set bank is a divide by zero for any address a future
+    // classifier change routes there.
+    for (all) |domain| {
+        try std.testing.expect(primary_layout.localSetCount(domain) != 0);
+        try std.testing.expect(victim_layout.localSetCount(domain) != 0);
+    }
+
+    // The unequal split still costs less memory than the equal one it
+    // replaced: four banks of 65,536 sets was 262,144 sets in total.
+    try std.testing.expect(primary_layout.totalSetCount() < (1 << 16) * domain_count);
+    try std.testing.expect(primary_layout.wellFormed());
+
+    // A bank with no sets is refused rather than silently mapped onto its
+    // neighbour.
+    const starved = Layout{
+        .name = "starved",
+        .bank_sets = .{ 1 << 10, 0, 1 << 4, 1 << 4 },
+        .ways = 4,
+        .banked = true,
+        .kind = .victim,
+    };
+    try std.testing.expect(!starved.wellFormed());
 }
 
 test "all layouts are well formed and primary banks are disjoint" {
@@ -517,9 +702,16 @@ test "every mapper and its geometry agree on the selected bank" {
     const dynamic_base = primarySetBase(address, .dynamic_generated);
     try std.testing.expect(static_base != dynamic_base);
     try std.testing.expectEqual(static_base % primary_layout.ways, dynamic_base % primary_layout.ways);
+    // Banks are unequal now, so the dynamic bank starts where the static bank
+    // ends. Reproducing the old `bank * localSetCount` product here is exactly
+    // the mistake `bankFirstSet` exists to prevent.
     try std.testing.expectEqual(
-        static_base / primary_layout.ways + primary_layout.localSetCount(),
+        static_base / primary_layout.ways + primary_layout.localSetCount(.static_image),
         dynamic_base / primary_layout.ways,
+    );
+    try std.testing.expectEqual(
+        primary_layout.bankFirstSet(.dynamic_generated),
+        primary_layout.localSetCount(.static_image),
     );
     try std.testing.expectEqual(static_base, primary_layout.setBase(address, .static_image));
     try std.testing.expectEqual(victimSetBase(address, .thunk_bridge), victim_layout.setBase(address, .thunk_bridge));
@@ -539,19 +731,19 @@ test "static startup conflict pair stays in distinct local sets" {
     // static-image bank. They aliased when the banked table accidentally gave
     // that bank only 8,192 sets; the expanded geometry and remapped seed keep
     // this particular reusable initializer decode out of the same set.
-    const source_set = primary_layout.setIndex(0x001c_bcca);
-    const victim_set = primary_layout.setIndex(0x0019_c23);
+    const source_set = primary_layout.setIndex(0x001c_bcca, .static_image);
+    const victim_set = primary_layout.setIndex(0x0019_c23, .static_image);
     try std.testing.expect(source_set != victim_set);
-    try std.testing.expectEqual(@as(usize, 1 << 16), primary_layout.localSetCount());
-    try std.testing.expectEqual(@as(usize, 1 << 10), victim_layout.localSetCount());
+    try std.testing.expectEqual(@as(usize, 1 << 17), primary_layout.localSetCount(.static_image));
+    try std.testing.expectEqual(@as(usize, 1 << 12), victim_layout.localSetCount(.static_image));
 }
 
 test "graphics setup conflict pair is separated by the expanded static bank" {
     // Regression for the genuine 17th-resident overflow observed after
     // GraphicsSystem setup began. Both starts were static image code and
     // exhausted one 16-way set under the previous 32,768-set budget.
-    const source_set = primary_layout.setIndex(0x00c3_42fc);
-    const victim_set = primary_layout.setIndex(0x009c_0618);
+    const source_set = primary_layout.setIndex(0x00c3_42fc, .static_image);
+    const victim_set = primary_layout.setIndex(0x009c_0618, .static_image);
     try std.testing.expect(source_set != victim_set);
 }
 
@@ -575,7 +767,10 @@ test "every primary placement choice stays inside its ownership bank" {
             for (bases) |base| {
                 try std.testing.expect(base + primary_layout.ways <= primary_layout.entryCount());
                 try std.testing.expectEqual(@as(usize, 0), base % primary_layout.ways);
-                try std.testing.expectEqual(domain.bank(), (base / primary_layout.ways) / primary_layout.localSetCount());
+                const set = base / primary_layout.ways;
+                const first = primary_layout.bankFirstSet(domain);
+                try std.testing.expect(set >= first);
+                try std.testing.expect(set < first + primary_layout.localSetCount(domain));
             }
         }
     }
@@ -595,8 +790,8 @@ test "higher address bits participate in the startup cache set" {
     // preserved the low 15 bits under modulo 2^15, so these two unrelated
     // static functions landed in the same local set despite differing well
     // above bit 14.
-    const source_set = primary_layout.setIndex(0x0027_5a10);
-    const victim_set = primary_layout.setIndex(0x001d_b24);
+    const source_set = primary_layout.setIndex(0x0027_5a10, .static_image);
+    const victim_set = primary_layout.setIndex(0x001d_b24, .static_image);
     try std.testing.expect(source_set != victim_set);
 }
 
@@ -604,22 +799,21 @@ test "previous static-init overflow pair is separated by the primary remap" {
     // This pair previously shared a set under the former primary seed. Once
     // the table is expanded, retain a deterministic separation regression so
     // a future mapper change cannot recreate that avoidable pressure hotspot.
-    const source_set = primary_layout.setIndex(0x0014_1ff3);
-    const victim_set = primary_layout.setIndex(0x0018_a32);
+    const source_set = primary_layout.setIndex(0x0014_1ff3, .static_image);
+    const victim_set = primary_layout.setIndex(0x0018_a32, .static_image);
     try std.testing.expect(source_set != victim_set);
     try std.testing.expectEqual(@as(usize, 16), primary_layout.ways);
 }
 
-// Strict mode stops on proven reusable loss, not on every non-empty fill. A
-// cold eviction is intentionally retained as evidence but is not actionable
-// until a later address-specific observation proves that reusable work was
-// actually lost.
-test "strict policy stops on actionable miss classes" {
+// Strict mode stops on every miss the cache could have avoided, while
+// retaining the cause distinction needed to tell unavoidable first-touch work
+// from avoidable reusable loss.
+test "strict policy stops on every avoidable miss class" {
     const armed = FailFastGate{ .strict = true, .fault_policy = true };
     try std.testing.expect(shouldFailFast(.capacity_conflict, armed));
     try std.testing.expect(shouldFailFast(.stale_bytes, armed));
     try std.testing.expect(shouldFailFast(.flush_collateral, armed));
-    try std.testing.expect(!shouldFailFast(.cold_eviction, armed));
+    try std.testing.expect(shouldFailFast(.cold_eviction, armed));
     try std.testing.expect(!shouldFailFast(.vacant_fill, armed));
     // A cold eviction still proves no hot conflict: the entry it displaced had
     // never been reused, and the two predicates must not be collapsed.
@@ -627,6 +821,132 @@ test "strict policy stops on actionable miss classes" {
     try std.testing.expect(!shouldFailFast(.capacity_conflict, .{ .strict = false, .fault_policy = true }));
     try std.testing.expect(!shouldFailFast(.capacity_conflict, .{ .strict = true, .fault_policy = false }));
     try std.testing.expect(!shouldFailFast(.capacity_conflict, .{ .strict = true, .fault_policy = true, .allowlisted = true }));
+}
+
+// The 2026-09-07 cold eviction. `spirv_cross::Parser::parse+0x397` at guest
+// 0x11f7357 found both of its hashed sets holding sixteen residents each, and
+// the run stopped on `cold-eviction` with `fills/vacant/conflict/cold =
+// 470193/470192/0/1`. Nothing about that set was special: placement had been
+// first-fit, so the second choice only ever saw an address whose first choice
+// was already completely full.
+test "placement compares the two set choices instead of filling the first" {
+    const ways: usize = primary_layout.ways;
+
+    // The regression itself. First fit puts this fill in choice 0 because a
+    // way is free there; the second choice is three deep and is the right
+    // answer.
+    try std.testing.expectEqual(@as(?usize, 1), chooseSet(&.{
+        .{ .occupied = 15, .ways = ways },
+        .{ .occupied = 3, .ways = ways },
+    }));
+
+    // Ties keep the first choice, so placement stays reproducible.
+    try std.testing.expectEqual(@as(?usize, 0), chooseSet(&.{
+        .{ .occupied = 7, .ways = ways },
+        .{ .occupied = 7, .ways = ways },
+    }));
+
+    // A full choice never wins against one with room, in either order.
+    try std.testing.expectEqual(@as(?usize, 1), chooseSet(&.{
+        .{ .occupied = ways, .ways = ways },
+        .{ .occupied = 15, .ways = ways },
+    }));
+    try std.testing.expectEqual(@as(?usize, 0), chooseSet(&.{
+        .{ .occupied = 15, .ways = ways },
+        .{ .occupied = ways, .ways = ways },
+    }));
+
+    // Only when both are genuinely full does the victim comparison decide,
+    // and that is the case strict policy is supposed to stop on.
+    try std.testing.expectEqual(@as(?usize, 1), chooseSet(&.{
+        .{ .occupied = ways, .ways = ways, .victim_reuse_count = 9 },
+        .{ .occupied = ways, .ways = ways, .victim_reuse_count = 0 },
+    }));
+    try std.testing.expectEqual(@as(?usize, 1), chooseSet(&.{
+        .{ .occupied = ways, .ways = ways, .victim_reuse_count = 4, .victim_recently_used = true },
+        .{ .occupied = ways, .ways = ways, .victim_reuse_count = 4, .victim_recently_used = false },
+    }));
+    try std.testing.expectEqual(@as(?usize, null), chooseSet(&.{}));
+}
+
+// The measurement behind the rule above, run against the real mixer rather
+// than argued from a distribution. The stream is the failing run's own demand:
+// 903,034 static-image fills — the working set that bank held when the
+// 2026-09-07 run stopped — placed into the static bank's real geometry.
+//
+// This asserts the pair of fixes together. First-fit at this density overflows
+// a set and evicts; comparing the two choices holds the deepest set at 10 of
+// 16 and evicts nothing. If a later change makes the deepest set reach `ways`
+// again, that is the cold eviction coming back, and the run will stop on it.
+test "two-choice placement keeps the observed demand inside the static bank" {
+    const sets = primary_layout.localSetCount(.static_image);
+    const ways = primary_layout.ways;
+    // The static-image fill count at the 2026-09-07 stop.
+    const fills: usize = 903_034;
+    const load = &struct {
+        var data: [1 << 17]u8 = undefined;
+    }.data;
+    try std.testing.expectEqual(load.len, sets);
+
+    var deepest: usize = 0;
+    var both_full: usize = 0;
+    @memset(load, 0);
+    var prng = std.Random.DefaultPrng.init(0x9E37_79B9_7F4A_7C15);
+    const random = prng.random();
+    for (0..fills) |_| {
+        const address: u64 = 0x1e380 + random.uintLessThan(u64, 0xdc8bf7 - 0x1e380);
+        const first = primary_layout.setIndexChoice(address, .static_image, 0);
+        const second = primary_layout.setIndexChoice(address, .static_image, 1);
+        const candidates = [_]SetOccupancy{
+            .{ .occupied = load[first], .ways = ways },
+            .{ .occupied = load[second], .ways = ways },
+        };
+        if (!candidates[0].hasFreeWay() and !candidates[1].hasFreeWay()) both_full += 1;
+        const set = if (chooseSet(&candidates).? == 0) first else second;
+        if (load[set] == ways) continue;
+        load[set] += 1;
+        deepest = @max(deepest, load[set]);
+    }
+
+    // No set reaches capacity, so no fill ever has to evict a resident, and
+    // the bank is only 43% occupied when it holds the whole observed image.
+    try std.testing.expect(deepest < ways);
+    try std.testing.expectEqual(@as(usize, 0), both_full);
+    try std.testing.expect(fills * 100 / (sets * ways) < 50);
+}
+
+// The 2026-09-07 step-zero fault. `requiresFailFast` had been widened to every
+// cause, so the first fill of an empty cache — `___cxx_global_var_init.2` at
+// guest 0x28a80, initializer 1 of 724, totals `fills/vacant=1/1` — raised
+// SIGSEGV before a single guest instruction retired. No cache holds an address
+// it has never seen, so this configuration cannot be satisfied by any run: the
+// gate is either allow-listed away entirely or the process never starts.
+//
+// The test is written as the run's own first fill rather than as a predicate
+// on the enum, because that is the fact that has to keep holding.
+test "the first fill of an empty cache cannot terminate a strict run" {
+    const armed = FailFastGate{ .strict = true, .fault_policy = true };
+    const empty = [_]ReplacementState{.{ .occupied = false, .recently_used = false, .reuse_count = 0 }} ** primary_layout.ways;
+    const choice = chooseReplacement(&empty).?;
+    try std.testing.expect(choice.empty);
+
+    // An empty way is a vacant fill by construction, and a vacant fill is
+    // compulsory. The two together are what makes step zero survivable.
+    const first_touch = Cause.vacant_fill;
+    try std.testing.expect(first_touch.compulsory());
+    try std.testing.expect(!shouldFailFast(first_touch, armed));
+
+    // Exactly one cause is carved out. Anything else the cache discards is
+    // still work it did and lost, and still stops the run.
+    var carve_outs: usize = 0;
+    inline for (@typeInfo(Cause).@"enum".fields) |field| {
+        const cause: Cause = @enumFromInt(field.value);
+        if (!shouldFailFast(cause, armed)) carve_outs += 1;
+        // Compulsory and fail-fast are exclusive: a miss no policy could have
+        // avoided is never the thing that proves the policy wrong.
+        try std.testing.expect(!(cause.compulsory() and cause.requiresFailFast()));
+    }
+    try std.testing.expectEqual(@as(usize, 1), carve_outs);
 }
 
 // The 2026-09-03 fail-fast. The resident dump showed all thirty-two ways of

@@ -515,7 +515,7 @@ pub const witnesses = [_]Witness{
         .export_name = "VdCallGraphicsNotificationRoutines",
         .module = .xboxkrnl,
         .milestone = "",
-        .proves = "the title told the kernel a display-mode change is happening; D3D calls it around swap, so it is a second, independent sign of a title that has reached its render loop",
+        .proves = "the title told the kernel a display-mode change is happening. D3D does this while it creates its device, so it places a title inside display bring-up; it is not evidence of a render loop, and only VdSwap is",
     },
     .{
         .export_name = "XAudioRegisterRenderDriverClient",
@@ -644,7 +644,6 @@ pub const phase_markers = [_]PhaseMarker{
     // Rendering, first: a title that has reached it has also made every call
     // below, and the furthest phase reached is the answer.
     .{ .export_name = "VdSwap", .phase = .rendering },
-    .{ .export_name = "VdCallGraphicsNotificationRoutines", .phase = .rendering },
 
     .{ .export_name = "VdInitializeRingBuffer", .phase = .gpu_handshake },
     .{ .export_name = "VdSetGraphicsInterruptCallback", .phase = .gpu_handshake },
@@ -652,6 +651,11 @@ pub const phase_markers = [_]PhaseMarker{
     .{ .export_name = "VdGetSystemCommandBuffer", .phase = .gpu_handshake },
 
     .{ .export_name = "VdQueryVideoMode", .phase = .display_query },
+    // Called while D3D builds its device, not around a swap. It was a
+    // `rendering` marker, and on the 2026-09-13 run that put a title with
+    // `VdSwap=0` in the rendering phase and told the reader "the title is
+    // presenting" - the exact opposite of what the ring showed.
+    .{ .export_name = "VdCallGraphicsNotificationRoutines", .phase = .display_query },
     .{ .export_name = "VdQueryRealVideoMode", .phase = .display_query },
     .{ .export_name = "VdQueryVideoFlags", .phase = .display_query },
     .{ .export_name = "VdInitializeEngines", .phase = .display_query },
@@ -945,4 +949,16 @@ test "both entry kinds carry a label and they differ" {
     try std.testing.expect(!std.mem.eql(u8, EntryKind.trampoline.label(), EntryKind.shim.label()));
     try std.testing.expect(EntryKind.trampoline.label().len != 0);
     try std.testing.expect(EntryKind.shim.label().len != 0);
+}
+
+test "only a swap places a title in the rendering phase" {
+    // The one phase whose advice tells a reader to stop suspecting the title.
+    // A marker that can fire before the first swap puts the blame on Xenia's
+    // presenter while the title has not presented anything.
+    for (phase_markers) |marker| {
+        if (marker.phase != .rendering) continue;
+        try std.testing.expectEqualStrings("VdSwap", marker.export_name);
+    }
+    try std.testing.expectEqual(@as(usize, 1), markerCountFor(.rendering));
+    try std.testing.expectEqual(BootPhase.display_query, phaseOf("VdCallGraphicsNotificationRoutines").?);
 }
