@@ -665,3 +665,88 @@ test "PE rejected void commands cannot inflate native or graphics health counter
     }
     try std.testing.expect(saw_unmapped_buffer);
 }
+
+test "PE rectangle tag rides only on draws indexed from Xenia's built-in expansion buffer" {
+    const Capture = struct {
+        var vertex_offsets: [8]i32 = @splat(0);
+        var draws: u32 = 0;
+        fn bindPipeline(_: abi.CommandBuffer, _: u32, _: u64) callconv(.c) void {}
+        fn bindIndex(_: abi.CommandBuffer, _: abi.Buffer, _: u64, _: u32) callconv(.c) void {}
+        fn draw(_: abi.CommandBuffer, _: u32, _: u32, _: u32, offset: i32, _: u32) callconv(.c) void {
+            vertex_offsets[draws] = offset;
+            draws += 1;
+        }
+    };
+    Capture.draws = 0;
+    var state = ElfState.init(std.testing.allocator);
+    defer state.deinit();
+    var bridge = Bridge{};
+    defer bridge.deinit();
+    const forwarder = &bridge.forwarder;
+    forwarder.real_vulkan.command_buffer_map[0] = .{ .synthetic = 0x111, .real = 0x222 };
+    forwarder.real_vulkan.command_buffer_map[1] = .{ .synthetic = 0x113, .real = 0x224 };
+    forwarder.real_vulkan.pipeline_map[0] = .{ .synthetic = 0x501, .real = 0x601 };
+    forwarder.real_vulkan.pipeline_map[1] = .{ .synthetic = 0x502, .real = 0x602 };
+    forwarder.real_vulkan.pipeline_map[2] = .{ .synthetic = 0x503, .real = 0x603 };
+    forwarder.real_vulkan.buffer_map[0] = .{ .synthetic = 0x701, .real = 0x801 };
+    forwarder.real_vulkan.buffer_map[1] = .{ .synthetic = 0x702, .real = 0x802 };
+    // 0x601 was built from a rewritten vertex shader with the strip-and-restart
+    // topology; 0x801 is the built-in index buffer.
+    forwarder.rect_expand_pipelines[0] = 0x601;
+    forwarder.rect_expand_pipeline_count = 1;
+    forwarder.rect_expand_builtin_index_buffer = 0x801;
+    forwarder.real_vulkan.fn_ptrs.cmd_bind_pipeline = Capture.bindPipeline;
+    forwarder.real_vulkan.fn_ptrs.cmd_bind_index_buffer = Capture.bindIndex;
+    forwarder.real_vulkan.fn_ptrs.cmd_draw_indexed = Capture.draw;
+    const stack = state.guestAlloc(128, 16).?;
+    const Call = struct {
+        fn bindPipeline(s: *ElfState, b: *Bridge, cb: u64, point: u64, pipeline: u64) !void {
+            s.regs.rcx = cb;
+            s.regs.rdx = point;
+            s.regs.r8 = pipeline;
+            try std.testing.expect(b.dispatch(s, "vkCmdBindPipeline", 0x9876));
+        }
+        fn bindIndex(s: *ElfState, b: *Bridge, cb: u64, buffer: u64, offset: u64, index_type: u64) !void {
+            s.regs.rcx = cb;
+            s.regs.rdx = buffer;
+            s.regs.r8 = offset;
+            s.regs.r9 = index_type;
+            try std.testing.expect(b.dispatch(s, "vkCmdBindIndexBuffer", 0x9876));
+        }
+        fn draw(s: *ElfState, b: *Bridge, sp: u64, cb: u64, count: u64) !void {
+            s.regs.rcx = cb;
+            s.regs.rdx = count;
+            s.regs.r8 = 1;
+            s.regs.r9 = 0;
+            s.regs.rsp = sp;
+            s.write64(sp + 32, 0);
+            s.write64(sp + 40, 0);
+            try std.testing.expect(b.dispatch(s, "vkCmdDrawIndexed", 0x9876));
+        }
+    };
+    const tag: i32 = @bitCast(@as(u32, 0x8000_0000));
+    state.regs.rsp = stack;
+    // A guest triangle strip with primitive restart on the same pipeline,
+    // with a rectangle-shaped count, stays a strip.
+    try Call.bindPipeline(&state, &bridge, 0x111, 0, 0x501);
+    try Call.bindIndex(&state, &bridge, 0x111, 0x702, 0x1000, 0);
+    try Call.draw(&state, &bridge, stack, 0x111, 9);
+    // The built-in buffer at offset 0, 32-bit: the expansion.
+    try Call.bindIndex(&state, &bridge, 0x111, 0x701, 0, 1);
+    try Call.draw(&state, &bridge, stack, 0x111, 9);
+    // Another thread's command buffer binds an ordinary pipeline, and this
+    // one dispatches compute between draws: neither untags the next draw.
+    try Call.bindPipeline(&state, &bridge, 0x113, 0, 0x502);
+    try Call.bindPipeline(&state, &bridge, 0x111, 1, 0x503);
+    try Call.draw(&state, &bridge, stack, 0x111, 4);
+    // An ordinary graphics pipeline in this command buffer does untag.
+    try Call.bindPipeline(&state, &bridge, 0x111, 0, 0x502);
+    try Call.draw(&state, &bridge, stack, 0x111, 4);
+    try std.testing.expectEqual(@as(u32, 4), Capture.draws);
+    try std.testing.expectEqual(@as(i32, 0), Capture.vertex_offsets[0]);
+    try std.testing.expectEqual(tag, Capture.vertex_offsets[1]);
+    try std.testing.expectEqual(tag, Capture.vertex_offsets[2]);
+    try std.testing.expectEqual(@as(i32, 0), Capture.vertex_offsets[3]);
+    try std.testing.expectEqual(@as(u64, 2), forwarder.rect_expand_draws_tagged);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.rect_expand_draws_declined_foreign_index);
+}

@@ -10,6 +10,7 @@
 
 pub const abi = @import("abi.zig");
 pub const marshal = @import("marshal.zig");
+pub const rect_list_expand = @import("rect_list_expand.zig");
 pub const tier_consistency = @import("tier_consistency.zig");
 pub const guest_state = @import("guest_state.zig");
 pub const selection = @import("selection.zig");
@@ -31,6 +32,7 @@ pub const Health = frame.Health;
 test {
     _ = abi;
     _ = marshal;
+    _ = rect_list_expand;
     _ = tier_consistency;
     _ = guest_state;
     _ = selection;

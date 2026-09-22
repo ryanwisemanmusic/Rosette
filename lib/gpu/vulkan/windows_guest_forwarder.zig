@@ -22,6 +22,14 @@ const rtld_lazy: u64 = 0x1;
 const rtld_local: u64 = 0x4;
 const max_stack_arguments: usize = 16;
 const scratch_stack_bytes: u64 = (max_stack_arguments + 1) * 8;
+const scratch_stack_alignment: u64 = 16;
+/// How many Microsoft-ABI Vulkan calls may be live at once before the bridge
+/// stops reusing a cached scratch stack. A forwarded call runs to completion
+/// without the interpreter scheduling another guest thread, so the depth is
+/// one in every observed run; the remaining slots exist so that a driver that
+/// calls back into guest code cannot make a nested dispatch share the outer
+/// call's stack.
+const scratch_stack_cache_depth: usize = 4;
 const metal_surface_create_info_bytes: u64 = 32;
 
 const MicrosoftRegisterArguments = struct {
@@ -61,11 +69,40 @@ fn microsoftStackArgumentOffset(index: usize, has_direct_return: bool) u64 {
     return stack_bias + @as(u64, @intCast(index - 4)) * 8;
 }
 
+const host_time_slots = 128;
+const HostTimeEntry = struct {
+    key: usize = 0,
+    name: [48]u8 = @splat(0),
+    name_len: u8 = 0,
+    calls: u64 = 0,
+    ns: u64 = 0,
+    max_ns: u64 = 0,
+
+    fn label(self: *const HostTimeEntry) []const u8 {
+        return self.name[0..self.name_len];
+    }
+};
+
 pub const Bridge = struct {
     forwarder: dynamic_forwarder.Forwarder = .{},
     library_token: u64 = 0,
     dispatch_attempts: u64 = 0,
     dispatches: u64 = 0,
+    /// Wall time spent inside outermost Vulkan dispatches - the native
+    /// Vulkan/MoltenVK work, and the marshalling around it, done on the one
+    /// host thread every guest thread runs on. It is the measured ceiling on
+    /// what moving host graphics work to a second host thread could return
+    /// (the first multi-core step in the TSO note), before any guest memory
+    /// model is involved.
+    host_ns: u64 = 0,
+    host_ns_max: u64 = 0,
+    host_timed_calls: u64 = 0,
+    /// The same wall time split by entry point, so the report names what
+    /// the host thread was doing: pipeline compiles, fence waits or command
+    /// recording. Keyed by the import name's address and length.
+    host_time_entries: [host_time_slots]HostTimeEntry = @splat(.{}),
+    host_time_overflow_ns: u64 = 0,
+    dispatch_depth: u32 = 0,
     dispatch_failures: u64 = 0,
     surface_name_remaps: u64 = 0,
     boundary_trace_initialized: bool = false,
@@ -75,6 +112,52 @@ pub const Bridge = struct {
     scalar_width_normalizations: u64 = 0,
     scalar_width_normalized_calls: u64 = 0,
     scalar_width_last_reported: u64 = 0,
+    /// The SysV stack this adapter hands the forwarded call.
+    ///
+    /// It used to be a fresh `guestAlloc` on every dispatch, and nothing ever
+    /// freed it: 3,823,761 Vulkan calls walked the guest heap cursor into its
+    /// limit, and the next `vkCmdDrawIndexed` was refused for want of 136
+    /// bytes. The Vulkan route is right to treat that refusal as fatal rather
+    /// than fall back to a synthetic command, so the leak presented as the
+    /// run dying with exit 127 on a draw that was in no way unusual.
+    ///
+    /// The buffer's whole lifetime is one dispatch and every byte a callee can
+    /// read is rewritten on entry, so one allocation serves every call.
+    scratch_stacks: [scratch_stack_cache_depth]u64 = @splat(0),
+    scratch_stack_depth: usize = 0,
+    scratch_stack_allocations: u64 = 0,
+    scratch_stack_reuses: u64 = 0,
+    scratch_stack_overflow_allocations: u64 = 0,
+
+    /// Hand out the scratch stack for the dispatch that is about to run, and
+    /// leave it owned until `releaseScratchStack`.
+    ///
+    /// A nested dispatch takes the next slot rather than the live one. Past
+    /// the cache's depth the bridge allocates rather than aliasing a stack a
+    /// caller is still standing on; that path is counted so a driver that
+    /// really does re-enter this deeply is visible instead of silently
+    /// reintroducing the leak this cache removed.
+    fn acquireScratchStack(self: *Bridge, state: anytype) ?u64 {
+        const depth = self.scratch_stack_depth;
+        if (depth >= self.scratch_stacks.len) {
+            const fresh = state.guestAlloc(scratch_stack_bytes, scratch_stack_alignment) orelse return null;
+            self.scratch_stack_overflow_allocations +|= 1;
+            self.scratch_stack_depth += 1;
+            return fresh;
+        }
+        if (self.scratch_stacks[depth] == 0) {
+            self.scratch_stacks[depth] = state.guestAlloc(scratch_stack_bytes, scratch_stack_alignment) orelse return null;
+            self.scratch_stack_allocations +|= 1;
+        } else {
+            self.scratch_stack_reuses +|= 1;
+        }
+        self.scratch_stack_depth += 1;
+        return self.scratch_stacks[depth];
+    }
+
+    fn releaseScratchStack(self: *Bridge) void {
+        if (self.scratch_stack_depth != 0) self.scratch_stack_depth -= 1;
+    }
 
     fn normalizeMicrosoftArgument(self: *Bridge, name: []const u8, signature: vulkan_contract.argument_widths.Signature, index: usize, raw: u64) u64 {
         const normalized = signature.normalize(index, raw);
@@ -260,7 +343,111 @@ pub const Bridge = struct {
     /// run from repeating the same topology at every step checkpoint.
     pub fn reportPresentChainFull(self: *Bridge) void {
         self.reportArgumentWidths(true);
+        self.reportScratchStacks();
+        self.reportHostTime();
         self.forwarder.reportPresentChain(true);
+    }
+
+    /// The guest-heap cost of the Microsoft-ABI boundary itself.
+    ///
+    /// `allocations` is the number of scratch stacks this bridge has ever
+    /// taken from the guest heap; it is the nesting depth actually reached,
+    /// not the call count. A run whose `allocations` tracks its `reuses` is
+    /// the leak that exhausted the heap at 3.8M calls, back again.
+    fn noteHostTime(self: *Bridge, name: []const u8, spent: u64) void {
+        const key = @intFromPtr(name.ptr) ^ (name.len << 48);
+        var slot = (key ^ (key >> 17)) % host_time_slots;
+        var probes: usize = 0;
+        while (probes < host_time_slots) : (probes += 1) {
+            const entry = &self.host_time_entries[slot];
+            if (entry.key == key) {
+                entry.calls +|= 1;
+                entry.ns +|= spent;
+                entry.max_ns = @max(entry.max_ns, spent);
+                return;
+            }
+            if (entry.key == 0) {
+                entry.key = key;
+                const len = @min(name.len, entry.name.len);
+                @memcpy(entry.name[0..len], name[0..len]);
+                entry.name_len = @intCast(len);
+                entry.calls = 1;
+                entry.ns = spent;
+                entry.max_ns = spent;
+                return;
+            }
+            slot = (slot + 1) % host_time_slots;
+        }
+        self.host_time_overflow_ns +|= spent;
+    }
+
+    /// The entry points that held the host thread longest, merged by name.
+    pub fn hostTimeLeaders(self: *const Bridge, out: []HostTimeEntry) usize {
+        var count: usize = 0;
+        for (self.host_time_entries) |entry| {
+            if (entry.key == 0) continue;
+            var merged = false;
+            for (out[0..count]) |*existing| {
+                if (std.mem.eql(u8, existing.label(), entry.label())) {
+                    existing.calls +|= entry.calls;
+                    existing.ns +|= entry.ns;
+                    existing.max_ns = @max(existing.max_ns, entry.max_ns);
+                    merged = true;
+                    break;
+                }
+            }
+            if (merged) continue;
+            if (count < out.len) {
+                out[count] = entry;
+                count += 1;
+            } else {
+                // Replace the smallest leader if this one outweighs it.
+                var smallest: usize = 0;
+                for (out[1..count], 1..) |existing, index| {
+                    if (existing.ns < out[smallest].ns) smallest = index;
+                }
+                if (entry.ns > out[smallest].ns) out[smallest] = entry;
+            }
+        }
+        std.mem.sort(HostTimeEntry, out[0..count], {}, struct {
+            fn more(_: void, a: HostTimeEntry, b: HostTimeEntry) bool {
+                return a.ns > b.ns;
+            }
+        }.more);
+        return count;
+    }
+
+    fn reportHostTime(self: *const Bridge) void {
+        var leaders: [12]HostTimeEntry = undefined;
+        const count = self.hostTimeLeaders(&leaders);
+        for (leaders[0..count], 1..) |entry, rank| {
+            log.info("Vulkan host time by entry point: rank={d} name={s} calls={d} host_ms={d} mean_us={d} max_ms={d}", .{
+                rank,
+                entry.label(),
+                entry.calls,
+                entry.ns / 1_000_000,
+                if (entry.calls == 0) 0 else entry.ns / entry.calls / 1_000,
+                entry.max_ns / 1_000_000,
+            });
+        }
+        log.info("Vulkan host time: calls={d} host_ms={d} mean_ns={d} max_ns={d}; native Vulkan work done on the one host thread every guest thread runs on, so this much wall time is what a second host thread could take off the guest before any memory model is needed", .{
+            self.host_timed_calls,
+            self.host_ns / 1_000_000,
+            if (self.host_timed_calls == 0) 0 else self.host_ns / self.host_timed_calls,
+            self.host_ns_max,
+        });
+    }
+
+    fn reportScratchStacks(self: *const Bridge) void {
+        log.info("Vulkan ABI scratch stacks: allocations={d} reuses={d} overflow_allocations={d} bytes_each={d} cache_depth={d} live_depth={d} guest_heap_bytes_held={d}; one stack per nesting level serves every call, because a dispatch owns it for exactly its own duration", .{
+            self.scratch_stack_allocations,
+            self.scratch_stack_reuses,
+            self.scratch_stack_overflow_allocations,
+            scratch_stack_bytes,
+            scratch_stack_cache_depth,
+            self.scratch_stack_depth,
+            (self.scratch_stack_allocations +| self.scratch_stack_overflow_allocations) *| scratch_stack_bytes,
+        });
     }
 
     pub fn updateGuestProgress(
@@ -281,6 +468,22 @@ pub const Bridge = struct {
         if (vulkan_contract.isProcLookup(name)) return self.lookupWindowsProc(state, direct_return_rip);
         if (!owns(name)) return false;
         self.dispatch_attempts +|= 1;
+        const outermost = self.dispatch_depth == 0;
+        self.dispatch_depth +|= 1;
+        const started_ns: u64 = if (outermost) gpu.vulkan.transport_timing.nowNs() else 0;
+        defer {
+            self.dispatch_depth -|= 1;
+            if (outermost and started_ns != 0) {
+                const now = gpu.vulkan.transport_timing.nowNs();
+                if (now >= started_ns) {
+                    const spent = now - started_ns;
+                    self.host_ns +|= spent;
+                    self.host_ns_max = @max(self.host_ns_max, spent);
+                    self.host_timed_calls +|= 1;
+                    self.noteHostTime(name, spent);
+                }
+            }
+        }
         const call_id = self.dispatch_attempts;
         const trace_boundary = self.shouldTraceBoundary(name);
         var trace_outcome: []const u8 = "not_completed";
@@ -328,11 +531,17 @@ pub const Bridge = struct {
                 return false;
             }
         }
-        const scratch_stack = state.guestAlloc(scratch_stack_bytes, 16) orelse {
+        const scratch_stack = self.acquireScratchStack(state) orelse {
             self.dispatch_failures +|= 1;
             trace_outcome = "scratch_stack_unavailable";
             return false;
         };
+        defer self.releaseScratchStack();
+        // A first allocation arrives zeroed; a reused one still carries the
+        // previous call's bytes. Every stack-argument slot is rewritten below
+        // whether or not this signature declares it, so clearing the return
+        // slot is all that reuse needs to be byte-identical to a fresh one.
+        state.write64(scratch_stack, 0);
 
         // Read declared parameters, not entire untyped eight-byte values.
         // DWORD stack stores leave the upper half unspecified; forwarding
@@ -654,4 +863,94 @@ test "Windows proc lookup keeps absent commands null and returns Windows thunks"
     try std.testing.expectEqual(@as(u32, 1), state.registrations);
     // The device is a test sentinel, not an owned native object.
     bridge.forwarder.real_vulkan.device = null;
+}
+
+test "Windows Vulkan scratch stacks are reused rather than leaked per call" {
+    // A bump allocator with the same failure shape as the guest heap: once the
+    // cursor passes the limit it refuses, which is exactly what ended the
+    // 3,823,761st Vulkan call of the Halo 3 run.
+    // Successive aligned allocations advance by the padded stride, not by the
+    // request, so size the arena for exactly three of them.
+    const stride = (scratch_stack_bytes + scratch_stack_alignment - 1) & ~(scratch_stack_alignment - 1);
+    const State = struct {
+        next: u64 = 0x1000,
+        limit: u64 = 0x1000 + 3 * ((scratch_stack_bytes + scratch_stack_alignment - 1) & ~(scratch_stack_alignment - 1)),
+        allocations: u32 = 0,
+        pub fn guestAlloc(self: *@This(), size: u64, alignment: u64) ?u64 {
+            const mask = alignment - 1;
+            const aligned = (self.next + mask) & ~mask;
+            if (aligned + size > self.limit) return null;
+            self.next = aligned + size;
+            self.allocations += 1;
+            return aligned;
+        }
+    };
+
+    var bridge = Bridge{};
+    defer bridge.deinit();
+    var state = State{};
+
+    // The leak this replaces took one allocation per call. A thousand
+    // sequential calls must take exactly one, at one address.
+    const first = bridge.acquireScratchStack(&state).?;
+    bridge.releaseScratchStack();
+    for (0..999) |_| {
+        try std.testing.expectEqual(first, bridge.acquireScratchStack(&state).?);
+        bridge.releaseScratchStack();
+    }
+    try std.testing.expectEqual(@as(u32, 1), state.allocations);
+    try std.testing.expectEqual(@as(u64, 1), bridge.scratch_stack_allocations);
+    try std.testing.expectEqual(@as(u64, 999), bridge.scratch_stack_reuses);
+    try std.testing.expectEqual(@as(usize, 0), bridge.scratch_stack_depth);
+
+    // A nested dispatch must never be handed the stack its caller is standing
+    // on, so each depth owns a distinct address.
+    const outer = bridge.acquireScratchStack(&state).?;
+    const inner = bridge.acquireScratchStack(&state).?;
+    try std.testing.expectEqual(first, outer);
+    try std.testing.expectEqual(outer + stride, inner);
+    try std.testing.expectEqual(@as(usize, 2), bridge.scratch_stack_depth);
+    bridge.releaseScratchStack();
+    bridge.releaseScratchStack();
+    try std.testing.expectEqual(@as(usize, 0), bridge.scratch_stack_depth);
+    try std.testing.expectEqual(@as(u64, 2), bridge.scratch_stack_allocations);
+
+    // The allocator has one scratch stack left. Nesting past the cache falls
+    // back to a fresh allocation and says so, rather than aliasing a live one.
+    bridge.scratch_stack_depth = scratch_stack_cache_depth;
+    const overflow = bridge.acquireScratchStack(&state).?;
+    try std.testing.expect(overflow != outer and overflow != inner);
+    try std.testing.expectEqual(@as(u64, 1), bridge.scratch_stack_overflow_allocations);
+    bridge.releaseScratchStack();
+    try std.testing.expectEqual(@as(usize, scratch_stack_cache_depth), bridge.scratch_stack_depth);
+
+    // Exhausted: the refusal is reported, and it does not leave the bridge
+    // believing a dispatch is live.
+    bridge.scratch_stack_depth = scratch_stack_cache_depth;
+    try std.testing.expect(bridge.acquireScratchStack(&state) == null);
+    try std.testing.expectEqual(@as(usize, scratch_stack_cache_depth), bridge.scratch_stack_depth);
+    bridge.scratch_stack_depth = 2;
+    try std.testing.expect(bridge.acquireScratchStack(&state) == null);
+    try std.testing.expectEqual(@as(usize, 2), bridge.scratch_stack_depth);
+    try std.testing.expectEqual(@as(u32, 3), state.allocations);
+}
+
+test "Vulkan host time is split by entry point and ranked by wall time" {
+    var bridge = Bridge{};
+    defer bridge.deinit();
+    const compile = "vkCreateGraphicsPipelines";
+    const wait = "vkWaitForFences";
+    const draw = "vkCmdDraw";
+    bridge.noteHostTime(compile, 90_000_000);
+    bridge.noteHostTime(compile, 10_000_000);
+    bridge.noteHostTime(wait, 30_000_000);
+    for (0..1000) |_| bridge.noteHostTime(draw, 1_000);
+    var leaders: [2]HostTimeEntry = undefined;
+    const count = bridge.hostTimeLeaders(&leaders);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqualStrings(compile, leaders[0].label());
+    try std.testing.expectEqual(@as(u64, 2), leaders[0].calls);
+    try std.testing.expectEqual(@as(u64, 100_000_000), leaders[0].ns);
+    try std.testing.expectEqual(@as(u64, 90_000_000), leaders[0].max_ns);
+    try std.testing.expectEqualStrings(wait, leaders[1].label());
 }
