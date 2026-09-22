@@ -31,10 +31,16 @@ const maximum_stack_reserve: u64 = 128 * 1024 * 1024;
 // heap separate from the main stack and give it enough bounded room for the
 // graphics bootstrap without making the runtime an unbounded allocator.
 // The 2026-09-14 run exhausted 512 MiB after 15 minutes with 31 threads
-// live, and the title's next CreateThread got no stack.
+// live, and the title's next CreateThread got no stack. The 2026-09-21 run
+// reached the first-frame path and then consumed almost all of the 1 GiB
+// reserve before asking malloc for another 512 MiB. Large PE images therefore
+// get a 2 GiB heap floor; small synthetic PE fixtures retain the 1 GiB floor
+// so their tests do not allocate an unnecessary multi-gigabyte backing store.
 const minimum_heap_reserve: u64 = 1024 * 1024 * 1024;
-const maximum_heap_reserve: u64 = 1024 * 1024 * 1024;
-const maximum_runtime_memory: u64 = 2048 * 1024 * 1024;
+const maximum_heap_reserve: u64 = 2 * 1024 * 1024 * 1024;
+const large_image_heap_reserve: u64 = 2 * 1024 * 1024 * 1024;
+const large_image_heap_threshold: u64 = 32 * 1024 * 1024;
+const maximum_runtime_memory: u64 = 4 * 1024 * 1024 * 1024;
 const synthetic_thunk_stride: u64 = 16;
 const tls_directory_index: usize = 9;
 const tls_directory_size_pe64: u32 = 40;
@@ -136,6 +142,24 @@ fn discoverWindowsConditionEntries(
         .broadcast = locateExecutableSignature(image, bytes, load_base, &broadcast_signature),
         .timedwait = locateExecutableSignature(image, bytes, load_base, &timedwait_signature),
     };
+}
+
+/// winpthreads' `pthread_mutex_lock_intern(mutex, milliseconds)`: five
+/// pushes, a 0x20 frame, the timeout saved in esi, and a call to
+/// `mutex_impl`. The prefix alone is unique in the image; the body after the
+/// call is checked as well - the null check on the implementation and the
+/// first `xchg state, 1` - so a rebuilt image that happens to share the
+/// prologue is refused rather than called.
+fn discoverWindowsMutexLockEntry(state: *elf.ElfState, image: *const parser.Image, bytes: []const u8, load_base: u64) ?u64 {
+    const prologue = [_]u8{ 0x41, 0x54, 0x55, 0x57, 0x56, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x89, 0xD6, 0xE8 };
+    const entry = locateExecutableSignature(image, bytes, load_base, &prologue) orelse return null;
+    const after_call = [_]u8{ 0x48, 0x89, 0xC3, 0x48, 0x85, 0xC0, 0x0F, 0x84 };
+    const first_attempt = [_]u8{ 0xBF, 0x01, 0x00, 0x00, 0x00, 0x89, 0xFD, 0x87, 0x28 };
+    const tail = state.guestMemoryConst(entry + 17, after_call.len) orelse return null;
+    if (!std.mem.eql(u8, tail, &after_call)) return null;
+    const xchg = state.guestMemoryConst(entry + 29, first_attempt.len) orelse return null;
+    if (!std.mem.eql(u8, xchg, &first_attempt)) return null;
+    return entry;
 }
 
 fn configureWindowsStaticTls(state: *elf.ElfState, image: *const parser.Image, load_base: u64) !void {
@@ -1064,7 +1088,11 @@ fn runtimeMemorySize(image: *const parser.Image, import_count: usize) !struct {
     const thunk_bytes = std.math.mul(u64, @intCast(import_count), synthetic_thunk_stride) catch return error.ImageTooLarge;
     const thunk_span = try alignUp(@max(page_size, thunk_bytes), page_size);
     const stack_reserve = clampReserve(image.size_of_stack_reserve, minimum_stack_reserve, maximum_stack_reserve);
-    const heap_reserve = clampReserve(image.size_of_heap_reserve, minimum_heap_reserve, maximum_heap_reserve);
+    const clamped_heap_reserve = clampReserve(image.size_of_heap_reserve, minimum_heap_reserve, maximum_heap_reserve);
+    const heap_reserve = if (image.size_of_image >= large_image_heap_threshold)
+        @max(clamped_heap_reserve, large_image_heap_reserve)
+    else
+        clamped_heap_reserve;
     const total = std.math.add(u64, image_span, thunk_span) catch return error.ImageTooLarge;
     const with_stack = std.math.add(u64, total, stack_reserve) catch return error.ImageTooLarge;
     const with_heap = std.math.add(u64, with_stack, heap_reserve) catch return error.ImageTooLarge;
@@ -1281,6 +1309,7 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
         condition_entries.broadcast,
     );
     state.configureWindowsTimedConditionEntry(condition_entries.timedwait);
+    state.configureWindowsMutexLockEntry(discoverWindowsMutexLockEntry(&state, image, bytes, load_base));
 
     const thunk_base = state.image_high;
     const dynamic_relocations = try allocator.alloc(elf.DynamicRelocation, parsed_imports.descriptors.len);
@@ -1292,6 +1321,8 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
         const thunk_address = std.math.add(u64, thunk_base, std.math.mul(u64, @intCast(index), synthetic_thunk_stride) catch return error.AddressOverflow) catch return error.AddressOverflow;
         const iat_address = try imageAddress(load_base, descriptor.iat_rva);
         state.write64(iat_address, thunk_address);
+        if (state.windows_iat_low == 0 or iat_address < state.windows_iat_low) state.windows_iat_low = iat_address;
+        if (iat_address + 8 > state.windows_iat_high) state.windows_iat_high = iat_address + 8;
         // Register the actual IAT target with the Windows dispatcher. A
         // decodable zero-return byte stub would bypass every Win32/Vulkan
         // contract and make direct imports look successful without executing
