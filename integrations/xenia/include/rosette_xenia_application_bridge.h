@@ -71,6 +71,16 @@ class ApplicationBridge final {
          opcode, count, packet_id, "PM4", "PM4 packet consumed");
   }
 
+  void ObserveControlledPm4Packet(uint32_t opcode, uint32_t count,
+                                  uint32_t packet_id) {
+    Emit(ROSETTE_APPLICATION_FRAMEWORK_EVENT_PM4_PACKET,
+         ROSETTE_APPLICATION_FRAMEWORK_TRUTH_OBSERVED,
+         ROSETTE_APPLICATION_FRAMEWORK_OWNER_XENIA_GPU,
+         ROSETTE_APPLICATION_FRAMEWORK_DOMAIN_PM4, 0, 0, opcode, count,
+         packet_id, "PM4-controlled",
+         "harness-owned PM4 packet consumed; not guest output");
+  }
+
   void ObserveIssueSwap(uint64_t guest_step, uint64_t guest_rip,
                         uint32_t frontbuffer_ptr, uint32_t width,
                         uint32_t height) {
@@ -80,6 +90,16 @@ class ApplicationBridge final {
          ROSETTE_APPLICATION_FRAMEWORK_DOMAIN_PRESENTER, guest_step,
          guest_rip, frontbuffer_ptr, width, height, "IssueSwap",
          "native IssueSwap boundary reached");
+  }
+
+  void ObserveControlledIssueSwap(uint32_t frontbuffer_ptr, uint32_t width,
+                                  uint32_t height) {
+    Emit(ROSETTE_APPLICATION_FRAMEWORK_EVENT_PRESENTATION,
+         ROSETTE_APPLICATION_FRAMEWORK_TRUTH_OBSERVED,
+         ROSETTE_APPLICATION_FRAMEWORK_OWNER_XENIA_PRESENTER,
+         ROSETTE_APPLICATION_FRAMEWORK_DOMAIN_PRESENTER, 0, 0,
+         frontbuffer_ptr, width, height, "IssueSwap-controlled",
+         "harness-owned controlled surface; not guest output");
   }
 
   void ObservePresenterOutcome(uint64_t guest_step, uint64_t guest_rip,
@@ -93,6 +113,21 @@ class ApplicationBridge final {
          guest_rip, frontbuffer_ptr,
          refresh_active ? 1 : 0, refresh_success_delta, "RefreshGuestOutput",
          detail != nullptr ? detail : "presenter outcome observed");
+  }
+
+  void ObserveControlledPresenterOutcome(uint32_t frontbuffer_ptr,
+                                         bool refresh_active,
+                                         uint64_t refresh_success_delta,
+                                         const char* detail) {
+    Emit(ROSETTE_APPLICATION_FRAMEWORK_EVENT_PRESENTATION,
+         ROSETTE_APPLICATION_FRAMEWORK_TRUTH_OBSERVED,
+         ROSETTE_APPLICATION_FRAMEWORK_OWNER_XENIA_PRESENTER,
+         ROSETTE_APPLICATION_FRAMEWORK_DOMAIN_PRESENTER, 0, 0,
+         frontbuffer_ptr, refresh_active ? 1 : 0, refresh_success_delta,
+         "RefreshGuestOutput-controlled",
+         detail != nullptr
+             ? detail
+             : "harness-owned presenter outcome; not guest output");
   }
 
   bool CompareValue(uint64_t guest_step, uint64_t guest_rip, uint64_t subject,
