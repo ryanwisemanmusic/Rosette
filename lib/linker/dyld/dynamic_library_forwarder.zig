@@ -4,6 +4,7 @@ const guest_sleep = @import("scheduler").guest_sleep;
 const rosette_gpu = @import("gpu");
 const abi = @import("gpu").vulkan.abi;
 const marshal = @import("gpu").vulkan.marshal;
+const gpu_vulkan = @import("gpu").vulkan;
 const frame_capture = @import("gpu").vulkan.frame_capture;
 const transport_timing = @import("gpu").vulkan.transport_timing;
 const tier_consistency = @import("gpu").vulkan.tier_consistency;
@@ -47,6 +48,7 @@ extern fn dlopen(path: ?[*:0]const u8, mode: c_int) ?*anyopaque;
 extern fn dlsym(handle: *anyopaque, symbol: [*:0]const u8) ?*anyopaque;
 extern fn dlclose(handle: *anyopaque) c_int;
 extern fn dlerror() ?[*:0]const u8;
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 const HostWindowDescribeFn = *const fn (*rosette_gpu.WindowGeometry) callconv(.c) c_int;
 
@@ -67,6 +69,25 @@ const HostWindowDescribeResolver = struct {
 };
 
 const HostFrameCaptureFn = *const fn (*const frame_capture.Frame) callconv(.c) u32;
+/// `rosette_macho_native_window_set_frame_counter`, resolved at run time so a
+/// test build that links no window bridge still links.
+const HostFrameCounterResolver = struct {
+    const Fn = *const fn (u64) callconv(.c) void;
+    var callback: ?Fn = null;
+    var resolved: bool = false;
+
+    fn resolve() ?Fn {
+        if (resolved) return callback;
+        resolved = true;
+        if (builtin.os.tag != .macos) return null;
+        const rtld_default: *anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -2))));
+        if (dlsym(rtld_default, "rosette_macho_native_window_set_frame_counter")) |address| {
+            callback = @ptrCast(@alignCast(address));
+        }
+        return callback;
+    }
+};
+
 const HostFrameCaptureResolver = struct {
     var callback: ?HostFrameCaptureFn = null;
     var resolved: bool = false;
@@ -214,7 +235,74 @@ const VulkanLoaderCandidates = struct {
     }
 };
 
+/// Whether a `vkCreateBuffer` is Xenia's built-in index buffer: the
+/// primitive processor creates it device-local with exactly
+/// TRANSFER_DST | INDEX_BUFFER usage (its upload twin is TRANSFER_SRC only,
+/// the per-frame converted-index pool is INDEX_BUFFER only), and it holds at
+/// least `GetTwoTriangleStripIndexCount(UINT16_MAX / 3)` 32-bit indices.
+pub fn rectExpansionBuiltinIndexBuffer(size: u64, usage: u32) bool {
+    const transfer_dst: u32 = 0x2;
+    const index_buffer: u32 = 0x40;
+    const rectangles: u64 = 0xFFFF / 3;
+    const min_bytes: u64 = 4 * (4 * rectangles + (rectangles - 1));
+    return usage == (transfer_dst | index_buffer) and size >= min_bytes;
+}
+
+test "only Xenia's built-in index buffer is recognised as rectangle expansion indices" {
+    // Point sprites and rectangles expanded: UINT16_MAX two-triangle strips,
+    // plus the 16-bit fan and quad sections.
+    try std.testing.expect(rectExpansionBuiltinIndexBuffer(4 * (5 * 0xFFFF - 1) + 393198 + 196596, 0x42));
+    try std.testing.expect(rectExpansionBuiltinIndexBuffer(436896, 0x42));
+    try std.testing.expect(!rectExpansionBuiltinIndexBuffer(436895, 0x42));
+    // The upload twin, the converted-index pool and the shared memory.
+    try std.testing.expect(!rectExpansionBuiltinIndexBuffer(1310696, 0x1));
+    try std.testing.expect(!rectExpansionBuiltinIndexBuffer(2 * 1024 * 1024, 0x40));
+    try std.testing.expect(!rectExpansionBuiltinIndexBuffer(512 * 1024 * 1024, 0x40 | 0x20 | 0x2 | 0x1));
+}
+
+/// MoltenVK settings an emulator needs, applied before the loader is opened
+/// because MoltenVK reads its environment once, at its first instance.
+/// A value the user already exported wins; `ROSETTE_MOLTENVK_DEFAULTS=0`
+/// applies none of them.
+///
+/// - `MVK_CONFIG_RESUME_LOST_DEVICE=1`: a command buffer the GPU watchdog
+///   kills (a hang or a timeout) loses its own work instead of marking the
+///   whole VkDevice lost. Xenia treats device loss as fatal and exits, so
+///   without this one bad frame ends the run.
+/// - `MVK_CONFIG_FAST_MATH_ENABLED=0`: Xenia's shaders declare
+///   SignedZeroInfNanPreserve and emulate Xenos NaN, infinity and signed-zero
+///   rules explicitly. Metal fast math may assume none of those values exist
+///   and compile the emulation away; the MoltenVK this runs on predates the
+///   on-demand mode that honours the declaration.
+pub const moltenvk_runtime_defaults = [_]struct { name: [*:0]const u8, value: [*:0]const u8 }{
+    .{ .name = "MVK_CONFIG_RESUME_LOST_DEVICE", .value = "1" },
+    .{ .name = "MVK_CONFIG_FAST_MATH_ENABLED", .value = "0" },
+};
+
+var moltenvk_runtime_defaults_applied = false;
+
+fn applyMoltenVKRuntimeDefaults() void {
+    if (moltenvk_runtime_defaults_applied) return;
+    moltenvk_runtime_defaults_applied = true;
+    if (std.c.getenv("ROSETTE_MOLTENVK_DEFAULTS")) |raw| {
+        if (std.mem.eql(u8, std.mem.span(raw), "0")) {
+            machoCapturePrint("macho-processor: MoltenVK runtime defaults: disabled by ROSETTE_MOLTENVK_DEFAULTS=0\n", .{});
+            return;
+        }
+    }
+    for (moltenvk_runtime_defaults) |setting| {
+        const existing = std.c.getenv(setting.name);
+        if (existing == null) _ = setenv(setting.name, setting.value, 0);
+        machoCapturePrint("macho-processor: MoltenVK runtime default: {s}={s} ({s})\n", .{
+            std.mem.span(setting.name),
+            if (existing) |value| std.mem.span(value) else std.mem.span(setting.value),
+            if (existing == null) "applied" else "kept the exported value",
+        });
+    }
+}
+
 fn vulkanLoaderCandidates(requested_path: []const u8) VulkanLoaderCandidates {
+    applyMoltenVKRuntimeDefaults();
     var candidates = VulkanLoaderCandidates{};
     if (std.c.getenv("ROSETTE_VULKAN_LIBRARY")) |raw| candidates.add(std.mem.span(raw));
     if (requested_path.len != 0) candidates.add(requested_path);
@@ -580,6 +668,8 @@ const MAX_REAL_FRAMEBUFFERS = 256;
 // smaller than the resource provenance budget.
 const MAX_REAL_PIPELINES = 4096;
 const MAX_REAL_SHADER_MODULES = 1024;
+const MAX_RECT_EXPAND_MODULES = 256;
+const MAX_RECT_EXPAND_PIPELINES = 512;
 /// One row per distinct `vkCreate*`/`vkAllocate*` entry point the guest
 /// reaches. Bounded because the set is bounded by the API, not by the run.
 const MAX_VULKAN_CREATE_LEDGER = 48;
@@ -670,6 +760,17 @@ const RealHandle = u64;
 /// Mapping from a synthetic guest handle to a real Vulkan handle. The synthetic
 /// handle is the value written into guest memory; the real handle is the value
 /// the driver returned. A null real handle means the slot is unused.
+const HandleLookupEntry = struct { base: usize = 0, synthetic: u64 = 0, index: u32 = 0 };
+const handle_lookup_bits = 14;
+/// One Rosette host thread forwards every Vulkan call, so the cache needs no
+/// lock; a stale entry is detected by the slot check in `findIndex`.
+var handle_lookup_cache: [1 << handle_lookup_bits]HandleLookupEntry = @splat(.{});
+
+fn handleLookupSlot(base: usize, synthetic: u64) usize {
+    const mixed = (synthetic ^ (@as(u64, base) >> 4)) *% 0x9E37_79B9_7F4A_7C15;
+    return @intCast(mixed >> (64 - handle_lookup_bits));
+}
+
 const HandleMap = struct {
     synthetic: u64 = 0,
     real: RealHandle = 0,
@@ -688,17 +789,35 @@ const HandleMap = struct {
     };
 
     pub fn findSlot(self: []HandleMap, synthetic: u64) ?*HandleMap {
-        if (synthetic == 0) return null;
-        for (self) |*entry| {
-            if (entry.synthetic == synthetic) return entry;
-        }
-        return null;
+        const index = HandleMap.findIndex(self, synthetic) orelse return null;
+        return &self[index];
     }
 
     pub fn findReal(self: []const HandleMap, synthetic: u64) ?RealHandle {
+        const index = HandleMap.findIndex(self, synthetic) orelse return null;
+        return self[index].real;
+    }
+
+    /// Every forwarded `vkCmd*` translates its command buffer, and a
+    /// descriptor update translates a set, a view and a sampler per write:
+    /// millions of lookups a run, each a scan of a fixed table of up to
+    /// 16384 slots. A hit in this cache is checked against the table slot
+    /// itself, so a released or reused slot can only miss, never answer
+    /// for a different handle.
+    fn findIndex(self: []const HandleMap, synthetic: u64) ?usize {
         if (synthetic == 0) return null;
-        for (self) |entry| {
-            if (entry.synthetic == synthetic) return entry.real;
+        const base = @intFromPtr(self.ptr);
+        const cached = &handle_lookup_cache[handleLookupSlot(base, synthetic)];
+        if (cached.synthetic == synthetic and cached.base == base and cached.index < self.len and
+            self[cached.index].synthetic == synthetic)
+        {
+            return cached.index;
+        }
+        for (self, 0..) |entry, index| {
+            if (entry.synthetic == synthetic) {
+                cached.* = .{ .base = base, .synthetic = synthetic, .index = @intCast(index) };
+                return index;
+            }
         }
         return null;
     }
@@ -717,17 +836,18 @@ const HandleMap = struct {
         // whole process; callers turn the result into a Vulkan failure and
         // keep the run's diagnostics alive.
         if (synthetic == 0 or real == 0) return .invalid;
-        for (self) |*entry| {
-            if (entry.synthetic == synthetic) {
-                const unchanged = entry.real == real and entry.owner == owner;
-                entry.real = real;
-                entry.owner = owner;
-                return if (unchanged) .existing else .replaced;
-            }
+        if (HandleMap.findIndex(self, synthetic)) |index| {
+            const entry = &self[index];
+            const unchanged = entry.real == real and entry.owner == owner;
+            entry.real = real;
+            entry.owner = owner;
+            return if (unchanged) .existing else .replaced;
         }
-        for (self) |*entry| {
+        for (self, 0..) |*entry, index| {
             if (entry.synthetic == 0) {
                 entry.* = .{ .synthetic = synthetic, .real = real, .owner = owner };
+                handle_lookup_cache[handleLookupSlot(@intFromPtr(self.ptr), synthetic)] =
+                    .{ .base = @intFromPtr(self.ptr), .synthetic = synthetic, .index = @intCast(index) };
                 return .inserted;
             }
         }
@@ -1284,6 +1404,13 @@ const VK_DYNAMIC_STATE_SCISSOR: u32 = 1;
 const VK_SHADER_STAGE_VERTEX_BIT: u32 = 0x0000_0001;
 const VK_PIPELINE_BIND_POINT_GRAPHICS: u32 = 0;
 
+const RECT_EXPAND_COMMAND_STATES = 8;
+const RectExpandCommandState = struct {
+    command_buffer: u64 = 0,
+    marked_pipeline: bool = false,
+    builtin_indices: bool = false,
+};
+
 const TrackedImageView = struct {
     synthetic: u64 = 0,
     image: u64 = 0,
@@ -1556,7 +1683,10 @@ const PixelProbeState = struct {
     last_swapchain: abi.SwapchainKHR = 0,
     capture_policy: frame_capture.Policy = .{},
     capture_configured: bool = false,
-    capture_enabled: bool = true,
+    /// Off unless `ROSETTE_VULKAN_CAPTURE` asks for it: capture keeps the
+    /// steady readback cadence alive, and that readback drains the GPU queue
+    /// on the thread every guest thread runs on.
+    capture_enabled: bool = false,
     preview_enabled: bool = false,
     exposure_enabled: bool = true,
     preview_interval_ns: u64 = 250_000_000,
@@ -2319,6 +2449,50 @@ pub const Forwarder = struct {
     graphics_topology_repair_create_failures: u64 = 0,
     graphics_topology_repairs: u64 = 0,
     graphics_topology_repair_bind_failures: u64 = 0,
+    /// Xenos rectangle lists, expanded by Rosette because Xenia's Vulkan
+    /// backend selects a vertex-shader fallback it never implemented.
+    ///
+    /// The switch reaches the shader in the vertex index: Vulkan defines an
+    /// indexed draw's `gl_VertexIndex` as `indexBuffer[i] + vertexOffset`, so
+    /// setting the tag in `vertexOffset` marks a whole draw without touching
+    /// the index buffer Xenia owns and shares with its point-list fallback.
+    rect_expand_configured: bool = false,
+    rect_expand_enabled: bool = true,
+    /// Synthetic shader-module handles this bridge rewrote.
+    rect_expand_modules: [MAX_RECT_EXPAND_MODULES]u64 = [_]u64{0} ** MAX_RECT_EXPAND_MODULES,
+    rect_expand_module_count: u32 = 0,
+    /// Synthetic pipeline handles built from a rewritten vertex shader with
+    /// the strip-plus-restart topology the rectangle fallback uses.
+    rect_expand_pipelines: [MAX_RECT_EXPAND_PIPELINES]u64 = [_]u64{0} ** MAX_RECT_EXPAND_PIPELINES,
+    rect_expand_pipeline_count: u32 = 0,
+    rect_expand_bound_pipeline: u64 = 0,
+    /// Per command buffer: is a rewritten rectangle pipeline bound, and are
+    /// the bound indices the built-in expansion buffer's. Guest threads
+    /// interleave their recording, so a bind in one command buffer must never
+    /// decide a draw in another.
+    rect_expand_command_states: [RECT_EXPAND_COMMAND_STATES]RectExpandCommandState = @splat(.{}),
+    rect_expand_command_state_next: u32 = 0,
+    /// Xenia's built-in index buffer (real handle): the one buffer the
+    /// primitive processor binds for rectangle-list and point-list
+    /// expansion, holding `(primitive << 2) | corner` strips. A rewritten
+    /// vertex shader's module is also used by ordinary triangle strips with
+    /// primitive restart; only a draw indexed from this buffer is a
+    /// rectangle expansion.
+    rect_expand_builtin_index_buffer: u64 = 0,
+    rect_expand_builtin_index_buffers_seen: u64 = 0,
+    /// Rectangle-shaped draws on a marked pipeline that were left untagged
+    /// because their indices came from some other buffer - each was a
+    /// guest triangle strip the old tagging rule decoded as rectangles.
+    rect_expand_draws_declined_foreign_index: u64 = 0,
+    rect_expand_shaders_rewritten: u64 = 0,
+    rect_expand_shaders_refused: u64 = 0,
+    rect_expand_last_refusal: gpu_vulkan.rect_list_expand.Refusal = .none,
+    rect_expand_pipelines_marked: u64 = 0,
+    rect_expand_draws_tagged: u64 = 0,
+    rect_expand_module_overflow: u64 = 0,
+    rect_expand_pipeline_overflow: u64 = 0,
+    rect_expand_module_rejections: u64 = 0,
+    rect_expand_pipelines_unmarked: u64 = 0,
     target_attribution_events: u64 = 0,
     target_offscreen_events: u64 = 0,
     target_unknown_events: u64 = 0,
@@ -2357,6 +2531,18 @@ pub const Forwarder = struct {
     vulkan_descriptor_sampled_unknown: u64 = 0,
     pixel_probe: PixelProbeState = .{},
     transport_cost: transport_timing.Ledger = .{},
+    /// Asynchronous present completion. `present_completion_confirmed` is the
+    /// count of real presents the queue is known to have finished - by a
+    /// blocking wait while proof is the point, then by one host fence
+    /// submitted behind a present and polled at a later one.
+    present_completion_fence: abi.Fence = 0,
+    present_completion_fence_pending: bool = false,
+    present_completion_fence_target: u64 = 0,
+    present_completion_confirmed: u64 = 0,
+    present_completion_blocking: u64 = 0,
+    present_completion_async: u64 = 0,
+    present_completion_fence_signals: u64 = 0,
+    present_completion_failures: u64 = 0,
     /// Entry points the device does not provide that the guest nevertheless
     /// reached. An absence with no entry here was never asked for.
     vulkan_absent_reached: VulkanAbsentEntryPoints = .{},
@@ -4109,6 +4295,170 @@ pub const Forwarder = struct {
     /// stages, no vertex input, one dynamic viewport/scissor, one colour
     /// attachment, no tessellation/depth work, and a vertex push range large
     /// enough for the four rectangle floats.
+    /// `ROSETTE_VULKAN_RECT_EXPAND=0` turns the expansion off and restores
+    /// the behaviour of every run before it existed: one shaded triangle per
+    /// rectangle and a diagonal seam across the rest.
+    fn rectExpandEnabled(self: *Forwarder) bool {
+        if (!self.rect_expand_configured) {
+            self.rect_expand_configured = true;
+            if (std.c.getenv("ROSETTE_VULKAN_RECT_EXPAND")) |raw| {
+                const value = std.mem.sliceTo(raw, 0);
+                self.rect_expand_enabled = !(std.mem.eql(u8, value, "0") or
+                    std.ascii.eqlIgnoreCase(value, "false") or
+                    std.ascii.eqlIgnoreCase(value, "no"));
+            }
+        }
+        return self.rect_expand_enabled;
+    }
+
+    /// Rewrite a marshalled vertex shader in place, returning the buffer that
+    /// has to outlive the driver call. A refusal leaves the module exactly as
+    /// the guest wrote it.
+    const RectExpansion = struct {
+        words: []u32,
+        original_code: ?*const anyopaque,
+        original_size: usize,
+    };
+
+    fn expandRectangleListShader(self: *Forwarder, info: []u8) ?RectExpansion {
+        if (!self.rectExpandEnabled()) return null;
+        if (info.len < @sizeOf(marshal.ShaderModuleCreateInfo)) return null;
+        const root: *marshal.ShaderModuleCreateInfo = @ptrCast(@alignCast(info.ptr));
+        const code = root.code orelse return null;
+        if (root.code_size < 20 or root.code_size % 4 != 0) return null;
+        const words: [*]const u32 = @ptrCast(@alignCast(code));
+        const source = words[0 .. root.code_size / 4];
+
+        const result = gpu_vulkan.rect_list_expand.expand(std.heap.c_allocator, source) catch {
+            self.rect_expand_shaders_refused +|= 1;
+            return null;
+        };
+        if (result.refusal != .none) {
+            // A fragment shader and an already-expanded vertex shader are the
+            // common refusals and are not findings; the rest are.
+            self.rect_expand_shaders_refused +|= 1;
+            self.rect_expand_last_refusal = result.refusal;
+            return null;
+        }
+        const expansion = RectExpansion{
+            .words = result.words,
+            .original_code = root.code,
+            .original_size = root.code_size,
+        };
+        root.code = @ptrCast(result.words.ptr);
+        root.code_size = result.words.len * 4;
+        self.rect_expand_shaders_rewritten +|= 1;
+        if (self.rect_expand_shaders_rewritten <= 4) machoCapturePrint(
+            "macho-processor: RECT EXPAND: vertex shader rewritten words={d}->{d} outputs_combined={d} index_loads_repointed={d}; Xenia selects kRectangleListAsTriangleStrip on a host with no geometry shader and its SPIR-V translator never implemented it\n",
+            .{ source.len, result.words.len, result.combined_outputs, result.repointed_loads },
+        );
+        return expansion;
+    }
+
+    fn noteRectangleExpandedModule(self: *Forwarder, synthetic_module: u64) void {
+        if (self.rect_expand_module_count == self.rect_expand_modules.len) {
+            self.rect_expand_module_overflow +|= 1;
+            return;
+        }
+        self.rect_expand_modules[self.rect_expand_module_count] = synthetic_module;
+        self.rect_expand_module_count += 1;
+    }
+
+    fn rectangleExpandedModule(self: *const Forwarder, synthetic_module: u64) bool {
+        for (self.rect_expand_modules[0..self.rect_expand_module_count]) |handle| {
+            if (handle == synthetic_module) return true;
+        }
+        return false;
+    }
+
+    fn noteRectangleExpandedPipeline(self: *Forwarder, synthetic_pipeline: u64) void {
+        if (self.rect_expand_pipeline_count == self.rect_expand_pipelines.len) {
+            self.rect_expand_pipeline_overflow +|= 1;
+            return;
+        }
+        self.rect_expand_pipelines[self.rect_expand_pipeline_count] = synthetic_pipeline;
+        self.rect_expand_pipeline_count += 1;
+        self.rect_expand_pipelines_marked +|= 1;
+    }
+
+    /// Prove a present's completion without waiting for it. One host fence
+    /// rides behind a present in queue order; a later present polls it. When
+    /// it has signalled, every present up to the one it followed is complete.
+    /// The present in hand is credited now unless the queue has reported a
+    /// failure: its fence is in flight, and a failure surfaces as a counted
+    /// fence error and a device-loss result, never as a silent success.
+    fn trackPresentCompletion(self: *Forwarder, queue: abi.Queue) bool {
+        const device = self.real_vulkan.device orelse return false;
+        const functions = &self.real_vulkan.fn_ptrs;
+        const create = functions.create_fence orelse return false;
+        const status_of = functions.get_fence_status orelse return false;
+        const reset = functions.reset_fences orelse return false;
+        const submit = functions.queue_submit orelse return false;
+        self.present_completion_async +|= 1;
+        if (self.present_completion_fence == 0) {
+            const info = abi.FenceCreateInfo{};
+            var fence: abi.Fence = 0;
+            const created = create(device, &info, null, &fence);
+            if (created != abi.SUCCESS or fence == 0) {
+                self.noteRealVulkanResult(created, "vkCreateFence(present-completion)");
+                self.present_completion_failures +|= 1;
+                return false;
+            }
+            self.present_completion_fence = fence;
+        }
+        if (self.present_completion_fence_pending) {
+            const status = status_of(device, self.present_completion_fence);
+            if (status == abi.SUCCESS) {
+                self.present_completion_fence_pending = false;
+                self.present_completion_fence_signals +|= 1;
+                self.present_completion_confirmed = @max(self.present_completion_confirmed, self.present_completion_fence_target);
+            } else if (status != abi.NOT_READY) {
+                self.noteRealVulkanResult(status, "vkGetFenceStatus(present-completion)");
+                self.present_completion_failures +|= 1;
+                self.present_completion_fence_pending = false;
+                return false;
+            }
+        }
+        if (!self.present_completion_fence_pending) {
+            const reset_result = reset(device, 1, @ptrCast(&self.present_completion_fence));
+            const submitted = if (reset_result == abi.SUCCESS) submit(queue, 0, null, self.present_completion_fence) else reset_result;
+            if (submitted != abi.SUCCESS) {
+                self.noteRealVulkanResult(submitted, "vkQueueSubmit(present-completion)");
+                self.present_completion_failures +|= 1;
+                return false;
+            }
+            self.present_completion_fence_pending = true;
+            // The present in hand is counted just after this returns.
+            self.present_completion_fence_target = self.vulkan_real_presents +| 1;
+        }
+        return true;
+    }
+
+    fn rectExpandCommandState(self: *Forwarder, command_buffer: u64) *RectExpandCommandState {
+        for (&self.rect_expand_command_states) |*entry| {
+            if (entry.command_buffer == command_buffer) return entry;
+        }
+        const slot = &self.rect_expand_command_states[self.rect_expand_command_state_next];
+        self.rect_expand_command_state_next = (self.rect_expand_command_state_next + 1) % RECT_EXPAND_COMMAND_STATES;
+        slot.* = .{ .command_buffer = command_buffer };
+        return slot;
+    }
+
+    fn rectangleExpandedPipeline(self: *const Forwarder, synthetic_pipeline: u64) bool {
+        for (self.rect_expand_pipelines[0..self.rect_expand_pipeline_count]) |handle| {
+            if (handle == synthetic_pipeline) return true;
+        }
+        return false;
+    }
+
+    /// The topology Xenia gives the rectangle fallback: a two-triangle strip
+    /// per rectangle, separated by primitive restarts.
+    fn isRectangleStripPipeline(root: *const abi.GraphicsPipelineCreateInfo) bool {
+        const input_assembly = root.input_assembly_state orelse return false;
+        if (input_assembly.topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP) return false;
+        return input_assembly.primitive_restart_enable != 0;
+    }
+
     fn isGuestOutputPaintPipeline(self: *const Forwarder, root: *const abi.GraphicsPipelineCreateInfo) bool {
         const input_assembly = root.input_assembly_state orelse return false;
         if (input_assembly.topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) return false;
@@ -4759,6 +5109,13 @@ pub const Forwarder = struct {
         if ((name_hash == vulkanNameHash("vkCmdBindPipeline") and std.mem.eql(u8, name, "vkCmdBindPipeline"))) {
             const pipeline = self.real_vulkan.realPipeline(state.regs.rdx) orelse return self.noteVulkanCommandRefusal(@src().line);
             self.noteCommandPipelineState(state.regs.rdi, state.regs.rdx, pipeline, state.regs.rsi);
+            // Compute and graphics are separate bind points: a compute bind
+            // (Xenia's resolves and texture loads) leaves the graphics
+            // pipeline its next draw uses in place.
+            if (@as(u32, @truncate(state.regs.rsi)) == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+                self.rect_expand_bound_pipeline = if (self.rectangleExpandedPipeline(pipeline)) pipeline else 0;
+                self.rectExpandCommandState(state.regs.rdi).marked_pipeline = self.rect_expand_bound_pipeline != 0;
+            }
             if (self.real_vulkan.fn_ptrs.cmd_bind_pipeline) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi), pipeline });
         } else if ((name_hash == vulkanNameHash("vkCmdExecuteCommands") and std.mem.eql(u8, name, "vkCmdExecuteCommands"))) {
             const count = state.regs.rsi;
@@ -4781,6 +5138,11 @@ pub const Forwarder = struct {
             if (self.real_vulkan.fn_ptrs.cmd_bind_vertex_buffers) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi), @intCast(count), &buffers, &offsets });
         } else if ((name_hash == vulkanNameHash("vkCmdBindIndexBuffer") and std.mem.eql(u8, name, "vkCmdBindIndexBuffer"))) {
             const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
+            // The two-triangle strips are the built-in buffer's first
+            // section, 32-bit, so an expansion binds it at offset 0.
+            self.rectExpandCommandState(state.regs.rdi).builtin_indices = self.rect_expand_builtin_index_buffer != 0 and
+                buffer == self.rect_expand_builtin_index_buffer and
+                state.regs.rdx == 0 and @as(u32, @truncate(state.regs.rcx)) == abi.INDEX_TYPE_UINT32;
             if (self.real_vulkan.fn_ptrs.cmd_bind_index_buffer) |function| self.callNativeVulkanCommand(function, .{ command_buffer, buffer, state.regs.rdx, @intCast(state.regs.rcx) });
         } else if (is_descriptor_bind) {
             const set_count = state.regs.r8;
@@ -4847,7 +5209,38 @@ pub const Forwarder = struct {
                 self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx), @intCast(state.regs.rcx), @intCast(state.regs.r8) });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdDrawIndexed") and std.mem.eql(u8, name, "vkCmdDrawIndexed"))) {
-            const vertex_offset: i32 = @bitCast(@as(u32, @truncate(state.regs.r8)));
+            // Vulkan defines an indexed draw's `gl_VertexIndex` as
+            // `indexBuffer[i] + vertexOffset`, so the rectangle tag rides in
+            // the offset. Xenia's builtin index buffer is untouched, which
+            // matters because its point-list fallback shares it - and that
+            // fallback's shader is one this bridge deliberately refuses to
+            // rewrite, so its draws are never tagged.
+            var vertex_offset: i32 = @bitCast(@as(u32, @truncate(state.regs.r8)));
+            // Xenia draws `4 * rectangles + (rectangles - 1)` indices for the
+            // fallback: four strip vertices per rectangle and a primitive
+            // restart between them. An index count that is not one short of a
+            // multiple of five is some other draw that happens to share this
+            // pipeline, and it is left alone.
+            const index_count = state.regs.rsi;
+            const rectangle_shaped = index_count >= 4 and (index_count + 1) % 5 == 0;
+            const recording = self.rectExpandCommandState(state.regs.rdi);
+            if (recording.marked_pipeline and rectangle_shaped) {
+                // The rewritten module is shared with guest triangle strips
+                // that use primitive restart, and 1 in 5 of those has a
+                // rectangle-shaped count. Decoding a guest index as
+                // `(rectangle << 2) | corner` shades three unrelated
+                // vertices per corner - giant triangles, and enough overdraw
+                // to trip the GPU watchdog. Only the built-in buffer holds
+                // expansion indices, and Xenia draws it from index 0.
+                const builtin_indices = recording.builtin_indices and
+                    @as(u32, @truncate(state.regs.rcx)) == 0;
+                if (builtin_indices) {
+                    vertex_offset = @bitCast(@as(u32, @bitCast(vertex_offset)) | gpu_vulkan.rect_list_expand.rect_tag);
+                    self.rect_expand_draws_tagged +|= 1;
+                } else {
+                    self.rect_expand_draws_declined_foreign_index +|= 1;
+                }
+            }
             if (self.real_vulkan.fn_ptrs.cmd_draw_indexed) |function| {
                 self.noteCommandTargets(state.regs.rdi, .content);
                 self.noteGraphicsDrawState(state.regs.rdi, "draw_indexed", state.regs.rsi, state.regs.rdx, state.regs.rcx, state.regs.r8, state.regs.r9);
@@ -5747,7 +6140,10 @@ pub const Forwarder = struct {
             }
             _ = self.releaseVulkanHandle(&self.real_vulkan.pipeline_map, handle);
         } else if (std.mem.eql(u8, name, "vkDestroyBuffer")) {
-            if (self.real_vulkan.realBuffer(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_buffer) |function| function(device, real, null);
+            if (self.real_vulkan.realBuffer(handle)) |real| {
+                if (real == self.rect_expand_builtin_index_buffer) self.rect_expand_builtin_index_buffer = 0;
+                if (self.real_vulkan.fn_ptrs.destroy_buffer) |function| function(device, real, null);
+            }
             _ = self.releaseVulkanHandle(&self.real_vulkan.buffer_map, handle);
             _ = self.releaseResource(handle);
         } else if (std.mem.eql(u8, name, "vkDestroyImage")) {
@@ -7706,6 +8102,12 @@ pub const Forwarder = struct {
             const result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_buffer);
             if (result == 0 and real_buffer != 0) {
                 _ = self.mapVulkanHandle(&self.real_vulkan.buffer_map, synthetic_handle, real_buffer, "vkCreateBuffer");
+                // VkBufferCreateInfo: size at +24, usage at +32.
+                if (rectExpansionBuiltinIndexBuffer(state.read64(create_info + 24), state.read32(create_info + 32))) {
+                    self.rect_expand_builtin_index_buffer = real_buffer;
+                    self.rect_expand_builtin_index_buffers_seen +|= 1;
+                    machoCapturePrint("macho-processor: RECT EXPAND: built-in index buffer identified real=0x{x} size={d}; only draws that bind it are rectangle expansions\n", .{ real_buffer, state.read64(create_info + 24) });
+                }
                 self.vulkan_real_objects_created +|= 1;
                 self.vulkan_tiers.note(.buffer_object, .real);
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreateBuffer synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_buffer });
@@ -7741,10 +8143,35 @@ pub const Forwarder = struct {
 
             const info = self.marshalCreateInfo(state, create_info, name) orelse return error.InvalidInfo;
             const create_fn = self.real_vulkan.fn_ptrs.create_shader_module orelse return error.MissingFn;
+            // Give a vertex shader the ability to expand a Xenos rectangle
+            // list itself. Xenia's SPIR-V translator never implemented the
+            // `kRectangleListAsTriangleStrip` fallback it selects on a host
+            // with no geometry shader, so without this the fourth corner of
+            // every rectangle is never shaded. See `rect_list_expand`.
+            const expanded = self.expandRectangleListShader(info);
+            defer if (expanded) |expansion| std.heap.c_allocator.free(expansion.words);
             var real_module: u64 = 0;
-            const result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_module);
+            var result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_module);
+            var expansion_used = expanded != null;
+            if (result != 0 and expanded != null) {
+                // The driver would not take the rewritten module. Put the
+                // guest's own SPIR-V back and create that instead: a rectangle
+                // with a missing fourth corner is a far better outcome than a
+                // pipeline this title cannot create at all.
+                const root: *marshal.ShaderModuleCreateInfo = @ptrCast(@alignCast(info.ptr));
+                root.code = expanded.?.original_code;
+                root.code_size = expanded.?.original_size;
+                expansion_used = false;
+                self.rect_expand_module_rejections +|= 1;
+                if (self.rect_expand_module_rejections <= 4) machoCapturePrint(
+                    "macho-processor: RECT EXPAND: the driver refused the rewritten vertex shader (VkResult={d}); the guest's own module was created instead\n",
+                    .{result},
+                );
+                result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_module);
+            }
             if (result == 0 and real_module != 0) {
                 _ = self.mapVulkanHandle(&self.real_vulkan.shader_module_map, synthetic_handle, real_module, "vkCreateShaderModule");
+                if (expansion_used) self.noteRectangleExpandedModule(real_module);
                 self.vulkan_real_objects_created +|= 1;
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreateShaderModule synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_module });
             } else {
@@ -11096,6 +11523,7 @@ pub const Forwarder = struct {
             const cost = timing.costs[@intFromEnum(stage)];
             machoCapturePrint("macho-processor: FRAME HOST COST: stage={s} calls={d} total_us={d} max_us={d}; readback and deferred cpu_capture are separately timed; ladder readbacks are included in readback_inclusive\n", .{ @tagName(stage), cost.calls, cost.total_ns / 1_000, cost.max_ns / 1_000 });
         }
+        machoCapturePrint("macho-processor: PRESENT COMPLETION: blocking_waits={d} async={d} fence_signals={d} confirmed={d} requests={d} fence_pending={} failures={d}; a present is waited on only until the first picture opens and when the pixel probe reads it back, then proven by a polled fence so the guest never idles for a GPU frame\n", .{ self.present_completion_blocking, self.present_completion_async, self.present_completion_fence_signals, self.present_completion_confirmed, self.vulkan_real_presents, self.present_completion_fence_pending, self.present_completion_failures });
         machoCapturePrint("macho-processor: SHADOW MEMORY CUSTODY: uploads={d} bytes={d} unchanged_skips={d} unmap_publications={d} failures={d}; coherent CPU changes are published without erasing unchanged GPU bytes; noncoherent ranges still require explicit flush\n", .{ self.vulkan_shadow_uploads, self.vulkan_shadow_upload_bytes, self.vulkan_shadow_unchanged, self.vulkan_shadow_unmap_uploads, self.vulkan_shadow_upload_failures });
         machoCapturePrint("macho-processor: NATIVE MEMORY IDENTITY: mappings={d}; PE driver-owned aliases retain exact CPU/GPU byte identity, including same-value stores; flush/invalidate and synchronization remain native Vulkan obligations\n", .{self.vulkan_native_memory_aliases});
         machoCapturePrint("macho-processor: TEXEL CUSTODY SUMMARY: samples={d} zero_tables={d} unreadable_native_ranges={d} printed={d} xenia_default_ramps={d} programmed_ramps={d} last(format/shape/out_max/out_7e3_one/out_mid)={d}/{s}/{d}/{d}/{d}; lookup bytes are checked only for bounded mapped A2B10G10R10 and R16G16_UINT uniform texel views, and a default shape means no title DC_LUT programming reached the ramp\n", .{ self.texel_custody_samples, self.texel_custody_zero, self.texel_custody_missing, self.texel_custody_printed, self.texel_custody_default_samples, self.texel_custody_programmed_samples, self.texel_custody_last_format, self.texel_custody_last_shape.label(), self.texel_custody_last_out[0], self.texel_custody_last_out[1], self.texel_custody_last_out[2] });
@@ -11647,6 +12075,25 @@ pub const Forwarder = struct {
                 .{ self.guest_output_topology_repair_enabled, self.graphics_topology_repair_candidates, self.graphics_topology_repair_pipeline_creations, self.graphics_topology_repair_create_failures, self.graphics_topology_repairs, self.graphics_topology_repair_bind_failures },
             );
         }
+        if (self.rect_expand_configured or self.rect_expand_shaders_rewritten != 0) {
+            machoCapturePrint(
+                "macho-processor: RECT EXPAND: enabled={} shaders(rewritten/refused)={d}/{d} last_refusal={s} pipelines(marked/unmarked)={d}/{d} draws_tagged={d} declined_foreign_index={d} builtin_index_buffer=0x{x} overflow(modules/pipelines)={d}/{d} driver_rejections={d}; a Xenos rectangle list is three vertices with the fourth corner derived, and Xenia's Vulkan backend selects a vertex-shader fallback its SPIR-V translator never implemented. draws_tagged counts the draws whose fourth corner this bridge shaded, and declined_foreign_index the rectangle-shaped draws on a rewritten pipeline whose indices were a guest strip's, not the built-in expansion buffer's; zero tagged with rewritten shaders means the rectangle pipelines were never recognised, not that the title drew no rectangles\n",
+                .{
+                    self.rect_expand_enabled,
+                    self.rect_expand_shaders_rewritten,
+                    self.rect_expand_shaders_refused,
+                    self.rect_expand_last_refusal.label(),
+                    self.rect_expand_pipelines_marked,
+                    self.rect_expand_pipelines_unmarked,
+                    self.rect_expand_draws_tagged,
+                    self.rect_expand_draws_declined_foreign_index,
+                    self.rect_expand_builtin_index_buffer,
+                    self.rect_expand_module_overflow,
+                    self.rect_expand_pipeline_overflow,
+                    self.rect_expand_module_rejections,
+                },
+            );
+        }
         self.printVulkanCommandAdmission();
         if (self.vulkan_descriptor_update_calls != 0 or
             self.vulkan_descriptor_template_update_calls != 0 or
@@ -11996,6 +12443,18 @@ pub const Forwarder = struct {
         // The pixel probe owns host Vulkan children outside the guest handle
         // maps.  Release them while the device function table is still live.
         self.destroyPixelProbeResources();
+        if (self.present_completion_fence != 0 and !self.real_vulkan.device_lost) {
+            // Only a submitted fence can signal: one whose reset succeeded
+            // and whose submit failed would be waited on forever.
+            if (self.present_completion_fence_pending) {
+                if (self.real_vulkan.fn_ptrs.wait_for_fences) |wait| _ = wait(device, 1, @ptrCast(&self.present_completion_fence), 1, std.math.maxInt(u64));
+            }
+            if (self.real_vulkan.fn_ptrs.destroy_fence) |destroy| destroy(device, self.present_completion_fence, null);
+        }
+        self.present_completion_fence = 0;
+        self.present_completion_fence_pending = false;
+        self.rect_expand_builtin_index_buffer = 0;
+        self.rect_expand_command_states = @splat(.{});
         if (self.real_vulkan.device_lost) {
             // Once the driver has reported VK_ERROR_DEVICE_LOST, child
             // destruction and idle waits are not a reliable recovery path.
@@ -14608,6 +15067,17 @@ pub const Forwarder = struct {
         return true;
     }
 
+    /// Hand every presented frame count to the window bridge. The bridge
+    /// uses it twice: as the frame clock that keeps a short key press
+    /// visible until the guest has had a whole frame to poll it, and, at
+    /// most four times a second, as the main window's title. The title is
+    /// applied asynchronously so a repaint can never stall the thread every
+    /// guest thread runs on, which is why the throttle lives on that side.
+    fn noteFrameCounterTitle(self: *Forwarder) void {
+        const callback = HostFrameCounterResolver.resolve() orelse return;
+        callback(self.vulkan_real_presents);
+    }
+
     fn configureFrameCapture(self: *Forwarder) void {
         if (self.pixel_probe.capture_configured) return;
         self.pixel_probe.capture_configured = true;
@@ -14696,7 +15166,17 @@ pub const Forwarder = struct {
         // time cadence: 1 Hz for fills, 4 Hz for content (not every 60 clears).
         const first_picture_probes = write_kind == .content and self.picture_sequence.frames != 0 and self.picture_sequence.frames < 8;
         const probe_interval_ns: u64 = if (write_kind == .content) 250_000_000 else 1_000_000_000;
-        if (!self.pixel_probe.probe_schedule.choose(real_swapchain, probe_now, probe_interval_ns, frame <= PIXEL_PROBE_INITIAL_SAMPLES or force_content_probe or first_picture_probes or preview_due)) return;
+        const discovery = frame <= PIXEL_PROBE_INITIAL_SAMPLES or force_content_probe or first_picture_probes or preview_due;
+        // The steady cadence exists to feed the capture files and the preview
+        // window. With neither enabled it bought nothing and cost 9.5% of the
+        // run: on 2026-09-20 2,526 readbacks took 114.5 s, because each one
+        // ends in `vkQueueWaitIdle` and every guest thread shares the host
+        // thread that waits. Discovery - the first samples, the pre-detail
+        // content retries and the first picture frames, all bounded - still
+        // runs, so the picture epoch opens and the validity chain still has
+        // its evidence.
+        if (!discovery and !self.pixel_probe.capture_enabled and !self.pixel_probe.preview_enabled) return;
+        if (!self.pixel_probe.probe_schedule.choose(real_swapchain, probe_now, probe_interval_ns, discovery)) return;
         self.pixel_probe.last_preview_probe_ns = probe_now;
         defer self.transport_cost.finish(.readback_inclusive, probe_now);
         self.pixel_probe.attempts +|= 1;
@@ -15375,17 +15855,35 @@ pub const Forwarder = struct {
             var hardware_completed = false;
             var completion_result: abi.Result = abi.NOT_READY;
             if (result == abi.SUCCESS or result == abi.SUBOPTIMAL_KHR) {
-                if (self.real_vulkan.fn_ptrs.queue_wait_idle) |wait_idle| {
-                    const completion_started = transport_timing.nowNs();
-                    completion_result = wait_idle(real_queue);
-                    self.transport_cost.finish(.present_completion, completion_started);
-                    self.noteRealVulkanResult(completion_result, "vkQueueWaitIdle(present-completion)");
-                    hardware_completed = completion_result == abi.SUCCESS;
+                // Waiting for the queue to drain after every present stalls
+                // every guest thread for a whole GPU frame (51 s of a 640 s
+                // run). Block only while the proof is the point: until the
+                // first picture opens, and on a present the pixel probe read
+                // back. Every other present is proven asynchronously by a
+                // fence that is polled, never waited on.
+                var probed = false;
+                for (samples[0..swapchain_count]) |sample| probed = probed or sample != null;
+                const prove_now = self.picture_sequence.frames == 0 or probed;
+                if (prove_now) {
+                    if (self.real_vulkan.fn_ptrs.queue_wait_idle) |wait_idle| {
+                        const completion_started = transport_timing.nowNs();
+                        completion_result = wait_idle(real_queue);
+                        self.transport_cost.finish(.present_completion, completion_started);
+                        self.noteRealVulkanResult(completion_result, "vkQueueWaitIdle(present-completion)");
+                        hardware_completed = completion_result == abi.SUCCESS;
+                        self.present_completion_blocking +|= 1;
+                        if (hardware_completed) self.present_completion_confirmed = self.vulkan_real_presents +| 1;
+                    }
+                } else {
+                    hardware_completed = self.trackPresentCompletion(real_queue);
                 }
             }
             self.gpu_runtime.observeBackendProgress(false, hardware_completed);
             self.vulkan_tiers.note(.presentation, .real);
-            if (result == abi.SUCCESS or result == abi.SUBOPTIMAL_KHR) self.vulkan_real_presents +|= 1;
+            if (result == abi.SUCCESS or result == abi.SUBOPTIMAL_KHR) {
+                self.vulkan_real_presents +|= 1;
+                self.noteFrameCounterTitle();
+            }
             if (hardware_completed) self.vulkan_real_present_completions +|= 1;
             const completed_ns = transport_timing.nowNs();
             for (0..swapchain_count) |index| {
@@ -16227,6 +16725,24 @@ pub const Forwarder = struct {
         }
         result_output.* = result;
         real_output.* = real_pipeline;
+        // A pipeline whose vertex shader this bridge rewrote, drawn as a
+        // strip with primitive restart, is Xenia's rectangle-list fallback.
+        // Its draws get the tag; nothing else does.
+        if (result == abi.SUCCESS and real_pipeline != 0 and isRectangleStripPipeline(&root)) {
+            var marked = false;
+            for (stages[0..@as(usize, @intCast(root.stage_count))]) |stage| {
+                if (stage.stage != VK_SHADER_STAGE_VERTEX_BIT) continue;
+                if (!self.rectangleExpandedModule(stage.module)) continue;
+                self.noteRectangleExpandedPipeline(real_pipeline);
+                marked = true;
+                break;
+            }
+            // A pipeline with the rectangle fallback's topology whose vertex
+            // shader was *not* rewritten cannot expand anything. If a title
+            // still shows the diagonal seam while draws_tagged is large, this
+            // is the counter that says its rectangles took this path instead.
+            if (!marked) self.rect_expand_pipelines_unmarked +|= 1;
+        }
         if (result == abi.SUCCESS) self.rememberGraphicsPipeline(real_pipeline, &root, repair_pipeline, guest_output_candidate);
     }
 
@@ -18664,6 +19180,63 @@ test "Vulkan swapchain teardown releases its synthetic image ownership" {
     try std.testing.expect(forwarder.real_vulkan.realSwapchain(synthetic_swapchain) == null);
     try std.testing.expect(forwarder.real_vulkan.realImage(synthetic_image) == null);
     try std.testing.expect(forwarder.real_vulkan.mutableSwapchainRecord(synthetic_swapchain) == null);
+}
+
+test "present completion is proven by a polled fence, never a wait" {
+    const Driver = struct {
+        var status: abi.Result = abi.NOT_READY;
+        var submits: u32 = 0;
+        var resets: u32 = 0;
+        fn create(_: abi.Device, _: *const abi.FenceCreateInfo, _: ?*const anyopaque, fence: *abi.Fence) callconv(.c) abi.Result {
+            fence.* = 0x77;
+            return abi.SUCCESS;
+        }
+        fn fenceStatus(_: abi.Device, fence: abi.Fence) callconv(.c) abi.Result {
+            std.debug.assert(fence == 0x77);
+            return status;
+        }
+        fn reset(_: abi.Device, count: u32, fences: [*]const abi.Fence) callconv(.c) abi.Result {
+            std.debug.assert(count == 1 and fences[0] == 0x77);
+            resets += 1;
+            return abi.SUCCESS;
+        }
+        fn submit(_: abi.Queue, count: u32, _: ?[*]const abi.SubmitInfo, fence: abi.Fence) callconv(.c) abi.Result {
+            std.debug.assert(count == 0 and fence == 0x77);
+            submits += 1;
+            return abi.SUCCESS;
+        }
+    };
+    Driver.status = abi.NOT_READY;
+    Driver.submits = 0;
+    Driver.resets = 0;
+    var forwarder: Forwarder = .{};
+    forwarder.real_vulkan.device = @ptrFromInt(0x1234);
+    forwarder.real_vulkan.fn_ptrs.create_fence = Driver.create;
+    forwarder.real_vulkan.fn_ptrs.get_fence_status = Driver.fenceStatus;
+    forwarder.real_vulkan.fn_ptrs.reset_fences = Driver.reset;
+    forwarder.real_vulkan.fn_ptrs.queue_submit = Driver.submit;
+    const queue: abi.Queue = @ptrFromInt(0x302);
+    // Present 1: the fence goes in behind it.
+    try std.testing.expect(forwarder.trackPresentCompletion(queue));
+    forwarder.vulkan_real_presents = 1;
+    try std.testing.expectEqual(@as(u32, 1), Driver.submits);
+    // Present 2 while the GPU is still behind: no second fence, no wait.
+    try std.testing.expect(forwarder.trackPresentCompletion(queue));
+    forwarder.vulkan_real_presents = 2;
+    try std.testing.expectEqual(@as(u32, 1), Driver.submits);
+    try std.testing.expectEqual(@as(u64, 0), forwarder.present_completion_confirmed);
+    // Present 3 after the fence signalled: present 1 is confirmed and a new
+    // fence follows present 3.
+    Driver.status = abi.SUCCESS;
+    try std.testing.expect(forwarder.trackPresentCompletion(queue));
+    try std.testing.expectEqual(@as(u64, 1), forwarder.present_completion_confirmed);
+    try std.testing.expectEqual(@as(u64, 3), forwarder.present_completion_fence_target);
+    try std.testing.expectEqual(@as(u32, 2), Driver.submits);
+    // A device loss surfaces as a failure, not a completion.
+    Driver.status = abi.ERROR_DEVICE_LOST;
+    try std.testing.expect(!forwarder.trackPresentCompletion(queue));
+    try std.testing.expectEqual(@as(u64, 1), forwarder.present_completion_failures);
+    try std.testing.expect(!forwarder.present_completion_fence_pending);
 }
 
 test "Vulkan device provenance rejects a lost native device" {
