@@ -2,6 +2,54 @@ const std = @import("std");
 const compat_runtime = @import("macho_compat_runtime");
 const cxx_object_model = @import("cxx_abi").cxx_object_model;
 const machoCapturePrint = @import("event_log").machoCapturePrint;
+const stream_symbols = @import("libcpp_stream_symbols.zig");
+const characterArrayCapacity = stream_symbols.characterArrayCapacity;
+const displayThreadId = stream_symbols.displayThreadId;
+const isBaseDestructor = stream_symbols.isBaseDestructor;
+const isBasicFilebufConstructor = stream_symbols.isBasicFilebufConstructor;
+const isBasicIosBool = stream_symbols.isBasicIosBool;
+const isBasicIosClear = stream_symbols.isBasicIosClear;
+const isBasicIosEof = stream_symbols.isBasicIosEof;
+const isBasicIosFail = stream_symbols.isBasicIosFail;
+const isBasicIosGood = stream_symbols.isBasicIosGood;
+const isBasicIosInit = stream_symbols.isBasicIosInit;
+const isBasicIosRdbuf = stream_symbols.isBasicIosRdbuf;
+const isBasicIosRdstate = stream_symbols.isBasicIosRdstate;
+const isBasicIosSetstate = stream_symbols.isBasicIosSetstate;
+const isBasicIostreamConstructor = stream_symbols.isBasicIostreamConstructor;
+const isBasicIstreamConstructor = stream_symbols.isBasicIstreamConstructor;
+const isBasicOstreamConstructor = stream_symbols.isBasicOstreamConstructor;
+const isBasicOstreamDestructor = stream_symbols.isBasicOstreamDestructor;
+const isBasicStreambufConstructor = stream_symbols.isBasicStreambufConstructor;
+const isBasicStreambufImbue = stream_symbols.isBasicStreambufImbue;
+const isBasicStreambufPubimbue = stream_symbols.isBasicStreambufPubimbue;
+const isCStringInsertion = stream_symbols.isCStringInsertion;
+const isCharacterReferenceExtraction = stream_symbols.isCharacterReferenceExtraction;
+const isDigitForBase = stream_symbols.isDigitForBase;
+const isDoubleInsertion = stream_symbols.isDoubleInsertion;
+const isFormattedWhitespace = stream_symbols.isFormattedWhitespace;
+const isIfstreamCStringConstructor = stream_symbols.isIfstreamCStringConstructor;
+const isIfstreamDefaultConstructor = stream_symbols.isIfstreamDefaultConstructor;
+const isIfstreamDestructor = stream_symbols.isIfstreamDestructor;
+const isIfstreamFilesystemPathConstructor = stream_symbols.isIfstreamFilesystemPathConstructor;
+const isIntegerInsertion = stream_symbols.isIntegerInsertion;
+const isOfstreamDestructor = stream_symbols.isOfstreamDestructor;
+const isOstreamManipulatorInsertion = stream_symbols.isOstreamManipulatorInsertion;
+const isPointerInsertion = stream_symbols.isPointerInsertion;
+const isSignedIntegerInsertion = stream_symbols.isSignedIntegerInsertion;
+const isStreamManipulator = stream_symbols.isStreamManipulator;
+const isStringStreamConstructor = stream_symbols.isStringStreamConstructor;
+const isStringStreamDestructor = stream_symbols.isStringStreamDestructor;
+const isStringStreamStr = stream_symbols.isStringStreamStr;
+const isStringStreamTextConstructor = stream_symbols.isStringStreamTextConstructor;
+const isStringbufStr = stream_symbols.isStringbufStr;
+const isThreadIdInsertion = stream_symbols.isThreadIdInsertion;
+const manipulatorAppend = stream_symbols.manipulatorAppend;
+const manipulatorNumericBase = stream_symbols.manipulatorNumericBase;
+const normalizeSymbol = stream_symbols.normalizeSymbol;
+const numericBaseForManipulator = stream_symbols.numericBaseForManipulator;
+const seekDirection = stream_symbols.seekDirection;
+const selectStreambufArgument = stream_symbols.selectStreambufArgument;
 
 /// Standard C++ streams constructed on demand when the Mach-O bindings for
 /// __ZSt4cin/cout/cerr/clog are resolved. Indexed by `StandardStreamKind`.
@@ -34,9 +82,7 @@ const PROC_SELF_MAPS_CAPACITY: usize = 256 * 1024;
 /// Update these when targeting a different libc++ version.
 const LIBCPP_STREAM_LAYOUT_VERSION: u32 = 16;
 const LIBCPP_STREAM_LAYOUT_NOTE: []const u8 = "libc++ v160006 specific; adjust for libstdc++ or other versions";
-const CURRENT_THREAD_HANDLE: u64 = 0x7FFF_1000;
-const SYNTHETIC_THREAD_BASE: u64 = 0x7FFF_2000;
-const IDLE_CALLBACK_HANDLE_BASE: u64 = 0xFFFF_F900_0000_0000;
+const SYNTHETIC_THREAD_BASE = stream_symbols.SYNTHETIC_THREAD_BASE;
 
 const OPENMODE_APP: u64 = 1 << 0;
 const OPENMODE_ATE: u64 = 1 << 1;
@@ -2272,305 +2318,6 @@ fn closeStream(stream: *Stream) void {
     if (stream.fd >= 0) _ = std.c.close(stream.fd);
     stream.fd = -1;
     stream.synthetic_proc_maps = false;
-}
-
-fn normalizeSymbol(symbol: []const u8) []const u8 {
-    if (symbol.len != 0 and symbol[0] == '_') return symbol[1..];
-    return symbol;
-}
-
-fn selectStreambufArgument(state: anytype) u64 {
-    // The libc++ C2 base constructor carries a hidden VTT in RSI and moves the
-    // declared streambuf argument to RDX. A tiny RSI (the logger showed 0x8)
-    // is never a valid object pointer even in test-backed address spaces.
-    if (state.regs.rsi >= 0x1000 and state.guestMemoryConst(state.regs.rsi, 8) != null) return state.regs.rsi;
-    if (state.regs.rdx != 0 and state.guestMemoryConst(state.regs.rdx, 8) != null) return state.regs.rdx;
-    return 0;
-}
-
-fn isBasicOstreamConstructor(name: []const u8) bool {
-    return std.mem.indexOf(u8, name, "basic_ostreamIcNS_11char_traitsIcEEEC1") != null or
-        std.mem.indexOf(u8, name, "basic_ostreamIcNS_11char_traitsIcEEEC2") != null;
-}
-
-fn isBasicIstreamConstructor(name: []const u8) bool {
-    return std.mem.indexOf(u8, name, "basic_istreamIcNS_11char_traitsIcEEEC1") != null or
-        std.mem.indexOf(u8, name, "basic_istreamIcNS_11char_traitsIcEEEC2") != null;
-}
-
-fn isBasicIostreamConstructor(name: []const u8) bool {
-    return std.mem.indexOf(u8, name, "basic_iostreamIcNS_11char_traitsIcEEEC1") != null or
-        std.mem.indexOf(u8, name, "basic_iostreamIcNS_11char_traitsIcEEEC2") != null;
-}
-
-fn isBasicOstreamDestructor(name: []const u8) bool {
-    return std.mem.indexOf(u8, name, "basic_ostreamIcNS_11char_traitsIcEEED1") != null or
-        std.mem.indexOf(u8, name, "basic_ostreamIcNS_11char_traitsIcEEED2") != null;
-}
-
-fn isStringStreamDestructor(name: []const u8) bool {
-    const family = std.mem.indexOf(u8, name, "basic_ostringstream") != null or
-        std.mem.indexOf(u8, name, "basic_istringstream") != null or
-        std.mem.indexOf(u8, name, "basic_stringstream") != null;
-    return family and (std.mem.indexOf(u8, name, "D1Ev") != null or std.mem.indexOf(u8, name, "D2Ev") != null);
-}
-
-fn isStringStreamConstructor(name: []const u8) bool {
-    const family = std.mem.indexOf(u8, name, "basic_ostringstream") != null or
-        std.mem.indexOf(u8, name, "basic_istringstream") != null or
-        std.mem.indexOf(u8, name, "basic_stringstream") != null;
-    return family and (std.mem.indexOf(u8, name, "C1") != null or std.mem.indexOf(u8, name, "C2") != null);
-}
-
-fn isStringStreamTextConstructor(name: []const u8) bool {
-    return isStringStreamConstructor(name) and
-        std.mem.indexOf(u8, name, "ERKNS_12basic_string") != null;
-}
-
-fn numericBaseForManipulator(name: []const u8) ?u8 {
-    if (std.mem.eql(u8, name, "_ZNSt3__13decB7v160006ERNS_8ios_baseE")) return 10;
-    if (std.mem.eql(u8, name, "_ZNSt3__13hexB7v160006ERNS_8ios_baseE")) return 16;
-    if (std.mem.eql(u8, name, "_ZNSt3__13octB7v160006ERNS_8ios_baseE")) return 8;
-    return null;
-}
-
-fn isCharacterReferenceExtraction(name: []const u8) bool {
-    return std.mem.eql(
-        u8,
-        name,
-        "_ZNSt3__1rsB7v160006IcNS_11char_traitsIcEEEERNS_13basic_istreamIT_T0_EES7_RS4_",
-    );
-}
-
-fn characterArrayCapacity(name: []const u8) ?usize {
-    const marker = "_ZNSt3__1rsB7v160006IcNS_11char_traitsIcEELm";
-    if (!std.mem.startsWith(u8, name, marker) or
-        std.mem.indexOf(u8, name, "RNS_13basic_istream") == null or
-        std.mem.indexOf(u8, name, "RAT1__S4_") == null)
-    {
-        return null;
-    }
-    const suffix = name[marker.len..];
-    const end = std.mem.indexOfScalar(u8, suffix, 'E') orelse return null;
-    const capacity = std.fmt.parseUnsigned(usize, suffix[0..end], 10) catch return null;
-    return if (capacity >= 2 and capacity <= 4096) capacity else null;
-}
-
-fn isFormattedWhitespace(byte: u8) bool {
-    return byte == ' ' or byte == '\n' or byte == '\t' or byte == '\r' or byte == '\x0b' or byte == '\x0c';
-}
-
-fn isDigitForBase(byte: u8, base: u8) bool {
-    const digit: u8 = if (byte >= '0' and byte <= '9')
-        byte - '0'
-    else if (byte >= 'a' and byte <= 'f')
-        byte - 'a' + 10
-    else if (byte >= 'A' and byte <= 'F')
-        byte - 'A' + 10
-    else
-        return false;
-    return digit < base;
-}
-
-fn isBasicFilebufConstructor(name: []const u8) bool {
-    return std.mem.indexOf(u8, name, "basic_filebufIcNS_11char_traitsIcEEEC1") != null or
-        std.mem.indexOf(u8, name, "basic_filebufIcNS_11char_traitsIcEEEC2") != null;
-}
-
-fn isBasicStreambufConstructor(name: []const u8) bool {
-    return std.mem.indexOf(u8, name, "basic_streambufIcNS_11char_traitsIcEEEC1") != null or
-        std.mem.indexOf(u8, name, "basic_streambufIcNS_11char_traitsIcEEEC2") != null;
-}
-
-fn isBasicIosMethod(name: []const u8, marker: []const u8) bool {
-    return std.mem.indexOf(u8, name, "basic_iosIcNS_11char_traitsIcEEE") != null and
-        std.mem.indexOf(u8, name, marker) != null;
-}
-
-fn isBasicIosInit(name: []const u8) bool {
-    return isBasicIosMethod(name, "4initE");
-}
-
-fn isBasicIosRdbuf(name: []const u8) bool {
-    return isBasicIosMethod(name, "5rdbuf");
-}
-
-fn isBasicStreambufPubimbue(name: []const u8) bool {
-    return std.mem.indexOf(u8, name, "basic_streambufIcNS_11char_traitsIcEEE8pubimbue") != null;
-}
-
-fn isBasicStreambufImbue(name: []const u8) bool {
-    return std.mem.indexOf(u8, name, "basic_streambufIcNS_11char_traitsIcEEE5imbue") != null;
-}
-
-fn isBasicIosRdstate(name: []const u8) bool {
-    return isBasicIosMethod(name, "7rdstate");
-}
-
-fn isBasicIosClear(name: []const u8) bool {
-    return isBasicIosMethod(name, "5clearE");
-}
-
-fn isBasicIosSetstate(name: []const u8) bool {
-    return isBasicIosMethod(name, "8setstateE");
-}
-
-fn isBasicIosGood(name: []const u8) bool {
-    return isBasicIosMethod(name, "4good");
-}
-
-fn isBasicIosFail(name: []const u8) bool {
-    return isBasicIosMethod(name, "4fail");
-}
-
-fn isBasicIosEof(name: []const u8) bool {
-    return isBasicIosMethod(name, "3eof");
-}
-
-fn isBasicIosBool(name: []const u8) bool {
-    return isBasicIosMethod(name, "cvb");
-}
-
-fn isThreadIdInsertion(name: []const u8) bool {
-    return std.mem.indexOf(u8, name, "basic_ostream") != null and
-        (std.mem.indexOf(u8, name, "NS_6thread2idE") != null or
-            std.mem.indexOf(u8, name, "NS_11__thread_idE") != null or
-            (std.mem.indexOf(u8, name, "thread") != null and std.mem.indexOf(u8, name, "idE") != null));
-}
-
-fn isPointerInsertion(name: []const u8) bool {
-    return std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEPKv");
-}
-
-fn isCStringInsertion(name: []const u8) bool {
-    return std.mem.indexOf(u8, name, "basic_ostream") != null and
-        std.mem.indexOf(u8, name, "PKc") != null and
-        std.mem.indexOf(u8, name, "ls") != null;
-}
-
-fn isIntegerInsertion(name: []const u8) bool {
-    return std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEb") or
-        std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEi") or
-        std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEj") or
-        std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEl") or
-        std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEm") or
-        std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEx") or
-        std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEy");
-}
-
-fn isSignedIntegerInsertion(name: []const u8) bool {
-    return std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEi") or
-        std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEl") or
-        std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEx");
-}
-
-/// basic_ostream::operator<<(double). Imported by the Xenia fork and currently
-/// unhandled; render it so a floating-point print cannot fall through to an
-/// unresolved import.
-fn isDoubleInsertion(name: []const u8) bool {
-    return std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEd");
-}
-
-/// basic_ostream::operator<<(ostream&(*)(ostream&)) / (ios_base&(*)(ios_base&)).
-/// Mangled member forms contain `ls` plus a function-pointer parameter that
-/// returns a reference to the stream (`PFRS`) or to ios_base (`PFRNS`).
-fn isOstreamManipulatorInsertion(name: []const u8) bool {
-    if (std.mem.indexOf(u8, name, "basic_ostream") == null) return false;
-    if (std.mem.indexOf(u8, name, "ls") == null) return false;
-    return std.mem.indexOf(u8, name, "PFRS") != null or std.mem.indexOf(u8, name, "PFRNS") != null;
-}
-
-/// The std::endl / std::flush / std::ends manipulator functions themselves.
-/// Length-prefixed mangling: `_ZNSt3__14endl...`, `_ZNSt3__15flush...`,
-/// `_ZNSt3__14ends...` — the digit prefix is the identifier length.
-fn isStreamManipulator(name: []const u8) bool {
-    if (std.mem.indexOf(u8, name, "basic_ostream") == null) return false;
-    return std.mem.indexOf(u8, name, "4endl") != null or
-        std.mem.indexOf(u8, name, "5flush") != null or
-        std.mem.indexOf(u8, name, "4ends") != null;
-}
-
-/// Classify a manipulator symbol name into a character to append, or null for
-/// flush-only manipulators. std::endl appends '\n', std::ends appends the null
-/// terminator, std::flush has no model state to flush (writes are unbuffered).
-fn manipulatorAppend(name: []const u8) ?[]const u8 {
-    if (std.mem.indexOf(u8, name, "4endl") != null) return "\n";
-    if (std.mem.indexOf(u8, name, "4ends") != null) return "\x00";
-    return null;
-}
-
-fn manipulatorNumericBase(name: []const u8) ?u8 {
-    if (std.mem.indexOf(u8, name, "3dec") != null) return 10;
-    if (std.mem.indexOf(u8, name, "3hex") != null) return 16;
-    if (std.mem.indexOf(u8, name, "3oct") != null) return 8;
-    return null;
-}
-
-fn isStringbufStr(name: []const u8) bool {
-    return std.mem.indexOf(u8, name, "basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEE3strEv") != null;
-}
-
-fn isStringStreamStr(name: []const u8) bool {
-    const family = std.mem.indexOf(u8, name, "basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEE3str") != null or
-        std.mem.indexOf(u8, name, "basic_stringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEE3str") != null;
-    return family and std.mem.indexOf(u8, name, "Ev") != null;
-}
-
-fn displayThreadId(raw_id: u64) u64 {
-    if (raw_id == 0 or raw_id == CURRENT_THREAD_HANDLE) return 1;
-    if (raw_id >= IDLE_CALLBACK_HANDLE_BASE) return 1;
-    if (raw_id >= SYNTHETIC_THREAD_BASE and raw_id < SYNTHETIC_THREAD_BASE + 0x10000) {
-        return 2 + ((raw_id - SYNTHETIC_THREAD_BASE) / 0x10);
-    }
-    return raw_id;
-}
-
-fn isUnsignedIntegerInsertion(name: []const u8) bool {
-    return isIntegerInsertion(name) and !isSignedIntegerInsertion(name);
-}
-
-fn isBaseDestructor(name: []const u8) bool {
-    return std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEED2Ev") or
-        std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEED1Ev") or
-        std.mem.eql(u8, name, "_ZNSt3__19basic_iosIcNS_11char_traitsIcEEED2Ev") or
-        std.mem.eql(u8, name, "_ZNSt3__19basic_iosIcNS_11char_traitsIcEEED1Ev") or
-        std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEED2Ev") or
-        std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEED1Ev");
-}
-
-fn isIfstreamDefaultConstructor(name: []const u8) bool {
-    return std.mem.eql(u8, name, "_ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEC1Ev") or
-        std.mem.eql(u8, name, "_ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEC2Ev");
-}
-
-fn isIfstreamCStringConstructor(name: []const u8) bool {
-    return std.mem.eql(u8, name, "_ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEC1EPKcj") or
-        std.mem.eql(u8, name, "_ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEC2EPKcj");
-}
-
-fn isIfstreamFilesystemPathConstructor(name: []const u8) bool {
-    return (std.mem.indexOf(u8, name, "basic_ifstreamIcNS_11char_traitsIcEEEC1") != null or
-        std.mem.indexOf(u8, name, "basic_ifstreamIcNS_11char_traitsIcEEEC2") != null) and
-        std.mem.indexOf(u8, name, "__fs10filesystem4path") != null;
-}
-
-fn isIfstreamDestructor(name: []const u8) bool {
-    return std.mem.eql(u8, name, "_ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEED1Ev") or
-        std.mem.eql(u8, name, "_ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEED2Ev");
-}
-
-fn isOfstreamDestructor(name: []const u8) bool {
-    return std.mem.eql(u8, name, "_ZNSt3__114basic_ofstreamIcNS_11char_traitsIcEEED1Ev") or
-        std.mem.eql(u8, name, "_ZNSt3__114basic_ofstreamIcNS_11char_traitsIcEEED2Ev");
-}
-
-fn seekDirection(value: u64) std.c.whence_t {
-    return switch (value) {
-        0 => std.c.SEEK.SET,
-        1 => std.c.SEEK.CUR,
-        2 => std.c.SEEK.END,
-        else => std.c.SEEK.SET,
-    };
 }
 
 test "stream bridge tracks guest filebuf state without host C++ objects" {
