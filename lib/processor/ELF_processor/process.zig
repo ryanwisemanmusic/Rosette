@@ -812,6 +812,37 @@ const MAX_WINDOWS_EXECUTABLE_RANGES: usize = WINDOWS_EXECUTABLE_RANGE_CAPACITY;
 // a monotonic guest range and can outlive this initial bookkeeping capacity
 // by many frame iterations.
 const INITIAL_WINDOWS_HEAP_ALLOCATIONS: usize = 65536;
+/// A freed PE heap block waits this long before it can be handed out again.
+/// Windows' heap does not hand a block straight back to the next caller of
+/// the same size and zero it, and a stale pointer's late read or a second
+/// free lands on the old contents there. Immediate LIFO reuse made both land
+/// on a live object instead (2026-09-22: a render-pass bucket array held 1,
+/// a waited XObject's vtable pointer pointed into the heap).
+const WINDOWS_HEAP_QUARANTINE_BLOCKS: usize = 262144;
+const WINDOWS_HEAP_QUARANTINE_BYTES: u64 = 192 * 1024 * 1024;
+/// Candidates a reuse inspects in one size bin before bumping instead, so an
+/// alignment the bin's blocks do not meet cannot make an allocation linear.
+const WINDOWS_HEAP_BIN_SCAN: usize = 8;
+const WINDOWS_HEAP_ANOMALY_LOG_LIMIT: u64 = 16;
+
+/// Exact-size free blocks, oldest first. `head` advances as blocks are
+/// taken; the consumed prefix is dropped once it is half the list.
+const WindowsHeapBin = struct {
+    indices: std.ArrayListUnmanaged(usize) = .empty,
+    head: usize = 0,
+
+    fn available(self: *const WindowsHeapBin) usize {
+        return self.indices.items.len - self.head;
+    }
+
+    fn compact(self: *WindowsHeapBin) void {
+        if (self.head == 0 or self.head * 2 < self.indices.items.len) return;
+        const remaining = self.indices.items.len - self.head;
+        std.mem.copyForwards(usize, self.indices.items[0..remaining], self.indices.items[self.head..]);
+        self.indices.shrinkRetainingCapacity(remaining);
+        self.head = 0;
+    }
+};
 const MAX_WINDOWS_INITTERM_FRAMES: usize = 16;
 const MAX_WINDOWS_INITTERM_ENTRIES: u64 = 1 << 20;
 // Xenia's UCRT bootstrap registers one callback for many of its C++ runtime
@@ -919,7 +950,16 @@ const WINDOWS_GUEST_FILETIME_BASE: u64 = 134_116_992_000_000_000;
 const WINDOWS_FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
 const WINDOWS_TLS_SLOT_COUNT: usize = 512;
 const WINDOWS_GUEST_THREAD_STACK_SIZE: u64 = 1024 * 1024;
-const WINDOWS_GUEST_THREAD_MAX_STACK_SIZE: u64 = 8 * 1024 * 1024;
+/// Xenia asks for a 16 MiB host stack for every guest thread (`XThread`:
+/// "Allocate a big host stack"): the x64 backend turns guest branches into
+/// host calls, so guest code that tail-chains between functions grows the
+/// host stack. An 8 MiB cap gave those threads half of what they asked for,
+/// and a worker stack is a heap block with other heap blocks below it.
+const WINDOWS_GUEST_THREAD_MAX_STACK_SIZE: u64 = 64 * 1024 * 1024;
+/// No-access pages under every worker stack. Without them an overflow wrote
+/// silently into whatever heap object sat below the stack; with them the
+/// first touch stops the run as a named stack overflow, as Windows would.
+const WINDOWS_GUEST_THREAD_STACK_GUARD: u64 = 256 * 1024;
 const WINDOWS_PAGE_SIZE: u64 = 0x1000;
 const WINDOWS_TEB_BYTES: u64 = 0x2000;
 const WINDOWS_TLS_BLOCK_BYTES: u64 = 0x11000;
@@ -1003,8 +1043,48 @@ const SYNTHETIC_WINDOWS_EXCEPTION_RETURN: u64 = 0xFFFF_FFFF_FFFF_FF50;
 /// comptime check below is what keeps a new synthetic address from being
 /// added below the floor and silently never handled.
 const SYNTHETIC_RIP_FLOOR: u64 = 0xFFFF_FFFF_FFFF_FF00;
+/// The return address of a user APC routine Rosette is running inside an
+/// alertable wait. The executor either starts the next queued APC or
+/// completes the wait with WAIT_IO_COMPLETION.
+const SYNTHETIC_WINDOWS_APC_RETURN: u64 = 0xFFFF_FFFF_FFFF_FF60;
+const WINDOWS_APC_QUEUE_CAPACITY: usize = 16;
+const WINDOWS_WAIT_IO_COMPLETION: u64 = 0xC0;
+
+/// User APCs queued to one thread (`QueueUserAPC`), and the frame of the
+/// delivery in progress. Windows runs them only inside an alertable wait,
+/// on the thread they were queued to, oldest first, and the wait then
+/// returns WAIT_IO_COMPLETION.
+const WindowsApcQueue = struct {
+    routines: [WINDOWS_APC_QUEUE_CAPACITY]u64 = @splat(0),
+    parameters: [WINDOWS_APC_QUEUE_CAPACITY]u64 = @splat(0),
+    head: u8 = 0,
+    count: u8 = 0,
+    delivering: bool = false,
+    saved_rsp: u64 = 0,
+    continuation: u64 = 0,
+    continuation_direct: bool = false,
+
+    fn push(self: *WindowsApcQueue, routine: u64, parameter: u64) bool {
+        if (self.count >= WINDOWS_APC_QUEUE_CAPACITY) return false;
+        const slot = (@as(usize, self.head) + self.count) % WINDOWS_APC_QUEUE_CAPACITY;
+        self.routines[slot] = routine;
+        self.parameters[slot] = parameter;
+        self.count += 1;
+        return true;
+    }
+
+    fn pop(self: *WindowsApcQueue) ?struct { routine: u64, parameter: u64 } {
+        if (self.count == 0) return null;
+        const slot = self.head;
+        self.head = @intCast((@as(usize, self.head) + 1) % WINDOWS_APC_QUEUE_CAPACITY);
+        self.count -= 1;
+        return .{ .routine = self.routines[slot], .parameter = self.parameters[slot] };
+    }
+};
+
 comptime {
     for ([_]u64{
+        SYNTHETIC_WINDOWS_APC_RETURN,
         SYNTHETIC_INIT_RETURN,
         SYNTHETIC_MAIN_RETURN,
         SYNTHETIC_WINDOWS_THREAD_RETURN,
@@ -1133,6 +1213,9 @@ const GuestAccessViolation = struct {
     /// For a store: the value the instruction tried to write, replayed if
     /// no handler takes the fault.
     value: u64 = 0,
+    /// The whole value of a 16-byte vector store (`value` holds its low
+    /// eight bytes).
+    wide_value: [16]u8 = @splat(0),
     width: u8 = 0,
     is_write: bool = false,
     protection: guest_page_protection.Protection = .accessible,
@@ -1708,6 +1791,10 @@ pub const WindowsFileMapping = struct {
     /// conservative for aliases, and a changed token still falls back to a
     /// byte comparison before the cached decode is reused.
     code_generation: u64 = 1,
+    /// Instructions were fetched from this mapping at least once. Its pages
+    /// are then never admitted to the translator's write TLB: a store into
+    /// them must reach `bumpWindowsMappedCodeGeneration`.
+    code_fetched: bool = false,
 };
 
 /// One MapViewOfFile/MapViewOfFileEx alias.  Xenia deliberately maps several
@@ -1743,6 +1830,8 @@ pub const WindowsVirtualAllocation = struct {
     /// Same contract as WindowsFileMapping.code_generation for executable
     /// fixed allocations.
     code_generation: u64 = 1,
+    /// Same contract as WindowsFileMapping.code_fetched.
+    code_fetched: bool = false,
 };
 
 /// A driver-owned mapping, borrowed only until vkUnmapMemory/free/device
@@ -2037,6 +2126,9 @@ const WindowsGuestThread = struct {
     thread_id: u64 = 0,
     stack_base: u64 = 0,
     stack_size: u64 = 0,
+    /// The guard allocation's base: `stack_base - WINDOWS_GUEST_THREAD_STACK_GUARD`
+    /// when the stack has one, zero otherwise.
+    stack_guard_base: u64 = 0,
     synthetic_return_slot: u64 = 0,
     teb: u64 = 0,
     tls_block: u64 = 0,
@@ -2099,6 +2191,12 @@ const WindowsGuestThread = struct {
     last_kernel_slot: u32 = 0,
     last_kernel_step: u64 = 0,
     kernel_calls: u64 = 0,
+    /// The critical section this thread last asked `RtlEnterCriticalSection`
+    /// for, and the membase that reaches it. A thread blocked there is
+    /// waiting on whoever the section names as its owner, and that owner is
+    /// the next link of the wait graph, which a handle-only report cannot see.
+    critical_section: u32 = 0,
+    critical_section_membase: u64 = 0,
     /// Turns this thread still gives away, and the size of its current
     /// backoff; see `noteWindowsGuestSliceShape`.
     spin_skip_remaining: u8 = 0,
@@ -2146,6 +2244,14 @@ const WindowsGuestThread = struct {
     /// waiter still retakes its mutex before it returns; this is what makes
     /// that return ETIMEDOUT instead of zero.
     condition_resume_timeout: bool = false,
+    /// This waiter has already parked on its mutex's event while retaking it
+    /// after a condition wake, so it must retake it the way the image's
+    /// contended lock path does - see `acquireWindowsGuestPthreadMutex`.
+    condition_mutex_contended: bool = false,
+    /// User APCs for this thread, and whether its current block is an
+    /// alertable wait an APC may end.
+    apc: WindowsApcQueue = .{},
+    blocked_alertable: bool = false,
     /// The timed-wait site of the wait this thread is in, plus one.
     timed_wait_site: u8 = 0,
     /// The requested interval retained for timeout diagnostics. The generic
@@ -2535,6 +2641,9 @@ const GPU_INDIRECT_BUFFER_CAPACITY: usize = 8;
 const PPC_CONTEXT_GPR_BASE: u64 = 0x28;
 const PPC_CONTEXT_LINK_REGISTER: u64 = 0x130;
 const PPC_CONTEXT_VIRTUAL_MEMBASE: u64 = 0xA98;
+/// Below this no thread's stack can be: it is the guest's null page.
+const STACK_COLLAPSE_FLOOR: u64 = 0x10000;
+const BLOCK_JIT_HOOK_FILTER_BYTES: usize = block_jit.hook_filter_bytes;
 
 fn ppcContextGpr(index: u6) u64 {
     return PPC_CONTEXT_GPR_BASE + @as(u64, index) * 8;
@@ -3736,19 +3845,63 @@ const block_jit = @import("block_jit.zig");
 /// only a small fraction of the slots were live at exit.  Four times the
 /// slots keeps the same lookup semantics and sharply lowers address aliasing
 /// without making the code cache itself unbounded.
-const BLOCK_JIT_TABLE_ENTRIES: usize = 1 << 18;
+// 2026-09-21: 338,808 evictions against 561,989 compiles - 60% of all
+// compiles were recompiles of evicted blocks - with the table only 21%
+// live at exit. Xenia keeps generating code for the whole run, so the
+// working set of start addresses is far larger than what is live at any
+// moment. A million slots in four ways is 8 MiB of pointers.
+const BLOCK_JIT_TABLE_ENTRIES: usize = 1 << 20;
+/// Slots per set. A direct-mapped table evicts whenever two hot addresses
+/// share an index; the 2026-09-19 run evicted 1.75M blocks over 3.35M
+/// compiles. Two candidates per index keep the same memory and the same
+/// probe cost, and turn most of those evictions into second-way fills.
+const BLOCK_JIT_WAYS: usize = 4;
+const BLOCK_JIT_SETS: usize = BLOCK_JIT_TABLE_ENTRIES / BLOCK_JIT_WAYS;
 /// Executions of a start address before it is compiled. Most addresses run
 /// once; compiling on first sight would spend more on cold code than the
 /// interpreter would have.
 const BLOCK_JIT_DEFAULT_HOT_THRESHOLD: u16 = 16;
 /// The most guest instructions one block covers.
-const BLOCK_JIT_MAX_INSTRUCTIONS: usize = 48;
+const BLOCK_JIT_MAX_INSTRUCTIONS: usize = 128;
+/// How many conditional branches one block may continue across.
+///
+/// Every one adds an exit stub and, because the code after it can also be
+/// reached by a jump from elsewhere, may duplicate that code into a second
+/// block. Both cost translation-cache space, which is already the thing 12
+/// resets a run were about. Eight buys most of the block-length increase -
+/// x86 branches roughly every seven instructions, so eight conditionals is
+/// already the 48-instruction ceiling - while keeping the exit stubs per
+/// block bounded.
+// 2026-09-20: the first run with traces on averaged 2.97 conditionals per
+// compiled block against a limit of 8, so this was not what ended most
+// blocks - unconditional transfers were. Raised with the instruction
+// ceiling because the two together decide how long a hot loop body may
+// become; `conditionals_followed` against `compiled` says if either binds.
+const BLOCK_JIT_MAX_CONDITIONALS: u32 = 24;
 /// Executable memory for translated code. Exhaustion drops every block and
-/// starts over; it is counted, not hidden.
-const BLOCK_JIT_CODE_BYTES: usize = 64 << 20;
+/// starts over; it is counted, not hidden. 64 MiB filled 24 times in the
+/// 2026-09-19 run and each reset recompiled some 50,000 live blocks after
+/// sixteen interpreted runs apiece; the reservation is virtual, so four
+/// times that costs nothing until it is written.
+// 2026-09-20: traces took `code_bytes(used)` from 40% of 256 MiB to 72%
+// with 7 resets still in the run, which makes this number - not the
+// guest's control flow - the thing capping how long a trace is worth
+// making. The mapping is reserved, not committed.
+// 2026-09-21: 603 MiB of 768 used with 2 resets, most of it code for
+// blocks later evicted. The reservation is virtual until written.
+const BLOCK_JIT_CODE_BYTES: usize = 1536 << 20;
+/// How far one `step` may follow blocks into each other before returning to
+/// the run loop. Every block boundary used to cost a full `step` (the three
+/// hook gates, the hotness probe, the loop's own per-step bookkeeping) and
+/// call-heavy code makes a block every four to six instructions. The bound
+/// keeps the scheduler, the clock and the spin probes at their cadence.
+const BLOCK_JIT_CHAIN_BLOCKS: u32 = 64;
+const BLOCK_JIT_CHAIN_INSTRUCTIONS: u32 = 2048;
 
+/// The first slot of the set `rip` hashes to; the set is `BLOCK_JIT_WAYS`
+/// consecutive slots.
 fn blockJitIndex(rip: u64) usize {
-    return @intCast(((rip >> 1) ^ (rip >> 17) ^ (rip >> 29)) & (BLOCK_JIT_TABLE_ENTRIES - 1));
+    return @as(usize, @intCast(((rip >> 1) ^ (rip >> 17) ^ (rip >> 29)) & (BLOCK_JIT_SETS - 1))) * BLOCK_JIT_WAYS;
 }
 
 const BlockHotness = struct {
@@ -3776,13 +3929,101 @@ const BlockJitState = struct {
     continuation_write_aborts: u64 = 0,
     revalidations: u64 = 0,
     invalidations: u64 = 0,
+    /// Why blocks were dropped: their bytes changed under them, their
+    /// mapping went away, the code memory was reset, or a cross-check
+    /// disagreed. Together with `slot_evictions` these sum to
+    /// `invalidations`.
+    dropped_stale: u64 = 0,
+    dropped_unmapped: u64 = 0,
+    dropped_reset: u64 = 0,
+    dropped_mismatch: u64 = 0,
     slot_evictions: u64 = 0,
     resets: u64 = 0,
     verified: u64 = 0,
     mismatches: u64 = 0,
+    /// Instructions whose flag computation the liveness pass removed.
+    flags_elided: u64 = 0,
+    flags_narrowed: u64 = 0,
+    /// Blocks entered directly from the block before them, without a `step`.
+    chained: u64 = 0,
+    /// Direct calls whose target carries no hook, so the translator emitted
+    /// a push and a jump, against those left on the interpreter's arm.
+    call_targets_plain: u64 = 0,
+    call_targets_hooked: u64 = 0,
+    /// Conditional branches a block continued across rather than ending at.
+    conditionals_followed: u64 = 0,
+    /// Deferred flag records actually materialised.
+    flag_completions: u64 = 0,
+    /// Block-to-block hops taken inside translated code, and links armed.
+    native_chain_hops: u64 = 0,
+    links_armed: u64 = 0,
+    /// Guest registers held in host registers, summed over compiled blocks.
+    cached_registers: u64 = 0,
+    /// Memory accesses compiled to go through a hoisted base pointer.
+    hoisted_accesses: u64 = 0,
+    /// The software TLB: pages admitted, refused at the helper, and the
+    /// invalidations protection and mapping changes caused.
+    tlb_fills: u64 = 0,
+    tlb_fill_refusals: u64 = 0,
+    tlb_invalidations: u64 = 0,
+    tlb_flushes: u64 = 0,
+    /// Fallback calls by instruction, so the next run says which templates
+    /// are missing rather than only how many calls there were.
+    fallback_ops: [ElfState.op_value_limit]u64 = @splat(0),
+    /// Indirect and relative transfers the interpreter ran, by why: an
+    /// import (the IAT shim owns it), a hooked target (a shim, milestone or
+    /// census entry may claim it), or neither - a transfer that could have
+    /// stayed native. The busiest targets are kept, so the report names the
+    /// function behind each class.
+    transfer_fallback_imports: u64 = 0,
+    transfer_fallback_hooked: u64 = 0,
+    transfer_fallback_plain: u64 = 0,
+    transfer_targets: [transfer_target_slots]TransferTarget = @splat(.{}),
+    transfer_target_overflow: u64 = 0,
+
+    const transfer_target_slots = 256;
+    const TransferTarget = struct {
+        target: u64 = 0,
+        op: u16 = 0,
+        hooked: bool = false,
+        count: u64 = 0,
+    };
+
+    fn noteTransferTarget(self: *BlockJitState, target: u64, op: u16, hooked: bool) void {
+        var slot: usize = @intCast(((target ^ (target >> 12)) *% 0x9E37_79B9) % transfer_target_slots);
+        var probes: usize = 0;
+        while (probes < 16) : (probes += 1) {
+            const entry = &self.transfer_targets[slot];
+            if (entry.count != 0 and entry.target == target and entry.op == op) {
+                entry.count +|= 1;
+                return;
+            }
+            if (entry.count == 0) {
+                entry.* = .{ .target = target, .op = op, .hooked = hooked, .count = 1 };
+                return;
+            }
+            slot = (slot + 1) % transfer_target_slots;
+        }
+        self.transfer_target_overflow +|= 1;
+    }
 
     fn create(allocator: std.mem.Allocator) ?*BlockJitState {
-        const memory = block_jit.CodeMemory.init(BLOCK_JIT_CODE_BYTES) catch return null;
+        // Ask for the full reservation, then step down rather than give up.
+        // A refused `MAP_JIT` is not a small loss: `blockJitActive` records
+        // the translator as unavailable for the whole run and every guest
+        // instruction goes back to the interpreter, which is several times
+        // slower than the lane it replaces. A smaller cache only means more
+        // resets, so any of these is better than none of them.
+        var memory: block_jit.CodeMemory = undefined;
+        var reserved: usize = 0;
+        for ([_]usize{ BLOCK_JIT_CODE_BYTES, 1024 << 20, 768 << 20, 512 << 20, 256 << 20, 128 << 20, 64 << 20 }) |bytes| {
+            if (bytes > BLOCK_JIT_CODE_BYTES) continue;
+            memory = block_jit.CodeMemory.init(bytes) catch continue;
+            reserved = bytes;
+            break;
+        }
+        if (reserved == 0) return null;
+        if (reserved != BLOCK_JIT_CODE_BYTES) log.info("PE64 BLOCK JIT: translation cache reserved {d} MiB of the {d} MiB asked for; expect more resets", .{ reserved >> 20, BLOCK_JIT_CODE_BYTES >> 20 });
         const self = allocator.create(BlockJitState) catch return null;
         const blocks = allocator.alloc(?*block_jit.Block, BLOCK_JIT_TABLE_ENTRIES) catch {
             allocator.destroy(self);
@@ -3831,7 +4072,11 @@ fn blockJitRead(state_ptr: *anyopaque, address: u64, size: u8) callconv(.c) u64 
     const self: *ElfState = @ptrCast(@alignCast(state_ptr));
     self.blockJitNameCurrentInstruction();
     const value = self.readMemVal(address, @enumFromInt(size));
-    if (self.guest_access_violation_pending or self.terminated) self.blockJitRequestAbort();
+    if (self.guest_access_violation_pending or self.terminated) {
+        self.blockJitRequestAbort();
+        return value;
+    }
+    self.blockJitTlbConsider(address, @as(u8, 1) << @intCast(size), false);
     return value;
 }
 
@@ -3839,23 +4084,112 @@ fn blockJitWrite(state_ptr: *anyopaque, address: u64, size: u8, value: u64) call
     const self: *ElfState = @ptrCast(@alignCast(state_ptr));
     self.blockJitNameCurrentInstruction();
     self.writeMemVal(address, @enumFromInt(size), value);
-    if (self.guest_access_violation_pending or self.terminated or self.blockJitContinuationChanged()) self.blockJitRequestAbort();
+    if (self.guest_access_violation_pending or self.terminated or self.blockJitContinuationChanged()) {
+        self.blockJitRequestAbort();
+        return;
+    }
+    self.blockJitTlbConsider(address, @as(u8, 1) << @intCast(size), true);
+}
+
+/// `readMem128` for emitted code: into the scratch vector slot.
+fn blockJitRead128(state_ptr: *anyopaque, address: u64, out: *[16]u8) callconv(.c) void {
+    const self: *ElfState = @ptrCast(@alignCast(state_ptr));
+    self.blockJitNameCurrentInstruction();
+    out.* = self.readMem128(address);
+    if (self.guest_access_violation_pending or self.terminated) {
+        self.blockJitRequestAbort();
+        return;
+    }
+    self.blockJitTlbConsider(address, 16, false);
+}
+
+/// `writeMem128` for emitted code, from the scratch vector slot.
+fn blockJitWrite128(state_ptr: *anyopaque, address: u64, value: *const [16]u8) callconv(.c) void {
+    const self: *ElfState = @ptrCast(@alignCast(state_ptr));
+    self.blockJitNameCurrentInstruction();
+    self.writeMem128(address, value.*);
+    if (self.guest_access_violation_pending or self.terminated or self.blockJitContinuationChanged()) {
+        self.blockJitRequestAbort();
+        return;
+    }
+    self.blockJitTlbConsider(address, 16, true);
 }
 
 /// One instruction through the interpreter, in the middle of a block.
 /// Returns nonzero when the block must stop: the interpreter moved RIP
 /// somewhere other than the next instruction, ended the run, left a fault
 /// pending, switched guest threads, or asked for the slice to end.
-fn blockJitInterpret(state_ptr: *anyopaque, block: *const block_jit.Block, index: u32) callconv(.c) u32 {
+/// Apply the deferred flag record to `rflags` and clear it.
+///
+/// Translated arithmetic computes only the flags a later instruction in its
+/// own block reads, and records `a op b = r` for the rest: materialising all
+/// six costs about thirty ARM instructions and a block otherwise pays that
+/// at every arithmetic instruction. This is where the rest is paid - once,
+/// on the way out of the block, and only when a record is pending.
+fn blockJitFlags(state_ptr: *anyopaque) callconv(.c) void {
     const self: *ElfState = @ptrCast(@alignCast(state_ptr));
-    if (self.block_jit) |jit| jit.fallback_calls +|= 1;
-    const slot_before = self.windows_active_guest_thread_slot;
+    const record = &self.block_jit_scratch;
+    if (record.flag_kind == 0) return;
+    const size: Size = @enumFromInt(record.flag_size);
+    switch (record.flag_kind) {
+        @intFromEnum(block_jit.FlagKind.add) => x64_decoder.applyAdd(&self.regs.rflags, record.flag_a, record.flag_b, record.flag_r, size),
+        @intFromEnum(block_jit.FlagKind.sub) => x64_decoder.applySub(&self.regs.rflags, record.flag_a, record.flag_b, record.flag_r, size),
+        @intFromEnum(block_jit.FlagKind.logic) => x64_decoder.applyLogic(&self.regs.rflags, record.flag_r, size),
+        else => {},
+    }
+    record.flag_kind = 0;
+    if (self.block_jit) |jit| jit.flag_completions +|= 1;
+}
+
+fn blockJitInterpret(state_ptr: *anyopaque, block: *const block_jit.Block, index: u32) callconv(.c) u32 {
+    // The interpreter reads `rflags` directly, so a record the translated
+    // code left pending has to be settled before it runs rather than on the
+    // way out of the block.
+    blockJitFlags(state_ptr);
+    const self: *ElfState = @ptrCast(@alignCast(state_ptr));
     const insn = block.insns[index];
+    if (self.block_jit) |jit| {
+        jit.fallback_calls +|= 1;
+        jit.fallback_ops[@intFromEnum(insn.decoded.op)] +|= 1;
+    }
+    const slot_before = self.windows_active_guest_thread_slot;
+    const imports_before = self.windows_import_calls;
     self.blockJitExecuteInsn(block, index);
-    if (self.terminated or self.guest_access_violation_pending) return 1;
+    switch (insn.decoded.op) {
+        .call_rel32, .call_mem64, .call_reg64, .jmp_mem64, .jmp_reg64 => if (self.block_jit) |jit| {
+            if (self.windows_import_calls != imports_before) {
+                jit.transfer_fallback_imports +|= 1;
+            } else {
+                const hooked = self.blockJitTargetHooked(self.regs.rip);
+                if (hooked) jit.transfer_fallback_hooked +|= 1 else jit.transfer_fallback_plain +|= 1;
+                jit.noteTransferTarget(self.regs.rip, @intFromEnum(insn.decoded.op), hooked);
+            }
+        },
+        else => {},
+    }
+    // A shim reached from here is the only way the run can end, a thread can
+    // switch or the scheduler can be asked for mid-block, and translated
+    // code cannot see any of that - so stop the native chain on exactly the
+    // conditions the glue's own loop stops on. This used to stop it
+    // whenever the interpreter ran at all: on 2026-09-21 that was 658
+    // million fallbacks, each ending a chain that had nothing to hand over,
+    // and native chains averaged 4.6 blocks.
+    // A shim can also park the running worker - the condition shim does,
+    // from inside a translated jump - and a parked thread must not execute
+    // one more instruction: re-entering the shim while blocked is refused,
+    // and the refusal falls through into the image's own implementation.
+    const parked = if (slot_before) |slot| self.windows_guest_threads[slot].status != .running else false;
+    if (self.terminated or self.guest_access_violation_pending or parked or
+        self.windows_active_guest_thread_slot != slot_before or
+        self.windows_guest_slice_yield_requested or self.windows_guest_handoff_requested or
+        self.blockJitTargetHooked(self.regs.rip))
+    {
+        self.block_jit_scratch.chain_break = 1;
+    }
+    if (self.terminated or self.guest_access_violation_pending or parked) return 1;
     if (self.regs.rip != insn.rip +% insn.len) return 1;
     if (self.windows_active_guest_thread_slot != slot_before) return 1;
-    if (self.windows_guest_slice_yield_requested) return 1;
+    if (self.windows_guest_slice_yield_requested or self.windows_guest_handoff_requested) return 1;
     // A vector/string fallback can write executable bytes just as the native
     // scalar write helper can. Never execute the old decoded continuation.
     if (self.blockJitContinuationChanged()) {
@@ -3912,6 +4246,30 @@ pub const ElfState = struct {
     /// seventy percent of the interpreter.
     windows_guest_slice_yield_requested: bool = false,
     windows_guest_slice_yields: u64 = 0,
+    /// Worker slices ended early at a PAUSE spin hint.
+    windows_guest_pause_yields: u64 = 0,
+    /// The running slice asked to end at a PAUSE. Such a slice is a spin for
+    /// `noteWindowsGuestSliceShape`: it ends before the spin probe is ever
+    /// taken, so without this a pause-spinner never earned a backoff and
+    /// took an equal turn every round - 101 million slice switches on
+    /// 2026-09-21, most of them XThread001A and RENDER waiting on MAIN.
+    windows_slice_pause_yield: bool = false,
+    windows_pause_spin_slices: u64 = 0,
+    /// A worker signalled an object the owner is waiting on. The worker's
+    /// slice ends at the next step, before any minimum-slice floor, so the
+    /// owner takes the object before the worker can take it back.
+    ///
+    /// Without this the owner's wait on a winpthreads mutex event was lost
+    /// 16384 times in a row on 2026-09-19: the worker unlocked (SetEvent),
+    /// kept its slice, and relocked; the owner - Xenia's UI thread - never
+    /// painted. A real kernel would have run the woken waiter on another
+    /// core; on one cooperative interpreter the handoff has to be explicit.
+    windows_guest_handoff_requested: bool = false,
+    windows_owner_wait_handoffs: u64 = 0,
+    /// The handles the owner's current (yielded) wait is on, valid while a
+    /// worker slice runs on the owner's behalf.
+    windows_owner_wait_handles: [8]u64 = @splat(0),
+    windows_owner_wait_handle_count: u8 = 0,
     windows_guest_sleep_parks: u64 = 0,
     // The ring implementation is shared with the other execution paths. Its
     // backing storage is heap-owned so returning this state by value cannot
@@ -3982,6 +4340,46 @@ pub const ElfState = struct {
     block_jit_hot_threshold: u16 = BLOCK_JIT_DEFAULT_HOT_THRESHOLD,
     /// Shared with the emitted code; see `block_jit.Scratch`.
     block_jit_scratch: block_jit.Scratch = .{},
+    /// The software TLB the emitted code probes before calling a memory
+    /// helper (`block_jit.Tlb`). The helpers admit pages after serving a
+    /// plain access; every protection and mapping change invalidates.
+    block_jit_tlb: block_jit.Tlb = block_jit.Tlb.empty,
+    block_jit_tlb_enabled: bool = true,
+    /// How many times a helper offered the TLB a page. The 2026-09-19
+    /// run reported zero fills *and* zero refusals, which the admission
+    /// rules cannot both produce: every path past the first four guards
+    /// counts one or the other. This says whether the helper is reached
+    /// at all, so the next run distinguishes "emitted code never takes
+    /// the slow path" from "a guard refuses everything silently".
+    block_jit_tlb_considers: u64 = 0,
+    /// The three guards that used to return without counting, so a run whose
+    /// fills and refusals are both zero says which one answered.
+    block_jit_tlb_bail_traced: u64 = 0,
+    block_jit_tlb_bail_straddle: u64 = 0,
+    block_jit_tlb_bail_null_page: u64 = 0,
+    /// Blocks run on from the RIP the previous block left
+    /// (ROSETTE_X64_BLOCK_JIT_CHAIN=0 interprets a `step` between blocks).
+    block_jit_chain_enabled: bool = true,
+    /// VEX.128 vector templates are compiled (ROSETTE_X64_BLOCK_JIT_VECTOR=0
+    /// hands every vector instruction to the interpreter).
+    block_jit_vectors_enabled: bool = true,
+    /// 16-byte vector loads and stores consult the page-protection table,
+    /// so a write watch sees `vmovaps` stores (ROSETTE_X64_WIDE_ACCESS_WATCH=0
+    /// turns it off).
+    ///
+    /// On by default since `NtProtectVirtualMemory` became real. Xenia's
+    /// PowerPC backend emits an SSE store for every VMX128 `stvx` and its CRT
+    /// copies vector-sized blocks, so with wide accesses unwatched most of
+    /// what a title writes into a watched texture or vertex buffer would
+    /// still pass without a fault and the watch would be half dead. The cost
+    /// is two O(1) table lookups per 128-bit access, and only while some page
+    /// is actually restricted.
+    ///
+    /// It was off before that: the first run with it on (2026-09-19 18:27)
+    /// refreshed one guest frame and then starved the GPU thread. That run
+    /// had no read-only page in it at all - nothing had ever recorded one -
+    /// so the watch could not have been what fired. It stays a bisect switch.
+    wide_access_watch_enabled: bool = true,
     /// How many guest instructions the last `step` retired: one for an
     /// interpreted instruction, a block's completed count otherwise. The
     /// two execution loops add it to every per-instruction counter.
@@ -4003,6 +4401,10 @@ pub const ElfState = struct {
     trace_syscall_bytes: bool = false,
     trace_fd_filter: ?u64 = null,
     trace_calls: bool = false,
+    /// `trace_windows_messages or trace_windows_threads`, kept by
+    /// `refreshBlockJitTransferTraced`. The translated `call` template reads
+    /// this one byte instead of both fields.
+    block_jit_transfer_traced: bool = false,
     // Resolve the optional RIP trace range once at state construction.  The
     // PE interpreter checks this on every instruction; consulting the host
     // environment in that hot path turns an opt-in diagnostic into a default
@@ -4211,6 +4613,31 @@ pub const ElfState = struct {
     windows_pthread_cond_wait_entry: ?u64 = null,
     windows_pthread_cond_signal_entry: ?u64 = null,
     windows_pthread_cond_broadcast_entry: ?u64 = null,
+    /// The image's `pthread_mutex_lock_intern(mutex, milliseconds)`, which
+    /// `pthread_mutex_lock` tail-jumps to with INFINITE. A signalled
+    /// condition waiter retakes its mutex by calling it, so every
+    /// acquisition of a guest mutex follows the image's own protocol.
+    windows_pthread_mutex_lock_intern_entry: ?u64 = null,
+    windows_condition_relocks: u64 = 0,
+    /// Reports written by `noteStackPointerCollapse`, capped.
+    stack_collapse_reports: u32 = 0,
+    /// A bloom filter over every address an interpreter call/jump arm has a
+    /// hook for inside the image: kernel-export entries, milestones, the
+    /// pthread condition entries and the accelerators. The native indirect
+    /// templates test a target inside the image against it and hand the
+    /// instruction to the interpreter on a hit, so a C++ vtable call or a
+    /// switch table jump into Xenia's own code runs natively unless its
+    /// exact target is hooked. A false positive only costs a fallback.
+    block_jit_hook_filter: [BLOCK_JIT_HOOK_FILTER_BYTES]u8 = @splat(0),
+    /// Nonzero until the filter is built, and whenever something hooks
+    /// image targets the filter cannot name (a local-function shim table,
+    /// an unresolved accelerator, the thread-call trace): every indirect
+    /// transfer into the image then takes the interpreter, as it always did.
+    block_jit_image_targets_hooked: u8 = 1,
+    /// The import address table, whose slots the dynamic-function shim keys
+    /// an indirect call on. Zero when unknown: the image range is used.
+    windows_iat_low: u64 = 0,
+    windows_iat_high: u64 = 0,
     // Enable Rosetta's cooperative completion of the image-linked MinGW
     // condition functions when requested. The image's semaphore/
     // critical-section sequence is host-oriented and cannot be allowed to
@@ -4560,6 +4987,30 @@ pub const ElfState = struct {
     windows_heap_provenance_untracked_allocations: u64 = 0,
     windows_heap_reused_allocations: u64 = 0,
     windows_heap_free_list_growth_failures: u64 = 0,
+    /// Freed blocks not yet reusable, as a ring of record indices.
+    windows_heap_quarantine: []usize = &.{},
+    windows_heap_quarantine_head: usize = 0,
+    windows_heap_quarantine_len: usize = 0,
+    windows_heap_quarantine_bytes: u64 = 0,
+    windows_heap_quarantine_limit_blocks: usize = WINDOWS_HEAP_QUARANTINE_BLOCKS,
+    windows_heap_quarantine_limit_bytes: u64 = WINDOWS_HEAP_QUARANTINE_BYTES,
+    /// Reusable blocks by exact length.
+    windows_heap_bins: std.AutoHashMapUnmanaged(u64, WindowsHeapBin) = .empty,
+    windows_heap_binned: usize = 0,
+    /// A free of a block that is already free: the second free is refused,
+    /// which is what keeps it from releasing the next owner's block.
+    windows_heap_double_frees: u64 = 0,
+    /// A free of an address no allocation starts at.
+    windows_heap_unknown_frees: u64 = 0,
+    windows_heap_bytes_live: u64 = 0,
+    windows_heap_bytes_peak: u64 = 0,
+    /// User APCs queued to the owner context (the process's first thread).
+    windows_owner_apc: WindowsApcQueue = .{},
+    windows_apcs_queued: u64 = 0,
+    windows_apcs_delivered: u64 = 0,
+    windows_apc_wakes: u64 = 0,
+    windows_apc_refusals: u64 = 0,
+    windows_stack_overflows: u64 = 0,
     // MapViewOfFile without an address hint gets a deterministic guest-only
     // placement outside the PE image.  Fixed Xenia views retain their exact
     // requested address and never consume this cursor.
@@ -4627,6 +5078,11 @@ pub const ElfState = struct {
     guest_access_violation: GuestAccessViolation = .{},
     guest_exception_dispatches_in_flight: u32 = 0,
     guest_access_violations_raised: u64 = 0,
+    /// Host-side mutable borrows of guest memory that overlapped a protected
+    /// page (see `noteProtectedBulkBorrow`).
+    guest_protected_bulk_borrows: u64 = 0,
+    guest_protected_bulk_borrow_bytes: u64 = 0,
+    guest_protected_bulk_borrow_reports: u8 = 0,
     guest_access_violation_reads: u64 = 0,
     guest_access_violation_writes: u64 = 0,
     guest_access_violations_dispatched: u64 = 0,
@@ -4638,6 +5094,9 @@ pub const ElfState = struct {
     guest_access_violation_sites: [GUEST_ACCESS_VIOLATION_SITE_CAPACITY]GuestAccessViolationSite = [_]GuestAccessViolationSite{.{}} ** GUEST_ACCESS_VIOLATION_SITE_CAPACITY,
     guest_access_violation_site_count: usize = 0,
     guest_access_violation_site_overflow: u64 = 0,
+    /// Faults the guest handler said to retry without clearing the protection
+    /// that caused them. Each one would have been an unbreakable loop.
+    guest_access_violation_unresolved_retries: u64 = 0,
     xma_registers: GuestXmaRegisterCensus = .{},
     frame_cost: GuestFrameCost = .{},
     gpu_front_buffer: GuestFrontBuffer = .{},
@@ -5000,6 +5459,7 @@ pub const ElfState = struct {
         state.trace_utf8 = envFlag("ROSETTE_ELF_TRACE_UTF8");
         state.trace_windows_threads = envFlag("ROSETTA_ELF_TRACE_WINDOWS_THREADS");
         state.trace_windows_messages = envFlag("ROSETTA_ELF_TRACE_WINDOWS_MESSAGES");
+        state.refreshBlockJitTransferTraced();
         state.trace_windows_audio = envFlag("ROSETTE_ELF_TRACE_WINDOWS_AUDIO") or envFlag("ROSETTA_ELF_TRACE_WINDOWS_AUDIO");
         state.trace_windows_paths = envFlag("ROSETTE_ELF_TRACE_WINDOWS_PATHS");
         state.trace_windows_waits = envFlag("ROSETTE_ELF_TRACE_WINDOWS_WAITS") or envFlag("ROSETTA_ELF_TRACE_WINDOWS_WAITS");
@@ -5030,6 +5490,10 @@ pub const ElfState = struct {
         // The block translator is on unless refused by name. The threshold
         // is how many times a start address runs before it is compiled.
         state.block_jit_enabled = !envPresentAndFalse("ROSETTE_X64_BLOCK_JIT");
+        state.block_jit_tlb_enabled = !envPresentAndFalse("ROSETTE_X64_BLOCK_JIT_TLB");
+        state.block_jit_chain_enabled = !envPresentAndFalse("ROSETTE_X64_BLOCK_JIT_CHAIN");
+        state.block_jit_vectors_enabled = !envPresentAndFalse("ROSETTE_X64_BLOCK_JIT_VECTOR");
+        state.wide_access_watch_enabled = !envPresentAndFalse("ROSETTE_X64_WIDE_ACCESS_WATCH");
         if (envU64("ROSETTE_X64_BLOCK_JIT_HOT_THRESHOLD")) |threshold| {
             if (threshold != 0 and threshold <= std.math.maxInt(u16)) state.block_jit_hot_threshold = @intCast(threshold);
         }
@@ -5115,6 +5579,10 @@ pub const ElfState = struct {
         self.native_memory_alias_count = 0;
         if (self.windows_heap_allocations.len != 0) self.allocator.free(self.windows_heap_allocations);
         if (self.windows_heap_free_indices.len != 0) self.allocator.free(self.windows_heap_free_indices);
+        if (self.windows_heap_quarantine.len != 0) self.allocator.free(self.windows_heap_quarantine);
+        var bins = self.windows_heap_bins.valueIterator();
+        while (bins.next()) |bin| bin.indices.deinit(self.allocator);
+        self.windows_heap_bins.deinit(self.allocator);
         if (self.interactive_output_path) |path| self.allocator.free(path);
         self.call_stack.deinit(self.allocator);
         if (self.trace_storage.len != 0) self.allocator.free(self.trace_storage);
@@ -5249,6 +5717,22 @@ pub const ElfState = struct {
         }
     }
 
+    /// A worker reached PAUSE.
+    ///
+    /// PAUSE is a spin-wait, and under one interpreter the value a spinner
+    /// polls can only change once some other thread runs. Xenia compiles the
+    /// PowerPC spin hint `db16cyc` to exactly this instruction, so a title's
+    /// hardware-thread spin loop used to keep its whole slice: Halo 3's idle
+    /// job worker spent 13% of a run going round two instructions. The
+    /// service loop's floor still lets it spin a few hundred instructions
+    /// before the switch. The owner is serviced at PAUSE separately.
+    pub fn noteWindowsGuestPause(self: *ElfState) void {
+        if (self.windows_active_guest_thread_slot == null) return;
+        self.requestWindowsGuestSliceYield();
+        self.windows_guest_pause_yields +|= 1;
+        self.windows_slice_pause_yield = true;
+    }
+
     /// A worker read the clock.
     ///
     /// Reads piling up inside one slice are a poll: the thread is waiting for
@@ -5353,6 +5837,127 @@ pub const ElfState = struct {
     /// uses while it waits for a title to open. Returns whether the caller was
     /// a worker that could be parked; the owner has no context to park and
     /// falls back to servicing workers.
+    fn activeWindowsApcQueue(self: *ElfState) *WindowsApcQueue {
+        if (self.windows_active_guest_thread_slot) |slot| return &self.windows_guest_threads[slot].apc;
+        return &self.windows_owner_apc;
+    }
+
+    /// `QueueUserAPC(routine, thread, parameter)`. The APC runs the next time
+    /// that thread is in an alertable wait; a thread already blocked in one
+    /// is made runnable now, so it re-enters the wait and runs it. Xenia's
+    /// Win32Thread::QueueUserCallback wakes a guest thread this way so it
+    /// delivers the guest APCs NtQueueApcThread just queued; refusing it left
+    /// every such thread asleep until its wait ended for another reason.
+    pub fn queueWindowsApc(self: *ElfState, handle: u64, routine: u64, parameter: u64) bool {
+        if (routine == 0) {
+            self.windows_apc_refusals +|= 1;
+            return false;
+        }
+        const pseudo_current_thread = std.math.maxInt(u64) - 1;
+        var queue: *WindowsApcQueue = undefined;
+        var target: ?*WindowsGuestThread = null;
+        if (handle == pseudo_current_thread) {
+            queue = self.activeWindowsApcQueue();
+            if (self.windows_active_guest_thread_slot) |slot| target = &self.windows_guest_threads[slot];
+        } else {
+            for (&self.windows_guest_threads) |*thread| {
+                if (thread.status == .vacant or thread.handle != handle) continue;
+                target = thread;
+                break;
+            }
+            const thread = target orelse {
+                self.windows_apc_refusals +|= 1;
+                return false;
+            };
+            if (thread.status == .completed or thread.status == .failed) {
+                self.windows_apc_refusals +|= 1;
+                return false;
+            }
+            queue = &thread.apc;
+        }
+        if (!queue.push(routine, parameter)) {
+            self.windows_apc_refusals +|= 1;
+            return false;
+        }
+        self.windows_apcs_queued +|= 1;
+        if (target) |thread| {
+            if (thread.status == .blocked and thread.blocked_alertable and
+                thread.blocked_srw_lock == 0 and thread.blocked_condition == 0)
+            {
+                self.endWindowsWaitAccounting(thread, .aborted);
+                thread.status = .runnable;
+                thread.blocked_alertable = false;
+                thread.blocked_wait_handle = 0;
+                thread.blocked_wait_handle_count = 0;
+                thread.blocked_wait_timeout = 0;
+                thread.blocked_wait_deadline = 0;
+                thread.multi_wait_deadline = 0;
+                thread.wait_resume = false;
+                thread.wait_resume_handle = 0;
+                thread.wait_resume_timeout = false;
+                thread.wait_resume_recheck = false;
+                self.windows_thread_unblocks +|= 1;
+                self.windows_apc_wakes +|= 1;
+            }
+        }
+        return true;
+    }
+
+    /// Record whether the wait the active thread is about to block in is
+    /// alertable, so a later QueueUserAPC knows whether it may end it.
+    pub fn setWindowsWaitAlertable(self: *ElfState, alertable: bool) void {
+        if (self.windows_active_guest_thread_slot) |slot| self.windows_guest_threads[slot].blocked_alertable = alertable;
+    }
+
+    /// At an alertable wait's entry: when the thread has APCs queued, run
+    /// them here instead of waiting. True when delivery began; the guest is
+    /// then at the first routine, and the wait completes with
+    /// WAIT_IO_COMPLETION once the last one returns.
+    pub fn beginWindowsApcDelivery(self: *ElfState, direct_return_rip: ?u64) bool {
+        const queue = self.activeWindowsApcQueue();
+        if (queue.delivering or queue.count == 0) return false;
+        queue.delivering = true;
+        queue.saved_rsp = self.regs.rsp;
+        queue.continuation = direct_return_rip orelse 0;
+        queue.continuation_direct = direct_return_rip != null;
+        self.startNextWindowsApc(queue);
+        return true;
+    }
+
+    /// Call one APC routine below the wait's frame: 64 bytes of room for the
+    /// callee's home area, 16-byte alignment, then the return address, so
+    /// the routine is entered with rsp at 8 mod 16 as the Windows ABI says.
+    fn startNextWindowsApc(self: *ElfState, queue: *WindowsApcQueue) void {
+        const apc = queue.pop() orelse return;
+        var frame = (queue.saved_rsp -% 0x40) & ~@as(u64, 0xF);
+        frame -%= 8;
+        self.write64(frame, SYNTHETIC_WINDOWS_APC_RETURN);
+        self.regs.rsp = frame;
+        self.regs.rcx = apc.parameter;
+        self.regs.rip = apc.routine;
+        self.windows_apcs_delivered +|= 1;
+    }
+
+    fn continueWindowsApcDelivery(self: *ElfState) void {
+        const queue = self.activeWindowsApcQueue();
+        if (!queue.delivering) {
+            self.faulted = true;
+            self.exit_code = 127;
+            self.termination_reason = .runtime_invariant_failure;
+            self.terminated = true;
+            if (comptime !@import("builtin").is_test) log.err("PE64 APC return without a delivery in progress at rsp=0x{x}", .{self.regs.rsp});
+            return;
+        }
+        if (queue.count != 0) {
+            self.startNextWindowsApc(queue);
+            return;
+        }
+        queue.delivering = false;
+        self.regs.rsp = queue.saved_rsp;
+        self.regs.rax = WINDOWS_WAIT_IO_COMPLETION;
+        self.regs.rip = if (queue.continuation_direct) queue.continuation else self.pop();
+    }
+
     pub fn parkWindowsGuestSleep(self: *ElfState, milliseconds: u64) bool {
         const index = self.windows_active_guest_thread_slot orelse return false;
         if (milliseconds == 0) {
@@ -5476,13 +6081,24 @@ pub const ElfState = struct {
     /// code.  A contended result carries the mutex's own event handle so the
     /// worker can park on exactly the same object that the image's lock path
     /// would wait on.
-    pub fn acquireWindowsGuestPthreadMutex(self: *ElfState, address: u64) WindowsPthreadMutexAcquireResult {
+    ///
+    /// `after_contention` is whether this caller has already parked on the
+    /// mutex's event. The image's `pthread_mutex_lock` takes a free mutex
+    /// with `xchg state, 1` on its first attempt but with `xchg state, 2`
+    /// on every attempt after it has waited, because other waiters may still
+    /// be parked on the same auto-reset event and the unlock only calls
+    /// `SetEvent` when it swaps a 2 out. Taking it with 1 here erased that
+    /// marker: the next unlock saw 1, signalled nobody, and a thread parked
+    /// in the image's own lock slept forever. On 2026-09-21 that was Xenia's
+    /// GPU thread on the shader-storage mutex, with the Shader Storage
+    /// Writer as the condition waiter, and Halo 3 never swapped again.
+    pub fn acquireWindowsGuestPthreadMutex(self: *ElfState, address: u64, after_contention: bool) WindowsPthreadMutexAcquireResult {
         const impl = self.windowsPthreadMutexImpl(address) orelse return .invalid;
         const state = self.read32(impl);
         const attributes = self.read32(impl + 4);
         const current_thread_id: u32 = @truncate(self.currentWindowsThreadId());
         if (state == 0) {
-            self.write32(impl, 1);
+            self.write32(impl, if (after_contention) 2 else 1);
             if (attributes != 0) self.write32(impl + 0x14, current_thread_id);
             return .acquired;
         }
@@ -5537,6 +6153,9 @@ pub const ElfState = struct {
         invalid,
         resumed,
         blocked,
+        /// Signalled; the caller hands the mutex back to the image's own
+        /// lock (`completeWindowsPthreadConditionRelock`).
+        relock,
     };
 
     pub const WindowsWaitResult = enum {
@@ -6071,6 +6690,7 @@ pub const ElfState = struct {
         self.noteWindowsWaitSignal(handle);
         object.signaled = true;
         const woken = self.wakeWindowsGuestThreadsForWait(handle, object.manual_reset);
+        if (woken == 0) self.handOffToWaitingOwner(handle);
         if (object.kind == .semaphore and object.count == 0) object.count = 1;
         if (pulse or (object.kind == .event and !object.manual_reset and woken != 0)) object.signaled = false;
         if (self.trace_windows_waits) {
@@ -6091,6 +6711,27 @@ pub const ElfState = struct {
             }
         }
         return woken;
+    }
+
+    /// End the running worker's slice now if the owner is waiting on
+    /// `handle`, so the owner's next instruction (which re-enters the wait)
+    /// finds it signalled before the worker can consume it again.
+    fn handOffToWaitingOwner(self: *ElfState, handle: u64) void {
+        if (self.windows_active_guest_thread_slot == null) return;
+        for (self.windows_owner_wait_handles[0..self.windows_owner_wait_handle_count]) |waiting| {
+            if (waiting != handle) continue;
+            if (!self.windows_guest_handoff_requested) {
+                self.windows_guest_handoff_requested = true;
+                self.windows_owner_wait_handoffs +|= 1;
+            }
+            return;
+        }
+    }
+
+    fn setOwnerWaitHandles(self: *ElfState, handles: []const u64) void {
+        const count = @min(handles.len, self.windows_owner_wait_handles.len);
+        @memcpy(self.windows_owner_wait_handles[0..count], handles[0..count]);
+        self.windows_owner_wait_handle_count = @intCast(count);
     }
 
     pub fn resetWindowsWaitObject(self: *ElfState, handle: u64) bool {
@@ -6118,6 +6759,7 @@ pub const ElfState = struct {
             object.count -= 1;
         }
         object.signaled = object.count != 0;
+        if (object.signaled) self.handOffToWaitingOwner(handle);
         return true;
     }
 
@@ -6216,7 +6858,9 @@ pub const ElfState = struct {
         // message-only window and execute the callback that will eventually
         // signal the event. Parking the owner here prevents that callback
         // from ever running on the single Rosetta interpreter.
+        self.setOwnerWaitHandles(&.{handle});
         const serviced = self.serviceWindowsGuestBoundary(self.windowsGuestWaitServiceSlice());
+        self.windows_owner_wait_handle_count = 0;
         self.windows_wait_last_owner_service_steps = serviced;
         if (serviced != 0) {
             self.windows_wait_owner_yields +|= 1;
@@ -6316,7 +6960,9 @@ pub const ElfState = struct {
 
         // The owner cannot park (see `waitWindowsGuestObject`). Give workers
         // a turn, then look again: that turn may have signalled one.
+        self.setOwnerWaitHandles(handles);
         const serviced = self.serviceWindowsGuestBoundary(self.windowsGuestWaitServiceSlice());
+        self.windows_owner_wait_handle_count = 0;
         if (serviced != 0) self.windows_wait_owner_yields +|= 1;
         if (self.takeReadyWindowsWaitObjects(handles, wait_all)) |result| return result;
         if (timeout != std.math.maxInt(u32)) {
@@ -6600,10 +7246,18 @@ pub const ElfState = struct {
                 deadline = self.guest_clock.ticks +| (milliseconds *| WINDOWS_GUEST_CLOCK_TICKS_PER_MILLISECOND);
             }
         }
-        switch (self.waitWindowsGuestConditionUntil(condition, mutex, deadline)) {
+        switch (self.waitWindowsGuestPthreadCondition(condition, mutex, deadline)) {
             .invalid => return false,
             .blocked => {
                 self.windows_condition_hook_events +|= 1;
+                return true;
+            },
+            // An INFINITE timed wait has no deadline and ends only by a
+            // signal, so it returns 0 through the image's lock as well.
+            .relock => {
+                self.windows_condition_hook_events +|= 1;
+                self.countWindowsTimedWaitOutcome(self.windows_guest_threads[slot].timed_wait_site, .signalled);
+                self.completeWindowsPthreadConditionRelock(mutex, return_rip);
                 return true;
             },
             .resumed => {
@@ -6643,6 +7297,13 @@ pub const ElfState = struct {
     /// loader found in executable bytes.  Keeping discovery in the PE intake
     /// and policy in the executor means a rebuilt Xenia image can move these
     /// routines without requiring a Rosetta or Xenia address edit.
+    pub fn configureWindowsMutexLockEntry(self: *ElfState, entry: ?u64) void {
+        self.windows_pthread_mutex_lock_intern_entry = entry;
+        if (entry) |address| {
+            log.info("PE64 guest synchronization hooks: pthread_mutex_lock_intern=0x{x} source=executable-signature; a signalled condition waiter retakes its mutex through the image's own lock", .{address});
+        }
+    }
+
     pub fn configureWindowsConditionEntries(
         self: *ElfState,
         wait_entry: ?u64,
@@ -6678,6 +7339,19 @@ pub const ElfState = struct {
     /// same direct call, observes the one-shot condition-resume marker, and
     /// this shim completes the call without entering the image's
     /// host-oriented semaphore implementation.
+    /// Leave a signalled `pthread_cond_wait` by calling the image's
+    /// `pthread_mutex_lock_intern(mutex, INFINITE)` in its place. Its return
+    /// value (0) is `pthread_cond_wait`'s, and it returns to the same caller:
+    /// a tail-jumped wait already has that caller's return address at
+    /// [rsp]; a called one gets it pushed, exactly as the call would have.
+    fn completeWindowsPthreadConditionRelock(self: *ElfState, mutex: u64, return_rip: ?u64) void {
+        const entry = self.windows_pthread_mutex_lock_intern_entry.?;
+        if (return_rip) |rip| self.push(rip);
+        self.regs.rcx = mutex;
+        self.regs.rdx = 0xFFFF_FFFF;
+        self.regs.rip = entry;
+    }
+
     fn completeWindowsPthreadConditionReturn(self: *ElfState, return_rip: ?u64) void {
         self.regs.rip = return_rip orelse self.readMemVal(self.regs.rsp, .bits64);
         // A tail-jump into the pthread routine inherits the caller's return
@@ -6697,9 +7371,14 @@ pub const ElfState = struct {
 
         if (self.windows_pthread_cond_wait_entry) |wait_entry| {
             if (target == wait_entry) {
-                const result = self.waitWindowsGuestCondition(self.regs.rcx, self.regs.rdx);
+                const result = self.waitWindowsGuestPthreadCondition(self.regs.rcx, self.regs.rdx, 0);
                 switch (result) {
                     .invalid => return false,
+                    .relock => {
+                        self.windows_condition_hook_events +|= 1;
+                        self.completeWindowsPthreadConditionRelock(self.regs.rdx, return_rip);
+                        return true;
+                    },
                     .blocked => {
                         self.windows_condition_hook_events +|= 1;
                         if (self.trace_windows_conditions) {
@@ -6995,12 +7674,46 @@ pub const ElfState = struct {
     /// ends, the waiter retakes its mutex before it returns, and which way it
     /// ended is left in `condition_resume_timeout`.
     pub fn waitWindowsGuestConditionUntil(self: *ElfState, address: u64, mutex_address: u64, deadline: u64) WindowsConditionWaitResult {
+        return self.waitWindowsGuestConditionFor(address, mutex_address, deadline, false);
+    }
+
+    /// The native pthread shim's wait: the same, except a signalled waiter on
+    /// a normal MinGW mutex is answered `.relock` (see
+    /// `completeWindowsPthreadConditionRelock`). Only this caller knows
+    /// `mutex_address` is a `pthread_mutex_t` and not, say, a critical
+    /// section, so only it may be told to call the image's mutex lock.
+    pub fn waitWindowsGuestPthreadCondition(self: *ElfState, address: u64, mutex_address: u64, deadline: u64) WindowsConditionWaitResult {
+        return self.waitWindowsGuestConditionFor(address, mutex_address, deadline, true);
+    }
+
+    fn waitWindowsGuestConditionFor(self: *ElfState, address: u64, mutex_address: u64, deadline: u64, allow_relock: bool) WindowsConditionWaitResult {
         const index = self.windows_active_guest_thread_slot orelse return .invalid;
         if (address == 0 or self.windows_guest_threads[index].status != .running) return .invalid;
         self.windows_condition_wait_calls +|= 1;
 
         if (self.windows_guest_threads[index].condition_resume) {
             const mutex = self.windows_guest_threads[index].blocked_condition_mutex;
+            // An untimed wait on a normal mutex retakes it through the
+            // image's own `pthread_mutex_lock`. Emulating that acquisition
+            // here parked the waiter on the mutex's event outside a real
+            // wait, where a signal already given could not reach it, and on
+            // 2026-09-21 the Shader Storage Writer and Xenia's GPU thread
+            // ended up asleep on the same event with nobody left to set it.
+            if (allow_relock and mutex != 0 and deadline == 0 and !self.windows_guest_threads[index].condition_resume_timeout and
+                self.windows_pthread_mutex_lock_intern_entry != null)
+            {
+                if (self.windowsPthreadMutexImpl(mutex)) |impl| {
+                    if (self.read32(impl + 4) == 0) {
+                        self.windows_guest_threads[index].condition_resume = false;
+                        self.windows_guest_threads[index].condition_mutex_contended = false;
+                        self.windows_guest_threads[index].blocked_condition_mutex = 0;
+                        self.windows_condition_wait_resumes +|= 1;
+                        self.windows_condition_relocks +|= 1;
+                        self.endWindowsWaitAccounting(&self.windows_guest_threads[index], .signaled);
+                        return .relock;
+                    }
+                }
+            }
             if (mutex == 0) {
                 const timed_out = self.windows_guest_threads[index].condition_resume_timeout;
                 self.windows_guest_threads[index].condition_resume = false;
@@ -7012,9 +7725,10 @@ pub const ElfState = struct {
                 return .resumed;
             }
 
-            switch (self.acquireWindowsGuestPthreadMutex(mutex)) {
+            switch (self.acquireWindowsGuestPthreadMutex(mutex, self.windows_guest_threads[index].condition_mutex_contended)) {
                 .acquired => {
                     const timed_out = self.windows_guest_threads[index].condition_resume_timeout;
+                    self.windows_guest_threads[index].condition_mutex_contended = false;
                     self.windows_guest_threads[index].condition_resume = false;
                     self.windows_guest_threads[index].blocked_condition_mutex = 0;
                     self.windows_guest_threads[index].wait_resume = false;
@@ -7028,6 +7742,7 @@ pub const ElfState = struct {
                     return .resumed;
                 },
                 .invalid => {
+                    self.windows_guest_threads[index].condition_mutex_contended = false;
                     self.windows_condition_mutex_release_failures +|= 1;
                     return .invalid;
                 },
@@ -7042,6 +7757,21 @@ pub const ElfState = struct {
                     {
                         self.windows_guest_threads[index].wait_resume = false;
                         self.windows_guest_threads[index].wait_resume_handle = 0;
+                    }
+                    self.windows_guest_threads[index].condition_mutex_contended = true;
+                    // A real wait on an auto-reset event that is already set
+                    // takes the signal and returns at once, and the image's
+                    // lock loop tries again. Parking here would wait for a
+                    // *next* SetEvent that the unlock already spent, so take
+                    // the signal and retry on the next turn instead.
+                    if (self.windowsWaitObjectIndex(wait_handle)) |object_index| {
+                        const object = &self.windows_wait_objects[object_index];
+                        if (object.signaled) {
+                            if (!object.manual_reset) object.signaled = false;
+                            self.windows_guest_threads[index].status = .runnable;
+                            self.windows_condition_mutex_reacquire_blocks +|= 1;
+                            return .blocked;
+                        }
                     }
                     self.windows_guest_threads[index].status = .blocked;
                     self.windows_guest_threads[index].blocked_srw_lock = 0;
@@ -7305,7 +8035,8 @@ pub const ElfState = struct {
         if (self.windowsWaitObjectIndex(finished.handle)) |wait_index| {
             self.windows_wait_objects[wait_index].signaled = true;
         }
-        for ([_]u64{ finished.stack_base, finished.teb, finished.tls_block }) |base| {
+        _ = self.releaseWindowsGuestThreadStack(finished);
+        for ([_]u64{ finished.teb, finished.tls_block }) |base| {
             if (base != 0) _ = self.releaseGuestAllocation(base);
         }
         self.windows_guest_threads[index] = .{};
@@ -7445,6 +8176,30 @@ pub const ElfState = struct {
         return null;
     }
 
+    /// Return a thread's stack block to the heap: the guard's protection is
+    /// cleared first, because the next owner of those bytes is ordinary heap.
+    fn releaseWindowsGuestThreadStack(self: *ElfState, thread: *WindowsGuestThread) bool {
+        if (thread.stack_base == 0) return false;
+        const allocation = if (thread.stack_guard_base != 0) thread.stack_guard_base else thread.stack_base;
+        if (thread.stack_guard_base != 0) {
+            self.clearGuestPageProtection(thread.stack_guard_base, WINDOWS_GUEST_THREAD_STACK_GUARD);
+            self.blockJitTlbInvalidate(thread.stack_guard_base, WINDOWS_GUEST_THREAD_STACK_GUARD);
+        }
+        if (!self.releaseGuestAllocation(allocation)) return false;
+        thread.stack_base = 0;
+        thread.stack_guard_base = 0;
+        return true;
+    }
+
+    /// The worker whose stack guard holds `address`, when it is one.
+    fn windowsStackGuardOwner(self: *const ElfState, address: u64) ?usize {
+        for (self.windows_guest_threads, 0..) |thread, index| {
+            if (thread.stack_guard_base == 0 or thread.status == .vacant) continue;
+            if (address >= thread.stack_guard_base and address < thread.stack_guard_base + WINDOWS_GUEST_THREAD_STACK_GUARD) return index;
+        }
+        return null;
+    }
+
     fn finishWindowsGuestThread(self: *ElfState) void {
         const index = self.windows_active_guest_thread_slot orelse {
             self.faulted = true;
@@ -7470,9 +8225,7 @@ pub const ElfState = struct {
         // exit. Holding it until the slot was reused kept megabytes per
         // finished thread out of the guest heap; on 2026-09-14 the heap ran
         // out and the title's next thread never got a stack at all.
-        const finished_stack = self.windows_guest_threads[index].stack_base;
-        if (finished_stack != 0 and self.releaseGuestAllocation(finished_stack)) {
-            self.windows_guest_threads[index].stack_base = 0;
+        if (self.releaseWindowsGuestThreadStack(&self.windows_guest_threads[index])) {
             self.windows_thread_stacks_released +|= 1;
         }
         if (self.diagnose_abi or self.trace_windows_threads) {
@@ -7529,7 +8282,7 @@ pub const ElfState = struct {
 
         const first_run = self.windows_guest_threads[index].status == .pending;
         if (first_run) {
-            const stack_base = self.guestAlloc(self.windows_guest_threads[index].stack_size, 0x1000) orelse {
+            const guard_base = self.guestAlloc(self.windows_guest_threads[index].stack_size + WINDOWS_GUEST_THREAD_STACK_GUARD, 0x1000) orelse {
                 self.windows_guest_threads[index].status = .failed;
                 self.windows_thread_failures +|= 1;
                 self.windows_active_guest_thread_slot = null;
@@ -7541,6 +8294,9 @@ pub const ElfState = struct {
                 });
                 return 0;
             };
+            self.noteGuestPageProtection(guard_base, WINDOWS_GUEST_THREAD_STACK_GUARD, 0x01, "stack guard", self.regs.rip);
+            self.windows_guest_threads[index].stack_guard_base = guard_base;
+            const stack_base = guard_base + WINDOWS_GUEST_THREAD_STACK_GUARD;
             const allocated_stack_end = stack_base + self.windows_guest_threads[index].stack_size;
             const stack_top = allocated_stack_end - WINDOWS_GUEST_THREAD_ENTRY_RESERVE;
             const initial_parent = self.windows_parent_guest_context;
@@ -7629,7 +8385,9 @@ pub const ElfState = struct {
 
         var executed: u64 = 0;
         self.windows_guest_slice_yield_requested = false;
+        self.windows_guest_handoff_requested = false;
         self.windows_slice_clock_reads = 0;
+        self.windows_slice_pause_yield = false;
         const slice_kernel_calls = self.windows_guest_threads[index].kernel_calls;
         var spin_probe_rip: u64 = 0;
         var spin_probe_state: u64 = 0;
@@ -7663,6 +8421,13 @@ pub const ElfState = struct {
             // floor keeps the yield meaningful - a spinner gets a couple of
             // hundred instructions instead of ten thousand - without letting
             // the switch dominate what it saved.
+            // A handoff to the waiting owner has no floor: the point is to
+            // run the owner before this worker takes the object back.
+            if (self.windows_guest_handoff_requested) {
+                self.windows_guest_handoff_requested = false;
+                self.windows_guest_slice_yield_requested = false;
+                break;
+            }
             if (self.windows_guest_slice_yield_requested and executed >= WINDOWS_GUEST_YIELD_MINIMUM_SLICE) {
                 self.windows_guest_slice_yield_requested = false;
                 break;
@@ -7736,7 +8501,12 @@ pub const ElfState = struct {
             if (!blocked) {
                 self.windows_guest_threads[index].status = .runnable;
                 self.windows_thread_yields +|= 1;
-                self.noteWindowsGuestSliceShape(index, slice_repeated_state, slice_kernel_calls);
+                if (self.windows_slice_pause_yield and !slice_repeated_state and
+                    self.windows_guest_threads[index].kernel_calls == slice_kernel_calls)
+                {
+                    self.windows_pause_spin_slices +|= 1;
+                }
+                self.noteWindowsGuestSliceShape(index, slice_repeated_state or self.windows_slice_pause_yield, slice_kernel_calls);
             }
             const parent = self.windows_parent_guest_context;
             self.restoreWindowsGuestContext(&parent);
@@ -8257,7 +9027,7 @@ pub const ElfState = struct {
     const windows_exception_continue_execution: u32 = 0xFFFF_FFFF;
     const windows_context_bytes: u64 = 0x4D0;
     const windows_exception_record_bytes: u64 = 0xA0;
-    const windows_exception_header_bytes: u64 = 0x30;
+    const windows_exception_header_bytes: u64 = 0x40;
     /// A handler that faults inside itself is dispatched again, as on
     /// Windows; past this depth Rosette stops and performs the access.
     const windows_exception_nesting_limit: u32 = 8;
@@ -8280,6 +9050,7 @@ pub const ElfState = struct {
             return;
         };
         const outcome = self.guest_page_protection.set(self.allocator, address, length, protection);
+        self.blockJitTlbInvalidate(address, length);
         if (outcome.allocation_failed) {
             log.warn("PE64 GUEST PAGE PROTECTION: could not allocate a protection page for [0x{x},+0x{x}) from {s}; accesses to it will not fault", .{ address, length, api });
         }
@@ -8315,6 +9086,7 @@ pub const ElfState = struct {
 
     pub fn clearGuestPageProtection(self: *ElfState, address: u64, length: u64) void {
         _ = self.guest_page_protection.set(self.allocator, address, length, .accessible);
+        self.blockJitTlbInvalidate(address, length);
     }
 
     /// The Windows `PAGE_*` value recorded for an address.
@@ -8348,6 +9120,43 @@ pub const ElfState = struct {
         return is_write;
     }
 
+    /// A host-side mutable borrow of guest memory (an import shim, a CRT
+    /// copy, a file read, an exception frame) that overlaps a page the guest
+    /// protected. Windows would have faulted inside the shim and let the
+    /// vectored handler see the write; Rosette writes without a fault, so a
+    /// write watch on that page never fires. Counted, and the first few
+    /// named, so the next run says how much watched memory is written this
+    /// way. This is a measurement, not yet the fault.
+    fn noteProtectedBulkBorrow(self: *ElfState, addr: u64, count: u64) void {
+        const page_size = guest_page_protection.page_size;
+        var page = addr & ~(page_size - 1);
+        const end = addr +| count;
+        var scanned: u32 = 0;
+        while (page < end and scanned < 1024) : ({
+            page +|= page_size;
+            scanned += 1;
+        }) {
+            const protection = self.guest_page_protection.get(page);
+            if (protection == .accessible) continue;
+            self.guest_protected_bulk_borrows +|= 1;
+            self.guest_protected_bulk_borrow_bytes +|= count;
+            if (self.guest_protected_bulk_borrow_reports < 8) {
+                self.guest_protected_bulk_borrow_reports += 1;
+                var rip_text: [guest_symbol_text_bytes]u8 = undefined;
+                log.info("PE64 GUEST ACCESS VIOLATIONS: a host-side borrow of {d} byte(s) at 0x{x} overlaps a {s} page at 0x{x} (rip=0x{x} {s} op={s}); Windows would have faulted inside the shim and let the vectored handler see the write, Rosette wrote without a fault, so a write watch on that page did not fire", .{
+                    count,
+                    addr,
+                    protection.label(),
+                    page,
+                    self.regs.rip,
+                    self.describeGuestAddressOrUnnamed(self.regs.rip, &rip_text),
+                    @tagName(self.last_decoded_op),
+                });
+            }
+            return;
+        }
+    }
+
     fn guestAccessViolationSite(self: *ElfState, page: u64) ?*GuestAccessViolationSite {
         for (self.guest_access_violation_sites[0..self.guest_access_violation_site_count]) |*site| {
             if (site.page == page) return site;
@@ -8371,6 +9180,30 @@ pub const ElfState = struct {
     fn raiseGuestAccessViolation(self: *ElfState) void {
         const fault = self.guest_access_violation;
         self.guest_access_violation_pending = false;
+        if (self.windowsStackGuardOwner(fault.address)) |slot| {
+            // Windows raises STATUS_STACK_OVERFLOW here and the process
+            // dies; performing the access instead would write the next heap
+            // object below the stack, which is how this used to fail.
+            const thread = self.windows_guest_threads[slot];
+            var rip_name: [256]u8 = undefined;
+            self.windows_stack_overflows +|= 1;
+            if (comptime !@import("builtin").is_test) log.err("PE64 GUEST STACK OVERFLOW: thread={s} {s} at 0x{x} rsp=0x{x} rip=0x{x} ({s}) stack=[0x{x},0x{x}) size={d}; the thread used more stack than it was created with, and the guard below it stopped the write before it reached the heap", .{
+                self.guestThreadLabel(@intCast(@min(slot + 1, 255))),
+                if (fault.is_write) "write" else "read",
+                fault.address,
+                self.regs.rsp,
+                fault.instruction_rip,
+                self.describeGuestAddressOrUnnamed(fault.instruction_rip, &rip_name),
+                thread.stack_base,
+                thread.stack_base +| thread.stack_size,
+                thread.stack_size,
+            });
+            self.faulted = true;
+            self.exit_code = 127;
+            self.termination_reason = .runtime_invariant_failure;
+            self.terminated = true;
+            return;
+        }
         self.guest_access_violations_raised +|= 1;
         if (fault.is_write) {
             self.guest_access_violation_writes +|= 1;
@@ -8388,30 +9221,57 @@ pub const ElfState = struct {
         self.noteApuRegisterFault(fault);
         if (self.windows_vectored_exception_handler == 0) {
             self.guest_access_violations_without_handler +|= 1;
-            self.completeSuppressedGuestAccess(fault.address, fault.width, fault.is_write, fault.value);
+            self.completeSuppressedGuestAccess(fault.address, fault.width, fault.is_write, fault.value, fault.wide_value);
             return;
         }
         if (self.guest_exception_dispatches_in_flight >= windows_exception_nesting_limit) {
             self.guest_access_violations_nesting_refused +|= 1;
-            self.completeSuppressedGuestAccess(fault.address, fault.width, fault.is_write, fault.value);
+            self.completeSuppressedGuestAccess(fault.address, fault.width, fault.is_write, fault.value, fault.wide_value);
             return;
         }
         if (!self.enterWindowsExceptionDispatch(fault)) {
             self.guest_access_violations_frame_refused +|= 1;
-            self.completeSuppressedGuestAccess(fault.address, fault.width, fault.is_write, fault.value);
+            self.completeSuppressedGuestAccess(fault.address, fault.width, fault.is_write, fault.value, fault.wide_value);
             return;
         }
         self.guest_access_violations_dispatched +|= 1;
     }
 
-    fn completeSuppressedGuestAccess(self: *ElfState, address: u64, width: u8, is_write: bool, value: u64) void {
+    fn completeSuppressedGuestAccess(self: *ElfState, address: u64, width: u8, is_write: bool, value: u64, wide_value: [16]u8) void {
         if (!is_write) return;
         switch (width) {
             1 => self.write8(address, @truncate(value)),
             2 => self.write16(address, @truncate(value)),
             4 => self.write32(address, @truncate(value)),
+            16 => {
+                self.traceGuestVectorWrite(address, wide_value);
+                if (self.guestMemory(address, 16)) |destination| @memcpy(destination, wide_value[0..]);
+            },
             else => self.write64(address, value),
         }
+    }
+
+    /// A 16-byte vector access against the protection table, with
+    /// `noteGuestOperandAccess`'s rules. Vector loads and stores skipped
+    /// this check before 2026-09-19: a write watch (Xenia protects
+    /// physical-heap pages read-only to learn what the guest changed, and
+    /// re-uploads only what faulted) never saw a `vmovaps` store, so the
+    /// GPU could be fed the previous contents of a buffer the title had
+    /// just rewritten with vector instructions.
+    fn noteGuestWideAccess(self: *ElfState, address: u64, is_write: bool, value: [16]u8) bool {
+        if (!self.guest_page_protection.faults(address, 16, is_write)) return false;
+        if (self.guest_access_violation_pending) return is_write;
+        self.guest_access_violation_pending = true;
+        self.guest_access_violation = .{
+            .address = address,
+            .instruction_rip = self.last_instruction_rip,
+            .value = std.mem.readInt(u64, value[0..8], .little),
+            .wide_value = value,
+            .width = 16,
+            .is_write = is_write,
+            .protection = self.guest_page_protection.get(address),
+        };
+        return is_write;
     }
 
     /// Call the guest's vectored exception handler with an access violation.
@@ -8448,6 +9308,13 @@ pub const ElfState = struct {
         self.write64(header + 16, post_rip);
         self.write64(header + 24, fault.value);
         self.write64(header + 32, @as(u64, fault.width) | (@as(u64, @intFromBool(fault.is_write)) << 8));
+        self.write64(header + 40, std.mem.readInt(u64, fault.wide_value[0..8], .little));
+        self.write64(header + 48, std.mem.readInt(u64, fault.wide_value[8..16], .little));
+        // The faulting instruction's own rip, so the return path can tell a
+        // retry (the handler left rip where it was, the write-watch protocol)
+        // from a skip (the handler emulated the access and stepped over it,
+        // the MMIO protocol). The header has room; nothing else uses +56.
+        self.write64(header + 56, fault.instruction_rip);
 
         self.write32(record, windows_status_access_violation);
         self.write64(record + 16, fault.instruction_rip); // ExceptionAddress
@@ -8523,14 +9390,22 @@ pub const ElfState = struct {
         const post_rip = self.read64(header + 16);
         const value = self.read64(header + 24);
         const shape = self.read64(header + 32);
+        var wide_value: [16]u8 = @splat(0);
+        std.mem.writeInt(u64, wide_value[0..8], self.read64(header + 40), .little);
+        std.mem.writeInt(u64, wide_value[8..16], self.read64(header + 48), .little);
         const width: u8 = @truncate(shape);
         const is_write = ((shape >> 8) & 1) != 0;
+        const faulting_rip = self.read64(header + 56);
 
         self.regs.rax = self.read64(context + 0x78);
         self.regs.rcx = self.read64(context + 0x80);
         self.regs.rdx = self.read64(context + 0x88);
         self.regs.rbx = self.read64(context + 0x90);
+        const rsp_before_restore = self.regs.rsp;
         self.regs.rsp = self.read64(context + 0x98);
+        if (self.regs.rsp < STACK_COLLAPSE_FLOOR) {
+            self.noteStackPointerCollapse("exception-context-restore", rsp_before_restore, self.read64(context + 0xf8), "CONTEXT.Rsp");
+        }
         self.regs.rbp = self.read64(context + 0xa0);
         self.regs.rsi = self.read64(context + 0xa8);
         self.regs.rdi = self.read64(context + 0xb0);
@@ -8556,7 +9431,35 @@ pub const ElfState = struct {
             if (candidate.page == page) site = candidate;
         }
         if (verdict == windows_exception_continue_execution) {
-            self.regs.rip = self.read64(context + 0xf8);
+            const resume_rip = self.read64(context + 0xf8);
+            // A handler that leaves rip on the faulting instruction is asking
+            // for the access to be retried, which is the write-watch protocol:
+            // it has cleared the protection, so the retry lands. If the
+            // protection is still there the retry faults again, on the same
+            // instruction, forever - and nothing in the run would say so,
+            // because a fault loop retires instructions and so reads as
+            // progress to every liveness gate. Perform the access once and
+            // report it instead of hanging. The MMIO protocol is untouched:
+            // that handler emulates the access and moves rip past it.
+            if (resume_rip == faulting_rip and
+                self.guest_page_protection.faults(fault_address, @max(width, 1), is_write))
+            {
+                self.guest_access_violation_unresolved_retries +|= 1;
+                if (self.guest_access_violation_unresolved_retries == 1) {
+                    log.warn("PE64 GUEST ACCESS VIOLATION: the handler asked for a retry at rip=0x{x} but left [0x{x},+{d}) {s}; a retry would fault forever, so Rosette performed the access. Xenia's page flags and Rosette's protection table disagree about this page", .{
+                        faulting_rip,
+                        fault_address,
+                        width,
+                        self.guest_page_protection.get(fault_address).label(),
+                    });
+                }
+                self.regs.rip = post_rip;
+                self.completeSuppressedGuestAccess(fault_address, width, is_write, value, wide_value);
+                self.guest_access_violations_handled +|= 1;
+                if (site) |record| record.handled +|= 1;
+                return;
+            }
+            self.regs.rip = resume_rip;
             self.guest_access_violations_handled +|= 1;
             if (site) |record| record.handled +|= 1;
             return;
@@ -8567,7 +9470,7 @@ pub const ElfState = struct {
         // before this one had - reported, so it is never mistaken for a
         // delivered fault.
         self.regs.rip = post_rip;
-        self.completeSuppressedGuestAccess(fault_address, width, is_write, value);
+        self.completeSuppressedGuestAccess(fault_address, width, is_write, value, wide_value);
         self.guest_access_violations_unhandled +|= 1;
         if (site) |record| {
             record.unhandled +|= 1;
@@ -8956,6 +9859,9 @@ pub const ElfState = struct {
         }
         self.windows_executable_box = box;
         self.windows_executable_range_hint = 0;
+        // Pages admitted for writing before a range became executable would
+        // skip the image code-generation bump.
+        self.blockJitTlbFlush(false, true);
     }
 
     pub fn windowsVirtualAllocationContains(self: *const ElfState, address: u64, count: u64) bool {
@@ -9040,7 +9946,10 @@ pub const ElfState = struct {
 
     pub fn releaseNativeMemory(self: *ElfState, guest_base: u64) void {
         for (self.native_memory_aliases[0..self.native_memory_alias_count]) |*alias| {
-            if (alias.guest_base == guest_base) alias.bytes = null;
+            if (alias.guest_base == guest_base) {
+                if (alias.bytes) |bytes| self.blockJitTlbInvalidate(alias.guest_base, bytes.len);
+                alias.bytes = null;
+            }
         }
         while (self.native_memory_alias_count != 0 and self.native_memory_aliases[self.native_memory_alias_count - 1].bytes == null) self.native_memory_alias_count -= 1;
     }
@@ -9267,11 +10176,27 @@ pub const ElfState = struct {
     pub fn releaseWindowsVirtualAllocation(self: *ElfState, guest_base: u64, requested_length: u64, allocation_type: u64) bool {
         const release_type: u64 = 0x8000; // MEM_RELEASE
         if ((allocation_type & release_type) == 0) return self.windowsGuestRangeContains(guest_base, requested_length);
+        // `VirtualAlloc(NULL, ...)` is served from the guest heap, so its
+        // MEM_RELEASE has to reach the heap too. It used to fail here with
+        // ERROR_INVALID_ADDRESS and every such block stayed live for the run:
+        // the 1 GiB heap ran out during Halo 3's campaign load.
+        if (requested_length == 0) {
+            if (self.findGuestHeapAllocation(guest_base)) |index| {
+                const record = self.windows_heap_allocations[index];
+                if (record.active) {
+                    self.clearGuestPageProtection(guest_base, record.length);
+                    self.blockJitTlbInvalidate(guest_base, record.length);
+                    return self.releaseGuestAllocation(guest_base);
+                }
+            }
+        }
         for (self.windows_virtual_allocations[0..self.windows_virtual_allocation_count], 0..) |*allocation, allocation_index| {
             if (allocation.backing == null or allocation.guest_base != guest_base) continue;
             const expected_length = if (requested_length == 0) allocation.length else requested_length;
             if (requested_length != 0 and expected_length > allocation.length) return false;
             self.windows_mapped_ranges.remove(.virtual_allocation, allocation_index);
+            self.blockJitTlbInvalidate(allocation.guest_base, allocation.length);
+            self.blockJitDropMappedSource(.virtual_allocation, allocation_index);
             self.invalidateMappedDecodeCache();
             if (allocation.backing) |backing| std.posix.munmap(backing);
             allocation.* = .{};
@@ -9383,6 +10308,8 @@ pub const ElfState = struct {
             if (view.length == 0 or view.guest_base != guest_base) continue;
             const mapping_index = view.mapping_index;
             self.windows_mapped_ranges.remove(.memory_view, view_index);
+            self.blockJitTlbInvalidate(view.guest_base, view.length);
+            self.blockJitDropMappedSource(.memory_view, mapping_index);
             self.invalidateMappedDecodeCache();
             if (self.windows_code_cache_view == view_index) self.windows_code_cache_view = null;
             view.* = .{};
@@ -9539,6 +10466,7 @@ pub const ElfState = struct {
             };
             if (generation.* == std.math.maxInt(u64)) {
                 self.invalidateMappedDecodeCache();
+                self.blockJitDropAllMapped();
                 generation.* = 1;
             } else generation.* += 1;
             return;
@@ -9562,12 +10490,16 @@ pub const ElfState = struct {
 
     fn invalidateMappedDecodeCache(self: *ElfState) void {
         // Recreated mappings may reuse both a table slot and generation 1.
-        // Their old decodes must not survive that lifetime boundary.
+        // Their old decodes must not survive that lifetime boundary. The
+        // translator's blocks are dropped per mapping at the removal sites
+        // (`blockJitDropMappedSource`), not here: dropping every mapped
+        // block on every map and unmap threw away the whole translated
+        // code cache each time a thread stack came or went.
         for (self.decode_cache) |*entry| if (entry.mapped_source) {
             entry.valid = false;
             entry.last_used = 0;
         };
-        self.blockJitDropMapped();
+        self.blockJitTlbFlush(true, true);
     }
 
     fn indexWindowsMappedRange(self: *ElfState, range: mapped_ranges.Range) bool {
@@ -9752,14 +10684,22 @@ pub const ElfState = struct {
         }
     }
 
+    /// The mapped-write trace is a bring-up diagnostic with a fixed budget
+    /// and a floor, and it observes *stores* only. Both are named because
+    /// `blockJitTlbConsider` withholds the write TLB while the trace can
+    /// still fire, and a guard that outlived the trace it protects cost the
+    /// 2026-09-19 run every one of its 35.7 billion memory accesses.
+    const windows_memory_trace_budget: u32 = 64;
+    const windows_memory_trace_floor: u64 = 0x40_0000_0000;
+
     inline fn traceWindowsMappedWrite(self: *ElfState, address: u64, width: u8, value: u64) void {
         if (!self.trace_windows_memory) return;
         self.traceWindowsMappedWriteEnabled(address, width, value);
     }
 
     fn traceWindowsMappedWriteEnabled(self: *ElfState, address: u64, width: u8, value: u64) void {
-        if (address < 0x40_0000_0000 or self.addrToOffset(address) != null or
-            self.windows_memory_trace_events >= 64)
+        if (address < windows_memory_trace_floor or self.addrToOffset(address) != null or
+            self.windows_memory_trace_events >= windows_memory_trace_budget)
         {
             return;
         }
@@ -10429,6 +11369,10 @@ pub const ElfState = struct {
     }
 
     fn handleSyntheticRip(self: *ElfState) bool {
+        if (self.regs.rip == SYNTHETIC_WINDOWS_APC_RETURN) {
+            self.continueWindowsApcDelivery();
+            return true;
+        }
         if (self.regs.rip == SYNTHETIC_WINDOWS_THREAD_RETURN) {
             self.finishWindowsGuestThread();
             return true;
@@ -13015,6 +13959,10 @@ pub const ElfState = struct {
                     if (candidate.count == 0) continue;
                     var hotspot_text: [guest_symbol_text_bytes]u8 = undefined;
                     log.info("PE64 CPU HOTSPOT: thread=0x{x} name='{s}' rank={d} region=0x{x} at={s} samples={d} count_lower/upper={d}/{d}; 256-byte lifetime candidate, one sample per ~1024 worker instructions; not a wall-time or spin verdict", .{ thread.handle, if (thread.name_len != 0) thread.nameText() else "<unnamed>", rank + 1, candidate.address, self.describeGuestAddressOrUnnamed(candidate.address, &hotspot_text), thread.code.heat.samples, candidate.count - candidate.error_bound, candidate.count });
+                    // The top three: on 2026-09-21 RENDER's first two regions
+                    // were one function 0xB00 apart, and one region alone
+                    // could not show where its loop closed.
+                    if (rank < 3) self.logHotspotBytes(thread.handle, candidate.address);
                 }
             }
             // What this thread last asked the emulated kernel for. For every
@@ -13029,6 +13977,11 @@ pub const ElfState = struct {
                     if (last_call) |slot| slot.export_name else "<none recorded>",
                     thread.last_kernel_step,
                 });
+                if (thread.status == .blocked and thread.critical_section != 0 and last_call != null and
+                    std.mem.eql(u8, last_call.?.export_name, "RtlEnterCriticalSection"))
+                {
+                    self.logCriticalSectionWait(thread);
+                }
             } else if (thread.entered_xenia_title) {
                 log.info("PE64 GUEST THREADS:     this thread runs the title and has made no kernel call at all; it is executing translated PowerPC that never reaches an import thunk, which PE64 GUEST CODE PROGRESS can say is new code or a loop", .{});
             }
@@ -14324,7 +15277,26 @@ pub const ElfState = struct {
             else
                 self.describeGuestAddressOrUnnamed(self.windows_vectored_exception_handler, &handler_text),
         });
-        log.info("PE64 GUEST ACCESS VIOLATIONS:   raised={d} (reads={d} writes={d}) dispatched={d} handled={d} unhandled={d} no_handler={d} frame_refused={d} nesting_refused={d}", .{
+        // The one-number test for Xenia's GPU write watch. It protects
+        // physical-heap pages PAGE_READONLY so a title's store to a texture
+        // or a vertex buffer faults and `TriggerCallbacks` re-uploads it.
+        // Every such request arrives through ntdll's
+        // `NtProtectVirtualMemory`, never `VirtualProtect`, because Xenia
+        // builds with `XE_USE_NTDLL_FUNCTIONS`. While that name returned
+        // STATUS_SUCCESS and recorded nothing, this counter read zero for
+        // the whole project's history and the GPU drew from stale memory.
+        log.info("PE64 GPU WRITE WATCH: read_only_pages={d} write_faults={d} unresolved_retries={d} state={s}; Xenia protects physical-heap pages read-only to learn what the guest rewrote, and it asks through ntdll's NtProtectVirtualMemory. Zero read-only pages means no store can fault, so the GPU keeps drawing from the copy of guest memory it uploaded first - the shape of banded, stale geometry. unresolved_retries counts faults the handler asked to retry without clearing the protection, each of which would have been an unbreakable loop", .{
+            table.read_only_pages,
+            self.guest_access_violation_writes,
+            self.guest_access_violation_unresolved_retries,
+            if (table.read_only_pages != 0 or self.guest_access_violation_writes > 1024)
+                "armed"
+            else if (self.wide_access_watch_enabled)
+                "never armed (no read-only page was ever recorded)"
+            else
+                "never armed, and wide accesses are unwatched (ROSETTE_X64_WIDE_ACCESS_WATCH=0)",
+        });
+        log.info("PE64 GUEST ACCESS VIOLATIONS:   raised={d} (reads={d} writes={d}) dispatched={d} handled={d} unhandled={d} no_handler={d} frame_refused={d} nesting_refused={d} host_side_borrows_of_protected_pages={d} (bytes={d}); the last pair counts import shims, CRT copies and file reads writing into pages the guest protected without a fault, which a write watch on those pages never sees", .{
             self.guest_access_violations_raised,
             self.guest_access_violation_reads,
             self.guest_access_violation_writes,
@@ -14334,6 +15306,8 @@ pub const ElfState = struct {
             self.guest_access_violations_without_handler,
             self.guest_access_violations_frame_refused,
             self.guest_access_violations_nesting_refused,
+            self.guest_protected_bulk_borrows,
+            self.guest_protected_bulk_borrow_bytes,
         });
         for (self.guest_access_violation_sites[0..self.guest_access_violation_site_count]) |*site| {
             var rip_text: [guest_symbol_text_bytes]u8 = undefined;
@@ -15026,6 +16000,21 @@ pub const ElfState = struct {
     /// function is reached by `call`, direct or indirect, and paying a bit
     /// test per instruction to also catch a tail jump would cost more than
     /// the answer is worth.
+    /// Whether `target` is an armed milestone - exactly, not by filter bit.
+    /// The filter alone answered yes for about one address in twelve (22
+    /// milestones over 256 bits), and every call site it answered yes for
+    /// stayed on the interpreter for good: most of 15,162 "hooked" direct
+    /// calls and 210 million fallbacks on 2026-09-21 were such collisions.
+    fn isGuestMilestoneAddress(self: *const ElfState, target: u64) bool {
+        const slot = self.guest_milestone_slot[guestMilestoneFilterBit(target)];
+        if (slot == 0) return false;
+        if (slot != milestone_slot_collision) return self.guest_milestone_addresses[@as(usize, slot) - 1] == target;
+        for (self.guest_milestone_addresses) |address| {
+            if (address == target) return true;
+        }
+        return false;
+    }
+
     fn noteGuestMilestoneEntry(self: *ElfState, target: u64) void {
         const bit = guestMilestoneFilterBit(target);
         const slot = self.guest_milestone_slot[bit];
@@ -15109,17 +16098,24 @@ pub const ElfState = struct {
         self.write32(command_processor +| 0x268, write_pointer);
         const woken = self.signalWindowsWaitObject(handle, false);
         self.windows_gpu_write_pointer_wake_repairs +|= 1;
-        log.info("PE64 GPU write-pointer wake repair: this=0x{x} event=0x{x} handle=0x{x} write_ptr=0x{x} woken={d} signaled_after={} step={d} repairs={d} misses={d}", .{
-            command_processor,
-            event_object,
-            handle,
-            write_pointer,
-            woken,
-            self.windowsWaitObjectSignaled(handle),
-            self.executed_steps,
-            self.windows_gpu_write_pointer_wake_repairs,
-            self.windows_gpu_write_pointer_wake_repair_misses,
-        });
+        // This fires on every ring publication, so it is a per-frame event
+        // for the whole run: 4180 lines on 2026-09-19. Report the first
+        // eight and then only at powers of two, the same governor the guest
+        // output log uses. The count itself is carried on the summary line,
+        // so nothing is lost but the volume.
+        const repairs = self.windows_gpu_write_pointer_wake_repairs;
+        if (repairs <= 8 or (repairs & (repairs - 1)) == 0)
+            log.info("PE64 GPU write-pointer wake repair: this=0x{x} event=0x{x} handle=0x{x} write_ptr=0x{x} woken={d} signaled_after={} step={d} repairs={d} misses={d}", .{
+                command_processor,
+                event_object,
+                handle,
+                write_pointer,
+                woken,
+                self.windowsWaitObjectSignaled(handle),
+                self.executed_steps,
+                self.windows_gpu_write_pointer_wake_repairs,
+                self.windows_gpu_write_pointer_wake_repair_misses,
+            });
     }
 
     fn recordGuestMilestone(self: *ElfState, index: usize, target: u64) void {
@@ -16660,6 +17656,13 @@ pub const ElfState = struct {
             thread.last_kernel_slot = slot_index;
             thread.last_kernel_step = accounting_step;
             thread.kernel_calls +|= 1;
+            if (self.guest_kernel_calls.slotAt(slot_index)) |entry| {
+                if (entry.kind == .trampoline and std.mem.eql(u8, entry.export_name, "RtlEnterCriticalSection")) {
+                    const context = self.regs.rcx;
+                    thread.critical_section_membase = self.readHostU64(context + PPC_CONTEXT_VIRTUAL_MEMBASE) orelse 0;
+                    thread.critical_section = @truncate(self.readHostU64(context + ppcContextGpr(3)) orelse 0);
+                }
+            }
         }
     }
 
@@ -16688,6 +17691,97 @@ pub const ElfState = struct {
     fn readHostU64(self: *const ElfState, address: u64) ?u64 {
         const bytes = self.guestMemoryConst(address, 8) orelse return null;
         return std.mem.readInt(u64, bytes[0..8], .little);
+    }
+
+    /// Report the first moments a worker's stack pointer falls into the null
+    /// page - where no thread's stack ever is. On 2026-09-21 Halo 3's RENDER
+    /// thread reached a function epilogue with rsp=0, "returned" through a
+    /// null return address, and was retired as finished while it still held
+    /// the critical section MAIN_THREAD then waited on for ten minutes. The
+    /// corruption itself left no trace; this names the code that did it.
+    fn noteStackPointerCollapse(self: *ElfState, via: []const u8, rsp_before: u64, rip_before: u64, detail: []const u8) void {
+        if (self.stack_collapse_reports >= 8) return;
+        self.stack_collapse_reports += 1;
+        const name = if (self.windows_active_guest_thread_slot) |slot|
+            (if (self.windows_guest_threads[slot].name_len != 0) self.windows_guest_threads[slot].nameText() else "<unnamed>")
+        else
+            "<owner>";
+        var symbol_text: [guest_symbol_text_bytes]u8 = undefined;
+        log.err("PE64 STACK POINTER COLLAPSE: thread='{s}' via={s} rsp_before=0x{x} rsp_after=0x{x} rip_before=0x{x} ({s}) rip_after=0x{x} detail={s} exception_dispatches_in_flight={d}; no stack lives in the null page, so the code named here wrote rsp", .{
+            name,
+            via,
+            rsp_before,
+            self.regs.rsp,
+            rip_before,
+            self.describeGuestAddressOrUnnamed(rip_before, &symbol_text),
+            self.regs.rip,
+            detail,
+            self.guest_exception_dispatches_in_flight,
+        });
+    }
+
+    /// The translated-code form: every block the native chain ran, with the
+    /// instructions each retired, because the collapse is somewhere in them.
+    fn noteStackPointerCollapseInBlocks(self: *ElfState, rsp_before: u64, rip_before: u64, first: *block_jit.Block, completed: u32) void {
+        if (self.stack_collapse_reports >= 8) return;
+        self.noteStackPointerCollapse("translated-blocks", rsp_before, rip_before, "see PE64 STACK POINTER COLLAPSE BLOCK");
+        const depth = @min(self.block_jit_scratch.chain_depth, block_jit.chain_log_capacity);
+        var entries: [block_jit.chain_log_capacity]block_jit.ChainLogEntry = undefined;
+        const count: usize = if (depth == 0) 1 else depth;
+        if (depth == 0) {
+            entries[0] = .{ .block = @intFromPtr(first), .retired = completed };
+        } else {
+            @memcpy(entries[0..depth], self.block_jit_scratch.chain_log[0..depth]);
+        }
+        // The last few blocks are the ones that matter.
+        const start = count -| 4;
+        for (entries[start..count], start..) |entry, position| {
+            const ran: *block_jit.Block = @ptrFromInt(@as(usize, @intCast(entry.block)));
+            const retired: usize = @min(@as(usize, @max(entry.retired, 1)), ran.insns.len);
+            var ops: [640]u8 = undefined;
+            var used: usize = 0;
+            for (ran.insns[0..retired]) |insn| {
+                const text = std.fmt.bufPrint(ops[used..], "0x{x}:{s} ", .{ insn.rip, @tagName(insn.decoded.op) }) catch break;
+                used += text.len;
+            }
+            log.err("PE64 STACK POINTER COLLAPSE BLOCK: position={d}/{d} start=0x{x} retired={d} ops={s}", .{ position + 1, count, ran.start_rip, entry.retired, ops[0..used] });
+        }
+    }
+
+    /// Name the owner of the critical section a blocked thread entered.
+    ///
+    /// Xenia's `X_RTL_CRITICAL_SECTION` is a 16-byte dispatcher header, then
+    /// `lock_count` in host byte order (Xenia updates it with host atomics),
+    /// then a big-endian `recursion_count` and `owning_thread` (a guest
+    /// KTHREAD). An owner of zero with `lock_count` at or above zero means
+    /// the section was released while a waiter was counted, and the
+    /// release's `KeSetEvent` never reached the waiter: a lost wake, not a
+    /// holder.
+    fn logCriticalSectionWait(self: *const ElfState, thread: *const WindowsGuestThread) void {
+        const bytes = self.xeniaGuestBytes(thread.critical_section_membase, thread.critical_section, 28) orelse {
+            log.info("PE64 CRITICAL SECTION WAIT: thread=0x{x} section=0x{x} unreadable", .{ thread.handle, thread.critical_section });
+            return;
+        };
+        const signal_state = std.mem.readInt(i32, bytes[4..8], .big);
+        const lock_count = std.mem.readInt(i32, bytes[16..20], .little);
+        const recursion = std.mem.readInt(i32, bytes[20..24], .big);
+        const owner = std.mem.readInt(u32, bytes[24..28], .big);
+        const verdict = if (owner == 0 and lock_count >= 0)
+            "no owner but waiters counted: the release happened and its wake was lost"
+        else if (owner != 0)
+            "held: the owner KTHREAD has not left it; find which thread that is and what it waits on"
+        else
+            "free: the waiter should be runnable";
+        log.info("PE64 CRITICAL SECTION WAIT: thread=0x{x} name='{s}' section=0x{x} owner_kthread=0x{x} lock_count={d} recursion={d} header_signal={d}; {s}", .{
+            thread.handle,
+            if (thread.name_len != 0) thread.nameText() else "<unnamed>",
+            thread.critical_section,
+            owner,
+            lock_count,
+            recursion,
+            signal_state,
+            verdict,
+        });
     }
 
     fn readWindowsInputState(self: *ElfState) ?WindowsInputState {
@@ -16758,7 +17852,6 @@ pub const ElfState = struct {
             self.windows_input_xam_refusals +|= 1;
             return false;
         };
-        const state = self.readWindowsInputState() orelse return false;
         const user_index: u64 = if (is_caps_ex)
             self.readHostU64(context + ppcContextGpr(4)) orelse {
                 self.windows_input_xam_refusals +|= 1;
@@ -16769,10 +17862,28 @@ pub const ElfState = struct {
                 self.windows_input_xam_refusals +|= 1;
                 return false;
             };
-        const valid_user = user_index < 4 or user_index == 0xFF;
-        const result: u32 = if (!valid_user)
-            1167 // ERROR_DEVICE_NOT_CONNECTED
-        else if (is_set_state)
+        // The keyboard is one pad, in slot 0, as Xenia's own keyboard driver
+        // places it (`keyboard_user_index` defaults to 0). Answering all four
+        // slots told the title four identical controllers were plugged in and
+        // pressing every button together. `XUSER_INDEX_ANY` resolves to slot 0.
+        const keyboard_user = user_index == 0 or user_index == 0xFF;
+        // Only the keyboard's own slot samples it, so the nonzero-sample
+        // census counts what the title was actually handed.
+        const state: WindowsInputState = if (keyboard_user)
+            self.readWindowsInputState() orelse return false
+        else
+            .{ .connected = 1 };
+        const result: u32 = if (!keyboard_user) blk: {
+            if (is_state) {
+                // XInput clears the caller's state even for an empty slot.
+                if (self.readHostU64(context + ppcContextGpr(5))) |output| {
+                    if (output != 0) {
+                        if (self.xeniaGuestBytesMut(membase, @truncate(output), 16)) |bytes| @memset(bytes, 0);
+                    }
+                }
+            }
+            break :blk 1167; // ERROR_DEVICE_NOT_CONNECTED
+        } else if (is_set_state)
             0
         else if (is_state) blk: {
             const output = self.readHostU64(context + ppcContextGpr(5)) orelse {
@@ -16823,7 +17934,7 @@ pub const ElfState = struct {
         self.regs.rip = next_rip;
         self.windows_input_xam_shims +|= 1;
         if (shouldReportWindowsPointOccurrence(self.windows_input_xam_shims)) {
-            log.info("PE64 INPUT BRIDGE: export={s} xam_shims={d} user_index={d} result={d} connected={} focused={} packet={d} buttons=0x{x} virtual_keyboard_pad=true; mapping=WASD:left-stick arrows:dpad space:A C:B X:X Y:Y return:Start delete:Back", .{
+            log.info("PE64 INPUT BRIDGE: export={s} xam_shims={d} user_index={d} result={d} connected={} focused={} packet={d} buttons=0x{x} virtual_keyboard_pad=true user0_only=true; mapping=Space/Return:A Escape/C:B X:X Y:Y P:Start Backspace/Tab:Back arrows:dpad WASD:left-stick", .{
                 name,
                 self.windows_input_xam_shims,
                 user_index,
@@ -17407,7 +18518,7 @@ pub const ElfState = struct {
 
     pub fn reportWindowsInputBridge(self: *const ElfState) void {
         const installed = self.windows_input_hooks.read_controller_state != null;
-        log.info("PE64 INPUT BRIDGE: installed={} contract_version={d} polls={d} bridged={d} invalid_or_disconnected={d} xinput_successes={d} xam_shims={d} xam_refusals={d} last_packet={d} last_buttons=0x{x} last_focused={} key_events(down/up)={d}/{d} snapshots={d} nonzero_samples={d} focused_zero_samples={d} focus_gains={d} focus_losses={d} rejected_key_events={d} last_key_code={d} mapping=WASD:left-stick IJKL:right-stick arrows:dpad space:A C:B X:X Y:Y return:Start delete:Back Q:LB R:RB F:left-thumb V:right-thumb Z/LT E/RT escape:Guide; connected is a virtual keyboard pad and an unfocused window reports zero state; compare key transitions, focus, and nonzero samples to distinguish AppKit delivery from guest polling", .{
+        log.info("PE64 INPUT BRIDGE: installed={} contract_version={d} polls={d} bridged={d} invalid_or_disconnected={d} xinput_successes={d} xam_shims={d} xam_refusals={d} last_packet={d} last_buttons=0x{x} last_focused={} key_events(down/up)={d}/{d} snapshots={d} nonzero_samples={d} focused_zero_samples={d} focus_gains={d} focus_losses={d} rejected_key_events={d} last_key_code={d} mapping=Space/Return:A Escape/C:B X:X Y:Y P:Start Backspace/Tab:Back Home:Guide WASD:left-stick IJKL:right-stick arrows:dpad Q:LB R:RB Z:LT E:RT F:left-thumb V:right-thumb; connected is a virtual keyboard pad in slot 0 only and an unfocused window reports zero state; compare key transitions, focus, and nonzero samples to distinguish AppKit delivery from guest polling", .{
             installed,
             self.windows_input_contract_version,
             self.windows_input_polls,
@@ -18114,6 +19225,7 @@ pub const ElfState = struct {
             };
             self.windows_heap_allocation_count += 1;
             self.windows_heap_allocations_live += 1;
+            self.noteGuestHeapBytes(size, true);
         }
         self.heap_next = aligned + size;
         if (self.trace_allocations and !@import("builtin").is_test) {
@@ -18136,50 +19248,98 @@ pub const ElfState = struct {
         return aligned;
     }
 
-    fn growWindowsHeapFreeList(self: *ElfState) bool {
-        const old_capacity = self.windows_heap_free_indices.len;
-        const base_capacity = @max(old_capacity, @as(usize, 1));
-        const new_capacity = std.math.mul(usize, base_capacity, 2) catch {
-            self.windows_heap_free_list_growth_failures +|= 1;
-            return false;
-        };
-        var grown: []usize = undefined;
-        if (old_capacity == 0) {
-            grown = self.allocator.alloc(usize, new_capacity) catch {
-                self.windows_heap_free_list_growth_failures +|= 1;
-                return false;
-            };
-        } else {
-            grown = self.allocator.realloc(self.windows_heap_free_indices, new_capacity) catch {
-                self.windows_heap_free_list_growth_failures +|= 1;
-                if (self.windows_runtime_enabled and self.windows_heap_free_list_growth_failures == 1) {
-                    log.err("PE64 guest allocation free-list growth failed: capacity={d}; released blocks remain unavailable", .{old_capacity});
-                }
-                return false;
-            };
-        }
-        @memset(grown[old_capacity..], 0);
-        self.windows_heap_free_indices = grown;
-        if (self.windows_runtime_enabled) {
-            log.info("PE64 guest allocation free-list grew: capacity={d} free={d} live={d}", .{
-                new_capacity,
-                self.windows_heap_free_count,
-                self.windows_heap_allocations_live,
-            });
-        }
-        return true;
+    /// How much of the PE heap the guest is using and how it is being freed.
+    /// `double_frees` and `unknown_frees` are defects of the caller named on
+    /// their own lines; a nonzero count is where a use-after-free starts.
+    fn reportGuestHeapUse(self: *const ElfState) void {
+        if (!self.windows_runtime_enabled) return;
+        const base = self.image_high;
+        const used = self.heap_next -| base;
+        const limit = self.guest_heap_limit -| base;
+        log.info("PE64 GUEST HEAP: bytes(live/peak/cursor/limit)={d}/{d}/{d}/{d} quarantine(blocks/bytes)={d}/{d} binned={d} double_frees={d} unknown_frees={d}; freed blocks wait in quarantine before reuse, so a late read sees the old bytes and a second free is refused instead of releasing the next owner's block", .{
+            self.windows_heap_bytes_live,
+            self.windows_heap_bytes_peak,
+            used,
+            limit,
+            self.windows_heap_quarantine_len,
+            self.windows_heap_quarantine_bytes,
+            self.windows_heap_binned,
+            self.windows_heap_double_frees,
+            self.windows_heap_unknown_frees,
+        });
+        log.info("PE64 GUEST THREAD CONTRACTS: apcs(queued/delivered/woken/refused)={d}/{d}/{d}/{d} stack_overflows={d} stack_guard={d} max_stack={d}; an APC runs inside its thread's next alertable wait, and a worker stack has no-access pages beneath it so an overflow stops instead of writing the heap", .{
+            self.windows_apcs_queued,
+            self.windows_apcs_delivered,
+            self.windows_apc_wakes,
+            self.windows_apc_refusals,
+            self.windows_stack_overflows,
+            WINDOWS_GUEST_THREAD_STACK_GUARD,
+            WINDOWS_GUEST_THREAD_MAX_STACK_SIZE,
+        });
     }
 
+    fn noteGuestHeapBytes(self: *ElfState, length: u64, live: bool) void {
+        if (live) {
+            self.windows_heap_bytes_live +|= length;
+            self.windows_heap_bytes_peak = @max(self.windows_heap_bytes_peak, self.windows_heap_bytes_live);
+        } else {
+            self.windows_heap_bytes_live -|= length;
+        }
+    }
+
+    /// A released block enters quarantine; the oldest quarantined blocks
+    /// leave it for their size bin once either limit is passed.
     fn rememberGuestHeapFreeIndex(self: *ElfState, allocation_index: usize) void {
-        if (self.windows_heap_free_count == self.windows_heap_free_indices.len and
-            !self.growWindowsHeapFreeList())
-        {
+        const length = self.windows_heap_allocations[allocation_index].length;
+        if (self.windows_heap_quarantine_limit_blocks == 0) {
+            self.binGuestHeapBlock(allocation_index);
             return;
         }
-        if (self.windows_heap_free_count < self.windows_heap_free_indices.len) {
-            self.windows_heap_free_indices[self.windows_heap_free_count] = allocation_index;
-            self.windows_heap_free_count += 1;
+        if (self.windows_heap_quarantine.len == 0) {
+            self.windows_heap_quarantine = self.allocator.alloc(usize, self.windows_heap_quarantine_limit_blocks) catch {
+                self.windows_heap_free_list_growth_failures +|= 1;
+                self.binGuestHeapBlock(allocation_index);
+                return;
+            };
         }
+        while (self.windows_heap_quarantine_len != 0 and
+            (self.windows_heap_quarantine_len >= self.windows_heap_quarantine.len or
+            self.windows_heap_quarantine_bytes +| length > self.windows_heap_quarantine_limit_bytes))
+        {
+            self.releaseOldestGuestHeapQuarantine();
+        }
+        const tail = (self.windows_heap_quarantine_head + self.windows_heap_quarantine_len) % self.windows_heap_quarantine.len;
+        self.windows_heap_quarantine[tail] = allocation_index;
+        self.windows_heap_quarantine_len += 1;
+        self.windows_heap_quarantine_bytes +|= length;
+        self.windows_heap_free_count += 1;
+    }
+
+    fn releaseOldestGuestHeapQuarantine(self: *ElfState) void {
+        const index = self.windows_heap_quarantine[self.windows_heap_quarantine_head];
+        self.windows_heap_quarantine_head = (self.windows_heap_quarantine_head + 1) % self.windows_heap_quarantine.len;
+        self.windows_heap_quarantine_len -= 1;
+        self.windows_heap_free_count -|= 1;
+        if (index < self.windows_heap_allocation_count) {
+            self.windows_heap_quarantine_bytes -|= self.windows_heap_allocations[index].length;
+            if (!self.windows_heap_allocations[index].active) self.binGuestHeapBlock(index);
+        }
+    }
+
+    fn binGuestHeapBlock(self: *ElfState, allocation_index: usize) void {
+        const length = self.windows_heap_allocations[allocation_index].length;
+        if (length == 0) return;
+        const entry = self.windows_heap_bins.getOrPut(self.allocator, length) catch {
+            self.windows_heap_free_list_growth_failures +|= 1;
+            return;
+        };
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        entry.value_ptr.indices.append(self.allocator, allocation_index) catch {
+            self.windows_heap_free_list_growth_failures +|= 1;
+            return;
+        };
+        self.windows_heap_binned += 1;
+        self.windows_heap_free_count += 1;
     }
 
     /// Reuse a released block without changing the address-ordered
@@ -18188,39 +19348,80 @@ pub const ElfState = struct {
     /// would make the binary-search lifetime table ambiguous.  A reused block
     /// is cleared before it is published to the guest, matching fresh
     /// `guestAlloc` storage and preventing stale contents from crossing CRT
-    /// object lifetimes.
+    /// object lifetimes. The oldest block in the bin goes first, and only a
+    /// block that has served its quarantine is in a bin at all.
     fn reuseGuestHeapAllocation(self: *ElfState, size: u64, alignment: u64) ?u64 {
         const mask = alignment - 1;
-        var position = self.windows_heap_free_count;
-        while (position != 0) {
-            position -= 1;
-            const allocation_index = self.windows_heap_free_indices[position];
-            if (allocation_index >= self.windows_heap_allocation_count or
-                self.windows_heap_allocations[allocation_index].active or
-                self.windows_heap_allocations[allocation_index].length == 0)
-            {
-                const last_position = self.windows_heap_free_count - 1;
-                self.windows_heap_free_indices[position] = self.windows_heap_free_indices[last_position];
-                self.windows_heap_free_count = last_position;
+        const bin = self.windows_heap_bins.getPtr(size) orelse return null;
+        var scanned: usize = 0;
+        var position = bin.head;
+        while (position < bin.indices.items.len and scanned < WINDOWS_HEAP_BIN_SCAN) : (scanned += 1) {
+            const allocation_index = bin.indices.items[position];
+            const usable = allocation_index < self.windows_heap_allocation_count and
+                !self.windows_heap_allocations[allocation_index].active and
+                self.windows_heap_allocations[allocation_index].length == size;
+            if (!usable) {
+                // Stale: drop it from the front or swap it out of the middle.
+                self.takeGuestHeapBinEntry(bin, position);
                 continue;
             }
-
             const record = self.windows_heap_allocations[allocation_index];
-            if (record.length != size or (record.guest_base & mask) != 0) continue;
-            const off = self.addrToOffset(record.guest_base) orelse continue;
+            if ((record.guest_base & mask) != 0) {
+                position += 1;
+                continue;
+            }
+            const off = self.addrToOffset(record.guest_base) orelse {
+                self.takeGuestHeapBinEntry(bin, position);
+                continue;
+            };
             const size_usize: usize = @intCast(size);
-            if (off > self.mem.len or size_usize > self.mem.len - off) continue;
-
-            const last_position = self.windows_heap_free_count - 1;
-            self.windows_heap_free_indices[position] = self.windows_heap_free_indices[last_position];
-            self.windows_heap_free_count = last_position;
+            if (off > self.mem.len or size_usize > self.mem.len - off) {
+                self.takeGuestHeapBinEntry(bin, position);
+                continue;
+            }
+            self.takeGuestHeapBinEntry(bin, position);
             self.windows_heap_allocations[allocation_index].active = true;
             self.windows_heap_allocations_live += 1;
             self.windows_heap_reused_allocations +|= 1;
+            self.noteGuestHeapBytes(size, true);
             @memset(self.mem[off..][0..size_usize], 0);
             return record.guest_base;
         }
         return null;
+    }
+
+    fn takeGuestHeapBinEntry(self: *ElfState, bin: *WindowsHeapBin, position: usize) void {
+        if (position == bin.head) {
+            bin.head += 1;
+        } else {
+            bin.indices.items[position] = bin.indices.items[bin.head];
+            bin.head += 1;
+        }
+        self.windows_heap_binned -|= 1;
+        self.windows_heap_free_count -|= 1;
+        bin.compact();
+    }
+
+    fn noteGuestHeapFreeAnomaly(self: *ElfState, guest_base: u64, double_free: bool) void {
+        const count = if (double_free) &self.windows_heap_double_frees else &self.windows_heap_unknown_frees;
+        count.* +|= 1;
+        if (!self.windows_runtime_enabled or count.* > WINDOWS_HEAP_ANOMALY_LOG_LIMIT) return;
+        const caller = self.read64(self.regs.rsp);
+        var caller_name: [256]u8 = undefined;
+        const slot_plus_one: u8 = if (self.windows_active_guest_thread_slot) |slot| @intCast(@min(slot + 1, 255)) else 0;
+        log.warn("PE64 GUEST HEAP {s}: address=0x{x} occurrence={d} caller=0x{x} ({s}) thread={s} step={d}; {s}", .{
+            if (double_free) "DOUBLE FREE" else "UNKNOWN FREE",
+            guest_base,
+            count.*,
+            caller,
+            self.describeGuestAddressOrUnnamed(caller, &caller_name),
+            self.guestThreadLabel(slot_plus_one),
+            self.totalInterpretedSteps(),
+            if (double_free)
+                "the block was already free; the second free is refused, so it cannot release whatever the block holds next"
+            else
+                "no allocation starts at this address; the free is ignored",
+        });
     }
 
     /// Grow the address-ordered PE allocation-provenance table.
@@ -18276,10 +19477,17 @@ pub const ElfState = struct {
     /// retained so the free-list path can match the block safely.
     pub fn releaseGuestAllocation(self: *ElfState, guest_base: u64) bool {
         if (guest_base == 0) return true;
-        const index = self.findGuestHeapAllocation(guest_base) orelse return false;
-        if (!self.windows_heap_allocations[index].active) return false;
+        const index = self.findGuestHeapAllocation(guest_base) orelse {
+            self.noteGuestHeapFreeAnomaly(guest_base, false);
+            return false;
+        };
+        if (!self.windows_heap_allocations[index].active) {
+            self.noteGuestHeapFreeAnomaly(guest_base, true);
+            return false;
+        }
         self.windows_heap_allocations[index].active = false;
         if (self.windows_heap_allocations_live != 0) self.windows_heap_allocations_live -= 1;
+        self.noteGuestHeapBytes(self.windows_heap_allocations[index].length, false);
         self.rememberGuestHeapFreeIndex(index);
         return true;
     }
@@ -18585,7 +19793,9 @@ pub const ElfState = struct {
         const slot = self.windows_active_guest_thread_slot orelse return;
         if (!self.windows_guest_threads[slot].entered_xenia_title) return;
         const index = self.windows_code_cache_view orelse return;
-        const view = self.windows_memory_views[index];
+        // By reference: this runs once per translated block - eighteen
+        // billion times on 2026-09-20 - and the view is not a scalar.
+        const view = &self.windows_memory_views[index];
         if (address >= view.guest_base and address - view.guest_base < view.length) {
             self.windows_title_code_fetches +|= count;
         }
@@ -18903,6 +20113,7 @@ pub const ElfState = struct {
             bytes = generated.bytes;
             remaining = bytes.len;
             mapped_code = generated;
+            self.noteMappedCodeFetched(generated);
             self.windows_generated_code_fetches +|= 1;
             self.noteWindowsTitleCodeFetch(fetch_address);
             if (self.windows_runtime_enabled and self.windows_generated_code_fetches == 1) {
@@ -19178,7 +20389,28 @@ pub const ElfState = struct {
     const block_jit_layout = block_jit.Layout{
         .regs_offset = @offsetOf(ElfState, "regs"),
         .scratch_offset = @offsetOf(ElfState, "block_jit_scratch"),
+        .tlb_offset = @offsetOf(ElfState, "block_jit_tlb"),
+        .xmm_offset = @offsetOf(ElfState, "xmm"),
+        .ymm_hi_offset = @offsetOf(ElfState, "ymm_hi"),
+        .zmm_hi_offset = @offsetOf(ElfState, "zmm_hi"),
+        .trace_calls_offset = @offsetOf(ElfState, "trace_calls"),
+        .return_captures_offset = @offsetOf(ElfState, "guest_return_captures_armed"),
+        .trace_transfers_offset = @offsetOf(ElfState, "block_jit_transfer_traced"),
+        .image_low_offset = @offsetOf(ElfState, "image_low"),
+        .image_high_offset = @offsetOf(ElfState, "image_high"),
+        .iat_low_offset = @offsetOf(ElfState, "windows_iat_low"),
+        .iat_high_offset = @offsetOf(ElfState, "windows_iat_high"),
+        .hook_filter_offset = @offsetOf(ElfState, "block_jit_hook_filter"),
+        .image_targets_hooked_offset = @offsetOf(ElfState, "block_jit_image_targets_hooked"),
     };
+
+    /// Keep the translator's one-load view of the transfer traces in step
+    /// with the two fields it stands for. Called wherever either is set;
+    /// translated `call` sites read it on every execution, so a trace turned
+    /// on after a block was compiled still reaches the interpreter's arm.
+    fn refreshBlockJitTransferTraced(self: *ElfState) void {
+        self.block_jit_transfer_traced = self.trace_windows_messages or self.trace_windows_threads;
+    }
 
     /// Per-instruction tracing reads state the translator does not write
     /// between instructions; the translator stays off while any of it is on.
@@ -19205,7 +20437,36 @@ pub const ElfState = struct {
         };
         jit.hot_threshold = self.block_jit_hot_threshold;
         self.block_jit = jit;
+        self.rebuildBlockJitHookFilter();
         return jit;
+    }
+
+    /// Fill `block_jit_hook_filter` from every call-arm hook the image has,
+    /// and clear the master switch only when nothing hooks an image target
+    /// the filter cannot see.
+    pub fn rebuildBlockJitHookFilter(self: *ElfState) void {
+        @memset(&self.block_jit_hook_filter, 0);
+        for (self.guest_kernel_calls.slots) |slot| {
+            if (slot.address != 0) block_jit.hookFilterAdd(&self.block_jit_hook_filter, slot.address);
+        }
+        for (self.guest_milestone_addresses) |address| {
+            if (address != 0) block_jit.hookFilterAdd(&self.block_jit_hook_filter, address);
+        }
+        inline for (.{
+            "windows_pthread_cond_wait_entry",
+            "windows_pthread_cond_signal_entry",
+            "windows_pthread_cond_broadcast_entry",
+            "windows_pthread_cond_timedwait_entry",
+            "xenia_sha1_target",
+            "xenia_rijndael_target",
+            "xenia_tabulate_target",
+        }) |field| {
+            if (@field(self, field)) |address| block_jit.hookFilterAdd(&self.block_jit_hook_filter, address);
+        }
+        const unresolved_accelerator = (self.xenia_sha1_accelerator_enabled and !self.xenia_sha1_target_checked) or
+            (self.xenia_rijndael_accelerator_enabled and !self.xenia_rijndael_target_checked) or
+            (self.xenia_tabulate_accelerator_enabled and !self.xenia_tabulate_target_checked);
+        self.block_jit_image_targets_hooked = @intFromBool(self.local_symbols.len != 0 or unresolved_accelerator or self.trace_windows_threads);
     }
 
     fn blockJitRequestAbort(self: *ElfState) void {
@@ -19272,6 +20533,7 @@ pub const ElfState = struct {
             return .{ .bytes = self.mem[offset..][0..@min(remaining, PE_MAX_INSTRUCTION_LENGTH)], .mapped = null };
         }
         if (self.windowsMappedCodeMemoryConst(address, PE_MAX_INSTRUCTION_LENGTH)) |generated| {
+            self.noteMappedCodeFetched(generated);
             return .{ .bytes = generated.bytes, .mapped = generated };
         }
         return null;
@@ -19292,10 +20554,43 @@ pub const ElfState = struct {
     fn blockJitTargetHooked(self: *const ElfState, target: u64) bool {
         if (target >= SYNTHETIC_RIP_FLOOR) return true;
         if (self.windows_stub_box.contains(target) or self.windows_compat_hook_points.contains(target)) return true;
-        if (self.windows_pthread_cond_timedwait_entry) |entry| {
-            if (target == entry) return true;
+        // All four condition entries, not only the timed wait. libstdc++'s
+        // `condition_variable::wait` and `notify_one` are tail jumps into
+        // winpthreads, and the interpreter's jump arm is where the condition
+        // shim takes them. A translated jump went straight into the real
+        // winpthreads body instead, so one side of a condition ran in
+        // Rosette's model and the other in winpthreads' semaphores: on
+        // 2026-09-21 the Shader Storage Writer never saw
+        // `ShutdownShaderStorage`'s notify, the GPU thread's join on it
+        // never returned, and Halo 3 stopped swapping between the Bungie
+        // logo and the title screen.
+        inline for (.{
+            "windows_pthread_cond_wait_entry",
+            "windows_pthread_cond_signal_entry",
+            "windows_pthread_cond_broadcast_entry",
+            "windows_pthread_cond_timedwait_entry",
+        }) |field| {
+            if (@field(self, field)) |entry| {
+                if (target == entry) return true;
+            }
         }
         return false;
+    }
+
+    /// A stable pointer to the live generation word for a block's source.
+    ///
+    /// `windows_file_mappings` and `windows_virtual_allocations` are fixed
+    /// arrays inside the state, so a pointer into one stays valid for the
+    /// life of the run - which is what lets translated code check a
+    /// successor's generation with a load instead of a call back into here.
+    /// Null when the source has no generation word; such a block is never
+    /// chained into.
+    fn blockJitGenerationPointer(self: *ElfState, mapped: bool, kind: u8, index: usize) ?*const u64 {
+        if (!mapped) return &self.windows_image_code_generation;
+        return switch (@as(mapped_ranges.Kind, @enumFromInt(kind))) {
+            .memory_view => if (index < self.windows_file_mappings.len) &self.windows_file_mappings[index].code_generation else null,
+            .virtual_allocation => if (index < self.windows_virtual_allocations.len) &self.windows_virtual_allocations[index].code_generation else null,
+        };
     }
 
     /// The generation the block's source currently carries, or null when the
@@ -19350,32 +20645,273 @@ pub const ElfState = struct {
         }
     }
 
-    /// Drop every block; the code memory starts over.
+    /// The valid block compiled for `rip`, if one is in its set.
+    fn blockJitFind(self: *ElfState, rip: u64) ?*block_jit.Block {
+        const jit = self.block_jit orelse return null;
+        const base = blockJitIndex(rip);
+        for (jit.blocks[base .. base + BLOCK_JIT_WAYS]) |slot| {
+            if (slot) |block| if (block.start_rip == rip) return block;
+        }
+        return null;
+    }
+
+    /// The hotness entry for `rip`: its own when it has one, otherwise the
+    /// set's empty or coldest entry, reset to this address.
+    fn blockJitHotness(jit: *BlockJitState, rip: u64) *BlockHotness {
+        const base = blockJitIndex(rip);
+        var coldest = base;
+        for (base..base + BLOCK_JIT_WAYS) |slot| {
+            const entry = &jit.hotness[slot];
+            if (entry.rip == rip) return entry;
+            if (entry.rip == 0) {
+                coldest = slot;
+                break;
+            }
+            if (entry.count < jit.hotness[coldest].count) coldest = slot;
+        }
+        jit.hotness[coldest] = .{ .rip = rip, .count = 0 };
+        return &jit.hotness[coldest];
+    }
+
+    /// Never compile `rip` again.
+    fn blockJitRefuse(jit: *BlockJitState, rip: u64) void {
+        const hot = blockJitHotness(jit, rip);
+        hot.* = .{ .rip = rip, .count = 0, .refused = true };
+    }
+
+    /// Drop every block; the code memory starts over. The hotness table is
+    /// kept: every address that had a block is still hot, and recompiling
+    /// it at its next execution rather than after another sixteen
+    /// interpreted runs is what keeps a reset from being a second cold
+    /// start.
     fn resetBlockJit(self: *ElfState, jit: *BlockJitState) void {
         for (jit.blocks, 0..) |slot, index| {
-            if (slot != null) self.dropBlockJitSlot(jit, index);
+            if (slot != null) {
+                self.dropBlockJitSlot(jit, index);
+                jit.dropped_reset +|= 1;
+            }
         }
-        @memset(jit.hotness, .{});
         jit.memory.reset();
         jit.resets +|= 1;
     }
 
-    /// Mapped code was unmapped or replaced: its blocks must not outlive
-    /// the mapping, whatever their generation says (a recreated mapping can
-    /// reuse both slot and generation 1). Called beside the decode cache's
-    /// own mapped invalidation.
-    fn blockJitDropMapped(self: *ElfState) void {
+    /// One mapping was unmapped or released: the blocks compiled from it
+    /// must not outlive the backing, whatever their generation says (a
+    /// recreated mapping can reuse both slot and generation 1).
+    fn blockJitDropMappedSource(self: *ElfState, kind: mapped_ranges.Kind, source_index: usize) void {
         const jit = self.block_jit orelse return;
         for (jit.blocks, 0..) |slot, index| {
-            if (slot) |block| if (block.source_mapped) self.dropBlockJitSlot(jit, index);
+            if (slot) |block| {
+                if (block.source_mapped and block.source_kind == @intFromEnum(kind) and block.source_index == source_index) {
+                    self.dropBlockJitSlot(jit, index);
+                    jit.dropped_unmapped +|= 1;
+                }
+            }
+        }
+    }
+
+    /// Every mapped block, for the generation-saturation boundary.
+    fn blockJitDropAllMapped(self: *ElfState) void {
+        const jit = self.block_jit orelse return;
+        for (jit.blocks, 0..) |slot, index| {
+            if (slot) |block| if (block.source_mapped) {
+                self.dropBlockJitSlot(jit, index);
+                jit.dropped_unmapped +|= 1;
+            };
         }
     }
 
     fn blockJitDropAll(self: *ElfState) void {
         const jit = self.block_jit orelse return;
         for (jit.blocks, 0..) |slot, index| {
-            if (slot != null) self.dropBlockJitSlot(jit, index);
+            if (slot != null) {
+                self.dropBlockJitSlot(jit, index);
+                jit.dropped_reset +|= 1;
+            }
         }
+    }
+
+    // -- the software TLB -----------------------------------------------------
+
+    /// After a helper served a plain access, decide whether emitted code
+    /// may touch the page directly from now on. Admission requires: no
+    /// trace watch on stores; the access inside one page; the page backed
+    /// by the image, a native alias or an indexed mapping; not restricted
+    /// for that direction; and, for writes, neither executable image bytes
+    /// nor a mapping instructions were ever fetched from, because a store
+    /// into those must bump the decode generation. Everything refused here
+    /// keeps taking the helper, which is the interpreter's own path.
+    /// Whether a live store trace still needs to see every write, which the
+    /// write TLB would hide by letting translated code store directly.
+    fn traceWithholdsWriteTlb(self: *const ElfState) bool {
+        // A watched address has no budget: it must see stores all run long.
+        if (self.trace_write_address != null) return true;
+        return self.trace_windows_memory and
+            self.windows_memory_trace_events < windows_memory_trace_budget;
+    }
+
+    fn blockJitTlbConsider(self: *ElfState, address: u64, width: u8, is_write: bool) void {
+        self.block_jit_tlb_considers +|= 1;
+        const jit = self.block_jit orelse return;
+        if (!self.block_jit_tlb_enabled) return;
+        // Both store traces are *store* traces, so neither has any claim on
+        // the read TLB, and the mapped-write one spends a fixed budget in the
+        // first moments of a run and is inert for the rest of it. This guard
+        // used to refuse every page for either trace, for the whole run: the
+        // Xenia script exports ROSETTE_ELF_TRACE_WINDOWS_MEMORY=1 by default,
+        // so on 2026-09-19 all 35,716,669,305 admissions were refused here and
+        // every load and store inside translated code took the helper.
+        if (is_write and self.traceWithholdsWriteTlb()) {
+            self.block_jit_tlb_bail_traced +|= 1;
+            return;
+        }
+        const page_bytes = block_jit.Tlb.page_bytes;
+        const page = address & ~(page_bytes - 1);
+        if ((address & (page_bytes - 1)) + width > page_bytes) {
+            self.block_jit_tlb_bail_straddle +|= 1;
+            return;
+        }
+        if (self.windows_runtime_enabled and page < WINDOWS_NULL_PAGE_LIMIT) {
+            self.block_jit_tlb_bail_null_page +|= 1;
+            return;
+        }
+        if (self.guest_page_protection.active) {
+            const protection = self.guest_page_protection.get(page);
+            if (protection == .no_access or (is_write and protection != .accessible)) {
+                jit.tlb_fill_refusals +|= 1;
+                return;
+            }
+        }
+        const host: [*]u8 = blk: {
+            if (self.addrToOffset(page)) |off| {
+                const offset: usize = @intCast(off);
+                if (offset + page_bytes > self.mem.len) {
+                    jit.tlb_fill_refusals +|= 1;
+                    return;
+                }
+                if (is_write and self.windows_executable_box.overlaps(page, page_bytes)) {
+                    jit.tlb_fill_refusals +|= 1;
+                    return;
+                }
+                break :blk self.mem.ptr + offset;
+            }
+            if (self.nativeMemoryAlias(page, page_bytes)) |bytes| break :blk bytes.ptr;
+            if (self.windows_mapped_ranges.find(page, page_bytes)) |range| {
+                if (is_write and self.mappedRangeCodeFetched(range)) {
+                    jit.tlb_fill_refusals +|= 1;
+                    return;
+                }
+                const slice = self.windowsIndexedMemory(page, page_bytes) orelse {
+                    jit.tlb_fill_refusals +|= 1;
+                    return;
+                };
+                break :blk @constCast(slice.bytes.ptr);
+            }
+            jit.tlb_fill_refusals +|= 1;
+            return;
+        };
+        self.block_jit_tlb.fill(is_write, page, host);
+        jit.tlb_fills +|= 1;
+    }
+
+    fn blockJitTlbInvalidate(self: *ElfState, base: u64, length: u64) void {
+        self.block_jit_tlb.invalidateRange(base, length);
+        if (self.block_jit) |jit| jit.tlb_invalidations +|= 1;
+    }
+
+    fn blockJitTlbFlush(self: *ElfState, reads: bool, writes: bool) void {
+        self.block_jit_tlb.flush(reads, writes);
+        if (self.block_jit) |jit| jit.tlb_flushes +|= 1;
+    }
+
+    /// Remember that instructions were fetched from a mapping: from then on
+    /// its pages are never admitted to the write TLB, and any already
+    /// admitted are dropped.
+    fn noteMappedCodeFetched(self: *ElfState, slice: WindowsMappedCodeSlice) void {
+        const flag: *bool = switch (slice.kind) {
+            .memory_view => if (slice.source_index < self.windows_file_mappings.len) &self.windows_file_mappings[slice.source_index].code_fetched else return,
+            .virtual_allocation => if (slice.source_index < self.windows_virtual_allocations.len) &self.windows_virtual_allocations[slice.source_index].code_fetched else return,
+        };
+        if (flag.*) return;
+        flag.* = true;
+        self.blockJitTlbFlush(false, true);
+    }
+
+    fn mappedRangeCodeFetched(self: *const ElfState, range: mapped_ranges.Range) bool {
+        return switch (range.kind) {
+            .memory_view => blk: {
+                if (range.slot >= self.windows_memory_views.len) break :blk true;
+                const mapping_index = self.windows_memory_views[range.slot].mapping_index;
+                break :blk mapping_index >= self.windows_file_mappings.len or self.windows_file_mappings[mapping_index].code_fetched;
+            },
+            .virtual_allocation => range.slot >= self.windows_virtual_allocations.len or self.windows_virtual_allocations[range.slot].code_fetched,
+        };
+    }
+
+    /// Whether a `call` to `target` would fall all the way through the
+    /// interpreter's `.call_rel32` arm to its last two lines - push the
+    /// return address, set RIP - with every hook on the way declining.
+    ///
+    /// That arm is the one place Rosette dispatches the guest milestone
+    /// tracepoints, the kernel-call census, the SHA-1/Rijndael/tabulate
+    /// accelerators, the pthread condition shim, the keyboard shim and the
+    /// local-function shims. A native template that skipped any of them
+    /// would not be a translation - it would silently disarm the
+    /// instruments this project diagnoses with, and an accelerator that
+    /// stops firing is a boot that stops finishing.
+    ///
+    /// So the predicate is deliberately conservative rather than exhaustive:
+    /// **a target inside the guest image is always refused.** Every hook
+    /// above is an address in Xenia's own code - resolved from one of its
+    /// symbols, or armed as one of its kernel exports - so a target outside
+    /// the image cannot be one, whatever hooks exist now or later. That
+    /// admits exactly the hot case, Xenia's generated PowerPC code, which
+    /// lives outside the image and carries no symbols, and leaves every call
+    /// into the image on the interpreter where the hooks are.
+    ///
+    /// The range test also has to be the one that carries this, because it
+    /// is O(1). An earlier version asked `localSymbolNameAt`, which is a
+    /// linear scan of the roughly ninety-six thousand symbols Xenia's MinGW
+    /// binary keeps: once per call site across 6.96 million block compiles,
+    /// that alone would have cost more than the fallbacks it removes. Every
+    /// remaining check below is a range test, an array index or a hash
+    /// probe; none of them may become a scan.
+    fn blockJitCallTargetPlain(self: *ElfState, target: u64) bool {
+        if (self.blockJitTargetHooked(target)) return false;
+        if (self.image_high == 0) return false;
+        // Inside the image, the one hook not keyed on an exact address
+        // below is the local-function shim, which names its target through
+        // `localSymbolNameAt` - and that table is the ELF loader's, empty on
+        // the PE route. The call traces are the other thing the arm does.
+        // 2026-09-21: refusing the whole image left 397 million `call_rel32`
+        // fallbacks, half of all of them, on Xenia calling its own code.
+        if (target >= self.image_low and target < self.image_high) {
+            if (self.local_symbols.len != 0 or self.trace_calls or self.block_jit_transfer_traced) return false;
+        }
+        if (self.guest_kernel_calls.exportAt(target) != null) return false;
+        if (self.isGuestMilestoneAddress(target)) return false;
+        // The accelerators resolve their target on the first call that
+        // reaches the arm. One that has not resolved yet cannot be compared
+        // against, so nothing is admitted until it has.
+        if (self.xenia_sha1_accelerator_enabled and !self.xenia_sha1_target_checked) return false;
+        if (self.xenia_rijndael_accelerator_enabled and !self.xenia_rijndael_target_checked) return false;
+        if (self.xenia_tabulate_accelerator_enabled and !self.xenia_tabulate_target_checked) return false;
+        inline for (.{ "xenia_sha1_target", "xenia_rijndael_target", "xenia_tabulate_target" }) |field| {
+            if (@field(self, field)) |resolved| {
+                if (resolved == target) return false;
+            }
+        }
+        inline for (.{
+            "windows_pthread_cond_wait_entry",
+            "windows_pthread_cond_signal_entry",
+            "windows_pthread_cond_broadcast_entry",
+            "windows_pthread_cond_timedwait_entry",
+        }) |field| {
+            if (@field(self, field)) |entry| {
+                if (entry == target) return false;
+            }
+        }
+        return true;
     }
 
     /// Decode the straight-line run at `rip` and compile it. Null when there
@@ -19387,6 +20923,7 @@ pub const ElfState = struct {
         defer bytes.deinit(self.allocator);
 
         var address = rip;
+        var conditionals_followed: u32 = 0;
         var source_mapped = false;
         var source_kind: u8 = 0;
         var source_index: usize = 0;
@@ -19420,10 +20957,31 @@ pub const ElfState = struct {
                 const target = address +% d.len +% d.imm;
                 if (self.blockJitTargetHooked(target)) insn.force_fallback = true;
             }
+            if (d.op == .call_rel32) {
+                const target = address +% d.len +% @as(u64, @bitCast(d.imm));
+                if (self.blockJitCallTargetPlain(target)) {
+                    jit.call_targets_plain +|= 1;
+                } else {
+                    insn.force_fallback = true;
+                    jit.call_targets_hooked +|= 1;
+                }
+            }
+            if (!self.block_jit_vectors_enabled and block_jit.isVectorNative(d)) insn.force_fallback = true;
             insns.append(self.allocator, insn) catch return null;
             bytes.appendSlice(self.allocator, fetch.bytes[0..decoded_len]) catch return null;
             address +%= d.len;
-            if (block_jit.isTerminator(d.op)) break;
+            // A control transfer ends the block, with one exception: a
+            // conditional branch the translator compiles itself. Its
+            // not-taken edge is the next byte, so the trace can continue
+            // across it and still be one contiguous range. That is what
+            // raises `mean_block_len` past the length of a basic block, and
+            // every per-block cost is paid per block, not per basic block.
+            if (block_jit.isTerminator(d.op) or block_jit.isFallbackTerminator(d.op)) {
+                if (!block_jit.isConditionalBranch(d.op) or insn.force_fallback or
+                    conditionals_followed >= BLOCK_JIT_MAX_CONDITIONALS) break;
+                conditionals_followed += 1;
+                jit.conditionals_followed +|= 1;
+            }
         }
         if (insns.items.len == 0) return null;
         // The image generation covers the whole block only if every byte of
@@ -19455,7 +21013,7 @@ pub const ElfState = struct {
             return null;
         };
         block.* = .{
-            .helpers = .{ .read = blockJitRead, .write = blockJitWrite, .interpret = blockJitInterpret, .block = block },
+            .helpers = .{ .read = blockJitRead, .write = blockJitWrite, .read128 = blockJitRead128, .write128 = blockJitWrite128, .interpret = blockJitInterpret, .block = block, .flags = blockJitFlags },
             .start_rip = rip,
             .end_rip = address,
             .insns = owned_insns,
@@ -19468,48 +21026,215 @@ pub const ElfState = struct {
             .source_kind = source_kind,
             .source_index = source_index,
             .source_generation = source_generation,
+            .chain_entry = compiled.chain_entry,
+            .generation_ptr = self.blockJitGenerationPointer(source_mapped, source_kind, source_index),
         };
         compiled.code = &.{};
         jit.compiled +|= 1;
         jit.native_instructions_compiled +|= block.native_count;
         jit.fallback_instructions_compiled +|= block.fallback_count;
+        jit.flags_elided +|= compiled.flags_elided;
+        jit.flags_narrowed +|= compiled.flags_narrowed;
+        jit.cached_registers +|= compiled.cached_registers;
+        jit.hoisted_accesses +|= compiled.hoisted_accesses;
         return block;
     }
 
-    /// Account a block's execution the way `step` and its loops account an
-    /// interpreted instruction, then raise any fault left pending.
-    fn accountBlockJit(self: *ElfState, jit: *BlockJitState, block: *block_jit.Block, completed: u32) void {
+    /// Account one block's execution the way `step` and its loops account
+    /// an interpreted instruction, and return how many instructions it
+    /// retired. The caller owns `step_retired` and the clock, because one
+    /// step may run a chain of blocks.
+    fn accountBlockJit(self: *ElfState, jit: *BlockJitState, block: *block_jit.Block, completed: u32) u32 {
         const retired: u32 = @max(completed, 1);
-        self.step_retired = retired;
         jit.executions +|= 1;
         jit.instructions_retired +|= retired;
         block.executions +|= 1;
         block.instructions_retired +|= retired;
-        const last = block.insns[@min(retired, @as(u32, @intCast(block.insns.len))) - 1];
+        // By reference. `Insn` carries a whole `DecodedInsn`, so taking it by
+        // value copies about eighty bytes to read three scalars - forty-one
+        // billion times on 2026-09-20. This is the same shape as the view
+        // copy in `noteWindowsTitleCodeFetches` directly below.
+        const last = &block.insns[@min(retired, @as(u32, @intCast(block.insns.len))) - 1];
         self.last_instruction_rip = last.rip;
         self.last_decoded_op = last.decoded.op;
         self.last_decoded_len = last.len;
-        // `step` advanced the clock once for this call; the block retired
-        // the rest.
-        self.advanceWindowsGuestClockBy(retired - 1);
         if (block.source_mapped) {
             self.windows_generated_code_fetches +|= retired;
             self.noteWindowsTitleCodeFetches(block.start_rip, retired);
         }
+        return retired;
     }
 
-    /// Execute a valid block from the current RIP. Returns `step`'s result.
-    fn executeBlockJit(self: *ElfState, jit: *BlockJitState, block: *block_jit.Block, slot_index: usize) bool {
-        if (block.register_only and !block.verified) {
+    const FoundBlock = struct { block: *block_jit.Block, slot: usize };
+
+    /// `blockJitFindValid`, also saying which slot it came from, because a
+    /// native chain link has to name the slot it expects its successor to
+    /// still occupy.
+    fn blockJitFindValidSlot(self: *ElfState, jit: *BlockJitState, rip: u64) ?FoundBlock {
+        const base = blockJitIndex(rip);
+        for (base..base + BLOCK_JIT_WAYS) |slot_index| {
+            const block = jit.blocks[slot_index] orelse continue;
+            if (block.start_rip != rip) continue;
+            if (self.blockJitValidate(jit, block)) return .{ .block = block, .slot = slot_index };
+            self.dropBlockJitSlot(jit, slot_index);
+            jit.dropped_stale +|= 1;
+            return null;
+        }
+        return null;
+    }
+
+    /// Record the hop `from` just took so translated code can take it again
+    /// without returning here.
+    ///
+    /// Everything the emitted check will compare is captured now: the guest
+    /// address, the successor's entry past its prologue, its helper table,
+    /// the table slot with the pointer that slot must still hold, and its
+    /// source generation. A block that is evicted leaves a different pointer
+    /// in its slot, and a source that is rewritten moves its generation, so
+    /// either makes the link fail its check and fall back here - no list of
+    /// back-pointers to unlink, and nothing to get wrong at eviction time.
+    fn blockJitLink(self: *ElfState, jit: *BlockJitState, from: *block_jit.Block, rip: u64, to: *block_jit.Block, slot: usize) void {
+        if (!self.block_jit_chain_enabled) return;
+        const generation = to.generation_ptr orelse return;
+        // Re-arm the way that already names this address; otherwise take
+        // the round-robin victim.
+        var way: usize = from.link_victim;
+        for (from.links, 0..) |link, index| {
+            if (link.rip == rip) {
+                way = index;
+                break;
+            }
+        } else from.link_victim = @intCast((way + 1) % block_jit.link_ways);
+        from.links[way] = .{
+            .rip = rip,
+            .entry = @intFromPtr(to.code.ptr) + to.chain_entry,
+            .helpers = @intFromPtr(&to.helpers),
+            .slot = @intFromPtr(&jit.blocks[slot]),
+            .block = @intFromPtr(to),
+            .gen_ptr = @intFromPtr(generation),
+            .generation = generation.*,
+        };
+        jit.links_armed +|= 1;
+    }
+
+    /// The bytes of a thread's hottest region, so it can be disassembled and
+    /// called work or a wait.
+    ///
+    /// The region's name alone cannot say. On 2026-09-20 the GPU thread's
+    /// hotspot was named `Queue::Acquisition`, a lock, because that symbol
+    /// starts the region - and the bytes, disassembled from the image, run
+    /// on through a `deque::emplace_back` into
+    /// `VulkanCommandProcessor::WriteRegister`, which is the command stream
+    /// doing real work. Code in Xenia's JIT cache has no bytes on disk to
+    /// check that way, and it is where the title's own hottest region is,
+    /// so it is logged here while it still exists.
+    fn logHotspotBytes(self: *const ElfState, handle: u64, address: u64) void {
+        // One region and the one after it: a loop that starts near the end
+        // of its 256-byte region closes in the next.
+        const bytes = self.guestMemoryConst(address, 512) orelse self.guestMemoryConst(address, 256) orelse return;
+        // `@min` against a comptime bound narrows to the smallest integer
+        // that holds it, and `count * 2` then wrapped to zero in ReleaseFast:
+        // every dump printed `bytes=`.
+        const count: usize = @min(bytes.len, 512);
+        var hex: [1024]u8 = undefined;
+        const digits = "0123456789abcdef";
+        for (bytes[0..count], 0..) |byte, i| {
+            hex[i * 2] = digits[byte >> 4];
+            hex[i * 2 + 1] = digits[byte & 0xF];
+        }
+        log.info("PE64 CPU HOTSPOT BYTES: thread=0x{x} region=0x{x} count={d} bytes={s}; x86-64, load at the region address to disassemble", .{ handle, address, count, hex[0 .. count * 2] });
+    }
+
+    /// The valid block for `rip` in its set, dropping a stale one.
+    fn blockJitFindValid(self: *ElfState, jit: *BlockJitState, rip: u64) ?*block_jit.Block {
+        const base = blockJitIndex(rip);
+        for (base..base + BLOCK_JIT_WAYS) |slot_index| {
+            const block = jit.blocks[slot_index] orelse continue;
+            if (block.start_rip != rip) continue;
+            if (self.blockJitValidate(jit, block)) return block;
+            self.dropBlockJitSlot(jit, slot_index);
+            jit.dropped_stale +|= 1;
+            return null;
+        }
+        return null;
+    }
+
+    /// Execute a valid block from the current RIP, then keep going: while
+    /// the RIP a block leaves has a valid, verified block of its own that no
+    /// hook owns, and nothing asked the step to end (a pending fault, the
+    /// run ending, a thread switch or a slice yield from an interpreted
+    /// instruction), that block runs too. One `step` thus retires a chain of
+    /// blocks; the chain is bounded so the loops' per-step services keep
+    /// their cadence. Returns `step`'s result.
+    fn executeBlockJit(self: *ElfState, jit: *BlockJitState, first: *block_jit.Block, first_slot: usize) bool {
+        if (first.register_only and !first.verified) {
             // The cross-check runs the block itself (once) and accounts it;
             // whichever way it went, this step is done.
-            _ = self.verifyBlockJit(jit, block, slot_index);
+            _ = self.verifyBlockJit(jit, first, first_slot);
             return !self.terminated;
         }
-        self.block_jit_scratch = .{ .block = block };
-        const completed = block.entry()(self, &block.helpers);
-        self.block_jit_scratch.block = null;
-        self.accountBlockJit(jit, block, completed);
+        var block = first;
+        var total_retired: u32 = 0;
+        var chained: u32 = 0;
+        while (true) {
+            const slot_before = self.windows_active_guest_thread_slot;
+            // Only the fields a block can observe before writing them.
+            // Assigning the whole record also zeroed `index` and the
+            // sixteen-byte vector slot, and the state escapes into the
+            // helpers, so those stores could not be optimised away. Emitted
+            // code writes `index` before every helper call that reads it and
+            // fills the vector slot before every helper that reads that, so
+            // neither is ever read stale.
+            self.block_jit_scratch.abort = 0;
+            self.block_jit_scratch.chain_break = 0;
+            self.block_jit_scratch.chain_depth = 0;
+            self.block_jit_scratch.block = block;
+            const rsp_in = self.regs.rsp;
+            const rip_in = self.regs.rip;
+            const completed = block.entry()(self, &block.helpers);
+            self.block_jit_scratch.block = null;
+            if (self.regs.rsp < STACK_COLLAPSE_FLOOR and rsp_in >= STACK_COLLAPSE_FLOOR) {
+                self.noteStackPointerCollapseInBlocks(rsp_in, rip_in, block, completed);
+            }
+            // The call may have run a whole chain of blocks without coming
+            // back here once. Account every one of them exactly as if it
+            // had: the per-block counters, `last_instruction_rip` and the
+            // title's code-fetch ledger all read the same afterwards.
+            const depth = @min(self.block_jit_scratch.chain_depth, block_jit.chain_log_capacity);
+            if (depth == 0) {
+                total_retired +|= self.accountBlockJit(jit, block, completed);
+            } else {
+                for (self.block_jit_scratch.chain_log[0..depth]) |entry| {
+                    const ran: *block_jit.Block = @ptrFromInt(@as(usize, @intCast(entry.block)));
+                    total_retired +|= self.accountBlockJit(jit, ran, entry.retired);
+                    block = ran;
+                }
+                const hops: u64 = depth - 1;
+                jit.chained +|= hops;
+                jit.native_chain_hops +|= hops;
+            }
+            if (self.guest_access_violation_pending or self.terminated) break;
+            if (self.windows_guest_slice_yield_requested or self.windows_guest_handoff_requested or self.windows_active_guest_thread_slot != slot_before) break;
+            if (slot_before) |slot| {
+                if (self.windows_guest_threads[slot].status != .running) break;
+            }
+            if (!self.block_jit_chain_enabled) break;
+            if (chained >= BLOCK_JIT_CHAIN_BLOCKS or total_retired >= BLOCK_JIT_CHAIN_INSTRUCTIONS) break;
+            const next_rip = self.regs.rip;
+            if (self.blockJitTargetHooked(next_rip)) break;
+            const found = self.blockJitFindValidSlot(jit, next_rip) orelse break;
+            if (found.block.register_only and !found.block.verified) break;
+            // Remember the hop so the next execution of this block takes it
+            // in translated code instead of coming back here for it.
+            self.blockJitLink(jit, block, next_rip, found.block, found.slot);
+            block = found.block;
+            chained += 1;
+            jit.chained +|= 1;
+        }
+        // `step` advanced the clock once for this call; the chain retired
+        // the rest.
+        self.step_retired = @max(total_retired, 1);
+        self.advanceWindowsGuestClockBy(self.step_retired - 1);
         if (self.guest_access_violation_pending) self.raiseGuestAccessViolation();
         return !self.terminated;
     }
@@ -19538,6 +21263,11 @@ pub const ElfState = struct {
         }
         self.regs = before;
         self.block_jit_scratch = .{ .block = block };
+        // The cross-check runs exactly this block against exactly this
+        // block's instructions. Letting it chain would run its successor
+        // too and report a mismatch against work the interpreter side never
+        // did, dropping a block that was in fact correct.
+        self.block_jit_scratch.chain_break = 1;
         const completed = block.entry()(self, &block.helpers);
         self.block_jit_scratch.block = null;
         const translated = self.regs;
@@ -19573,14 +21303,17 @@ pub const ElfState = struct {
             self.regs = reference;
             self.step_retired = @max(interpreted, 1);
             self.advanceWindowsGuestClockBy(self.step_retired - 1);
-            jit.hotness[blockJitIndex(block.start_rip)] = .{ .rip = block.start_rip, .count = 0, .refused = true };
+            blockJitRefuse(jit, block.start_rip);
             self.dropBlockJitSlot(jit, slot_index);
+            jit.dropped_mismatch +|= 1;
             return false;
         }
         jit.verified +|= 1;
         // The translation's result is the one that stands (it is identical);
         // account it as a normal execution.
-        self.accountBlockJit(jit, block, completed);
+        const retired = self.accountBlockJit(jit, block, completed);
+        self.step_retired = retired;
+        self.advanceWindowsGuestClockBy(retired - 1);
         return true;
     }
 
@@ -19590,18 +21323,16 @@ pub const ElfState = struct {
     fn runBlockJit(self: *ElfState) ?bool {
         const jit = self.blockJitActive() orelse return null;
         const rip = self.regs.rip;
-        const index = blockJitIndex(rip);
-        if (jit.blocks[index]) |block| {
-            if (block.start_rip == rip) {
-                if (self.blockJitValidate(jit, block)) return self.executeBlockJit(jit, block, index);
-                self.dropBlockJitSlot(jit, index);
-            }
+        const base = blockJitIndex(rip);
+        for (base..base + BLOCK_JIT_WAYS) |slot_index| {
+            const block = jit.blocks[slot_index] orelse continue;
+            if (block.start_rip != rip) continue;
+            if (self.blockJitValidate(jit, block)) return self.executeBlockJit(jit, block, slot_index);
+            self.dropBlockJitSlot(jit, slot_index);
+            jit.dropped_stale +|= 1;
+            break;
         }
-        const hot = &jit.hotness[index];
-        if (hot.rip != rip) {
-            hot.* = .{ .rip = rip, .count = 1 };
-            return null;
-        }
+        const hot = blockJitHotness(jit, rip);
         if (hot.refused) return null;
         hot.count +|= 1;
         if (hot.count < jit.hot_threshold) return null;
@@ -19610,12 +21341,27 @@ pub const ElfState = struct {
             jit.compile_refusals +|= 1;
             return null;
         };
-        if (jit.blocks[index] != null) {
-            jit.slot_evictions +|= 1;
-            self.dropBlockJitSlot(jit, index);
+        // An empty way, else the way that has run least.
+        var chosen: usize = base;
+        var chosen_executions: u64 = std.math.maxInt(u64);
+        for (base..base + BLOCK_JIT_WAYS) |slot_index| {
+            if (jit.blocks[slot_index]) |resident| {
+                if (resident.executions < chosen_executions) {
+                    chosen = slot_index;
+                    chosen_executions = resident.executions;
+                }
+            } else {
+                chosen = slot_index;
+                chosen_executions = 0;
+                break;
+            }
         }
-        jit.blocks[index] = block;
-        return self.executeBlockJit(jit, block, index);
+        if (jit.blocks[chosen] != null) {
+            jit.slot_evictions +|= 1;
+            self.dropBlockJitSlot(jit, chosen);
+        }
+        jit.blocks[chosen] = block;
+        return self.executeBlockJit(jit, block, chosen);
     }
 
     fn reportBlockJit(self: *ElfState) void {
@@ -19632,8 +21378,9 @@ pub const ElfState = struct {
         const table_load_percent = @divTrunc(jit.liveBlocks() *| 100, BLOCK_JIT_TABLE_ENTRIES);
         const eviction_per_compile = if (jit.compiled == 0) 0 else @divTrunc(jit.slot_evictions *| 100, jit.compiled);
         const reset_per_compile = if (jit.compiled == 0) 0 else @divTrunc(jit.resets *| 100, jit.compiled);
-        log.info("PE64 BLOCK JIT: active=true table(entries/live/load_percent)={d}/{d}/{d} hot_threshold={d} churn(evictions/compiles_percent/resets/compiles_percent)={d}/{d}/{d}/{d} blocks(live/compiled/refused/failed/dropped/evicted/resets)={d}/{d}/{d}/{d}/{d}/{d}/{d} compiled_instructions(native/fallback)={d}/{d} executions={d} retired={d} ({d}% of the run) mean_block_len={d} fallback_calls={d} aborts={d} continuation_write_aborts={d} revalidations={d} verified={d} mismatches={d} code_bytes(used/capacity)={d}/{d}; high eviction or reset ratios indicate translation-cache churn, while high fallback_calls indicate blocks are not buying native work; retired counts the block-JIT lane including interpreter fallback helpers, not exclusively native instructions; integer/register verification does not cover all vector or memory effects; mismatches must read zero", .{
+        log.info("PE64 BLOCK JIT: active=true table(entries/ways/live/load_percent)={d}/{d}/{d}/{d} hot_threshold={d} churn(evictions/compiles_percent/resets/compiles_percent)={d}/{d}/{d}/{d} blocks(live/compiled/refused/failed/dropped/evicted/resets)={d}/{d}/{d}/{d}/{d}/{d}/{d} dropped(stale/unmapped/reset/mismatch)={d}/{d}/{d}/{d} compiled_instructions(native/fallback/flags_elided/flags_narrowed)={d}/{d}/{d}/{d} executions={d} retired={d} ({d}% of the run) mean_block_len={d} conditionals_followed={d} flag_completions={d} native_chain(hops/links)={d}/{d}; high eviction or reset ratios indicate translation-cache churn; retired counts the block-JIT lane including interpreter fallback helpers, not exclusively native instructions", .{
             BLOCK_JIT_TABLE_ENTRIES,
+            BLOCK_JIT_WAYS,
             jit.liveBlocks(),
             table_load_percent,
             jit.hot_threshold,
@@ -19648,21 +21395,137 @@ pub const ElfState = struct {
             jit.invalidations,
             jit.slot_evictions,
             jit.resets,
+            jit.dropped_stale,
+            jit.dropped_unmapped,
+            jit.dropped_reset,
+            jit.dropped_mismatch,
             jit.native_instructions_compiled,
             jit.fallback_instructions_compiled,
+            jit.flags_elided,
+            jit.flags_narrowed,
             jit.executions,
             jit.instructions_retired,
             translated_percent,
             mean_block,
+            jit.conditionals_followed,
+            jit.flag_completions,
+            jit.native_chain_hops,
+            jit.links_armed,
+        });
+        const fallback_percent = if (jit.instructions_retired == 0) 0 else @divTrunc(jit.fallback_calls *| 100, jit.instructions_retired);
+        log.info("PE64 BLOCK JIT LANE: chained={d} ({d}% of executions entered from the previous block) fallback_calls={d} ({d}% of retired) aborts={d} continuation_write_aborts={d} revalidations={d} verified={d} mismatches={d} tlb(considers/fills/refused/invalidations/flushes)={d}/{d}/{d}/{d}/{d} tlb_bail(traced/straddle/null_page)={d}/{d}/{d} direct_calls(native/hooked)={d}/{d} code_bytes(used/capacity)={d}/{d}; high fallback_calls indicate blocks are not buying native work (see FALLBACK OPS); direct_calls counts call sites, not executions, and a hooked one keeps the interpreter's arm because its target carries a milestone, a kernel export, an accelerator or a symbol a shim may claim; integer/register verification does not cover all vector or memory effects; mismatches must read zero", .{
+            jit.chained,
+            if (jit.executions == 0) 0 else @divTrunc(jit.chained *| 100, jit.executions),
             jit.fallback_calls,
+            fallback_percent,
             jit.aborts,
             jit.continuation_write_aborts,
             jit.revalidations,
             jit.verified,
             jit.mismatches,
+            self.block_jit_tlb_considers,
+            jit.tlb_fills,
+            jit.tlb_fill_refusals,
+            jit.tlb_invalidations,
+            jit.tlb_flushes,
+            self.block_jit_tlb_bail_traced,
+            self.block_jit_tlb_bail_straddle,
+            self.block_jit_tlb_bail_null_page,
+            jit.call_targets_plain,
+            jit.call_targets_hooked,
             jit.memory.used,
             jit.memory.capacity(),
         });
+        // How much of the guest register file the translated code kept in
+        // host registers. Per block it is at most four; a mean near zero
+        // means blocks are too short, or too spread across registers, for
+        // the cache to find anything worth holding.
+        log.info("PE64 BLOCK JIT REGISTERS: cached={d} across {d} compiled blocks (mean {d}.{d:0>2} per block, at most 4); a cached guest register lives in x25-x28 for its block and meets the register file only at an exit and around an interpreted instruction", .{
+            jit.cached_registers,
+            jit.compiled,
+            if (jit.compiled == 0) 0 else jit.cached_registers / jit.compiled,
+            if (jit.compiled == 0) 0 else ((jit.cached_registers *| 100) / jit.compiled) % 100,
+        });
+        log.info("PE64 BLOCK JIT HOISTING: accesses={d} across {d} compiled blocks; each is a [base+disp] access that reaches memory through one per-block page translation held in x29 instead of its own TLB probe", .{
+            jit.hoisted_accesses,
+            jit.compiled,
+        });
+        self.reportBlockJitFallbackOps(jit);
+    }
+
+    /// The interpreter's share of the translated lane, by instruction: the
+    /// twelve most frequent fallbacks and their share of all fallback
+    /// calls. This is the list of templates the next version should add.
+    fn reportBlockJitFallbackOps(self: *ElfState, jit: *const BlockJitState) void {
+        if (jit.fallback_calls == 0) return;
+        var ranked: [12]usize = undefined;
+        var ranked_count: usize = 0;
+        for (jit.fallback_ops, 0..) |count, op_index| {
+            if (count == 0) continue;
+            var position = ranked_count;
+            while (position > 0 and jit.fallback_ops[ranked[position - 1]] < count) : (position -= 1) {}
+            if (position >= ranked.len) continue;
+            var cursor = @min(ranked_count, ranked.len - 1);
+            while (cursor > position) : (cursor -= 1) ranked[cursor] = ranked[cursor - 1];
+            ranked[position] = op_index;
+            if (ranked_count < ranked.len) ranked_count += 1;
+        }
+        var buffer: [1024]u8 = undefined;
+        var written: usize = 0;
+        for (ranked[0..ranked_count]) |op_index| {
+            const name = op_names[op_index] orelse continue;
+            const count = jit.fallback_ops[op_index];
+            const percent = @divTrunc(count *| 100, jit.fallback_calls);
+            const piece = std.fmt.bufPrint(buffer[written..], " {s}={d}({d}%)", .{ name, count, percent }) catch break;
+            written += piece.len;
+        }
+        log.info("PE64 BLOCK JIT FALLBACK OPS:{s}; each is an instruction the translator hands to the interpreter one at a time, ranked by calls, with its share of all fallback calls; the first entries are the templates worth writing next", .{buffer[0..written]});
+        self.reportBlockJitTransferFallbacks(jit);
+    }
+
+    /// Where the interpreted transfers went. An import has to be
+    /// interpreted; a hooked target is interpreted by design; a plain one is
+    /// a template that declined for a reason its site did not need.
+    fn reportBlockJitTransferFallbacks(self: *ElfState, jit: *const BlockJitState) void {
+        const total = jit.transfer_fallback_imports +| jit.transfer_fallback_hooked +| jit.transfer_fallback_plain;
+        if (total == 0) return;
+        log.info("PE64 BLOCK JIT TRANSFER FALLBACKS: imports={d} hooked={d} plain={d} target_overflow={d}; hooked is a target a shim, milestone, census entry or hook-filter collision claims, plain is one no hook claims", .{
+            jit.transfer_fallback_imports,
+            jit.transfer_fallback_hooked,
+            jit.transfer_fallback_plain,
+            jit.transfer_target_overflow,
+        });
+        var ranked: [10]usize = undefined;
+        var ranked_count: usize = 0;
+        for (jit.transfer_targets, 0..) |entry, entry_index| {
+            if (entry.count == 0) continue;
+            var position = ranked_count;
+            while (position > 0 and jit.transfer_targets[ranked[position - 1]].count < entry.count) : (position -= 1) {}
+            if (position >= ranked.len) continue;
+            var cursor = @min(ranked_count, ranked.len - 1);
+            while (cursor > position) : (cursor -= 1) ranked[cursor] = ranked[cursor - 1];
+            ranked[position] = entry_index;
+            if (ranked_count < ranked.len) ranked_count += 1;
+        }
+        for (ranked[0..ranked_count], 1..) |entry_index, rank| {
+            const entry = jit.transfer_targets[entry_index];
+            var name_buffer: [256]u8 = undefined;
+            const name = self.describeGuestAddressOrUnnamed(entry.target, &name_buffer);
+            const milestone = self.isGuestMilestoneAddress(entry.target);
+            const census = self.guest_kernel_calls.exportAt(entry.target) != null;
+            const filter_hit = block_jit.hookFilterHas(&self.block_jit_hook_filter, entry.target);
+            log.info("PE64 BLOCK JIT TRANSFER FALLBACKS:   rank={d} op={s} target=0x{x} ({s}) calls={d} hooked={} milestone={} census={} filter_bit={}", .{
+                rank,
+                op_names[entry.op] orelse "?",
+                entry.target,
+                name,
+                entry.count,
+                entry.hooked,
+                milestone,
+                census,
+                filter_hit,
+            });
+        }
     }
 
     fn step(self: *ElfState) bool {
@@ -19798,6 +21661,11 @@ pub const ElfState = struct {
         self.last_decoded_op = decoded.op;
         self.last_decoded_len = decoded.len;
         self.recordTrace(decoded);
+        const stack_rsp_before = self.regs.rsp;
+        const stack_rip_before = self.regs.rip;
+        defer if (self.regs.rsp < STACK_COLLAPSE_FLOOR and stack_rsp_before >= STACK_COLLAPSE_FLOOR) {
+            self.noteStackPointerCollapse("interpreter", stack_rsp_before, stack_rip_before, @tagName(decoded.op));
+        };
         if (self.trace_formatter and self.regs.rip == 0x1400ccf50 and
             (self.trace_formatter_address == null or self.trace_formatter_address.? == self.regs.r8))
         {
@@ -19832,6 +21700,7 @@ pub const ElfState = struct {
             _ = self.serviceWindowsGuestThreads(WINDOWS_GUEST_THREAD_SERVICE_SLICE);
             if (self.terminated) return false;
         }
+        if (is_pause) self.noteWindowsGuestPause();
         const trace_this = shouldTraceRip(self, self.regs.rip);
         var trace_rip: u64 = 0;
         var trace_flags_before: u64 = 0;
@@ -20627,6 +22496,17 @@ pub const ElfState = struct {
         // The budget line returns early on a run too short to have two
         // checkpoints; the translator's account is printed regardless.
         self.reportBlockJit();
+        log.info("PE64 BLOCK JIT SWITCHES: chain={} vectors={} tlb={} wide_access_watch={}; ROSETTE_X64_BLOCK_JIT_CHAIN, ROSETTE_X64_BLOCK_JIT_VECTOR, ROSETTE_X64_BLOCK_JIT_TLB and ROSETTE_X64_WIDE_ACCESS_WATCH set them; turn one off (or the watch on) per run to bisect a behaviour change", .{
+            self.block_jit_chain_enabled,
+            self.block_jit_vectors_enabled,
+            self.block_jit_tlb_enabled,
+            self.wide_access_watch_enabled,
+        });
+        self.reportGuestAccessViolations();
+        log.info("PE64 OWNER WAKE HANDOFF: handoffs={d} owner_yields={d}; a handoff ends a worker's slice the moment it signals an object the owner is waiting on, so the owner (Xenia's UI thread) takes it before the worker can retake it; zero handoffs with a growing owner_yields and no paints is the 2026-09-19 starvation again", .{
+            self.windows_owner_wait_handoffs,
+            self.windows_wait_owner_yields,
+        });
         self.logGuestThreadShare();
         self.logGuestSchedulingHealth();
         self.reportWindowsTimedWaitSites(WINDOWS_TIMED_WAIT_SITE_CAPACITY);
@@ -20699,6 +22579,7 @@ pub const ElfState = struct {
             self.windows_spin_slices,
             self.windows_spin_turns_given,
         });
+        log.info("PE64 guest scheduling health: pause_yields={d} pause_spin_slices={d}; a worker slice ended at a PAUSE spin hint (Xenia's db16cyc), so the thread it waits on ran sooner, and a slice that did nothing else gave away doubling turns", .{ self.windows_guest_pause_yields, self.windows_pause_spin_slices });
         log.info("PE64 guest thread lifecycle: created={d} live={d} completed={d} failed={d} vacant={d} capacity={d}; completed is a normal one-shot exit, failed/refused is the missing-thread signal", .{
             threads_created,
             threads_live,
@@ -20786,6 +22667,7 @@ pub const ElfState = struct {
             self.windows_heap_free_list_growth_failures,
             self.windows_heap_provenance_untracked_allocations,
         });
+        self.reportGuestHeapUse();
         // The line above says where the guest is; this one says what it is
         // doing there. Without it a reader has a hexadecimal address and no
         // way to tell an expensive computation from a stall.
@@ -20924,6 +22806,7 @@ pub const ElfState = struct {
             self.windows_heap_free_list_growth_failures,
             self.windows_heap_provenance_untracked_allocations,
         });
+        self.reportGuestHeapUse();
         self.logWindowsGuestFailurePointSummary();
         log.info("PE64 Xenia accelerators: rijndael_calls={d} rijndael_failures={d} sha1_blocks={d} sha1_failures={d} sha1_feed_spans={d} sha1_feed_bytes={d} sha1_feed_declines={d} sha1_feed_steps_saved~={d}", .{
             self.xenia_rijndael_accelerated_calls,
@@ -22223,15 +24106,21 @@ pub const ElfState = struct {
         if ((d.imm & (1 << 9)) != 0) _ = self.x87PopRaw();
     }
 
-    pub fn readMem128(self: *const ElfState, addr: u64) [16]u8 {
+    pub fn readMem128(self: *ElfState, addr: u64) [16]u8 {
         var value = [_]u8{0} ** 16;
         const source = self.guestMemoryConst(addr, 16) orelse return value;
         @memcpy(value[0..], source);
+        // Same contract as `readMemVal`: the backing bytes are returned and
+        // a no-access page leaves a fault pending for the step boundary.
+        if (self.guest_page_protection.active and self.wide_access_watch_enabled) _ = self.noteGuestWideAccess(addr, false, value);
         return value;
     }
 
     pub fn writeMem128(self: *ElfState, addr: u64, value: [16]u8) void {
         self.traceGuestVectorWrite(addr, value);
+        // A protected store is withheld until the fault is resolved, as in
+        // `writeMemVal`.
+        if (self.guest_page_protection.active and self.wide_access_watch_enabled and self.noteGuestWideAccess(addr, true, value)) return;
         const destination = self.guestMemory(addr, 16) orelse return;
         @memcpy(destination, value[0..]);
     }
@@ -22258,6 +24147,7 @@ pub const ElfState = struct {
     pub fn guestMemory(self: *ElfState, addr: u64, count: u64) ?[]u8 {
         if (count > std.math.maxInt(usize)) return null;
         const count_usize: usize = @intCast(count);
+        if (self.guest_page_protection.active) self.noteProtectedBulkBorrow(addr, count);
         if (self.addrToOffset(addr)) |off| {
             const off_usize: usize = @intCast(off);
             if (off_usize > self.mem.len or count_usize > self.mem.len - off_usize) return null;
@@ -22819,6 +24709,15 @@ pub const ElfState = struct {
         var limit: usize = 0;
         for (@typeInfo(Op).@"enum".fields) |field| limit = @max(limit, @as(usize, field.value) + 1);
         break :blk limit;
+    };
+
+    /// `@tagName` by integer value, for tables indexed like `fallback_ops`;
+    /// null where the enum has no member.
+    const op_names: [op_value_limit]?[]const u8 = blk: {
+        @setEvalBranchQuota(200_000);
+        var names: [op_value_limit]?[]const u8 = @splat(null);
+        for (@typeInfo(Op).@"enum".fields) |field| names[field.value] = field.name;
+        break :blk names;
     };
 
     /// Evaluate a pure predicate over every `Op` once, at compile time, so
@@ -26983,6 +28882,16 @@ fn envFlag(name: [:0]const u8) bool {
 /// True only when the variable is set *and* set to a false value.  A default
 /// -on diagnostic uses this so an unset variable keeps the default rather
 /// than reading as "off".
+fn envPresentAndTrue(name: [:0]const u8) bool {
+    const raw = std.c.getenv(name) orelse return false;
+    const value = std.mem.sliceTo(raw, 0);
+    if (value.len == 0) return false;
+    return std.mem.eql(u8, value, "1") or
+        std.ascii.eqlIgnoreCase(value, "true") or
+        std.ascii.eqlIgnoreCase(value, "yes") or
+        std.ascii.eqlIgnoreCase(value, "on");
+}
+
 fn envPresentAndFalse(name: [:0]const u8) bool {
     const raw = std.c.getenv(name) orelse return false;
     const value = std.mem.sliceTo(raw, 0);
@@ -30980,6 +32889,69 @@ test "PE IAT targets are routed through the Windows import dispatcher" {
     try testing.expect(!state.registerWindowsImportStubAt(address, "kernel32.dll", "VirtualAlloc"));
 }
 
+test "QueueUserAPC runs inside the next alertable wait and the wait answers WAIT_IO_COMPLETION" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+
+    const routine = MEM_BASE + 0x1C00;
+    const continuation = MEM_BASE + 0x780;
+    const pseudo_current_thread = std.math.maxInt(u64) - 1;
+    state.regs.rsp = MEM_BASE + 0x8008;
+    state.regs.rcx = routine;
+    state.regs.rdx = pseudo_current_thread;
+    state.regs.r8 = 0x1234;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "KERNEL32.dll", "QueueUserAPC", continuation));
+    try testing.expectEqual(@as(u64, 1), state.regs.rax);
+    try testing.expectEqual(@as(u64, 1), state.windows_apcs_queued);
+
+    // A non-alertable sleep leaves the APC queued.
+    state.regs.rcx = 0;
+    state.regs.rdx = 0;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "KERNEL32.dll", "SleepEx", continuation));
+    try testing.expectEqual(@as(u64, 0), state.windows_apcs_delivered);
+
+    // SleepEx(0, TRUE): the routine runs on this thread's stack, entered at
+    // 8 mod 16 with room for its home area, and returns into Rosette.
+    const wait_rsp = state.regs.rsp;
+    state.regs.rcx = 0;
+    state.regs.rdx = 1;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "KERNEL32.dll", "SleepEx", continuation));
+    try testing.expectEqual(routine, state.regs.rip);
+    try testing.expectEqual(@as(u64, 0x1234), state.regs.rcx);
+    try testing.expectEqual(@as(u64, 8), state.regs.rsp % 16);
+    try testing.expect(state.regs.rsp + 0x28 <= wait_rsp);
+    try testing.expectEqual(SYNTHETIC_WINDOWS_APC_RETURN, state.read64(state.regs.rsp));
+    // The routine returns.
+    state.regs.rip = state.pop();
+    try testing.expect(state.handleSyntheticRip());
+    try testing.expectEqual(continuation, state.regs.rip);
+    try testing.expectEqual(wait_rsp, state.regs.rsp);
+    try testing.expectEqual(WINDOWS_WAIT_IO_COMPLETION, state.regs.rax);
+    try testing.expectEqual(@as(u64, 1), state.windows_apcs_delivered);
+    // A thread handle nobody owns is refused.
+    state.regs.rcx = routine;
+    state.regs.rdx = 0xFFFF_F000_0000_9999;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "KERNEL32.dll", "QueueUserAPC", continuation));
+    try testing.expectEqual(@as(u64, 0), state.regs.rax);
+}
+
+test "an APC queued to a thread blocked in an alertable wait makes it runnable to run it" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    state.windows_guest_threads[2] = .{ .status = .blocked, .handle = 0xFFFF_F000_0000_0A01, .thread_id = 7, .blocked_wait_handle = 0xFFFF_F000_0000_0A02, .blocked_wait_timeout = 0xFFFF_FFFF, .blocked_alertable = true };
+    state.windows_guest_threads[3] = .{ .status = .blocked, .handle = 0xFFFF_F000_0000_0A03, .thread_id = 8, .blocked_wait_handle = 0xFFFF_F000_0000_0A02, .blocked_wait_timeout = 0xFFFF_FFFF };
+    try testing.expect(state.queueWindowsApc(0xFFFF_F000_0000_0A01, MEM_BASE + 0x1C00, 5));
+    try testing.expectEqual(WindowsGuestThreadStatus.runnable, state.windows_guest_threads[2].status);
+    try testing.expectEqual(@as(u64, 0), state.windows_guest_threads[2].blocked_wait_handle);
+    try testing.expectEqual(@as(u8, 1), state.windows_guest_threads[2].apc.count);
+    // A non-alertable waiter keeps waiting; its APC waits with it.
+    try testing.expect(state.queueWindowsApc(0xFFFF_F000_0000_0A03, MEM_BASE + 0x1C00, 6));
+    try testing.expectEqual(WindowsGuestThreadStatus.blocked, state.windows_guest_threads[3].status);
+    try testing.expectEqual(@as(u64, 1), state.windows_apc_wakes);
+}
+
 test "Windows CRT realloc preserves guest bytes and zeroes grown recalloc tails" {
     var state = ElfState.init(testing.allocator);
     defer state.deinit();
@@ -31045,6 +33017,7 @@ test "PE heap reuses an exact released block without growing provenance" {
     var state = ElfState.init(testing.allocator);
     defer state.deinit();
     state.windows_runtime_enabled = true;
+    state.windows_heap_quarantine_limit_blocks = 0;
 
     const first = state.guestAlloc(24, 16).?;
     for (0..24) |index| state.write8(first + @as(u64, @intCast(index)), 0xA5);
@@ -31059,6 +33032,95 @@ test "PE heap reuses an exact released block without growing provenance" {
     try testing.expectEqual(@as(usize, 1), state.windows_heap_allocations_live);
     try testing.expectEqual(@as(u64, 1), state.windows_heap_reused_allocations);
     for (0..24) |index| try testing.expectEqual(@as(u8, 0), state.read8(reused + @as(u64, @intCast(index))));
+}
+
+test "PE heap quarantines a freed block, refuses its second free and reuses it oldest first" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    state.windows_heap_quarantine_limit_blocks = 2;
+
+    const a = state.guestAlloc(48, 16).?;
+    const b = state.guestAlloc(48, 16).?;
+    const c = state.guestAlloc(48, 16).?;
+    state.write8(a, 0x5A);
+    try testing.expect(state.releaseGuestAllocation(a));
+    // A late read of the freed block still finds its old contents.
+    try testing.expectEqual(@as(u8, 0x5A), state.read8(a));
+    // A second free is refused rather than releasing a later owner's block.
+    try testing.expect(!state.releaseGuestAllocation(a));
+    try testing.expectEqual(@as(u64, 1), state.windows_heap_double_frees);
+    // Quarantined, so a same-size request is a fresh block.
+    const d = state.guestAlloc(48, 16).?;
+    try testing.expect(d != a);
+    try testing.expect(state.releaseGuestAllocation(b));
+    try testing.expect(state.releaseGuestAllocation(c));
+    // Two quarantine slots: releasing a third pushes the oldest (a) out.
+    try testing.expectEqual(@as(usize, 1), state.windows_heap_binned);
+    try testing.expectEqual(a, state.guestAlloc(48, 16).?);
+    try testing.expectEqual(@as(u8, 0), state.read8(a));
+    try testing.expect(!state.releaseGuestAllocation(0x1234));
+    try testing.expectEqual(@as(u64, 1), state.windows_heap_unknown_frees);
+    try testing.expect(state.releaseGuestAllocation(d));
+}
+
+test "PE heap reuse takes a fitting block from the size bin without scanning others" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    state.windows_heap_quarantine_limit_blocks = 0;
+    var blocks: [64]u64 = undefined;
+    for (&blocks, 0..) |*block, index| block.* = state.guestAlloc(16 + @as(u64, @intCast(index)) * 16, 16).?;
+    for (blocks) |block| try testing.expect(state.releaseGuestAllocation(block));
+    try testing.expectEqual(@as(usize, 64), state.windows_heap_free_count);
+    // Each size has its own bin: the 40th size comes straight back.
+    try testing.expectEqual(blocks[40], state.guestAlloc(16 + 40 * 16, 16).?);
+    try testing.expectEqual(@as(usize, 63), state.windows_heap_free_count);
+    // A 4 KiB-aligned request does not take a 16-byte-aligned block.
+    const page_aligned = state.guestAlloc(16 + 3 * 16, 0x1000).?;
+    try testing.expect(page_aligned & 0xFFF == 0);
+}
+
+test "a worker that runs past its stack stops as a stack overflow instead of writing the heap below" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    state.windows_process_peb = MEM_BASE;
+
+    // lea rax, [rsp - 0x100000] ; mov [rax], rax ; ret
+    const entry = MEM_BASE + 0x1A00;
+    const code = [_]u8{ 0x48, 0x8D, 0x84, 0x24, 0x00, 0x00, 0xF0, 0xFF, 0x48, 0x89, 0x00, 0xC3 };
+    for (code, 0..) |byte, index| state.write8(entry + index, byte);
+    try testing.expect(state.enqueueWindowsGuestThread(0xFFFF_F000_0000_0902, entry, 0, 0, false));
+    _ = state.serviceWindowsGuestThreads(16);
+
+    const thread = state.windows_guest_threads[0];
+    try testing.expect(thread.stack_guard_base != 0);
+    try testing.expectEqual(thread.stack_guard_base + WINDOWS_GUEST_THREAD_STACK_GUARD, thread.stack_base);
+    try testing.expect(state.terminated);
+    try testing.expect(state.faulted);
+    try testing.expectEqual(@as(u64, 1), state.windows_stack_overflows);
+    // The write never reached the guard's bytes.
+    for (0..WINDOWS_GUEST_THREAD_STACK_GUARD / 8) |slot| {
+        try testing.expectEqual(@as(u64, 0), state.read64(thread.stack_guard_base + slot * 8));
+    }
+}
+
+test "a finished worker's stack goes back to the heap with its guard unprotected" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    state.windows_process_peb = MEM_BASE;
+
+    const entry = MEM_BASE + 0x1A00;
+    state.write8(entry, 0x58); // pop rax
+    state.write8(entry + 1, 0xC3); // ret
+    try testing.expect(state.enqueueWindowsGuestThread(0xFFFF_F000_0000_0903, entry, 0, 0, false));
+    _ = state.serviceWindowsGuestThreads(16);
+    try testing.expectEqual(WindowsGuestThreadStatus.completed, state.windows_guest_threads[0].status);
+    try testing.expectEqual(@as(u64, 0), state.windows_guest_threads[0].stack_base);
+    try testing.expectEqual(@as(u64, 1), state.windows_thread_stacks_released);
+    try testing.expectEqual(@as(u64, 0), state.windows_heap_unknown_frees);
 }
 
 test "a Windows worker return to a null slot completes locally" {
@@ -31649,6 +33711,45 @@ test "a yield boundary ends the slice, and a Sleep parks on the guest clock" {
     try testing.expect(!thread.wait_resume_timeout);
 }
 
+test "a worker that signals the owner's wait object hands its slice to the owner" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    // winpthreads' mutex handoff event: auto-reset, signalled by unlock
+    // only when a waiter announced itself.
+    const event: u64 = 0xFFFF_F000_0000_0B01;
+    const other: u64 = 0xFFFF_F000_0000_0B02;
+    state.registerWindowsEvent(event, false, false);
+    state.registerWindowsEvent(other, false, false);
+    state.windows_guest_threads[3] = .{ .status = .running, .handle = 0xD0 };
+
+    // The owner is not waiting on anything: a worker's signal is not a handoff.
+    state.windows_active_guest_thread_slot = 3;
+    try testing.expectEqual(@as(u64, 0), state.signalWindowsWaitObject(event, false));
+    try testing.expect(!state.windows_guest_handoff_requested);
+    _ = state.resetWindowsWaitObject(event);
+
+    // The owner waits on `event`; a worker signalling `other` is unrelated.
+    state.setOwnerWaitHandles(&.{event});
+    try testing.expectEqual(@as(u64, 0), state.signalWindowsWaitObject(other, false));
+    try testing.expect(!state.windows_guest_handoff_requested);
+
+    // Signalling the owner's object ends the worker's slice, once.
+    try testing.expectEqual(@as(u64, 0), state.signalWindowsWaitObject(event, false));
+    try testing.expect(state.windows_guest_handoff_requested);
+    try testing.expectEqual(@as(u64, 1), state.windows_owner_wait_handoffs);
+    try testing.expectEqual(@as(u64, 0), state.signalWindowsWaitObject(event, false));
+    try testing.expectEqual(@as(u64, 1), state.windows_owner_wait_handoffs);
+    // The object stays signalled for the owner: nobody consumed it.
+    try testing.expect(state.windowsWaitObjectSignaled(event));
+
+    // The owner itself signalling is never a handoff (no worker is running).
+    state.windows_guest_handoff_requested = false;
+    state.windows_active_guest_thread_slot = null;
+    try testing.expectEqual(@as(u64, 0), state.signalWindowsWaitObject(event, false));
+    try testing.expect(!state.windows_guest_handoff_requested);
+    state.windows_owner_wait_handle_count = 0;
+}
+
 test "a milestone filter hit costs one comparison, not a scan" {
     var table = TestSymbolTable{ .entries = &.{
         .{ .address = 0x140001000, .name = MILESTONE_REFRESH },
@@ -31874,6 +33975,58 @@ test "a declined access violation performs the access Rosette always did" {
     try testing.expectEqual(@as(u64, 1), state.guest_access_violations_unhandled);
 }
 
+fn setUpWriteWatchRetry(state: *ElfState) struct { page: u64, context: u64 } {
+    const page = MEM_BASE + 0x30000;
+    // Xenia's GPU write watch: PAGE_READONLY, so a store faults and a load
+    // does not. Read-only pages only exist at all since the ntdll protect
+    // entry points became real.
+    state.noteGuestPageProtection(page, 0x1000, 0x02, "NtProtectVirtualMemory", 0);
+    state.windows_vectored_exception_handler = MEM_BASE + 0x1234;
+    state.regs.rsp = MEM_BASE + 0x60000;
+    state.last_instruction_rip = MEM_BASE + 0x5000;
+    state.regs.rip = MEM_BASE + 0x5003;
+    state.writeMemVal(page + 0x40, .bits32, 0xABCD);
+    state.raiseGuestAccessViolation();
+    const context = state.read64(state.regs.rcx + 8);
+    // The handler returns EXCEPTION_CONTINUE_EXECUTION with rip left on the
+    // faulting instruction: the write-watch protocol asks for a retry.
+    state.regs.rax = 0xFFFF_FFFF;
+    state.regs.rsp += 8;
+    state.regs.rip = SYNTHETIC_WINDOWS_EXCEPTION_RETURN;
+    return .{ .page = page, .context = context };
+}
+
+test "a write watch that the handler cleared retries the faulting instruction" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    const setup = setUpWriteWatchRetry(&state);
+    try testing.expectEqual(MEM_BASE + 0x5000, state.read64(setup.context + 0xf8));
+    // The store was withheld, and `TriggerCallbacks` unprotected the page.
+    try testing.expectEqual(@as(u32, 0), state.read32(setup.page + 0x40));
+    state.clearGuestPageProtection(setup.page, 0x1000);
+    try testing.expect(state.handleSyntheticRip());
+    // Back on the store, which now lands on its own. Rosette must not have
+    // performed it: that would write it twice.
+    try testing.expectEqual(MEM_BASE + 0x5000, state.regs.rip);
+    try testing.expectEqual(@as(u32, 0), state.read32(setup.page + 0x40));
+    try testing.expectEqual(@as(u64, 0), state.guest_access_violation_unresolved_retries);
+    try testing.expectEqual(@as(u64, 1), state.guest_access_violations_handled);
+}
+
+test "a retry the handler did not resolve is performed once instead of looping forever" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    const setup = setUpWriteWatchRetry(&state);
+    // The protection is still on. Retrying would fault on the same
+    // instruction forever, and a fault loop retires instructions, so no
+    // liveness gate would ever call it a stall.
+    try testing.expect(state.handleSyntheticRip());
+    try testing.expectEqual(MEM_BASE + 0x5003, state.regs.rip);
+    try testing.expectEqual(@as(u32, 0xABCD), state.read32(setup.page + 0x40));
+    try testing.expectEqual(@as(u64, 1), state.guest_access_violation_unresolved_retries);
+    try testing.expectEqual(@as(u64, 1), state.guest_access_violations_handled);
+}
+
 test "with no vectored handler the access completes at once and is counted" {
     var state = ElfState.init(testing.allocator);
     defer state.deinit();
@@ -31905,11 +34058,221 @@ test "VirtualProtect's old protection is the one this run recorded" {
     try testing.expect(!state.guest_page_protection.active);
 }
 
+test "NtProtectVirtualMemory is the ntdll spelling of VirtualProtect and arms the same watch" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    const return_rip = state.mem_base + 0x1000;
+    const page = MEM_BASE + 0x40000;
+    const base_slot = MEM_BASE + 0x50000;
+    const size_slot = MEM_BASE + 0x50008;
+    const old_slot = MEM_BASE + 0x50010;
+    state.regs.rsp = MEM_BASE + 0x60000;
+
+    // `xe::memory::Protect` passes the base and the length as in/out
+    // parameters and always supplies a slot for the old protection.
+    state.write64(base_slot, page + 0x40); // deliberately mid-page
+    state.write64(size_slot, 0x40);
+    state.regs.rcx = 0xFFFF_FFFF_FFFF_FFFF; // (HANDLE)-1, the current process
+    state.regs.rdx = base_slot;
+    state.regs.r8 = size_slot;
+    state.regs.r9 = 0x02; // PAGE_READONLY, the write watch
+    state.write64(state.regs.rsp + 32, old_slot);
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ntdll.dll", "NtProtectVirtualMemory", return_rip));
+    try testing.expectEqual(@as(u64, 0), state.regs.rax); // STATUS_SUCCESS
+    // The kernel rounds the base down and the end up and writes both back.
+    try testing.expectEqual(page, state.read64(base_slot));
+    try testing.expectEqual(@as(u64, 0x1000), state.read64(size_slot));
+    try testing.expectEqual(@as(u32, 0x40), state.read32(old_slot));
+    try testing.expectEqual(@as(u32, 0x02), state.guestPageProtectionFlags(page));
+    try testing.expectEqual(@as(u64, 1), state.guest_page_protection.read_only_pages);
+    // The point of the call: a store to the page now faults, and a read does
+    // not. That is how Xenia learns a title rewrote a texture or a vertex
+    // buffer, and it is what this name answering STATUS_SUCCESS and doing
+    // nothing took away from every run before 2026-09-19.
+    try testing.expect(state.guest_page_protection.faults(page + 0x10, 4, true));
+    try testing.expect(!state.guest_page_protection.faults(page + 0x10, 4, false));
+
+    // Unprotecting is the same call with PAGE_READWRITE, which is what
+    // `PhysicalHeap::TriggerCallbacks` makes from inside the handler.
+    state.write64(base_slot, page);
+    state.write64(size_slot, 0x1000);
+    state.regs.rcx = 0xFFFF_FFFF_FFFF_FFFF;
+    state.regs.rdx = base_slot;
+    state.regs.r8 = size_slot;
+    state.regs.r9 = 0x04; // PAGE_READWRITE
+    state.write64(state.regs.rsp + 32, old_slot);
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ntdll.dll", "NtProtectVirtualMemory", return_rip));
+    try testing.expectEqual(@as(u32, 0x02), state.read32(old_slot));
+    try testing.expectEqual(@as(u64, 0), state.guest_page_protection.read_only_pages);
+    try testing.expect(!state.guest_page_protection.active);
+}
+
+test "NtProtectVirtualMemory refuses a call whose out-parameters it cannot reach" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    const return_rip = state.mem_base + 0x1000;
+    state.regs.rsp = MEM_BASE + 0x60000;
+    state.regs.rcx = 0xFFFF_FFFF_FFFF_FFFF;
+    state.regs.rdx = 0; // no BaseAddress slot
+    state.regs.r8 = MEM_BASE + 0x50008;
+    state.regs.r9 = 0x02;
+    state.write64(state.regs.rsp + 32, MEM_BASE + 0x50010);
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ntdll.dll", "NtProtectVirtualMemory", return_rip));
+    try testing.expectEqual(@as(u64, 0xC000_0005), state.regs.rax); // STATUS_ACCESS_VIOLATION
+    try testing.expect(!state.guest_page_protection.active);
+}
+
+test "NtQueryVirtualMemory reports the protection this run recorded" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    const return_rip = state.mem_base + 0x1000;
+    const page = MEM_BASE + 0x40000;
+    const buffer = MEM_BASE + 0x50000;
+    const result_slot = MEM_BASE + 0x50100;
+    state.regs.rsp = MEM_BASE + 0x60000;
+    state.noteGuestPageProtection(page, 0x3000, 0x02, "test", 0);
+
+    state.regs.rcx = 0xFFFF_FFFF_FFFF_FFFF;
+    state.regs.rdx = page + 0x800;
+    state.regs.r8 = 0; // MemoryBasicInformation
+    state.regs.r9 = buffer;
+    // Xenia hands its own region length here, not sizeof(the structure), so
+    // the length is a lower bound and never an equality.
+    state.write64(state.regs.rsp + 32, 0x1000);
+    state.write64(state.regs.rsp + 40, result_slot);
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ntdll.dll", "NtQueryVirtualMemory", return_rip));
+    try testing.expectEqual(@as(u64, 0), state.regs.rax);
+    try testing.expectEqual(page, state.read64(buffer + 0)); // BaseAddress
+    try testing.expectEqual(@as(u32, 0x02), state.read32(buffer + 36)); // Protect
+    // The region runs to the end of the pages that share that protection.
+    try testing.expectEqual(@as(u64, 0x3000), state.read64(buffer + 24));
+    try testing.expectEqual(@as(u64, 48), state.read64(result_slot));
+
+    // An information class this runner does not model is refused rather than
+    // answered with a zeroed structure.
+    state.regs.rcx = 0xFFFF_FFFF_FFFF_FFFF;
+    state.regs.rdx = page;
+    state.regs.r8 = 2;
+    state.regs.r9 = buffer;
+    state.write64(state.regs.rsp + 32, 0x1000);
+    state.write64(state.regs.rsp + 40, result_slot);
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ntdll.dll", "NtQueryVirtualMemory", return_rip));
+    try testing.expectEqual(@as(u64, 0xC000_0003), state.regs.rax);
+}
+
 test "a guest log line names the thread that wrote it" {
     try testing.expectEqualStrings("F8000014", ElfState.guestLogLineThreadToken("!> F8000014 ResolvePath() failed - device not found").?);
     try testing.expectEqualStrings("00000005", ElfState.guestLogLineThreadToken("w> 00000005 BaseHeap::AllocFixed").?);
     try testing.expectEqual(@as(?[]const u8, null), ElfState.guestLogLineThreadToken("!> short"));
     try testing.expectEqual(@as(?[]const u8, null), ElfState.guestLogLineThreadToken("no marker here"));
+}
+
+test "a signalled pthread condition waiter retakes its mutex through the image's own lock" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    state.windows_pthread_cond_native = true;
+    const wait_entry: u64 = MEM_BASE + 0x2000;
+    const lock_entry: u64 = MEM_BASE + 0x2400;
+    state.configureWindowsConditionEntries(wait_entry, null, null);
+    state.configureWindowsMutexLockEntry(lock_entry);
+    // A normal MinGW mutex (attributes 0), held by the waiter.
+    const mutex = MEM_BASE + 0x3000;
+    const record = MEM_BASE + 0x3100;
+    state.write64(mutex, record);
+    state.write32(record, 1);
+    state.write32(record + 4, 0);
+    state.write64(record + 8, 0xFFFF_F000_0000_0C01);
+    const condition = MEM_BASE + 0x3200;
+    state.windows_guest_threads[3] = .{ .status = .running, .handle = 0xD3, .thread_id = 5 };
+    state.windows_active_guest_thread_slot = 3;
+    const thread = &state.windows_guest_threads[3];
+
+    // Entered by a tail jump: the caller's return address is at [rsp].
+    const stack = MEM_BASE + 0x5000;
+    const caller_return: u64 = MEM_BASE + 0x1234;
+    state.regs.rsp = stack;
+    state.write64(stack, caller_return);
+    state.regs.rcx = condition;
+    state.regs.rdx = mutex;
+    try testing.expect(state.tryWindowsPthreadConditionShim(wait_entry, null));
+    try testing.expectEqual(WindowsGuestThreadStatus.blocked, thread.status);
+    try testing.expectEqual(@as(u32, 0), state.read32(record));
+
+    // Signalled: instead of emulating the acquisition, the waiter calls
+    // pthread_mutex_lock_intern(mutex, INFINITE) with the same return slot.
+    try testing.expectEqual(@as(u64, 1), state.signalWindowsGuestCondition(condition, false));
+    thread.status = .running;
+    state.regs.rcx = condition;
+    state.regs.rdx = mutex;
+    try testing.expect(state.tryWindowsPthreadConditionShim(wait_entry, null));
+    try testing.expectEqual(lock_entry, state.regs.rip);
+    try testing.expectEqual(mutex, state.regs.rcx);
+    try testing.expectEqual(@as(u64, 0xFFFF_FFFF), state.regs.rdx);
+    try testing.expectEqual(stack, state.regs.rsp);
+    try testing.expectEqual(@as(u32, 0), state.read32(record));
+    try testing.expectEqual(@as(u64, 1), state.windows_condition_relocks);
+
+    // Entered by a call: the return address the call would have pushed is
+    // pushed, so the lock returns to the call site.
+    state.write32(record, 1);
+    const call_return: u64 = MEM_BASE + 0x1005;
+    state.regs.rcx = condition;
+    state.regs.rdx = mutex;
+    try testing.expect(state.tryWindowsPthreadConditionShim(wait_entry, call_return));
+    try testing.expectEqual(@as(u64, 1), state.signalWindowsGuestCondition(condition, false));
+    thread.status = .running;
+    state.regs.rcx = condition;
+    state.regs.rdx = mutex;
+    try testing.expect(state.tryWindowsPthreadConditionShim(wait_entry, call_return));
+    try testing.expectEqual(lock_entry, state.regs.rip);
+    try testing.expectEqual(stack - 8, state.regs.rsp);
+    try testing.expectEqual(call_return, state.read64(stack - 8));
+}
+
+test "a condition waiter that had to wait for its mutex retakes it with the waiters marker, as the image's lock does" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    // A MinGW mutex held by thread 7 (state 1), with its auto-reset event.
+    const mutex = MEM_BASE + 0x3000;
+    const record = MEM_BASE + 0x3100;
+    state.write64(mutex, record);
+    state.write32(record, 1);
+    state.write32(record + 4, 0);
+    state.write64(record + 8, 0xFFFF_F000_0000_0C01);
+    state.write32(record + 0x10, 0);
+    state.write32(record + 0x14, 7);
+    const condition = MEM_BASE + 0x3200;
+
+    // Thread 5 was signalled and now retakes the mutex: contended, so it
+    // marks waiters (2) and parks on the event.
+    state.windows_guest_threads[3] = .{ .status = .running, .handle = 0xD3, .thread_id = 5, .condition_resume = true, .blocked_condition_mutex = mutex };
+    state.windows_active_guest_thread_slot = 3;
+    const thread = &state.windows_guest_threads[3];
+    try testing.expectEqual(ElfState.WindowsConditionWaitResult.blocked, state.waitWindowsGuestCondition(condition, mutex));
+    try testing.expectEqual(@as(u32, 2), state.read32(record));
+    try testing.expect(thread.condition_mutex_contended);
+
+    // The holder unlocks the image's way (swap 0, SetEvent). Meanwhile a
+    // second thread is parked in the image's own lock on the same event;
+    // the waker must leave the marker so the next unlock wakes it too.
+    state.write32(record, 0);
+    thread.status = .running;
+    try testing.expectEqual(ElfState.WindowsConditionWaitResult.resumed, state.waitWindowsGuestCondition(condition, mutex));
+    try testing.expectEqual(@as(u32, 2), state.read32(record));
+    try testing.expect(!thread.condition_mutex_contended);
+
+    // A waiter that never had to wait takes a free mutex plainly, as the
+    // image's first attempt does.
+    state.write32(record, 0);
+    thread.condition_resume = true;
+    thread.blocked_condition_mutex = mutex;
+    try testing.expectEqual(ElfState.WindowsConditionWaitResult.resumed, state.waitWindowsGuestCondition(condition, mutex));
+    try testing.expectEqual(@as(u32, 1), state.read32(record));
 }
 
 test "a timed condition wait parks on the guest clock, and a signal or its deadline resumes it through its mutex" {
@@ -32077,6 +34440,20 @@ test "a full thread table gives the earliest finished thread's slot to a new thr
     try testing.expectEqual(@as(u64, 1), state.windows_thread_table_full);
 }
 
+test "a worker's PAUSE ends its slice; the owner's does not" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.noteWindowsGuestPause();
+    try testing.expect(!state.windows_guest_slice_yield_requested);
+    try testing.expectEqual(@as(u64, 0), state.windows_guest_pause_yields);
+
+    state.windows_guest_threads[3] = .{ .status = .running, .handle = 0xC3 };
+    state.windows_active_guest_thread_slot = 3;
+    state.noteWindowsGuestPause();
+    try testing.expect(state.windows_guest_slice_yield_requested);
+    try testing.expectEqual(@as(u64, 1), state.windows_guest_pause_yields);
+}
+
 test "clock reads piling up inside one worker slice end that slice" {
     var state = ElfState.init(testing.allocator);
     defer state.deinit();
@@ -32177,6 +34554,169 @@ test "every instruction form Xenia's x64 JIT can emit under Rosette's CPUID deco
         }
     }
     if (failures != 0) std.debug.print("{d} Xenia JIT form(s) fail; the first is {s}\n", .{ failures, first_failure });
+    try testing.expectEqual(@as(usize, 0), failures);
+}
+
+/// The general register an AT&T operand names, as a `RegId` number, or null.
+fn corpusGprIndex(operand: []const u8) ?u4 {
+    if (operand.len < 2 or operand[0] != '%') return null;
+    const name = operand[1..];
+    const legacy = [_]struct { names: []const []const u8, index: u4 }{
+        .{ .names = &.{ "rax", "eax", "ax", "al", "ah" }, .index = 0 },
+        .{ .names = &.{ "rcx", "ecx", "cx", "cl", "ch" }, .index = 1 },
+        .{ .names = &.{ "rdx", "edx", "dx", "dl", "dh" }, .index = 2 },
+        .{ .names = &.{ "rbx", "ebx", "bx", "bl", "bh" }, .index = 3 },
+        .{ .names = &.{ "rsp", "esp", "sp", "spl" }, .index = 4 },
+        .{ .names = &.{ "rbp", "ebp", "bp", "bpl" }, .index = 5 },
+        .{ .names = &.{ "rsi", "esi", "si", "sil" }, .index = 6 },
+        .{ .names = &.{ "rdi", "edi", "di", "dil" }, .index = 7 },
+    };
+    for (legacy) |entry| {
+        for (entry.names) |candidate| if (std.mem.eql(u8, name, candidate)) return entry.index;
+    }
+    if (name.len >= 2 and name[0] == 'r' and std.ascii.isDigit(name[1])) {
+        var end: usize = 1;
+        while (end < name.len and std.ascii.isDigit(name[end])) end += 1;
+        const number = std.fmt.parseInt(u8, name[1..end], 10) catch return null;
+        if (number >= 8 and number <= 15) return @intCast(number);
+    }
+    return null;
+}
+
+/// The operands of an AT&T line, split at top-level commas.
+fn corpusOperands(text: []const u8, out: *[4][]const u8) usize {
+    const space = std.mem.indexOfScalar(u8, text, ' ') orelse return 0;
+    const operands = std.mem.trim(u8, text[space..], " ");
+    var count: usize = 0;
+    var depth: usize = 0;
+    var start: usize = 0;
+    for (operands, 0..) |c, i| {
+        switch (c) {
+            '(' => depth += 1,
+            ')' => depth -|= 1,
+            ',' => if (depth == 0) {
+                if (count < out.len) out[count] = std.mem.trim(u8, operands[start..i], " ");
+                count += 1;
+                start = i + 1;
+            },
+            else => {},
+        }
+    }
+    if (count < out.len and start < operands.len) {
+        out[count] = std.mem.trim(u8, operands[start..], " ");
+        count += 1;
+    }
+    return @min(count, out.len);
+}
+
+test "every Xenia JIT form writes only the general registers its assembler text names" {
+    // The decodes-and-executes corpus test above cannot see a form that
+    // runs cleanly into the wrong register. On 2026-09-21 VEX `vpextrw
+    // r32, xmm, imm` (0F C5, ModRM.reg is the destination) was decoded with
+    // the roles of the 0F3A 15 form; `vpextrw eax, xmm4, n` zeroed rsp and
+    // retired Halo 3's RENDER thread mid campaign load. Here every register
+    // starts distinct, and after one step only the registers the
+    // assembler's own disassembly names as written - plus each mnemonic's
+    // architectural implicit writes - may have changed. rsp in particular
+    // moves only for the stack instructions.
+    const corpus = @embedFile("xenia_jit_corpus.txt");
+    var state = ElfState.init(testing.allocator);
+    state.block_jit_enabled = false;
+    defer state.deinit();
+    const code = MEM_BASE + 0x1000;
+    const data = MEM_BASE + 0x40000;
+    var failures: usize = 0;
+    var checked: usize = 0;
+    var lines = std.mem.splitScalar(u8, corpus, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, line, '|');
+        const hex = fields.next() orelse continue;
+        const mnemonic = fields.next() orelse continue;
+        const text = fields.next() orelse continue;
+        var bytes = [_]u8{0x90} ** 16;
+        var count: usize = 0;
+        var tokens = std.mem.tokenizeScalar(u8, hex, ' ');
+        while (tokens.next()) |token| {
+            if (count == bytes.len) break;
+            bytes[count] = try std.fmt.parseInt(u8, token, 16);
+            count += 1;
+        }
+        const decoded = decodeInsn(bytes[0..count]);
+        if (decoded.op == .invalid or decoded.len != count) continue;
+        for (bytes, 0..) |byte, offset| state.write8(code + offset, byte);
+        const segments = state.regs.segments;
+        state.regs = .{};
+        state.regs.segments = segments;
+        // Distinct values, each still an address inside readable memory, and
+        // CL still a shift count of one.
+        for (0..16) |index| {
+            const id: RegId = @enumFromInt(index);
+            state.setReg(id, .bits64, data + index * 0x200 + (if (index == 1) @as(u64, 1) else 0));
+        }
+        state.regs.rsp = MEM_BASE + 0x80000;
+        state.regs.rip = code;
+        var before: [16]u64 = undefined;
+        for (0..16) |index| before[index] = state.regVal(@enumFromInt(index), .bits64);
+        state.terminated = false;
+        state.faulted = false;
+        state.termination_reason = .unknown;
+        _ = state.step();
+        if (state.terminated or state.faulted) continue;
+        checked += 1;
+
+        var allowed = [_]bool{false} ** 16;
+        var operands: [4][]const u8 = undefined;
+        const operand_count = corpusOperands(text, &operands);
+        if (operand_count != 0) {
+            if (corpusGprIndex(operands[operand_count - 1])) |index| allowed[index] = true;
+        }
+        const implicit = struct {
+            fn any(m: []const u8, names: []const []const u8) bool {
+                for (names) |name| if (std.mem.startsWith(u8, m, name)) return true;
+                return false;
+            }
+        };
+        if (implicit.any(mnemonic, &.{ "xchg", "xadd" }) and operand_count != 0) {
+            if (corpusGprIndex(operands[0])) |index| allowed[index] = true;
+        }
+        if (implicit.any(mnemonic, &.{ "push", "pop", "call", "ret", "enter", "leave" })) {
+            allowed[4] = true;
+            allowed[5] = true;
+        }
+        if (implicit.any(mnemonic, &.{ "cmpxchg", "cqo", "cdq", "cwd", "cbw", "cwde", "cdqe", "cltq", "cltd", "cqto", "cwtl", "cwtd", "cbtw", "lahf", "rdtsc", "cpuid" })) {
+            allowed[0] = true;
+            allowed[2] = true;
+            if (implicit.any(mnemonic, &.{ "cpuid", "rdtsc" })) {
+                allowed[1] = true;
+                allowed[3] = true;
+            }
+        }
+        if ((implicit.any(mnemonic, &.{ "mul", "div", "idiv" }) or
+            (std.mem.startsWith(u8, mnemonic, "imul") and operand_count == 1)))
+        {
+            allowed[0] = true;
+            allowed[2] = true;
+        }
+        // The string instructions (none are in Xenia's JIT today) move rsi,
+        // rdi and rcx and read or write rax.
+        if (implicit.any(mnemonic, &.{ "stos", "lods", "cmps", "scas", "rep", "loop" }) or
+            std.mem.eql(u8, mnemonic, "movsb") or std.mem.eql(u8, mnemonic, "movsw") or std.mem.eql(u8, mnemonic, "movsq"))
+        {
+            allowed[0] = true;
+            allowed[1] = true;
+            allowed[6] = true;
+            allowed[7] = true;
+        }
+        for (0..16) |index| {
+            const after = state.regVal(@enumFromInt(index), .bits64);
+            if (after == before[index] or allowed[index]) continue;
+            if (failures < 8) std.debug.print("register {d} changed 0x{x} -> 0x{x} by {s}\n", .{ index, before[index], after, line });
+            failures += 1;
+            break;
+        }
+    }
+    try testing.expect(checked > 1000);
     try testing.expectEqual(@as(usize, 0), failures);
 }
 
@@ -33138,19 +35678,276 @@ const DifferentialAssembler = struct {
     fn hlt(self: *DifferentialAssembler) void {
         self.put(&.{0xF4});
     }
+
+    /// A `[base + disp32]` ModRM (mod = 10) for a register field.
+    fn memOperand(self: *DifferentialAssembler, reg: u8, base: u8, disp: i32) void {
+        self.put(&.{0x80 | ((reg & 7) << 3) | (base & 7)});
+        self.imm32(@bitCast(disp));
+    }
+
+    /// Group 1 `op [base + disp32], r64` (opcodes 01/29/21/09/31/39, and 85 for test).
+    fn aluMemReg(self: *DifferentialAssembler, opcode: u8, reg: u8, base: u8, disp: i32) void {
+        self.put(&.{ rexW(reg, base), opcode });
+        self.memOperand(reg, base, disp);
+    }
+
+    /// Group 1 `op r64, [base + disp32]` (opcodes 03/2B/23/0B/33/3B, 13 adc, 1B sbb).
+    fn aluRegMem(self: *DifferentialAssembler, opcode: u8, reg: u8, base: u8, disp: i32) void {
+        self.put(&.{ rexW(reg, base), opcode });
+        self.memOperand(reg, base, disp);
+    }
+
+    /// Group 1 `op qword [base + disp32], imm8` (0x83 /ext).
+    fn aluMemImm8(self: *DifferentialAssembler, ext: u8, base: u8, disp: i32, value: i8) void {
+        self.put(&.{ rexW(0, base), 0x83 });
+        self.memOperand(ext, base, disp);
+        self.put(&.{@bitCast(value)});
+    }
+
+    /// inc (0) / dec (1) qword [base + disp32]
+    fn incDecMem(self: *DifferentialAssembler, ext: u8, base: u8, disp: i32) void {
+        self.put(&.{ rexW(0, base), 0xFF });
+        self.memOperand(ext, base, disp);
+    }
+
+    /// not (2) / neg (3) qword [base + disp32]
+    fn notNegMem(self: *DifferentialAssembler, ext: u8, base: u8, disp: i32) void {
+        self.put(&.{ rexW(0, base), 0xF7 });
+        self.memOperand(ext, base, disp);
+    }
+
+    fn imulRegMem(self: *DifferentialAssembler, dst: u8, base: u8, disp: i32) void {
+        self.put(&.{ rexW(dst, base), 0x0F, 0xAF });
+        self.memOperand(dst, base, disp);
+    }
+
+    fn cmovMem(self: *DifferentialAssembler, cond: u8, dst: u8, base: u8, disp: i32) void {
+        self.put(&.{ rexW(dst, base), 0x0F, 0x40 | cond });
+        self.memOperand(dst, base, disp);
+    }
+
+    /// movbe r64, [base + disp32]
+    fn movbeLoad(self: *DifferentialAssembler, dst: u8, base: u8, disp: i32) void {
+        self.put(&.{ rexW(dst, base), 0x0F, 0x38, 0xF0 });
+        self.memOperand(dst, base, disp);
+    }
+
+    /// movbe [base + disp32], r64
+    fn movbeStore(self: *DifferentialAssembler, src: u8, base: u8, disp: i32) void {
+        self.put(&.{ rexW(src, base), 0x0F, 0x38, 0xF1 });
+        self.memOperand(src, base, disp);
+    }
+
+    /// rol (0), ror (1), shl (4), shr (5), sar (7) r64, cl
+    fn shiftCl(self: *DifferentialAssembler, ext: u8, dst: u8) void {
+        self.put(&.{ rexW(0, dst), 0xD3, modrmReg(ext, dst) });
+    }
+
+    /// rol (0) / ror (1) r64, imm8
+    fn rotateImm(self: *DifferentialAssembler, ext: u8, dst: u8, count: u8) void {
+        self.put(&.{ rexW(0, dst), 0xC1, modrmReg(ext, dst), count });
+    }
+
+    /// bt (A3) / bts (AB) / btr (B3) r64, r64: the bit index is the reg field.
+    fn bitTestRegReg(self: *DifferentialAssembler, opcode: u8, dst: u8, index: u8) void {
+        self.put(&.{ rexW(index, dst), 0x0F, opcode, modrmReg(index, dst) });
+    }
+
+    /// bt (4) / bts (5) / btr (6) r64, imm8
+    fn bitTestRegImm(self: *DifferentialAssembler, ext: u8, dst: u8, bit: u8) void {
+        self.put(&.{ rexW(0, dst), 0x0F, 0xBA, modrmReg(ext, dst), bit });
+    }
+
+    /// bsf (BC) / bsr (BD) r64, r64, or tzcnt/lzcnt with the F3 prefix.
+    fn bitScan(self: *DifferentialAssembler, opcode: u8, dst: u8, src: u8, count_zeros: bool) void {
+        if (count_zeros) self.put(&.{0xF3});
+        self.put(&.{ rexW(dst, src), 0x0F, opcode, modrmReg(dst, src) });
+    }
+
+    /// xchg r64, r64 (0x87 /r)
+    fn xchgRegReg(self: *DifferentialAssembler, dst: u8, src: u8) void {
+        self.put(&.{ rexW(src, dst), 0x87, modrmReg(src, dst) });
+    }
+
+    /// mul (4) / imul (5) / div (6) / idiv (7) r64
+    fn mulDiv(self: *DifferentialAssembler, ext: u8, src: u8) void {
+        self.put(&.{ rexW(0, src), 0xF7, modrmReg(ext, src) });
+    }
+
+    fn cqo(self: *DifferentialAssembler) void {
+        self.put(&.{ 0x48, 0x99 });
+    }
+
+    /// call rel32 to `target` (an offset into `bytes`).
+    fn callRel32(self: *DifferentialAssembler, target: usize) void {
+        const next: i64 = @intCast(self.bytes.items.len + 5);
+        const rel: i32 = @intCast(@as(i64, @intCast(target)) - next);
+        self.put(&.{0xE8});
+        self.imm32(@bitCast(rel));
+    }
+
+    fn ret(self: *DifferentialAssembler) void {
+        self.put(&.{0xC3});
+    }
+
+    /// jmp rel8 forward over `skip` bytes.
+    fn jmpOver(self: *DifferentialAssembler, skip: u8) void {
+        self.put(&.{ 0xEB, skip });
+    }
+
+    /// A three-byte VEX prefix. `map` 1/2/3 = 0F/0F38/0F3A, `pp` 0/1/2/3 =
+    /// none/66/F3/F2; `reg` is the ModRM.reg register, `vvvv` the extra
+    /// source (0 when the form has none), `rm` the ModRM.rm register or base.
+    fn vex(self: *DifferentialAssembler, map: u8, pp: u8, w: bool, reg: u8, vvvv: u8, rm: u8) void {
+        const r_bar: u8 = if (reg >= 8) 0 else 0x80;
+        const b_bar: u8 = if (rm >= 8) 0 else 0x20;
+        self.put(&.{ 0xC4, r_bar | 0x40 | b_bar | map, (if (w) @as(u8, 0x80) else 0) | ((~vvvv & 0xF) << 3) | pp });
+    }
+
+    /// VEX op with three register operands (reg = dst, vvvv = src1, rm = src2).
+    fn vexRR(self: *DifferentialAssembler, map: u8, pp: u8, w: bool, opcode: u8, reg: u8, vvvv: u8, rm: u8) void {
+        self.vex(map, pp, w, reg, vvvv, rm);
+        self.put(&.{ opcode, modrmReg(reg, rm) });
+    }
+
+    fn vexRRI(self: *DifferentialAssembler, map: u8, pp: u8, w: bool, opcode: u8, reg: u8, vvvv: u8, rm: u8, imm: u8) void {
+        self.vexRR(map, pp, w, opcode, reg, vvvv, rm);
+        self.put(&.{imm});
+    }
+
+    /// VEX op with a `[rbx + disp32]` memory operand in rm.
+    fn vexRM(self: *DifferentialAssembler, map: u8, pp: u8, w: bool, opcode: u8, reg: u8, vvvv: u8, disp: i32) void {
+        self.vex(map, pp, w, reg, vvvv, 3);
+        self.put(&.{opcode});
+        self.memOperand(reg, 3, disp);
+    }
+
+    fn vexRMI(self: *DifferentialAssembler, map: u8, pp: u8, w: bool, opcode: u8, reg: u8, vvvv: u8, disp: i32, imm: u8) void {
+        self.vexRM(map, pp, w, opcode, reg, vvvv, disp);
+        self.put(&.{imm});
+    }
+
+    fn vzeroupper(self: *DifferentialAssembler) void {
+        self.put(&.{ 0xC5, 0xF8, 0x77 });
+    }
+
+    /// A VEX.256 (L=1) register or `[rbx + disp32]` form.
+    fn vex256(self: *DifferentialAssembler, map: u8, pp: u8, opcode: u8, reg: u8, vvvv: u8, rm: ?u8, disp: i32) void {
+        const r_bar: u8 = if (reg >= 8) 0 else 0x80;
+        const b_bar: u8 = if ((rm orelse 3) >= 8) 0 else 0x20;
+        self.put(&.{ 0xC4, r_bar | 0x40 | b_bar | map, ((~vvvv & 0xF) << 3) | 0x04 | pp, opcode });
+        if (rm) |register| self.put(&.{modrmReg(reg, register)}) else self.memOperand(reg, 3, disp);
+    }
+
+    /// vldmxcsr / vstmxcsr `[rbx + disp32]` (VEX.LZ.0F AE /2, /3).
+    fn vmxcsr(self: *DifferentialAssembler, is_store: bool, disp: i32) void {
+        self.put(&.{ 0xC5, 0xF8, 0xAE });
+        self.memOperand(if (is_store) 3 else 2, 3, disp);
+    }
+
+    /// `lock xadd|cmpxchg|xchg [rbx + disp32], reg` at 16, 32 or 64 bits.
+    fn lockedMemReg(self: *DifferentialAssembler, kind: u8, size: u8, reg: u8, disp: i32) void {
+        if (size == 16) self.put(&.{0x66});
+        if (kind != 2) self.put(&.{0xF0});
+        const rex: u8 = (if (size == 64) @as(u8, 0x48) else 0x40) | (if (reg >= 8) @as(u8, 4) else 0);
+        if (rex != 0x40) self.put(&.{rex});
+        switch (kind) {
+            0 => self.put(&.{ 0x0F, 0xC1 }), // xadd
+            1 => self.put(&.{ 0x0F, 0xB1 }), // cmpxchg
+            else => self.put(&.{0x87}), // xchg
+        }
+        self.memOperand(reg, 3, disp);
+    }
+
+    /// add|sub rbx, imm8 - moves the data base the hoist planner picks.
+    fn moveBase(self: *DifferentialAssembler, subtract: bool, amount: i8) void {
+        self.put(&.{ 0x48, 0x83, if (subtract) @as(u8, 0xEB) else 0xC3, @bitCast(amount) });
+    }
 };
+
+/// One random AVX-128 instruction over xmm0-xmm7, `[rbx + disp]` and the
+/// general registers the integer body leaves free: the forms the vector
+/// templates compile, in the encodings Xenia's emitter and MinGW produce.
+fn buildVectorBody(asm_: *DifferentialAssembler, random: std.Random, count: usize) void {
+    const gprs = [_]u8{ 0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 13, 14 };
+    var emitted: usize = 0;
+    while (emitted < count) : (emitted += 1) {
+        const dst = random.uintLessThan(u8, 8);
+        const src1 = random.uintLessThan(u8, 8);
+        const src2 = random.uintLessThan(u8, 8);
+        const gpr = gprs[random.uintLessThan(usize, gprs.len)];
+        const disp: i32 = @intCast(random.uintLessThan(u32, 0xFF) * 16);
+        const imm = random.int(u8);
+        switch (random.uintLessThan(u8, 44)) {
+            // moves
+            0 => asm_.vexRR(1, 0, false, 0x28, dst, 0, src2), // vmovaps x, x
+            1 => asm_.vexRM(1, 0, false, 0x28, dst, 0, disp), // vmovaps x, [m]
+            2 => asm_.vexRM(1, 0, false, 0x29, src1, 0, disp), // vmovaps [m], x
+            3 => asm_.vexRM(1, 2, false, 0x6F, dst, 0, disp), // vmovdqu x, [m]
+            4 => asm_.vexRM(1, 2, false, 0x7F, src1, 0, disp), // vmovdqu [m], x
+            5 => asm_.vexRR(1, 1, false, 0x6E, dst, 0, gpr), // vmovd x, r32
+            6 => asm_.vexRR(1, 1, true, 0x6E, dst, 0, gpr), // vmovq x, r64
+            7 => asm_.vexRR(1, 1, false, 0x7E, src1, 0, gpr), // vmovd r32, x
+            8 => asm_.vexRR(1, 1, true, 0x7E, src1, 0, gpr), // vmovq r64, x
+            9 => asm_.vexRR(1, 2, false, 0x7E, dst, 0, src2), // vmovq x, x
+            10 => asm_.vexRM(1, 2, false, 0x10, dst, 0, disp), // vmovss x, [m]
+            11 => asm_.vexRM(1, 3, false, 0x11, src1, 0, disp), // vmovsd [m], x
+            12 => asm_.vexRR(1, 2, false, 0x10, dst, src1, src2), // vmovss x, x, x
+            // bitwise and integer
+            13 => asm_.vexRR(1, 0, false, ([_]u8{ 0x54, 0x55, 0x56, 0x57 })[random.uintLessThan(usize, 4)], dst, src1, src2), // vandps/vandnps/vorps/vxorps
+            14 => asm_.vexRM(1, 1, false, ([_]u8{ 0xDB, 0xDF, 0xEB, 0xEF })[random.uintLessThan(usize, 4)], dst, src1, disp), // vpand/vpandn/vpor/vpxor [m]
+            15 => asm_.vexRR(1, 1, false, ([_]u8{ 0xFC, 0xFD, 0xFE, 0xD4, 0xF8, 0xF9, 0xFA, 0xFB })[random.uintLessThan(usize, 8)], dst, src1, src2), // vpadd/vpsub b w d q
+            16 => asm_.vexRR(1, 1, false, ([_]u8{ 0x74, 0x75, 0x76, 0x64, 0x65, 0x66 })[random.uintLessThan(usize, 6)], dst, src1, src2), // vpcmpeq/gt b w d
+            17 => asm_.vexRR(1, 1, false, ([_]u8{ 0xDA, 0xDE, 0xEA, 0xEE, 0xDC, 0xDD, 0xD8, 0xD9, 0xEC, 0xED, 0xE8, 0xE9, 0xE0, 0xE3, 0xD5 })[random.uintLessThan(usize, 15)], dst, src1, src2), // min/max ub/sw, addus/subus, adds/subs, avg, mullw
+            18 => asm_.vexRR(2, 1, false, ([_]u8{ 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F })[random.uintLessThan(usize, 8)], dst, src1, src2), // vpmin/max sb sd uw ud
+            19 => asm_.vexRR(1, 1, false, ([_]u8{ 0x60, 0x61, 0x62, 0x6C, 0x68, 0x69, 0x6A, 0x6D })[random.uintLessThan(usize, 8)], dst, src1, src2), // vpunpck l/h bw wd dq qdq
+            20 => asm_.vexRR(1, 0, false, if (random.boolean()) 0x14 else 0x15, dst, src1, src2), // vunpckl/hps
+            21 => asm_.vexRRI(1, 1, false, 0x72, ([_]u8{ 6, 2, 4 })[random.uintLessThan(usize, 3)], dst, src2, random.uintLessThan(u8, 40)), // vpslld/vpsrld/vpsrad x, x, imm
+            22 => asm_.vexRRI(1, 1, false, 0x73, ([_]u8{ 6, 2, 7, 3 })[random.uintLessThan(usize, 4)], dst, src2, random.uintLessThan(u8, 20)), // vpsllq/vpsrlq/vpslldq/vpsrldq
+            23 => asm_.vexRRI(1, 1, false, 0x71, ([_]u8{ 6, 2, 4 })[random.uintLessThan(usize, 3)], dst, src2, random.uintLessThan(u8, 20)), // vpsllw/vpsrlw/vpsraw
+            24 => asm_.vexRR(2, 1, false, 0x00, dst, src1, src2), // vpshufb
+            25 => asm_.vexRRI(1, 1, false, 0x70, dst, 0, src2, imm), // vpshufd
+            26 => asm_.vexRRI(1, 0, false, 0xC6, dst, src1, src2, imm), // vshufps
+            27 => asm_.vexRR(1, 1, false, ([_]u8{ 0x63, 0x67, 0x6B })[random.uintLessThan(usize, 3)], dst, src1, src2), // vpacksswb/vpackuswb/vpackssdw
+            28 => asm_.vexRR(2, 1, false, ([_]u8{ 0x30, 0x31, 0x33, 0x20, 0x23, 0x25 })[random.uintLessThan(usize, 6)], dst, 0, src2), // vpmovzx/sx bw bd wd
+            29 => asm_.vexRRI(3, 1, false, 0x4C, dst, src1, src2, @as(u8, random.uintLessThan(u8, 8)) << 4), // vpblendvb with mask xmm
+            30 => asm_.vexRRI(3, 1, false, 0x16, src1, 0, gpr, imm), // vpextrd r32, x, imm
+            31 => asm_.vexRRI(3, 1, false, 0x22, dst, src1, gpr, imm), // vpinsrd x, x, r32, imm
+            // float
+            32 => asm_.vexRR(1, 0, false, ([_]u8{ 0x58, 0x59, 0x5C, 0x5E, 0x5D, 0x5F })[random.uintLessThan(usize, 6)], dst, src1, src2), // vadd/mul/sub/div/min/maxps
+            33 => asm_.vexRM(1, 1, false, ([_]u8{ 0x58, 0x59, 0x5C, 0x5E, 0x5D, 0x5F })[random.uintLessThan(usize, 6)], dst, src1, disp), // ...pd [m]
+            34 => asm_.vexRR(1, 2, false, ([_]u8{ 0x58, 0x59, 0x5C, 0x5E, 0x5D, 0x5F, 0x51 })[random.uintLessThan(usize, 7)], dst, src1, src2), // ...ss, vsqrtss
+            35 => asm_.vexRR(1, 3, false, ([_]u8{ 0x58, 0x59, 0x5C, 0x5E, 0x5D, 0x5F, 0x51 })[random.uintLessThan(usize, 7)], dst, src1, src2), // ...sd, vsqrtsd
+            36 => asm_.vexRR(1, 0, false, 0x51, dst, 0, src2), // vsqrtps
+            37 => asm_.vexRR(1, if (random.boolean()) 0 else 2, false, 0x5B, dst, 0, src2), // vcvtdq2ps / vcvttps2dq
+            38 => {
+                // vcvtps2pd / vcvtpd2ps are two-operand (VEX.vvvv must be
+                // 1111); vcvtss2sd / vcvtsd2ss merge into a first source.
+                const pp = random.uintLessThan(u8, 4);
+                asm_.vexRR(1, pp, false, 0x5A, dst, if (pp >= 2) src1 else 0, src2);
+            },
+            39 => asm_.vexRR(1, if (random.boolean()) 2 else 3, random.boolean(), 0x2A, dst, src1, gpr), // vcvtsi2ss/sd x, x, r32/r64
+            40 => asm_.vexRR(1, if (random.boolean()) 2 else 3, random.boolean(), if (random.boolean()) 0x2C else 0x2D, gpr, 0, src2), // vcvt(t)ss2si / sd2si
+            41 => asm_.vexRR(1, if (random.boolean()) 0 else 1, false, 0x2E, src1, 0, src2), // vucomiss / vucomisd
+            42 => asm_.vexRRI(1, 0, false, 0xC2, dst, src1, src2, random.uintLessThan(u8, 8)), // vcmpps imm
+            else => asm_.vexRRI(3, 1, false, 0x08, dst, 0, src2, random.uintLessThan(u8, 8)), // vroundps imm
+        }
+    }
+}
 
 /// Build one random loop body: instructions the translator compiles, over
 /// registers that leave the loop counter (r15), the data base (rbx) and the
 /// stack (rsp) alone. Memory operands stay inside the data region.
-fn buildDifferentialBody(asm_: *DifferentialAssembler, random: std.Random, count: usize) void {
+fn buildDifferentialBody(asm_: *DifferentialAssembler, random: std.Random, count: usize, subroutine: ?usize) void {
     const usable = [_]u8{ 0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 13, 14 };
     var emitted: usize = 0;
     while (emitted < count) : (emitted += 1) {
         const dst = usable[random.uintLessThan(usize, usable.len)];
         const src = usable[random.uintLessThan(usize, usable.len)];
+        // A divisor register other than rax/rdx, which the divide reads.
+        const divisor: u8 = if (src == 0 or src == 2) 5 else src;
         const disp: i32 = @intCast(random.uintLessThan(u32, 0x200) * 8);
-        switch (random.uintLessThan(u8, 20)) {
+        switch (random.uintLessThan(u8, 38)) {
             0 => asm_.movImm(dst, random.int(i32)),
             1 => asm_.aluRegReg(0x01, dst, src), // add
             2 => asm_.aluRegReg(0x29, dst, src), // sub
@@ -33170,11 +35967,42 @@ fn buildDifferentialBody(asm_: *DifferentialAssembler, random: std.Random, count
             16 => asm_.store(src, 3, disp),
             17 => if (random.boolean()) asm_.movzxByte(dst, 3, disp) else asm_.movsxd(dst, 3, disp),
             18 => asm_.cmov(random.uintLessThan(u8, 16), dst, src),
-            else => {
+            19 => {
                 asm_.setcc(random.uintLessThan(u8, 16), dst);
                 asm_.push(src);
                 asm_.pop(dst);
             },
+            // The 2026-09-19 templates: memory forms, cl shifts, rotates,
+            // bit tests and scans, adc/sbb, movbe, xchg, multiply, divide,
+            // and calls into a subroutine that returns.
+            20 => asm_.aluMemReg(([_]u8{ 0x01, 0x29, 0x21, 0x09, 0x31, 0x39, 0x85 })[random.uintLessThan(usize, 7)], src, 3, disp),
+            21 => asm_.aluRegMem(([_]u8{ 0x03, 0x2B, 0x23, 0x0B, 0x33, 0x3B, 0x13, 0x1B })[random.uintLessThan(usize, 8)], dst, 3, disp),
+            22 => asm_.aluMemImm8(random.uintLessThan(u8, 8), 3, disp, random.int(i8)),
+            23 => if (random.boolean()) asm_.incDecMem(random.uintLessThan(u8, 2), 3, disp) else asm_.notNegMem(2 + random.uintLessThan(u8, 2), 3, disp),
+            24 => if (random.boolean()) asm_.imulRegMem(dst, 3, disp) else asm_.cmovMem(random.uintLessThan(u8, 16), dst, 3, disp),
+            25 => if (random.boolean()) asm_.movbeLoad(dst, 3, disp) else asm_.movbeStore(src, 3, disp),
+            26 => asm_.shiftCl(([_]u8{ 4, 5, 7 })[random.uintLessThan(usize, 3)], dst),
+            27 => asm_.shiftCl(random.uintLessThan(u8, 2), dst),
+            28 => asm_.rotateImm(random.uintLessThan(u8, 2), dst, random.uintLessThan(u8, 64)),
+            29 => asm_.bitTestRegReg(([_]u8{ 0xA3, 0xAB, 0xB3 })[random.uintLessThan(usize, 3)], dst, src),
+            30 => asm_.bitTestRegImm(4 + random.uintLessThan(u8, 3), dst, random.int(u8)),
+            31 => asm_.bitScan(0xBC + random.uintLessThan(u8, 2), dst, src, random.boolean()),
+            32 => asm_.aluRegReg(if (random.boolean()) 0x11 else 0x19, dst, src), // adc / sbb
+            33 => asm_.xchgRegReg(dst, src),
+            34 => asm_.mulDiv(4 + random.uintLessThan(u8, 2), src), // mul / imul
+            35 => {
+                // A non-faulting unsigned divide: rdx = 0, divisor = 7.
+                asm_.movImm(2, 0);
+                asm_.movImm(divisor, 7);
+                asm_.mulDiv(6, divisor);
+            },
+            36 => {
+                // A non-faulting signed divide: rdx = sign(rax), divisor = 7.
+                asm_.cqo();
+                asm_.movImm(divisor, 7);
+                asm_.mulDiv(7, divisor);
+            },
+            else => if (subroutine) |target| asm_.callRel32(target) else asm_.aluRegReg(0x01, dst, src),
         }
         // Occasionally a forward conditional skip over one register move,
         // so blocks end on branches that are taken and not taken.
@@ -33190,6 +36018,9 @@ const DifferentialOutcome = struct {
     exit_code: u64,
     terminated: bool,
     faulted: bool,
+    xmm: [16][16]u8,
+    ymm_hi: [16][16]u8,
+    zmm_hi: [16][32]u8,
     data: [0x1000]u8,
     translated_instructions: u64,
     compiled_blocks: u64,
@@ -33210,6 +36041,7 @@ fn runDifferentialProgram(program: []const u8, seed: u64, translate: bool) Diffe
     inline for (.{ "rax", "rcx", "rdx", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14" }) |name| {
         @field(state.regs, name) = random.int(u64);
     }
+    for (state.xmm[0..8]) |*register| random.bytes(register);
     state.regs.rbx = data;
     state.regs.rsp = stack;
     state.regs.r15 = 40;
@@ -33223,6 +36055,9 @@ fn runDifferentialProgram(program: []const u8, seed: u64, translate: bool) Diffe
         .exit_code = state.exit_code,
         .terminated = state.terminated,
         .faulted = state.faulted,
+        .xmm = state.xmm[0..16].*,
+        .ymm_hi = state.ymm_hi[0..16].*,
+        .zmm_hi = state.zmm_hi[0..16].*,
         .data = undefined,
         .translated_instructions = 0,
         .compiled_blocks = 0,
@@ -33245,11 +36080,16 @@ test "translated blocks retire the same state as the interpreter over random int
     const random = prng.random();
     var total_translated: u64 = 0;
     var total_verified: u64 = 0;
-    for (0..24) |trial| {
+    for (0..64) |trial| {
         var asm_ = DifferentialAssembler{ .allocator = std.testing.allocator };
         defer asm_.deinit();
+        // A subroutine the body may call: add rax, 1 ; ret, skipped on entry.
+        asm_.jmpOver(5);
+        const subroutine = asm_.bytes.items.len;
+        asm_.aluImm8(0, 0, 1);
+        asm_.ret();
         const body_start = asm_.bytes.items.len;
-        buildDifferentialBody(&asm_, random, 4 + random.uintLessThan(usize, 10));
+        buildDifferentialBody(&asm_, random, 4 + random.uintLessThan(usize, 10), subroutine);
         asm_.incDec(1, 15); // dec r15
         asm_.jnzBack(body_start);
         asm_.hlt();
@@ -33276,6 +36116,171 @@ test "translated blocks retire the same state as the interpreter over random int
     // ran as ARM64, so most of the work was translated.
     try std.testing.expect(total_translated > 1000);
     try std.testing.expect(total_verified > 0);
+}
+
+test "translated blocks retire the same vector state as the interpreter over random AVX programs" {
+    if (!block_jit.CodeMemory.available()) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0xA5_5E_D0);
+    const random = prng.random();
+    var total_translated: u64 = 0;
+    for (0..64) |trial| {
+        var asm_ = DifferentialAssembler{ .allocator = std.testing.allocator };
+        defer asm_.deinit();
+        const body_start = asm_.bytes.items.len;
+        buildVectorBody(&asm_, random, 6 + random.uintLessThan(usize, 10));
+        // A little integer work keeps the flags and general registers moving.
+        buildDifferentialBody(&asm_, random, 1 + random.uintLessThan(usize, 3), null);
+        if (random.uintLessThan(u8, 4) == 0) asm_.vzeroupper();
+        asm_.incDec(1, 15); // dec r15
+        asm_.jnzBack(body_start);
+        asm_.hlt();
+        const seed = 0x5000 + trial;
+        const interpreted = runDifferentialProgram(asm_.bytes.items, seed, false);
+        const translated = runDifferentialProgram(asm_.bytes.items, seed, true);
+        if (!interpreted.terminated or interpreted.faulted) {
+            std.debug.print("trial {d}: the interpreter did not finish the program (faulted={}) program={any}\n", .{ trial, interpreted.faulted, asm_.bytes.items });
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expect(translated.terminated);
+        try std.testing.expectEqual(interpreted.exit_code, translated.exit_code);
+        inline for (.{ "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip" }) |name| {
+            if (@field(interpreted.regs, name) != @field(translated.regs, name)) {
+                std.debug.print("vector trial {d}: {s} differs interpreter=0x{x} translated=0x{x} program={any}\n", .{ trial, name, @field(interpreted.regs, name), @field(translated.regs, name), asm_.bytes.items });
+                return error.TestUnexpectedResult;
+            }
+        }
+        try std.testing.expectEqual(interpreted.regs.rflags, translated.regs.rflags);
+        for (0..16) |register| {
+            if (!std.mem.eql(u8, &interpreted.xmm[register], &translated.xmm[register]) or
+                !std.mem.eql(u8, &interpreted.ymm_hi[register], &translated.ymm_hi[register]) or
+                !std.mem.eql(u8, &interpreted.zmm_hi[register], &translated.zmm_hi[register]))
+            {
+                std.debug.print("vector trial {d}: xmm{d} differs\n  interpreter xmm={any} hi={any}\n  translated  xmm={any} hi={any}\n  program={any}\n", .{ trial, register, interpreted.xmm[register], interpreted.ymm_hi[register], translated.xmm[register], translated.ymm_hi[register], asm_.bytes.items });
+                return error.TestUnexpectedResult;
+            }
+        }
+        try std.testing.expectEqualSlices(u8, &interpreted.data, &translated.data);
+        try std.testing.expectEqual(@as(u64, 0), translated.mismatches);
+        total_translated += translated.translated_instructions;
+    }
+    try std.testing.expect(total_translated > 1000);
+}
+
+/// Xenia's hot forms from the 2026-09-21 fallback census, locked
+/// read-modify-writes at every width, and a data base that moves between
+/// memory accesses - the shapes a hoisted base pointer and the newest
+/// templates are exposed to.
+fn buildHotFormBody(asm_: *DifferentialAssembler, random: std.Random, count: usize) void {
+    const gprs = [_]u8{ 0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 13, 14 };
+    var emitted: usize = 0;
+    while (emitted < count) : (emitted += 1) {
+        const dst = random.uintLessThan(u8, 8);
+        const src1 = random.uintLessThan(u8, 8);
+        const src2 = random.uintLessThan(u8, 8);
+        const gpr = gprs[random.uintLessThan(usize, gprs.len)];
+        const disp: i32 = @intCast(random.uintLessThan(u32, 0xF0) * 16);
+        const imm = random.int(u8);
+        switch (random.uintLessThan(u8, 20)) {
+            18 => {
+                // XObject::Retain/Release: `lock inc|dec dword [rbx+d]`,
+                // then the branch and setcc that read its ZF.
+                asm_.put(&.{ 0xF0, 0xFF });
+                asm_.memOperand(random.uintLessThan(u8, 2), 3, disp);
+                asm_.setcc(4, gpr); // sete
+                asm_.jccOver(5, 3); // jne over one register add
+                asm_.aluRegReg(0x01, gpr, gpr);
+            },
+            19 => {
+                // `lock add|sub qword [rbx+d], imm8` and a dependent jcc.
+                asm_.put(&.{ 0xF0, 0x48, 0x83 });
+                asm_.memOperand(if (random.boolean()) 0 else 5, 3, disp);
+                asm_.put(&.{@bitCast(random.int(i8))});
+                asm_.jccOver(random.uintLessThan(u8, 16), 3);
+                asm_.aluRegReg(0x01, gpr, gpr);
+            },
+            0 => asm_.vexRR(1, 1, false, 0xF4, dst, src1, src2), // vpmuludq
+            1 => asm_.vexRM(1, 1, false, 0xF4, dst, src1, disp),
+            2 => asm_.vexRRI(3, 1, false, 0x0E, dst, src1, src2, imm), // vpblendw
+            3 => asm_.vexRMI(3, 1, false, 0x0E, dst, src1, disp, imm),
+            4 => asm_.vexRRI(1, 1, false, 0xC6, dst, src1, src2, imm), // vshufpd
+            5 => asm_.vexRMI(1, 1, false, 0xC6, dst, src1, disp, imm),
+            6 => asm_.vexRRI(3, 1, false, 0x21, dst, src1, src2, imm), // vinsertps
+            7 => asm_.vexRMI(3, 1, false, 0x21, dst, src1, disp, imm),
+            8 => asm_.vex256(1, 0, 0x5A, dst, 0, src2, 0), // vcvtps2pd ymm, xmm
+            9 => asm_.vex256(1, 0, 0x5A, dst, 0, null, disp), // vcvtps2pd ymm, [m]
+            10 => asm_.vex256(1, 0, 0x11, src1, 0, null, disp), // vmovups [m], ymm
+            11 => asm_.vex256(1, 0, 0x10, dst, 0, null, disp), // vmovups ymm, [m]
+            12 => asm_.vmxcsr(random.boolean(), disp),
+            13 => {
+                // winpthreads' mutex and its lazy event: xchg the state word,
+                // cmpxchg the event pointer, and a branch on the ZF it left.
+                asm_.lockedMemReg(random.uintLessThan(u8, 3), ([_]u8{ 16, 32, 64 })[random.uintLessThan(usize, 3)], gpr, disp);
+                asm_.setcc(4, gprs[random.uintLessThan(usize, gprs.len)]); // sete
+            },
+            14 => {
+                // The base moves, is used, and moves back.
+                const amount: i8 = @intCast(16 * (1 + random.uintLessThan(u8, 4)));
+                asm_.moveBase(false, amount);
+                asm_.store(gpr, 3, disp);
+                asm_.load(gprs[random.uintLessThan(usize, gprs.len)], 3, disp +% 8);
+                asm_.moveBase(true, amount);
+            },
+            15 => asm_.load(gpr, 3, disp),
+            16 => asm_.store(gpr, 3, disp),
+            else => {
+                asm_.push(3);
+                asm_.load(gpr, 3, disp);
+                asm_.pop(3);
+            },
+        }
+    }
+}
+
+test "translated blocks retire the same state as the interpreter over Xenia's hot forms, moving bases and locked RMW" {
+    if (!block_jit.CodeMemory.available()) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0x4A11_0F0E);
+    const random = prng.random();
+    var total_translated: u64 = 0;
+    for (0..96) |trial| {
+        var asm_ = DifferentialAssembler{ .allocator = std.testing.allocator };
+        defer asm_.deinit();
+        const body_start = asm_.bytes.items.len;
+        buildHotFormBody(&asm_, random, 6 + random.uintLessThan(usize, 12));
+        buildDifferentialBody(&asm_, random, 1 + random.uintLessThan(usize, 3), null);
+        asm_.incDec(1, 15); // dec r15
+        asm_.jnzBack(body_start);
+        asm_.hlt();
+        const seed = 0x9000 + trial;
+        const interpreted = runDifferentialProgram(asm_.bytes.items, seed, false);
+        const translated = runDifferentialProgram(asm_.bytes.items, seed, true);
+        if (!interpreted.terminated or interpreted.faulted) {
+            std.debug.print("hot-form trial {d}: the interpreter did not finish the program (faulted={}) program={any}\n", .{ trial, interpreted.faulted, asm_.bytes.items });
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expect(translated.terminated);
+        inline for (.{ "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "rflags", "mxcsr" }) |name| {
+            if (@field(interpreted.regs, name) != @field(translated.regs, name)) {
+                std.debug.print("hot-form trial {d}: {s} differs interpreter=0x{x} translated=0x{x} program={any}\n", .{ trial, name, @field(interpreted.regs, name), @field(translated.regs, name), asm_.bytes.items });
+                return error.TestUnexpectedResult;
+            }
+        }
+        for (0..16) |register| {
+            if (!std.mem.eql(u8, &interpreted.xmm[register], &translated.xmm[register]) or
+                !std.mem.eql(u8, &interpreted.ymm_hi[register], &translated.ymm_hi[register]))
+            {
+                std.debug.print("hot-form trial {d}: xmm{d} differs\n  interpreter xmm={any} hi={any}\n  translated  xmm={any} hi={any}\n  program={any}\n", .{ trial, register, interpreted.xmm[register], interpreted.ymm_hi[register], translated.xmm[register], translated.ymm_hi[register], asm_.bytes.items });
+                return error.TestUnexpectedResult;
+            }
+        }
+        if (!std.mem.eql(u8, &interpreted.data, &translated.data)) {
+            const first = std.mem.indexOfDiff(u8, &interpreted.data, &translated.data).?;
+            std.debug.print("hot-form trial {d}: data differs first at +0x{x} interpreter={any} translated={any} program={any}\n", .{ trial, first, interpreted.data[first..@min(first + 16, 0x1000)], translated.data[first..@min(first + 16, 0x1000)], asm_.bytes.items });
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expectEqual(@as(u64, 0), translated.mismatches);
+        total_translated += translated.translated_instructions;
+    }
+    try std.testing.expect(total_translated > 1000);
 }
 
 test "a translated block is dropped when its bytes change and recompiled from the new bytes" {
@@ -33445,6 +36450,118 @@ test "UI scissor packed AVX conversion and clamping retain a nonempty rectangle 
     }
 }
 
+const TlbProtectionOutcome = struct {
+    rax: u64,
+    violations: u64,
+    fills: u64,
+    admitted_before: bool,
+    admitted_after_protect: bool,
+    admitted_after_executable: bool,
+};
+
+/// Run a store loop twice, protecting its data page read-only in between.
+fn runTlbProtectionProgram(translate: bool) TlbProtectionOutcome {
+    var asm_ = DifferentialAssembler{ .allocator = std.testing.allocator };
+    defer asm_.deinit();
+    // loop: mov [rbx + 0x10], rax ; add rax, 1 ; dec r15 ; jnz loop ; hlt
+    asm_.store(0, 3, 0x10);
+    asm_.aluImm8(0, 0, 1);
+    asm_.incDec(1, 15);
+    asm_.jnzBack(0);
+    asm_.hlt();
+    var state = ElfState.initWithMemory(std.testing.allocator, 0x80000);
+    defer state.deinit();
+    const code = MEM_BASE + 0x1000;
+    const data = MEM_BASE + 0x20000;
+    @memcpy(state.mem[0x1000..][0..asm_.bytes.items.len], asm_.bytes.items);
+    state.regs.rbx = data;
+    state.regs.rsp = MEM_BASE + 0x40000;
+    state.regs.rip = code;
+    state.regs.r15 = 100;
+    state.regs.rax = 0;
+    state.block_jit_enabled = translate;
+    state.block_jit_hot_threshold = 2;
+    state.windows_runtime_enabled = true;
+    state.runWithLimit(100_000);
+    std.debug.assert(state.terminated);
+    const admitted_before = state.block_jit_tlb.lookup(true, data + 0x10) != null;
+    // PAGE_READONLY on the data page: every later store faults. With no
+    // vectored handler installed the access is performed and counted.
+    state.noteGuestPageProtection(data, 0x1000, 0x02, "test", 0);
+    const admitted_after_protect = state.block_jit_tlb.lookup(true, data + 0x10) != null;
+    state.terminated = false;
+    state.regs.rip = code;
+    state.regs.r15 = 100;
+    state.runWithLimit(100_000);
+    std.debug.assert(state.terminated);
+    // Back to accessible, run once more so the page is admitted again,
+    // then make it executable: the write side must be dropped.
+    state.clearGuestPageProtection(data, 0x1000);
+    state.terminated = false;
+    state.regs.rip = code;
+    state.regs.r15 = 4;
+    state.runWithLimit(100_000);
+    state.configureWindowsExecutableRanges(&.{.{ .guest_base = data, .length = 0x1000 }});
+    const admitted_after_executable = state.block_jit_tlb.lookup(true, data + 0x10) != null;
+    return .{
+        .rax = state.regs.rax,
+        .violations = state.guest_access_violations_raised,
+        .fills = if (state.block_jit) |jit| jit.tlb_fills else 0,
+        .admitted_before = admitted_before,
+        .admitted_after_protect = admitted_after_protect,
+        .admitted_after_executable = admitted_after_executable,
+    };
+}
+
+test "a store trace withholds only the write TLB, and only while it can still fire" {
+    if (!block_jit.CodeMemory.available()) return error.SkipZigTest;
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    if (state.blockJitActive() == null) return error.SkipZigTest;
+    const page = MEM_BASE + 0x20000;
+
+    // The Xenia run script exports ROSETTE_ELF_TRACE_WINDOWS_MEMORY=1, and
+    // this guard used to refuse every page for the whole run because of it.
+    state.trace_windows_memory = true;
+    try testing.expect(state.traceWithholdsWriteTlb());
+    state.blockJitTlbConsider(page, 4, false);
+    state.blockJitTlbConsider(page, 4, true);
+    // A store trace has no claim on loads.
+    try testing.expect(state.block_jit_tlb.lookup(false, page) != null);
+    try testing.expect(state.block_jit_tlb.lookup(true, page) == null);
+
+    // The trace spends a fixed budget in the first moments of a run; once it
+    // is spent it observes nothing, so it withholds nothing.
+    state.windows_memory_trace_events = ElfState.windows_memory_trace_budget;
+    try testing.expect(!state.traceWithholdsWriteTlb());
+    state.blockJitTlbConsider(page, 4, true);
+    try testing.expect(state.block_jit_tlb.lookup(true, page) != null);
+
+    // A watched store address has no budget and must see stores all run long.
+    state.block_jit_tlb.flush(true, true);
+    state.trace_write_address = page;
+    try testing.expect(state.traceWithholdsWriteTlb());
+    state.blockJitTlbConsider(page, 4, true);
+    try testing.expect(state.block_jit_tlb.lookup(true, page) == null);
+    state.blockJitTlbConsider(page, 4, false);
+    try testing.expect(state.block_jit_tlb.lookup(false, page) != null);
+}
+
+test "the translator's TLB is emptied by a protection change and never lets a protected store skip its fault" {
+    if (!block_jit.CodeMemory.available()) return error.SkipZigTest;
+    const interpreted = runTlbProtectionProgram(false);
+    const translated = runTlbProtectionProgram(true);
+    try std.testing.expectEqual(@as(u64, 204), interpreted.rax);
+    try std.testing.expectEqual(interpreted.rax, translated.rax);
+    try std.testing.expectEqual(@as(u64, 100), interpreted.violations);
+    try std.testing.expectEqual(interpreted.violations, translated.violations);
+    try std.testing.expect(translated.fills > 0);
+    try std.testing.expect(translated.admitted_before);
+    try std.testing.expect(!translated.admitted_after_protect);
+    try std.testing.expect(!translated.admitted_after_executable);
+}
+
 test "the translator stays off under per-instruction tracing and when refused by name" {
     var traced = ElfState.initWithMemory(std.testing.allocator, 0x80000);
     defer traced.deinit();
@@ -33498,13 +36615,9 @@ fn lockstepDivergence(interpreting: *ElfState, translating: *ElfState, max_steps
             divergence = .{ .step = step_index, .register = "rflags", .interpreted = interpreting.regs.rflags, .translated = translating.regs.rflags, .block_start = rip_before, .block_ops = undefined, .block_len = 0 };
         }
         if (divergence) |*found| {
-            if (translating.block_jit) |jit| {
-                if (jit.blocks[blockJitIndex(rip_before)]) |block| {
-                    if (block.start_rip == rip_before) {
-                        found.block_len = @min(block.insns.len, found.block_ops.len);
-                        for (block.insns[0..found.block_len], 0..) |insn, i| found.block_ops[i] = insn.decoded.op;
-                    }
-                }
+            if (translating.blockJitFind(rip_before)) |block| {
+                found.block_len = @min(block.insns.len, found.block_ops.len);
+                for (block.insns[0..found.block_len], 0..) |insn, i| found.block_ops[i] = insn.decoded.op;
             }
             return found.*;
         }
@@ -33540,4 +36653,92 @@ test "lockstep: the SHA1 feed loop translates identically to its interpretation"
     try testing.expectEqual(stop, translating.regs.rip);
     try testing.expectEqualSlices(u8, interpreting.guestMemoryConst(interpreting.regs.rdi, 0x70).?, translating.guestMemoryConst(translating.regs.rdi, 0x70).?);
     try testing.expect(translating.block_jit.?.instructions_retired > 100_000);
+    // The loop body is a chain: blocks reach their successors inside
+    // translated code rather than by returning here for a hash probe. The
+    // lockstep comparison above is what makes this safe to assert - every
+    // one of those hops retired exactly what the interpreter retired.
+    try testing.expect(translating.block_jit.?.native_chain_hops > 0);
+    try testing.expect(translating.block_jit.?.links_armed > 0);
+}
+
+test "the hooked-target filter names every call-arm hook and opens image targets only when nothing else hooks them" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    try testing.expectEqual(@as(u8, 1), state.block_jit_image_targets_hooked);
+    state.windows_pthread_cond_signal_entry = 0x1451_3914;
+    state.guest_milestone_addresses[0] = 0x1406_2bff0;
+    state.rebuildBlockJitHookFilter();
+    try testing.expectEqual(@as(u8, 0), state.block_jit_image_targets_hooked);
+    try testing.expect(block_jit.hookFilterHas(&state.block_jit_hook_filter, 0x1451_3914));
+    try testing.expect(block_jit.hookFilterHas(&state.block_jit_hook_filter, 0x1406_2bff0));
+    // An accelerator that has not resolved its target keeps every image
+    // target on the interpreter.
+    state.xenia_sha1_accelerator_enabled = true;
+    state.rebuildBlockJitHookFilter();
+    try testing.expectEqual(@as(u8, 1), state.block_jit_image_targets_hooked);
+}
+
+test "every pthread condition entry is hooked, so no translated jump reaches winpthreads' own body" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.image_low = 0x1400_0000;
+    state.image_high = 0x1700_0000;
+    state.windows_pthread_cond_wait_entry = 0x1451_3b07;
+    state.windows_pthread_cond_signal_entry = 0x1451_3914;
+    state.windows_pthread_cond_broadcast_entry = 0x1451_3a10;
+    state.windows_pthread_cond_timedwait_entry = 0x1451_3c00;
+    // A tail jump into any of them is forced to the interpreter's jump arm,
+    // where the condition shim runs; a call is refused the native template.
+    for ([_]u64{ 0x1451_3b07, 0x1451_3914, 0x1451_3a10, 0x1451_3c00 }) |entry| {
+        try testing.expect(state.blockJitTargetHooked(entry));
+        try testing.expect(!state.blockJitCallTargetPlain(entry));
+    }
+    try testing.expect(!state.blockJitTargetHooked(0x1451_3b08));
+}
+
+test "a direct call is translated unless a hook or a trace could claim its target" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.image_low = 0x1400_0000;
+    state.image_high = 0x1700_0000;
+
+    // Xenia's own code. The milestones, the kernel-call census, the
+    // accelerators and the pthread shims are exact addresses the predicate
+    // checks; the one hook it cannot see by address is the local-function
+    // shim, whose table is empty on the PE route. So an image target is
+    // translated here, and refused once either of the others is present.
+    try testing.expect(state.blockJitCallTargetPlain(state.image_low));
+    try testing.expect(state.blockJitCallTargetPlain(0x1500_0000));
+    state.trace_calls = true;
+    try testing.expect(!state.blockJitCallTargetPlain(0x1500_0000));
+    state.trace_calls = false;
+    state.block_jit_transfer_traced = true;
+    try testing.expect(!state.blockJitCallTargetPlain(0x1500_0000));
+    state.block_jit_transfer_traced = false;
+    const symbols = [_]elf_loader.Symbol{.{ .name = "local", .value = 0x1500_0000, .size = 0, .section_index = 0 }};
+    state.local_symbols = &symbols;
+    try testing.expect(!state.blockJitCallTargetPlain(0x1500_0000));
+    state.local_symbols = &.{};
+
+    // Xenia's generated PowerPC code, which is where the hot calls are.
+    try testing.expect(state.blockJitCallTargetPlain(state.image_high));
+    try testing.expect(state.blockJitCallTargetPlain(0xA000_0000));
+
+    // The predicate must answer from range tests, array indices and hash
+    // probes only. A linear scan of the roughly ninety-six thousand symbols
+    // Xenia carries, once per call site per block compile, would cost far
+    // more than the fallbacks this removes; that is what an earlier version
+    // did. Nothing below may reintroduce one.
+    try testing.expect(state.local_symbols.len == 0);
+
+    // An unresolved image is refused outright rather than treated as an
+    // empty range that admits everything.
+    state.image_low = 0;
+    state.image_high = 0;
+    try testing.expect(!state.blockJitCallTargetPlain(0xA000_0000));
+
+    // A synthetic address is already the hook box's, and stays refused.
+    state.image_low = 0x1400_0000;
+    state.image_high = 0x1700_0000;
+    try testing.expect(!state.blockJitCallTargetPlain(SYNTHETIC_RIP_FLOOR));
 }
