@@ -263,15 +263,26 @@ test "VEX immediate shift group 4 is arithmetic, not a left shift" {
     try std.testing.expectEqual(types.Op.invalid, vex.decodeVex2(&[_]u8{ 0xC5, 0xE9, 0x73, 0xE2, 0x03 }, 0).op);
 }
 
-test "VEX short-form PEXTRW decodes the 0F C5 encoding" {
-    // VEX.128.66.0F.W0 C5 /r ib: vpextrw ecx, xmm13, 1.
+test "VEX short-form PEXTRW decodes the 0F C5 encoding with ModRM.reg as the destination" {
+    // VEX.128.66.0F.W0 C5 /r ib is RMI: ModRM.reg is the GPR written, r/m the
+    // XMM read. llvm-mc: C5 79 C5 E9 01 = vpextrw r13d, xmm1, 1.
     const decoded = vex.decodeVex2(&[_]u8{ 0xC5, 0x79, 0xC5, 0xE9, 0x01 }, 0);
     try std.testing.expectEqual(types.Op.vpextrw, decoded.op);
     try std.testing.expectEqual(@as(u8, 5), decoded.len);
-    try std.testing.expectEqual(@as(u8, 13), decoded.xmm_src);
-    try std.testing.expectEqual(types.RegId.cl_cx_ecx_rcx, decoded.dst_reg);
+    try std.testing.expectEqual(@as(u8, 1), decoded.xmm_src);
+    try std.testing.expectEqual(types.RegId.r13b_r13w_r13d_r13, decoded.dst_reg);
     try std.testing.expect(decoded.is_reg_form);
     try std.testing.expectEqual(@as(u64, 1), decoded.imm);
+
+    // C5 F9 C5 C4 02 = vpextrw eax, xmm4, 2. Read the 0F3A way this wrote
+    // register 4 - rsp - and retired Halo 3's RENDER thread mid campaign load.
+    const render = vex.decodeVex2(&[_]u8{ 0xC5, 0xF9, 0xC5, 0xC4, 0x02 }, 0);
+    try std.testing.expectEqual(types.Op.vpextrw, render.op);
+    try std.testing.expectEqual(types.RegId.al_ax_eax_rax, render.dst_reg);
+    try std.testing.expectEqual(@as(u8, 4), render.xmm_src);
+
+    // The C5 form has no memory operand.
+    try std.testing.expectEqual(types.Op.invalid, vex.decodeVex2(&[_]u8{ 0xC5, 0xF9, 0xC5, 0x04, 0x24, 0x02 }, 0).op);
 }
 
 test "VEX packed floating-point unpack decodes both VEX widths" {

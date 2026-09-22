@@ -2676,21 +2676,20 @@ fn decodeVex2Table(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
-    // VPEXTRW: VEX.128.66.0F.W0 C5 /r ib. This is the short two-byte-VEX
-    // form of word extraction; unlike the byte/dword/qword forms, which use
-    // the 0F3A map, the legacy PEXTRW opcode remains in the 0F map. ModRM.reg
-    // names the source XMM and ModRM.r/m names the zero-extended GPR or the
-    // 16-bit memory destination.
+    // VPEXTRW: VEX.128.66.0F.W0 C5 /r ib (Op/En RMI). ModRM.reg is the
+    // destination GPR and ModRM.r/m the source XMM, register-only - the
+    // reverse of the 0F3A 15 form, whose r/m is the destination. Reading it
+    // the 0F3A way wrote the extracted word into whatever GPR shared the
+    // source's number: `vpextrw eax, xmm4, n` zeroed rsp, and on 2026-09-21
+    // that retired Halo 3's RENDER thread mid campaign load while it held
+    // the lock MAIN_THREAD then waited on forever.
     if (opcode == 0xC5 and !vector_256 and prefix == 1 and mask_vex.vvvv == 0) {
         var decoded = DecodedInsn{ .op = .vpextrw, .size = .bits16 };
         var pos = start_pos + 3;
-        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits16);
-        decoded.xmm_src = @intFromEnum(rm.reg);
-        if (decoded.is_reg_form) {
-            decoded.dst_reg = addressing.rmRegister(rm.addr);
-        } else {
-            decoded.addr = rm.addr;
-        }
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits32);
+        if (!decoded.is_reg_form) return .{};
+        decoded.dst_reg = rm.reg;
+        decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
         if (pos >= bytes.len) return .{};
         decoded.imm = bytes[pos];
         decoded.uses_imm = true;
@@ -3704,13 +3703,11 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
     {
         var decoded = DecodedInsn{ .op = .vpextrw, .size = .bits16 };
         var pos = start_pos + 4;
-        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits16);
-        decoded.xmm_src = @intFromEnum(rm.reg);
-        if (decoded.is_reg_form) {
-            decoded.dst_reg = addressing.rmRegister(rm.addr);
-        } else {
-            decoded.addr = rm.addr;
-        }
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits32);
+        // RMI, register-only, as in the two-byte form above.
+        if (!decoded.is_reg_form) return .{};
+        decoded.dst_reg = rm.reg;
+        decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
         if (pos >= bytes.len) return .{};
         decoded.imm = bytes[pos];
         decoded.uses_imm = true;

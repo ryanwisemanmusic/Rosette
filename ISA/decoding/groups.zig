@@ -791,8 +791,10 @@ pub fn decodeXchgRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: 
     d.size = sz;
 
     if (is_mem) {
+        // A 66-prefixed exchange is the 32-bit op at 16 bits: every executor
+        // of it reads `d.size`, as the 16-bit XADD already did.
         d.op = switch (sz) {
-            .bits32 => .xchg_mem32_reg32,
+            .bits16, .bits32 => .xchg_mem32_reg32,
             .bits64 => .xchg_mem64_reg64,
             else => .invalid,
         };
@@ -800,7 +802,7 @@ pub fn decodeXchgRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: 
         d.src_reg = rm.reg;
     } else {
         d.op = switch (sz) {
-            .bits32 => .xchg_reg32_reg32,
+            .bits16, .bits32 => .xchg_reg32_reg32,
             .bits64 => .xchg_reg64_reg64,
             else => .invalid,
         };
