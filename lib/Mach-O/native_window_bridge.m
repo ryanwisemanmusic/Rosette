@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <stdatomic.h>
+#include <time.h>
 
 static void RosetteMachOUpdateMetalDrawable(void);
 
@@ -165,8 +167,31 @@ static uint64_t g_keyboard_rejected_key_events;
 static uint32_t g_keyboard_last_key_code;
 static BOOL g_reported_keyboard_mapping;
 
+// A press must outlive the guest's polling interval. At a few frames a second
+// the guest samples its controllers once per frame, so a 100 ms tap lands
+// between two samples and the title never sees it. Each down edge therefore
+// latches the key until the presented frame count has advanced twice, which
+// spans at least one whole inter-frame interval and so at least one poll. The
+// wall-clock cap keeps a key from sticking if presents stop, and without a
+// frame clock (a route that never presents through Vulkan) the latch is a
+// short fixed hold instead.
+static const uint64_t kRosetteKeyboardLatchFrames = 2u;
+static const uint64_t kRosetteKeyboardLatchCapNs = 3000000000ull;
+static const uint64_t kRosetteKeyboardLatchNoClockNs = 150000000ull;
+static _Atomic uint64_t g_guest_frame_clock;
+static BOOL g_keyboard_latched[128];
+static uint64_t g_keyboard_press_frame[128];
+static uint64_t g_keyboard_press_ns[128];
+// The last state handed out, so a latch that expires between two physical
+// events still changes the packet number. XInput callers may skip a packet
+// they have already seen.
+static uint16_t g_keyboard_reported_buttons;
+static uint8_t g_keyboard_reported_triggers[2];
+static int16_t g_keyboard_reported_axes[4];
+
 static void RosetteMachOClearKeyboardStateLocked(void) {
   memset(g_keyboard_keys, 0, sizeof(g_keyboard_keys));
+  memset(g_keyboard_latched, 0, sizeof(g_keyboard_latched));
 }
 
 static void RosetteMachOUpdateKeyboardFocusOnMainThread(void) {
@@ -223,6 +248,10 @@ static void RosetteMachOApplyKeyboardEvent(NSEvent *event, BOOL down) {
     // change on the transition, not on every repeat notification.
     if (!was_down) {
       g_keyboard_keys[key_code] = YES;
+      g_keyboard_latched[key_code] = YES;
+      g_keyboard_press_frame[key_code] =
+          atomic_load_explicit(&g_guest_frame_clock, memory_order_relaxed);
+      g_keyboard_press_ns[key_code] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
       ++g_keyboard_packet;
       ++g_keyboard_key_down_events;
     }
@@ -235,7 +264,35 @@ static void RosetteMachOApplyKeyboardEvent(NSEvent *event, BOOL down) {
 }
 
 static BOOL RosetteMachOKeyboardKeyDownLocked(NSUInteger key_code) {
-  return key_code < 128u && g_keyboard_keys[key_code];
+  if (key_code >= 128u) return NO;
+  if (g_keyboard_keys[key_code]) return YES;
+  if (!g_keyboard_latched[key_code]) return NO;
+  const uint64_t clock =
+      atomic_load_explicit(&g_guest_frame_clock, memory_order_relaxed);
+  const uint64_t held_ns =
+      clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - g_keyboard_press_ns[key_code];
+  const BOOL frame_clock_running = clock != 0u;
+  const BOOL still_latched =
+      frame_clock_running
+          ? (clock - g_keyboard_press_frame[key_code] <
+                 kRosetteKeyboardLatchFrames &&
+             held_ns < kRosetteKeyboardLatchCapNs)
+          : held_ns < kRosetteKeyboardLatchNoClockNs;
+  if (!still_latched) {
+    g_keyboard_latched[key_code] = NO;
+    return NO;
+  }
+  return YES;
+}
+
+static BOOL RosetteMachOAnyKeyDownLocked(const uint16_t *key_codes,
+                                         size_t count) {
+  BOOL down = NO;
+  // Evaluate every key: the lookup also retires expired latches.
+  for (size_t i = 0; i < count; ++i) {
+    if (RosetteMachOKeyboardKeyDownLocked(key_codes[i])) down = YES;
+  }
+  return down;
 }
 
 static int16_t RosetteMachOAxisLocked(NSUInteger negative_key, NSUInteger positive_key) {
@@ -887,9 +944,45 @@ int rosette_macho_native_window_ensure(uint32_t width, uint32_t height,
   return result ? 1 : 0;
 }
 
+/// The main window's title is Rosette's, not the guest's: "Rosette — frame N".
+///
+/// Once set, a guest SetWindowText no longer replaces it, because the guest
+/// title (Xenia's) carries nothing the frame count does not already say and
+/// the frame count is the only live progress readout on screen.
+///
+/// Asynchronous on purpose. Every guest thread runs on the one host thread
+/// that calls this, so a synchronous hop to the main thread would stall the
+/// whole emulation for however long AppKit takes to repaint a title bar.
+static BOOL g_rosette_frame_title_owned = NO;
+static uint64_t g_rosette_frame_title_last_ns;
+void rosette_macho_native_window_set_frame_counter(uint64_t frame) {
+  g_rosette_frame_title_owned = YES;
+  // Every present advances the keyboard latch's clock; only the title is
+  // throttled.
+  atomic_store_explicit(&g_guest_frame_clock, frame, memory_order_relaxed);
+  const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  if (g_rosette_frame_title_last_ns != 0u &&
+      now - g_rosette_frame_title_last_ns < 250000000ull) {
+    return;
+  }
+  g_rosette_frame_title_last_ns = now;
+  const unsigned long long value = (unsigned long long)frame;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    if (!g_window) return;
+    g_window.title = [NSString stringWithFormat:@"Rosette — frame %llu", value];
+  });
+}
+
 int rosette_macho_native_window_set_title(const char *title) {
   if (!title) {
     return 0;
+  }
+  // Once Rosette's frame counter owns the title there is nothing for a guest
+  // title to change, and this path is a synchronous hop to the main thread -
+  // one the whole emulation waits on, every time Xenia refreshes its own
+  // title. The window already exists by then, so the answer is simply yes.
+  if (g_rosette_frame_title_owned && g_window) {
+    return 1;
   }
   __block BOOL result = NO;
   NSString *window_title = [NSString stringWithUTF8String:title];
@@ -1258,6 +1351,33 @@ uint64_t rosette_macho_native_window_present_frame(
   return presented;
 }
 
+// The one keyboard layout, stated once for the reader and the report. Keys are
+// macOS virtual key codes. Enter and Space both confirm (A) and Escape backs
+// out (B), because the first thing any title asks of a player is a menu.
+#define ROSETTE_KEYBOARD_MAPPING_TEXT                                        \
+  "Space/Return:A Escape/C:B X:X Y:Y P:Start Backspace/Tab:Back "           \
+  "Home:Guide WASD:left-stick IJKL:right-stick arrows:dpad Q:LB R:RB "      \
+  "Z:LT E:RT F:left-thumb V:right-thumb"
+static const uint16_t kRosetteKeysA[] = {49u, 36u, 76u};      // Space, Return, keypad Enter
+static const uint16_t kRosetteKeysB[] = {53u, 8u};            // Escape, C
+static const uint16_t kRosetteKeysX[] = {7u};                 // X
+static const uint16_t kRosetteKeysY[] = {16u};                // Y
+static const uint16_t kRosetteKeysStart[] = {35u};            // P
+static const uint16_t kRosetteKeysBack[] = {51u, 48u};        // Backspace, Tab
+static const uint16_t kRosetteKeysGuide[] = {115u};           // Home
+static const uint16_t kRosetteKeysLB[] = {12u};               // Q
+static const uint16_t kRosetteKeysRB[] = {15u};               // R
+static const uint16_t kRosetteKeysLT[] = {6u};                // Z
+static const uint16_t kRosetteKeysRT[] = {14u};               // E
+static const uint16_t kRosetteKeysLThumb[] = {3u};            // F
+static const uint16_t kRosetteKeysRThumb[] = {9u};            // V
+static const uint16_t kRosetteKeysDpadUp[] = {126u};
+static const uint16_t kRosetteKeysDpadDown[] = {125u};
+static const uint16_t kRosetteKeysDpadLeft[] = {123u};
+static const uint16_t kRosetteKeysDpadRight[] = {124u};
+#define ROSETTE_KEYS_DOWN(keys) \
+  RosetteMachOAnyKeyDownLocked((keys), sizeof(keys) / sizeof((keys)[0]))
+
 int rosette_macho_native_window_read_controller_state(
     RosetteMachOKeyboardControllerState *out) {
   if (!out) {
@@ -1266,7 +1386,6 @@ int rosette_macho_native_window_read_controller_state(
   memset(out, 0, sizeof(*out));
   pthread_mutex_lock(&g_keyboard_lock);
   ++g_keyboard_snapshot_reads;
-  out->packet_number = g_keyboard_packet;
   out->connected = g_keyboard_window_available ? 1u : 0u;
   out->focused = g_keyboard_focused ? 1u : 0u;
   out->key_down_events = g_keyboard_key_down_events;
@@ -1276,7 +1395,7 @@ int rosette_macho_native_window_read_controller_state(
   out->focus_loss_events = g_keyboard_focus_loss_events;
   out->rejected_key_events = g_keyboard_rejected_key_events;
   out->last_key_code = g_keyboard_last_key_code;
-  out->input_contract_version = 1u;
+  out->input_contract_version = 2u;
   if (g_keyboard_window_available && g_keyboard_focused) {
     // Left stick: WASD. XInput's positive Y is up.
     out->thumb_lx = RosetteMachOAxisLocked(0u, 2u);   // A / D
@@ -1285,31 +1404,49 @@ int rosette_macho_native_window_read_controller_state(
     out->thumb_rx = RosetteMachOAxisLocked(38u, 37u); // J / L
     out->thumb_ry = RosetteMachOAxisLocked(40u, 34u); // K / I
 
-    // D-pad arrows.
-    if (RosetteMachOKeyboardKeyDownLocked(126u)) out->buttons |= 0x0001u; // up
-    if (RosetteMachOKeyboardKeyDownLocked(125u)) out->buttons |= 0x0002u; // down
-    if (RosetteMachOKeyboardKeyDownLocked(123u)) out->buttons |= 0x0004u; // left
-    if (RosetteMachOKeyboardKeyDownLocked(124u)) out->buttons |= 0x0008u; // right
-    if (RosetteMachOKeyboardKeyDownLocked(36u)) out->buttons |= 0x0010u;  // start
-    if (RosetteMachOKeyboardKeyDownLocked(51u)) out->buttons |= 0x0020u;  // back
-    if (RosetteMachOKeyboardKeyDownLocked(12u)) out->buttons |= 0x0100u;  // LB (Q)
-    if (RosetteMachOKeyboardKeyDownLocked(15u)) out->buttons |= 0x0200u;  // RB
-    if (RosetteMachOKeyboardKeyDownLocked(53u)) out->buttons |= 0x0400u;  // guide
-    if (RosetteMachOKeyboardKeyDownLocked(49u)) out->buttons |= 0x1000u;  // A
-    if (RosetteMachOKeyboardKeyDownLocked(8u)) out->buttons |= 0x2000u;   // B
-    if (RosetteMachOKeyboardKeyDownLocked(7u)) out->buttons |= 0x4000u;   // X
-    if (RosetteMachOKeyboardKeyDownLocked(16u)) out->buttons |= 0x8000u;  // Y
-    if (RosetteMachOKeyboardKeyDownLocked(3u)) out->buttons |= 0x0040u;   // left thumb
-    if (RosetteMachOKeyboardKeyDownLocked(9u)) out->buttons |= 0x0080u;   // right thumb
-    if (RosetteMachOKeyboardKeyDownLocked(6u)) out->left_trigger = 255u;  // Z
-    if (RosetteMachOKeyboardKeyDownLocked(14u)) out->right_trigger = 255u; // E
+    if (ROSETTE_KEYS_DOWN(kRosetteKeysDpadUp)) out->buttons |= 0x0001u;
+    if (ROSETTE_KEYS_DOWN(kRosetteKeysDpadDown)) out->buttons |= 0x0002u;
+    if (ROSETTE_KEYS_DOWN(kRosetteKeysDpadLeft)) out->buttons |= 0x0004u;
+    if (ROSETTE_KEYS_DOWN(kRosetteKeysDpadRight)) out->buttons |= 0x0008u;
+    if (ROSETTE_KEYS_DOWN(kRosetteKeysStart)) out->buttons |= 0x0010u;
+    if (ROSETTE_KEYS_DOWN(kRosetteKeysBack)) out->buttons |= 0x0020u;
+    if (ROSETTE_KEYS_DOWN(kRosetteKeysLThumb)) out->buttons |= 0x0040u;
+    if (ROSETTE_KEYS_DOWN(kRosetteKeysRThumb)) out->buttons |= 0x0080u;
+    if (ROSETTE_KEYS_DOWN(kRosetteKeysLB)) out->buttons |= 0x0100u;
+    if (ROSETTE_KEYS_DOWN(kRosetteKeysRB)) out->buttons |= 0x0200u;
+    if (ROSETTE_KEYS_DOWN(kRosetteKeysGuide)) out->buttons |= 0x0400u;
+    if (ROSETTE_KEYS_DOWN(kRosetteKeysA)) out->buttons |= 0x1000u;
+    if (ROSETTE_KEYS_DOWN(kRosetteKeysB)) out->buttons |= 0x2000u;
+    if (ROSETTE_KEYS_DOWN(kRosetteKeysX)) out->buttons |= 0x4000u;
+    if (ROSETTE_KEYS_DOWN(kRosetteKeysY)) out->buttons |= 0x8000u;
+    if (ROSETTE_KEYS_DOWN(kRosetteKeysLT)) out->left_trigger = 255u;
+    if (ROSETTE_KEYS_DOWN(kRosetteKeysRT)) out->right_trigger = 255u;
   }
+  const BOOL changed =
+      out->buttons != g_keyboard_reported_buttons ||
+      out->left_trigger != g_keyboard_reported_triggers[0] ||
+      out->right_trigger != g_keyboard_reported_triggers[1] ||
+      out->thumb_lx != g_keyboard_reported_axes[0] ||
+      out->thumb_ly != g_keyboard_reported_axes[1] ||
+      out->thumb_rx != g_keyboard_reported_axes[2] ||
+      out->thumb_ry != g_keyboard_reported_axes[3];
+  if (changed) {
+    ++g_keyboard_packet;
+    g_keyboard_reported_buttons = out->buttons;
+    g_keyboard_reported_triggers[0] = out->left_trigger;
+    g_keyboard_reported_triggers[1] = out->right_trigger;
+    g_keyboard_reported_axes[0] = out->thumb_lx;
+    g_keyboard_reported_axes[1] = out->thumb_ly;
+    g_keyboard_reported_axes[2] = out->thumb_rx;
+    g_keyboard_reported_axes[3] = out->thumb_ry;
+  }
+  out->packet_number = g_keyboard_packet;
   const BOOL available = g_keyboard_window_available;
   pthread_mutex_unlock(&g_keyboard_lock);
 
   if (!g_reported_keyboard_mapping && available) {
     fprintf(stderr,
-            "macho-processor: INPUT BRIDGE: virtual keyboard controller active; mapping=WASD:left-stick IJKL:right-stick arrows:dpad space:A C:B X:X Y:Y return:Start delete:Back Q:LB R:RB F:left-thumb V:right-thumb Z/LT E/RT escape:Guide; controller is connected while the window exists and reports zero state when unfocused\n");
+            "macho-processor: INPUT BRIDGE: virtual keyboard controller active on user 0 only; mapping=" ROSETTE_KEYBOARD_MAPPING_TEXT "; a press is held until two frames have been presented so a slow guest still polls it; the controller reports zero state when unfocused\n");
     g_reported_keyboard_mapping = YES;
   }
   return available ? 1 : 0;

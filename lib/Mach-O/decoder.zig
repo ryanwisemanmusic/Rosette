@@ -279,13 +279,30 @@ pub fn roundVexFloat(comptime Float: type, value: Float, immediate: u8) Float {
     };
 }
 
+/// Round to nearest, ties to even, with the sign of a zero result taken
+/// from the input as IEEE 754 `roundToIntegralTiesToEven` (and `frintn`,
+/// and x86 `vroundps` mode 0) do. The previous floor-and-fraction form
+/// returned +0.0 for every input in (-0.5, 0), which the x86-64 block
+/// translator's differential test caught against the hardware rounding.
 pub fn roundNearestEven(comptime Float: type, value: Float) Float {
-    const lower = @floor(value);
-    const fraction = value - lower;
-    const half: Float = 0.5;
-    if (fraction < half) return lower;
-    if (fraction > half) return lower + 1.0;
-    return if (@mod(lower, 2.0) == 0.0) lower else lower + 1.0;
+    const rounded = @round(value); // nearest, ties away from zero
+    const result = if (@abs(rounded - value) == 0.5 and @mod(rounded, 2.0) != 0.0)
+        rounded - std.math.sign(value) // the tie went to the odd neighbour: step back to the even one
+    else
+        rounded;
+    return std.math.copysign(result, value);
+}
+
+test "round to nearest even keeps the sign of zero and breaks ties to even" {
+    try std.testing.expectEqual(@as(f32, 2.0), roundNearestEven(f32, 2.5));
+    try std.testing.expectEqual(@as(f32, 4.0), roundNearestEven(f32, 3.5));
+    try std.testing.expectEqual(@as(f32, -2.0), roundNearestEven(f32, -2.5));
+    try std.testing.expectEqual(@as(f32, 0.0), roundNearestEven(f32, 0.5));
+    try std.testing.expectEqual(@as(u32, 0x8000_0000), @as(u32, @bitCast(roundNearestEven(f32, -0.5))));
+    try std.testing.expectEqual(@as(u32, 0x8000_0000), @as(u32, @bitCast(roundNearestEven(f32, -1.0e-10))));
+    try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(roundNearestEven(f32, 1.0e-10))));
+    try std.testing.expectEqual(@as(f64, 2147483647.0), roundNearestEven(f64, 2147483647.4));
+    try std.testing.expectEqual(@as(f32, -7.0), roundNearestEven(f32, -7.3));
 }
 
 pub fn roundVexPackedF32(source: [16]u8, immediate: u8) [16]u8 {
