@@ -714,9 +714,11 @@ pub fn fabs(width: FpWidth, rd: Reg, rn: Reg) u32 {
 }
 
 pub fn fcmp(width: FpWidth, rn: Reg, rm: Reg) u32 {
-    // The architectural compare encoding has an unused zero Rd field; it is
-    // not the general-purpose XZR number used by integer compare aliases.
-    return fpScalar3(width, 0x1E212000, 0x1E612000, 0, rn, rm);
+    // `fcmp Sn, Sm` / `fcmp Dn, Dm`: bits 4:0 are opc (00 for the register
+    // form). Until 2026-09-19 the base carried bit 16, the low bit of Rm, so
+    // every compare against an even-numbered register read the register
+    // above it; the x86-64 translator's `vucomiss` template found it.
+    return fpScalar3(width, 0x1E202000, 0x1E602000, 0, rn, rm);
 }
 
 /// Convert a single scalar to double precision, or double to single
@@ -984,6 +986,52 @@ pub fn brk(imm16: u16) u32 {
     return 0xD4200000 | (@as(u32, imm16) << 5);
 }
 
+/// `dmb <option>`: a data memory barrier. The option is the four-bit CRm
+/// field, so `ish` (inner shareable, both directions) is 0b1011.
+pub fn dmb(option: u4) u32 {
+    return 0xD50330BF | (@as(u32, option) << 8);
+}
+
+/// `dmb ish`, the barrier an emulated `mfence`/`lfence`/`sfence` becomes.
+pub fn dmbIsh() u32 {
+    return dmb(0b1011);
+}
+
+// -- LSE atomics (ARMv8.1) -------------------------------------------------
+//
+// The acquire-release forms: each is a single sequentially consistent
+// read-modify-write, which is what an x86 `lock` operation is under TSO.
+// Rn must hold a naturally aligned host address.
+
+/// `casal Rs, Rt, [Rn]`: if `[Rn] == Rs` store `Rt`; Rs receives the old
+/// value either way.
+pub fn casal(width: Width, rs: Reg, rt: Reg, rn: Reg) u32 {
+    const base: u32 = if (width == .x64) 0xC8E0FC00 else 0x88E0FC00;
+    return base | (@as(u32, rs) << 16) | (@as(u32, rn) << 5) | @as(u32, rt);
+}
+
+/// `swpal Rs, Rt, [Rn]`: store Rs, Rt receives the old value.
+pub fn swpal(width: Width, rs: Reg, rt: Reg, rn: Reg) u32 {
+    const base: u32 = if (width == .x64) 0xF8E08000 else 0xB8E08000;
+    return base | (@as(u32, rs) << 16) | (@as(u32, rn) << 5) | @as(u32, rt);
+}
+
+/// `ldaddal Rs, Rt, [Rn]`: store old + Rs, Rt receives the old value.
+pub fn ldaddal(width: Width, rs: Reg, rt: Reg, rn: Reg) u32 {
+    const base: u32 = if (width == .x64) 0xF8E00000 else 0xB8E00000;
+    return base | (@as(u32, rs) << 16) | (@as(u32, rn) << 5) | @as(u32, rt);
+}
+
+test "LSE atomics match the assembler, with even and odd registers" {
+    // llvm-mc -triple=aarch64 -mattr=+lse -show-encoding
+    try std.testing.expectEqual(@as(u32, 0x88E1FC62), casal(.w32, 1, 2, 3));
+    try std.testing.expectEqual(@as(u32, 0xC8E4FCC5), casal(.x64, 4, 5, 6));
+    try std.testing.expectEqual(@as(u32, 0xB8E78128), swpal(.w32, 7, 8, 9));
+    try std.testing.expectEqual(@as(u32, 0xF8EA818B), swpal(.x64, 10, 11, 12));
+    try std.testing.expectEqual(@as(u32, 0xB8ED01EE), ldaddal(.w32, 13, 14, 15));
+    try std.testing.expectEqual(@as(u32, 0xF8F00251), ldaddal(.x64, 16, 17, 18));
+}
+
 // ---------------------------------------------------------------------------
 // Constant materialisation
 // ---------------------------------------------------------------------------
@@ -1056,6 +1104,16 @@ pub fn materialize(rd: Reg, value: u64, out: []u32) usize {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "memory barriers match the assembler" {
+    // `dmb ish` and `dmb sy`, the two options an emulated x86 fence uses.
+    try testing.expectEqual(@as(u32, 0xd5033bbf), dmbIsh());
+    try testing.expectEqual(@as(u32, 0xd5033bbf), dmb(0b1011));
+    try testing.expectEqual(@as(u32, 0xd5033fbf), dmb(0b1111));
+    // The option is the only field, so the smallest and the largest must
+    // differ in exactly the CRm bits and nowhere else.
+    try testing.expectEqual(@as(u32, 0xd50330bf), dmb(0));
+}
 
 test "add and subtract immediates match the assembler" {
     try testing.expectEqual(@as(?u32, 0x91001020), addImm(.x64, 0, 1, 4));
@@ -1282,4 +1340,407 @@ test "32-bit bitmasks stay inside 32 bits" {
     try testing.expectEqual(@as(?u64, 0xFF00), decodeBitmask(bits, .w32));
     // A value with bits above 32 has no 32-bit encoding.
     try testing.expectEqual(@as(?Bitmask, null), encodeBitmask(0x1_0000_0000, .w32));
+}
+
+// ---------------------------------------------------------------------------
+// Advanced SIMD: 128-bit vectors and the scalar FP forms the x86-64 block
+// translator uses for SSE/AVX templates. Encodings are the ARM ARM's; each
+// has a known-disassembly check in the tests below.
+// ---------------------------------------------------------------------------
+
+/// Element arrangement of a 128-bit vector, as the `size` field encodes it.
+pub const Lanes = enum(u2) {
+    b16 = 0,
+    h8 = 1,
+    s4 = 2,
+    d2 = 3,
+
+    pub fn elementBits(self: Lanes) u32 {
+        return @as(u32, 8) << @intFromEnum(self);
+    }
+};
+
+/// Floating-point element size of a 128-bit vector (`sz`).
+pub const FpLanes = enum(u1) { s4 = 0, d2 = 1 };
+
+fn vec3(base: u32, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return base | (@as(u32, rm) << 16) | (@as(u32, rn) << 5) | @as(u32, rd);
+}
+
+fn vec2(base: u32, rd: Reg, rn: Reg) u32 {
+    return base | (@as(u32, rn) << 5) | @as(u32, rd);
+}
+
+fn sizeBits(lanes: Lanes) u32 {
+    return @as(u32, @intFromEnum(lanes)) << 22;
+}
+
+fn szBit(lanes: FpLanes) u32 {
+    return @as(u32, @intFromEnum(lanes)) << 22;
+}
+
+/// `ldr qt, [xn, #offset]` (offset a multiple of 16, at most 65520).
+pub fn vldrQ(rt: Reg, rn: Reg, offset: u32) ?u32 {
+    if (offset % 16 != 0 or offset / 16 > 0xFFF) return null;
+    return 0x3DC00000 | ((offset / 16) << 10) | (@as(u32, rn) << 5) | @as(u32, rt);
+}
+
+/// `str qt, [xn, #offset]`.
+pub fn vstrQ(rt: Reg, rn: Reg, offset: u32) ?u32 {
+    if (offset % 16 != 0 or offset / 16 > 0xFFF) return null;
+    return 0x3D800000 | ((offset / 16) << 10) | (@as(u32, rn) << 5) | @as(u32, rt);
+}
+
+/// `movi vd.16b, #0`.
+pub fn vmoviZero(rd: Reg) u32 {
+    return 0x4F00E400 | @as(u32, rd);
+}
+
+/// `movi vd.16b, #imm8`.
+pub fn vmovi8(rd: Reg, imm8: u8) u32 {
+    const abc: u32 = imm8 >> 5;
+    const defgh: u32 = imm8 & 0x1F;
+    return 0x4F00E400 | (abc << 16) | (defgh << 5) | @as(u32, rd);
+}
+
+/// `fmov vd.4s, #1.0`.
+pub fn vfmovOne(rd: Reg) u32 {
+    return 0x4F03F600 | @as(u32, rd);
+}
+
+/// `movi vd.4s, #imm8, lsl #(shift * 8)` and its inverted form `mvni`.
+pub fn vmovi32(rd: Reg, imm8: u8, shift: u2, inverted: bool) u32 {
+    const abc: u32 = imm8 >> 5;
+    const defgh: u32 = imm8 & 0x1F;
+    const cmode: u32 = @as(u32, shift) << 1;
+    return 0x4F000400 | (@as(u32, @intFromBool(inverted)) << 29) | (abc << 16) | (cmode << 12) | (defgh << 5) | @as(u32, rd);
+}
+
+// Bitwise, all 16 bytes.
+pub fn vand(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x4E201C00, rd, rn, rm);
+}
+pub fn vorr(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x4EA01C00, rd, rn, rm);
+}
+pub fn veor(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x6E201C00, rd, rn, rm);
+}
+/// `bic vd, vn, vm`: vn & ~vm.
+pub fn vbic(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x4E601C00, rd, rn, rm);
+}
+/// `bsl vd, vn, vm`: vd = (vd & vn) | (~vd & vm), a lane select by mask.
+pub fn vbsl(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x6E601C00, rd, rn, rm);
+}
+pub fn vnot(rd: Reg, rn: Reg) u32 {
+    return vec2(0x6E205800, rd, rn);
+}
+pub fn vmov(rd: Reg, rn: Reg) u32 {
+    return vorr(rd, rn, rn);
+}
+
+// Integer, lane-wise.
+pub fn vadd(lanes: Lanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x4E208400 | sizeBits(lanes), rd, rn, rm);
+}
+pub fn vsub(lanes: Lanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x6E208400 | sizeBits(lanes), rd, rn, rm);
+}
+pub fn vmul(lanes: Lanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x4E209C00 | sizeBits(lanes), rd, rn, rm);
+}
+pub fn vcmeq(lanes: Lanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x6E208C00 | sizeBits(lanes), rd, rn, rm);
+}
+/// Signed greater-than.
+pub fn vcmgt(lanes: Lanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x4E203400 | sizeBits(lanes), rd, rn, rm);
+}
+pub fn vsmax(lanes: Lanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x4E206400 | sizeBits(lanes), rd, rn, rm);
+}
+pub fn vsmin(lanes: Lanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x4E206C00 | sizeBits(lanes), rd, rn, rm);
+}
+pub fn vumax(lanes: Lanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x6E206400 | sizeBits(lanes), rd, rn, rm);
+}
+pub fn vumin(lanes: Lanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x6E206C00 | sizeBits(lanes), rd, rn, rm);
+}
+pub fn vsqadd(lanes: Lanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x4E200C00 | sizeBits(lanes), rd, rn, rm);
+}
+pub fn vuqadd(lanes: Lanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x6E200C00 | sizeBits(lanes), rd, rn, rm);
+}
+pub fn vsqsub(lanes: Lanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x4E202C00 | sizeBits(lanes), rd, rn, rm);
+}
+pub fn vuqsub(lanes: Lanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x6E202C00 | sizeBits(lanes), rd, rn, rm);
+}
+/// Unsigned rounding halving add: (a + b + 1) >> 1.
+pub fn vurhadd(lanes: Lanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x6E201400 | sizeBits(lanes), rd, rn, rm);
+}
+pub fn vabs(lanes: Lanes, rd: Reg, rn: Reg) u32 {
+    return vec2(0x4E20B800 | sizeBits(lanes), rd, rn);
+}
+
+/// `shl vd, vn, #shift` with 0 <= shift < element bits.
+pub fn vshl(lanes: Lanes, rd: Reg, rn: Reg, shift: u32) u32 {
+    return vec2(0x4F005400 | ((lanes.elementBits() + shift) << 16), rd, rn);
+}
+/// `ushr vd, vn, #shift` with 1 <= shift <= element bits.
+pub fn vushr(lanes: Lanes, rd: Reg, rn: Reg, shift: u32) u32 {
+    return vec2(0x6F000400 | ((2 * lanes.elementBits() - shift) << 16), rd, rn);
+}
+/// `sshr vd, vn, #shift` with 1 <= shift <= element bits.
+pub fn vsshr(lanes: Lanes, rd: Reg, rn: Reg, shift: u32) u32 {
+    return vec2(0x4F000400 | ((2 * lanes.elementBits() - shift) << 16), rd, rn);
+}
+/// `sshll vd, vn, #0`: sign-extend the low half's elements of `source`
+/// width to twice the width (`sxtl`).
+pub fn vsxtl(source: Lanes, rd: Reg, rn: Reg) u32 {
+    return vec2(0x0F00A400 | (source.elementBits() << 16), rd, rn);
+}
+pub fn vuxtl(source: Lanes, rd: Reg, rn: Reg) u32 {
+    return vec2(0x2F00A400 | (source.elementBits() << 16), rd, rn);
+}
+/// Saturating narrow of `destination`-width lanes into the low (or, with
+/// `high`, the high) half.
+pub fn vsqxtn(destination: Lanes, high: bool, rd: Reg, rn: Reg) u32 {
+    return vec2((if (high) @as(u32, 0x4E214800) else 0x0E214800) | sizeBits(destination), rd, rn);
+}
+pub fn vuqxtn(destination: Lanes, high: bool, rd: Reg, rn: Reg) u32 {
+    return vec2((if (high) @as(u32, 0x6E214800) else 0x2E214800) | sizeBits(destination), rd, rn);
+}
+/// Signed input, unsigned saturating narrow.
+pub fn vsqxtun(destination: Lanes, high: bool, rd: Reg, rn: Reg) u32 {
+    return vec2((if (high) @as(u32, 0x6E212800) else 0x2E212800) | sizeBits(destination), rd, rn);
+}
+
+/// `ext vd.16b, vn.16b, vm.16b, #index`.
+pub fn vext(rd: Reg, rn: Reg, rm: Reg, index: u4) u32 {
+    return vec3(0x6E000000 | (@as(u32, index) << 11), rd, rn, rm);
+}
+pub fn vzip1(lanes: Lanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x4E003800 | sizeBits(lanes), rd, rn, rm);
+}
+pub fn vzip2(lanes: Lanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x4E007800 | sizeBits(lanes), rd, rn, rm);
+}
+pub fn vuzp1(lanes: Lanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x4E001800 | sizeBits(lanes), rd, rn, rm);
+}
+pub fn vtrn1(lanes: Lanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x4E002800 | sizeBits(lanes), rd, rn, rm);
+}
+pub fn vtrn2(lanes: Lanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x4E006800 | sizeBits(lanes), rd, rn, rm);
+}
+/// `tbl vd.16b, {vn.16b}, vm.16b`: out-of-range indices give zero.
+pub fn vtbl(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x4E000000, rd, rn, rm);
+}
+
+fn imm5For(lanes: Lanes, index: u32) u32 {
+    const size: u5 = @intFromEnum(lanes);
+    return (index << (size + 1)) | (@as(u32, 1) << size);
+}
+
+/// `dup vd, vn.lane[index]`.
+pub fn vdupLane(lanes: Lanes, rd: Reg, rn: Reg, index: u32) u32 {
+    return vec2(0x4E000400 | (imm5For(lanes, index) << 16), rd, rn);
+}
+/// `dup vd, wn/xn`.
+pub fn vdupGpr(lanes: Lanes, rd: Reg, rn: Reg) u32 {
+    return vec2(0x4E000C00 | (imm5For(lanes, 0) << 16), rd, rn);
+}
+/// `ins vd.lane[dst], vn.lane[src]`.
+pub fn vinsLane(lanes: Lanes, rd: Reg, dst_index: u32, rn: Reg, src_index: u32) u32 {
+    const size: u5 = @intFromEnum(lanes);
+    return vec2(0x6E000400 | (imm5For(lanes, dst_index) << 16) | ((src_index << size) << 11), rd, rn);
+}
+/// `ins vd.lane[index], wn/xn`.
+pub fn vinsGpr(lanes: Lanes, rd: Reg, index: u32, rn: Reg) u32 {
+    return vec2(0x4E001C00 | (imm5For(lanes, index) << 16), rd, rn);
+}
+/// `umov wd/xd, vn.lane[index]` (xd for 64-bit lanes).
+pub fn vumov(lanes: Lanes, rd: Reg, rn: Reg, index: u32) u32 {
+    const base: u32 = if (lanes == .d2) 0x4E003C00 else 0x0E003C00;
+    return vec2(base | (imm5For(lanes, index) << 16), rd, rn);
+}
+/// `smov xd, vn.lane[index]` for byte, halfword and word lanes.
+pub fn vsmov(lanes: Lanes, rd: Reg, rn: Reg, index: u32) u32 {
+    return vec2(0x4E002C00 | (imm5For(lanes, index) << 16), rd, rn);
+}
+
+// Floating point, lane-wise.
+pub fn vfadd(lanes: FpLanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x4E20D400 | szBit(lanes), rd, rn, rm);
+}
+pub fn vfsub(lanes: FpLanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x4EA0D400 | szBit(lanes), rd, rn, rm);
+}
+pub fn vfmul(lanes: FpLanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x6E20DC00 | szBit(lanes), rd, rn, rm);
+}
+pub fn vfdiv(lanes: FpLanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x6E20FC00 | szBit(lanes), rd, rn, rm);
+}
+pub fn vfcmeq(lanes: FpLanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x4E20E400 | szBit(lanes), rd, rn, rm);
+}
+pub fn vfcmge(lanes: FpLanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x6E20E400 | szBit(lanes), rd, rn, rm);
+}
+pub fn vfcmgt(lanes: FpLanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x6EA0E400 | szBit(lanes), rd, rn, rm);
+}
+pub fn vfsqrt(lanes: FpLanes, rd: Reg, rn: Reg) u32 {
+    return vec2(0x6EA1F800 | szBit(lanes), rd, rn);
+}
+/// Signed integer to floating point, lane-wise.
+pub fn vscvtf(lanes: FpLanes, rd: Reg, rn: Reg) u32 {
+    return vec2(0x4E21D800 | szBit(lanes), rd, rn);
+}
+/// Floating point to signed integer, toward zero, saturating.
+pub fn vfcvtzs(lanes: FpLanes, rd: Reg, rn: Reg) u32 {
+    return vec2(0x4EA1B800 | szBit(lanes), rd, rn);
+}
+pub const RoundMode = enum { nearest_even, toward_minus, toward_plus, toward_zero, nearest_away };
+pub fn vfrint(mode: RoundMode, lanes: FpLanes, rd: Reg, rn: Reg) u32 {
+    const base: u32 = switch (mode) {
+        .nearest_even => 0x4E218800,
+        .toward_minus => 0x4E219800,
+        .toward_plus => 0x4EA18800,
+        .toward_zero => 0x4EA19800,
+        .nearest_away => 0x6E218800,
+    };
+    return vec2(base | szBit(lanes), rd, rn);
+}
+/// `fcvtl vd.2d, vn.2s`: the low two singles to doubles.
+pub fn vfcvtl(rd: Reg, rn: Reg) u32 {
+    return vec2(0x0E617800, rd, rn);
+}
+/// `fcvtl2 vd.2d, vn.4s`: the upper two singles to doubles.
+pub fn vfcvtl2(rd: Reg, rn: Reg) u32 {
+    return vec2(0x4E617800, rd, rn);
+}
+/// `umull vd.2d, vn.2s, vm.2s`: the low two unsigned words of each source,
+/// multiplied into two 64-bit products.
+pub fn vumull(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x2EA0C000, rd, rn, rm);
+}
+
+test "vector widening encodings match llvm-mc" {
+    try std.testing.expectEqual(@as(u32, 0x2EA2C020), vumull(0, 1, 2));
+    try std.testing.expectEqual(@as(u32, 0x2EA5C3D1), vumull(17, 30, 5));
+    try std.testing.expectEqual(@as(u32, 0x4E617820), vfcvtl2(0, 1));
+    try std.testing.expectEqual(@as(u32, 0x0E617820), vfcvtl(0, 1));
+}
+/// `fcvtn vd.2s, vn.2d`: two doubles to singles in the low half (upper half zero).
+pub fn vfcvtn(rd: Reg, rn: Reg) u32 {
+    return vec2(0x0E616800, rd, rn);
+}
+
+// Scalar floating point and general-register transfers.
+/// `fmov sd, wn`.
+pub fn fmovSFromW(rd: Reg, rn: Reg) u32 {
+    return vec2(0x1E270000, rd, rn);
+}
+/// `fmov wd, sn`.
+pub fn fmovWFromS(rd: Reg, rn: Reg) u32 {
+    return vec2(0x1E260000, rd, rn);
+}
+/// `scvtf sd/dd, wn/xn`.
+pub fn scvtfScalar(fp: FpWidth, from_64: bool, rd: Reg, rn: Reg) u32 {
+    var base: u32 = if (fp == .single) 0x1E220000 else 0x1E620000;
+    if (from_64) base |= 0x80000000;
+    return vec2(base, rd, rn);
+}
+/// `fcvtzs wd/xd, sn/dn` (toward zero, saturating).
+pub fn fcvtzsScalar(fp: FpWidth, to_64: bool, rd: Reg, rn: Reg) u32 {
+    var base: u32 = if (fp == .single) 0x1E380000 else 0x1E780000;
+    if (to_64) base |= 0x80000000;
+    return vec2(base, rd, rn);
+}
+/// `frint<mode> sd/dd, sn/dn`.
+pub fn frintScalar(mode: RoundMode, fp: FpWidth, rd: Reg, rn: Reg) u32 {
+    var base: u32 = switch (mode) {
+        .nearest_even => 0x1E244000,
+        .toward_plus => 0x1E24C000,
+        .toward_minus => 0x1E254000,
+        .toward_zero => 0x1E25C000,
+        .nearest_away => 0x1E264000,
+    };
+    if (fp == .double) base |= 0x00400000;
+    return vec2(base, rd, rn);
+}
+/// `fcsel sd/dd, sn, sm, cond`.
+pub fn fcsel(fp: FpWidth, rd: Reg, rn: Reg, rm: Reg, cond: Cond) u32 {
+    const base: u32 = if (fp == .single) 0x1E200C00 else 0x1E600C00;
+    return base | (@as(u32, rm) << 16) | (@as(u32, @intFromEnum(cond)) << 12) | (@as(u32, rn) << 5) | @as(u32, rd);
+}
+
+test "advanced SIMD encodings match their known disassembly" {
+    try std.testing.expectEqual(@as(u32, 0x4E221C20), vand(0, 1, 2));
+    try std.testing.expectEqual(@as(u32, 0x4EA21C20), vorr(0, 1, 2));
+    try std.testing.expectEqual(@as(u32, 0x6E221C20), veor(0, 1, 2));
+    try std.testing.expectEqual(@as(u32, 0x6E621C20), vbsl(0, 1, 2));
+    try std.testing.expectEqual(@as(u32, 0x4EA28420), vadd(.s4, 0, 1, 2));
+    try std.testing.expectEqual(@as(u32, 0x4E22D420), vfadd(.s4, 0, 1, 2));
+    try std.testing.expectEqual(@as(u32, 0x6E22DC20), vfmul(.s4, 0, 1, 2));
+    try std.testing.expectEqual(@as(u32, 0x4E22E420), vfcmeq(.s4, 0, 1, 2));
+    try std.testing.expectEqual(@as(u32, 0x6EA2E420), vfcmgt(.s4, 0, 1, 2));
+    try std.testing.expectEqual(@as(u32, 0x6EA28C20), vcmeq(.s4, 0, 1, 2));
+    try std.testing.expectEqual(@as(u32, 0x4EA23420), vcmgt(.s4, 0, 1, 2));
+    try std.testing.expectEqual(@as(u32, 0x4F00E400), vmoviZero(0));
+    try std.testing.expectEqual(@as(u32, 0x4F046400), vmovi32(0, 0x80, 3, false));
+    try std.testing.expectEqual(@as(u32, 0x6F046400), vmovi32(0, 0x80, 3, true));
+    try std.testing.expectEqual(@as(u32, 0x3DC00020), vldrQ(0, 1, 0).?);
+    try std.testing.expectEqual(@as(u32, 0x3D800420), vstrQ(0, 1, 16).?);
+    try std.testing.expect(vldrQ(0, 1, 8) == null);
+    try std.testing.expectEqual(@as(u32, 0x6E022020), vext(0, 1, 2, 4));
+    try std.testing.expectEqual(@as(u32, 0x4E823820), vzip1(.s4, 0, 1, 2));
+    try std.testing.expectEqual(@as(u32, 0x4E0C0420), vdupLane(.s4, 0, 1, 1));
+    try std.testing.expectEqual(@as(u32, 0x0E0C3C20), vumov(.s4, 0, 1, 1));
+    try std.testing.expectEqual(@as(u32, 0x4E183C20), vumov(.d2, 0, 1, 1));
+    try std.testing.expectEqual(@as(u32, 0x4E0C1C20), vinsGpr(.s4, 0, 1, 1));
+    try std.testing.expectEqual(@as(u32, 0x4E21D820), vscvtf(.s4, 0, 1));
+    try std.testing.expectEqual(@as(u32, 0x4EA1B820), vfcvtzs(.s4, 0, 1));
+    try std.testing.expectEqual(@as(u32, 0x6EA1F820), vfsqrt(.s4, 0, 1));
+    try std.testing.expectEqual(@as(u32, 0x4F235420), vshl(.s4, 0, 1, 3));
+    try std.testing.expectEqual(@as(u32, 0x6F3D0420), vushr(.s4, 0, 1, 3));
+    try std.testing.expectEqual(@as(u32, 0x0F08A420), vsxtl(.b16, 0, 1));
+    try std.testing.expectEqual(@as(u32, 0x0E614820), vsqxtn(.h8, false, 0, 1));
+    try std.testing.expectEqual(@as(u32, 0x4E614820), vsqxtn(.h8, true, 0, 1));
+    try std.testing.expectEqual(@as(u32, 0x0E617820), vfcvtl(0, 1));
+    try std.testing.expectEqual(@as(u32, 0x0E616820), vfcvtn(0, 1));
+    try std.testing.expectEqual(@as(u32, 0x4E218820), vfrint(.nearest_even, .s4, 0, 1));
+    try std.testing.expectEqual(@as(u32, 0x6E205820), vnot(0, 1));
+    try std.testing.expectEqual(@as(u32, 0x4EA0B820), vabs(.s4, 0, 1));
+    try std.testing.expectEqual(@as(u32, 0x6E221420), vurhadd(.b16, 0, 1, 2));
+    try std.testing.expectEqual(@as(u32, 0x4E620C20), vsqadd(.h8, 0, 1, 2));
+    try std.testing.expectEqual(@as(u32, 0x4EA29C20), vmul(.s4, 0, 1, 2));
+    try std.testing.expectEqual(@as(u32, 0x4E020020), vtbl(0, 1, 2));
+    try std.testing.expectEqual(@as(u32, 0x4F04E5E3), vmovi8(3, 0x8F));
+    try std.testing.expectEqual(@as(u32, 0x4F03F600), vfmovOne(0));
+    try std.testing.expectEqual(@as(u32, 0x4E822820), vtrn1(.s4, 0, 1, 2));
+    try std.testing.expectEqual(@as(u32, 0x4E826820), vtrn2(.s4, 0, 1, 2));
+    try std.testing.expectEqual(@as(u32, 0x1E270020), fmovSFromW(0, 1));
+    try std.testing.expectEqual(@as(u32, 0x1E260020), fmovWFromS(0, 1));
+    try std.testing.expectEqual(@as(u32, 0x1E220020), scvtfScalar(.single, false, 0, 1));
+    try std.testing.expectEqual(@as(u32, 0x9E620020), scvtfScalar(.double, true, 0, 1));
+    try std.testing.expectEqual(@as(u32, 0x1E380020), fcvtzsScalar(.single, false, 0, 1));
+    try std.testing.expectEqual(@as(u32, 0x9E780020), fcvtzsScalar(.double, true, 0, 1));
+    try std.testing.expectEqual(@as(u32, 0x1E244020), frintScalar(.nearest_even, .single, 0, 1));
+    try std.testing.expectEqual(@as(u32, 0x1E65C020), frintScalar(.toward_zero, .double, 0, 1));
+    try std.testing.expectEqual(@as(u32, 0x1E220C20), fcsel(.single, 0, 1, 2, .eq));
+    try std.testing.expectEqual(@as(u32, 0x1E222020), fcmp(.single, 1, 2));
+    try std.testing.expectEqual(@as(u32, 0x1E602000), fcmp(.double, 0, 0));
 }
