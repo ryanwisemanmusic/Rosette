@@ -140,6 +140,20 @@ pub const Milestone = struct {
 pub const milestones = [_]Milestone{
     // ---- guest output: bring-up, then the title, then the picture ----
     .{
+        .mangled = "_ZN2xe3app11EmulatorApp14EmulatorThreadEv",
+        .readable = "EmulatorApp::EmulatorThread",
+        .owner = .xenia_emulator,
+        .chain = .guest_output,
+        .proves = "Xenia's dedicated emulator startup thread began; this distinguishes a thread-creation failure from a subsystem setup that has not returned",
+    },
+    .{
+        .mangled = "_ZN2xe8Emulator5SetupEPNS_2ui6WindowEPNS1_11ImGuiDrawerEbSt8functionIFSt10unique_ptrINS_3apu11AudioSystemESt14default_deleteIS9_EEPNS_3cpu9ProcessorEEES6_IFS7_INS_3gpu14GraphicsSystemESA_ISJ_EEvEES6_IFSt6vectorIS7_INS_3hid11InputDriverESA_ISQ_EESaISS_EES3_EE",
+        .readable = "Emulator::Setup",
+        .owner = .xenia_emulator,
+        .chain = .guest_output,
+        .proves = "the complete Xenia subsystem bootstrap was entered; Rosette records its X_STATUS on return so a missing presenter callback can be separated into setup-in-progress, setup-failure, or successful-setup cases",
+    },
+    .{
         .mangled = "_ZN2xe3gpu6vulkan20VulkanGraphicsSystem5SetupEPNS_3cpu9ProcessorEPNS_6kernel11KernelStateEPNS_2ui18WindowedAppContextEb",
         .readable = "VulkanGraphicsSystem::Setup",
         .owner = .xenia_emulator,
@@ -545,6 +559,71 @@ pub const milestones = [_]Milestone{
     },
     // ---- UI: entry is not completion; the processor captures selected returns ----
     .{
+        .mangled = "_ZN2xe2ui18WindowedAppContext14CallInUIThreadESt8functionIFvvEE",
+        .readable = "WindowedAppContext::CallInUIThread",
+        .owner = .xenia_emulator,
+        .chain = .ui_output,
+        .proxy_only = true,
+        .proves = "Xenia requested that work be marshaled to its UI thread; the deferred variant and Win32 message ledger show whether that request was posted and dispatched",
+    },
+    .{
+        .mangled = "_ZN2xe2ui18WindowedAppContext22CallInUIThreadDeferredESt8functionIFvvEE",
+        .readable = "WindowedAppContext::CallInUIThreadDeferred",
+        .owner = .xenia_emulator,
+        .chain = .ui_output,
+        .proxy_only = true,
+        .proves = "Xenia entered the asynchronous UI-thread queue path; its captured bool return says whether the request was accepted",
+    },
+    .{
+        .mangled = "_ZN2xe3app14EmulatorWindow36SetupGraphicsSystemPresenterPaintingEv",
+        .readable = "EmulatorWindow::SetupGraphicsSystemPresenterPainting",
+        .owner = .xenia_ui_thread,
+        .chain = .ui_output,
+        .proxy_only = true,
+        .proves = "Xenia's post-Emulator::Setup UI callback began. This is the point that should fetch the graphics presenter and attach it to the already-open window; no entry means the callback was not delivered or setup has not reached it",
+    },
+    .{
+        .mangled = "_ZNK2xe3app14EmulatorWindow26GetGraphicsSystemPresenterEv",
+        .readable = "EmulatorWindow::GetGraphicsSystemPresenter",
+        .owner = .xenia_ui_thread,
+        .chain = .ui_output,
+        .proxy_only = true,
+        .proves = "the presenter-setup callback asked the graphics system for its presenter; the paired return snapshot records whether that pointer was null",
+    },
+    .{
+        .mangled = "_ZN2xe2ui6Window12SetPresenterEPNS0_9PresenterE",
+        .readable = "Window::SetPresenter",
+        .owner = .xenia_ui_thread,
+        .chain = .ui_output,
+        .proxy_only = true,
+        .proves = "Xenia attempted to associate a presenter with the window; the first bounded argument snapshots distinguish detach from attach",
+    },
+    .{
+        .mangled = "_ZN2xe2ui11Win32Window17CreateSurfaceImplEj",
+        .readable = "Win32Window::CreateSurfaceImpl",
+        .owner = .xenia_ui_thread,
+        .chain = .ui_output,
+        .proxy_only = true,
+        .proves = "the open Win32 window attempted to create its native surface. If SetPresenter ran but this did not, Xenia's inline Window::CreateSurface rejected the current window phase or the presenter was already attached",
+    },
+    .{
+        .mangled = "_ZN2xe2ui9Presenter28SetWindowSurfaceFromUIThreadEPNS0_6WindowEPNS0_7SurfaceE",
+        .readable = "Presenter::SetWindowSurfaceFromUIThread",
+        .owner = .xenia_ui_thread,
+        .chain = .ui_output,
+        .proxy_only = true,
+        .proves = "Xenia passed the window and resulting surface into the presenter; a null surface here separates native-window creation from Vulkan surface creation",
+    },
+    .{
+        .mangled = "_ZN2xe2ui6vulkan15VulkanPresenter47ConnectOrReconnectPaintingToSurfaceFromUIThreadERNS0_7SurfaceEjjbRb",
+        .readable = "VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread",
+        .owner = .xenia_ui_thread,
+        .chain = .ui_output,
+        .proxy_only = true,
+        .proves = "the Vulkan presenter began connecting to Xenia's surface; if this runs but the Rosette surface-dispatch counter stays zero, inspect Xenia's surface-type/support branch before the Vulkan entry point",
+    },
+    // ---- UI painting, after the window and presenter connection ----
+    .{
         .mangled = "_ZN11ImFontAtlas18GetTexDataAsRGBA32EPPhPiS2_S2_",
         .readable = "ImFontAtlas::GetTexDataAsRGBA32",
         .owner = .xenia_ui_thread,
@@ -688,6 +767,40 @@ test "the milestone that explains a black window is present and owned by the tit
 
     const swap = find("_ZN2xe3gpu6vulkan22VulkanCommandProcessor9IssueSwapEjjj").?;
     try std.testing.expectEqual(Owner.guest_title, swap.owner);
+}
+
+test "presenter attach milestones cover the Xenia UI-to-Vulkan surface boundary" {
+    const attach = [_][]const u8{
+        "_ZN2xe3app14EmulatorWindow36SetupGraphicsSystemPresenterPaintingEv",
+        "_ZNK2xe3app14EmulatorWindow26GetGraphicsSystemPresenterEv",
+        "_ZN2xe2ui6Window12SetPresenterEPNS0_9PresenterE",
+        "_ZN2xe2ui11Win32Window17CreateSurfaceImplEj",
+        "_ZN2xe2ui9Presenter28SetWindowSurfaceFromUIThreadEPNS0_6WindowEPNS0_7SurfaceE",
+        "_ZN2xe2ui6vulkan15VulkanPresenter47ConnectOrReconnectPaintingToSurfaceFromUIThreadERNS0_7SurfaceEjjbRb",
+    };
+    var previous_index: ?usize = null;
+    for (attach) |mangled| {
+        const index = indexOf(mangled) orelse return error.MissingPresenterAttachMilestone;
+        const milestone = milestones[index];
+        try std.testing.expectEqual(Owner.xenia_ui_thread, milestone.owner);
+        try std.testing.expectEqual(Chain.ui_output, milestone.chain);
+        try std.testing.expect(milestone.proxy_only);
+        if (previous_index) |previous| try std.testing.expect(previous < index);
+        previous_index = index;
+    }
+}
+
+test "emulator setup and UI marshaling milestones cover the pre-presenter handoff" {
+    const setup = find("_ZN2xe8Emulator5SetupEPNS_2ui6WindowEPNS1_11ImGuiDrawerEbSt8functionIFSt10unique_ptrINS_3apu11AudioSystemESt14default_deleteIS9_EEPNS_3cpu9ProcessorEEES6_IFS7_INS_3gpu14GraphicsSystemESA_ISJ_EEvEES6_IFSt6vectorIS7_INS_3hid11InputDriverESA_ISQ_EESaISS_EES3_EE").?;
+    try std.testing.expectEqual(Owner.xenia_emulator, setup.owner);
+    try std.testing.expectEqual(Chain.guest_output, setup.chain);
+
+    const call_ui = find("_ZN2xe2ui18WindowedAppContext14CallInUIThreadESt8functionIFvvEE").?;
+    const deferred = find("_ZN2xe2ui18WindowedAppContext22CallInUIThreadDeferredESt8functionIFvvEE").?;
+    try std.testing.expectEqual(Chain.ui_output, call_ui.chain);
+    try std.testing.expectEqual(Chain.ui_output, deferred.chain);
+    try std.testing.expect(call_ui.proxy_only);
+    try std.testing.expect(deferred.proxy_only);
 }
 
 test "the audio chain starts with the title, not with the backend" {
