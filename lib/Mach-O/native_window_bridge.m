@@ -108,6 +108,7 @@ static NSApplication *g_application;
 static NSWindow *g_window;
 static RosetteMachOMetalView *g_view;
 static CAMetalLayer *g_metal_layer;
+static _Atomic(uintptr_t) g_native_metal_layer_pointer = ATOMIC_VAR_INIT(0);
 static id<MTLDevice> g_metal_device;
 static id<MTLCommandQueue> g_metal_command_queue;
 static uint32_t g_width = 1280;
@@ -121,6 +122,8 @@ static const uint32_t kRosetteLockedWindowHeight = 720u;
 static uint32_t g_events_pumped;
 static BOOL g_fullscreen;
 static BOOL g_reported_off_main_thread;
+static RosetteMachOMainThreadRequestHook g_main_thread_request_hook;
+static uint64_t g_off_main_thread_requests;
 static uint64_t g_diagnostic_frames_presented;
 static uint64_t g_guest_frames_presented;
 static uint64_t g_foreground_reassertions;
@@ -571,21 +574,53 @@ static void RosetteMachOShowWindowOnMainThread(const char *reason) {
 
 static void RosetteMachORunOnMainThreadSync(dispatch_block_t block) {
   if (![NSThread isMainThread]) {
+    __atomic_add_fetch(&g_off_main_thread_requests, 1, __ATOMIC_RELAXED);
     if (!g_reported_off_main_thread) {
       fprintf(stderr,
               "macho-processor: native AppKit bridge marshaling an off-main-"
-              "thread request to the main runloop\n");
+              "thread request to the main runloop; the main thread serves "
+              "such requests from inside its waits, so a guest thread holding "
+              "a lock cannot deadlock it\n");
       g_reported_off_main_thread = YES;
     }
     // A Vulkan Metal-surface request can originate from a guest worker while
-    // the cooperative scheduler has parked the guest UI continuation.  AppKit
-    // and CAMetalLayer must still be touched on the host main runloop.  Do not
-    // silently drop that request: dispatch it synchronously so its completion
-    // is observed before the guest worker is allowed to continue.
+    // the guest UI thread runs, or waits, on the main thread. AppKit and
+    // CAMetalLayer must still be touched there. Dispatch synchronously so the
+    // worker observes completion - and tell the processor first: the main
+    // thread may be parked on a lock this worker holds, and on 2026-09-25 it
+    // was, and neither thread ever moved again. The hook cuts the main
+    // thread's park short so it drains this queue from inside the wait.
+    RosetteMachOMainThreadRequestHook hook =
+        __atomic_load_n(&g_main_thread_request_hook, __ATOMIC_ACQUIRE);
+    if (hook) hook(0);
     dispatch_sync(dispatch_get_main_queue(), block);
+    if (hook) hook(1);
     return;
   }
   block();
+}
+
+void rosette_macho_native_set_main_thread_request_hook(
+    RosetteMachOMainThreadRequestHook hook) {
+  __atomic_store_n(&g_main_thread_request_hook, hook, __ATOMIC_RELEASE);
+}
+
+uint32_t rosette_macho_native_service_main_queue(void) {
+  if (![NSThread isMainThread]) {
+    return 0;
+  }
+  uint32_t handled = 0;
+  @autoreleasepool {
+    // A zero-second pass handles every source that is already signalled -
+    // the main dispatch queue among them - and returns at once. It does not
+    // dequeue NSEvents: input stays with the message pump.
+    while (handled < 16 &&
+           CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true) ==
+               kCFRunLoopRunHandledSource) {
+      ++handled;
+    }
+  }
+  return handled;
 }
 
 // Whether a VkSwapchainKHR is live on the layer.
@@ -911,6 +946,13 @@ static BOOL RosetteMachOEnsureWindowOnMainThread(uint32_t width,
   g_metal_layer.maximumDrawableCount = 3;
   g_window.contentView = g_view;
   g_window.initialFirstResponder = g_view;
+  // Publish only after the layer is attached and has a Metal device. The
+  // guest Vulkan surface adapter reads this pointer from worker threads; the
+  // native layer has process lifetime and the acquire/release pair avoids an
+  // AppKit status round trip on that hot handoff.
+  atomic_store_explicit(
+      &g_native_metal_layer_pointer,
+      (uintptr_t)(__bridge void *)g_metal_layer, memory_order_release);
   pthread_mutex_lock(&g_keyboard_lock);
   g_keyboard_window_available = YES;
   pthread_mutex_unlock(&g_keyboard_lock);
@@ -918,6 +960,11 @@ static BOOL RosetteMachOEnsureWindowOnMainThread(uint32_t width,
   RosetteMachOUpdateMetalDrawable();
   RosetteMachOShowWindowOnMainThread("created");
   return YES;
+}
+
+uintptr_t rosette_macho_native_window_metal_layer_pointer(void) {
+  return atomic_load_explicit(&g_native_metal_layer_pointer,
+                              memory_order_acquire);
 }
 
 int rosette_macho_native_application_ensure(void) {
@@ -1823,6 +1870,8 @@ void rosette_macho_native_window_shutdown(void) {
         [g_window toggleFullScreen:nil];
       }
       [g_window orderOut:nil];
+      atomic_store_explicit(&g_native_metal_layer_pointer, 0,
+                            memory_order_release);
       g_metal_layer.device = nil;
       g_window.contentView = nil;
       g_metal_command_queue = nil;

@@ -137,6 +137,10 @@ int rosette_macho_native_window_show(void);
 int rosette_macho_native_window_hide(void);
 int rosette_macho_native_window_set_fullscreen(int fullscreen);
 int rosette_macho_native_window_attach_metal_layer(void);
+// Lock-free read of the layer published after it is attached to the native
+// window. Vulkan surface creation may run on a guest worker; it must not
+// synchronously ask AppKit for a status snapshot just to obtain this pointer.
+uintptr_t rosette_macho_native_window_metal_layer_pointer(void);
 // Hand the CAMetalLayer's drawableSize to the Vulkan driver, or take it back.
 //
 // A CAMetalLayer's drawableSize belongs to whoever vends its drawables. Once
@@ -196,6 +200,21 @@ uint32_t rosette_macho_native_window_capture_frame(
 uint32_t rosette_macho_native_window_pump_events(void);
 RosetteMachONativeWindowStatus rosette_macho_native_window_status(void);
 void rosette_macho_native_window_shutdown(void);
+
+// Run what other threads have queued for the main thread - AppKit requests
+// that guest workers dispatch_sync to it - without dequeuing input events.
+// Returns the number of run-loop sources handled; zero off the main thread.
+// The main thread calls this from every wait, so no wait keeps it away from
+// those requests (lib/concurrency/park.zig).
+uint32_t rosette_macho_native_service_main_queue(void);
+
+// Called around every off-main-thread request: phase 0 just before the
+// dispatch_sync, phase 1 after it returns. The processor uses it to cut the
+// main thread's current park short and to record the waiting thread for the
+// stall watchdog.
+typedef void (*RosetteMachOMainThreadRequestHook)(int phase);
+void rosette_macho_native_set_main_thread_request_hook(
+    RosetteMachOMainThreadRequestHook hook);
 
 #ifdef __cplusplus
 }
