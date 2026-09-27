@@ -3,6 +3,18 @@ const scheduler = @import("scheduler");
 const machoCapturePrint = @import("event_log").machoCapturePrint;
 const wait_policy = @import("xenia_wait_handshake_policy");
 
+/// Return the architectural register file belonging to this host executor's
+/// bound guest context, or the traditional owner register file when the
+/// caller uses a standalone state value.
+fn guestRegs(state: anytype) if (@typeInfo(@TypeOf(state)).pointer.is_const)
+    *const @FieldType(@TypeOf(state.*), "regs")
+else
+    *@FieldType(@TypeOf(state.*), "regs") {
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "windowsGuestContextField")) return state.windowsGuestContextField("regs");
+    return &@field(state.*, "regs");
+}
+
 const CURRENT_THREAD_HANDLE: u64 = 0x7FFF_1000;
 const SYNTHETIC_THREAD_BASE: u64 = 0x7FFF_2000;
 const MAX_ATTRIBUTES = 32;
@@ -220,14 +232,14 @@ pub const Runtime = struct {
 
     pub fn dispatch(self: *Runtime, state: anytype, name: []const u8) ?Outcome {
         if (std.mem.eql(u8, name, "_pthread_self")) return .{ .handled = self.currentThreadHandle(state) };
-        if (std.mem.eql(u8, name, "_pthread_equal")) return .{ .handled = @intFromBool(state.regs.rdi == state.regs.rsi) };
+        if (std.mem.eql(u8, name, "_pthread_equal")) return .{ .handled = @intFromBool(guestRegs(state).*.rdi == guestRegs(state).*.rsi) };
         if (std.mem.eql(u8, name, "_pthread_threadid_np")) return .{ .handled = self.threadId(state) };
         if (std.mem.eql(u8, name, "_pthread_attr_init")) return .{ .handled = self.attributeInit(state) };
-        if (std.mem.eql(u8, name, "_pthread_attr_destroy")) return .{ .handled = self.attributeDestroy(state.regs.rdi) };
-        if (std.mem.eql(u8, name, "_pthread_attr_setstacksize")) return .{ .handled = self.attributeSetStackSize(state.regs.rdi, state.regs.rsi) };
+        if (std.mem.eql(u8, name, "_pthread_attr_destroy")) return .{ .handled = self.attributeDestroy(guestRegs(state).*.rdi) };
+        if (std.mem.eql(u8, name, "_pthread_attr_setstacksize")) return .{ .handled = self.attributeSetStackSize(guestRegs(state).*.rdi, guestRegs(state).*.rsi) };
         if (std.mem.eql(u8, name, "_pthread_create")) return .{ .handled = self.create(state) };
         if (std.mem.eql(u8, name, "_pthread_join")) return .{ .handled = self.join(state) };
-        if (std.mem.eql(u8, name, "_pthread_cancel")) return .{ .handled = self.cancel(state.regs.rdi) };
+        if (std.mem.eql(u8, name, "_pthread_cancel")) return .{ .handled = self.cancel(guestRegs(state).*.rdi) };
         if (std.mem.eql(u8, name, "_pthread_setname_np") or
             std.mem.eql(u8, name, "_pthread_setschedparam")) return .{ .handled = 0 };
         if (std.mem.eql(u8, name, "_pthread_yield_np") or
@@ -239,29 +251,29 @@ pub const Runtime = struct {
         if (std.mem.eql(u8, name, "_pthread_getname_np")) return .{ .handled = self.getName(state) };
         if (std.mem.eql(u8, name, "_pthread_getschedparam")) return .{ .handled = self.getSchedule(state) };
         if (std.mem.eql(u8, name, "_pthread_key_create")) return .{ .handled = self.tlsKeyCreate(state) };
-        if (std.mem.eql(u8, name, "_pthread_key_delete")) return .{ .handled = self.tlsKeyDelete(state.regs.rdi) };
-        if (std.mem.eql(u8, name, "_pthread_getspecific")) return .{ .handled = self.tlsGet(self.currentThreadHandle(state), state.regs.rdi) };
+        if (std.mem.eql(u8, name, "_pthread_key_delete")) return .{ .handled = self.tlsKeyDelete(guestRegs(state).*.rdi) };
+        if (std.mem.eql(u8, name, "_pthread_getspecific")) return .{ .handled = self.tlsGet(self.currentThreadHandle(state), guestRegs(state).*.rdi) };
         if (std.mem.eql(u8, name, "_pthread_setspecific")) {
-            return .{ .handled = self.tlsSet(self.currentThreadHandle(state), state.regs.rdi, state.regs.rsi) };
+            return .{ .handled = self.tlsSet(self.currentThreadHandle(state), guestRegs(state).*.rdi, guestRegs(state).*.rsi) };
         }
         if (std.mem.eql(u8, name, "_pthread_mutex_init")) return .{ .handled = self.mutexInit(state) };
-        if (std.mem.eql(u8, name, "_pthread_mutex_destroy")) return .{ .handled = self.mutexDestroy(state.regs.rdi) };
-        if (std.mem.eql(u8, name, "_pthread_mutex_lock")) return .{ .handled = self.mutexLockForThread(state.regs.rdi, self.currentThreadHandle(state)) };
-        if (std.mem.eql(u8, name, "_pthread_mutex_trylock")) return .{ .handled = self.mutexTryLockForThread(state.regs.rdi, self.currentThreadHandle(state)) };
-        if (std.mem.eql(u8, name, "_pthread_mutex_unlock")) return .{ .handled = self.mutexUnlockForThread(state.regs.rdi, self.currentThreadHandle(state)) };
+        if (std.mem.eql(u8, name, "_pthread_mutex_destroy")) return .{ .handled = self.mutexDestroy(guestRegs(state).*.rdi) };
+        if (std.mem.eql(u8, name, "_pthread_mutex_lock")) return .{ .handled = self.mutexLockForThread(guestRegs(state).*.rdi, self.currentThreadHandle(state)) };
+        if (std.mem.eql(u8, name, "_pthread_mutex_trylock")) return .{ .handled = self.mutexTryLockForThread(guestRegs(state).*.rdi, self.currentThreadHandle(state)) };
+        if (std.mem.eql(u8, name, "_pthread_mutex_unlock")) return .{ .handled = self.mutexUnlockForThread(guestRegs(state).*.rdi, self.currentThreadHandle(state)) };
         if (std.mem.eql(u8, name, "_pthread_cond_init")) return .{ .handled = self.condvarInitialize(state) };
-        if (std.mem.eql(u8, name, "_pthread_cond_destroy")) return .{ .handled = self.condvarDestroy(state.regs.rdi) };
+        if (std.mem.eql(u8, name, "_pthread_cond_destroy")) return .{ .handled = self.condvarDestroy(guestRegs(state).*.rdi) };
         if (std.mem.eql(u8, name, "_pthread_cond_signal")) {
             self.condition_notifications +|= 1;
-            self.noteNotifier(state.regs.rdi, self.currentThreadHandle(state), state.regs.rip, schedulerStep(state));
-            self.condvarSignal(state.regs.rdi);
+            self.noteNotifier(guestRegs(state).*.rdi, self.currentThreadHandle(state), guestRegs(state).*.rip, schedulerStep(state));
+            self.condvarSignal(guestRegs(state).*.rdi);
             return .{ .handled = 0 };
         }
         if (std.mem.eql(u8, name, "_pthread_cond_broadcast")) {
             self.condition_notifications +|= 1;
             self.condition_broadcasts +|= 1;
-            self.noteNotifier(state.regs.rdi, self.currentThreadHandle(state), state.regs.rip, schedulerStep(state));
-            self.condvarBroadcast(state.regs.rdi);
+            self.noteNotifier(guestRegs(state).*.rdi, self.currentThreadHandle(state), guestRegs(state).*.rip, schedulerStep(state));
+            self.condvarBroadcast(guestRegs(state).*.rdi);
             return .{ .handled = 0 };
         }
         if (std.mem.eql(u8, name, "_pthread_cond_wait")) {
@@ -283,15 +295,15 @@ pub const Runtime = struct {
         const owner = self.currentThreadHandle(state);
         if (std.mem.indexOf(u8, name, "condition_variable10notify_one") != null) {
             self.condition_notifications +|= 1;
-            self.noteNotifier(state.regs.rdi, owner, state.regs.rip, schedulerStep(state));
-            self.condvarSignal(state.regs.rdi);
+            self.noteNotifier(guestRegs(state).*.rdi, owner, guestRegs(state).*.rip, schedulerStep(state));
+            self.condvarSignal(guestRegs(state).*.rdi);
             return .handled_void;
         }
         if (std.mem.indexOf(u8, name, "condition_variable10notify_all") != null) {
             self.condition_notifications +|= 1;
             self.condition_broadcasts +|= 1;
-            self.noteNotifier(state.regs.rdi, owner, state.regs.rip, schedulerStep(state));
-            self.condvarBroadcast(state.regs.rdi);
+            self.noteNotifier(guestRegs(state).*.rdi, owner, guestRegs(state).*.rip, schedulerStep(state));
+            self.condvarBroadcast(guestRegs(state).*.rdi);
             return .handled_void;
         }
         if (std.mem.eql(u8, name, "__ZNSt3__119__shared_mutex_baseC1Ev")) {
@@ -304,28 +316,28 @@ pub const Runtime = struct {
             return .{ .handled = self.recursiveMutexInit(state) };
         }
         if (std.mem.indexOf(u8, name, "recursive_mutex4lockEv") != null) {
-            return .{ .handled = self.mutexLockForThread(state.regs.rdi, owner) };
+            return .{ .handled = self.mutexLockForThread(guestRegs(state).*.rdi, owner) };
         }
         if (std.mem.indexOf(u8, name, "recursive_mutex6unlockEv") != null) {
-            return .{ .handled = self.mutexUnlockForThread(state.regs.rdi, owner) };
+            return .{ .handled = self.mutexUnlockForThread(guestRegs(state).*.rdi, owner) };
         }
         if (std.mem.indexOf(u8, name, "recursive_mutex8try_lockEv") != null) {
-            return .{ .handled = @intFromBool(self.mutexTryLockForThread(state.regs.rdi, owner) == 0) };
+            return .{ .handled = @intFromBool(self.mutexTryLockForThread(guestRegs(state).*.rdi, owner) == 0) };
         }
         if (std.mem.indexOf(u8, name, "recursive_mutexD1Ev") != null or
             std.mem.indexOf(u8, name, "recursive_mutexD2Ev") != null)
         {
-            self.recursiveMutexDestroy(state.regs.rdi);
+            self.recursiveMutexDestroy(guestRegs(state).*.rdi);
             return .handled_void;
         }
         if (std.mem.eql(u8, name, "__ZNSt3__15mutex4lockEv")) {
-            return .{ .handled = self.mutexLockForThread(state.regs.rdi, owner) };
+            return .{ .handled = self.mutexLockForThread(guestRegs(state).*.rdi, owner) };
         }
         if (std.mem.eql(u8, name, "__ZNSt3__15mutex6unlockEv")) {
-            return .{ .handled = self.mutexUnlockForThread(state.regs.rdi, owner) };
+            return .{ .handled = self.mutexUnlockForThread(guestRegs(state).*.rdi, owner) };
         }
         if (std.mem.eql(u8, name, "__ZNSt3__15mutex8try_lockEv")) {
-            return .{ .handled = @intFromBool(self.mutexTryLockForThread(state.regs.rdi, owner) == 0) };
+            return .{ .handled = @intFromBool(self.mutexTryLockForThread(guestRegs(state).*.rdi, owner) == 0) };
         }
         return null;
     }
@@ -706,7 +718,7 @@ pub const Runtime = struct {
     /// the import is re-entered and returns success. An unavailable
     /// cooperative context is never reported as a completed join.
     pub fn beginJoin(self: *Runtime, state: anytype) JoinDecision {
-        const target_handle = state.regs.rdi;
+        const target_handle = guestRegs(state).*.rdi;
         const caller_handle = self.currentThreadHandle(state);
         if (target_handle == 0 or target_handle == caller_handle) return .invalid;
         const target = self.threadForHandle(target_handle) orelse return .unavailable;
@@ -717,7 +729,7 @@ pub const Runtime = struct {
         }
         caller.state = .waiting_join;
         caller.blocked_since_step = schedulerStep(state);
-        caller.blocked_rip = state.regs.rip;
+        caller.blocked_rip = guestRegs(state).*.rip;
         caller.blocked_reason = "pthread_join";
         caller.waiting_join_target = target_handle;
         caller.wait_result = .pending;
@@ -743,13 +755,13 @@ pub const Runtime = struct {
     }
 
     fn tlsKeyCreate(self: *Runtime, state: anytype) u64 {
-        if (state.regs.rdi == 0 or state.guestMemory(state.regs.rdi, 8) == null) return 14;
+        if (guestRegs(state).*.rdi == 0 or state.guestMemory(guestRegs(state).*.rdi, 8) == null) return 14;
         if (self.next_tls_key >= MAX_TLS_KEYS) return 11;
         const key = self.next_tls_key;
         self.next_tls_key += 1;
         self.tls_keys |= @as(u64, 1) << @intCast(key);
-        self.tls_destructors[@intCast(key)] = state.regs.rsi;
-        state.write64(state.regs.rdi, key);
+        self.tls_destructors[@intCast(key)] = guestRegs(state).*.rsi;
+        state.write64(guestRegs(state).*.rdi, key);
         self.tls_key_creates +|= 1;
         return 0;
     }
@@ -810,20 +822,20 @@ pub const Runtime = struct {
     /// owns its mutex.
     pub fn beginCooperativeCondvarWait(self: *Runtime, state: anytype, timed_wait: bool) bool {
         const handle = self.currentThreadHandle(state);
-        const cond_addr = state.regs.rdi;
-        const mutex_addr = state.regs.rsi;
+        const cond_addr = guestRegs(state).*.rdi;
+        const mutex_addr = guestRegs(state).*.rsi;
         const deadline = if (timed_wait) pthreadDeadlineNanoseconds(state) else 0;
         return self.beginCooperativeWait(state, handle, cond_addr, mutex_addr, deadline);
     }
 
     pub fn beginCooperativeCppCondvarWait(self: *Runtime, state: anytype, timed_wait: bool) bool {
         const handle = self.currentThreadHandle(state);
-        const cond_addr = state.regs.rdi;
-        const unique_lock = state.regs.rsi;
+        const cond_addr = guestRegs(state).*.rdi;
+        const unique_lock = guestRegs(state).*.rsi;
         const mutex_addr = readGuestU64(state, unique_lock) orelse return false;
         if (mutex_addr == 0) return false;
         const deadline = if (timed_wait) cppDeadlineNanoseconds(state) else 0;
-        if (timed_wait and state.regs.rdx == cpp_infinite_time_point) {
+        if (timed_wait and guestRegs(state).*.rdx == cpp_infinite_time_point) {
             self.cpp_indefinite_waits_started +|= 1;
         }
         return self.beginCooperativeWait(state, handle, cond_addr, mutex_addr, deadline);
@@ -851,7 +863,7 @@ pub const Runtime = struct {
             }
             waiting_thread.state = .waiting_condvar;
             waiting_thread.blocked_since_step = schedulerStep(state);
-            waiting_thread.blocked_rip = state.regs.rip;
+            waiting_thread.blocked_rip = guestRegs(state).*.rip;
             waiting_thread.blocked_reason = "pthread_cond_wait";
             waiting_thread.waiting_condvar = cond_addr;
             waiting_thread.waiting_mutex = mutex_addr;
@@ -868,7 +880,7 @@ pub const Runtime = struct {
                 // report can say *who* is waiting, not just how many. The
                 // handle is scheduler knowledge the graph cannot derive from
                 // a slot bitmask.
-                self.waits.noteWaiterIdentity(cond_addr, handle, state.regs.rip);
+                self.waits.noteWaiterIdentity(cond_addr, handle, guestRegs(state).*.rip);
             }
             self.bumpStateVersion();
         }
@@ -1209,10 +1221,10 @@ pub const Runtime = struct {
     }
 
     fn attributeInit(self: *Runtime, state: anytype) u64 {
-        if (initializeOpaque(state, state.regs.rdi, 64) != 0) return 22;
+        if (initializeOpaque(state, guestRegs(state).*.rdi, 64) != 0) return 22;
         for (&self.attributes) |*attribute| {
             if (attribute.active) continue;
-            attribute.* = .{ .active = true, .address = state.regs.rdi };
+            attribute.* = .{ .active = true, .address = guestRegs(state).*.rdi };
             return 0;
         }
         return 12;
@@ -1237,7 +1249,7 @@ pub const Runtime = struct {
     }
 
     fn create(self: *Runtime, state: anytype) u64 {
-        if (state.guestMemory(state.regs.rdi, 8) == null) return 14;
+        if (state.guestMemory(guestRegs(state).*.rdi, 8) == null) return 14;
         for (&self.threads, 0..) |*thread, index| {
             if (thread.active) continue;
             const handle = SYNTHETIC_THREAD_BASE + @as(u64, @intCast(index)) * 0x10;
@@ -1245,13 +1257,13 @@ pub const Runtime = struct {
                 .active = true,
                 .handle = handle,
                 .numeric_id = self.allocateNumericThreadId(),
-                .start_routine = state.regs.rdx,
-                .argument = state.regs.rcx,
-                .stack_size = self.stackSize(state.regs.rsi),
+                .start_routine = guestRegs(state).*.rdx,
+                .argument = guestRegs(state).*.rcx,
+                .stack_size = self.stackSize(guestRegs(state).*.rsi),
                 .state = .runnable,
                 .blocked_since_step = schedulerStep(state),
             };
-            state.write64(state.regs.rdi, handle);
+            state.write64(guestRegs(state).*.rdi, handle);
             self.created_threads +|= 1;
             self.deferred_threads +|= 1;
             self.emit(.{ .kind = .thread_created, .step = schedulerStep(state), .thread = handle, .reason = "pthread_create" });
@@ -1270,7 +1282,7 @@ pub const Runtime = struct {
     /// after `markCompleted` wakes the caller. Direct callers that cannot park
     /// receive EBUSY rather than a fabricated success.
     fn join(self: *Runtime, state: anytype) u64 {
-        const target = self.threadForHandle(state.regs.rdi) orelse return 3;
+        const target = self.threadForHandle(guestRegs(state).*.rdi) orelse return 3;
         const caller_handle = self.currentThreadHandle(state);
         const terminated = target.state == .terminated or target.state == .cancelled;
 
@@ -1282,7 +1294,7 @@ pub const Runtime = struct {
 
         target.joined = true;
         self.joined_threads +|= 1;
-        if (state.regs.rsi != 0 and state.guestMemory(state.regs.rsi, 8) != null) state.write64(state.regs.rsi, 0);
+        if (guestRegs(state).*.rsi != 0 and state.guestMemory(guestRegs(state).*.rsi, 8) != null) state.write64(guestRegs(state).*.rsi, 0);
         return 0;
     }
 
@@ -1295,20 +1307,20 @@ pub const Runtime = struct {
     }
 
     fn mutexInit(self: *Runtime, state: anytype) u64 {
-        if (initializeOpaque(state, state.regs.rdi, 64) != 0) return 22;
-        _ = self.mutexForAddress(state.regs.rdi, true) orelse return 12;
+        if (initializeOpaque(state, guestRegs(state).*.rdi, 64) != 0) return 22;
+        _ = self.mutexForAddress(guestRegs(state).*.rdi, true) orelse return 12;
         return 0;
     }
 
     fn recursiveMutexInit(self: *Runtime, state: anytype) u64 {
         const result = self.mutexInit(state);
         if (result != 0) return result;
-        const mutex = self.mutexForAddress(state.regs.rdi, false) orelse return 12;
+        const mutex = self.mutexForAddress(guestRegs(state).*.rdi, false) orelse return 12;
         mutex.recursive = true;
         // C++ constructors are modeled as returning the object address in the
         // import bridge, matching the legacy constructor shim and making the
         // result useful to callers that chain the ABI operation.
-        return state.regs.rdi;
+        return guestRegs(state).*.rdi;
     }
 
     fn recursiveMutexDestroy(self: *Runtime, address: u64) void {
@@ -1414,8 +1426,8 @@ pub const Runtime = struct {
     }
 
     fn condvarInitialize(self: *Runtime, state: anytype) u64 {
-        if (initializeOpaque(state, state.regs.rdi, 48) != 0) return 22;
-        _ = self.condvarInit(state.regs.rdi) orelse return 12;
+        if (initializeOpaque(state, guestRegs(state).*.rdi, 48) != 0) return 22;
+        _ = self.condvarInit(guestRegs(state).*.rdi) orelse return 12;
         return 0;
     }
 
@@ -1510,10 +1522,10 @@ pub const Runtime = struct {
     }
 
     fn threadId(self: *Runtime, state: anytype) u64 {
-        if (state.regs.rsi == 0 or state.guestMemory(state.regs.rsi, 8) == null) return 22;
-        const handle = if (state.regs.rdi == 0) self.currentThreadHandle(state) else state.regs.rdi;
+        if (guestRegs(state).*.rsi == 0 or state.guestMemory(guestRegs(state).*.rsi, 8) == null) return 22;
+        const handle = if (guestRegs(state).*.rdi == 0) self.currentThreadHandle(state) else guestRegs(state).*.rdi;
         const numeric_id = self.numericThreadId(handle);
-        state.write64(state.regs.rsi, numeric_id);
+        state.write64(guestRegs(state).*.rsi, numeric_id);
         self.thread_id_queries +|= 1;
         if (self.thread_id_queries <= 16 or self.thread_id_queries % 256 == 0) {
             machoCapturePrint(
@@ -1546,8 +1558,8 @@ pub const Runtime = struct {
 
     fn getName(self: *Runtime, state: anytype) u64 {
         _ = self;
-        if (state.regs.rdx == 0) return 22;
-        const storage = state.guestMemory(state.regs.rsi, state.regs.rdx) orelse return 14;
+        if (guestRegs(state).*.rdx == 0) return 22;
+        const storage = state.guestMemory(guestRegs(state).*.rsi, guestRegs(state).*.rdx) orelse return 14;
         const name = "rosette-guest";
         const length = @min(name.len, storage.len - 1);
         @memcpy(storage[0..length], name[0..length]);
@@ -1557,8 +1569,8 @@ pub const Runtime = struct {
 
     fn getSchedule(self: *Runtime, state: anytype) u64 {
         _ = self;
-        if (state.regs.rsi != 0 and state.guestMemory(state.regs.rsi, 4) != null) state.write32(state.regs.rsi, 0);
-        if (state.regs.rdx != 0 and state.guestMemory(state.regs.rdx, 8) != null) state.write64(state.regs.rdx, 0);
+        if (guestRegs(state).*.rsi != 0 and state.guestMemory(guestRegs(state).*.rsi, 4) != null) state.write32(guestRegs(state).*.rsi, 0);
+        if (guestRegs(state).*.rdx != 0 and state.guestMemory(guestRegs(state).*.rdx, 8) != null) state.write64(guestRegs(state).*.rdx, 0);
         return 0;
     }
 
@@ -1671,13 +1683,13 @@ fn readGuestU64(state: anytype, address: u64) ?u64 {
 }
 
 fn cppDeadlineNanoseconds(state: anytype) u64 {
-    const raw = state.regs.rdx;
+    const raw = guestRegs(state).*.rdx;
     if (raw == 0) return monotonicNow(state);
     return normalizeCppDeadline(raw, monotonicNow(state), wallEpochNanoseconds(state));
 }
 
 fn pthreadDeadlineNanoseconds(state: anytype) u64 {
-    const pointer = state.regs.rdx;
+    const pointer = guestRegs(state).*.rdx;
     if (pointer == 0) return monotonicNow(state);
     const State = @TypeOf(state.*);
     const bytes = if (comptime @hasDecl(State, "guestMemoryConst"))
@@ -1743,14 +1755,14 @@ test "pthread runtime records deferred guest threads" {
 
     var runtime = Runtime{};
     var state = TestState{};
-    state.regs.rdi = 16;
+    guestRegs(&state).*.rdi = 16;
     try std.testing.expectEqual(@as(u64, 0), runtime.dispatch(&state, "_pthread_attr_init").?.handled);
-    state.regs.rsi = 4 * 1024 * 1024;
+    guestRegs(&state).*.rsi = 4 * 1024 * 1024;
     try std.testing.expectEqual(@as(u64, 0), runtime.dispatch(&state, "_pthread_attr_setstacksize").?.handled);
-    state.regs.rdi = 8;
-    state.regs.rsi = 16;
-    state.regs.rdx = 0x1234;
-    state.regs.rcx = 0x5678;
+    guestRegs(&state).*.rdi = 8;
+    guestRegs(&state).*.rsi = 16;
+    guestRegs(&state).*.rdx = 0x1234;
+    guestRegs(&state).*.rcx = 0x5678;
     try std.testing.expectEqual(@as(u64, 0), runtime.dispatch(&state, "_pthread_create").?.handled);
     try std.testing.expectEqual(@as(u64, 1), runtime.deferred_threads);
     try std.testing.expectEqual(@as(u64, 4 * 1024 * 1024), runtime.threads[0].stack_size);
@@ -1785,8 +1797,8 @@ test "pthread TLS keys retain values per cooperative thread" {
         }
     }{};
 
-    state.regs.rdi = 8;
-    state.regs.rsi = 0xDEAD;
+    guestRegs(&state).*.rdi = 8;
+    guestRegs(&state).*.rsi = 0xDEAD;
     try std.testing.expectEqual(@as(u64, 0), runtime.dispatch(&state, "_pthread_key_create").?.handled);
     const key = std.mem.readInt(u64, state.memory[8..16], .little);
     try std.testing.expectEqual(@as(u64, 0), key);
@@ -1800,7 +1812,7 @@ test "pthread TLS keys retain values per cooperative thread" {
     try std.testing.expectEqual(@as(u64, 0x2222), runtime.tlsGet(worker, key));
     try std.testing.expectEqual(@as(u64, 0x1111), runtime.tlsGet(CURRENT_THREAD_HANDLE, key));
 
-    state.regs.rdi = key;
+    guestRegs(&state).*.rdi = key;
     try std.testing.expectEqual(@as(u64, 0), runtime.dispatch(&state, "_pthread_key_delete").?.handled);
     try std.testing.expectEqual(@as(u64, 0), runtime.tlsGet(worker, key));
     try std.testing.expectEqual(@as(u64, 22), runtime.tlsSet(worker, key, 1));
@@ -2007,12 +2019,12 @@ test "cooperative condition wait releases and reacquires its mutex" {
     try std.testing.expectEqual(@as(u64, 0), runtime.mutexes[0].depth);
     try std.testing.expectEqual(ThreadState.waiting_condvar, runtime.threads[0].state);
     try std.testing.expectEqual(@as(?u64, null), runtime.resumeCooperativeWait(worker, 0));
-    runtime.condvarSignal(state.regs.rdi);
+    runtime.condvarSignal(guestRegs(&state).*.rdi);
     try std.testing.expectEqual(@as(?u64, 0), runtime.resumeCooperativeWait(worker, 0));
     try std.testing.expectEqual(@as(u64, 1), runtime.mutexes[0].depth);
     try std.testing.expectEqual(worker, runtime.mutexes[0].owner_thread);
     try std.testing.expectEqual(ThreadState.runnable, runtime.threads[0].state);
-    try std.testing.expectEqual(@as(u32, 0), runtime.waits.find(state.regs.rdi).?.waiterCount());
+    try std.testing.expectEqual(@as(u32, 0), runtime.waits.find(guestRegs(&state).*.rdi).?.waiterCount());
 }
 
 test "synthetic condition notifier history is retained without claiming a pthread slot" {
@@ -2049,7 +2061,7 @@ test "cooperative timed wait returns ETIMEDOUT without a signal" {
         }
     }{};
 
-    try std.testing.expect(runtime.beginCooperativeWait(&state, worker, state.regs.rdi, mutex, 5_000));
+    try std.testing.expect(runtime.beginCooperativeWait(&state, worker, guestRegs(&state).*.rdi, mutex, 5_000));
     try std.testing.expectEqual(@as(?u64, null), runtime.resumeCooperativeWait(worker, 4_999));
     try std.testing.expectEqual(@as(?u64, ETIMEDOUT), runtime.resumeCooperativeWait(worker, 5_000));
     try std.testing.expectEqual(ThreadState.runnable, runtime.threads[0].state);
@@ -2139,7 +2151,7 @@ test "libc++ timed condition wait remains blocked until notify all" {
 
     try std.testing.expect(runtime.beginCooperativeCppCondvarWait(&state, true));
     try std.testing.expectEqual(@as(?u64, null), runtime.resumeCooperativeWait(worker, 5_999));
-    state.regs.rdi = condvar;
+    guestRegs(&state).*.rdi = condvar;
     try std.testing.expect(runtime.dispatchCppSynchronization(&state, "__ZNSt3__118condition_variable10notify_allEv") != null);
     try std.testing.expectEqual(@as(?u64, 0), runtime.resumeCooperativeWait(worker, 5_999));
     try std.testing.expectEqual(worker, runtime.mutexes[0].owner_thread);
@@ -2190,7 +2202,7 @@ test "scheduler resume overrides RAX only when a condition wait completes" {
         }
     }{};
 
-    try std.testing.expect(runtime.beginCooperativeWait(&state, worker, state.regs.rdi, mutex, 5_000));
+    try std.testing.expect(runtime.beginCooperativeWait(&state, worker, guestRegs(&state).*.rdi, mutex, 5_000));
     const decision = runtime.resumeCooperativeContext(worker, 5_000) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(?u64, ETIMEDOUT), decision.rax_override);
     try std.testing.expectEqual(@as(u64, ETIMEDOUT), decision.restoredRax(0x4D7_AF80));
@@ -2333,7 +2345,7 @@ test "pthread_threadid_np assigns stable numeric ids" {
 
     try std.testing.expectEqual(@as(u64, 0), runtime.threadId(&state));
     try std.testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, state.mem[8..16], .little));
-    state.regs.rdi = CURRENT_THREAD_HANDLE;
+    guestRegs(&state).*.rdi = CURRENT_THREAD_HANDLE;
     try std.testing.expectEqual(@as(u64, 0), runtime.threadId(&state));
     try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, state.mem[8..16], .little));
 }

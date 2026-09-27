@@ -2453,6 +2453,16 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             if (d.lock) releaseBarrier();
         },
 
+        .xchg_mem8_reg8 => {
+            // XCHG with memory is architecturally always atomic (implicit LOCK#).
+            releaseBarrier();
+            const source_operand = x64_decoder.RegisterOperand{ .id = d.src_reg, .high8 = d.src_high8 };
+            const a = self.readMemVal(d.addr, .bits8);
+            const b = x64_decoder.registerOperandValue(&self.regs, source_operand, .bits8);
+            self.writeMemVal(d.addr, .bits8, b);
+            x64_decoder.setRegisterOperand(&self.regs, source_operand, .bits8, a);
+            releaseBarrier();
+        },
         .xchg_mem32_reg32 => {
             // XCHG with memory is architecturally always atomic (implicit LOCK#)
             // Acquire+release semantics via full barrier (XCHG implies LOCK)
@@ -2472,6 +2482,14 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             self.writeMemVal(d.addr, .bits64, b);
             self.setReg(d.src_reg, .bits64, a);
             releaseBarrier();
+        },
+        .xchg_reg8_reg8 => {
+            const destination_operand = x64_decoder.RegisterOperand{ .id = d.dst_reg, .high8 = d.dst_high8 };
+            const source_operand = x64_decoder.RegisterOperand{ .id = d.src_reg, .high8 = d.src_high8 };
+            const a = x64_decoder.registerOperandValue(&self.regs, destination_operand, .bits8);
+            const b = x64_decoder.registerOperandValue(&self.regs, source_operand, .bits8);
+            x64_decoder.setRegisterOperand(&self.regs, destination_operand, .bits8, b);
+            x64_decoder.setRegisterOperand(&self.regs, source_operand, .bits8, a);
         },
         .xchg_reg32_reg32 => {
             const sz: Size = if (d.size == .bits16) .bits16 else .bits32;

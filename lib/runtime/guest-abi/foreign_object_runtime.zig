@@ -1,6 +1,18 @@
 const std = @import("std");
 const machoCapturePrint = @import("event_log").machoCapturePrint;
 
+/// Return the architectural register file belonging to this host executor's
+/// bound guest context, or the traditional owner register file when the
+/// caller uses a standalone state value.
+fn guestRegs(state: anytype) if (@typeInfo(@TypeOf(state)).pointer.is_const)
+    *const @FieldType(@TypeOf(state.*), "regs")
+else
+    *@FieldType(@TypeOf(state.*), "regs") {
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "windowsGuestContextField")) return state.windowsGuestContextField("regs");
+    return &@field(state.*, "regs");
+}
+
 const MAX_TYPES = 128;
 const MAX_OBJECTS = 512;
 const OBJECT_SIZE: u64 = 64;
@@ -151,10 +163,10 @@ pub const Runtime = struct {
     /// share one id.
     fn connectSignal(self: *Runtime, state: anytype) u64 {
         self.signal_connects +|= 1;
-        const instance = state.regs.rdi;
-        const callback = state.regs.rdx;
-        const data = state.regs.rcx;
-        const name = state.guestCString(state.regs.rsi, 64) orelse "";
+        const instance = guestRegs(state).*.rdi;
+        const callback = guestRegs(state).*.rdx;
+        const data = guestRegs(state).*.rcx;
+        const name = state.guestCString(guestRegs(state).*.rsi, 64) orelse "";
         // GTK detailed signal names may carry a "::detail" suffix.
         const base = name[0 .. std.mem.indexOfScalar(u8, name, ':') orelse name.len];
         const signal: Signal = if (std.mem.eql(u8, base, "draw")) .draw else .other;
@@ -319,18 +331,18 @@ pub const Runtime = struct {
             return .{ .handled = self.typeFor(state, name) orelse 0 };
         }
         if (std.mem.eql(u8, name, "g_type_check_instance_cast")) {
-            return .{ .handled = if (self.isObject(state.regs.rdi)) state.regs.rdi else 0 };
+            return .{ .handled = if (self.isObject(guestRegs(state).*.rdi)) guestRegs(state).*.rdi else 0 };
         }
         if (std.mem.eql(u8, name, "g_type_check_instance_is_a")) {
-            return .{ .handled = @intFromBool(self.isObject(state.regs.rdi)) };
+            return .{ .handled = @intFromBool(self.isObject(guestRegs(state).*.rdi)) };
         }
         if (std.mem.eql(u8, name, "g_object_ref_sink") or std.mem.eql(u8, name, "g_object_ref")) {
-            if (self.findObject(state.regs.rdi)) |object| object.references +|= 1;
+            if (self.findObject(guestRegs(state).*.rdi)) |object| object.references +|= 1;
             self.references +|= 1;
-            return .{ .handled = state.regs.rdi };
+            return .{ .handled = guestRegs(state).*.rdi };
         }
         if (std.mem.eql(u8, name, "g_object_unref")) {
-            if (self.findObject(state.regs.rdi)) |object| object.references -|= 1;
+            if (self.findObject(guestRegs(state).*.rdi)) |object| object.references -|= 1;
             self.references +|= 1;
             return .handled_void;
         }
@@ -346,14 +358,14 @@ pub const Runtime = struct {
             return .{ .handled = object };
         }
         if (std.mem.eql(u8, name, "gtk_window_set_title")) {
-            const title = state.guestCString(state.regs.rsi, 4096) orelse "Xenia Canary (Rosette)";
+            const title = state.guestCString(guestRegs(state).*.rsi, 4096) orelse "Xenia Canary (Rosette)";
             _ = setNativeWindowTitle(state, title);
             self.mutations +|= 1;
             return .handled_void;
         }
         if (std.mem.eql(u8, name, "gtk_widget_set_size_request")) {
-            const width: i32 = @bitCast(@as(u32, @truncate(state.regs.rsi)));
-            const height: i32 = @bitCast(@as(u32, @truncate(state.regs.rdx)));
+            const width: i32 = @bitCast(@as(u32, @truncate(guestRegs(state).*.rsi)));
+            const height: i32 = @bitCast(@as(u32, @truncate(guestRegs(state).*.rdx)));
             if (width > 0 and height > 0) _ = setNativeWindowSize(state, width, height);
             self.mutations +|= 1;
             return .handled_void;
@@ -373,7 +385,7 @@ pub const Runtime = struct {
             return .handled_void;
         }
         if (std.mem.eql(u8, name, "gtk_widget_get_allocation")) {
-            writeNativeAllocation(state, state.regs.rsi);
+            writeNativeAllocation(state, guestRegs(state).*.rsi);
             return .handled_void;
         }
         if (std.mem.eql(u8, name, "gdk_window_get_width")) {
@@ -386,7 +398,7 @@ pub const Runtime = struct {
             return .{ .handled = nativeViewToken(state) };
         }
         if (isPointerGetter(name)) {
-            return .{ .handled = self.associatedObject(state, name, state.regs.rdi) orelse 0 };
+            return .{ .handled = self.associatedObject(state, name, guestRegs(state).*.rdi) orelse 0 };
         }
         if (std.mem.eql(u8, name, "g_signal_connect_data")) {
             return .{ .handled = self.connectSignal(state) };
@@ -395,10 +407,10 @@ pub const Runtime = struct {
             std.mem.eql(u8, name, "gtk_widget_queue_draw_area") or
             std.mem.eql(u8, name, "gtk_widget_queue_draw_region"))
         {
-            self.requestDraw(state, state.regs.rdi);
+            self.requestDraw(state, guestRegs(state).*.rdi);
             return .handled_void;
         }
-        if (isBooleanQuery(name)) return .{ .handled = @intFromBool(self.isObject(state.regs.rdi)) };
+        if (isBooleanQuery(name)) return .{ .handled = @intFromBool(self.isObject(guestRegs(state).*.rdi)) };
         if (std.mem.eql(u8, name, "gtk_main_level")) {
             return .{ .handled = self.main_loop_depth };
         }
@@ -685,12 +697,12 @@ test "queue_draw reaches the connected draw handler" {
     const widget: u64 = 0xAAAA;
     const handler: u64 = 0xBBBB;
     const user_data: u64 = 0xCCCC;
-    state.regs = .{ .rdi = widget, .rsi = 0, .rdx = handler, .rcx = user_data };
+    guestRegs(&state).* = .{ .rdi = widget, .rsi = 0, .rdx = handler, .rcx = user_data };
     const id = runtime.dispatch(&state, "_g_signal_connect_data").?.handled;
     try std.testing.expect(id != 0);
 
     // Emitting on that widget delivers (widget, cr=null, user_data).
-    state.regs = .{ .rdi = widget };
+    guestRegs(&state).* = .{ .rdi = widget };
     _ = runtime.dispatch(&state, "_gtk_widget_queue_draw").?;
     try std.testing.expectEqual(@as(u64, 1), state.schedule_calls);
     try std.testing.expectEqual(handler, state.scheduled_function);
@@ -699,7 +711,7 @@ test "queue_draw reaches the connected draw handler" {
 
     // A different widget has no handler, so nothing is scheduled — the model
     // must not invent an emission for a widget the guest never connected.
-    state.regs = .{ .rdi = 0xDEAD };
+    guestRegs(&state).* = .{ .rdi = 0xDEAD };
     _ = runtime.dispatch(&state, "_gtk_widget_queue_draw").?;
     try std.testing.expectEqual(@as(u64, 1), state.schedule_calls);
     try std.testing.expectEqual(@as(u64, 2), runtime.draw_requests);
@@ -707,7 +719,7 @@ test "queue_draw reaches the connected draw handler" {
     // A second request before the first is serviced must coalesce, exactly as
     // GTK does. Queueing a callback per call would fill a bounded queue with
     // duplicate paints and starve the guest's main-loop pump.
-    state.regs = .{ .rdi = widget };
+    guestRegs(&state).* = .{ .rdi = widget };
     _ = runtime.dispatch(&state, "_gtk_widget_queue_draw").?;
     try std.testing.expectEqual(@as(u64, 1), state.schedule_calls);
     try std.testing.expectEqual(@as(u64, 1), runtime.draw_coalesced);
@@ -715,7 +727,7 @@ test "queue_draw reaches the connected draw handler" {
 
     // Once the queued paint has been serviced, the next request schedules again.
     state.pending_source = 0;
-    state.regs = .{ .rdi = widget };
+    guestRegs(&state).* = .{ .rdi = widget };
     _ = runtime.dispatch(&state, "_gtk_widget_queue_draw").?;
     try std.testing.expectEqual(@as(u64, 2), state.schedule_calls);
     try std.testing.expectEqual(@as(u64, 2), runtime.draw_dispatches);
@@ -723,7 +735,7 @@ test "queue_draw reaches the connected draw handler" {
     // A signal Rosette cannot emit is counted as dropped rather than retained.
     @memcpy(state.memory[16..23], "clicked");
     state.memory[23] = 0;
-    state.regs = .{ .rdi = widget, .rsi = 16, .rdx = handler, .rcx = user_data };
+    guestRegs(&state).* = .{ .rdi = widget, .rsi = 16, .rdx = handler, .rcx = user_data };
     _ = runtime.dispatch(&state, "_g_signal_connect_data").?;
     try std.testing.expectEqual(@as(u64, 1), runtime.signal_connects_dropped);
 
@@ -777,11 +789,11 @@ const PaintState = struct {
 
     fn connectDraw(self: *@This(), runtime: *Runtime, widget: u64) void {
         @memcpy(self.memory[0..5], "draw\x00");
-        self.regs = .{ .rdi = widget, .rsi = 0, .rdx = 0xBBBB, .rcx = 0xCCCC };
+        guestRegs(self).* = .{ .rdi = widget, .rsi = 0, .rdx = 0xBBBB, .rcx = 0xCCCC };
         _ = runtime.dispatch(self, "_g_signal_connect_data").?;
     }
     fn queueDraw(self: *@This(), runtime: *Runtime, widget: u64) void {
-        self.regs = .{ .rdi = widget };
+        guestRegs(self).* = .{ .rdi = widget };
         _ = runtime.dispatch(self, "_gtk_widget_queue_draw").?;
     }
 };
@@ -936,7 +948,7 @@ test "foreign UI constructors return dereferenceable typed guest objects" {
     try std.testing.expect(class > 1);
     try std.testing.expect(state.read64(class) > 1);
 
-    state.regs.rdi = object;
+    guestRegs(&state).*.rdi = object;
     try std.testing.expectEqual(object, runtime.dispatch(&state, "_g_object_ref_sink").?.handled);
     try std.testing.expectEqual(object, runtime.dispatch(&state, "_g_type_check_instance_cast").?.handled);
 
@@ -945,7 +957,7 @@ test "foreign UI constructors return dereferenceable typed guest objects" {
     try std.testing.expect(first_window != 0);
     try std.testing.expectEqual(first_window, second_window);
 
-    state.regs.rsi = 800;
+    guestRegs(&state).*.rsi = 800;
     try std.testing.expect(runtime.dispatch(&state, "_gtk_widget_get_allocation").? == .handled_void);
     try std.testing.expectEqual(@as(u32, 1280), std.mem.readInt(u32, state.memory[808..812], .little));
     try std.testing.expectEqual(@as(u32, 720), std.mem.readInt(u32, state.memory[812..816], .little));

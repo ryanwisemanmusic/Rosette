@@ -7,6 +7,19 @@
 const std = @import("std");
 const macho_log = @import("dyld").event_log;
 const gpu = @import("gpu");
+
+/// Return the architectural register file belonging to this host executor's
+/// bound guest context, or the traditional owner register file when the
+/// caller uses a standalone state value.
+fn guestRegs(state: anytype) if (@typeInfo(@TypeOf(state)).pointer.is_const)
+    *const @FieldType(@TypeOf(state.*), "regs")
+else
+    *@FieldType(@TypeOf(state.*), "regs") {
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "windowsGuestContextField")) return state.windowsGuestContextField("regs");
+    return &@field(state.*, "regs");
+}
+
 const machoCapturePrint = macho_log.machoCapturePrint;
 /// The rejection structure over a fixed phrase set is a build-time artifact;
 /// deciding what a matched line *means* stays here.
@@ -592,7 +605,7 @@ pub fn observeLivelockWaits(self: anytype, message: []const u8) void {
 /// which is the difference between a finding and a search.
 fn guestProgramCounter(self: anytype) u64 {
     const State = @TypeOf(self.*);
-    if (comptime @hasField(State, "regs")) return self.regs.rip;
+    if (comptime @hasField(State, "regs")) return guestRegs(self).*.rip;
     return 0;
 }
 
@@ -1987,7 +2000,7 @@ test "wait evidence rejects seeded and cross-domain continuations" {
 
     // The next breadcrumb is Rosette's translated x86 RIP. It is direct host
     // evidence, but it cannot be compared to a PPC guest PC as a continuation.
-    state.regs.rip = 0x2ef558;
+    guestRegs(&state).*.rip = 0x2ef558;
     state.executed_steps = 12;
     observeLivelockWaits(&state, "translated host activity after wait");
     const seeded_continuation = state.wait_graph.continuationFor(0x827CEC14, 0x24).?;
@@ -2015,7 +2028,7 @@ test "wait evidence rejects seeded and cross-domain continuations" {
             "pc_domain=xenia_guest_ppc guest_pc_valid=YES " ++
             "guest_pc_quality=tracked guest_pc_source=jit_source_offset",
     );
-    state.regs.rip = 0x2ef558;
+    guestRegs(&state).*.rip = 0x2ef558;
     state.executed_steps = 22;
     observeLivelockWaits(&state, "translated host continuation");
     const incomparable_continuation = state.wait_graph.continuationFor(0x827CEC14, 0x24).?;
@@ -4606,11 +4619,11 @@ pub fn logProfileHostPreflight(self: anytype, profile_id: []const u8) void {
 
 pub fn observeProfileAccountFlow(self: anytype) void {
     const load_entry = self.internal_targets.profile_manager_load_account;
-    if (load_entry != 0 and self.regs.rip == load_entry) {
-        const return_address = if (self.guestMemoryConst(self.regs.rsp, 8) != null) self.read64(self.regs.rsp) else 0;
+    if (load_entry != 0 and guestRegs(self).*.rip == load_entry) {
+        const return_address = if (self.guestMemoryConst(guestRegs(self).*.rsp, 8) != null) self.read64(guestRegs(self).*.rsp) else 0;
         self.profile_account_flow.active = true;
-        self.profile_account_flow.manager = self.regs.rdi;
-        self.profile_account_flow.xuid = self.regs.rsi;
+        self.profile_account_flow.manager = guestRegs(self).*.rdi;
+        self.profile_account_flow.xuid = guestRegs(self).*.rsi;
         self.profile_account_flow.return_address = return_address;
         self.profile_account_flow.started_step = self.executed_steps;
         self.profile_account_flow.stage = .loading;
@@ -4621,7 +4634,7 @@ pub fn observeProfileAccountFlow(self: anytype) void {
         const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
         machoCapturePrint(
             "macho-processor: profile Account flow #{d} started: manager=0x{x} xuid={x:0>16} return=0x{x} {s}+0x{x} step={d}\n",
-            .{ self.profile_account_flow.attempts, self.regs.rdi, self.regs.rsi, return_address, self.metadata.symbolLabelFor(caller, return_address), if (caller) |symbol| symbol.offset else 0, self.executed_steps },
+            .{ self.profile_account_flow.attempts, guestRegs(self).*.rdi, guestRegs(self).*.rsi, return_address, self.metadata.symbolLabelFor(caller, return_address), if (caller) |symbol| symbol.offset else 0, self.executed_steps },
         );
         return;
     }
@@ -4629,8 +4642,8 @@ pub fn observeProfileAccountFlow(self: anytype) void {
     if (!self.profile_account_flow.active) return;
 
     const dismount_entry = self.internal_targets.profile_manager_dismount_profile;
-    if (dismount_entry != 0 and self.regs.rip == dismount_entry) {
-        const return_address = if (self.guestMemoryConst(self.regs.rsp, 8) != null) self.read64(self.regs.rsp) else 0;
+    if (dismount_entry != 0 and guestRegs(self).*.rip == dismount_entry) {
+        const return_address = if (self.guestMemoryConst(guestRegs(self).*.rsp, 8) != null) self.read64(guestRegs(self).*.rsp) else 0;
         const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
         if (caller) |symbol| {
             if (classifyProfileDismountCaller(symbol.name, symbol.offset)) |stage| self.profile_account_flow.stage = stage;
@@ -4643,20 +4656,20 @@ pub fn observeProfileAccountFlow(self: anytype) void {
     }
 
     const insert_entry = self.internal_targets.profile_account_insert_or_assign;
-    if (insert_entry != 0 and self.regs.rip == insert_entry) {
+    if (insert_entry != 0 and guestRegs(self).*.rip == insert_entry) {
         self.profile_account_flow.stage = .inserting;
-        const key = if (self.guestMemoryConst(self.regs.rsi, 8) != null) self.read64(self.regs.rsi) else 0;
+        const key = if (self.guestMemoryConst(guestRegs(self).*.rsi, 8) != null) self.read64(guestRegs(self).*.rsi) else 0;
         machoCapturePrint(
             "macho-processor: profile accounts_ insertion checkpoint: map=0x{x} key_ptr=0x{x} key={x:0>16} account=0x{x} expected_xuid={x:0>16} key_matches={}\n",
-            .{ self.regs.rdi, self.regs.rsi, key, self.regs.rdx, self.profile_account_flow.xuid, key == self.profile_account_flow.xuid },
+            .{ guestRegs(self).*.rdi, guestRegs(self).*.rsi, key, guestRegs(self).*.rdx, self.profile_account_flow.xuid, key == self.profile_account_flow.xuid },
         );
         return;
     }
 
     if (self.profile_account_flow.return_address != 0 and
-        self.regs.rip == self.profile_account_flow.return_address)
+        guestRegs(self).*.rip == self.profile_account_flow.return_address)
     {
-        const succeeded = self.regs.rax & 1 != 0;
+        const succeeded = guestRegs(self).*.rax & 1 != 0;
         if (succeeded) {
             self.profile_account_flow.successes +|= 1;
             self.profile_account_flow.stage = .completed;
@@ -4702,7 +4715,7 @@ pub fn noteProfileAccountRead(self: anytype, guest_fd: u64, requested: u64, resu
 
 pub fn observeBackendGuestLog(self: anytype, message: []const u8) void {
     const observation = self.backend_diagnostics.observeLine(message, self.executed_steps) orelse return;
-    const return_address = if (self.guestMemoryConst(self.regs.rsp, 8) != null) self.read64(self.regs.rsp) else 0;
+    const return_address = if (self.guestMemoryConst(guestRegs(self).*.rsp, 8) != null) self.read64(guestRegs(self).*.rsp) else 0;
     const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
     machoCapturePrint(
         "macho-processor: x64 backend event #{d}: event={s} phase={s}->{s} step={d} delta={d} active=0x{x} caller=0x{x} {s}+0x{x}\n",
@@ -4754,7 +4767,7 @@ pub fn backendMemoryDiagnosticsActive(self: anytype) bool {
 
 pub fn noteBackendMmapAttempt(self: anytype, route: []const u8, address: u64, length: u64, prot: u64, flags: u64, fixed: bool, anonymous: bool) void {
     if (!self.backend_diagnostics.noteMmapAttempt(route, address, length, prot, flags, fixed, anonymous, self.executed_steps)) return;
-    const return_address = if (self.guestMemoryConst(self.regs.rsp, 8) != null) self.read64(self.regs.rsp) else 0;
+    const return_address = if (self.guestMemoryConst(guestRegs(self).*.rsp, 8) != null) self.read64(guestRegs(self).*.rsp) else 0;
     const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
     machoCapturePrint(
         "macho-processor: x64 backend mmap attempt #{d}: route={s} phase={s} step={d} address=0x{x} length={d} prot=0x{x} flags=0x{x} fixed={} anonymous={} caller=0x{x} {s}+0x{x}\n",

@@ -15,6 +15,27 @@ const Op = x64_decoder.Op;
 const DecodedInsn = x64_decoder.DecodedInsn;
 const Size = x64_decoder.OperandSize;
 
+/// The architectural register file (`regs`, `xmm`, `ymm_hi`, `zmm_hi`, `k`)
+/// of the guest context executing on this host thread. A Windows worker
+/// runs against its own saved context rather than the process owner's
+/// fields, and the ELF state selects it through `windowsGuestContextField`;
+/// a state without a selector (the Mach-O processor) has one register file.
+/// Every register access in this file goes through here: until 2026-09-25
+/// the direct `self.xmm` / `self.regs.rflags` accesses made every such
+/// instruction a Windows worker executed read and write the process owner's
+/// registers instead of its own.
+fn contextField(self: anytype, comptime field: []const u8) ContextField(@TypeOf(self), field) {
+    const State = @typeInfo(@TypeOf(self)).pointer.child;
+    if (comptime @hasDecl(State, "windowsGuestContextField")) return self.windowsGuestContextField(field);
+    return &@field(self.*, field);
+}
+
+fn ContextField(comptime Self: type, comptime field: []const u8) type {
+    const pointer = @typeInfo(Self).pointer;
+    const Field = @FieldType(pointer.child, field);
+    return if (pointer.is_const) *const Field else *Field;
+}
+
 fn vectorBytes(d: DecodedInsn) usize {
     return if (d.vector_512) 64 else if (d.vector_256) 32 else 16;
 }
@@ -42,9 +63,9 @@ fn traceVectorState() bool {
 
 fn readVectorRegister(self: anytype, index: u8) [64]u8 {
     var result = [_]u8{0} ** 64;
-    @memcpy(result[0..16], self.xmm[index][0..16]);
-    @memcpy(result[16..32], self.ymm_hi[index][0..16]);
-    @memcpy(result[32..64], self.zmm_hi[index][0..32]);
+    @memcpy(result[0..16], contextField(self, "xmm")[index][0..16]);
+    @memcpy(result[16..32], contextField(self, "ymm_hi")[index][0..16]);
+    @memcpy(result[32..64], contextField(self, "zmm_hi")[index][0..32]);
     return result;
 }
 
@@ -52,12 +73,12 @@ fn writeVectorRegister(self: anytype, index: u8, value: [64]u8, count: usize) vo
     // EVEX instructions always zero the part of the architectural ZMM
     // register above their encoded vector length.  Clearing all three backing
     // pieces first also makes scalar VMOVD and narrow VPMOV forms correct.
-    @memset(&self.xmm[index], 0);
-    @memset(&self.ymm_hi[index], 0);
-    @memset(&self.zmm_hi[index], 0);
+    @memset(&contextField(self, "xmm")[index], 0);
+    @memset(&contextField(self, "ymm_hi")[index], 0);
+    @memset(&contextField(self, "zmm_hi")[index], 0);
     if (count > value.len) {
         std.log.err("vector register write width exceeds architectural storage: rip=0x{x} index={d} count={d} storage={d}", .{
-            self.regs.rip,
+            contextField(self, "regs").rip,
             index,
             count,
             value.len,
@@ -73,14 +94,14 @@ fn writeVectorRegister(self: anytype, index: u8, value: [64]u8, count: usize) vo
         return;
     }
     const low = @min(count, @as(usize, 16));
-    @memcpy(self.xmm[index][0..low], value[0..low]);
+    @memcpy(contextField(self, "xmm")[index][0..low], value[0..low]);
     if (count > 16) {
         const high = @min(count - 16, @as(usize, 16));
-        @memcpy(self.ymm_hi[index][0..high], value[16..][0..high]);
+        @memcpy(contextField(self, "ymm_hi")[index][0..high], value[16..][0..high]);
     }
     if (count > 32) {
         const top = @min(count - 32, @as(usize, 32));
-        @memcpy(self.zmm_hi[index][0..top], value[32..][0..top]);
+        @memcpy(contextField(self, "zmm_hi")[index][0..top], value[32..][0..top]);
     }
 }
 
@@ -160,7 +181,7 @@ fn readRmOperand(
 
 fn maskActive(self: anytype, d: DecodedInsn, lane: usize) bool {
     if (d.opmask == 0) return true;
-    return ((self.k[d.opmask] >> @as(u6, @intCast(lane))) & 1) != 0;
+    return ((contextField(self, "k")[d.opmask] >> @as(u6, @intCast(lane))) & 1) != 0;
 }
 
 fn maskedVector(
@@ -232,7 +253,7 @@ fn executeMove(self: anytype, d: DecodedInsn) void {
     const count = vectorBytes(d);
     if (traceVectorState()) {
         std.log.info("EVEX vector move rip=0x{x} op={s} len={d} count={d} vector256={} vector512={} evex={} dst={d} src={d} src2={d} reg_form={} addr=0x{x}", .{
-            self.regs.rip,
+            contextField(self, "regs").rip,
             @tagName(d.op),
             d.len,
             count,
@@ -701,7 +722,7 @@ fn executeVduplicate(self: anytype, d: DecodedInsn) void {
     if (d.legacy_sse) {
         // Legacy MOVDDUP/MOVSLDUP/MOVSHDUP write XMM only.  Unlike VEX.128,
         // they leave the destination's architectural YMM upper half intact.
-        @memcpy(self.xmm[d.xmm_dst][0..16], computed[0..16]);
+        @memcpy(contextField(self, "xmm")[d.xmm_dst][0..16], computed[0..16]);
     } else {
         writeVectorRegister(self, d.xmm_dst, computed, count);
     }
@@ -809,7 +830,7 @@ fn executeVpcmpistri(self: anytype, d: DecodedInsn) void {
     if (rhs_len < lane_count) new_flags |= x64_decoder.RFL_ZF;
     if (lhs_len < lane_count) new_flags |= x64_decoder.RFL_SF;
     if ((result & 1) != 0) new_flags |= x64_decoder.RFL_OF;
-    self.regs.rflags = (self.regs.rflags & ~flags_mask) | new_flags;
+    contextField(self, "regs").rflags = (contextField(self, "regs").rflags & ~flags_mask) | new_flags;
 }
 
 fn truncateF64ToI32(value: f64) i32 {
@@ -1246,7 +1267,7 @@ fn executeVpcmpb(self: anytype, d: DecodedInsn) void {
     const lhs = readVectorRegister(self, d.xmm_src);
     const rhs = readRmOperand(self, d, count, 1, 1);
     const predicate: u3 = @truncate(d.imm);
-    var result = if (d.opmask == 0 or d.zero_mask) 0 else self.k[d.dst_k];
+    var result = if (d.opmask == 0 or d.zero_mask) 0 else contextField(self, "k")[d.dst_k];
     const lane_count = @min(count, 64);
     for (0..lane_count) |lane| {
         const a: i8 = @bitCast(lhs[lane]);
@@ -1268,7 +1289,7 @@ fn executeVpcmpb(self: anytype, d: DecodedInsn) void {
         }
     }
     if (lane_count < 64) result &= (@as(u64, 1) << @as(u6, @intCast(lane_count))) - 1;
-    self.k[d.dst_k] = result;
+    contextField(self, "k")[d.dst_k] = result;
 }
 
 fn executeVmovd(self: anytype, d: DecodedInsn) void {
@@ -1313,7 +1334,7 @@ fn executeMovdir64b(self: anytype, d: DecodedInsn) void {
 }
 
 fn terminateUnsupported(self: anytype, d: DecodedInsn) void {
-    std.log.err("unimplemented vector instruction: {s} at rip=0x{x}", .{ @tagName(d.op), self.regs.rip });
+    std.log.err("unimplemented vector instruction: {s} at rip=0x{x}", .{ @tagName(d.op), contextField(self, "regs").rip });
     self.faulted = true;
     self.exit_code = 127;
     self.terminated = true;

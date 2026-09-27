@@ -15,6 +15,18 @@
 const std = @import("std");
 const machoCapturePrint = @import("event_log").machoCapturePrint;
 
+/// Return the architectural register file belonging to this host executor's
+/// bound guest context, or the traditional owner register file when the
+/// caller uses a standalone state value.
+fn guestRegs(state: anytype) if (@typeInfo(@TypeOf(state)).pointer.is_const)
+    *const @FieldType(@TypeOf(state.*), "regs")
+else
+    *@FieldType(@TypeOf(state.*), "regs") {
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "windowsGuestContextField")) return state.windowsGuestContextField("regs");
+    return &@field(state.*, "regs");
+}
+
 pub const compatibility_version = [3]u8{ 2, 0, 12 };
 pub const audio_callback_handle_base: u64 = 0xFFFF_F910_0000_0000;
 pub const window_handle_base: u64 = 0xFFFF_F410_0000_0000;
@@ -171,7 +183,7 @@ pub const Runtime = struct {
         if (symbolMatches(symbol, "SDL_GetVersion")) {
             self.calls +|= 1;
             self.version_queries +|= 1;
-            const output = state.guestMemory(state.regs.rdi, compatibility_version.len) orelse
+            const output = state.guestMemory(guestRegs(state).*.rdi, compatibility_version.len) orelse
                 return .handled_void;
             @memcpy(output, &compatibility_version);
             return .handled_void;
@@ -180,20 +192,20 @@ pub const Runtime = struct {
         if (symbolMatches(symbol, "SDL_Init")) {
             self.calls +|= 1;
             self.subsystem_initializations +|= 1;
-            self.retainSubsystems(@truncate(state.regs.rdi));
+            self.retainSubsystems(@truncate(guestRegs(state).*.rdi));
             return .{ .handled = 0 };
         }
 
         if (symbolMatches(symbol, "SDL_InitSubSystem")) {
             self.calls +|= 1;
             self.subsystem_initializations +|= 1;
-            self.retainSubsystems(@truncate(state.regs.rdi));
+            self.retainSubsystems(@truncate(guestRegs(state).*.rdi));
             return .{ .handled = 0 };
         }
 
         if (symbolMatches(symbol, "SDL_WasInit")) {
             self.calls +|= 1;
-            const requested: u32 = @truncate(state.regs.rdi);
+            const requested: u32 = @truncate(guestRegs(state).*.rdi);
             return .{ .handled = if (requested == 0) self.initialized_mask else self.initialized_mask & requested };
         }
 
@@ -207,7 +219,7 @@ pub const Runtime = struct {
         if (symbolMatches(symbol, "SDL_QuitSubSystem")) {
             self.calls +|= 1;
             self.subsystem_quits +|= 1;
-            const requested: u32 = @truncate(state.regs.rdi);
+            const requested: u32 = @truncate(guestRegs(state).*.rdi);
             self.releaseSubsystems(requested);
             if (requested & sdl_init_audio != 0 and self.initialized_mask & sdl_init_audio == 0) {
                 for (&self.devices, 0..) |*device, slot| {
@@ -230,7 +242,7 @@ pub const Runtime = struct {
         if (symbolMatches(symbol, "SDL_DestroyWindow")) {
             self.calls +|= 1;
             self.window_destroy_requests +|= 1;
-            if (!self.validWindow(state.regs.rdi)) {
+            if (!self.validWindow(guestRegs(state).*.rdi)) {
                 self.rejectWindowHandle("SDL_DestroyWindow received a stale or foreign SDL_Window");
                 return .handled_void;
             }
@@ -240,9 +252,9 @@ pub const Runtime = struct {
 
         if (symbolMatches(symbol, "SDL_SetWindowTitle")) {
             self.calls +|= 1;
-            if (!self.requireWindow(state.regs.rdi, "SDL_SetWindowTitle received a stale or foreign SDL_Window"))
+            if (!self.requireWindow(guestRegs(state).*.rdi, "SDL_SetWindowTitle received a stale or foreign SDL_Window"))
                 return .handled_void;
-            const title = state.guestCString(state.regs.rsi, 4096) orelse {
+            const title = state.guestCString(guestRegs(state).*.rsi, 4096) orelse {
                 self.setError("SDL_SetWindowTitle title is unreadable or unterminated");
                 return .handled_void;
             };
@@ -256,10 +268,10 @@ pub const Runtime = struct {
 
         if (symbolMatches(symbol, "SDL_SetWindowSize")) {
             self.calls +|= 1;
-            if (!self.requireWindow(state.regs.rdi, "SDL_SetWindowSize received a stale or foreign SDL_Window"))
+            if (!self.requireWindow(guestRegs(state).*.rdi, "SDL_SetWindowSize received a stale or foreign SDL_Window"))
                 return .handled_void;
-            const width: i32 = @bitCast(@as(u32, @truncate(state.regs.rsi)));
-            const height: i32 = @bitCast(@as(u32, @truncate(state.regs.rdx)));
+            const width: i32 = @bitCast(@as(u32, @truncate(guestRegs(state).*.rsi)));
+            const height: i32 = @bitCast(@as(u32, @truncate(guestRegs(state).*.rdx)));
             if (width <= 0 or height <= 0 or !setNativeWindowSize(state, width, height)) {
                 self.setError("SDL_SetWindowSize dimensions are invalid or Cocoa rejected them");
                 return .handled_void;
@@ -277,21 +289,21 @@ pub const Runtime = struct {
         {
             self.calls +|= 1;
             self.window_size_queries +|= 1;
-            if (!self.requireWindow(state.regs.rdi, "SDL window size query received a stale or foreign SDL_Window"))
+            if (!self.requireWindow(guestRegs(state).*.rdi, "SDL window size query received a stale or foreign SDL_Window"))
                 return .handled_void;
             const width = nativeWindowWidth(state);
             const height = nativeWindowHeight(state);
             if (width != 0) self.window_width = width;
             if (height != 0) self.window_height = height;
-            writeGuestI32(state, state.regs.rsi, @intCast(self.window_width));
-            writeGuestI32(state, state.regs.rdx, @intCast(self.window_height));
+            writeGuestI32(state, guestRegs(state).*.rsi, @intCast(self.window_width));
+            writeGuestI32(state, guestRegs(state).*.rdx, @intCast(self.window_height));
             return .handled_void;
         }
 
         if (symbolMatches(symbol, "SDL_ShowWindow") or symbolMatches(symbol, "SDL_RaiseWindow")) {
             self.calls +|= 1;
             self.window_show_requests +|= 1;
-            if (!self.requireWindow(state.regs.rdi, "SDL_ShowWindow received a stale or foreign SDL_Window"))
+            if (!self.requireWindow(guestRegs(state).*.rdi, "SDL_ShowWindow received a stale or foreign SDL_Window"))
                 return .handled_void;
             if (!showNativeWindow(state)) {
                 self.setError("SDL_ShowWindow could not show the canonical Cocoa window");
@@ -304,7 +316,7 @@ pub const Runtime = struct {
         if (symbolMatches(symbol, "SDL_HideWindow")) {
             self.calls +|= 1;
             self.window_hide_requests +|= 1;
-            if (!self.requireWindow(state.regs.rdi, "SDL_HideWindow received a stale or foreign SDL_Window"))
+            if (!self.requireWindow(guestRegs(state).*.rdi, "SDL_HideWindow received a stale or foreign SDL_Window"))
                 return .handled_void;
             if (!hideNativeWindow(state)) {
                 self.setError("SDL_HideWindow could not hide the canonical Cocoa window");
@@ -317,9 +329,9 @@ pub const Runtime = struct {
         if (symbolMatches(symbol, "SDL_SetWindowFullscreen")) {
             self.calls +|= 1;
             self.window_fullscreen_updates +|= 1;
-            if (!self.requireWindow(state.regs.rdi, "SDL_SetWindowFullscreen received a stale or foreign SDL_Window"))
+            if (!self.requireWindow(guestRegs(state).*.rdi, "SDL_SetWindowFullscreen received a stale or foreign SDL_Window"))
                 return .{ .handled = signedResult(-1) };
-            const requested_flags: u32 = @truncate(state.regs.rsi);
+            const requested_flags: u32 = @truncate(guestRegs(state).*.rsi);
             const fullscreen = requested_flags & sdl_window_fullscreen != 0;
             if (!setNativeWindowFullscreen(state, fullscreen)) {
                 self.setError("SDL_SetWindowFullscreen could not update the canonical Cocoa window");
@@ -334,19 +346,19 @@ pub const Runtime = struct {
 
         if (symbolMatches(symbol, "SDL_GetWindowFlags")) {
             self.calls +|= 1;
-            if (!self.requireWindow(state.regs.rdi, "SDL_GetWindowFlags received a stale or foreign SDL_Window"))
+            if (!self.requireWindow(guestRegs(state).*.rdi, "SDL_GetWindowFlags received a stale or foreign SDL_Window"))
                 return .{ .handled = 0 };
             return .{ .handled = self.window_flags };
         }
 
         if (symbolMatches(symbol, "SDL_GetWindowID")) {
             self.calls +|= 1;
-            return .{ .handled = if (self.validWindow(state.regs.rdi)) 1 else 0 };
+            return .{ .handled = if (self.validWindow(guestRegs(state).*.rdi)) 1 else 0 };
         }
 
         if (symbolMatches(symbol, "SDL_GetWindowFromID")) {
             self.calls +|= 1;
-            return .{ .handled = if (state.regs.rdi == 1 and self.window_active) self.window_token else 0 };
+            return .{ .handled = if (guestRegs(state).*.rdi == 1 and self.window_active) self.window_token else 0 };
         }
 
         if (symbolMatches(symbol, "SDL_GetWindowWMInfo")) {
@@ -362,8 +374,8 @@ pub const Runtime = struct {
         if (symbolMatches(symbol, "SDL_PauseAudioDevice")) {
             self.calls +|= 1;
             self.audio_pause_updates +|= 1;
-            const device_id: u32 = @truncate(state.regs.rdi);
-            const paused = state.regs.rsi != 0;
+            const device_id: u32 = @truncate(guestRegs(state).*.rdi);
+            const paused = guestRegs(state).*.rsi != 0;
             const device = self.deviceForId(device_id) orelse {
                 self.audio_invalid_handles +|= 1;
                 self.setError("SDL_PauseAudioDevice received a stale or foreign device id");
@@ -377,7 +389,7 @@ pub const Runtime = struct {
         if (symbolMatches(symbol, "SDL_CloseAudioDevice")) {
             self.calls +|= 1;
             self.audio_close_requests +|= 1;
-            const device_id: u32 = @truncate(state.regs.rdi);
+            const device_id: u32 = @truncate(guestRegs(state).*.rdi);
             const device = self.deviceForId(device_id) orelse {
                 self.audio_invalid_handles +|= 1;
                 self.setError("SDL_CloseAudioDevice received a stale or foreign device id");
@@ -391,8 +403,8 @@ pub const Runtime = struct {
         if (symbolMatches(symbol, "SDL_AddEventWatch")) {
             self.calls +|= 1;
             self.event_watch_adds +|= 1;
-            const callback = state.regs.rdi;
-            const userdata = state.regs.rsi;
+            const callback = guestRegs(state).*.rdi;
+            const userdata = guestRegs(state).*.rsi;
             if (callback != 0 and state.isExecutableAddress(callback)) {
                 for (&self.event_watches) |*watch| {
                     if (watch.active) continue;
@@ -407,7 +419,7 @@ pub const Runtime = struct {
             self.calls +|= 1;
             self.event_watch_removes +|= 1;
             for (&self.event_watches) |*watch| {
-                if (!watch.active or watch.callback != state.regs.rdi or watch.userdata != state.regs.rsi) continue;
+                if (!watch.active or watch.callback != guestRegs(state).*.rdi or watch.userdata != guestRegs(state).*.rsi) continue;
                 watch.* = .{};
             }
             return .handled_void;
@@ -442,7 +454,7 @@ pub const Runtime = struct {
 
         if (symbolMatches(symbol, "SDL_GameControllerAddMapping")) {
             self.calls +|= 1;
-            _ = state.guestCString(state.regs.rdi, 4096) orelse return .{ .handled = @as(u32, @bitCast(@as(i32, -1))) };
+            _ = state.guestCString(guestRegs(state).*.rdi, 4096) orelse return .{ .handled = @as(u32, @bitCast(@as(i32, -1))) };
             self.mapping_updates +|= 1;
             return .{ .handled = 1 };
         }
@@ -468,11 +480,11 @@ pub const Runtime = struct {
         if (symbolMatches(symbol, "SDL_SetHintWithPriority")) {
             self.calls +|= 1;
             self.hint_updates +|= 1;
-            _ = state.guestCString(state.regs.rdi, 256) orelse {
+            _ = state.guestCString(guestRegs(state).*.rdi, 256) orelse {
                 self.hint_rejections +|= 1;
                 return .{ .handled = 0 };
             };
-            _ = state.guestCString(state.regs.rsi, 1024) orelse {
+            _ = state.guestCString(guestRegs(state).*.rsi, 1024) orelse {
                 self.hint_rejections +|= 1;
                 return .{ .handled = 0 };
             };
@@ -482,15 +494,15 @@ pub const Runtime = struct {
         if (symbolMatches(symbol, "SDL_LogSetOutputFunction")) {
             self.calls +|= 1;
             self.log_callback_updates +|= 1;
-            self.log_callback = state.regs.rdi;
-            self.log_userdata = state.regs.rsi;
+            self.log_callback = guestRegs(state).*.rdi;
+            self.log_userdata = guestRegs(state).*.rsi;
             return .handled_void;
         }
 
         if (symbolMatches(symbol, "SDL_LogSetAllPriority")) {
             self.calls +|= 1;
             self.log_priority_updates +|= 1;
-            self.log_priority = @bitCast(@as(u32, @truncate(state.regs.rdi)));
+            self.log_priority = @bitCast(@as(u32, @truncate(guestRegs(state).*.rdi)));
             return .handled_void;
         }
 
@@ -547,11 +559,11 @@ pub const Runtime = struct {
         if (self.window_active)
             return self.rejectWindowCreate("Rosette SDL currently exposes one canonical Cocoa window");
 
-        const title = state.guestCString(state.regs.rdi, 4096) orelse
+        const title = state.guestCString(guestRegs(state).*.rdi, 4096) orelse
             return self.rejectWindowCreate("SDL_CreateWindow title is unreadable or unterminated");
-        const width: i32 = @bitCast(@as(u32, @truncate(state.regs.rcx)));
-        const height: i32 = @bitCast(@as(u32, @truncate(state.regs.r8)));
-        const requested_flags: u32 = @truncate(state.regs.r9);
+        const width: i32 = @bitCast(@as(u32, @truncate(guestRegs(state).*.rcx)));
+        const height: i32 = @bitCast(@as(u32, @truncate(guestRegs(state).*.r8)));
+        const requested_flags: u32 = @truncate(guestRegs(state).*.r9);
         if (width <= 0 or height <= 0)
             return self.rejectWindowCreate("SDL_CreateWindow dimensions must be positive");
         if (!setNativeWindowSize(state, width, height) or !setNativeWindowTitle(state, title))
@@ -638,9 +650,9 @@ pub const Runtime = struct {
 
     fn getWindowWmInfo(self: *Runtime, state: anytype) u64 {
         self.window_wm_info_queries +|= 1;
-        if (!self.requireWindow(state.regs.rdi, "SDL_GetWindowWMInfo received a stale or foreign SDL_Window"))
+        if (!self.requireWindow(guestRegs(state).*.rdi, "SDL_GetWindowWMInfo received a stale or foreign SDL_Window"))
             return 0;
-        const output = state.guestMemory(state.regs.rsi, sdl_syswm_info_size) orelse {
+        const output = state.guestMemory(guestRegs(state).*.rsi, sdl_syswm_info_size) orelse {
             self.setError("SDL_GetWindowWMInfo output structure is unreadable");
             return 0;
         };
@@ -658,7 +670,7 @@ pub const Runtime = struct {
         self.audio_open_attempts +|= 1;
         if (self.initialized_mask & sdl_init_audio == 0)
             return self.rejectAudioOpen("SDL_OpenAudioDevice requires SDL_INIT_AUDIO ownership");
-        const desired_bytes = state.guestMemory(state.regs.rdx, audio_spec_size) orelse
+        const desired_bytes = state.guestMemory(guestRegs(state).*.rdx, audio_spec_size) orelse
             return self.rejectAudioOpen("SDL_OpenAudioDevice desired SDL_AudioSpec is unreadable");
         var spec = AudioSpec.read(desired_bytes);
         if (spec.frequency < 8000 or spec.frequency > 192000)
@@ -703,8 +715,8 @@ pub const Runtime = struct {
                 .callback_stack_address = callback_stack_address,
                 .callback_stack_size = audio_callback_stack_size,
             };
-            if (state.regs.rcx != 0) {
-                const obtained = state.guestMemory(state.regs.rcx, audio_spec_size) orelse {
+            if (guestRegs(state).*.rcx != 0) {
+                const obtained = state.guestMemory(guestRegs(state).*.rcx, audio_spec_size) orelse {
                     device.active = false;
                     return self.rejectAudioOpen("SDL_OpenAudioDevice obtained SDL_AudioSpec is unwritable");
                 };
@@ -790,7 +802,7 @@ pub const Runtime = struct {
                 return false;
             }
             const context = state.cooperative_ui_context.?;
-            state.regs = context.regs;
+            guestRegs(state).* = context.regs;
             state.xmm = context.xmm;
             state.ymm_hi = context.ymm_hi;
             state.x87 = context.x87;
@@ -798,11 +810,11 @@ pub const Runtime = struct {
             // process-wide dispositions, but never the interrupted worker's
             // active signal-handler stack.
             state.resetActiveGuestSignalState();
-            state.regs.rip = device.spec.callback;
-            state.regs.rdi = device.spec.userdata;
-            state.regs.rsi = device.stream_address;
-            state.regs.rdx = device.spec.size;
-            state.regs.rsp = (device.callback_stack_address + device.callback_stack_size) & ~@as(u64, 0xF);
+            guestRegs(state).*.rip = device.spec.callback;
+            guestRegs(state).*.rdi = device.spec.userdata;
+            guestRegs(state).*.rsi = device.stream_address;
+            guestRegs(state).*.rdx = device.spec.size;
+            guestRegs(state).*.rsp = (device.callback_stack_address + device.callback_stack_size) & ~@as(u64, 0xF);
             state.push(return_sentinel);
             state.active_guest_thread = audio_callback_handle_base + slot;
             state.noteSyntheticStackEntry(state.active_guest_thread);
@@ -837,15 +849,15 @@ pub const Runtime = struct {
     }
 
     fn mixAudioFormat(self: *Runtime, state: anytype) void {
-        const format: u16 = @truncate(state.regs.rdx);
-        const length: usize = @intCast(@min(state.regs.rcx, @as(u64, 64 * 1024 * 1024)));
-        const volume: u32 = @truncate(state.regs.r8);
+        const format: u16 = @truncate(guestRegs(state).*.rdx);
+        const length: usize = @intCast(@min(guestRegs(state).*.rcx, @as(u64, 64 * 1024 * 1024)));
+        const volume: u32 = @truncate(guestRegs(state).*.r8);
         if (format != audio_f32_lsb or length % @sizeOf(f32) != 0) {
             self.setError("SDL_MixAudioFormat received an unsupported format or length");
             return;
         }
-        const destination = state.guestMemory(state.regs.rdi, length) orelse return;
-        const source = state.guestMemory(state.regs.rsi, length) orelse return;
+        const destination = state.guestMemory(guestRegs(state).*.rdi, length) orelse return;
+        const source = state.guestMemory(guestRegs(state).*.rsi, length) orelse return;
         const gain = @as(f32, @floatFromInt(@min(volume, sdl_mix_max_volume))) / @as(f32, @floatFromInt(sdl_mix_max_volume));
         var offset: usize = 0;
         while (offset < length) : (offset += 4) {
@@ -1045,7 +1057,7 @@ const TestState = struct {
     }
 
     fn push(self: *TestState, value: u64) void {
-        self.regs.rsp -= 8;
+        guestRegs(self).*.rsp -= 8;
         self.pushed = value;
     }
 
@@ -1059,7 +1071,7 @@ const TestState = struct {
     }
 
     fn noteSyntheticStackEntry(self: *TestState, handle: u64) void {
-        self.synthetic_stack_entry_rsp = self.regs.rsp;
+        self.synthetic_stack_entry_rsp = guestRegs(self).*.rsp;
         self.synthetic_stack_entry_handle = handle;
         self.synthetic_stack_dispatches += 1;
     }
@@ -1149,7 +1161,7 @@ const TestState = struct {
 test "SDL compatibility version satisfies Xenia audio and input" {
     var runtime = Runtime{};
     var state = TestState{};
-    state.regs.rdi = 8;
+    guestRegs(&state).*.rdi = 8;
     try std.testing.expect(runtime.dispatch(&state, "_SDL_GetVersion") != null);
     try std.testing.expectEqualSlices(u8, &compatibility_version, state.memory[8..11]);
 }
@@ -1157,7 +1169,7 @@ test "SDL compatibility version satisfies Xenia audio and input" {
 test "SDL subsystem reference counts do not lose a shared owner" {
     var runtime = Runtime{};
     var state = TestState{};
-    state.regs.rdi = 0x10;
+    guestRegs(&state).*.rdi = 0x10;
     _ = runtime.dispatch(&state, "SDL_InitSubSystem").?;
     _ = runtime.dispatch(&state, "SDL_InitSubSystem").?;
     _ = runtime.dispatch(&state, "SDL_QuitSubSystem").?;
@@ -1169,11 +1181,11 @@ test "SDL subsystem reference counts do not lose a shared owner" {
 test "SDL window adapter borrows canonical Cocoa identities and exports WM info" {
     var runtime = Runtime{};
     var state = TestState{};
-    state.regs.rdi = sdl_init_video;
+    guestRegs(&state).*.rdi = sdl_init_video;
     try std.testing.expectEqual(@as(u64, 0), runtime.dispatch(&state, "SDL_Init").?.handled);
 
     @memcpy(state.memory[16..28], "Xenia Cocoa\x00");
-    state.regs = .{
+    guestRegs(&state).* = .{
         .rdi = 16,
         .rsi = 0,
         .rdx = 0,
@@ -1199,12 +1211,12 @@ test "SDL window adapter borrows canonical Cocoa identities and exports WM info"
     state.memory[@intCast(wm_info)] = 2;
     state.memory[@intCast(wm_info + 1)] = 0;
     state.memory[@intCast(wm_info + 2)] = 12;
-    state.regs = .{ .rdi = window, .rsi = wm_info };
+    guestRegs(&state).* = .{ .rdi = window, .rsi = wm_info };
     try std.testing.expectEqual(@as(u64, 1), runtime.dispatch(&state, "SDL_GetWindowWMInfo").?.handled);
     try std.testing.expectEqual(sdl_syswm_cocoa, std.mem.readInt(u32, state.memory[132..136], .little));
     try std.testing.expectEqual(state.native_window_token, std.mem.readInt(u64, state.memory[136..144], .little));
 
-    state.regs = .{ .rdi = window, .rsi = 224, .rdx = 228 };
+    guestRegs(&state).* = .{ .rdi = window, .rsi = 224, .rdx = 228 };
     _ = runtime.dispatch(&state, "SDL_Vulkan_GetDrawableSize").?;
     try std.testing.expectEqual(@as(u32, 1920), std.mem.readInt(u32, state.memory[224..228], .little));
     try std.testing.expectEqual(@as(u32, 1080), std.mem.readInt(u32, state.memory[228..232], .little));
@@ -1213,24 +1225,24 @@ test "SDL window adapter borrows canonical Cocoa identities and exports WM info"
 test "SDL window generation rejects a destroyed handle after recreation" {
     var runtime = Runtime{};
     var state = TestState{};
-    state.regs.rdi = sdl_init_video;
+    guestRegs(&state).*.rdi = sdl_init_video;
     _ = runtime.dispatch(&state, "SDL_Init").?;
     @memcpy(state.memory[16..22], "first\x00");
-    state.regs = .{ .rdi = 16, .rcx = 640, .r8 = 480 };
+    guestRegs(&state).* = .{ .rdi = 16, .rcx = 640, .r8 = 480 };
     const first = runtime.dispatch(&state, "SDL_CreateWindow").?.handled;
     try std.testing.expect(first != 0);
 
-    state.regs = .{ .rdi = first };
+    guestRegs(&state).* = .{ .rdi = first };
     _ = runtime.dispatch(&state, "SDL_DestroyWindow").?;
     try std.testing.expect(!runtime.graphicsSnapshot().window_bound);
 
     @memcpy(state.memory[32..39], "second\x00");
-    state.regs = .{ .rdi = 32, .rcx = 800, .r8 = 600 };
+    guestRegs(&state).* = .{ .rdi = 32, .rcx = 800, .r8 = 600 };
     const second = runtime.dispatch(&state, "SDL_CreateWindow").?.handled;
     try std.testing.expect(second != 0);
     try std.testing.expect(first != second);
 
-    state.regs = .{ .rdi = first, .rsi = 1024, .rdx = 768 };
+    guestRegs(&state).* = .{ .rdi = first, .rsi = 1024, .rdx = 768 };
     _ = runtime.dispatch(&state, "SDL_SetWindowSize").?;
     try std.testing.expectEqual(@as(u64, 1), runtime.window_invalid_handles);
     try std.testing.expectEqual(@as(u32, 800), runtime.window_width);
@@ -1240,10 +1252,10 @@ test "SDL window generation rejects a destroyed handle after recreation" {
 test "SDL Quit releases the SDL binding but leaves Cocoa ownership external" {
     var runtime = Runtime{};
     var state = TestState{};
-    state.regs.rdi = sdl_init_video;
+    guestRegs(&state).*.rdi = sdl_init_video;
     _ = runtime.dispatch(&state, "SDL_Init").?;
     @memcpy(state.memory[16..22], "owned\x00");
-    state.regs = .{ .rdi = 16, .rcx = 1280, .r8 = 720 };
+    guestRegs(&state).* = .{ .rdi = 16, .rcx = 1280, .r8 = 720 };
     _ = runtime.dispatch(&state, "SDL_CreateWindow").?;
     _ = runtime.dispatch(&state, "SDL_Quit").?;
     try std.testing.expectEqual(@as(u32, 0), runtime.initialized_mask);
@@ -1254,7 +1266,7 @@ test "SDL Quit releases the SDL binding but leaves Cocoa ownership external" {
 test "SDL audio devices copy the obtained spec and reject stale ids" {
     var runtime = Runtime{};
     var state = TestState{};
-    state.regs.rdi = sdl_init_audio;
+    guestRegs(&state).*.rdi = sdl_init_audio;
     _ = runtime.dispatch(&state, "SDL_InitSubSystem").?;
     const desired_address = 64;
     const obtained_address = 128;
@@ -1270,15 +1282,15 @@ test "SDL audio devices copy the obtained spec and reject stale ids" {
         .userdata = 0x1234,
     };
     desired.write(state.memory[desired_address .. desired_address + audio_spec_size]);
-    state.regs.rdx = desired_address;
-    state.regs.rcx = obtained_address;
+    guestRegs(&state).*.rdx = desired_address;
+    guestRegs(&state).*.rcx = obtained_address;
     const opened = runtime.dispatch(&state, "_SDL_OpenAudioDevice").?.handled;
     try std.testing.expect(opened != 0);
     const obtained = AudioSpec.read(state.memory[obtained_address .. obtained_address + audio_spec_size]);
     try std.testing.expectEqual(@as(u32, 6144), obtained.size);
     try std.testing.expectEqual(@as(u8, 6), obtained.channels);
 
-    state.regs.rdi = opened;
+    guestRegs(&state).*.rdi = opened;
     _ = runtime.dispatch(&state, "SDL_CloseAudioDevice").?;
     _ = runtime.dispatch(&state, "SDL_CloseAudioDevice").?;
     try std.testing.expectEqual(@as(u64, 1), runtime.audio_invalid_handles);
@@ -1300,15 +1312,15 @@ test "SDL audio open requires subsystem ownership and final quit retires devices
         .userdata = 0,
     };
     desired.write(state.memory[desired_address .. desired_address + audio_spec_size]);
-    state.regs.rdx = desired_address;
+    guestRegs(&state).*.rdx = desired_address;
     try std.testing.expectEqual(@as(u64, 0), runtime.dispatch(&state, "SDL_OpenAudioDevice").?.handled);
 
-    state.regs.rdi = sdl_init_audio;
+    guestRegs(&state).*.rdi = sdl_init_audio;
     _ = runtime.dispatch(&state, "SDL_InitSubSystem").?;
-    state.regs.rdx = desired_address;
+    guestRegs(&state).*.rdx = desired_address;
     const device_id = runtime.dispatch(&state, "SDL_OpenAudioDevice").?.handled;
     try std.testing.expect(device_id != 0);
-    state.regs.rdi = sdl_init_audio;
+    guestRegs(&state).*.rdi = sdl_init_audio;
     _ = runtime.dispatch(&state, "SDL_QuitSubSystem").?;
     try std.testing.expectEqual(@as(u32, 0), runtime.initialized_mask & sdl_init_audio);
     try std.testing.expectEqual(@as(u64, 1), runtime.audio_subsystem_closes);
@@ -1318,7 +1330,7 @@ test "SDL audio open requires subsystem ownership and final quit retires devices
 test "an audio callback owns a dedicated stack until its return sentinel" {
     var runtime = Runtime{};
     var state = TestState{};
-    state.regs.rdi = sdl_init_audio;
+    guestRegs(&state).*.rdi = sdl_init_audio;
     _ = runtime.dispatch(&state, "SDL_InitSubSystem").?;
 
     const desired_address = 64;
@@ -1334,12 +1346,12 @@ test "an audio callback owns a dedicated stack until its return sentinel" {
         .userdata = 0x1234,
     };
     desired.write(state.memory[desired_address .. desired_address + audio_spec_size]);
-    state.regs.rdx = desired_address;
-    state.regs.rcx = 0;
+    guestRegs(&state).*.rdx = desired_address;
+    guestRegs(&state).*.rcx = 0;
     const opened = runtime.dispatch(&state, "_SDL_OpenAudioDevice").?.handled;
     try std.testing.expect(opened != 0);
-    state.regs.rdi = opened;
-    state.regs.rsi = 0;
+    guestRegs(&state).*.rdi = opened;
+    guestRegs(&state).*.rsi = 0;
     _ = runtime.dispatch(&state, "SDL_PauseAudioDevice").?;
 
     try std.testing.expect(!runtime.audioCallbackInFlight());
@@ -1358,7 +1370,7 @@ test "an audio callback owns a dedicated stack until its return sentinel" {
     try std.testing.expectEqual(sentinel, state.pushed);
     try std.testing.expectEqual(
         runtime.devices[0].callback_stack_address + runtime.devices[0].callback_stack_size - 8,
-        state.regs.rsp,
+        guestRegs(&state).*.rsp,
     );
     try std.testing.expectEqual(state.active_guest_thread, state.synthetic_stack_entry_handle);
     try std.testing.expectEqual(@as(u64, 1), state.synthetic_stack_dispatches);
@@ -1388,13 +1400,13 @@ test "SDL hint success requires two complete guest strings" {
     state.memory[17] = 0;
     @memcpy(state.memory[32..37], "value");
     state.memory[37] = 0;
-    state.regs.rdi = 8;
-    state.regs.rsi = 32;
+    guestRegs(&state).*.rdi = 8;
+    guestRegs(&state).*.rsi = 32;
 
     const valid = runtime.dispatch(&state, "SDL_SetHintWithPriority").?;
     try std.testing.expectEqual(@as(u64, 1), valid.handled);
 
-    state.regs.rsi = state.memory.len - 1;
+    guestRegs(&state).*.rsi = state.memory.len - 1;
     state.memory[state.memory.len - 1] = 'x';
     const invalid = runtime.dispatch(&state, "_SDL_SetHintWithPriority").?;
     try std.testing.expectEqual(@as(u64, 0), invalid.handled);

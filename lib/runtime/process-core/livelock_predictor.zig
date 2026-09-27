@@ -30,6 +30,18 @@
 const std = @import("std");
 const machoCapturePrint = @import("dyld").event_log.machoCapturePrint;
 
+/// Return the architectural register file belonging to this host executor's
+/// bound guest context, or the traditional owner register file when the
+/// caller uses a standalone state value.
+fn guestRegs(state: anytype) if (@typeInfo(@TypeOf(state)).pointer.is_const)
+    *const @FieldType(@TypeOf(state.*), "regs")
+else
+    *@FieldType(@TypeOf(state.*), "regs") {
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "windowsGuestContextField")) return state.windowsGuestContextField("regs");
+    return &@field(state.*, "regs");
+}
+
 pub const SIGNATURE_CAPACITY: usize = 32;
 pub const RECENT_CAPACITY: usize = 16;
 /// Cap per-signature emissions so a recurring wait loop cannot spam the log.
@@ -206,7 +218,7 @@ pub const Predictor = struct {
         // active register file's RIP is the guest's own site. Test states
         // expose only `executed_steps`; only real states have `regs`.
         if (comptime @hasField(@TypeOf(state.*), "regs")) {
-            signature.pc = state.regs.rip;
+            signature.pc = guestRegs(state).*.rip;
         }
         self.pushRecent(op, object, state.executed_steps);
 
@@ -558,7 +570,7 @@ test "the guest PC of the operation is captured when the state has registers" {
     var predictor = Predictor{};
     var state = TestState{};
     state.executed_steps = 100;
-    state.regs.rip = 0x82581ad0;
+    guestRegs(&state).*.rip = 0x82581ad0;
     predictor.note(&state, .set_event, 0x827CEC28, 0x7fff2080, true);
     try std.testing.expectEqual(@as(u64, 0x82581ad0), predictor.findOrInsert(.set_event, 0x827CEC28).?.pc);
 }

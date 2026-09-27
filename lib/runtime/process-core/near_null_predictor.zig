@@ -47,6 +47,18 @@ const receiver_classification = @import("common_receiver_classification");
 /// Receivers below this bound are "near null": dereferencing them faults on
 /// the zero page or a tiny tag-like address. Matches the existing 0x1000
 /// near-null convention used by the fault classifier and memory views.
+/// Return the architectural register file belonging to this host executor's
+/// bound guest context, or the traditional owner register file when the
+/// caller uses a standalone state value.
+fn guestRegs(state: anytype) if (@typeInfo(@TypeOf(state)).pointer.is_const)
+    *const @FieldType(@TypeOf(state.*), "regs")
+else
+    *@FieldType(@TypeOf(state.*), "regs") {
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "windowsGuestContextField")) return state.windowsGuestContextField("regs");
+    return &@field(state.*, "regs");
+}
+
 pub const NEAR_NULL_LIMIT: u64 = 0x1000;
 pub const SIGNATURE_CAPACITY: usize = 32;
 pub const RECENT_CAPACITY: usize = 16;
@@ -203,7 +215,7 @@ pub const Predictor = struct {
     /// Only near-null receivers on receiver-shaped imports resolve the caller
     /// and touch the table.
     pub fn note(self: *Predictor, state: anytype, symbol: []const u8) void {
-        const receiver = state.regs.rdi;
+        const receiver = guestRegs(state).*.rdi;
         if (receiver >= NEAR_NULL_LIMIT) return;
         self.near_null_dispatches +|= 1;
         // Two different reasons a near-null rdi here predicts nothing: the
@@ -615,9 +627,9 @@ pub const Predictor = struct {
 /// caller collapsed to the thunk address — read the stack directly, exactly
 /// like the proven `handleImport` path.
 fn importCallerAddress(state: anytype) u64 {
-    if (state.regs.rsp == 0) return state.regs.rip;
-    const caller = state.read64(state.regs.rsp);
-    return if (caller != 0) caller else state.regs.rip;
+    if (guestRegs(state).*.rsp == 0) return guestRegs(state).*.rip;
+    const caller = state.read64(guestRegs(state).*.rsp);
+    return if (caller != 0) caller else guestRegs(state).*.rip;
 }
 
 /// The display name of a signature's callee: resolved from the stored callee
@@ -682,7 +694,7 @@ test "predictor records first sight and recurrence separately" {
 
     var predictor = Predictor{};
     var state = TestState{};
-    state.regs.rdi = 0;
+    guestRegs(&state).*.rdi = 0;
     state.executed_steps = 10;
     predictor.note(&state, "_ZStls...EPKc");
     try std.testing.expectEqual(@as(u64, 1), predictor.near_null_dispatches);
@@ -692,13 +704,13 @@ test "predictor records first sight and recurrence separately" {
     try std.testing.expectEqual(@as(u32, 1), signature.emissions);
 
     // A sane receiver is ignored entirely.
-    state.regs.rdi = 0x10000;
+    guestRegs(&state).*.rdi = 0x10000;
     predictor.note(&state, "_ZStls...EPKc");
     try std.testing.expectEqual(@as(u64, 1), predictor.near_null_dispatches);
 
     // Recurrence with the same receiver re-emits only at a doubling threshold
     // (count 2 is a power of two) and stays quiet otherwise.
-    state.regs.rdi = 0;
+    guestRegs(&state).*.rdi = 0;
     state.executed_steps = 20;
     predictor.note(&state, "_ZStls...EPKc");
     try std.testing.expectEqual(@as(u32, 2), signature.count);
@@ -931,7 +943,7 @@ test "correct calls with a small first argument are not retained as predictions"
     var predictor = Predictor{};
     var state = TestState{};
     for (observed) |call| {
-        state.regs.rdi = call.rdi;
+        guestRegs(&state).*.rdi = call.rdi;
         predictor.note(&state, call.symbol);
     }
 
@@ -966,7 +978,7 @@ test "a genuine null receiver is still retained after the benign lists grow" {
     var state = TestState{};
 
     // Takes SDL_AudioSpec*/SDL_Surface* — null here is a real defect.
-    state.regs.rdi = 0;
+    guestRegs(&state).*.rdi = 0;
     predictor.note(&state, "_SDL_FreeSurface");
     predictor.note(&state, "_SDL_GameControllerName");
     // A C++ member function is always receiver-shaped.
