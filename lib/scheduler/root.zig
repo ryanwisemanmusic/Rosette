@@ -74,14 +74,15 @@ pub const WaitNode = wait_graph.WaitNode;
 pub const BlockingClassification = wait_graph.BlockingClassification;
 pub const BlockingType = wait_graph.BlockingType;
 pub const ThreadStateInfo = wait_graph.ThreadStateInfo;
-// pub const NativeThreadBackend = native_thread_backend.NativeThreadBackend;
-// pub const NativeThreadConfig = native_thread_backend.NativeThreadConfig;
-// pub const NativeThreadContext = native_thread_backend.NativeThreadContext;
-// pub const ExecutionMode = native_thread_backend.ExecutionMode;
-// pub const AffinityPolicy = native_thread_backend.AffinityPolicy;
-// pub const ThreadState = native_thread_backend.ThreadState;
-// pub const ThreadError = native_thread_backend.ThreadError;
-// pub const CpuContext = native_thread_backend.CpuContext;
+pub const NativeThreadBackend = native_thread_backend.NativeThreadBackend;
+pub const NativeThreadConfig = native_thread_backend.NativeThreadConfig;
+pub const NativeThreadContext = native_thread_backend.NativeThreadContext;
+pub const NativeThreadSnapshot = native_thread_backend.NativeThreadSnapshot;
+pub const ExecutionMode = native_thread_backend.ExecutionMode;
+pub const AffinityPolicy = native_thread_backend.AffinityPolicy;
+pub const NativeThreadState = native_thread_backend.ThreadState;
+pub const NativeThreadError = native_thread_backend.ThreadError;
+pub const CpuContext = native_thread_backend.CpuContext;
 
 // Global functions
 pub const getGlobalScheduler = scheduler.getGlobalScheduler;
@@ -104,7 +105,7 @@ test "scheduler module integration" {
     _ = polling_detection;
     _ = wait_graph;
     _ = notifier_liveness;
-    // _ = native_thread_backend; // Skip for now due to threading complexity
+    _ = native_thread_backend;
 
     // Test global functions
     const allocator = std.testing.allocator;
