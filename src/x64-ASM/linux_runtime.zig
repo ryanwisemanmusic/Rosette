@@ -3,6 +3,18 @@ const x64_syscalls = @import("x64_syscalls");
 const x64_interactive_bridge = @import("interactive_bridge.zig");
 const windows_runtime = @import("windows_runtime");
 
+/// Return the architectural register file belonging to this host executor's
+/// bound guest context, or the traditional owner register file when the
+/// caller uses a standalone state value.
+fn guestRegs(state: anytype) if (@typeInfo(@TypeOf(state)).pointer.is_const)
+    *const @FieldType(@TypeOf(state.*), "regs")
+else
+    *@FieldType(@TypeOf(state.*), "regs") {
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "windowsGuestContextField")) return state.windowsGuestContextField("regs");
+    return &@field(state.*, "regs");
+}
+
 pub const SYNTHETIC_PTHREAD_ONCE_RETURN = windows_runtime.SYNTHETIC_PTHREAD_ONCE_RETURN;
 pub const SYNTHETIC_INITTERM_RETURN = windows_runtime.SYNTHETIC_INITTERM_RETURN;
 pub const SYNTHETIC_QSORT_RETURN = windows_runtime.SYNTHETIC_QSORT_RETURN;
@@ -48,10 +60,9 @@ pub fn setupInitialStack(state: anytype, argv: []const []const u8) !void {
         i -= 1;
         const arg = actual_argv[i];
         sp -|= arg.len + 1;
-        const off = state.addrToOffset(sp) orelse return error.StackOutOfRange;
-        if (off + arg.len + 1 > state.mem.len) return error.StackOutOfRange;
-        @memcpy(state.mem[off..][0..arg.len], arg);
-        state.mem[off + arg.len] = 0;
+        if (state.guestMemory(sp, @intCast(arg.len + 1)) == null) return error.StackOutOfRange;
+        if (!state.copyToGuest(sp, arg)) return error.StackOutOfRange;
+        state.write8(sp +| @as(u64, @intCast(arg.len)), 0);
         arg_ptrs[i] = sp;
     }
 
@@ -70,21 +81,21 @@ pub fn setupInitialStack(state: anytype, argv: []const []const u8) !void {
 
     sp -|= 8;
     state.write64(sp, @intCast(actual_argv.len));
-    state.regs.rsp = sp;
+    guestRegs(state).*.rsp = sp;
 }
 
 pub fn tryLibcStartMainTrampoline(state: anytype, d: anytype, return_rip: u64) bool {
     if (state.libc_start_main_trampolined) return false;
     if (!d.rip_relative) return false;
 
-    const main_addr = state.regs.rdi;
+    const main_addr = guestRegs(state).*.rdi;
     if (main_addr == 0 or state.addrToOffset(main_addr) == null) return false;
 
     const first = state.read8(main_addr);
     if (first != 0x55 and first != 0x48 and first != 0xF3) return false;
 
-    const argc = state.regs.rsi;
-    const argv = state.regs.rdx;
+    const argc = guestRegs(state).*.rsi;
+    const argv = guestRegs(state).*.rdx;
     _ = return_rip;
     state.startLibcMain(main_addr, argc, argv);
     std.log.scoped(.x64_linux_runtime).info("bridged unresolved __libc_start_main to main=0x{x} argc={d} init_count={d}", .{
@@ -109,10 +120,10 @@ pub fn tryDynamicFunctionShim(state: anytype, got_addr: u64, direct_return_rip: 
     const relocation = dynamicRelocation(state, got_addr) orelse {
         if (windows_mode or direct_return_rip != null) return false;
         const resolver_name = dynamicPltResolverRelocationName(state) orelse return false;
-        const old_rsp = state.regs.rsp;
-        state.regs.rsp +%= 16;
+        const old_rsp = guestRegs(state).*.rsp;
+        guestRegs(state).*.rsp +%= 16;
         if (tryNamedFunctionShim(state, resolver_name, null)) return true;
-        state.regs.rsp = old_rsp;
+        guestRegs(state).*.rsp = old_rsp;
         if (tryWindowsLazyImport(state, resolver_name)) return true;
         std.log.scoped(.x64_linux_runtime).warn("unsupported lazy PLT symbol {s}", .{resolver_name});
         return false;
@@ -140,6 +151,13 @@ pub fn tryWindowsFunction(state: anytype, dll_name: []const u8, name: []const u8
     return windows_runtime.tryFunction(state, dll_name, name, direct_return_rip);
 }
 
+/// Probe only the narrow Windows imports that are safe before acquiring the
+/// runtime-table lock. The caller must still prove that its target is a
+/// direct static import stub.
+pub fn tryWindowsFastFunction(state: anytype, dll_name: []const u8, name: []const u8, direct_return_rip: ?u64) bool {
+    return windows_runtime.tryWindowsFastFunction(state, dll_name, name, direct_return_rip);
+}
+
 /// Complete a Rosetta-owned semantic compatibility boundary for a Windows
 /// guest before its first instruction executes. This stays alongside the
 /// Windows ABI bridge so the ELF executor only owns the architectural return
@@ -150,26 +168,51 @@ pub fn tryWindowsGuestCompatibility(state: anytype) bool {
 
 pub fn tryLocalFunctionShim(state: anytype, target: u64, direct_return_rip: u64) bool {
     const name = state.localSymbolNameAt(target) orelse return false;
-    if (x64_interactive_bridge.tryLocalFunctionBridge(state, name, direct_return_rip)) return true;
-    if (symbolNameEql(name, "_ZNKSt3__16locale9use_facetERNS0_2idE")) {
-        const facet = resolveLocaleFacet(state) orelse return false;
-        state.regs.rax = facet;
-        finishExternalReturn(state, direct_return_rip);
-        return true;
+    const bridge_match = x64_interactive_bridge.enabled() and x64_interactive_bridge.recognizesLocalFunction(name);
+    const locale_match = symbolNameEql(name, "_ZNKSt3__16locale9use_facetERNS0_2idE");
+    if (!bridge_match and !locale_match) return false;
+
+    const State = @TypeOf(state.*);
+    if (comptime @hasField(State, "parallel_guest_execution") and @hasDecl(State, "lockWindowsRuntime")) {
+        if (state.parallel_guest_execution) {
+            // A dispatch level: it only routes into the shim's handler.
+            var runtime_guard = if (comptime @hasDecl(State, "lockWindowsRuntimeForDispatch"))
+                state.lockWindowsRuntimeForDispatch()
+            else
+                state.lockWindowsRuntime();
+            defer runtime_guard.unlock();
+            return tryLocalFunctionShimResolved(state, name, direct_return_rip, bridge_match, locale_match);
+        }
     }
-    return false;
+    return tryLocalFunctionShimResolved(state, name, direct_return_rip, bridge_match, locale_match);
+}
+
+fn tryLocalFunctionShimResolved(
+    state: anytype,
+    name: []const u8,
+    direct_return_rip: u64,
+    bridge_match: bool,
+    locale_match: bool,
+) bool {
+    if (bridge_match and x64_interactive_bridge.tryLocalFunctionBridge(state, name, direct_return_rip)) return true;
+    if (!locale_match) return false;
+    const facet = resolveLocaleFacet(state) orelse return false;
+    guestRegs(state).*.rax = facet;
+    finishExternalReturn(state, direct_return_rip);
+    return true;
 }
 
 fn tryNamedFunctionShim(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
     if (symbolNameEql(name, "remove")) {
-        const path = guestCString(state, state.regs.rdi) orelse "";
-        state.regs.rax = 0;
+        var path_storage: [4096]u8 = undefined;
+        const path = state.copyGuestCString(guestRegs(state).*.rdi, path_storage.len + 1, path_storage[0..]) orelse 0;
+        guestRegs(state).*.rax = 0;
         finishExternalReturn(state, direct_return_rip);
-        std.log.scoped(.x64_linux_runtime).info("shimmed remove({s}) as no-op", .{path});
+        std.log.scoped(.x64_linux_runtime).info("shimmed remove({s}) as no-op", .{path_storage[0..path]});
         return true;
     }
     if (symbolNameEql(name, "exit") or symbolNameEql(name, "_exit")) {
-        state.exit_code = state.regs.rdi;
+        state.exit_code = guestRegs(state).*.rdi;
         state.terminated = true;
         std.log.scoped(.x64_linux_runtime).info("shimmed {s}({d})", .{ name, state.exit_code });
         return true;
@@ -182,14 +225,14 @@ fn tryNamedFunctionShim(state: anytype, name: []const u8, direct_return_rip: ?u6
         return true;
     }
     if (symbolNameEql(name, "__cxa_atexit")) {
-        state.regs.rax = 0;
+        guestRegs(state).*.rax = 0;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
     if (symbolNameEql(name, "aligned_alloc")) {
-        const alignment = state.regs.rdi;
-        const size = state.regs.rsi;
-        state.regs.rax = state.guestAlloc(size, alignment) orelse 0;
+        const alignment = guestRegs(state).*.rdi;
+        const size = guestRegs(state).*.rsi;
+        guestRegs(state).*.rax = state.guestAlloc(size, alignment) orelse 0;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
@@ -197,19 +240,19 @@ fn tryNamedFunctionShim(state: anytype, name: []const u8, direct_return_rip: ?u6
         symbolNameEql(name, "_Znwm") or
         symbolNameEql(name, "_Znam"))
     {
-        state.regs.rax = state.guestAlloc(state.regs.rdi, 16) orelse 0;
+        guestRegs(state).*.rax = state.guestAlloc(guestRegs(state).*.rdi, 16) orelse 0;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
     if (symbolNameEql(name, "calloc")) {
-        const count = state.regs.rdi;
-        const elem_size = state.regs.rsi;
+        const count = guestRegs(state).*.rdi;
+        const elem_size = guestRegs(state).*.rsi;
         const total = std.math.mul(u64, count, elem_size) catch {
-            state.regs.rax = 0;
+            guestRegs(state).*.rax = 0;
             finishExternalReturn(state, direct_return_rip);
             return true;
         };
-        state.regs.rax = state.guestAlloc(total, 16) orelse 0;
+        guestRegs(state).*.rax = state.guestAlloc(total, 16) orelse 0;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
@@ -219,7 +262,7 @@ fn tryNamedFunctionShim(state: anytype, name: []const u8, direct_return_rip: ?u6
         symbolNameEql(name, "_ZdlPvm") or
         symbolNameEql(name, "_ZdaPvm"))
     {
-        state.regs.rax = 0;
+        guestRegs(state).*.rax = 0;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
@@ -228,37 +271,37 @@ fn tryNamedFunctionShim(state: anytype, name: []const u8, direct_return_rip: ?u6
         symbolNameEql(name, "dlerror") or
         symbolNameEql(name, "dl_iterate_phdr"))
     {
-        state.regs.rax = 0;
+        guestRegs(state).*.rax = 0;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
     if (symbolNameEql(name, "dlclose")) {
-        state.regs.rax = 0;
+        guestRegs(state).*.rax = 0;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
     if (symbolNameEql(name, "newlocale")) {
-        state.regs.rax = state.guestAlloc(16, 8) orelse 1;
+        guestRegs(state).*.rax = state.guestAlloc(16, 8) orelse 1;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
     if (symbolNameEql(name, "uselocale")) {
-        state.regs.rax = 1;
+        guestRegs(state).*.rax = 1;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
     if (symbolNameEql(name, "freelocale")) {
-        state.regs.rax = 0;
+        guestRegs(state).*.rax = 0;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
     if (symbolNameEql(name, "setlocale")) {
-        state.regs.rax = guestStringLiteral(state, "C");
+        guestRegs(state).*.rax = guestStringLiteral(state, "C");
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
     if (symbolNameEql(name, "localeconv")) {
-        state.regs.rax = guestLocaleConv(state);
+        guestRegs(state).*.rax = guestLocaleConv(state);
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
@@ -272,13 +315,13 @@ fn tryNamedFunctionShim(state: anytype, name: []const u8, direct_return_rip: ?u6
         symbolNameEql(name, "pthread_rwlock_wrlock") or
         symbolNameEql(name, "pthread_rwlock_unlock"))
     {
-        state.regs.rax = 0;
+        guestRegs(state).*.rax = 0;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
     if (symbolNameEql(name, "isatty")) {
-        const fd = state.regs.rdi;
-        state.regs.rax = if (fd <= 2) 1 else 0;
+        const fd = guestRegs(state).*.rdi;
+        guestRegs(state).*.rax = if (fd <= 2) 1 else 0;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
@@ -288,7 +331,7 @@ fn tryNamedFunctionShim(state: anytype, name: []const u8, direct_return_rip: ?u6
         return true;
     }
     if (symbolNameEql(name, "__ctype_get_mb_cur_max")) {
-        state.regs.rax = 1;
+        guestRegs(state).*.rax = 1;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
@@ -298,14 +341,14 @@ fn tryNamedFunctionShim(state: anytype, name: []const u8, direct_return_rip: ?u6
         return true;
     }
     if (symbolNameEql(name, "btowc")) {
-        const ch = state.regs.rdi & 0xFF;
-        state.regs.rax = if (ch == 0xFF) 0xFFFF_FFFF else ch;
+        const ch = guestRegs(state).*.rdi & 0xFF;
+        guestRegs(state).*.rax = if (ch == 0xFF) 0xFFFF_FFFF else ch;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
     if (symbolNameEql(name, "wctob")) {
-        const wc = state.regs.rdi;
-        state.regs.rax = if (wc <= 0x7F) wc else 0xFFFF_FFFF;
+        const wc = guestRegs(state).*.rdi;
+        guestRegs(state).*.rax = if (wc <= 0x7F) wc else 0xFFFF_FFFF;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
@@ -315,16 +358,16 @@ fn tryNamedFunctionShim(state: anytype, name: []const u8, direct_return_rip: ?u6
         return true;
     }
     if (symbolNameEql(name, "iswcntrl_l")) {
-        const wc = state.regs.rdi;
-        state.regs.rax = if (wc < 0x20 or wc == 0x7F) 1 else 0;
+        const wc = guestRegs(state).*.rdi;
+        guestRegs(state).*.rax = if (wc < 0x20 or wc == 0x7F) 1 else 0;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
     if (symbolNameEql(name, "towlower_l") or symbolNameEql(name, "towupper_l")) {
-        var wc = state.regs.rdi;
+        var wc = guestRegs(state).*.rdi;
         if (symbolNameEql(name, "towlower_l") and wc >= 'A' and wc <= 'Z') wc += 32;
         if (symbolNameEql(name, "towupper_l") and wc >= 'a' and wc <= 'z') wc -= 32;
-        state.regs.rax = wc;
+        guestRegs(state).*.rax = wc;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
@@ -334,19 +377,19 @@ fn tryNamedFunctionShim(state: anytype, name: []const u8, direct_return_rip: ?u6
         return true;
     }
     if (symbolNameEql(name, "strcmp") or symbolNameEql(name, "strcoll_l")) {
-        state.regs.rax = @bitCast(@as(i64, guestStrcmp(state, state.regs.rdi, state.regs.rsi)));
+        guestRegs(state).*.rax = @bitCast(@as(i64, guestStrcmp(state, guestRegs(state).*.rdi, guestRegs(state).*.rsi)));
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
     if (symbolNameEql(name, "syscall")) {
         state.invokeLinuxSyscall(
-            state.regs.rdi,
-            state.regs.rsi,
-            state.regs.rdx,
-            state.regs.rcx,
-            state.regs.r8,
-            state.regs.r9,
-            state.read64(state.regs.rsp + 8),
+            guestRegs(state).*.rdi,
+            guestRegs(state).*.rsi,
+            guestRegs(state).*.rdx,
+            guestRegs(state).*.rcx,
+            guestRegs(state).*.r8,
+            guestRegs(state).*.r9,
+            state.read64(guestRegs(state).*.rsp + 8),
         );
         finishExternalReturn(state, direct_return_rip);
         return true;
@@ -359,19 +402,19 @@ fn tryNamedFunctionShim(state: anytype, name: []const u8, direct_return_rip: ?u6
         symbolNameEql(name, "pthread_detach") or
         symbolNameEql(name, "pthread_kill"))
     {
-        state.regs.rax = 0;
+        guestRegs(state).*.rax = 0;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
     if (symbolNameEql(name, "pthread_self")) {
-        state.regs.rax = 1;
+        guestRegs(state).*.rax = 1;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
     if (symbolNameEql(name, "fwrite") or symbolNameEql(name, "fwrite_unlocked")) {
-        const size = state.regs.rsi;
-        const count = state.regs.rdx;
-        state.regs.rax = if (size == 0) 0 else count;
+        const size = guestRegs(state).*.rsi;
+        const count = guestRegs(state).*.rdx;
+        guestRegs(state).*.rax = if (size == 0) 0 else count;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
@@ -379,17 +422,17 @@ fn tryNamedFunctionShim(state: anytype, name: []const u8, direct_return_rip: ?u6
         symbolNameEql(name, "putc") or
         symbolNameEql(name, "putchar"))
     {
-        state.regs.rax = state.regs.rdi & 0xFF;
+        guestRegs(state).*.rax = guestRegs(state).*.rdi & 0xFF;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
     if (symbolNameEql(name, "fputs") or symbolNameEql(name, "puts")) {
-        state.regs.rax = 0;
+        guestRegs(state).*.rax = 0;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
     if (symbolNameEql(name, "fflush")) {
-        state.regs.rax = 0;
+        guestRegs(state).*.rax = 0;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
@@ -399,7 +442,7 @@ fn tryNamedFunctionShim(state: anytype, name: []const u8, direct_return_rip: ?u6
         symbolNameEql(name, "snprintf") or
         symbolNameEql(name, "vsnprintf"))
     {
-        state.regs.rax = 0;
+        guestRegs(state).*.rax = 0;
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
@@ -412,7 +455,7 @@ fn tryNamedFunctionShim(state: anytype, name: []const u8, direct_return_rip: ?u6
 }
 
 fn dynamicPltResolverRelocationName(state: anytype) ?[]const u8 {
-    const relocation_index = state.read64(state.regs.rsp + 8);
+    const relocation_index = state.read64(guestRegs(state).*.rsp + 8);
     var jump_slot_index: u64 = 0;
     for (state.dynamic_relocations) |reloc| {
         if (reloc.rel_type != 7) continue; // R_X86_64_JUMP_SLOT
@@ -448,7 +491,65 @@ fn tryWindowsLazyImport(state: anytype, name: []const u8) bool {
     return false;
 }
 
+/// Bounded call-site cache for indirect import lookup. PE games repeatedly
+/// call through the same IAT slots; scanning every relocation for each
+/// `call [mem]` made the import bridge pay O(import_count) on its hot path.
+/// The cache is owned by the emulation state, so multiple guests do not share
+/// mutable lookup state. A full address key makes direct-map collisions safe,
+/// and misses are remembered too because ordinary vtable calls are common.
+pub const DynamicRelocationLookup = struct {
+    const entry_count = 256;
+    const no_relocation = std.math.maxInt(u32);
+
+    const Entry = struct {
+        address: u64 = 0,
+        index: u32 = no_relocation,
+        valid: bool = false,
+    };
+
+    entries: [entry_count]Entry = [_]Entry{.{}} ** entry_count,
+
+    pub fn clear(self: *DynamicRelocationLookup) void {
+        @memset(self.entries[0..], .{});
+    }
+
+    fn slotFor(address: u64) usize {
+        const mixed = (address >> 3) *% 0x9E37_79B9_7F4A_7C15;
+        return @intCast(mixed & (entry_count - 1));
+    }
+
+    pub fn lookup(self: *DynamicRelocationLookup, relocations: anytype, address: u64) ?*const @TypeOf(relocations[0]) {
+        if (relocations.len == 0) return null;
+
+        const entry = &self.entries[slotFor(address)];
+        if (entry.valid and entry.address == address) {
+            if (entry.index == no_relocation) return null;
+            const index: usize = @intCast(entry.index);
+            if (index < relocations.len and relocations[index].offset == address) {
+                return &relocations[index];
+            }
+            // The relocation slice can be replaced by another load. A stale
+            // index is never trusted; fall through to the authoritative scan.
+            entry.valid = false;
+        }
+
+        for (relocations, 0..) |*relocation, index| {
+            if (relocation.offset != address) continue;
+            if (index < @as(usize, no_relocation)) {
+                entry.* = .{ .address = address, .index = @intCast(index), .valid = true };
+            }
+            return relocation;
+        }
+
+        entry.* = .{ .address = address, .index = no_relocation, .valid = true };
+        return null;
+    }
+};
+
 fn dynamicRelocation(state: anytype, got_addr: u64) ?*const @TypeOf(state.dynamic_relocations[0]) {
+    if (comptime @hasField(@TypeOf(state.*), "dynamic_relocation_lookup")) {
+        return state.dynamic_relocation_lookup.lookup(state.dynamic_relocations, got_addr);
+    }
     for (state.dynamic_relocations) |*reloc| {
         if (reloc.offset == got_addr) return reloc;
     }
@@ -483,7 +584,7 @@ const locale_facets = [_]LocaleFacetMap{
 fn resolveLocaleFacet(state: anytype) ?u64 {
     if (localeTableFacet(state)) |facet| return facet;
 
-    const id_addr = state.regs.rsi;
+    const id_addr = guestRegs(state).*.rsi;
     for (locale_facets) |facet| {
         const known_id = state.localSymbolAddress(facet.id_symbol) orelse continue;
         if (known_id != id_addr) continue;
@@ -496,8 +597,8 @@ fn resolveLocaleFacet(state: anytype) ?u64 {
 }
 
 fn localeTableFacet(state: anytype) ?u64 {
-    const id_addr = state.regs.rsi;
-    const locale_obj = state.regs.rdi;
+    const id_addr = guestRegs(state).*.rsi;
+    const locale_obj = guestRegs(state).*.rdi;
     const locale_imp = state.read64(locale_obj);
     if (locale_imp == 0 or state.addrToOffset(locale_imp) == null) return null;
     const raw_index = state.read32(id_addr + 8);
@@ -513,7 +614,7 @@ fn localeTableFacet(state: anytype) ?u64 {
 }
 
 fn seedLocaleFacetTable(state: anytype, id_addr: u64, facet_addr: u64) void {
-    const locale_obj = state.regs.rdi;
+    const locale_obj = guestRegs(state).*.rdi;
     const locale_imp = state.read64(locale_obj);
     if (locale_imp == 0 or state.addrToOffset(locale_imp) == null) return;
     const raw_index = state.read32(id_addr + 8);
@@ -532,21 +633,11 @@ fn seedFacetVtable(state: anytype, facet_addr: u64, vtable_symbol: []const u8) v
     state.write64(facet_addr, vtable + 16);
 }
 
-fn guestCString(state: anytype, addr: u64) ?[]const u8 {
-    const off = state.addrToOffset(addr) orelse return null;
-    const off_usize: usize = @intCast(off);
-    const rest = state.mem[off_usize..];
-    const len = std.mem.indexOfScalar(u8, rest, 0) orelse return null;
-    return rest[0..len];
-}
-
 fn guestStringLiteral(state: anytype, text: []const u8) u64 {
     const addr = state.guestAlloc(text.len + 1, 1) orelse return 0;
-    const off = state.addrToOffset(addr) orelse return 0;
-    const off_usize: usize = @intCast(off);
-    if (off_usize > state.mem.len or text.len + 1 > state.mem.len - off_usize) return 0;
-    @memcpy(state.mem[off_usize..][0..text.len], text);
-    state.mem[off_usize + text.len] = 0;
+    if (state.guestMemory(addr, @intCast(text.len + 1)) == null) return 0;
+    if (!state.copyToGuest(addr, text)) return 0;
+    state.write8(addr +| @as(u64, @intCast(text.len)), 0);
     return addr;
 }
 
@@ -554,66 +645,58 @@ fn guestLocaleConv(state: anytype) u64 {
     const decimal = guestStringLiteral(state, ".");
     const empty = guestStringLiteral(state, "");
     const addr = state.guestAlloc(96, 8) orelse return 0;
-    const off = state.addrToOffset(addr) orelse return 0;
-    const off_usize: usize = @intCast(off);
-    if (off_usize + 96 > state.mem.len) return 0;
-    @memset(state.mem[off_usize..][0..96], 0);
+    if (!state.fillGuestMemory(addr, 96, 0)) return 0;
     state.write64(addr + 0, decimal);
     state.write64(addr + 8, empty);
     return addr;
 }
 
 fn handleMbrtowcShim(state: anytype) void {
-    const pwc = state.regs.rdi;
-    const src = state.regs.rsi;
-    const len = state.regs.rdx;
+    const pwc = guestRegs(state).*.rdi;
+    const src = guestRegs(state).*.rsi;
+    const len = guestRegs(state).*.rdx;
     if (src == 0) {
-        state.regs.rax = 0;
+        guestRegs(state).*.rax = 0;
         return;
     }
     if (len == 0) {
-        state.regs.rax = std.math.maxInt(u64) - 1;
+        guestRegs(state).*.rax = std.math.maxInt(u64) - 1;
         return;
     }
     const ch = guestByte(state, src) orelse {
-        state.regs.rax = x64_syscalls.errnoValue(.bad_address);
+        guestRegs(state).*.rax = x64_syscalls.errnoValue(.bad_address);
         return;
     };
     if (pwc != 0) writeGuest32(state, pwc, ch);
-    state.regs.rax = if (ch == 0) 0 else 1;
+    guestRegs(state).*.rax = if (ch == 0) 0 else 1;
 }
 
 fn handleWcrtombShim(state: anytype) void {
-    const dst = state.regs.rdi;
-    const wc = state.regs.rsi;
+    const dst = guestRegs(state).*.rdi;
+    const wc = guestRegs(state).*.rsi;
     if (dst != 0) {
-        const off = state.addrToOffset(dst) orelse {
-            state.regs.rax = x64_syscalls.errnoValue(.bad_address);
-            return;
-        };
-        const off_usize: usize = @intCast(off);
-        if (off_usize >= state.mem.len) {
-            state.regs.rax = x64_syscalls.errnoValue(.bad_address);
+        if (state.guestMemory(dst, 1) == null) {
+            guestRegs(state).*.rax = x64_syscalls.errnoValue(.bad_address);
             return;
         }
-        state.mem[off_usize] = @truncate(wc);
+        state.write8(dst, @truncate(wc));
     }
-    state.regs.rax = 1;
+    guestRegs(state).*.rax = 1;
 }
 
 fn handleMemchrShim(state: anytype) void {
-    const ptr = state.regs.rdi;
-    const needle: u8 = @truncate(state.regs.rsi);
-    const len = state.regs.rdx;
+    const ptr = guestRegs(state).*.rdi;
+    const needle: u8 = @truncate(guestRegs(state).*.rsi);
+    const len = guestRegs(state).*.rdx;
     var index: u64 = 0;
     while (index < len) : (index += 1) {
         const ch = guestByte(state, ptr + index) orelse break;
         if (ch == needle) {
-            state.regs.rax = ptr + index;
+            guestRegs(state).*.rax = ptr + index;
             return;
         }
     }
-    state.regs.rax = 0;
+    guestRegs(state).*.rax = 0;
 }
 
 fn guestStrcmp(state: anytype, lhs: u64, rhs: u64) i32 {
@@ -627,80 +710,135 @@ fn guestStrcmp(state: anytype, lhs: u64, rhs: u64) i32 {
 }
 
 fn guestByte(state: anytype, addr: u64) ?u8 {
-    const off = state.addrToOffset(addr) orelse return null;
-    const off_usize: usize = @intCast(off);
-    if (off_usize >= state.mem.len) return null;
-    return state.mem[off_usize];
+    if (state.guestMemoryConst(addr, 1) == null) return null;
+    return state.read8(addr);
 }
 
 fn writeGuest32(state: anytype, addr: u64, value: u32) void {
-    const off = state.addrToOffset(addr) orelse return;
-    const off_usize: usize = @intCast(off);
-    if (off_usize + 4 > state.mem.len) return;
-    std.mem.writeInt(u32, state.mem[off_usize..][0..4], value, .little);
+    if (state.guestMemory(addr, 4) == null) return;
+    state.write32(addr, value);
 }
 
 fn finishExternalReturn(state: anytype, direct_return_rip: ?u64) void {
     if (direct_return_rip) |rip| {
-        state.regs.rip = rip;
+        guestRegs(state).*.rip = rip;
     } else {
-        state.regs.rip = state.pop();
+        guestRegs(state).*.rip = state.pop();
     }
 }
 
 fn handleWriteShim(state: anytype) void {
-    const fd = state.regs.rdi;
-    const buf = state.regs.rsi;
-    const len = state.regs.rdx;
-    const data = state.guestMemoryConst(buf, len) orelse {
-        state.regs.rax = x64_syscalls.errnoValue(.bad_address);
-        state.traceGuestIo("libc.write", fd, buf, len, state.regs.rax);
+    const fd = guestRegs(state).*.rdi;
+    const buf = guestRegs(state).*.rsi;
+    const len = guestRegs(state).*.rdx;
+    if (len == 0) {
+        guestRegs(state).*.rax = state.writeHostFd(fd, &.{});
+        state.traceGuestIo("libc.write", fd, buf, len, guestRegs(state).*.rax);
+        return;
+    }
+    if (len > std.math.maxInt(usize) or state.guestMemoryConst(buf, len) == null) {
+        guestRegs(state).*.rax = x64_syscalls.errnoValue(.bad_address);
+        state.traceGuestIo("libc.write", fd, buf, len, guestRegs(state).*.rax);
+        return;
+    }
+    const storage = state.allocator.alloc(u8, @intCast(len)) catch {
+        guestRegs(state).*.rax = x64_syscalls.errnoValue(.no_memory);
+        state.traceGuestIo("libc.write", fd, buf, len, guestRegs(state).*.rax);
         return;
     };
-    state.regs.rax = state.writeHostFd(fd, data);
-    state.traceGuestIo("libc.write", fd, buf, len, state.regs.rax);
+    defer state.allocator.free(storage);
+    if (!state.copyFromGuest(storage, buf)) {
+        guestRegs(state).*.rax = x64_syscalls.errnoValue(.bad_address);
+        state.traceGuestIo("libc.write", fd, buf, len, guestRegs(state).*.rax);
+        return;
+    }
+    guestRegs(state).*.rax = state.writeHostFd(fd, storage);
+    state.traceGuestIo("libc.write", fd, buf, len, guestRegs(state).*.rax);
 }
 
 fn handleWritevShim(state: anytype) void {
-    const fd = state.regs.rdi;
-    const iov = state.regs.rsi;
-    const iovcnt = state.regs.rdx;
+    const fd = guestRegs(state).*.rdi;
+    const iov = guestRegs(state).*.rsi;
+    const iovcnt = guestRegs(state).*.rdx;
     var total: u64 = 0;
     var index: u64 = 0;
     while (index < iovcnt) : (index += 1) {
-        const entry = iov + index * 16;
-        const base = state.read64(entry);
-        const len = state.read64(entry + 8);
-        const off = state.addrToOffset(base) orelse {
-            state.regs.rax = x64_syscalls.errnoValue(.bad_address);
+        const entry_offset = std.math.mul(u64, index, 16) catch {
+            guestRegs(state).*.rax = x64_syscalls.errnoValue(.bad_address);
             return;
         };
-        if (len > std.math.maxInt(usize)) {
-            state.regs.rax = x64_syscalls.errnoValue(.bad_address);
+        const entry = std.math.add(u64, iov, entry_offset) catch {
+            guestRegs(state).*.rax = x64_syscalls.errnoValue(.bad_address);
+            return;
+        };
+        if (state.guestMemoryConst(entry, 16) == null) {
+            guestRegs(state).*.rax = x64_syscalls.errnoValue(.bad_address);
             return;
         }
-        const off_usize: usize = @intCast(off);
-        const len_usize: usize = @intCast(len);
-        if (off_usize > state.mem.len or len_usize > state.mem.len - off_usize) {
-            state.regs.rax = x64_syscalls.errnoValue(.bad_address);
-            state.traceGuestIo("libc.writev", fd, base, len, state.regs.rax);
+        const base = state.read64(entry);
+        const len = state.read64(entry + 8);
+        if (len > std.math.maxInt(usize) or state.guestMemoryConst(base, len) == null) {
+            guestRegs(state).*.rax = x64_syscalls.errnoValue(.bad_address);
             return;
         }
-        const data = state.mem[off_usize .. off_usize + len_usize];
+        const data = state.allocator.alloc(u8, @intCast(len)) catch {
+            guestRegs(state).*.rax = x64_syscalls.errnoValue(.no_memory);
+            state.traceGuestIo("libc.writev", fd, base, len, guestRegs(state).*.rax);
+            return;
+        };
+        defer state.allocator.free(data);
+        if (!state.copyFromGuest(data, base)) {
+            guestRegs(state).*.rax = x64_syscalls.errnoValue(.bad_address);
+            state.traceGuestIo("libc.writev", fd, base, len, guestRegs(state).*.rax);
+            return;
+        }
         const result = state.writeHostFd(fd, data);
         state.traceGuestIo("libc.writev", fd, base, len, result);
         if (@as(i64, @bitCast(result)) < 0) {
-            state.regs.rax = result;
+            guestRegs(state).*.rax = result;
             return;
         }
         total +%= len;
     }
-    state.regs.rax = total;
-    if (iovcnt == 0) state.traceGuestIo("libc.writev", fd, iov, 0, state.regs.rax);
+    guestRegs(state).*.rax = total;
+    if (iovcnt == 0) state.traceGuestIo("libc.writev", fd, iov, 0, guestRegs(state).*.rax);
 }
 
 fn symbolNameEql(name: []const u8, expected: []const u8) bool {
     if (std.mem.eql(u8, name, expected)) return true;
     if (std.mem.startsWith(u8, name, expected) and name.len > expected.len and name[expected.len] == '@') return true;
     return false;
+}
+
+test "dynamic relocation lookup caches hits and misses without trusting collisions" {
+    const Relocation = struct { offset: u64, name: []const u8 };
+    const first_address: u64 = 0x1000;
+    const colliding_address = first_address + DynamicRelocationLookup.entry_count * 8;
+    try std.testing.expectEqual(
+        DynamicRelocationLookup.slotFor(first_address),
+        DynamicRelocationLookup.slotFor(colliding_address),
+    );
+
+    var relocations = [_]Relocation{
+        .{ .offset = first_address, .name = "first" },
+        .{ .offset = colliding_address, .name = "second" },
+    };
+    var lookup = DynamicRelocationLookup{};
+
+    try std.testing.expectEqualStrings("first", lookup.lookup(relocations[0..], first_address).?.name);
+    try std.testing.expectEqualStrings("second", lookup.lookup(relocations[0..], colliding_address).?.name);
+    // The second address replaced the first direct-mapped entry. A miss in
+    // the cache must search the table and recover the first exact match.
+    try std.testing.expectEqualStrings("first", lookup.lookup(relocations[0..], first_address).?.name);
+
+    const absent_address: u64 = 0x9000;
+    try std.testing.expect(lookup.lookup(relocations[0..], absent_address) == null);
+    const absent_entry = lookup.entries[DynamicRelocationLookup.slotFor(absent_address)];
+    try std.testing.expect(absent_entry.valid);
+    try std.testing.expectEqual(DynamicRelocationLookup.no_relocation, absent_entry.index);
+    try std.testing.expect(lookup.lookup(relocations[0..], absent_address) == null);
+
+    lookup.clear();
+    relocations[0].offset = 0x3000;
+    try std.testing.expectEqualStrings("first", lookup.lookup(relocations[0..], 0x3000).?.name);
 }

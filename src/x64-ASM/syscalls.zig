@@ -383,6 +383,7 @@ pub const SYS_removexattrat: u64 = 466;
 pub const Errno = enum(i64) {
     no_entry = -2,
     bad_file_descriptor = -9,
+    no_memory = -12,
     permission_denied = -13,
     bad_address = -14,
     invalid_argument = -22,

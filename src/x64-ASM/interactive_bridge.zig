@@ -1,6 +1,20 @@
 const std = @import("std");
 const x64_syscalls = @import("x64_syscalls");
 
+
+/// Return the architectural register file belonging to this host executor's
+/// bound guest context, or the traditional owner register file when the
+/// caller uses a standalone state value.
+fn guestRegs(state: anytype) if (@typeInfo(@TypeOf(state)).pointer.is_const)
+    *const @FieldType(@TypeOf(state.*), "regs")
+else
+    *@FieldType(@TypeOf(state.*), "regs")
+{
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "windowsGuestContextField")) return state.windowsGuestContextField("regs");
+    return &@field(state.*, "regs");
+}
+
 const log = std.log.scoped(.x64_interactive);
 
 const STDIN_FILENO: std.c.fd_t = 0;
@@ -13,35 +27,46 @@ pub fn tryLocalFunctionBridge(state: anytype, name: []const u8, direct_return_ri
     if (!enabled()) return false;
     if (symbolNameEql(name, "getNumber")) {
         bridgeGetNumber(state);
-        state.regs.rip = direct_return_rip;
+        guestRegs(state).*.rip = direct_return_rip;
         return true;
     }
     if (symbolNameEql(name, "getWord")) {
         bridgeGetWord(state);
-        state.regs.rip = direct_return_rip;
+        guestRegs(state).*.rip = direct_return_rip;
         return true;
     }
     if (symbolNameEql(name, "printWord")) {
         bridgePrintWord(state);
-        state.regs.rip = direct_return_rip;
+        guestRegs(state).*.rip = direct_return_rip;
         return true;
     }
     if (symbolNameEql(name, "printString")) {
         bridgePrintString(state);
-        state.regs.rip = direct_return_rip;
+        guestRegs(state).*.rip = direct_return_rip;
         return true;
     }
     if (symbolNameEql(name, "readLine")) {
         bridgeReadLine(state);
-        state.regs.rip = direct_return_rip;
+        guestRegs(state).*.rip = direct_return_rip;
         return true;
     }
     if (symbolNameEql(name, "printNumber")) {
         bridgePrintNumber(state);
-        state.regs.rip = direct_return_rip;
+        guestRegs(state).*.rip = direct_return_rip;
         return true;
     }
     return false;
+}
+
+/// A cheap immutable name check so the executor can acquire its shared-state
+/// boundary only for local functions this bridge will actually complete.
+pub fn recognizesLocalFunction(name: []const u8) bool {
+    return symbolNameEql(name, "getNumber") or
+        symbolNameEql(name, "getWord") or
+        symbolNameEql(name, "printWord") or
+        symbolNameEql(name, "printString") or
+        symbolNameEql(name, "readLine") or
+        symbolNameEql(name, "printNumber");
 }
 
 pub fn enabled() bool {
@@ -49,9 +74,9 @@ pub fn enabled() bool {
 }
 
 fn bridgeGetNumber(state: anytype) void {
-    const out_buf = state.regs.rdi;
-    const max_len = state.regs.rsi;
-    const index_ptr = state.regs.rdx;
+    const out_buf = guestRegs(state).*.rdi;
+    const max_len = guestRegs(state).*.rsi;
+    const index_ptr = guestRegs(state).*.rdx;
 
     while (true) {
         writeGuestCStringSymbol(state, "InputMessage", "Input a number: \n");
@@ -59,18 +84,18 @@ fn bridgeGetNumber(state: anytype) void {
         var line_buf: [256]u8 = undefined;
         const maybe_line = readHostLine(line_buf[0..]) catch |err| {
             log.warn("education getNumber read failed: {s}", .{@errorName(err)});
-            state.regs.rax = 0;
+            guestRegs(state).*.rax = 0;
             return;
         };
         const raw_line = maybe_line orelse {
-            state.regs.rax = 0;
+            guestRegs(state).*.rax = 0;
             return;
         };
         const payload = trimLineEnding(raw_line);
         const numeric = std.mem.trim(u8, payload, " \t");
         if (numeric.len == 0) {
             writeNumberSummary(state);
-            state.regs.rax = 0;
+            guestRegs(state).*.rax = 0;
             return;
         }
 
@@ -79,45 +104,48 @@ fn bridgeGetNumber(state: anytype) void {
             continue;
         }
 
-        const guest_buf = state.guestMemory(out_buf, payload.len + 1) orelse {
-            state.regs.rax = x64_syscalls.errnoValue(.bad_address);
+        if (state.guestMemory(out_buf, payload.len + 1) == null) {
+            guestRegs(state).*.rax = x64_syscalls.errnoValue(.bad_address);
             return;
-        };
-        @memcpy(guest_buf[0..payload.len], payload);
-        guest_buf[payload.len] = 0;
+        }
+        if (!state.copyToGuest(out_buf, payload)) {
+            guestRegs(state).*.rax = x64_syscalls.errnoValue(.bad_address);
+            return;
+        }
+        state.write8(out_buf +| @as(u64, @intCast(payload.len)), 0);
         writeGuestU32(state, index_ptr, @intCast(payload.len)) orelse {
-            state.regs.rax = x64_syscalls.errnoValue(.bad_address);
+            guestRegs(state).*.rax = x64_syscalls.errnoValue(.bad_address);
             return;
         };
-        state.regs.rax = 1;
+        guestRegs(state).*.rax = 1;
         return;
     }
 }
 
 fn bridgeGetWord(state: anytype) void {
-    const out_buf = state.regs.rdi;
-    const valid_ptr = state.regs.rsi;
-    const max_len = state.regs.rdx;
-    const fd_ptr = state.regs.rcx;
+    const out_buf = guestRegs(state).*.rdi;
+    const valid_ptr = guestRegs(state).*.rsi;
+    const max_len = guestRegs(state).*.rdx;
+    const fd_ptr = guestRegs(state).*.rcx;
     const guest_fd = readGuestU64(state, fd_ptr) orelse {
-        state.regs.rax = x64_syscalls.errnoValue(.bad_address);
+        guestRegs(state).*.rax = x64_syscalls.errnoValue(.bad_address);
         return;
     };
     const host_fd: std.c.fd_t = if (guest_fd <= std.math.maxInt(std.c.fd_t))
         @intCast(guest_fd)
     else {
-        state.regs.rax = x64_syscalls.errnoValue(.bad_file_descriptor);
+        guestRegs(state).*.rax = x64_syscalls.errnoValue(.bad_file_descriptor);
         return;
     };
 
     var token: [4096]u8 = undefined;
     const maybe_token = readNextToken(host_fd, token[0..]) catch |err| {
         log.warn("education getWord read failed: {s}", .{@errorName(err)});
-        state.regs.rax = x64_syscalls.errnoValue(.io);
+        guestRegs(state).*.rax = x64_syscalls.errnoValue(.io);
         return;
     };
     const word = maybe_token orelse {
-        state.regs.rax = 0;
+        guestRegs(state).*.rax = 0;
         return;
     };
 
@@ -125,32 +153,33 @@ fn bridgeGetWord(state: anytype) void {
     const copy_len: usize = @intCast(@min(@as(u64, @intCast(word.len)), report_limit));
     const valid = isAssignmentWordValid(word, report_limit);
     if (!writeGuestCString(state, out_buf, word[0..copy_len], max_len + 1)) {
-        state.regs.rax = x64_syscalls.errnoValue(.bad_address);
+        guestRegs(state).*.rax = x64_syscalls.errnoValue(.bad_address);
         return;
     }
     if (!writeGuestByte(state, valid_ptr, if (valid) 1 else 0)) {
-        state.regs.rax = x64_syscalls.errnoValue(.bad_address);
+        guestRegs(state).*.rax = x64_syscalls.errnoValue(.bad_address);
         return;
     }
-    state.regs.rax = 1;
+    guestRegs(state).*.rax = 1;
 }
 
 fn bridgePrintWord(state: anytype) void {
-    const word_addr = state.regs.rdi;
-    const valid = (state.regs.rsi & 0xff) != 0;
+    const word_addr = guestRegs(state).*.rdi;
+    const valid = (guestRegs(state).*.rsi & 0xff) != 0;
     if (valid) {
-        state.regs.rax = 0;
+        guestRegs(state).*.rax = 0;
         return;
     }
 
     if (envFlag("ROSETTE_ELF_INTERACTIVE_PRINT_INVALID_PREFIX") or envFlag("ROSETTE_ELF_EDU_PRINT_INVALID_PREFIX")) {
         writeGuestCStringSymbol(state, "outputMessage", "Invalid Word found: ");
     }
-    if (guestCString(state, word_addr)) |word| {
+    var word_buffer: [4096]u8 = undefined;
+    if (copyGuestCString(state, word_addr, word_buffer[0..])) |word| {
         _ = state.writeHostFd(STDOUT_FILENO, word);
     }
     writeGuestCStringSymbol(state, "nlMessage", "\n");
-    state.regs.rax = 0;
+    guestRegs(state).*.rax = 0;
 }
 
 fn readHostLine(buffer: []u8) !?[]const u8 {
@@ -288,43 +317,41 @@ fn writeOutputFilePreview(state: anytype) void {
 }
 
 fn writeGuestCStringSymbol(state: anytype, symbol: []const u8, fallback: []const u8) void {
+    var scratch: [4096]u8 = undefined;
     const data = if (state.localSymbolAddress(symbol)) |addr|
-        guestCString(state, addr) orelse fallback
+        copyGuestCString(state, addr, scratch[0..]) orelse fallback
     else
         fallback;
     _ = state.writeHostFd(STDOUT_FILENO, data);
 }
 
-fn guestCString(state: anytype, addr: u64) ?[]const u8 {
-    const off = state.addrToOffset(addr) orelse return null;
-    const off_usize: usize = @intCast(off);
-    const rest = state.mem[off_usize..];
-    const len = std.mem.indexOfScalar(u8, rest, 0) orelse return null;
-    return rest[0..len];
+fn copyGuestCString(state: anytype, addr: u64, destination: []u8) ?[]const u8 {
+    const length = state.copyGuestCString(addr, destination.len + 1, destination) orelse return null;
+    return destination[0..length];
 }
 
 fn writeGuestU32(state: anytype, addr: u64, value: u32) ?void {
-    const data = state.guestMemory(addr, 4) orelse return null;
-    std.mem.writeInt(u32, data[0..4], value, .little);
+    if (state.guestMemory(addr, 4) == null) return null;
+    state.write32(addr, value);
 }
 
 fn readGuestU64(state: anytype, addr: u64) ?u64 {
-    const data = state.guestMemoryConst(addr, 8) orelse return null;
-    return std.mem.readInt(u64, data[0..8], .little);
+    if (state.guestMemoryConst(addr, 8) == null) return null;
+    return state.read64(addr);
 }
 
 fn writeGuestByte(state: anytype, addr: u64, value: u8) bool {
-    const data = state.guestMemory(addr, 1) orelse return false;
-    data[0] = value;
+    if (state.guestMemory(addr, 1) == null) return false;
+    state.write8(addr, value);
     return true;
 }
 
 fn writeGuestCString(state: anytype, addr: u64, text: []const u8, capacity: u64) bool {
     const required = @as(u64, @intCast(text.len)) + 1;
     if (required > capacity) return false;
-    const data = state.guestMemory(addr, required) orelse return false;
-    @memcpy(data[0..text.len], text);
-    data[text.len] = 0;
+    if (state.guestMemory(addr, required) == null) return false;
+    if (!state.copyToGuest(addr, text)) return false;
+    state.write8(addr +| @as(u64, @intCast(text.len)), 0);
     return true;
 }
 
@@ -341,55 +368,59 @@ fn symbolNameEql(name: []const u8, expected: []const u8) bool {
 /// Print a null-terminated guest string to stdout.
 /// rdi = guest address of string
 fn bridgePrintString(state: anytype) void {
-    const addr = state.regs.rdi;
-    if (guestCString(state, addr)) |text| {
+    const addr = guestRegs(state).*.rdi;
+    var scratch: [4096]u8 = undefined;
+    if (copyGuestCString(state, addr, scratch[0..])) |text| {
         _ = state.writeHostFd(STDOUT_FILENO, text);
     }
     _ = state.writeHostFd(STDOUT_FILENO, "\n");
-    state.regs.rax = 1;
+    guestRegs(state).*.rax = 1;
 }
 
 /// Read a line from stdin into a guest buffer.
 /// rdi = guest buffer address, rsi = max length
 /// Returns length in rax, 0 on EOF/error
 fn bridgeReadLine(state: anytype) void {
-    const out_buf = state.regs.rdi;
-    const max_len = state.regs.rsi;
+    const out_buf = guestRegs(state).*.rdi;
+    const max_len = guestRegs(state).*.rsi;
 
     var line_buf: [1024]u8 = undefined;
     const maybe_line = readHostLine(line_buf[0..]) catch |err| {
         log.warn("interactive readLine read failed: {s}", .{@errorName(err)});
-        state.regs.rax = 0;
+        guestRegs(state).*.rax = 0;
         return;
     };
     const raw_line = maybe_line orelse {
-        state.regs.rax = 0;
+        guestRegs(state).*.rax = 0;
         return;
     };
     const payload = trimLineEnding(raw_line);
     const copy_len = @min(payload.len, @as(usize, @intCast(@min(max_len, line_buf.len))));
 
-    const guest_buf = state.guestMemory(out_buf, copy_len + 1) orelse {
-        state.regs.rax = 0;
+    if (state.guestMemory(out_buf, copy_len + 1) == null) {
+        guestRegs(state).*.rax = 0;
         return;
-    };
-    @memcpy(guest_buf[0..copy_len], payload[0..copy_len]);
-    guest_buf[copy_len] = 0;
-    state.regs.rax = @intCast(copy_len);
+    }
+    if (!state.copyToGuest(out_buf, payload[0..copy_len])) {
+        guestRegs(state).*.rax = 0;
+        return;
+    }
+    state.write8(out_buf +| @as(u64, @intCast(copy_len)), 0);
+    guestRegs(state).*.rax = @intCast(copy_len);
 }
 
 /// Print a 64-bit unsigned integer as decimal to stdout.
 /// rdi = value to print
 fn bridgePrintNumber(state: anytype) void {
-    const value = state.regs.rdi;
+    const value = guestRegs(state).*.rdi;
     var buf: [32]u8 = undefined;
     const text = std.fmt.bufPrint(&buf, "{d}", .{value}) catch {
-        state.regs.rax = 0;
+        guestRegs(state).*.rax = 0;
         return;
     };
     _ = state.writeHostFd(STDOUT_FILENO, text);
     _ = state.writeHostFd(STDOUT_FILENO, "\n");
-    state.regs.rax = 1;
+    guestRegs(state).*.rax = 1;
 }
 
 fn envFlag(name: [:0]const u8) bool {
