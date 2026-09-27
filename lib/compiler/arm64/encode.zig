@@ -836,6 +836,24 @@ pub fn strReg(size: MemSize, rt: Reg, rn: Reg, rm: Reg) u32 {
     return memRegister(size, false, rt, rn, rm);
 }
 
+/// `ldar` for the unsigned 8/16/32/64-bit access size. Signed variants are
+/// intentionally excluded: acquire ordering changes visibility, not the
+/// value-extension rule.
+pub fn ldar(size: MemSize, rt: Reg, rn: Reg) u32 {
+    return switch (size) {
+        .byte, .half, .word, .doubleword => (@as(u32, size.sizeField()) << 30) | 0x08DFFC00 | (@as(u32, rn) << 5) | rt,
+        else => unreachable,
+    };
+}
+
+/// `stlr` for the unsigned 8/16/32/64-bit access size.
+pub fn stlr(size: MemSize, rt: Reg, rn: Reg) u32 {
+    return switch (size) {
+        .byte, .half, .word, .doubleword => (@as(u32, size.sizeField()) << 30) | 0x089FFC00 | (@as(u32, rn) << 5) | rt,
+        else => unreachable,
+    };
+}
+
 /// Scalar floating-point load/store size. These use the same unsigned scaled
 /// immediate addressing shape as integer loads, with an FP register operand.
 pub const FpMemSize = enum { single, double };
@@ -966,6 +984,17 @@ test "register pair forms match the assembler" {
     try std.testing.expectEqual(@as(u32, 0xd53b4209), mrsNzcv(9));
 }
 
+test "ordered scalar loads and stores match the assembler" {
+    try testing.expectEqual(@as(u32, 0x08DFFC20), ldar(.byte, 0, 1));
+    try testing.expectEqual(@as(u32, 0x48DFFC20), ldar(.half, 0, 1));
+    try testing.expectEqual(@as(u32, 0x88DFFC20), ldar(.word, 0, 1));
+    try testing.expectEqual(@as(u32, 0xC8DFFC20), ldar(.doubleword, 0, 1));
+    try testing.expectEqual(@as(u32, 0x089FFC20), stlr(.byte, 0, 1));
+    try testing.expectEqual(@as(u32, 0x489FFC20), stlr(.half, 0, 1));
+    try testing.expectEqual(@as(u32, 0x889FFC20), stlr(.word, 0, 1));
+    try testing.expectEqual(@as(u32, 0xC89FFC20), stlr(.doubleword, 0, 1));
+}
+
 pub fn retReg(rn: Reg) u32 {
     return 0xD65F0000 | (@as(u32, rn) << 5);
 }
@@ -1022,6 +1051,29 @@ pub fn ldaddal(width: Width, rs: Reg, rt: Reg, rn: Reg) u32 {
     return base | (@as(u32, rs) << 16) | (@as(u32, rn) << 5) | @as(u32, rt);
 }
 
+/// `caspal Rs, Rs+1, Rt, Rt+1, [Rn]`: atomically compare and replace a
+/// pair of adjacent 64-bit words with acquire-release ordering. CASP encodes
+/// the first register in each even pair; the following register is implicit.
+pub fn caspal(rs: Reg, rt: Reg, rn: Reg) u32 {
+    std.debug.assert(rs & 1 == 0 and rs < 31);
+    std.debug.assert(rt & 1 == 0 and rt < 31);
+    return 0x4860FC00 | (@as(u32, rs) << 16) | (@as(u32, rn) << 5) | @as(u32, rt);
+}
+
+/// LSE byte/half/word/doubleword acquire-release operations. The byte and
+/// halfword encodings avoid widening a locked x86 operand into its neighbour.
+pub fn casalScalar(size: MemSize, rs: Reg, rt: Reg, rn: Reg) u32 {
+    return (size.sizeField() << 30) | 0x08E0FC00 | (@as(u32, rs) << 16) | (@as(u32, rn) << 5) | @as(u32, rt);
+}
+
+pub fn swpalScalar(size: MemSize, rs: Reg, rt: Reg, rn: Reg) u32 {
+    return (size.sizeField() << 30) | 0x38E08000 | (@as(u32, rs) << 16) | (@as(u32, rn) << 5) | @as(u32, rt);
+}
+
+pub fn ldaddalScalar(size: MemSize, rs: Reg, rt: Reg, rn: Reg) u32 {
+    return (size.sizeField() << 30) | 0x38E00000 | (@as(u32, rs) << 16) | (@as(u32, rn) << 5) | @as(u32, rt);
+}
+
 test "LSE atomics match the assembler, with even and odd registers" {
     // llvm-mc -triple=aarch64 -mattr=+lse -show-encoding
     try std.testing.expectEqual(@as(u32, 0x88E1FC62), casal(.w32, 1, 2, 3));
@@ -1030,6 +1082,18 @@ test "LSE atomics match the assembler, with even and odd registers" {
     try std.testing.expectEqual(@as(u32, 0xF8EA818B), swpal(.x64, 10, 11, 12));
     try std.testing.expectEqual(@as(u32, 0xB8ED01EE), ldaddal(.w32, 13, 14, 15));
     try std.testing.expectEqual(@as(u32, 0xF8F00251), ldaddal(.x64, 16, 17, 18));
+    try std.testing.expectEqual(casal(.w32, 1, 2, 3), casalScalar(.word, 1, 2, 3));
+    try std.testing.expectEqual(casal(.x64, 4, 5, 6), casalScalar(.doubleword, 4, 5, 6));
+    try std.testing.expectEqual(swpal(.w32, 7, 8, 9), swpalScalar(.word, 7, 8, 9));
+    try std.testing.expectEqual(ldaddal(.x64, 16, 17, 18), ldaddalScalar(.doubleword, 16, 17, 18));
+    try std.testing.expectEqual(@as(u32, 0x08E1FC62), casalScalar(.byte, 1, 2, 3));
+    try std.testing.expectEqual(@as(u32, 0x48E1FC62), casalScalar(.half, 1, 2, 3));
+    try std.testing.expectEqual(@as(u32, 0x38E78128), swpalScalar(.byte, 7, 8, 9));
+    try std.testing.expectEqual(@as(u32, 0x78E78128), swpalScalar(.half, 7, 8, 9));
+    try std.testing.expectEqual(@as(u32, 0x38ED01EE), ldaddalScalar(.byte, 13, 14, 15));
+    try std.testing.expectEqual(@as(u32, 0x78ED01EE), ldaddalScalar(.half, 13, 14, 15));
+    try std.testing.expectEqual(@as(u32, 0x4860FC82), caspal(0, 2, 4));
+    try std.testing.expectEqual(@as(u32, 0x486EFE0C), caspal(14, 12, 16));
 }
 
 // ---------------------------------------------------------------------------
