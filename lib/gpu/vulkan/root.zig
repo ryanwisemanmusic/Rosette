@@ -9,6 +9,7 @@
 //! allowed to be wrong only once.
 
 pub const abi = @import("abi.zig");
+pub const async_command_worker = @import("async_command_worker.zig");
 pub const marshal = @import("marshal.zig");
 pub const rect_list_expand = @import("rect_list_expand.zig");
 pub const tier_consistency = @import("tier_consistency.zig");
@@ -31,6 +32,7 @@ pub const Health = frame.Health;
 
 test {
     _ = abi;
+    _ = async_command_worker;
     _ = marshal;
     _ = rect_list_expand;
     _ = tier_consistency;

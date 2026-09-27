@@ -167,6 +167,19 @@ pub const TextureBinding = struct {
     binding: u8,
     fetch_constant: u8,
     fetch: registers.TextureFetch,
+    provenance: registers.TextureFetchProvenance,
+};
+
+/// A raw fetch entry with the exact register words and last-write sequence.
+/// Consumers can report why a shader slot did not become a texture binding
+/// without coercing `.vertex` or `.invalid_vertex` into `.texture`.
+pub const TextureFetchEvidence = struct {
+    fetch_constant: u8,
+    raw: [6]u32,
+    fetch: registers.TextureFetch,
+    diagnosis: registers.TextureSlotDiagnosis,
+    vertex_view: ?registers.VertexFetch,
+    provenance: registers.TextureFetchProvenance,
 };
 
 /// Register-backed surface evidence.  `renderTargets()` always returns a
@@ -681,6 +694,22 @@ pub const Runtime = struct {
         return self.executor.register_file.textureFetch(index);
     }
 
+    pub fn textureFetchEvidence(self: *const Runtime, index: usize) ?TextureFetchEvidence {
+        const raw = self.executor.register_file.fetchConstant(index) orelse return null;
+        const fetch = registers.TextureFetch.decode(raw);
+        return .{
+            .fetch_constant = @intCast(index),
+            .raw = raw,
+            .fetch = fetch,
+            .diagnosis = registers.diagnoseTextureSlot(raw),
+            .vertex_view = if (fetch.type == .vertex or fetch.type == .invalid_vertex)
+                registers.VertexFetch.decode(.{ raw[0], raw[1] })
+            else
+                null,
+            .provenance = self.executor.register_file.fetchConstantProvenance(index) orelse return null,
+        };
+    }
+
     /// Enumerate programmed texture fetch constants in their stable Xenos
     /// slot order.  The native Vulkan path receives Xenia's descriptor writes
     /// directly; this compact mapping is the fallback/resource-invalidation
@@ -696,6 +725,7 @@ pub const Runtime = struct {
                 .binding = @intCast(written),
                 .fetch_constant = @intCast(index),
                 .fetch = fetch,
+                .provenance = self.executor.register_file.fetchConstantProvenance(index) orelse continue,
             };
             written += 1;
         }
@@ -1488,6 +1518,10 @@ test "Xenos runtime exposes typed resource and pipeline state" {
     runtime.executor.register_file.write(registers.shader_constant_fetch_base + 3, 1 | (0xA55 << 1));
     runtime.executor.register_file.write(registers.shader_constant_fetch_base + 4, 1 << 12);
     runtime.executor.register_file.write(registers.shader_constant_fetch_base + 5, 1 << 9);
+    // The shared aperture also carries vertex fetch descriptors. Preserve
+    // their raw type and write provenance without admitting them as textures.
+    runtime.executor.register_file.write(registers.shader_constant_fetch_base + 6, 0x0523_2583);
+    runtime.executor.register_file.write(registers.shader_constant_fetch_base + 7, 0x1000_001A);
     runtime.executor.register_file.write(registers.shader_constant_alu_base, 11);
     runtime.executor.register_file.write(registers.shader_constant_alu_base + 1, 22);
     runtime.executor.register_file.write(registers.shader_constant_alu_base + 2, 33);
@@ -1498,6 +1532,8 @@ test "Xenos runtime exposes typed resource and pipeline state" {
     runtime.executor.register_file.write(registers.PA_SU_POLY_OFFSET_FRONT_SCALE, @bitCast(@as(f32, 2)));
     runtime.executor.register_file.write(registers.PA_SU_POLY_OFFSET_FRONT_OFFSET, @bitCast(@as(f32, 3)));
     const fetch = runtime.textureFetch(0).?;
+    const texture_evidence = runtime.textureFetchEvidence(0).?;
+    const vertex_evidence = runtime.textureFetchEvidence(1).?;
     var bindings: [2]TextureBinding = undefined;
     const binding_count = runtime.textureBindings(&bindings);
     const constant = runtime.aluConstant(0).?;
@@ -1506,6 +1542,18 @@ test "Xenos runtime exposes typed resource and pipeline state" {
     try std.testing.expectEqual(@as(u32, 32), fetch.width);
     try std.testing.expectEqual(@as(usize, 1), binding_count);
     try std.testing.expectEqual(@as(u8, 0), bindings[0].fetch_constant);
+    try std.testing.expectEqual(@as(u6, 0b11_1111), bindings[0].provenance.writtenMask());
+    try std.testing.expectEqual(@as(u64, 6), bindings[0].provenance.latestWrite());
+    try std.testing.expectEqual(registers.FetchConstantType.texture, texture_evidence.fetch.type);
+    try std.testing.expectEqual(registers.FetchConstantType.vertex, vertex_evidence.fetch.type);
+    try std.testing.expectEqual(registers.TextureSlotDiagnosis.texture, texture_evidence.diagnosis);
+    try std.testing.expectEqual(registers.TextureSlotDiagnosis.vertex_in_texture_slot, vertex_evidence.diagnosis);
+    try std.testing.expectEqual(@as(u64, 0x0523_2580), vertex_evidence.vertex_view.?.addressBytes());
+    try std.testing.expectEqual(@as(u32, 6), vertex_evidence.vertex_view.?.size_words);
+    try std.testing.expectEqual(@as(u32, 0x0523_2583), vertex_evidence.raw[0]);
+    try std.testing.expectEqual(@as(u6, 1 << 0 | 1 << 1), vertex_evidence.provenance.writtenMask());
+    try std.testing.expectEqual(registers.FetchConstantWritePattern.vertex_pair, vertex_evidence.provenance.writePattern());
+    try std.testing.expectEqual(@as(?u2, 0), vertex_evidence.provenance.vertexPairIndex());
     try std.testing.expectEqual(@as(u32, 11), constant[0]);
     try std.testing.expectEqual(@as(u32, 44), constant[3]);
     try std.testing.expect(state.depth_bias_enable);

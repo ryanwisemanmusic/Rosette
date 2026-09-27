@@ -12,6 +12,9 @@ const std = @import("std");
 const gpu = @import("gpu");
 const vulkan_contract = @import("dll_win32_catalogue").vulkan;
 const dynamic_forwarder = @import("dyld").dynamic_library_forwarder;
+const register_file = @import("windows_guest_forwarder/context/register_file.zig");
+const windows_abi = @import("windows_guest_forwarder/abi/microsoft_to_sysv.zig");
+const surface_calls_module = @import("windows_guest_forwarder/diagnostics/surface_calls.zig");
 
 const log = std.log.scoped(.windows_guest_vulkan);
 
@@ -31,43 +34,6 @@ const scratch_stack_alignment: u64 = 16;
 /// call's stack.
 const scratch_stack_cache_depth: usize = 4;
 const metal_surface_create_info_bytes: u64 = 32;
-
-const MicrosoftRegisterArguments = struct {
-    rcx: u64,
-    rdx: u64,
-    r8: u64,
-    r9: u64,
-};
-
-const SysVRegisterArguments = struct {
-    rdi: u64,
-    rsi: u64,
-    rdx: u64,
-    rcx: u64,
-    r8: u64,
-    r9: u64,
-};
-
-fn mapMicrosoftToSysV(
-    microsoft: MicrosoftRegisterArguments,
-    stack_arg4: u64,
-    stack_arg5: u64,
-) SysVRegisterArguments {
-    return .{
-        .rdi = microsoft.rcx,
-        .rsi = microsoft.rdx,
-        .rdx = microsoft.r8,
-        .rcx = microsoft.r9,
-        .r8 = stack_arg4,
-        .r9 = stack_arg5,
-    };
-}
-
-fn microsoftStackArgumentOffset(index: usize, has_direct_return: bool) u64 {
-    std.debug.assert(index >= 4);
-    const stack_bias: u64 = if (has_direct_return) 32 else 40;
-    return stack_bias + @as(u64, @intCast(index - 4)) * 8;
-}
 
 const host_time_slots = 128;
 const HostTimeEntry = struct {
@@ -104,7 +70,7 @@ pub const Bridge = struct {
     host_time_overflow_ns: u64 = 0,
     dispatch_depth: u32 = 0,
     dispatch_failures: u64 = 0,
-    surface_name_remaps: u64 = 0,
+    surface_calls: surface_calls_module.SurfaceCalls = .{},
     boundary_trace_initialized: bool = false,
     boundary_trace_enabled: bool = false,
     boundary_trace_events: u64 = 0,
@@ -284,9 +250,11 @@ pub const Bridge = struct {
         return if (comptime @hasField(State, "executed_steps")) state.executed_steps else 0;
     }
 
+    /// The calling guest thread: the one this call is made for, not the
+    /// process owner whose copy the state's own field is.
     fn stateThread(state: anytype) u64 {
         const State = @TypeOf(state.*);
-        return if (comptime @hasField(State, "active_guest_thread")) state.active_guest_thread else 0;
+        return if (comptime @hasField(State, "active_guest_thread")) register_file.field(state, "active_guest_thread").* else 0;
     }
 
     fn logBoundaryEnter(self: *const Bridge, state: anytype, name: []const u8, call_id: u64, direct_return_rip: ?u64) void {
@@ -295,13 +263,13 @@ pub const Bridge = struct {
             name,
             stateStep(state),
             stateThread(state),
-            state.regs.rip,
+            register_file.field(state, "regs").*.rip,
             direct_return_rip orelse 0,
-            state.regs.rcx,
-            state.regs.rdx,
-            state.regs.r8,
-            state.regs.r9,
-            state.regs.rsp,
+            register_file.field(state, "regs").*.rcx,
+            register_file.field(state, "regs").*.rdx,
+            register_file.field(state, "regs").*.r8,
+            register_file.field(state, "regs").*.r9,
+            register_file.field(state, "regs").*.rsp,
             self.forwarder.vulkan_call_count,
             self.forwarder.real_vulkan.hasDevice(),
             self.forwarder.real_vulkan.surface != 0,
@@ -313,15 +281,15 @@ pub const Bridge = struct {
             call_id,
             name,
             outcome,
-            state.regs.rax,
+            register_file.field(state, "regs").*.rax,
             stateStep(state),
             stateThread(state),
-            state.regs.rip,
-            state.regs.rcx,
-            state.regs.rdx,
-            state.regs.r8,
-            state.regs.r9,
-            state.regs.rsp,
+            register_file.field(state, "regs").*.rip,
+            register_file.field(state, "regs").*.rcx,
+            register_file.field(state, "regs").*.rdx,
+            register_file.field(state, "regs").*.r8,
+            register_file.field(state, "regs").*.r9,
+            register_file.field(state, "regs").*.rsp,
             self.dispatches,
             self.dispatch_failures,
             self.forwarder.vulkan_call_count,
@@ -345,6 +313,7 @@ pub const Bridge = struct {
         self.reportArgumentWidths(true);
         self.reportScratchStacks();
         self.reportHostTime();
+        self.surface_calls.report();
         self.forwarder.reportPresentChain(true);
     }
 
@@ -467,6 +436,10 @@ pub const Bridge = struct {
     pub fn dispatch(self: *Bridge, state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
         if (vulkan_contract.isProcLookup(name)) return self.lookupWindowsProc(state, direct_return_rip);
         if (!owns(name)) return false;
+        const is_surface_call = std.mem.eql(u8, name, "vkCreateWin32SurfaceKHR");
+        var surface_dispatch_completed = false;
+        defer if (is_surface_call and !surface_dispatch_completed) self.surface_calls.noteDispatchRefusal();
+        if (is_surface_call) self.surface_calls.noteDispatchAttempt();
         self.dispatch_attempts +|= 1;
         const outermost = self.dispatch_depth == 0;
         self.dispatch_depth +|= 1;
@@ -518,13 +491,13 @@ pub const Bridge = struct {
             return false;
         }
 
-        const original_regs = state.regs;
+        const original_regs = register_file.field(state, "regs").*;
         const signature = vulkan_contract.argument_widths.lookup(name) orelse {
             self.dispatch_failures +|= 1;
             trace_outcome = "argument_signature_missing";
             return false;
         };
-        if (std.mem.eql(u8, name, "vkCreateWin32SurfaceKHR")) {
+        if (is_surface_call) {
             if (!ensureWindow(state)) {
                 self.dispatch_failures +|= 1;
                 trace_outcome = "window_unavailable";
@@ -558,7 +531,7 @@ pub const Bridge = struct {
                 1 => original_regs.rdx,
                 2 => original_regs.r8,
                 3 => original_regs.r9,
-                else => state.read64(original_regs.rsp +| microsoftStackArgumentOffset(index, has_direct_return)),
+                else => state.read64(original_regs.rsp +| windows_abi.stackArgumentOffset(index, has_direct_return)),
             };
             arguments[index] = self.normalizeMicrosoftArgument(name, signature, index, raw);
         }
@@ -567,7 +540,7 @@ pub const Bridge = struct {
             state.write64(scratch_stack +| 8 +| @as(u64, @intCast(index * 8)), arguments[index + 6]);
         }
 
-        const mapped = mapMicrosoftToSysV(
+        const mapped = windows_abi.mapArguments(
             .{
                 .rcx = arguments[0],
                 .rdx = arguments[1],
@@ -577,17 +550,17 @@ pub const Bridge = struct {
             arguments[4],
             arguments[5],
         );
-        state.regs.rdi = mapped.rdi;
-        state.regs.rsi = mapped.rsi;
-        state.regs.rdx = mapped.rdx;
-        state.regs.rcx = mapped.rcx;
-        state.regs.r8 = mapped.r8;
-        state.regs.r9 = mapped.r9;
-        state.regs.rsp = scratch_stack;
+        register_file.field(state, "regs").*.rdi = mapped.rdi;
+        register_file.field(state, "regs").*.rsi = mapped.rsi;
+        register_file.field(state, "regs").*.rdx = mapped.rdx;
+        register_file.field(state, "regs").*.rcx = mapped.rcx;
+        register_file.field(state, "regs").*.r8 = mapped.r8;
+        register_file.field(state, "regs").*.r9 = mapped.r9;
+        register_file.field(state, "regs").*.rsp = scratch_stack;
 
         if (std.mem.eql(u8, name, "vkCreateWin32SurfaceKHR")) {
             const metal_info = state.guestAlloc(metal_surface_create_info_bytes, 8) orelse {
-                state.regs = original_regs;
+                register_file.field(state, "regs").* = original_regs;
                 self.dispatch_failures +|= 1;
                 trace_outcome = "surface_info_unavailable";
                 return false;
@@ -598,26 +571,38 @@ pub const Bridge = struct {
             state.write64(metal_info + 24, native_metal_layer_token);
             // SysV's second argument is pCreateInfo; the Windows allocator
             // remains SysV rdx and the output pointer remains SysV rcx.
-            state.regs.rsi = metal_info;
-            self.surface_name_remaps +|= 1;
+            register_file.field(state, "regs").*.rsi = metal_info;
+            self.surface_calls.noteNameRemap();
         }
 
-        const original_xmm = state.xmm;
-        defer state.xmm = original_xmm;
-        mapWindowsScalarFloats(&state.xmm, name);
+        const original_xmm = register_file.field(state, "xmm").*;
+        defer register_file.field(state, "xmm").* = original_xmm;
+        windows_abi.mapScalarFloatArguments(
+            register_file.field(state, "xmm"),
+            vulkan_contract.scalarFloatCount(name),
+        );
         const command = std.mem.startsWith(u8, name, "vkCmd");
         const native_commands_before = self.forwarder.vulkan_real_command_calls;
-        const dispatched = self.forwarder.dispatchGuestSymbol(state, symbol_token);
-        const result = state.regs.rax;
+        const dispatched = register_file.dispatchWithActiveRegisterFile(&self.forwarder, state, symbol_token);
+        const result = register_file.field(state, "regs").*.rax;
         const native_objects_ready = self.forwarder.guestVulkanInstanceReady() or
             self.forwarder.guestVulkanDeviceReady();
-        state.regs = original_regs;
+        register_file.field(state, "regs").* = original_regs;
         if (!dispatched) {
             self.dispatch_failures +|= 1;
             trace_outcome = "forwarder_rejected";
             return false;
         }
-        state.regs.rax = result;
+        if (is_surface_call) {
+            surface_dispatch_completed = true;
+            const output_surface = if (state.guestMemoryConst(arguments[3], 8) != null)
+                state.read64(arguments[3])
+            else
+                0;
+            const vk_result: i32 = @bitCast(@as(u32, @truncate(result)));
+            self.surface_calls.noteAdapterInvocation(vk_result, output_surface);
+        }
+        register_file.field(state, "regs").*.rax = result;
         self.dispatches +|= 1;
         // Every void command has an actual native-call admission ledger.
         // Handling a thunk is not proof that its native marshaller accepted
@@ -638,20 +623,33 @@ pub const Bridge = struct {
     /// Apply native capability gating before minting a Microsoft-ABI thunk.
     /// A native/SysV token must never escape into the Windows function table.
     fn lookupWindowsProc(self: *Bridge, state: anytype, direct_return_rip: ?u64) bool {
-        const requested = state.guestCString(state.regs.rdx, 512) orelse {
-            state.regs.rax = 0;
+        const requested = state.guestCString(register_file.field(state, "regs").*.rdx, 512) orelse {
+            register_file.field(state, "regs").*.rax = 0;
             finishWindowsCall(state, direct_return_rip);
             return true;
         };
+        const is_surface_lookup = std.mem.eql(u8, requested, "vkCreateWin32SurfaceKHR");
         state.windows_graphics.noteProcAddressQuery(requested);
         const library = self.ensureLibrary() orelse {
-            state.regs.rax = 0;
+            if (is_surface_lookup) self.surface_calls.noteProcLookup(false);
+            register_file.field(state, "regs").*.rax = 0;
             finishWindowsCall(state, direct_return_rip);
             return true;
         };
         const native_name = if (std.mem.eql(u8, requested, "vkCreateWin32SurfaceKHR")) "vkCreateMetalSurfaceEXT" else requested;
-        const available = self.forwarder.lookupVulkanProcGuest(library, native_name) != 0;
-        state.regs.rax = if (available) state.registerWindowsImportStub("vulkan-1.dll", requested) orelse 0 else 0;
+        const native_proc_token = self.forwarder.lookupVulkanProcGuest(library, native_name);
+        const available = native_proc_token != 0;
+        const thunk = if (available) state.registerWindowsImportStub("vulkan-1.dll", requested) orelse 0 else 0;
+        if (std.mem.startsWith(u8, requested, "vkGetPhysicalDeviceSurface") or is_surface_lookup) {
+            log.info("Windows Vulkan proc publication: requested={s} native_name={s} capability_token=0x{x} thunk=0x{x}", .{
+                requested,
+                native_name,
+                native_proc_token,
+                thunk,
+            });
+        }
+        if (is_surface_lookup) self.surface_calls.noteProcLookup(thunk != 0);
+        register_file.field(state, "regs").*.rax = thunk;
         finishWindowsCall(state, direct_return_rip);
         return true;
     }
@@ -662,11 +660,6 @@ pub const Bridge = struct {
         return if (self.library_token != 0) self.library_token else null;
     }
 };
-
-fn mapWindowsScalarFloats(xmm: anytype, name: []const u8) void {
-    const count = vulkan_contract.scalarFloatCount(name);
-    for (0..count) |index| xmm[index] = xmm[index + 1];
-}
 
 fn owns(name: []const u8) bool {
     if (!std.mem.startsWith(u8, name, "vk")) return false;
@@ -763,9 +756,9 @@ fn noteForwarderFrameEvidence(self: *const Bridge, state: anytype) void {
 
 fn finishWindowsCall(state: anytype, direct_return_rip: ?u64) void {
     if (direct_return_rip) |rip| {
-        state.regs.rip = rip;
+        register_file.field(state, "regs").*.rip = rip;
     } else {
-        state.regs.rip = state.pop();
+        register_file.field(state, "regs").*.rip = state.pop();
     }
 }
 
@@ -780,40 +773,6 @@ test "Windows surface adapter exposes the stable Metal layer token" {
     try std.testing.expect(native_metal_layer_token != 0);
 }
 
-test "Windows Vulkan adapter maps Microsoft x64 arguments to SysV" {
-    const mapped = mapMicrosoftToSysV(.{
-        .rcx = 0x11,
-        .rdx = 0x22,
-        .r8 = 0x33,
-        .r9 = 0x44,
-    }, 0x55, 0x66);
-    try std.testing.expectEqual(@as(u64, 0x11), mapped.rdi);
-    try std.testing.expectEqual(@as(u64, 0x22), mapped.rsi);
-    try std.testing.expectEqual(@as(u64, 0x33), mapped.rdx);
-    try std.testing.expectEqual(@as(u64, 0x44), mapped.rcx);
-    try std.testing.expectEqual(@as(u64, 0x55), mapped.r8);
-    try std.testing.expectEqual(@as(u64, 0x66), mapped.r9);
-
-    try std.testing.expectEqual(@as(u64, 32), microsoftStackArgumentOffset(4, true));
-    try std.testing.expectEqual(@as(u64, 40), microsoftStackArgumentOffset(5, true));
-    try std.testing.expectEqual(@as(u64, 48), microsoftStackArgumentOffset(6, true));
-    try std.testing.expectEqual(@as(u64, 40), microsoftStackArgumentOffset(4, false));
-    try std.testing.expectEqual(@as(u64, 48), microsoftStackArgumentOffset(5, false));
-    try std.testing.expectEqual(@as(u64, 56), microsoftStackArgumentOffset(6, false));
-}
-
-test "Windows depth bias preserves all three scalar bit patterns" {
-    var xmm: [16][16]u8 = @splat(@splat(0));
-    const bits = [_]u32{ 0x3f800000, 0x80000000, 0xc0200000 };
-    for (bits, 1..) |value, index| std.mem.writeInt(u32, xmm[index][0..4], value, .little);
-    const saved = xmm;
-    mapWindowsScalarFloats(&xmm, "vkCmdSetDepthBias");
-    for (bits, 0..) |value, index| try std.testing.expectEqual(value, std.mem.readInt(u32, xmm[index][0..4], .little));
-    xmm = saved;
-    mapWindowsScalarFloats(&xmm, "vkCmdSetBlendConstants");
-    try std.testing.expectEqualDeep(saved, xmm);
-}
-
 test "Xenia Windows GPU and UI entry points have a bridge dispatch contract" {
     for (vulkan_contract.xenia_entry_points) |name| {
         if (!owns(name) and !vulkan_contract.isProcLookup(name)) {
@@ -821,6 +780,10 @@ test "Xenia Windows GPU and UI entry points have a bridge dispatch contract" {
             return error.MissingVulkanDispatchContract;
         }
     }
+}
+
+test {
+    _ = windows_abi;
 }
 
 test "Windows proc lookup keeps absent commands null and returns Windows thunks" {
@@ -863,6 +826,61 @@ test "Windows proc lookup keeps absent commands null and returns Windows thunks"
     try std.testing.expectEqual(@as(u32, 1), state.registrations);
     // The device is a test sentinel, not an owned native object.
     bridge.forwarder.real_vulkan.device = null;
+}
+
+test "Windows Vulkan proc lookup uses the worker register file" {
+    const Registers = struct {
+        rax: u64 = 0,
+        rdx: u64 = 0,
+        rsp: u64 = 0,
+        rip: u64 = 0,
+    };
+    const State = struct {
+        regs: Registers = .{},
+        context: struct { regs: Registers = .{} } = .{},
+        requested_address: u64 = 0,
+        windows_graphics: struct {
+            queries: u32 = 0,
+            pub fn noteProcAddressQuery(self: *@This(), _: []const u8) void {
+                self.queries += 1;
+            }
+        } = .{},
+
+        pub fn windowsGuestContextField(self: *@This(), comptime name: []const u8) *@FieldType(@This(), name) {
+            return &@field(self.context, name);
+        }
+
+        pub fn guestCString(self: *@This(), address: u64, _: usize) ?[]const u8 {
+            self.requested_address = address;
+            return "vkCmdNotRecognizedByRosette";
+        }
+
+        pub fn registerWindowsImportStub(_: *@This(), _: []const u8, _: []const u8) ?u64 {
+            return null;
+        }
+
+        pub fn pop(_: *@This()) u64 {
+            return 0;
+        }
+    };
+
+    var bridge = Bridge{};
+    defer bridge.deinit();
+    bridge.library_token = 1;
+    bridge.forwarder.guest_libraries[0] = .{ .token = 1, .virtual_vulkan = true };
+
+    var state = State{};
+    state.regs = .{ .rax = 0xA11CE, .rdx = 0x222, .rsp = 0x333, .rip = 0x140001000 };
+    state.context.regs = .{ .rax = 0xB0B, .rdx = 0x111, .rsp = 0x444, .rip = 0x140002000 };
+    const owner_before = state.regs;
+
+    try std.testing.expect(bridge.lookupWindowsProc(&state, 0x140002004));
+
+    try std.testing.expectEqual(@as(u64, 0x111), state.requested_address);
+    try std.testing.expectEqual(@as(u64, 0), state.context.regs.rax);
+    try std.testing.expectEqual(@as(u64, 0x140002004), state.context.regs.rip);
+    try std.testing.expectEqualDeep(owner_before, state.regs);
+    try std.testing.expectEqual(@as(u32, 1), state.windows_graphics.queries);
 }
 
 test "Windows Vulkan scratch stacks are reused rather than leaked per call" {

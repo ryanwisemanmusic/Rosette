@@ -17,6 +17,7 @@ const std = @import("std");
 /// *values* a register holds.
 const register_map = @import("xenos_register_map");
 const journal_module = @import("register_journal.zig");
+const fetch_constants = @import("fetch_constants/root.zig");
 
 pub const Register = register_map.Register;
 pub const register_count = register_map.register_count;
@@ -160,181 +161,18 @@ pub const IndexFormat = enum(u1) {
     uint32 = 1,
 };
 
-/// The two dwords in a Xenos vertex fetch constant.  These are deliberately
-/// kept separate from the texture fetch metadata: Xenia uses the same
-/// register aperture for both, but the vertex constant has only an address,
-/// endian mode, and word count.
-pub const FetchConstantType = enum(u2) {
-    invalid_texture = 0,
-    invalid_vertex = 1,
-    texture = 2,
-    vertex = 3,
-};
-
-pub const TextureDimension = enum(u2) {
-    one_d = 0,
-    two_d = 1,
-    three_d = 2,
-    cube = 3,
-};
-
-pub const Endian = enum(u2) {
-    none = 0,
-    @"8in16" = 1,
-    @"8in32" = 2,
-    @"16in32" = 3,
-};
-
-pub const VertexFetch = struct {
-    type: FetchConstantType = .invalid_texture,
-    address_dwords: u32 = 0,
-    endian: Endian = .none,
-    size_words: u32 = 0,
-
-    pub fn decode(raw: [2]u32) VertexFetch {
-        return .{
-            .type = @enumFromInt(@as(u2, @truncate(raw[0] & 0x3))),
-            .address_dwords = raw[0] >> 2,
-            .endian = @enumFromInt(@as(u2, @truncate(raw[1] & 0x3))),
-            .size_words = (raw[1] >> 2) & 0x00FF_FFFF,
-        };
-    }
-
-    pub fn addressBytes(self: VertexFetch) u64 {
-        return @as(u64, self.address_dwords) * 4;
-    }
-
-    pub fn sizeBytes(self: VertexFetch) u64 {
-        return @as(u64, self.size_words) * 4;
-    }
-};
-
-fn signedBits(value: u32, bits: u5) i32 {
-    const mask = (@as(u32, 1) << bits) - 1;
-    const raw: i32 = @intCast(value & mask);
-    const sign = @as(i32, 1) << (bits - 1);
-    return if ((raw & sign) != 0) raw - (@as(i32, 1) << bits) else raw;
-}
-
-/// Decoded form of the six-dword Xenos texture fetch constant.  The Vulkan
-/// path normally receives the finished SPIR-V/resource bindings from Xenia,
-/// but retaining this state is still important for the fallback presenter,
-/// diagnostics, and texture-cache invalidation.  Stored dimensions and
-/// addresses are expanded to the units callers actually use.
-pub const TextureFetch = struct {
-    type: FetchConstantType = .invalid_texture,
-    sign: [4]u2 = .{ 0, 0, 0, 0 },
-    clamp: [3]u3 = .{ 0, 0, 0 },
-    pitch_pixels: u32 = 0,
-    tiled: bool = false,
-    format: u6 = 0,
-    endian: Endian = .none,
-    request_size: u2 = 0,
-    stacked: bool = false,
-    nearest_clamp_policy: bool = false,
-    base_address_bytes: u64 = 0,
-    width: u32 = 1,
-    height: u32 = 1,
-    depth: u32 = 1,
-    num_format: bool = false,
-    swizzle: u12 = 0,
-    exp_adjust: i8 = 0,
-    mag_filter: u2 = 0,
-    min_filter: u2 = 0,
-    mip_filter: u2 = 0,
-    aniso_filter: u3 = 0,
-    arbitrary_filter: u3 = 0,
-    border_size: bool = false,
-    volume_mag_filter: bool = false,
-    volume_min_filter: bool = false,
-    mip_min_level: u4 = 0,
-    mip_max_level: u4 = 0,
-    mag_aniso_walk: bool = false,
-    min_aniso_walk: bool = false,
-    lod_bias: i16 = 0,
-    grad_exp_adjust_h: i8 = 0,
-    grad_exp_adjust_v: i8 = 0,
-    border_color: u2 = 0,
-    force_bc_w_to_max: bool = false,
-    tri_clamp: u2 = 0,
-    aniso_bias: i8 = 0,
-    dimension: TextureDimension = .two_d,
-    packed_mips: bool = false,
-    mip_address_bytes: u64 = 0,
-
-    pub fn decode(raw: [6]u32) TextureFetch {
-        const dimension: TextureDimension = @enumFromInt(@as(u2, @truncate(raw[5] >> 9)));
-        var result = TextureFetch{
-            .type = @enumFromInt(@as(u2, @truncate(raw[0]))),
-            .sign = .{
-                @truncate(raw[0] >> 2),
-                @truncate(raw[0] >> 4),
-                @truncate(raw[0] >> 6),
-                @truncate(raw[0] >> 8),
-            },
-            .clamp = .{
-                @truncate(raw[0] >> 10),
-                @truncate(raw[0] >> 13),
-                @truncate(raw[0] >> 16),
-            },
-            .pitch_pixels = ((raw[0] >> 22) & 0x1FF) << 5,
-            .tiled = (raw[0] & 0x8000_0000) != 0,
-            .format = @truncate(raw[1]),
-            .endian = @enumFromInt(@as(u2, @truncate(raw[1] >> 6))),
-            .request_size = @truncate(raw[1] >> 8),
-            .stacked = (raw[1] & (1 << 10)) != 0,
-            .nearest_clamp_policy = (raw[1] & (1 << 11)) != 0,
-            .base_address_bytes = @as(u64, raw[1] >> 12) << 12,
-            .num_format = (raw[3] & 1) != 0,
-            .swizzle = @truncate(raw[3] >> 1),
-            .exp_adjust = @intCast(signedBits(raw[3] >> 13, 6)),
-            .mag_filter = @truncate(raw[3] >> 19),
-            .min_filter = @truncate(raw[3] >> 21),
-            .mip_filter = @truncate(raw[3] >> 23),
-            .aniso_filter = @truncate(raw[3] >> 25),
-            .arbitrary_filter = @truncate(raw[3] >> 28),
-            .border_size = (raw[3] & 0x8000_0000) != 0,
-            .volume_mag_filter = (raw[4] & 1) != 0,
-            .volume_min_filter = (raw[4] & 2) != 0,
-            .mip_min_level = @truncate(raw[4] >> 2),
-            .mip_max_level = @truncate(raw[4] >> 6),
-            .mag_aniso_walk = (raw[4] & (1 << 10)) != 0,
-            .min_aniso_walk = (raw[4] & (1 << 11)) != 0,
-            .lod_bias = @intCast(signedBits(raw[4] >> 12, 10)),
-            .grad_exp_adjust_h = @intCast(signedBits(raw[4] >> 22, 5)),
-            .grad_exp_adjust_v = @intCast(signedBits(raw[4] >> 27, 5)),
-            .border_color = @truncate(raw[5]),
-            .force_bc_w_to_max = (raw[5] & (1 << 2)) != 0,
-            .tri_clamp = @truncate(raw[5] >> 3),
-            .aniso_bias = @intCast(signedBits(raw[5] >> 5, 4)),
-            .dimension = dimension,
-            .packed_mips = (raw[5] & (1 << 11)) != 0,
-            .mip_address_bytes = @as(u64, raw[5] >> 12) << 12,
-        };
-
-        switch (dimension) {
-            .one_d => {
-                result.width = (raw[2] & 0x00FF_FFFF) + 1;
-            },
-            .two_d => {
-                result.width = (raw[2] & 0x1FFF) + 1;
-                result.height = ((raw[2] >> 13) & 0x1FFF) + 1;
-                result.depth = if (result.stacked) ((raw[2] >> 26) & 0x3F) + 1 else 1;
-            },
-            .three_d => {
-                result.width = (raw[2] & 0x7FF) + 1;
-                result.height = ((raw[2] >> 11) & 0x7FF) + 1;
-                result.depth = ((raw[2] >> 22) & 0x3FF) + 1;
-            },
-            .cube => {
-                result.width = (raw[2] & 0x1FFF) + 1;
-                result.height = ((raw[2] >> 13) & 0x1FFF) + 1;
-                result.depth = if (result.stacked) ((raw[2] >> 26) & 0x3F) + 1 else 6;
-            },
-        }
-        return result;
-    }
-};
+// The six-word texture and two-word vertex views alias the same Xenos
+// register aperture. Keep their layouts and type discrimination in one
+// library so callers cannot quietly treat a vertex descriptor as a texture.
+pub const FetchConstantType = fetch_constants.FetchConstantType;
+pub const TextureDimension = fetch_constants.TextureDimension;
+pub const Endian = fetch_constants.Endian;
+pub const TextureSlotDiagnosis = fetch_constants.TextureSlotDiagnosis;
+pub const diagnoseTextureSlot = fetch_constants.diagnoseTextureSlot;
+pub const VertexFetch = fetch_constants.VertexFetch;
+pub const TextureFetch = fetch_constants.TextureFetch;
+pub const TextureFetchProvenance = fetch_constants.TextureFetchProvenance;
+pub const FetchConstantWritePattern = fetch_constants.WritePattern;
 
 pub const IndexBufferState = struct {
     address_bytes: u32 = 0,
@@ -539,6 +377,7 @@ pub const BlendState = struct {
 
 pub const RegisterFile = struct {
     values: [register_count]u32 = [_]u32{0} ** register_count,
+    fetch_constant_write_sequence: [shader_constant_fetch_count][6]u64 = [_][6]u64{[_]u64{0} ** 6} ** shader_constant_fetch_count,
     write_count: u64 = 0,
     read_count: u64 = 0,
     unknown_write_count: u64 = 0,
@@ -573,6 +412,13 @@ pub const RegisterFile = struct {
             return;
         }
         self.values[register] = value;
+        if (register >= shader_constant_fetch_base) {
+            const fetch_offset = @as(usize, register - shader_constant_fetch_base);
+            const fetch_aperture_words = shader_constant_fetch_count * 6;
+            if (fetch_offset < fetch_aperture_words) {
+                self.fetch_constant_write_sequence[fetch_offset / 6][fetch_offset % 6] = self.write_count;
+            }
+        }
     }
 
     pub fn writeRange(self: *RegisterFile, start: Register, values: []const u32) void {
@@ -754,6 +600,11 @@ pub const RegisterFile = struct {
         return result;
     }
 
+    pub fn fetchConstantProvenance(self: *const RegisterFile, index: usize) ?TextureFetchProvenance {
+        if (index >= shader_constant_fetch_count) return null;
+        return .{ .write_sequence = self.fetch_constant_write_sequence[index] };
+    }
+
     pub fn textureFetch(self: *const RegisterFile, index: usize) ?TextureFetch {
         return TextureFetch.decode(self.fetchConstant(index) orelse return null);
     }
@@ -817,6 +668,20 @@ test "draw initiator round-trips the Xenos bit fields" {
     };
     try std.testing.expectEqual(input.encode(), DrawInitiator.decode(input.encode()).encode());
     try std.testing.expectEqual(@as(u32, 1024), DrawInitiator.decode(input.encode()).index_count);
+}
+
+test "fetch constant provenance is per descriptor word and write ordered" {
+    var file: RegisterFile = .{};
+    file.write(shader_constant_fetch_base + 2, 0xAABB_CCDD);
+    file.write(shader_constant_fetch_base + 7, 0x1122_3344);
+
+    const first = file.fetchConstantProvenance(0).?;
+    const second = file.fetchConstantProvenance(1).?;
+    try std.testing.expectEqual(@as(u6, 1 << 2), first.writtenMask());
+    try std.testing.expectEqual(@as(u64, 1), first.latestWrite());
+    try std.testing.expectEqual(@as(u6, 1 << 1), second.writtenMask());
+    try std.testing.expectEqual(@as(u64, 2), second.latestWrite());
+    try std.testing.expect(file.fetchConstantProvenance(shader_constant_fetch_count) == null);
 }
 
 test "draw initiator preserves the Xenia primitive wire values" {
