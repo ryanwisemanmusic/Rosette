@@ -2131,11 +2131,51 @@ pub fn build(b: *std.Build) void {
     const dll_win32_library_inventory_test = b.addTest(.{ .root_module = dll_win32_library_inventory_mod });
     check_step.dependOn(&b.addRunArtifact(dll_win32_library_inventory_test).step);
 
+    const tso_memory_mod = b.createModule(.{
+        .root_source_file = b.path("../lib/processor/ELF_processor/tso_memory.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // The guest memory model's own suite: the store buffer, the stripe
+    // coordinator and the boundary ledger. It was wired only as an import,
+    // so none of its tests ever ran.
+    const tso_memory_test = b.addTest(.{ .root_module = tso_memory_mod });
+    check_step.dependOn(&b.addRunArtifact(tso_memory_test).step);
+    // Host-thread concurrency: futex parking, the stop-the-world gate, the
+    // main-thread service hook and the stall watchdog the PE executor's
+    // guest threads coordinate through.
+    const concurrency_mod = b.createModule(.{
+        .root_source_file = b.path("../lib/concurrency/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const concurrency_test = b.addTest(.{ .root_module = concurrency_mod });
+    check_step.dependOn(&b.addRunArtifact(concurrency_test).step);
+    // Parallel guest execution is a processor-level package layered on top
+    // of host synchronization. Its executor, guest gate, message handoff,
+    // and atomic metrics are compiled and tested as one boundary.
+    const parallelism_mod = b.createModule(.{
+        .root_source_file = b.path("../lib/processor/ELF_processor/parallelism/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    parallelism_mod.addImport("concurrency", concurrency_mod);
+    const parallelism_test = b.addTest(.{ .root_module = parallelism_mod });
+    check_step.dependOn(&b.addRunArtifact(parallelism_test).step);
+    const utf8_codec_mod = b.createModule(.{
+        .root_source_file = b.path("../lib/text/utf8/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const utf8_codec_test = b.addTest(.{ .root_module = utf8_codec_mod });
+    check_step.dependOn(&b.addRunArtifact(utf8_codec_test).step);
     const windows_runtime_mod = b.createModule(.{
         .root_source_file = b.path("../src/x64-ASM/windows_runtime.zig"),
         .target = target,
         .optimize = optimize,
     });
+    windows_runtime_mod.addImport("tso_memory", tso_memory_mod);
+    windows_runtime_mod.addImport("utf8_codec", utf8_codec_mod);
     windows_runtime_mod.addImport("dll_win32_return_contract", dll_win32_return_contract_mod);
     windows_runtime_mod.addImport("dll_win32_library_inventory", dll_win32_library_inventory_mod);
     // The Win32 ABI surface owns the import classification and the fallback
@@ -2144,6 +2184,20 @@ pub fn build(b: *std.Build) void {
     // could reach a run unchallenged.
     const windows_runtime_test = b.addTest(.{ .root_module = windows_runtime_mod });
     check_step.dependOn(&b.addRunArtifact(windows_runtime_test).step);
+    const crt_math_mod = b.createModule(.{
+        .root_source_file = b.path("../src/x64-ASM/windows_runtime/crt_math.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const crt_math_test = b.addTest(.{ .root_module = crt_math_mod });
+    check_step.dependOn(&b.addRunArtifact(crt_math_test).step);
+    const crt_time_mod = b.createModule(.{
+        .root_source_file = b.path("../src/x64-ASM/windows_runtime/crt_time.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const crt_time_test = b.addTest(.{ .root_module = crt_time_mod });
+    check_step.dependOn(&b.addRunArtifact(crt_time_test).step);
 
     var windows_graphics_state_test_mod: *std.Build.Module = undefined;
     // ELF processor (x86-64 ELF binary loader/emulator)
@@ -2191,6 +2245,9 @@ pub fn build(b: *std.Build) void {
         elf_processor_mod.addImport("screen_validity", screen_validity_mod);
         elf_processor_mod.addImport("address_region_map", address_region_map_mod);
         elf_processor_mod.addImport("arm64_encode", arm64_encode_module);
+        elf_processor_mod.addImport("tso_memory", tso_memory_mod);
+        elf_processor_mod.addImport("concurrency", concurrency_mod);
+        elf_processor_mod.addImport("parallelism", parallelism_mod);
         const elf_processor = b.addExecutable(.{
             .name = "elf_processor",
             .root_module = elf_processor_mod,
@@ -2223,6 +2280,9 @@ pub fn build(b: *std.Build) void {
         elf_processor_test_mod.addImport("screen_validity", screen_validity_mod);
         elf_processor_test_mod.addImport("address_region_map", address_region_map_mod);
         elf_processor_test_mod.addImport("arm64_encode", arm64_encode_module);
+        elf_processor_test_mod.addImport("tso_memory", tso_memory_mod);
+        elf_processor_test_mod.addImport("concurrency", concurrency_mod);
+        elf_processor_test_mod.addImport("parallelism", parallelism_mod);
         // Rooted so the frontier classification rules execute rather than
         // only compile as the ELF processor's dependency. A shadowed rule is
         // invisible at runtime and only shows up as a workload nobody names.
@@ -2241,7 +2301,13 @@ pub fn build(b: *std.Build) void {
         windows_graphics_contract_check.dependOn(&b.addRunArtifact(windows_graphics_contract_test).step);
         const elf_processor_test = b.addTest(.{ .root_module = elf_processor_test_mod });
         check_step.dependOn(&b.addRunArtifact(elf_processor_test).step);
-
+        // The PE execution core on its own: the processor, the guest memory
+        // model and the Win32 runtime, without the rest of `check`.
+        const elf_check = b.step("elf-check", "Run the ELF/PE processor, TSO memory-model and Win32 runtime tests");
+        elf_check.dependOn(&b.addRunArtifact(elf_processor_test).step);
+        elf_check.dependOn(&b.addRunArtifact(tso_memory_test).step);
+        elf_check.dependOn(&b.addRunArtifact(concurrency_test).step);
+        elf_check.dependOn(&b.addRunArtifact(windows_runtime_test).step);
         const pe64_runtime_test_mod = b.createModule(.{
             .root_source_file = b.path("../src/tooling/exe_parser/pe64_runtime.zig"),
             .target = target,
@@ -2725,11 +2791,22 @@ pub fn build(b: *std.Build) void {
         gpu_mod.addImport("xenia_kernel_export_map", xenia_kernel_export_map_mod);
         const gpu_test = b.addTest(.{ .root_module = gpu_mod });
         check_step.dependOn(&b.addRunArtifact(gpu_test).step);
+        // The executing guest thread's registers for code that runs on its
+        // behalf. The dyld forwarder and the Windows Vulkan adapter run on
+        // whichever host thread made the call; see lib/guest_context/README.md.
+        const guest_context_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/guest_context/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const guest_context_test = b.addTest(.{ .root_module = guest_context_mod });
+        check_step.dependOn(&b.addRunArtifact(guest_context_test).step);
         const dyld_mod = b.createModule(.{
             .root_source_file = b.path("../lib/linker/dyld/root.zig"),
             .target = target,
             .optimize = optimize,
         });
+        dyld_mod.addImport("guest_context", guest_context_mod);
         dyld_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
         dyld_mod.addImport("gpu", gpu_mod);
         dyld_mod.addImport("xenia_heap_range", xenia_heap_range_mod);
@@ -2750,6 +2827,16 @@ pub fn build(b: *std.Build) void {
         // untested version of it is worse than none.
         const scheduler_test = b.addTest(.{ .root_module = scheduler_mod });
         check_step.dependOn(&b.addRunArtifact(scheduler_test).step);
+        // The native worker backend has its own lifecycle stress cases. Keep
+        // it as an explicit test root so its tests run even if the scheduler
+        // root's import graph does not retain dependency test declarations.
+        const native_thread_backend_test_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/scheduler/native_thread_backend.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const native_thread_backend_test = b.addTest(.{ .root_module = native_thread_backend_test_mod });
+        check_step.dependOn(&b.addRunArtifact(native_thread_backend_test).step);
         dyld_mod.addImport("scheduler", scheduler_mod);
         const cxx_abi_mod = b.createModule(.{
             .root_source_file = b.path("../lib/abi/cxx-abi/root.zig"),
@@ -2813,6 +2900,7 @@ pub fn build(b: *std.Build) void {
         });
         windows_vulkan_adapter_mod.addImport("gpu", gpu_mod);
         windows_vulkan_adapter_mod.addImport("dyld", dyld_mod);
+        windows_vulkan_adapter_mod.addImport("guest_context", guest_context_mod);
         windows_vulkan_adapter_mod.addImport("dll_win32_catalogue", dll_win32_catalogue_mod);
         const windows_vulkan_adapter_test = b.addTest(.{ .root_module = windows_vulkan_adapter_mod });
         const windows_vulkan_adapter_check = b.step("windows-vulkan-check", "Run Windows Vulkan ABI adapter tests");
