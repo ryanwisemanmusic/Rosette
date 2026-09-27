@@ -1058,6 +1058,9 @@ const ProcessInfo = struct {
     pid: i32,
     ppid: i32,
     stat: []const u8,
+    executable_path: []const u8,
+    argv0: []const u8,
+    argv1: []const u8,
     command: []const u8,
 };
 
@@ -1133,7 +1136,7 @@ fn collectCleanupCandidates(allocator: std.mem.Allocator, options: CleanOptions)
         if (process.pid <= 1) continue;
         if (process.pid == self_pid or process.pid == parent_pid) continue;
         if (process.ppid == self_pid) continue;
-        if (cleanupReason(process.command, options)) |reason| {
+        if (cleanupReason(process.executable_path, process.argv0, process.argv1, options)) |reason| {
             try candidates.append(allocator, .{
                 .process = process,
                 .reason = reason,
@@ -1160,25 +1163,35 @@ fn auditRosetteProcessState(allocator: std.mem.Allocator, phase: []const u8) !vo
     return error.RosetteProcessAuditFailed;
 }
 
-fn cleanupReason(command: []const u8, options: CleanOptions) ?[]const u8 {
-    if (containsIgnoreCase(command, " rosette-shell clean-state")) return null;
-    if (containsIgnoreCase(command, "/rosette-shell clean-state")) return null;
-    if (!options.include_xenia and containsIgnoreCase(command, "xenia_canary.app/contents/macos/xenia_canary")) return null;
-    if (containsIgnoreCase(command, "rosette-shell compiler-sanitize")) return "Rosette compiler sanitizer";
-    if (containsIgnoreCase(command, "rosette-compiler-sanitize")) return "Rosette compiler sanitizer launcher";
-    if (containsIgnoreCase(command, "rosette-shell route-arch")) return "Rosette arch handoff";
-    if (containsIgnoreCase(command, "rosette-arch")) return "Rosette arch backend";
-    if (containsIgnoreCase(command, "rosette-shell detect")) return "Rosette project detector";
-    if (containsIgnoreCase(command, "rosette-shell recipe-shell")) return "Rosette make recipe shell";
-    if (containsIgnoreCase(command, "rosette-shell tool")) return "Rosette compiler/tool wrapper";
-    if (containsIgnoreCase(command, "rosette-router")) return "Rosette compatibility router";
-    if (containsIgnoreCase(command, "elf_processor")) return "Rosette ELF processor";
-    if (containsIgnoreCase(command, "rosette_assembler_runner")) return "Rosette assembler ABI runner";
-    if (containsIgnoreCase(command, "rosette_exe_runner")) return "Rosette EXE runner";
-    if (containsIgnoreCase(command, "rosette_mscoree_window_helper")) return "Rosette managed window helper";
-    if (containsIgnoreCase(command, "/usr/local/bin/rose")) return "legacy Rosette launcher";
-    if (containsIgnoreCase(command, "xenia-rosetta.")) return "Rosette Xenia handoff script";
-    if (options.include_xenia and containsIgnoreCase(command, "xenia_canary.app/contents/macos/xenia_canary")) return "Rosette-launched Xenia Canary";
+fn cleanupReason(executable_path: []const u8, argv0: []const u8, argv1: []const u8, options: CleanOptions) ?[]const u8 {
+    const executable = std.fs.path.basename(executable_path);
+    const process_name = if (executable.len != 0) executable else std.fs.path.basename(argv0);
+    const first_argument = std.fs.path.basename(argv1);
+
+    // Classify the executable or the shell's actual script argument. Never
+    // search the rendered command: a parent shell's `-c` text, an editor
+    // buffer path, or a compiler argument can mention a Rosette binary and
+    // must not make that unrelated process look owned by this runtime.
+    if (std.ascii.eqlIgnoreCase(process_name, "rosette-shell")) {
+        if (std.ascii.eqlIgnoreCase(argv1, "clean-state")) return null;
+        if (std.ascii.eqlIgnoreCase(argv1, "compiler-sanitize")) return "Rosette compiler sanitizer";
+        if (std.ascii.eqlIgnoreCase(argv1, "route-arch")) return "Rosette arch handoff";
+        if (std.ascii.eqlIgnoreCase(argv1, "detect")) return "Rosette project detector";
+        if (std.ascii.eqlIgnoreCase(argv1, "recipe-shell")) return "Rosette make recipe shell";
+        if (std.ascii.eqlIgnoreCase(argv1, "tool")) return "Rosette compiler/tool wrapper";
+    }
+    if (std.ascii.eqlIgnoreCase(process_name, "rosette-compiler-sanitize")) return "Rosette compiler sanitizer launcher";
+    if (std.ascii.eqlIgnoreCase(process_name, "rosette-arch") or std.ascii.eqlIgnoreCase(first_argument, "rosette-arch")) return "Rosette arch backend";
+    if (std.ascii.eqlIgnoreCase(process_name, "rosette-router")) return "Rosette compatibility router";
+    if (std.ascii.eqlIgnoreCase(process_name, "elf_processor")) return "Rosette ELF processor";
+    if (std.ascii.eqlIgnoreCase(process_name, "rosette_assembler_runner")) return "Rosette assembler ABI runner";
+    if (std.ascii.eqlIgnoreCase(process_name, "rosette_exe_runner")) return "Rosette EXE runner";
+    if (std.ascii.eqlIgnoreCase(process_name, "rosette_mscoree_window_helper")) return "Rosette managed window helper";
+    if (std.ascii.eqlIgnoreCase(process_name, "rose") and std.mem.startsWith(u8, executable_path, "/usr/local/bin/")) return "legacy Rosette launcher";
+    if (std.mem.startsWith(u8, first_argument, "xenia-rosetta.")) return "Rosette Xenia handoff script";
+    if (std.ascii.eqlIgnoreCase(first_argument, "rosette-xenia-run.sh")) return "Rosette Xenia run supervisor";
+    if (!options.include_xenia and std.ascii.eqlIgnoreCase(process_name, "xenia_canary")) return null;
+    if (options.include_xenia and std.ascii.eqlIgnoreCase(process_name, "xenia_canary")) return "Rosette-launched Xenia Canary";
     return null;
 }
 
@@ -1224,24 +1237,33 @@ fn readDarwinProcessInfo(allocator: std.mem.Allocator, pid: c_int) !ProcessInfo 
     else
         "";
 
-    const command = try readDarwinProcessCommand(allocator, pid, path);
-    if (command.len == 0) return error.InvalidProcessLine;
+    const args = try readDarwinProcessCommand(allocator, pid, path);
+    if (args.command.len == 0) return error.InvalidProcessLine;
 
     return .{
         .pid = @intCast(pid),
         .ppid = try readDarwinParentPid(pid),
         .stat = try allocator.dupe(u8, "unknown"),
-        .command = command,
+        .executable_path = try allocator.dupe(u8, path),
+        .argv0 = args.argv0,
+        .argv1 = args.argv1,
+        .command = args.command,
     };
 }
 
-fn readDarwinProcessCommand(allocator: std.mem.Allocator, pid: c_int, path: []const u8) ![]const u8 {
+const ProcessArguments = struct {
+    argv0: []const u8 = "",
+    argv1: []const u8 = "",
+    command: []const u8 = "",
+};
+
+fn readDarwinProcessCommand(allocator: std.mem.Allocator, pid: c_int, path: []const u8) !ProcessArguments {
     var mib = [_]c_int{ c.CTL_KERN, c.KERN_PROCARGS2, pid };
     const buffer = try allocator.alloc(u8, 128 * 1024);
     defer allocator.free(buffer);
     var size: usize = buffer.len;
     if (c.sysctl(&mib, mib.len, buffer.ptr, &size, null, 0) != 0) {
-        if (path.len != 0) return try allocator.dupe(u8, path);
+        if (path.len != 0) return .{ .command = try allocator.dupe(u8, path) };
         return error.InvalidProcessLine;
     }
 
@@ -1254,6 +1276,8 @@ fn readDarwinProcessCommand(allocator: std.mem.Allocator, pid: c_int, path: []co
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     if (path.len != 0) try out.appendSlice(allocator, path);
+    var argv0: []const u8 = "";
+    var argv1: []const u8 = "";
 
     // KERN_PROCARGS2 is laid out as argc, executable path, padding, argv, then
     // the environment. Stop after exactly argc argv strings. Reading until an
@@ -1273,6 +1297,8 @@ fn readDarwinProcessCommand(allocator: std.mem.Allocator, pid: c_int, path: []co
         while (index < bytes.len and bytes[index] != 0) : (index += 1) {}
         if (index <= start) continue;
         const value = bytes[start..index];
+        if (arguments_seen == 1) argv0 = try allocator.dupe(u8, value);
+        if (arguments_seen == 2) argv1 = try allocator.dupe(u8, value);
         arguments_seen += 1;
         if (value.len == 0) continue;
         if (path.len != 0 and std.mem.eql(u8, value, path)) continue;
@@ -1280,7 +1306,7 @@ fn readDarwinProcessCommand(allocator: std.mem.Allocator, pid: c_int, path: []co
         try out.appendSlice(allocator, value);
     }
 
-    return out.items;
+    return .{ .argv0 = argv0, .argv1 = argv1, .command = out.items };
 }
 
 fn readDarwinParentPid(pid: c_int) !i32 {
@@ -1301,10 +1327,16 @@ fn parseProcessLine(allocator: std.mem.Allocator, raw_line: []const u8) !Process
     const stat_text = takeField(&line) orelse return error.InvalidProcessLine;
     const command = std.mem.trim(u8, line, " \t\r\n");
     if (command.len == 0) return error.InvalidProcessLine;
+    var command_fields = command;
+    const executable = takeField(&command_fields) orelse return error.InvalidProcessLine;
+    const argv1 = takeField(&command_fields) orelse "";
     return .{
         .pid = try std.fmt.parseInt(i32, pid_text, 10),
         .ppid = try std.fmt.parseInt(i32, ppid_text, 10),
         .stat = try allocator.dupe(u8, stat_text),
+        .executable_path = try allocator.dupe(u8, executable),
+        .argv0 = try allocator.dupe(u8, executable),
+        .argv1 = try allocator.dupe(u8, argv1),
         .command = try allocator.dupe(u8, command),
     };
 }
@@ -5199,20 +5231,36 @@ test "clean-state parser reads ps output lines" {
     try std.testing.expectEqual(@as(i32, 77587), process.pid);
     try std.testing.expectEqual(@as(i32, 1), process.ppid);
     try std.testing.expectEqualStrings("UE", process.stat);
+    try std.testing.expectEqualStrings("/Users/test/.rosette/bin/rosette-shell", process.executable_path);
+    try std.testing.expectEqualStrings("route-arch", process.argv1);
     try std.testing.expect(containsIgnoreCase(process.command, "rosette-shell route-arch"));
     try std.testing.expect(isKernelHeldStatus(process.stat));
 }
 
 test "clean-state matcher can include or exclude Xenia launches" {
-    const command = "./xenia_canary.app/Contents/MacOS/xenia_canary --gpu=vulkan";
-    try std.testing.expect(cleanupReason(command, .{ .include_xenia = true }) != null);
-    try std.testing.expect(cleanupReason(command, .{ .include_xenia = false }) == null);
-    try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-router run ./xenia_canary.app/Contents/MacOS/xenia_canary", .{ .include_xenia = false }) == null);
-    try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-shell detect /repo", .{}) != null);
-    try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-shell compiler-sanitize /bin/echo", .{}) != null);
-    try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-compiler-sanitize /bin/echo", .{}) != null);
-    try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-arch -x86_64 /bin/bash /tmp/xenia-rosetta.ABC", .{}) != null);
-    try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-shell clean-state", .{}) == null);
+    const xenia = "/Applications/xenia_canary.app/Contents/MacOS/xenia_canary";
+    try std.testing.expect(cleanupReason(xenia, xenia, "--gpu=vulkan", .{ .include_xenia = true }) != null);
+    try std.testing.expect(cleanupReason(xenia, xenia, "--gpu=vulkan", .{ .include_xenia = false }) == null);
+    try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-router", "rosette-router", "run", .{ .include_xenia = false }) != null);
+    try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-shell", "rosette-shell", "detect", .{}) != null);
+    try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-shell", "rosette-shell", "compiler-sanitize", .{}) != null);
+    try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-compiler-sanitize", "rosette-compiler-sanitize", "/bin/echo", .{}) != null);
+    try std.testing.expect(cleanupReason("/bin/bash", "bash", "/Users/test/.rosette/bin/rosette-arch", .{}) != null);
+    try std.testing.expect(cleanupReason("/bin/bash", "bash", "/tmp/xenia-rosetta.ABC", .{}) != null);
+    try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-shell", "rosette-shell", "clean-state", .{}) == null);
+}
+
+test "clean-state matcher ignores Rosette paths in unrelated command arguments" {
+    try std.testing.expect(cleanupReason("/bin/zsh", "zsh", "-c", .{}) == null);
+    try std.testing.expect(cleanupReason("/usr/bin/python3", "python3", "tools/analyze_generated_code_trace.py", .{}) == null);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const process = try parseProcessLine(
+        arena.allocator(),
+        "123 1 S /bin/zsh -c make -f build/Makefile inspect lib/processor/ELF_processor/block_jit.zig",
+    );
+    try std.testing.expect(containsIgnoreCase(process.command, "block_jit.zig"));
+    try std.testing.expect(cleanupReason(process.executable_path, process.argv0, process.argv1, .{}) == null);
     try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "filtered=()"));
     try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "-include"));
     try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "x86_intrinsics_compat.h"));
