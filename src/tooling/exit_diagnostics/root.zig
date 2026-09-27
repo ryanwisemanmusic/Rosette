@@ -19,6 +19,9 @@ pub const TerminationReason = enum(u8) {
     system_policy_rejected = 15,
     unhandled_guest_signal = 16,
     host_termination_signal = 17,
+    /// The guest's own C or C++ runtime ended the process: abort(),
+    /// std::terminate() or a pure virtual call.
+    guest_abort = 18,
 };
 
 pub const StopOwner = enum {
@@ -44,6 +47,8 @@ pub const AttributionInput = struct {
     reason: TerminationReason,
     faulted: bool,
     unresolved_import_calls: u64 = 0,
+    /// The stop site recorded what it decided (`ExitReport.terminal_event`).
+    terminal_event_recorded: bool = false,
 };
 
 pub const TerminalRegs = struct {
@@ -101,6 +106,51 @@ pub const StackEntry = struct {
     value: u64 = 0,
     symbol: []const u8 = "",
     symbol_offset: u64 = 0,
+    /// The caller's own description of the value ("name+0x1c", or the region
+    /// that owns it), printed instead of symbol+offset when present.
+    description: []const u8 = "",
+};
+
+/// What ended the run, as recorded by the site that decided it.
+pub const TerminalEventReport = struct {
+    kind: []const u8 = "",
+    label: []const u8 = "",
+    detail: []const u8 = "",
+    step: u64 = 0,
+    thread: []const u8 = "",
+    rip: u64 = 0,
+    rip_description: []const u8 = "",
+    return_address: u64 = 0,
+    return_description: []const u8 = "",
+    /// Terminal decisions the run made; more than one means a later site
+    /// also tried to stop it.
+    decisions: u32 = 0,
+};
+
+/// A notable runtime event from before the stop (refused allocation, C++
+/// throw, double free, null-page access, ...).
+pub const PrecedingEvent = struct {
+    kind: []const u8 = "",
+    step: u64 = 0,
+    thread: []const u8 = "",
+    rip: u64 = 0,
+    text: []const u8 = "",
+};
+
+/// One frame of a guest call chain recovered by scanning the stack.
+pub const BacktraceFrame = struct {
+    slot_address: u64 = 0,
+    return_address: u64 = 0,
+    call_site: u64 = 0,
+    form: []const u8 = "",
+    description: []const u8 = "",
+};
+
+/// One of the last error or warning lines the processor wrote.
+pub const RecentLogLine = struct {
+    level: []const u8 = "",
+    sequence: u64 = 0,
+    text: []const u8 = "",
 };
 
 pub const MemoryAccessFailure = struct {
@@ -270,6 +320,15 @@ pub const ExitReport = struct {
     cxx_exception: ?CxxExceptionReport = null,
     execution_authoritative: bool = true,
     detail: []const u8 = "",
+    /// The terminal rip described by the caller, for when `terminal_symbol`
+    /// has no symbol table to consult (PE images).
+    terminal_description: []const u8 = "",
+    terminal_event: ?TerminalEventReport = null,
+    preceding_events: []const PrecedingEvent = &.{},
+    preceding_events_total: u64 = 0,
+    guest_backtrace: []const BacktraceFrame = &.{},
+    recent_log_lines: []const RecentLogLine = &.{},
+    recent_log_total: u64 = 0,
 };
 
 pub fn logExitReport(report: ExitReport) void {
@@ -277,20 +336,28 @@ pub fn logExitReport(report: ExitReport) void {
         .reason = report.reason,
         .faulted = report.faulted,
         .unresolved_import_calls = report.unresolved_import_calls,
+        .terminal_event_recorded = report.terminal_event != null,
     });
     std.debug.print("\n  \x1b[31m======= EXIT DIAGNOSTICS =======\x1b[0m\n", .{});
     std.debug.print("  exit_code:    {d}\n", .{report.exit_code});
-    std.debug.print("  reason:       {s}\n", .{reasonLabel(report.reason)});
+    if (report.reason == .runtime_invariant_failure and report.terminal_event != null) {
+        std.debug.print("  reason:       a Rosette runtime check stopped the run: {s}\n", .{report.terminal_event.?.label});
+    } else {
+        std.debug.print("  reason:       {s}\n", .{reasonLabel(report.reason)});
+    }
     std.debug.print("  faulted:      {}\n", .{report.faulted});
     std.debug.print("  rip:          0x{x}\n", .{report.rip});
     if (report.terminal_symbol) |symbol| {
         std.debug.print("  location:     {s}+0x{x} (0x{x})\n", .{ symbol.symbol, symbol.symbol_offset, symbol.address });
+    } else if (report.terminal_description.len != 0) {
+        std.debug.print("  location:     {s} (0x{x})\n", .{ report.terminal_description, report.rip });
     }
     std.debug.print("  authoritative:{}\n", .{attribution.authority == .authoritative});
     std.debug.print("  stop owner:   {s}\n", .{ownerLabel(attribution.owner)});
     std.debug.print("  verdict:      {s}\n", .{authorityLabel(attribution.authority)});
     std.debug.print("  evidence:     {s}\n", .{attribution.evidence});
     std.debug.print("  next check:   {s}\n", .{attribution.next_action});
+    printTerminalEvent(report);
 
     const r = report.regs;
     std.debug.print("  \x1b[33mregisters:\x1b[0m\n", .{});
@@ -539,13 +606,17 @@ pub fn logExitReport(report: ExitReport) void {
     if (report.stack_entries.len > 0) {
         std.debug.print("  \x1b[33mstack snapshot:\x1b[0m\n", .{});
         for (report.stack_entries, 0..) |entry, i| {
-            if (entry.symbol.len != 0) {
+            if (entry.description.len != 0) {
+                std.debug.print("    [{d:>2}] 0x{x}: 0x{x} -> {s}\n", .{ i, entry.slot_address, entry.value, entry.description });
+            } else if (entry.symbol.len != 0) {
                 std.debug.print("    [{d:>2}] 0x{x}: 0x{x} -> {s}+0x{x}\n", .{ i, entry.slot_address, entry.value, entry.symbol, entry.symbol_offset });
             } else {
                 std.debug.print("    [{d:>2}] 0x{x}: 0x{x}\n", .{ i, entry.slot_address, entry.value });
             }
         }
     }
+
+    printCausalContext(report);
 
     const trace = report.last_instructions;
     if (trace.len > 0) {
@@ -570,6 +641,57 @@ pub fn logExitReport(report: ExitReport) void {
     std.debug.print("  \x1b[31m==================================\x1b[0m\n", .{});
 }
 
+fn printTerminalEvent(report: ExitReport) void {
+    if (report.terminal_event) |event| {
+        std.debug.print("  \x1b[33mterminal event:\x1b[0m {s} label={s} step={d} thread={s} decisions={d}\n", .{
+            event.kind,
+            event.label,
+            event.step,
+            event.thread,
+            event.decisions,
+        });
+        std.debug.print("    at=0x{x} ({s}) caller=0x{x} ({s})\n", .{
+            event.rip,
+            if (event.rip_description.len != 0) event.rip_description else "<unnamed>",
+            event.return_address,
+            if (event.return_address == 0) "<not recorded>" else if (event.return_description.len != 0) event.return_description else "<unnamed>",
+        });
+        if (event.detail.len != 0) std.debug.print("    detail: {s}\n", .{event.detail});
+        return;
+    }
+    if (report.reason == .runtime_invariant_failure) {
+        std.debug.print("  \x1b[33mterminal event:\x1b[0m none recorded - the stop site set a reason without describing itself; the recent errors below are the nearest evidence, and that site should record a terminal event\n", .{});
+    }
+}
+
+fn printCausalContext(report: ExitReport) void {
+    if (report.guest_backtrace.len > 0) {
+        std.debug.print("  \x1b[33mguest backtrace (stack scan; each frame follows a real call instruction, nearest first):\x1b[0m\n", .{});
+        for (report.guest_backtrace, 0..) |frame, index| {
+            std.debug.print("    #{d:<2} 0x{x} {s} [slot 0x{x}, {s} call at 0x{x}]\n", .{
+                index,
+                frame.return_address,
+                if (frame.description.len != 0) frame.description else "<unnamed>",
+                frame.slot_address,
+                frame.form,
+                frame.call_site,
+            });
+        }
+    }
+    if (report.preceding_events.len > 0) {
+        std.debug.print("  \x1b[33mpreceding notable events (oldest first, {d} of {d} recorded):\x1b[0m\n", .{ report.preceding_events.len, report.preceding_events_total });
+        for (report.preceding_events) |event| {
+            std.debug.print("    step={d} thread={s} {s} rip=0x{x}: {s}\n", .{ event.step, event.thread, event.kind, event.rip, event.text });
+        }
+    }
+    if (report.recent_log_lines.len > 0) {
+        std.debug.print("  \x1b[33mrecent error/warning lines (oldest first, {d} of {d} kept):\x1b[0m\n", .{ report.recent_log_lines.len, report.recent_log_total });
+        for (report.recent_log_lines) |line| {
+            std.debug.print("    [{d}] {s}: {s}\n", .{ line.sequence, line.level, line.text });
+        }
+    }
+}
+
 pub fn reasonLabel(reason: TerminationReason) []const u8 {
     return switch (reason) {
         .unknown => "unknown",
@@ -590,6 +712,7 @@ pub fn reasonLabel(reason: TerminationReason) []const u8 {
         .system_policy_rejected => "system boundary policy rejected the guest operation",
         .unhandled_guest_signal => "guest signal handler did not resolve the fault",
         .host_termination_signal => "host lifecycle termination signal received",
+        .guest_abort => "guest runtime requested abnormal termination (abort / std::terminate / pure virtual call)",
     };
 }
 
@@ -611,6 +734,14 @@ pub fn attribute(input: AttributionInput) Attribution {
             .authority = .diagnostic_only,
             .evidence = "One or more guest dependency calls were not executed.",
             .next_action = "Resolve the recorded imports before interpreting the guest exit status.",
+        };
+    }
+    if (input.reason == .runtime_invariant_failure and input.terminal_event_recorded) {
+        return .{
+            .owner = .rosette_runtime,
+            .authority = .diagnostic_only,
+            .evidence = "A Rosette runtime check stopped the run; the terminal event below names the check, where it fired and what it saw.",
+            .next_action = "Start from the terminal event's label and detail, then read the preceding events for what led the guest there.",
         };
     }
 
@@ -699,6 +830,12 @@ pub fn attribute(input: AttributionInput) Attribution {
             .evidence = "The guest SIGILL handler returned while the faulting UD2 and instruction pointer were unchanged.",
             .next_action = "Inspect why the guest rejected this UD2 as a managed breakpoint; the decoder successfully executed the signal path.",
         },
+        .guest_abort => .{
+            .owner = .guest_application,
+            .authority = .diagnostic_only,
+            .evidence = "The guest's C/C++ runtime ended the process itself (abort, std::terminate or _purecall): a check the guest made failed first, so the stop is the guest's decision about an input it received.",
+            .next_action = "Read the terminal event and the preceding events: a refused allocation, an unhandled C++ exception or a corrupted object is what the guest reacted to, and it is a Rosette defect whenever that input came from Rosette.",
+        },
         .host_termination_signal => unreachable,
         .unknown => .{
             .owner = .indeterminate,
@@ -760,6 +897,13 @@ pub fn inferReason(reason: TerminationReason, evidence: RuntimeEvidence) Termina
     return .unknown;
 }
 
+test "a guest abort is the guest's decision but never an authoritative result" {
+    const result = attribute(.{ .reason = .guest_abort, .faulted = true });
+    try std.testing.expectEqual(StopOwner.guest_application, result.owner);
+    try std.testing.expectEqual(ResultAuthority.diagnostic_only, result.authority);
+    try std.testing.expect(std.mem.indexOf(u8, reasonLabel(.guest_abort), "abort") != null);
+}
+
 test "C++ exception stop is attributed to missing Rosette unwinding" {
     const result = attribute(.{ .reason = .cxx_exception, .faulted = false });
     try std.testing.expectEqual(StopOwner.rosette_runtime, result.owner);
@@ -809,6 +953,14 @@ test "unresolved import reason requires a concrete dependency record" {
         TerminationReason.unresolved_import_result,
         normalizeReason(.unresolved_import_result, 1),
     );
+}
+
+test "a runtime check that recorded its terminal event is named, not called unexplained" {
+    const unexplained = attribute(.{ .reason = .runtime_invariant_failure, .faulted = true });
+    const described = attribute(.{ .reason = .runtime_invariant_failure, .faulted = true, .terminal_event_recorded = true });
+    try std.testing.expect(std.mem.indexOf(u8, unexplained.evidence, "without preserving") != null);
+    try std.testing.expect(std.mem.indexOf(u8, described.evidence, "terminal event") != null);
+    try std.testing.expectEqual(StopOwner.rosette_runtime, described.owner);
 }
 
 test "unknown runtime faults are classified from captured evidence" {
