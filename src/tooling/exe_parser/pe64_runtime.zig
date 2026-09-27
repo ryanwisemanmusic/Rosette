@@ -547,6 +547,21 @@ const utf8_find_any_of_prefix = [_]u8{
     0x84,
 };
 
+// MinGW/libstdc++'s codecvt_utf8_utf16<wchar_t>::do_in. Symbol lookup keeps
+// this guest-side compatibility implementation tied to the exact routine and
+// allows stripped or differently built images to use their own implementation.
+const utf8_utf16_codecvt_do_in_symbol = "_ZNKSt25__codecvt_utf8_utf16_baseIwE5do_inERiPKcS3_RS3_PwS5_RS5_";
+
+// Xenia validates generated configuration lines with xe::utf8::count.  The
+// observer is diagnostic-only: it identifies invalid input and then lets the
+// guest function execute unchanged.
+const xenia_utf8_count_symbol = "_ZN2xe4utf85countESt17basic_string_viewIcSt11char_traitsIcEE";
+const xenia_cxa_throw_symbol = "__cxa_throw";
+// fmt's linked formatting entry points. The probes narrow corruption to the
+// handoff, parser/argument lookup, buffer writer, or std::string return path.
+const fmt_vformat_symbol = "_ZN3fmt3v127vformatB5cxx11ENS0_17basic_string_viewIcEENS0_17basic_format_argsINS0_7contextEEE";
+const fmt_vformat_to_symbol = "_ZN3fmt3v126detail10vformat_toERNS1_6bufferIcEENS0_17basic_string_viewIcEENS0_17basic_format_argsINS0_7contextEEENS0_10locale_refE";
+
 fn locateUtf8FindAnyOfEntry(
     image: *const parser.Image,
     bytes: []const u8,
@@ -1032,6 +1047,7 @@ fn reportExitSummary() void {
     state.reportGuestLockContention();
     state.reportRunThroughput();
     state.reportGuestThreads();
+    state.reportWindowsUiPipeline();
     state.reportAudioChain();
     state.reportWindowsDynamicRefusals();
     state.reportWindowsMemoryContract();
@@ -1328,8 +1344,21 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
         // contract and make direct imports look successful without executing
         // them. The dispatcher still receives an F4 sentinel at this address
         // and handles the call before the ordinary decoder runs.
-        if (!state.registerWindowsImportStubAt(thunk_address, descriptor.dll_name, descriptor.function_name)) {
+        if (!state.registerWindowsImportStubAtIat(thunk_address, descriptor.dll_name, descriptor.function_name, iat_address)) {
             return error.WindowsImportStubCapacityExceeded;
+        }
+        if (std.ascii.eqlIgnoreCase(descriptor.dll_name, "user32.dll") and
+            (std.mem.eql(u8, descriptor.function_name, "GetMessageW") or
+                std.mem.eql(u8, descriptor.function_name, "TranslateMessage") or
+                std.mem.eql(u8, descriptor.function_name, "DispatchMessageW")))
+        {
+            log.info("PE64 import binding: {s}!{s} descriptor_index={d} iat=0x{x} expected_stub=0x{x}", .{
+                descriptor.dll_name,
+                descriptor.function_name,
+                index,
+                iat_address,
+                thunk_address,
+            });
         }
         dynamic_relocations[index] = .{
             .name = descriptor.function_name,
@@ -1339,6 +1368,7 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
         };
     }
     state.dynamic_relocations = dynamic_relocations;
+    state.dynamic_relocation_lookup.clear();
     state.windows_runtime_enabled = true;
     state.configureWindowsTraceRing();
     state.windows_unknown_imports_fatal = unknownImportsFatal();
@@ -1352,6 +1382,26 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
     state.configureWindowsUtf8FindAnyOfEntry(locateUtf8FindAnyOfEntry(image, bytes, load_base));
     if (state.windows_utf8_find_any_of_entry) |entry| {
         log.info("PE64 guest compatibility: recognized UTF-8 find_any_of entry=0x{x}; empty character sets will return npos", .{entry});
+    }
+    state.configureWindowsCodecvtInEntry(symbol_index.addressOf(utf8_utf16_codecvt_do_in_symbol));
+    if (state.windows_codecvt_in_entry) |entry| {
+        log.info("PE64 guest compatibility: recognized UTF-8 to UTF-16 codecvt do_in entry=0x{x}; conversion uses Rosetta's guest-memory implementation", .{entry});
+    }
+    state.configureWindowsUtf8CountEntry(symbol_index.addressOf(xenia_utf8_count_symbol));
+    if (state.windows_utf8_count_entry) |entry| {
+        log.info("PE64 guest diagnostics: recognized xe::utf8::count entry=0x{x}; invalid input bytes and the caller will be captured without changing guest execution", .{entry});
+    }
+    const fmt_vformat_entry = symbol_index.addressOf(fmt_vformat_symbol);
+    const fmt_vformat_to_entry = symbol_index.addressOf(fmt_vformat_to_symbol);
+    state.configureWindowsFmtEntries(fmt_vformat_entry, fmt_vformat_to_entry);
+    log.info("PE64 guest diagnostics: fmt SaveConfig probes vformat=0x{x} vformat_to=0x{x}; snapshots are armed only when vformat's return address resolves to config::SaveConfig", .{
+        fmt_vformat_entry orelse 0,
+        fmt_vformat_to_entry orelse 0,
+    });
+    const cxa_throw_entry = symbol_index.addressOf(xenia_cxa_throw_symbol) orelse symbol_index.addressOf("_cxa_throw");
+    state.configureWindowsCxaThrowEntry(cxa_throw_entry);
+    if (state.windows_cxa_throw_entry) |entry| {
+        log.info("PE64 guest diagnostics: recognized Itanium __cxa_throw entry=0x{x}; invalid_utf8 exceptions will capture their checked throw frame, input cursor and recent file-read origin without changing guest execution", .{entry});
     }
 
     const sentinel = std.math.sub(u64, image_end, 0x1000) catch return error.AddressOverflow;
@@ -1369,6 +1419,9 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
     // that runs handlers, so the summary now survives that.
     installExitSummary(&state);
     defer clearExitSummary();
+    // From here on this thread runs every guest thread; sample it until the
+    // exit report.
+    state.startHostProfile();
     state.runWithLimit(options.max_steps);
     reportExitSummary();
 

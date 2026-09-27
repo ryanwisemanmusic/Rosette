@@ -13,27 +13,10 @@ const builtin = @import("builtin");
 const std = @import("std");
 const gpu = @import("gpu");
 const windows_guest_forwarder = @import("windows_guest_forwarder");
-
-const NativeWindowStatus = extern struct {
-    application: usize,
-    window: usize,
-    view: usize,
-    metal_layer: usize,
-    metal_device: usize,
-    width: u32,
-    height: u32,
-    events_pumped: u32,
-    application_ready: u8,
-    window_ready: u8,
-    layer_attached: u8,
-    visible: u8,
-    on_main_thread: u8,
-    reserved: [3]u8,
-};
+const window_access = @import("native_windows_graphics/window_access.zig");
 
 extern fn dlopen(path: [*:0]const u8, flags: c_int) ?*anyopaque;
 extern fn dlsym(handle: ?*anyopaque, name: [*:0]const u8) ?*anyopaque;
-extern fn rosette_macho_native_window_status() NativeWindowStatus;
 
 const rtld_now: c_int = 0x2;
 const rtld_local: c_int = 0x4;
@@ -107,9 +90,7 @@ pub const NativeWindowsGraphics = struct {
     /// address space.
     pub fn metalLayerHostPointer(_: *const NativeWindowsGraphics) usize {
         if (comptime builtin.target.os.tag != .macos) return 0;
-        const window = rosette_macho_native_window_status();
-        if (window.metal_layer == 0 or window.layer_attached == 0) return 0;
-        return window.metal_layer;
+        return window_access.metalLayerPointer() orelse 0;
     }
 
     pub fn reportPresentChain(self: *NativeWindowsGraphics) void {
@@ -143,7 +124,7 @@ pub const NativeWindowsGraphics = struct {
         if (self.presenter.stage == .device_lost) return false;
         if (self.presenter.stage.isReady()) return true;
 
-        const window = rosette_macho_native_window_status();
+        const window = window_access.snapshot();
         if (window.metal_layer == 0 or window.layer_attached == 0) return false;
         const loader = self.loadVulkan() orelse return false;
 

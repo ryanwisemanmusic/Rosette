@@ -28,6 +28,8 @@ extern fn rosette_macho_native_application_ensure() c_int;
 extern fn rosette_macho_native_window_ensure(width: u32, height: u32, title: [*:0]const u8) c_int;
 extern fn rosette_macho_native_window_show() c_int;
 extern fn rosette_macho_native_window_pump_events() u32;
+extern fn rosette_macho_native_service_main_queue() u32;
+extern fn rosette_macho_native_set_main_thread_request_hook(hook: ?*const fn (c_int) callconv(.c) void) void;
 extern fn rosette_macho_native_window_read_controller_state(out: *elf_processor_state.WindowsInputState) c_int;
 extern fn rosette_macho_native_window_set_drawable_owner(owned_by_swapchain: c_int) c_int;
 extern fn rosette_macho_native_window_prepare_drawable_size(width: u32, height: u32) c_int;
@@ -50,6 +52,13 @@ fn nativeShowWindow(_: ?*anyopaque) callconv(.c) c_int {
 fn nativePumpEvents(_: ?*anyopaque) callconv(.c) u32 {
     if (comptime builtin.target.os.tag != .macos) return 0;
     return rosette_macho_native_window_pump_events();
+}
+
+/// The main thread's park service: drain AppKit requests other threads
+/// dispatched to it, without taking input events off the queue.
+fn nativeServiceMainThread(_: ?*anyopaque) callconv(.c) u32 {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    return rosette_macho_native_service_main_queue();
 }
 
 fn nativeReadControllerState(_: ?*anyopaque, out: *elf_processor_state.WindowsInputState) callconv(.c) c_int {
@@ -236,11 +245,15 @@ fn windowsAudioHooks(audio_context: ?*anyopaque) elf_processor_state.WindowsAudi
 
 fn windowsGraphicsHooks(native_context: ?*anyopaque) pe64_runtime.GraphicsHooks {
     if (comptime builtin.target.os.tag != .macos) return .{};
+    // A guest worker that needs AppKit waits on the main thread; the hook
+    // lets the processor wake the main thread's park and record the wait.
+    rosette_macho_native_set_main_thread_request_hook(elf_processor_state.mainThreadRequestHook);
     return .{
         .ensure_application = nativeEnsureApplication,
         .ensure_window = nativeEnsureWindow,
         .show_window = nativeShowWindow,
         .pump_events = nativePumpEvents,
+        .service_main_thread = nativeServiceMainThread,
         .native_context = native_context,
         .native_presenter_start = nativePresenterStart,
         .native_presenter_stage = nativePresenterStage,
