@@ -25,6 +25,7 @@ pub fn build(b: *std.Build) void {
     helper_mod.addObjectFile(compileCObject(
         b,
         target,
+        optimize,
         b.path("../../src/graphics/common/debug_runtime.c"),
         "debug_runtime.o",
         arch_flags,
@@ -32,10 +33,37 @@ pub fn build(b: *std.Build) void {
     helper_mod.addObjectFile(compileCObject(
         b,
         target,
+        optimize,
         b.path("../../src/graphics/CLI/window_main.c"),
         "window_main_cli.o",
         arch_flags,
     ));
+    if (is_macos) {
+        // The Windows-target route still runs on the macOS host.  Give the
+        // Rosetta runner the same native Cocoa/Metal ownership boundary as
+        // the Mach-O processor so CreateWindowEx/ShowWindow can produce a
+        // real host window without changing the inspected Windows tree.
+        helper_mod.addObjectFile(compileCObject(
+            b,
+            target,
+            optimize,
+            b.path("../../lib/Mach-O/native_window_bridge.m"),
+            "windows_route_native_window_bridge.o",
+            &[_][]const u8{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
+        ));
+        helper_mod.addObjectFile(compileCObject(
+            b,
+            target,
+            optimize,
+            b.path("../../lib/Mach-O/native_audio_bridge.m"),
+            "windows_route_native_audio_bridge.o",
+            &[_][]const u8{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
+        ));
+        helper_mod.linkFramework("AppKit", .{});
+        helper_mod.linkFramework("QuartzCore", .{});
+        helper_mod.linkFramework("Metal", .{});
+        helper_mod.linkFramework("AudioToolbox", .{});
+    }
     const app_bundle_parser_mod = b.createModule(.{
         .root_source_file = b.path("../../src/tooling/app_parser/bundle_parser.zig"),
         .target = target,
@@ -82,6 +110,76 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    const phrase_filter_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/common/text/phrase-filter/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const xenia_fatal_condition_map_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/common/xenia/fatal-condition-map/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    xenia_fatal_condition_map_module.addImport("phrase_filter", phrase_filter_module);
+    // Whether a Xenia warning-level line is a finding at all.
+    const xenia_warning_severity_map_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/common/xenia/warning-severity-map/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    xenia_warning_severity_map_module.addImport("phrase_filter", phrase_filter_module);
+    // What a Xenia symbol name means, so a report can say what the guest is
+    // doing at an address rather than only where it is.
+    const xenia_guest_frontier_map_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/common/xenia/guest-frontier-map/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // What a Vulkan command can put into the image it targets, so a frame
+    // built only from clears is never counted as a frame with a picture.
+    const windows_frame_content_contract_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/common/rosette/frame-content-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // The ELF processor's terminal screen verdict is shared with the native
+    // graphics path; keep the app-bundling route on the same module identity.
+    const windows_screen_validity_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/gpu/screen_validity.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // What a guest address is when no symbol names it.
+    const windows_address_region_map_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/common/rosette/address-region-map/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // What a guest address is, independent of the route that reached it.
+    const xenia_guest_address_map_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/common/xenia/guest-address-map/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // The Xenia functions whose first entry answers a question no counter of
+    // Rosette's own surface can: whether the title ever produced a frame.
+    const xenia_guest_milestone_map_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/common/xenia/guest-milestone-map/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // Xenia's kernel export shims, and the console's export tables they are
+    // joined against. See pkg/common/xenia/kernel-shim-map.
+    const xenia_kernel_shim_map_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/common/xenia/kernel-shim-map/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const xenia_kernel_export_map_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/common/xenia/kernel-export-map/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const compat_source_include_module = b.createModule(.{
         .root_source_file = b.path("../../src/compat/source/include_compat.zig"),
         .target = target,
@@ -104,6 +202,11 @@ pub fn build(b: *std.Build) void {
     });
     const isa_highway_module = b.createModule(.{
         .root_source_file = b.path("../../ISA/highway.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const isa_decode_module = b.createModule(.{
+        .root_source_file = b.path("../../ISA/decode/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -180,19 +283,43 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    const decoder_flags_module = b.createModule(.{
+        .root_source_file = b.path("../../src/x64-ASM/flags.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const decoder_cpu_state_module = b.createModule(.{
+        .root_source_file = b.path("../../src/x64-ASM/cpu_state.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    decoder_cpu_state_module.addImport("flags", decoder_flags_module);
+    const decoder_bit_test_module = b.createModule(.{
+        .root_source_file = b.path("../../src/x64-ASM/bit_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    decoder_bit_test_module.addImport("flags", decoder_flags_module);
+    const decoder_capabilities_module = b.createModule(.{
+        .root_source_file = b.path("../../src/x64-ASM/capabilities.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const x64_decoder_module = b.createModule(.{
         .root_source_file = b.path("../../ISA/decoding/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     x64_decoder_module.addImport("isa_highway", isa_highway_module);
+    x64_decoder_module.addImport("isa_decode", isa_decode_module);
+    x64_decoder_module.addImport("isa_registry", isa_module);
+    x64_decoder_module.addImport("runtime_abi_handshake", runtime_abi_module);
+    x64_decoder_module.addImport("flags", decoder_flags_module);
+    x64_decoder_module.addImport("cpu_state", decoder_cpu_state_module);
+    x64_decoder_module.addImport("bit_test", decoder_bit_test_module);
+    x64_decoder_module.addImport("capabilities", decoder_capabilities_module);
     const x64_interpreter_module = b.createModule(.{
         .root_source_file = b.path("../../src/x64-ASM/interpreter.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const macho_runtime_module = b.createModule(.{
-        .root_source_file = b.path("../../src/x64-ASM/macho_runtime.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -206,12 +333,213 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-
-    const contract_module = b.createModule(.{
-        .root_source_file = b.path("../../lib/Contract/root.zig"),
+    const pe_execution_history_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/runtime/execution-history/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    const pe_evex_runtime_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/runtime/process-core/evex.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pe_evex_runtime_module.addImport("x64_decoder", x64_decoder_module);
+    pe_evex_runtime_module.addImport("exit_diagnostics", exit_diagnostics_module);
+    const pe_x86_vector_helpers_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/Mach-O/execution_helpers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pe_x86_vector_helpers_module.addImport("x64_decoder", x64_decoder_module);
+    const native_windows_graphics_module = b.createModule(.{
+        .root_source_file = b.path("../../src/tooling/exe_parser/native_windows_graphics.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    // The audible half of the guest's wave device. Separate from the
+    // graphics companion because the two fail independently and a run has to
+    // be able to say which one it lost.
+    const native_windows_audio_module = b.createModule(.{
+        .root_source_file = b.path("../../src/tooling/exe_parser/native_windows_audio.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const pe_x64_syscalls_module = b.createModule(.{
+        .root_source_file = b.path("../../src/x64-ASM/syscalls.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const tso_memory_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/processor/ELF_processor/tso_memory.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const utf8_codec_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/text/utf8/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // Host-thread parking, the stop-the-world gate and the stall watchdog.
+    const concurrency_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/concurrency/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const parallelism_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/processor/ELF_processor/parallelism/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    parallelism_module.addImport("concurrency", concurrency_module);
+    const windows_runtime_module = b.createModule(.{
+        .root_source_file = b.path("../../src/x64-ASM/windows_runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    windows_runtime_module.addImport("tso_memory", tso_memory_module);
+    windows_runtime_module.addImport("utf8_codec", utf8_codec_module);
+
+    // The Windows import boundary's static facts live in pkg/dll/win32.
+    const dll_win32_return_contract_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/dll/win32/return-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // What a declined Windows DLL would have to gain before Rosette could
+    // serve it.
+    const dll_win32_capability_gap_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/dll/win32/capability-gap/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // The shape every per-DLL package uses to declare one export.
+    const dll_win32_export_contract_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/dll/win32/export-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const dll_win32_library_inventory_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/dll/win32/library-inventory/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const dll_win32_catalogue_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/dll/win32/catalogue/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const dll_win32_package_specs = [_]struct {
+        import_name: []const u8,
+        root_source_file: []const u8,
+    }{
+        .{ .import_name = "dll_win32_advapi32", .root_source_file = "../../pkg/dll/win32/advapi32/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_convert_l1_1_0", .root_source_file = "../../pkg/dll/win32/api-ms-win-crt-convert-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_environment_l1_1_0", .root_source_file = "../../pkg/dll/win32/api-ms-win-crt-environment-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_filesystem_l1_1_0", .root_source_file = "../../pkg/dll/win32/api-ms-win-crt-filesystem-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_heap_l1_1_0", .root_source_file = "../../pkg/dll/win32/api-ms-win-crt-heap-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_locale_l1_1_0", .root_source_file = "../../pkg/dll/win32/api-ms-win-crt-locale-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_math_l1_1_0", .root_source_file = "../../pkg/dll/win32/api-ms-win-crt-math-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_private_l1_1_0", .root_source_file = "../../pkg/dll/win32/api-ms-win-crt-private-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_runtime_l1_1_0", .root_source_file = "../../pkg/dll/win32/api-ms-win-crt-runtime-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_stdio_l1_1_0", .root_source_file = "../../pkg/dll/win32/api-ms-win-crt-stdio-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_string_l1_1_0", .root_source_file = "../../pkg/dll/win32/api-ms-win-crt-string-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_time_l1_1_0", .root_source_file = "../../pkg/dll/win32/api-ms-win-crt-time-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_api_ms_win_crt_utility_l1_1_0", .root_source_file = "../../pkg/dll/win32/api-ms-win-crt-utility-l1-1-0/src/root.zig" },
+        .{ .import_name = "dll_win32_bcrypt", .root_source_file = "../../pkg/dll/win32/bcrypt/src/root.zig" },
+        .{ .import_name = "dll_win32_cfgmgr32", .root_source_file = "../../pkg/dll/win32/cfgmgr32/src/root.zig" },
+        .{ .import_name = "dll_win32_dwmapi", .root_source_file = "../../pkg/dll/win32/dwmapi/src/root.zig" },
+        .{ .import_name = "dll_win32_dxgi", .root_source_file = "../../pkg/dll/win32/dxgi/src/root.zig" },
+        .{ .import_name = "dll_win32_vulkan_1", .root_source_file = "../../pkg/dll/win32/vulkan-1/src/root.zig" },
+        .{ .import_name = "dll_win32_dynamic", .root_source_file = "../../pkg/dll/win32/dynamic/src/root.zig" },
+        .{ .import_name = "dll_win32_gdi32", .root_source_file = "../../pkg/dll/win32/gdi32/src/root.zig" },
+        .{ .import_name = "dll_win32_hid", .root_source_file = "../../pkg/dll/win32/hid/src/root.zig" },
+        .{ .import_name = "dll_win32_imm32", .root_source_file = "../../pkg/dll/win32/imm32/src/root.zig" },
+        .{ .import_name = "dll_win32_kernel32", .root_source_file = "../../pkg/dll/win32/kernel32/src/root.zig" },
+        .{ .import_name = "dll_win32_libusbk", .root_source_file = "../../pkg/dll/win32/libusbk/src/root.zig" },
+        .{ .import_name = "dll_win32_msvcrt", .root_source_file = "../../pkg/dll/win32/msvcrt/src/root.zig" },
+        .{ .import_name = "dll_win32_ole32", .root_source_file = "../../pkg/dll/win32/ole32/src/root.zig" },
+        .{ .import_name = "dll_win32_oleaut32", .root_source_file = "../../pkg/dll/win32/oleaut32/src/root.zig" },
+        .{ .import_name = "dll_win32_setupapi", .root_source_file = "../../pkg/dll/win32/setupapi/src/root.zig" },
+        .{ .import_name = "dll_win32_shcore", .root_source_file = "../../pkg/dll/win32/shcore/src/root.zig" },
+        .{ .import_name = "dll_win32_shell32", .root_source_file = "../../pkg/dll/win32/shell32/src/root.zig" },
+        .{ .import_name = "dll_win32_shlwapi", .root_source_file = "../../pkg/dll/win32/shlwapi/src/root.zig" },
+        .{ .import_name = "dll_win32_user32", .root_source_file = "../../pkg/dll/win32/user32/src/root.zig" },
+        .{ .import_name = "dll_win32_version", .root_source_file = "../../pkg/dll/win32/version/src/root.zig" },
+        .{ .import_name = "dll_win32_winmm", .root_source_file = "../../pkg/dll/win32/winmm/src/root.zig" },
+        .{ .import_name = "dll_win32_winusb", .root_source_file = "../../pkg/dll/win32/winusb/src/root.zig" },
+        .{ .import_name = "dll_win32_wsock32", .root_source_file = "../../pkg/dll/win32/wsock32/src/root.zig" },
+    };
+    for (dll_win32_package_specs) |spec| {
+        const package_mod = b.createModule(.{
+            .root_source_file = b.path(spec.root_source_file),
+            .target = target,
+            .optimize = optimize,
+        });
+        package_mod.addImport("dll_win32_export_contract", dll_win32_export_contract_module);
+        dll_win32_catalogue_module.addImport(spec.import_name, package_mod);
+    }
+    dll_win32_export_contract_module.addImport("dll_win32_return_contract", dll_win32_return_contract_module);
+    dll_win32_catalogue_module.addImport("dll_win32_export_contract", dll_win32_export_contract_module);
+    dll_win32_library_inventory_module.addImport("dll_win32_catalogue", dll_win32_catalogue_module);
+    dll_win32_library_inventory_module.addImport("dll_win32_capability_gap", dll_win32_capability_gap_module);
+    windows_runtime_module.addImport("dll_win32_return_contract", dll_win32_return_contract_module);
+    windows_runtime_module.addImport("dll_win32_library_inventory", dll_win32_library_inventory_module);
+    const pe_x64_linux_runtime_module = b.createModule(.{
+        .root_source_file = b.path("../../src/x64-ASM/linux_runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pe_x64_linux_runtime_module.addImport("x64_syscalls", pe_x64_syscalls_module);
+    pe_x64_linux_runtime_module.addImport("windows_runtime", windows_runtime_module);
+    const pe_x64_guest_abi_module = b.createModule(.{
+        .root_source_file = b.path("../../src/x64-ASM/guest_abi.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const pe_elf_state_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/processor/ELF_processor/process.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pe_elf_state_module.addImport("tso_memory", tso_memory_module);
+    pe_elf_state_module.addImport("concurrency", concurrency_module);
+    pe_elf_state_module.addImport("parallelism", parallelism_module);
+    pe_elf_state_module.addImport("x64_decoder", x64_decoder_module);
+    pe_elf_state_module.addImport("x64_interpreter", x64_interpreter_module);
+    pe_elf_state_module.addImport("x64_linux_runtime", pe_x64_linux_runtime_module);
+    pe_elf_state_module.addImport("x64_syscalls", pe_x64_syscalls_module);
+    pe_elf_state_module.addImport("x64_guest_abi", pe_x64_guest_abi_module);
+    pe_elf_state_module.addImport("exit_diagnostics", exit_diagnostics_module);
+    // The full CLEO root exports the same routing surface used by the ELF
+    // processor. Reuse it here so the runner has one owner for lib/CLEO files.
+    pe_elf_state_module.addImport("cleo_routing", cleo_module);
+    pe_elf_state_module.addImport("execution_history", pe_execution_history_module);
+    pe_elf_state_module.addImport("evex_runtime", pe_evex_runtime_module);
+    pe_elf_state_module.addImport("x86_vector_helpers", pe_x86_vector_helpers_module);
+    pe_elf_state_module.addImport("xenia_fatal_condition_map", xenia_fatal_condition_map_module);
+    pe_elf_state_module.addImport("xenia_guest_frontier_map", xenia_guest_frontier_map_module);
+    pe_elf_state_module.addImport("xenia_warning_severity_map", xenia_warning_severity_map_module);
+    pe_elf_state_module.addImport("xenia_guest_milestone_map", xenia_guest_milestone_map_module);
+    pe_elf_state_module.addImport("xenia_kernel_shim_map", xenia_kernel_shim_map_module);
+    pe_elf_state_module.addImport("xenia_kernel_export_map", xenia_kernel_export_map_module);
+    pe_elf_state_module.addImport("xenia_guest_address_map", xenia_guest_address_map_module);
+    pe_elf_state_module.addImport("frame_content_contract", windows_frame_content_contract_module);
+    pe_elf_state_module.addImport("screen_validity", windows_screen_validity_module);
+    pe_elf_state_module.addImport("address_region_map", windows_address_region_map_module);
+
+    const pe64_runtime_test_module = b.createModule(.{
+        .root_source_file = b.path("../../src/tooling/exe_parser/pe64_runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pe64_runtime_test_module.addImport("x64_decoder", x64_decoder_module);
+    pe64_runtime_test_module.addImport("elf_processor_state", pe_elf_state_module);
+    pe64_runtime_test_module.addImport("windows_runtime", windows_runtime_module);
+    pe64_runtime_test_module.addImport("evex_runtime", pe_evex_runtime_module);
+    pe64_runtime_test_module.addImport("cleo_routing", cleo_module);
+    pe64_runtime_test_module.addImport("x86_vector_helpers", pe_x86_vector_helpers_module);
 
     runtime_abi_module.addImport("abort_trap_taxonomy", abort_trap_taxonomy_module);
     runtime_abi_module.addImport("entrypoint_code_text_segment", entrypoint_code_text_segment_module);
@@ -268,6 +596,14 @@ pub fn build(b: *std.Build) void {
     exe_runner_mod.addImport("x86_asm", x86_asm_module);
     exe_runner_mod.addImport("x86_disasm", x86_disasm_module);
     exe_runner_mod.addImport("x86_trace_logger", x86_trace_logger_module);
+    exe_runner_mod.addImport("x64_decoder", x64_decoder_module);
+    exe_runner_mod.addImport("elf_processor_state", pe_elf_state_module);
+    exe_runner_mod.addImport("windows_runtime", windows_runtime_module);
+    exe_runner_mod.addImport("evex_runtime", pe_evex_runtime_module);
+    exe_runner_mod.addImport("cleo_routing", cleo_module);
+    exe_runner_mod.addImport("x86_vector_helpers", pe_x86_vector_helpers_module);
+    exe_runner_mod.addImport("native_windows_graphics", native_windows_graphics_module);
+    exe_runner_mod.addImport("native_windows_audio", native_windows_audio_module);
     exe_runner_cli_mod.addImport("runtime_abi_handshake", runtime_abi_module);
     exe_runner_cli_mod.addImport("abort_trap_taxonomy", abort_trap_taxonomy_module);
     exe_runner_cli_mod.addImport("entrypoint_code_text_segment", entrypoint_code_text_segment_module);
@@ -285,6 +621,14 @@ pub fn build(b: *std.Build) void {
     exe_runner_cli_mod.addImport("x86_asm", x86_asm_module);
     exe_runner_cli_mod.addImport("x86_disasm", x86_disasm_module);
     exe_runner_cli_mod.addImport("x86_trace_logger", x86_trace_logger_module);
+    exe_runner_cli_mod.addImport("x64_decoder", x64_decoder_module);
+    exe_runner_cli_mod.addImport("elf_processor_state", pe_elf_state_module);
+    exe_runner_cli_mod.addImport("windows_runtime", windows_runtime_module);
+    exe_runner_cli_mod.addImport("evex_runtime", pe_evex_runtime_module);
+    exe_runner_cli_mod.addImport("cleo_routing", cleo_module);
+    exe_runner_cli_mod.addImport("x86_vector_helpers", pe_x86_vector_helpers_module);
+    exe_runner_cli_mod.addImport("native_windows_graphics", native_windows_graphics_module);
+    exe_runner_cli_mod.addImport("native_windows_audio", native_windows_audio_module);
     helper_mod.addImport("exe_runner", exe_runner_cli_mod);
 
     const helper = b.addExecutable(.{
@@ -341,45 +685,171 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const macho_processor_mod = b.createModule(.{
-        .root_source_file = b.path("../../lib/Mach-O/main.zig"),
+
+    // The Windows PE route reuses the real Vulkan guest forwarder that already
+    // powers the Mach-O path. Keep this graph local to the app build: the PE
+    // executor only sees the callback seam, while the host-side companion owns
+    // the heavier dyld/GPU forwarding implementation.
+    const windows_event_log_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/runtime/event-log/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const windows_device_tree_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/device_tree/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // Shared with the guest-ABI window runtime so the forwarder and the
+    // runtime describe the same AppKit geometry layout.
+    const windows_window_geometry_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/gpu/window_geometry.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const windows_gpu_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/gpu/windows_forwarder_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    windows_gpu_module.addImport("device_tree", windows_device_tree_module);
+    windows_gpu_module.addImport("window_geometry", windows_window_geometry_module);
+    windows_gpu_module.addImport("frame_content_contract", windows_frame_content_contract_module);
+    windows_gpu_module.addImport("screen_validity", windows_screen_validity_module);
+
+    const windows_ppc_decode_module = b.createModule(.{
+        .root_source_file = b.path("../../ISA/ppc/decode/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const windows_arm64_encode_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/compiler/arm64/encode.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const windows_ppc_routing_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/PPC/xenia/runtime/instruction-routing/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const windows_ppc_runtime_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/runtime/ppc/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    const macho_processor = b.addExecutable(.{
-        .name = "macho_processor",
-        .root_module = macho_processor_mod,
+    windows_ppc_runtime_module.addImport("ppc_decode", windows_ppc_decode_module);
+    windows_ppc_runtime_module.addImport("arm64_encode", windows_arm64_encode_module);
+    windows_ppc_runtime_module.addImport("ppc_instruction_routing", windows_ppc_routing_module);
+    // The PE64 route's x86-64 block translator emits through the same encoder
+    // and maps its code memory through libc.
+    windows_arm64_encode_module.link_libc = true;
+    pe_elf_state_module.addImport("arm64_encode", windows_arm64_encode_module);
+
+    const windows_ppc_host_abi_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/common/abi/rosette-ppc-host/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
     });
-    macho_processor_mod.addImport("x64_decoder", x64_decoder_module);
-    macho_processor_mod.addImport("x64_interpreter", x64_interpreter_module);
-    macho_processor_mod.addImport("macho_runtime", macho_runtime_module);
-    macho_processor_mod.addImport("exit_diagnostics", exit_diagnostics_module);
-    macho_processor_mod.addImport("contract", contract_module);
-    macho_processor_mod.addImport("macho_compat_runtime", macho_compat_runtime_module);
-    macho_processor_mod.addImport("scheduler", scheduler_module);
+    const windows_heap_range_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/ARM64/xenia/memory/heap-range/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const windows_application_framework_contract_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/common/application-framework-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const windows_launch_assist_contract_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/common/xenia/launch-assist-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const windows_host_gpu_callback_contract_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/common/xenia/host-gpu-callback-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const windows_macos_host_contract_module = b.createModule(.{
+        .root_source_file = b.path("../../pkg/common/rosette/macos-host-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const windows_application_framework_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/framework/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    windows_application_framework_module.addImport("application_framework_contract", windows_application_framework_contract_module);
+    windows_application_framework_module.addImport("xenia_launch_assist_contract", windows_launch_assist_contract_module);
+    windows_application_framework_module.addImport("xenia_host_gpu_callback_contract", windows_host_gpu_callback_contract_module);
+
+    // The executing guest thread's registers for code that runs on its
+    // behalf; see lib/guest_context/README.md.
+    const windows_guest_context_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/guest_context/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const windows_dyld_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/linker/dyld/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    windows_dyld_module.addImport("guest_context", windows_guest_context_module);
+    windows_dyld_module.addImport("macho_compat_runtime", macho_compat_runtime_module);
+    windows_dyld_module.addImport("gpu", windows_gpu_module);
+    windows_dyld_module.addImport("event_log", windows_event_log_module);
+    windows_dyld_module.addImport("scheduler", scheduler_module);
+    windows_dyld_module.addImport("xenia_heap_range", windows_heap_range_module);
+    windows_dyld_module.addImport("rosette_ppc_host_abi", windows_ppc_host_abi_module);
+    windows_dyld_module.addImport("ppc_runtime", windows_ppc_runtime_module);
+    windows_dyld_module.addImport("application_framework", windows_application_framework_module);
+    windows_dyld_module.addImport("xenia_launch_assist_contract", windows_launch_assist_contract_module);
+    windows_dyld_module.addImport("xenia_host_gpu_callback_contract", windows_host_gpu_callback_contract_module);
+    windows_dyld_module.addImport("rosette_macos_host_contract", windows_macos_host_contract_module);
+
+    const windows_guest_forwarder_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/gpu/vulkan/windows_guest_forwarder.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    windows_guest_forwarder_module.addImport("gpu", windows_gpu_module);
+    windows_guest_forwarder_module.addImport("dyld", windows_dyld_module);
+    windows_guest_forwarder_module.addImport("guest_context", windows_guest_context_module);
+    windows_guest_forwarder_module.addImport("dll_win32_catalogue", dll_win32_catalogue_module);
+    native_windows_graphics_module.addImport("gpu", windows_gpu_module);
+    native_windows_graphics_module.addImport("windows_guest_forwarder", windows_guest_forwarder_module);
+    // The full Mach-O processor is assembled by build/build.zig. This app
+    // build used to carry a second, incomplete dependency graph here; as the
+    // processor gained its GPU/runtime modules that copy stopped compiling and
+    // could also leave the app bundle with a different processor than the
+    // shell-installed artifact. shell-helper-build (the Makefile prerequisite
+    // for app-wrapper) builds the canonical binary before this install step.
+
     if (is_macos) {
-        macho_processor_mod.addObjectFile(compileCObject(
+        exe_runner_mod.addObjectFile(compileCObject(
             b,
             target,
+            optimize,
             b.path("../../lib/Mach-O/native_window_bridge.m"),
-            "macho_native_window_bridge.o",
+            "standalone_windows_route_native_window_bridge.o",
             &[_][]const u8{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
         ));
-        macho_processor_mod.linkFramework("AppKit", .{});
-        macho_processor_mod.linkFramework("QuartzCore", .{});
-        macho_processor_mod.linkFramework("Metal", .{});
+        exe_runner_mod.addObjectFile(compileCObject(
+            b,
+            target,
+            optimize,
+            b.path("../../lib/Mach-O/native_audio_bridge.m"),
+            "standalone_windows_route_native_audio_bridge.o",
+            &[_][]const u8{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
+        ));
+        exe_runner_mod.linkFramework("AppKit", .{});
+        exe_runner_mod.linkFramework("QuartzCore", .{});
+        exe_runner_mod.linkFramework("Metal", .{});
+        exe_runner_mod.linkFramework("AudioToolbox", .{});
     }
-    b.installArtifact(macho_processor);
-
-    // Add WinForms native Cocoa bridge to the exe runner module
-    // Temporarily disabled to debug hang
-    // exe_runner_mod.addCSourceFile(.{
-    //     .file = b.path("../../include/winforms/winforms_native.m"),
-    //     .flags = &.{ "-fobjc-arc", "-Wall", "-Wextra" },
-    // });
-    // exe_runner_mod.linkFramework("Cocoa", .{});
-    // exe_runner_mod.linkFramework("Foundation", .{});
 
     const standalone_runner = b.addExecutable(.{
         .name = "rosette_exe_runner",
@@ -397,6 +867,8 @@ pub fn build(b: *std.Build) void {
     {
         const helper_test = b.addTest(.{ .root_module = helper_mod });
         check_step.dependOn(&helper_test.step);
+        const pe64_runtime_test = b.addTest(.{ .root_module = pe64_runtime_test_module });
+        check_step.dependOn(&b.addRunArtifact(pe64_runtime_test).step);
     }
 
     // Native Cocoa shell launched by Finder.
@@ -408,6 +880,7 @@ pub fn build(b: *std.Build) void {
     app_mod.addObjectFile(compileCObject(
         b,
         target,
+        optimize,
         b.path("src/RosetteApp.m"),
         "RosetteApp.o",
         if (is_macos)
@@ -477,13 +950,24 @@ pub fn build(b: *std.Build) void {
     compat_router_install.step.dependOn(&compat_router.step);
     bundle_step.dependOn(&compat_router_install.step);
 
-    const macho_processor_install = b.addInstallFileWithDir(
-        macho_processor.getEmittedBin(),
-        .{ .custom = b.fmt("{s}.app/Contents/MacOS", .{app_name}) },
-        "macho_processor",
+    const macho_processor_install = b.addInstallFile(
+        b.path("../../zig-out/bin/macho_processor"),
+        b.fmt("{s}.app/Contents/MacOS/macho_processor", .{app_name}),
     );
-    macho_processor_install.step.dependOn(&macho_processor.step);
     bundle_step.dependOn(&macho_processor_install.step);
+
+    // These companions are built by shell-update's canonical runtime gate.
+    // Give them real file inputs/install steps: old, unmanaged copies in an
+    // existing .app must not survive an otherwise successful bundle refresh.
+    const runtime_companions = [_]struct { source: []const u8, name: []const u8 }{
+        .{ .source = "../../zig-out/bin/elf_processor", .name = "elf_processor" },
+        .{ .source = "../../zig-out/lib/rosette-exec.dylib", .name = "rosette-exec.dylib" },
+        .{ .source = "../../zig-out/lib/avx-shim.dylib", .name = "avx-shim.dylib" },
+    };
+    for (runtime_companions) |companion| {
+        const install = b.addInstallFile(b.path(companion.source), b.fmt("{s}.app/Contents/MacOS/{s}", .{ app_name, companion.name }));
+        bundle_step.dependOn(&install.step);
+    }
 
     const exe_runner_install = b.addInstallFileWithDir(
         standalone_runner.getEmittedBin(),
@@ -603,9 +1087,17 @@ pub fn build(b: *std.Build) void {
     bundle_step.dependOn(&pkg_info_install.step);
 }
 
+/// Compile one C/Objective-C source into an object the Zig link can take.
+///
+/// `zig cc` with no flags is `-O0` with UBSan instrumentation that *calls*
+/// `__ubsan_handle_*`. A Debug Zig link happens to provide those symbols, so
+/// the omission was invisible; a ReleaseFast link does not, and the runner
+/// would not link at all. Both halves are decided here so the C side follows
+/// the Zig side's optimize mode instead of silently staying at -O0.
 fn compileCObject(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
     source: std.Build.LazyPath,
     output_name: []const u8,
     flags: []const []const u8,
@@ -615,6 +1107,15 @@ fn compileCObject(
         compile.addArg("-target");
         compile.addArg(target.result.zigTriple(b.allocator) catch @panic("OOM"));
     }
+    compile.addArg(switch (optimize) {
+        .Debug => "-O0",
+        .ReleaseSafe, .ReleaseFast => "-O2",
+        .ReleaseSmall => "-Os",
+    });
+    // The Zig modules keep their own safety settings; these bridges are
+    // AppKit and CoreAudio glue, and their UBSan calls are what break the
+    // release link.
+    compile.addArg("-fno-sanitize=undefined");
     compile.addArgs(flags);
     compile.addPrefixedDirectoryArg("-I", b.path("../../include"));
     compile.addArg("-c");
