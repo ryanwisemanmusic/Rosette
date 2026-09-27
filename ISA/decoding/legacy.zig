@@ -955,6 +955,23 @@ test "Group1 full-width register immediates keep their immediate width" {
     try std.testing.expectEqual(Size.bits8, byte_alias.size);
 }
 
+test "FF group indirect calls preserve the REX.B register and FS-prefixed form" {
+    const call_r14 = decodeLegacyInstruction(&[_]u8{ 0x41, 0xFF, 0xD6 }, .long64);
+    try std.testing.expectEqual(Op.call_reg64, call_r14.op);
+    try std.testing.expectEqual(RegId.r14b_r14w_r14d_r14, call_r14.dst_reg);
+    try std.testing.expect(call_r14.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 3), call_r14.len);
+
+    // This is the byte sequence Rosette observed in the Xenia UI image at
+    // RunMainMessageLoop+0x3b. With 0x65 as a segment override instead of a
+    // REX prefix, FF /2 remains CALL r/m64 and ModRM D6 names RSI.
+    const call_rsi = decodeLegacyInstruction(&[_]u8{ 0x65, 0xFF, 0xD6 }, .long64);
+    try std.testing.expectEqual(Op.call_reg64, call_rsi.op);
+    try std.testing.expectEqual(RegId.dh_si_esi_rsi, call_rsi.dst_reg);
+    try std.testing.expect(call_rsi.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 3), call_rsi.len);
+}
+
 test "TEST register and memory forms preserve the decoded operand width" {
     const byte_register = decodeLegacyInstruction(&[_]u8{ 0x84, 0xC0 }, .long64);
     try std.testing.expectEqual(Op.test_reg8_reg8, byte_register.op);
@@ -1615,7 +1632,7 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
         },
 
         0x86, 0x87 => {
-            return decodeXchgRmReg(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode);
+            return decodeXchgRmReg(bytes, pos, prefixes, opcode);
         },
 
         0x88, 0x89, 0x8A, 0x8B => {

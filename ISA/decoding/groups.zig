@@ -780,35 +780,47 @@ pub fn decodeTestRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: 
     return d;
 }
 
-pub fn decodeXchgRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, _: u8) DecodedInsn {
+pub fn decodeXchgRmReg(bytes: []const u8, start_pos: usize, prefixes: LegacyPrefixes, opcode: u8) DecodedInsn {
     var d = DecodedInsn{};
     var pos = start_pos + 1;
     if (pos >= bytes.len) return .{};
-    const modrm = bytes[pos];
-    const sz: Size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
-    const is_mem = modrm < 0xC0;
-    const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
+    const is_byte = opcode == 0x86;
+    const sz: Size = if (is_byte) .bits8 else if (prefixes.rexW()) .bits64 else if (prefixes.operand_size_override) .bits16 else .bits32;
+    const operands = decodeModRm(bytes, &pos, prefixes, is_byte) orelse return .{};
     d.size = sz;
+    d.lock = prefixes.lock;
+    d.has_0x67 = prefixes.address_size_override;
 
-    if (is_mem) {
-        // A 66-prefixed exchange is the 32-bit op at 16 bits: every executor
-        // of it reads `d.size`, as the 16-bit XADD already did.
-        d.op = switch (sz) {
-            .bits16, .bits32 => .xchg_mem32_reg32,
-            .bits64 => .xchg_mem64_reg64,
-            else => .invalid,
-        };
-        d.addr = rm.addr;
-        d.src_reg = rm.reg;
-    } else {
-        d.op = switch (sz) {
-            .bits16, .bits32 => .xchg_reg32_reg32,
-            .bits64 => .xchg_reg64_reg64,
-            else => .invalid,
-        };
-        d.dst_reg = addressing.rmRegister(rm.addr);
-        d.src_reg = rm.reg;
-        d.is_reg_form = true;
+    switch (operands.rm) {
+        .memory => |memory| {
+            d.op = switch (sz) {
+                .bits8 => .xchg_mem8_reg8,
+                .bits16, .bits32 => .xchg_mem32_reg32,
+                .bits64 => .xchg_mem64_reg64,
+            };
+            d.src_reg = operands.reg.id;
+            d.src_high8 = operands.reg.high8;
+            d.addr = memory.displacement;
+            d.sib_has_index = memory.has_index;
+            d.sib_index_reg = memory.index_reg;
+            d.sib_scale = memory.scale;
+            d.sib_has_base = memory.has_base;
+            d.sib_base_reg = memory.base_reg;
+            d.rip_relative = memory.rip_relative;
+            d.segment = memory.segment;
+        },
+        .register => |rm| {
+            d.op = switch (sz) {
+                .bits8 => .xchg_reg8_reg8,
+                .bits16, .bits32 => .xchg_reg32_reg32,
+                .bits64 => .xchg_reg64_reg64,
+            };
+            d.dst_reg = rm.id;
+            d.dst_high8 = rm.high8;
+            d.src_reg = operands.reg.id;
+            d.src_high8 = operands.reg.high8;
+            d.is_reg_form = true;
+        },
     }
 
     d.len = @as(u8, @intCast(pos));
