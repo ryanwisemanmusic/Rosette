@@ -212,6 +212,7 @@ pub const Instruction = struct {
     base_reg: ?x64_decoder.RegId = null,
     index_reg: ?x64_decoder.RegId = null,
     displacement: u64 = 0,
+    branch_target: ?u64 = null,
     rip_relative: bool = false,
 };
 
@@ -258,15 +259,48 @@ pub const Listing = struct {
     pub fn hasBackwardBranch(self: *const Listing) bool {
         for (self.slice()) |instruction| {
             if (!isBranch(instruction.op)) continue;
-            // A backward branch inside the window: the target is encoded as a
-            // displacement from the next instruction, which the decoder has
-            // already folded into `addr` for relative forms.
-            const target = instruction.displacement;
+            // `disassemble` resolves relative displacement against the next
+            // instruction. A raw signed displacement is not an address and
+            // cannot be compared with the sampled window.
+            const target = instruction.branch_target orelse continue;
             if (target != 0 and target <= instruction.address and target >= self.instructions[0].address) return true;
         }
         return false;
     }
 };
+
+/// What the sampled instruction-pointer window proves about control flow.
+/// A repeated RIP is useful evidence, but a one-instruction snapshot cannot
+/// show whether the guest branched back, retried a faulting instruction, or
+/// was interrupted between samples. Keep those claims separate.
+pub const LoopEvidence = enum {
+    no_code_decoded,
+    one_instruction_window,
+    no_backedge_in_sampled_window,
+    backward_branch_observed,
+};
+
+pub fn loopEvidence(listing: *const Listing) LoopEvidence {
+    if (listing.count == 0) return .no_code_decoded;
+    if (listing.hasBackwardBranch()) return .backward_branch_observed;
+    if (listing.count == 1) return .one_instruction_window;
+    return .no_backedge_in_sampled_window;
+}
+
+/// Address-space catalog membership and guest-readable backing are separate
+/// facts. A guest pointer may be readable from the primary mapping while its
+/// owner has not yet registered a descriptive region for it.
+pub const MemoryBacking = enum {
+    registered_readable,
+    registered_unreadable,
+    readable_unregistered,
+    unreadable_unregistered,
+};
+
+pub fn classifyMemoryBacking(readable: bool, registered_region: bool) MemoryBacking {
+    if (registered_region) return if (readable) .registered_readable else .registered_unreadable;
+    return if (readable) .readable_unregistered else .unreadable_unregistered;
+}
 
 /// Whether this instruction transfers control.
 ///
@@ -277,7 +311,7 @@ fn isBranch(op: x64_decoder.Op) bool {
     const name = @tagName(op);
     return std.mem.startsWith(u8, name, "jmp_") or
         std.mem.startsWith(u8, name, "jcc_") or
-        std.mem.startsWith(u8, name, "call_");
+        std.mem.startsWith(u8, name, "loop_");
 }
 
 /// Whether a decoded instruction's `addr` field is a branch target rather
@@ -334,6 +368,7 @@ pub fn disassemble(
             .length = decoded.len,
             .op = decoded.op,
             .displacement = decoded.addr,
+            .branch_target = if (addressFieldIsBranchTarget(decoded.op)) address +% @as(u64, decoded.len) +% decoded.addr else null,
             .rip_relative = decoded.rip_relative,
         };
         if (!decoded.is_reg_form and !addressFieldIsBranchTarget(decoded.op)) {
@@ -440,10 +475,10 @@ test "the two-gigabyte span that read as two pages" {
 }
 
 test "a polling loop names the address it is polling" {
-    // cmp dword ptr [rbx+0x10], 0 ; jne -7   -- the shape of every poll.
+    // cmp dword ptr [rbx+0x10], 0 ; jne -6   -- the shape of every poll.
     const code = [_]u8{
         0x83, 0x7B, 0x10, 0x00, // cmpl $0x0, 0x10(%rbx)
-        0x75, 0xF9, // jne .-7
+        0x75, 0xFA, // jne .-6
     };
     var memory = TestMemory{ .base = 0xA0026000, .bytes = &code };
     var regs = std.mem.zeroes(x64_decoder.Regs);
@@ -460,6 +495,25 @@ test "a polling loop names the address it is polling" {
     try std.testing.expectEqual(@as(usize, 1), count);
     try std.testing.expectEqual(@as(u64, 0x40004C00), touched[0]);
     try std.testing.expectEqual(x64_decoder.RegId.bl_bx_ebx_rbx, listing.instructions[0].base_reg.?);
+    try std.testing.expectEqual(LoopEvidence.backward_branch_observed, loopEvidence(&listing));
+}
+
+test "one sampled instruction is not proof of a branch loop" {
+    var listing = Listing{};
+    listing.instructions[0] = .{ .address = 0x1000, .length = 4, .op = .mov_reg64_mem64 };
+    listing.count = 1;
+    try std.testing.expectEqual(LoopEvidence.one_instruction_window, loopEvidence(&listing));
+
+    listing.instructions[1] = .{ .address = 0x1004, .length = 2, .op = .jcc_rel8, .branch_target = 0x1000 };
+    listing.count = 2;
+    try std.testing.expectEqual(LoopEvidence.backward_branch_observed, loopEvidence(&listing));
+}
+
+test "readable memory without a recorded region is not called unmapped" {
+    try std.testing.expectEqual(MemoryBacking.registered_readable, classifyMemoryBacking(true, true));
+    try std.testing.expectEqual(MemoryBacking.registered_unreadable, classifyMemoryBacking(false, true));
+    try std.testing.expectEqual(MemoryBacking.readable_unregistered, classifyMemoryBacking(true, false));
+    try std.testing.expectEqual(MemoryBacking.unreadable_unregistered, classifyMemoryBacking(false, false));
 }
 
 test "a window that will not decode says where it stopped" {

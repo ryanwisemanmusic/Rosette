@@ -142,6 +142,7 @@ pub const Census = struct {
     forwarder_calls: u64 = 0,
     /// The furthest boot phase any entered export places the title in.
     furthest_phase: shim_map.BootPhase = .no_kernel_contact,
+    phase_lock: std.atomic.Value(bool) = .init(false),
     /// The slot of the most recent shim entry, plus one. Zero means none.
     last_slot: u32 = 0,
     last_step: u64 = 0,
@@ -240,6 +241,30 @@ pub const Census = struct {
     /// On the interpreter's call path. Returns the slot index plus one when
     /// it was a shim, so the caller can attribute it to a thread without a
     /// second lookup, and zero otherwise.
+    /// Read-only membership probe used before taking the process-wide runtime
+    /// mutation lock. The armed address set is immutable once guest execution
+    /// starts; hit counters are only written by `note` under that lock.
+    pub fn contains(self: *const Census, address: u64) bool {
+        if (self.slots.len == 0 or address < self.low or address > self.high) return false;
+        var index = indexOf(address);
+        var probes: usize = 0;
+        while (probes < slot_count) : (probes += 1) {
+            const slot = &self.slots[index];
+            if (slot.address == 0) return false;
+            if (slot.address == address) return true;
+            index = (index + 1) & @as(usize, slot_mask);
+        }
+        return false;
+    }
+
+    /// Count one entry into an armed shim and return its slot plus one.
+    ///
+    /// Every guest thread's kernel calls pass here, in parallel mode from
+    /// their own host threads, so the counters move atomically and no lock is
+    /// taken: the slot table never changes after arming. A lock per call put
+    /// every kernel call of every title thread - RtlEnterCriticalSection and
+    /// RtlLeaveCriticalSection run thousands of times a frame - through the
+    /// runtime mutex.
     pub fn note(self: *Census, address: u64, step: u64) u32 {
         if (self.slots.len == 0) return 0;
         if (address < self.low or address > self.high) return 0;
@@ -249,33 +274,37 @@ pub const Census = struct {
             const slot = &self.slots[index];
             if (slot.address == 0) return 0;
             if (slot.address == address) {
-                const first = slot.hits == 0;
-                slot.hits +|= 1;
-                slot.last_step = step;
+                const previous_hits = @atomicRmw(u64, &slot.hits, .Add, 1, .monotonic);
+                @atomicStore(u64, &slot.last_step, step, .monotonic);
                 if (slot.kind == .shim) {
                     // The forwarder is reached from its own trampoline, never
                     // from the guest. Counting it in the totals would report
                     // two kernel calls for one.
-                    self.forwarder_calls +|= 1;
+                    _ = @atomicRmw(u64, &self.forwarder_calls, .Add, 1, .monotonic);
                     return @intCast(index + 1);
                 }
-                if (first) {
-                    slot.first_step = step;
-                    self.distinct_entered += 1;
-                    if (slot.phase) |phase| {
-                        if (@intFromEnum(phase) > @intFromEnum(self.furthest_phase)) {
-                            self.furthest_phase = phase;
-                        }
-                    }
+                if (previous_hits == 0) {
+                    // Exactly one caller sees the first hit of a slot.
+                    @atomicStore(u64, &slot.first_step, step, .monotonic);
+                    _ = @atomicRmw(u32, &self.distinct_entered, .Add, 1, .monotonic);
+                    if (slot.phase) |phase| self.raiseFurthestPhase(phase);
                 }
-                self.total_calls +|= 1;
-                self.last_slot = @intCast(index + 1);
-                self.last_step = step;
+                _ = @atomicRmw(u64, &self.total_calls, .Add, 1, .monotonic);
+                @atomicStore(u32, &self.last_slot, @intCast(index + 1), .monotonic);
+                @atomicStore(u64, &self.last_step, step, .monotonic);
                 return @intCast(index + 1);
             }
             index = (index + 1) & @as(usize, slot_mask);
         }
         return 0;
+    }
+
+    /// First entries are rare (one per export per run), so the furthest
+    /// phase takes a spin lock of its own rather than an atomic enum.
+    fn raiseFurthestPhase(self: *Census, phase: shim_map.BootPhase) void {
+        while (self.phase_lock.swap(true, .acquire)) std.atomic.spinLoopHint();
+        defer self.phase_lock.store(false, .release);
+        if (@intFromEnum(phase) > @intFromEnum(self.furthest_phase)) self.furthest_phase = phase;
     }
 
     /// O(1) lookup of an armed export by entry address without changing its
@@ -587,6 +616,8 @@ test "a trampoline is armed once and counted from the call path" {
     try testing.expectEqual(@as(u32, 1), census.armed);
     try testing.expectEqual(@as(u32, 1), census.armed_trampolines);
     try testing.expect(census.isArmed("VdQueryVideoMode"));
+    try testing.expect(census.contains(0x1409cb000));
+    try testing.expect(!census.contains(0x1409cb008));
 
     try testing.expectEqual(@as(u32, 0), census.note(0x1409cb008, 10));
     try testing.expectEqual(@as(u64, 0), census.total_calls);
@@ -815,6 +846,7 @@ test "an empty census answers every question without allocating" {
     var census = Census{};
     defer census.deinit(testing.allocator);
     try testing.expectEqual(@as(u32, 0), census.note(0x140000000, 1));
+    try testing.expect(!census.contains(0x140000000));
     try testing.expectEqual(@as(?*const Slot, null), census.busiest());
     try testing.expectEqual(@as(?*const Slot, null), census.nthLatestFirstEntry(0));
     try testing.expectEqual(@as(?*const Slot, null), census.slotAt(0));

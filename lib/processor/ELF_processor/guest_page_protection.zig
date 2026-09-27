@@ -49,6 +49,7 @@ pub const window_end: u64 = @as(u64, chunk_count) << chunk_shift;
 const pages_per_chunk: usize = @as(usize, 1) << (chunk_shift - page_shift);
 const pages_per_word: usize = 32;
 pub const words_per_chunk: usize = pages_per_chunk / pages_per_word;
+const Word = std.atomic.Value(u64);
 
 /// What an access to a page is allowed to do.
 ///
@@ -110,12 +111,26 @@ pub const SetOutcome = struct {
     allocation_failed: bool = false,
 };
 
+pub const Stats = struct {
+    no_access_pages: u64 = 0,
+    read_only_pages: u64 = 0,
+    requests: u64 = 0,
+    requests_outside_window: u64 = 0,
+    allocation_failures: u64 = 0,
+};
+
 pub const Table = struct {
     /// True while any page is restricted. The interpreter tests this single
     /// byte before anything else, so a process that never protects a page
     /// pays one load per memory operand and nothing more.
-    active: bool = false,
-    leaves: [chunk_count]?*[words_per_chunk]u64 = [_]?*[words_per_chunk]u64{null} ** chunk_count,
+    active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Leaf pointers are published atomically so an access can read the
+    /// table without taking the writer lock. The memory remains alive until
+    /// `deinit` closes the table and drains active readers.
+    leaves: [chunk_count]std.atomic.Value(usize) = [_]std.atomic.Value(usize){std.atomic.Value(usize).init(0)} ** chunk_count,
+    mutation_mutex: std.atomic.Mutex = .unlocked,
+    readers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    closing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     restricted_in_chunk: [chunk_count]u32 = [_]u32{0} ** chunk_count,
     no_access_pages: u64 = 0,
     read_only_pages: u64 = 0,
@@ -124,24 +139,76 @@ pub const Table = struct {
     allocation_failures: u64 = 0,
 
     pub fn deinit(self: *Table, allocator: std.mem.Allocator) void {
+        self.lock();
+        self.closing.store(true, .seq_cst);
+        self.active.store(false, .release);
+        self.mutation_mutex.unlock();
+        while (self.readers.load(.seq_cst) != 0) std.atomic.spinLoopHint();
         for (&self.leaves) |*leaf| {
-            if (leaf.*) |words| allocator.destroy(words);
-            leaf.* = null;
+            const address = leaf.swap(0, .acq_rel);
+            if (address != 0) allocator.destroy(@as(*[words_per_chunk]Word, @ptrFromInt(address)));
         }
-        self.* = .{};
+        self.restricted_in_chunk = [_]u32{0} ** chunk_count;
+        self.no_access_pages = 0;
+        self.read_only_pages = 0;
+        self.requests = 0;
+        self.requests_outside_window = 0;
+        self.allocation_failures = 0;
     }
 
-    pub fn restrictedPages(self: *const Table) u64 {
+    pub fn restrictedPages(self: *Table) u64 {
+        self.lock();
+        defer self.mutation_mutex.unlock();
+        return self.restrictedPagesUnlocked();
+    }
+
+    fn restrictedPagesUnlocked(self: *const Table) u64 {
         return self.no_access_pages + self.read_only_pages;
     }
 
+    fn lock(self: *Table) void {
+        while (!self.mutation_mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    pub fn isActive(self: *const Table) bool {
+        return self.active.load(.acquire);
+    }
+
+    pub fn stats(self: *const Table) Stats {
+        // Snapshot under the writer mutex: the counters are updated together
+        // with the packed leaf words and are intentionally non-atomic. This
+        // is interior synchronization only; callers can report a const
+        // process snapshot without racing a concurrent protection update.
+        const mutable_self = @constCast(self);
+        mutable_self.lock();
+        defer mutable_self.mutation_mutex.unlock();
+        return .{
+            .no_access_pages = self.no_access_pages,
+            .read_only_pages = self.read_only_pages,
+            .requests = self.requests,
+            .requests_outside_window = self.requests_outside_window,
+            .allocation_failures = self.allocation_failures,
+        };
+    }
+
     pub fn get(self: *const Table, address: u64) Protection {
+        // Join the reader set before consulting either the lifecycle flag or
+        // the fast inactive flag. If the checks came first, deinit could see
+        // zero readers and free a leaf between the `active` load and this
+        // increment. Readers that arrive after closing still touch no leaf.
+        const mutable_self = @constCast(self);
+        _ = mutable_self.readers.fetchAdd(1, .seq_cst);
+        defer _ = mutable_self.readers.fetchSub(1, .seq_cst);
+        if (self.closing.load(.seq_cst) or !self.active.load(.acquire)) return .accessible;
         const chunk = address >> chunk_shift;
         if (chunk >= chunk_count) return .accessible;
-        const leaf = self.leaves[@intCast(chunk)] orelse return .accessible;
+        const leaf_address = self.leaves[@intCast(chunk)].load(.acquire);
+        if (leaf_address == 0) return .accessible;
+        const leaf: *[words_per_chunk]Word = @ptrFromInt(leaf_address);
         const page: usize = @intCast((address >> page_shift) & (pages_per_chunk - 1));
         const shift: u6 = @intCast((page % pages_per_word) * 2);
-        return @enumFromInt(@as(u2, @truncate(leaf[page / pages_per_word] >> shift)));
+        const word = leaf[page / pages_per_word].load(.monotonic);
+        return @enumFromInt(@as(u2, @truncate(word >> shift)));
     }
 
     /// Whether an access of `width` bytes at `address` violates protection.
@@ -164,6 +231,9 @@ pub const Table = struct {
         length: u64,
         protection: Protection,
     ) SetOutcome {
+        self.lock();
+        defer self.mutation_mutex.unlock();
+        if (self.closing.load(.acquire)) return .{ .allocation_failed = true };
         self.requests +|= 1;
         var outcome = SetOutcome{};
         const span = @max(length, 1);
@@ -178,28 +248,32 @@ pub const Table = struct {
                 break;
             }
             const chunk_index: usize = @intCast(chunk);
-            if (self.leaves[chunk_index] == null) {
+            var leaf_address = self.leaves[chunk_index].load(.monotonic);
+            if (leaf_address == 0) {
                 if (protection == .accessible) {
                     // Nothing recorded here and nothing to record: skip the
                     // whole chunk rather than walking 65,536 empty pages.
                     page = (chunk + 1) << (chunk_shift - page_shift);
                     continue;
                 }
-                const words = allocator.create([words_per_chunk]u64) catch {
+                const words = allocator.create([words_per_chunk]Word) catch {
                     outcome.allocation_failed = true;
                     self.allocation_failures +|= 1;
                     break;
                 };
-                @memset(words, 0);
-                self.leaves[chunk_index] = words;
+                for (words) |*word| word.* = Word.init(0);
+                leaf_address = @intFromPtr(words);
+                self.leaves[chunk_index].store(leaf_address, .release);
             }
-            const leaf = self.leaves[chunk_index].?;
+            const leaf: *[words_per_chunk]Word = @ptrFromInt(leaf_address);
             const index: usize = @intCast(page & (pages_per_chunk - 1));
             const shift: u6 = @intCast((index % pages_per_word) * 2);
             const word = &leaf[index / pages_per_word];
-            const old: Protection = @enumFromInt(@as(u2, @truncate(word.* >> shift)));
+            const old_word = word.load(.monotonic);
+            const old: Protection = @enumFromInt(@as(u2, @truncate(old_word >> shift)));
             if (old != protection) {
-                word.* = (word.* & ~(@as(u64, 3) << shift)) | (@as(u64, @intFromEnum(protection)) << shift);
+                const new_word = (old_word & ~(@as(u64, 3) << shift)) | (@as(u64, @intFromEnum(protection)) << shift);
+                word.store(new_word, .release);
                 self.account(chunk_index, old, -1);
                 self.account(chunk_index, protection, 1);
                 outcome.pages_changed +|= 1;
@@ -207,7 +281,7 @@ pub const Table = struct {
             if (page == std.math.maxInt(u64)) break;
             page += 1;
         }
-        self.active = self.restrictedPages() != 0;
+        self.active.store(self.restrictedPagesUnlocked() != 0, .release);
         return outcome;
     }
 
@@ -232,7 +306,7 @@ const testing = std.testing;
 test "an untouched table is inactive and permits everything" {
     var table = Table{};
     defer table.deinit(testing.allocator);
-    try testing.expect(!table.active);
+    try testing.expect(!table.isActive());
     try testing.expectEqual(Protection.accessible, table.get(0x2_7FC8_0714));
     try testing.expect(!table.faults(0x2_7FC8_0714, 4, true));
 }
@@ -244,12 +318,12 @@ test "a GPU register page faults on read and write, and nothing beside it does" 
     // 64 KiB range committed no-access.
     const outcome = table.set(testing.allocator, 0x2_7FC8_0000, 0xFFFF, .no_access);
     try testing.expectEqual(@as(u64, 16), outcome.pages_changed);
-    try testing.expect(table.active);
+    try testing.expect(table.isActive());
     try testing.expect(table.faults(0x2_7FC8_0714, 4, true)); // CP_RB_WPTR store
     try testing.expect(table.faults(0x2_7FC8_0710, 4, false)); // CP_RB_RPTR load
     try testing.expect(!table.faults(0x2_7FC7_FFF8, 4, true));
     try testing.expect(!table.faults(0x2_7FC9_0000, 4, false));
-    try testing.expectEqual(@as(u64, 16), table.no_access_pages);
+    try testing.expectEqual(@as(u64, 16), table.stats().no_access_pages);
 }
 
 test "a read-only page faults only on write" {
@@ -273,10 +347,10 @@ test "restoring access clears the page and deactivates the table" {
     var table = Table{};
     defer table.deinit(testing.allocator);
     _ = table.set(testing.allocator, 0x4000_0000, 0x3000, .read_only);
-    try testing.expectEqual(@as(u64, 3), table.read_only_pages);
+    try testing.expectEqual(@as(u64, 3), table.stats().read_only_pages);
     _ = table.set(testing.allocator, 0x4000_0000, 0x3000, .accessible);
     try testing.expectEqual(@as(u64, 0), table.restrictedPages());
-    try testing.expect(!table.active);
+    try testing.expect(!table.isActive());
     // Setting a page to what it already is changes nothing and counts nothing.
     try testing.expectEqual(@as(u64, 0), table.set(testing.allocator, 0x4000_0000, 0x3000, .accessible).pages_changed);
 }
@@ -286,7 +360,7 @@ test "clearing a huge untouched range is cheap and allocates nothing" {
     defer table.deinit(testing.allocator);
     const outcome = table.set(testing.allocator, 0, window_end, .accessible);
     try testing.expectEqual(@as(u64, 0), outcome.pages_changed);
-    for (table.leaves) |leaf| try testing.expect(leaf == null);
+    for (table.leaves) |leaf| try testing.expectEqual(@as(usize, 0), leaf.load(.monotonic));
 }
 
 test "a request above the modelled window is counted, never silently enforced" {
@@ -294,9 +368,91 @@ test "a request above the modelled window is counted, never silently enforced" {
     defer table.deinit(testing.allocator);
     const outcome = table.set(testing.allocator, 0x40_E000_0000, 0x1000, .no_access);
     try testing.expect(outcome.outside_window);
-    try testing.expectEqual(@as(u64, 1), table.requests_outside_window);
-    try testing.expect(!table.active);
+    try testing.expectEqual(@as(u64, 1), table.stats().requests_outside_window);
+    try testing.expect(!table.isActive());
     try testing.expect(!table.faults(0x40_E000_0000, 8, true));
+}
+
+test "concurrent readers observe published protection words" {
+    const Reader = struct {
+        table: *Table,
+        address: u64,
+
+        fn run(context: @This()) void {
+            for (0..20_000) |_| {
+                const protection = context.table.get(context.address);
+                std.debug.assert(protection == .accessible or protection == .read_only);
+            }
+        }
+    };
+    const Writer = struct {
+        table: *Table,
+        address: u64,
+        allocator: std.mem.Allocator,
+
+        fn run(context: @This()) void {
+            for (0..4_000) |_| {
+                _ = context.table.set(context.allocator, context.address, page_size, .accessible);
+                _ = context.table.set(context.allocator, context.address, page_size, .read_only);
+            }
+        }
+    };
+
+    var table = Table{};
+    defer table.deinit(testing.allocator);
+    const address = 0x5_0000_1000;
+    _ = table.set(testing.allocator, address, page_size, .read_only);
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Reader.run, .{Reader{ .table = &table, .address = address }});
+    }
+    const writer = try std.Thread.spawn(.{}, Writer.run, .{Writer{ .table = &table, .address = address, .allocator = testing.allocator }});
+    writer.join();
+    for (threads) |thread| thread.join();
+    try testing.expectEqual(Protection.read_only, table.get(address));
+}
+
+test "deinit closes readers before freeing published leaves" {
+    const address = 0x7000_0000;
+    var table = Table{};
+    _ = table.set(testing.allocator, address, page_size, .read_only);
+
+    const Reader = struct {
+        table: *const Table,
+        address: u64,
+        ready: *std.atomic.Value(u32),
+        start: *std.atomic.Value(bool),
+
+        fn run(context: @This()) void {
+            _ = context.ready.fetchAdd(1, .seq_cst);
+            while (!context.start.load(.seq_cst)) std.atomic.spinLoopHint();
+            for (0..100_000) |_| {
+                const protection = context.table.get(context.address);
+                std.debug.assert(protection == .accessible or protection == .read_only);
+            }
+        }
+    };
+    var ready = std.atomic.Value(u32).init(0);
+    var start = std.atomic.Value(bool).init(false);
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*thread| {
+        thread.* = std.Thread.spawn(.{}, Reader.run, .{Reader{
+            .table = &table,
+            .address = address,
+            .ready = &ready,
+            .start = &start,
+        }}) catch unreachable;
+    }
+    while (ready.load(.seq_cst) != threads.len) std.atomic.spinLoopHint();
+    start.store(true, .seq_cst);
+
+    // Closing while readers are active must wait for any reader that may
+    // already have loaded a leaf pointer. The Table itself remains alive
+    // until the joined workers return, so post-close calls exercise the
+    // closed fast path without touching freed storage.
+    table.deinit(testing.allocator);
+    for (threads) |thread| thread.join();
+    try testing.expectEqual(Protection.accessible, table.get(address));
 }
 
 test "Windows protection values map onto the three states, and guard pages are refused" {

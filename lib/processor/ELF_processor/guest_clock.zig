@@ -43,6 +43,22 @@ pub const ticks_per_millisecond: u64 = hz / 1000;
 /// performance counter with finite resolution does.
 pub const sample_stride: u64 = 512;
 
+/// A one-word publication of the multi-field clock for readers that only
+/// need its counter. The owner still mutates `Clock` under its mutex; an
+/// acquire load lets a hot Windows time import observe the last published
+/// counter without taking that mutex.
+pub const PublishedTicks = struct {
+    value: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    pub fn publish(self: *PublishedTicks, ticks: u64) void {
+        self.value.store(ticks, .release);
+    }
+
+    pub fn load(self: *const PublishedTicks) u64 {
+        return self.value.load(.acquire);
+    }
+};
+
 /// Where the counter's value comes from.
 pub const Source = enum {
     /// The host's monotonic clock. A guest millisecond is a real
@@ -220,6 +236,15 @@ test "a guest millisecond is a real millisecond" {
     deadline_clock.ticks = start;
     const deadline = deadline_clock.deadlineAfterMilliseconds(10);
     try std.testing.expectEqual(clock.ticks, deadline);
+}
+
+test "published clock ticks expose a coherent scalar snapshot" {
+    var published: PublishedTicks = .{};
+    try std.testing.expectEqual(@as(u64, 0), published.load());
+    published.publish(0x1_0000_0001);
+    try std.testing.expectEqual(@as(u64, 0x1_0000_0001), published.load());
+    published.publish(0x1_0000_0000);
+    try std.testing.expectEqual(@as(u64, 0x1_0000_0000), published.load());
 }
 
 test "the stride keeps the read off the hot path without skipping a deadline" {

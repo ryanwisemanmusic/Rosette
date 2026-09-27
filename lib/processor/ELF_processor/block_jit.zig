@@ -130,7 +130,9 @@ const helper_block_offset: u32 = @offsetOf(Helpers, "block");
 const helper_flags_offset: u32 = @offsetOf(Helpers, "flags");
 
 /// The block's view of the state it is running in, written by emitted code
-/// and read by the helpers. Lives inside the state at `Layout.scratch_offset`.
+/// and read by the helpers. Lives inside the state at `Layout.scratch_offset`
+/// for inline layouts; with `.pointers_in_scratch` it is the executing guest
+/// context's own record, and the block's entry receives it directly.
 pub const Scratch = extern struct {
     /// Set to nonzero by a helper when the block must stop after the current
     /// instruction (a fault is pending or the run ended).
@@ -143,6 +145,17 @@ pub const Scratch = extern struct {
     index: u32 = 0,
     /// The block being executed, set by the glue before entry.
     block: ?*const Block = null,
+    /// The executing context's register files and TLB, for layouts with
+    /// `.register_files = .pointers_in_scratch`: the glue binds them before
+    /// entry and the prologue loads them from here. Kept in this record
+    /// rather than in the shared state so that guest threads on different
+    /// host threads, each running translated code, cannot overwrite each
+    /// other's binding - the record is per context, the state is not.
+    regs_file: u64 = 0,
+    xmm_file: u64 = 0,
+    ymm_hi_file: u64 = 0,
+    zmm_hi_file: u64 = 0,
+    tlb_file: u64 = 0,
     /// The 16-byte value a vector memory helper reads into or writes from.
     vector: [16]u8 align(16) = @splat(0),
     /// The deferred flag record: which arithmetic produced the flags that
@@ -328,7 +341,89 @@ pub const Tlb = extern struct {
         if (entry.tag != tag) return null;
         return @ptrFromInt(address +% entry.delta);
     }
+
+    // -- parallel mode --------------------------------------------------------
+    //
+    // Each executor fills only its own table, but a protection or mapping
+    // change made by one thread invalidates every thread's table while its
+    // owner may be probing it. The emitted probe reads `tag` and then
+    // `delta` with plain loads, so another thread must never write a delta:
+    // it only ever retires a tag. A probe then sees either the old tag with
+    // its old, still-valid delta, or a miss. The owner's own fill writes the
+    // delta before the tag, and its own later probes see both in program
+    // order.
+
+    /// The owner's fill in parallel mode: the delta, then the tag, the tag
+    /// sequentially consistent so the caller's epoch re-check that follows
+    /// cannot be ordered before it.
+    pub fn fillOrdered(self: *Tlb, is_write: bool, page: u64, host: [*]u8) void {
+        const tag = page >> page_shift;
+        const table = if (is_write) &self.write else &self.read;
+        const entry = &table[index(tag)];
+        @atomicStore(u64, &entry.delta, @intFromPtr(host) -% page, .monotonic);
+        @atomicStore(u64, &entry.tag, tag, .seq_cst);
+    }
+
+    /// Retire the tag `fillOrdered` just wrote for `page`, if it is still
+    /// that page's: the fill raced an invalidation.
+    pub fn retireOrdered(self: *Tlb, is_write: bool, page: u64) void {
+        const tag = page >> page_shift;
+        const table = if (is_write) &self.write else &self.read;
+        const entry = &table[index(tag)];
+        if (@atomicLoad(u64, &entry.tag, .seq_cst) == tag) @atomicStore(u64, &entry.tag, invalid_tag, .seq_cst);
+    }
+
+    /// `flush` from a thread other than this table's owner: tags only.
+    pub fn flushOrdered(self: *Tlb, reads: bool, writes: bool) void {
+        if (reads) {
+            for (&self.read) |*entry| @atomicStore(u64, &entry.tag, invalid_tag, .seq_cst);
+        }
+        if (writes) {
+            for (&self.write) |*entry| @atomicStore(u64, &entry.tag, invalid_tag, .seq_cst);
+        }
+    }
+
+    /// `invalidateRange` from a thread other than this table's owner.
+    pub fn invalidateRangeOrdered(self: *Tlb, base: u64, length: u64) void {
+        if (length == 0) return;
+        const first = base >> page_shift;
+        const last = (base +| (length - 1)) >> page_shift;
+        if (last - first + 1 >= @min(entries, invalidate_scan_limit)) {
+            self.flushOrdered(true, true);
+            return;
+        }
+        var tag = first;
+        while (true) : (tag += 1) {
+            const slot = index(tag);
+            if (@atomicLoad(u64, &self.read[slot].tag, .seq_cst) == tag) @atomicStore(u64, &self.read[slot].tag, invalid_tag, .seq_cst);
+            if (@atomicLoad(u64, &self.write[slot].tag, .seq_cst) == tag) @atomicStore(u64, &self.write[slot].tag, invalid_tag, .seq_cst);
+            if (tag == last) break;
+        }
+    }
 };
+
+test "an ordered invalidation retires tags and never touches a delta" {
+    const tlb = try std.testing.allocator.create(Tlb);
+    defer std.testing.allocator.destroy(tlb);
+    tlb.* = Tlb.empty;
+    var bytes: [8192]u8 align(4096) = undefined;
+    tlb.fillOrdered(false, 0x1_0000_0000, &bytes);
+    tlb.fillOrdered(true, 0x1_0000_1000, bytes[4096..].ptr);
+    const read_slot = Tlb.index(0x1_0000_0000 >> Tlb.page_shift);
+    const delta = tlb.read[read_slot].delta;
+    try std.testing.expectEqual(@intFromPtr(&bytes) + 0x10, @intFromPtr(tlb.lookup(false, 0x1_0000_0010).?));
+    tlb.invalidateRangeOrdered(0x1_0000_0000, 16);
+    try std.testing.expect(tlb.lookup(false, 0x1_0000_0010) == null);
+    // A probe that read the old tag just before still pairs it with the
+    // delta that tag was filled with.
+    try std.testing.expectEqual(delta, tlb.read[read_slot].delta);
+    try std.testing.expect(tlb.lookup(true, 0x1_0000_1008) != null);
+    tlb.retireOrdered(true, 0x1_0000_1000);
+    try std.testing.expect(tlb.lookup(true, 0x1_0000_1008) == null);
+    tlb.fillOrdered(false, 0x2000, &bytes);
+    tlb.flushOrdered(true, false);
+    try std.testing.expect(tlb.lookup(false, 0x2004) == null);
+}
 
 const tlb_write_offset: u32 = @offsetOf(Tlb, "write");
 
@@ -338,8 +433,11 @@ pub const Layout = struct {
     regs_offset: u32,
     /// Byte offset of the `Scratch` record inside the state.
     scratch_offset: u32,
-    /// Byte offset of the `Tlb` inside the state.
+    /// Byte offset of the inline TLB or active-TLB pointer inside the state.
     tlb_offset: u32,
+    /// Production PE state selects the active cooperative guest thread's
+    /// TLB through a pointer. Small translator fixtures keep an inline TLB.
+    tlb_indirect: bool = false,
     /// Byte offsets of the `[32][16]u8` xmm and ymm-upper register files
     /// and the `[32][32]u8` zmm-upper file, each addressed from the state.
     xmm_offset: u32,
@@ -378,7 +476,24 @@ pub const Layout = struct {
     /// every image target to the interpreter regardless of the filter.
     hook_filter_offset: u32,
     image_targets_hooked_offset: u32,
+    /// For a `call_rel32` whose target is a milestone tracepoint (see
+    /// `Insn.milestone_gate`): the `[n]u8` "saturated" flags and the `[n]u64`
+    /// hit counters, indexed by milestone. Only read for an instruction the
+    /// glue gave a gate, so a glue that never gates may leave them zero.
+    milestone_saturated_offset: u32 = 0,
+    milestone_hits_offset: u32 = 0,
+    /// Where the register files are. `.inline_in_state`: at the offsets
+    /// above, inside the state (small translator fixtures).
+    /// `.pointers_in_scratch`: the block's entry receives the executing
+    /// guest context's `Scratch` record as its third argument, and that
+    /// record holds pointers to the context's register files and TLB
+    /// (`Scratch.regs_file` ...); the offsets above are then unused. That is
+    /// what lets guest threads on several host threads run translated code
+    /// at once, each on its own registers.
+    register_files: RegisterFiles = .inline_in_state,
 };
+
+pub const RegisterFiles = enum { inline_in_state, pointers_in_scratch };
 
 /// The hooked-target bloom filter: 2^17 bits. Against the ~750 addresses a
 /// Xenia image hooks, about one image target in 170 is a false positive,
@@ -402,6 +517,11 @@ pub fn hookFilterHas(filter: *const [hook_filter_bytes]u8, address: u64) bool {
 }
 
 const scratch_abort_offset: u32 = @offsetOf(Scratch, "abort");
+const scratch_regs_file_offset: u32 = @offsetOf(Scratch, "regs_file");
+const scratch_xmm_file_offset: u32 = @offsetOf(Scratch, "xmm_file");
+const scratch_ymm_hi_file_offset: u32 = @offsetOf(Scratch, "ymm_hi_file");
+const scratch_zmm_hi_file_offset: u32 = @offsetOf(Scratch, "zmm_hi_file");
+const scratch_tlb_file_offset: u32 = @offsetOf(Scratch, "tlb_file");
 const scratch_transfer_target_offset: u32 = @offsetOf(Scratch, "transfer_target");
 const scratch_index_offset: u32 = @offsetOf(Scratch, "index");
 const scratch_vector_offset: u32 = @offsetOf(Scratch, "vector");
@@ -415,6 +535,20 @@ const scratch_chain_depth_offset: u32 = @offsetOf(Scratch, "chain_depth");
 const scratch_chain_log_offset: u32 = @offsetOf(Scratch, "chain_log");
 const scratch_block_offset: u32 = @offsetOf(Scratch, "block");
 
+pub const FallbackReason = enum(u8) {
+    missing_native_template,
+    hook_observation,
+    vector_policy_disabled,
+
+    pub fn label(self: FallbackReason) []const u8 {
+        return switch (self) {
+            .missing_native_template => "missing-native-template",
+            .hook_observation => "hook-observation",
+            .vector_policy_disabled => "vector-policy-disabled",
+        };
+    }
+};
+
 pub const Insn = struct {
     rip: u64,
     len: u8,
@@ -422,12 +556,20 @@ pub const Insn = struct {
     /// not an effective address.
     decoded: DecodedInsn,
     segment: Segment,
-    /// The glue asks for the interpreter although a template exists: a
-    /// relative jump into an address one of the RIP hooks would intercept.
+    /// The glue asks for the interpreter although a template exists, with
+    /// `fallback_reason` naming the policy that owns that decision.
     force_fallback: bool = false,
+    fallback_reason: FallbackReason = .missing_native_template,
+    /// A `call_rel32` into a milestone tracepoint the glue may stop
+    /// observing: native once the milestone's saturated flag is set, with its
+    /// hit counter bumped in place; the interpreter's arm until then.
+    milestone_gate: ?u16 = null,
 };
 
-pub const BlockFn = *const fn (state: *anyopaque, helpers: *const Helpers) callconv(.c) u32;
+/// A block's entry: the state the helpers receive, the block's helper table,
+/// and - for `.pointers_in_scratch` layouts - the executing context's scratch
+/// record (inline layouts ignore it).
+pub const BlockFn = *const fn (state: *anyopaque, helpers: *const Helpers, scratch: *Scratch) callconv(.c) u32;
 
 pub const Block = struct {
     helpers: Helpers,
@@ -520,18 +662,30 @@ pub const Compiled = struct {
 /// whole decode, not of the op alone.
 pub fn isNative(d: DecodedInsn) bool {
     if (d.is_evex) return false;
+    // A malformed LOCK encoding is #UD, not a candidate for a translated
+    // template. Leave it for the shared interpreter guard so it terminates
+    // consistently instead of silently executing an unlocked operation.
+    if (!lockPrefixAllowed(d)) return false;
     // A `lock` prefix is honoured only by the atomic templates, which make
     // it a real host atomic; every other locked form stays interpreted.
-    if (d.lock and atomicForm(d.op) == null) return false;
+    if (d.lock) {
+        const form = atomicForm(d.op) orelse return false;
+        if ((form == .bit_set or form == .bit_reset or form == .bit_complement) and
+            d.size == .bits8) return false;
+    }
     if (isVectorNative(d)) return true;
     const wide = d.size == .bits32 or d.size == .bits64;
     return switch (d.op) {
         .nop => d.len != 2,
-        // The 32-bit ops also carry 66-prefixed 16-bit operands, and a word
-        // atomic has no single LSE instruction: a 32-bit SWPAL/LDADDAL on a
-        // 16-bit field writes the next two bytes too (an XADD carries into
-        // them). Those stay with the interpreter.
-        .xchg_mem32_reg32, .xchg_mem64_reg64, .cmpxchg_mem32_reg32, .cmpxchg_mem64_reg64, .xadd_mem32_reg32, .xadd_mem64_reg64 => wide and !d.is_reg_form and memoryOperandSupported(d),
+        // The 32-bit op tags also carry 66-prefixed 16-bit operands. Select
+        // the LSE encoding from the decoded width so a word update cannot
+        // overwrite the neighbouring two bytes.
+        .xchg_mem8_reg8 => !d.is_reg_form and memoryOperandSupported(d),
+        .xchg_mem32_reg32, .xchg_mem64_reg64 => !d.src_high8 and !d.is_reg_form and memoryOperandSupported(d),
+        .cmpxchg_mem32_reg32, .cmpxchg_mem64_reg64, .xadd_mem32_reg32, .xadd_mem64_reg64 => d.size != .bits8 and !d.is_reg_form and memoryOperandSupported(d),
+        .cmpxchg_mem8_reg8, .cmpxchg_mem16_reg16, .xadd_mem8_reg8 => !d.src_high8 and !d.is_reg_form and memoryOperandSupported(d),
+        .cmpxchg8b_mem => !d.is_reg_form and memoryOperandSupported(d),
+        .cmpxchg16b_mem => !d.is_reg_form and memoryOperandSupported(d),
         .mov_reg8_reg8, .mov_reg16_reg16, .mov_reg32_reg32, .mov_reg64_reg64 => true,
         .mov_reg_imm => true,
         .mov_reg8_mem8, .mov_reg16_mem16, .mov_reg32_mem32, .mov_reg64_mem64 => memoryOperandSupported(d),
@@ -546,10 +700,18 @@ pub fn isNative(d: DecodedInsn) bool {
         .movsxd_reg64_reg32 => true,
         .movsxd_reg64_mem32 => memoryOperandSupported(d),
         .lea_reg_mem => memoryOperandSupported(d) and d.size != .bits8,
-        .xchg_reg32_reg32, .xchg_reg64_reg64 => d.is_reg_form,
+        .xchg_reg8_reg8, .xchg_reg32_reg32, .xchg_reg64_reg64 => d.is_reg_form,
         .xchg_accum_reg => true,
+        // These register-only forms have no memory admission or atomicity
+        // edge. Keep the memory forms interpreted unless their native path
+        // can prove its full access contract.
+        .mul_reg8 => true,
+        .popcnt_reg_reg => d.is_reg_form,
         // Group 1 arithmetic and logic: register, immediate and memory forms.
         else => blk: {
+            if (atomicForm(d.op)) |form| {
+                if (form == .update) break :blk !d.is_reg_form and memoryOperandSupported(d);
+            }
             if (binaryOpOf(d.op)) |_| {
                 break :blk !binaryTouchesMemory(d.op) or memoryOperandSupported(d);
             }
@@ -567,7 +729,16 @@ pub fn isNative(d: DecodedInsn) bool {
                 // interpreter's reading of an undefined bit. 35 million
                 // narrow `shr` fallbacks on 2026-09-21.
                 .shl_reg_imm, .shr_reg_imm, .sar_reg_imm => wide or shiftCount(d) < bits(d.size),
-                .shl_reg_cl, .shr_reg_cl, .sar_reg_cl => wide,
+                // CL is masked to five bits for narrow operands. Counts at
+                // or above the operand width stay on the interpreter's
+                // guarded path; smaller counts have the same result and
+                // defined flag bits in the native template.
+                .shl_reg_cl, .shr_reg_cl, .sar_reg_cl => true,
+                // The 2026-09-22 Halo 3 run reached the interpreter about
+                // 19.6 million times for `shl [mem], cl`. Use the same
+                // guarded memory path as the register forms, including the
+                // watched-page helper for writes.
+                .shl_mem_cl, .shr_mem_cl, .sar_mem_cl => !d.is_reg_form and memoryOperandSupported(d),
                 // Narrow immediate rotates too: `rol r16, 8` is how compilers
                 // spell a 16-bit byte swap, 31 million fallbacks on 2026-09-21.
                 .rol_reg_imm, .ror_reg_imm => true,
@@ -582,7 +753,15 @@ pub fn isNative(d: DecodedInsn) bool {
                 // The immediate form never moves the address, so it is a
                 // plain read, a bit, and a write. `btr [mem], imm` was the
                 // largest fallback on 2026-09-21: 62 million calls.
-                .bt_mem_imm, .bts_mem_imm, .btr_mem_imm => d.size != .bits8 and memoryOperandSupported(d),
+                .bt_mem_imm,
+                .bts_mem_imm,
+                .btr_mem_imm,
+                .btc_mem_imm,
+                .bt_mem_reg,
+                .bts_mem_reg,
+                .btr_mem_reg,
+                .btc_mem_reg,
+                => d.size != .bits8 and memoryOperandSupported(d),
                 .bsf_reg_reg, .bsr_reg_reg => d.size != .bits8,
                 .tzcnt_reg_reg, .lzcnt_reg_reg => wide,
                 .cmovcc_reg_reg => wide,
@@ -839,9 +1018,9 @@ fn binaryOpOf(op: Op) ?BinaryOp {
         .test_reg8_reg8, .test_reg16_reg16, .test_reg32_reg32, .test_reg64_reg64, .test_reg8_imm8, .test_reg16_imm16, .test_reg32_imm32, .test_reg64_imm32 => .tst,
         .test_mem8_reg8, .test_mem16_reg16, .test_mem32_reg32, .test_mem64_reg64, .test_mem8_imm8, .test_mem16_imm16, .test_mem32_imm32, .test_mem64_imm32 => .tst,
         .adc_reg8_reg8, .adc_reg16_reg16, .adc_reg32_reg32, .adc_reg64_reg64, .adc_reg8_imm8, .adc_reg16_imm8, .adc_reg32_imm8, .adc_reg64_imm8, .adc_reg16_imm32, .adc_reg32_imm32, .adc_reg64_imm32, .adc_accum_imm => .adc,
-        .adc_reg8_mem8, .adc_reg16_mem16, .adc_reg32_mem32, .adc_reg64_mem64 => .adc,
+        .adc_reg8_mem8, .adc_reg16_mem16, .adc_reg32_mem32, .adc_reg64_mem64, .adc_mem8_reg8, .adc_mem16_reg16, .adc_mem32_reg32, .adc_mem64_reg64, .adc_mem8_imm8, .adc_mem16_imm8, .adc_mem32_imm8, .adc_mem64_imm8, .adc_mem16_imm32, .adc_mem32_imm32, .adc_mem64_imm32 => .adc,
         .sbb_reg8_reg8, .sbb_reg16_reg16, .sbb_reg32_reg32, .sbb_reg64_reg64, .sbb_reg8_imm8, .sbb_reg16_imm8, .sbb_reg32_imm8, .sbb_reg64_imm8, .sbb_reg16_imm32, .sbb_reg32_imm32, .sbb_reg64_imm32, .sbb_accum_imm => .sbb,
-        .sbb_reg8_mem8, .sbb_reg16_mem16, .sbb_reg32_mem32, .sbb_reg64_mem64 => .sbb,
+        .sbb_reg8_mem8, .sbb_reg16_mem16, .sbb_reg32_mem32, .sbb_reg64_mem64, .sbb_mem8_reg8, .sbb_mem16_reg16, .sbb_mem32_reg32, .sbb_mem64_reg64, .sbb_mem8_imm8, .sbb_mem16_imm8, .sbb_mem32_imm8, .sbb_mem64_imm8, .sbb_mem16_imm32, .sbb_mem32_imm32, .sbb_mem64_imm32 => .sbb,
         else => null,
     };
 }
@@ -849,8 +1028,8 @@ fn binaryOpOf(op: Op) ?BinaryOp {
 fn binaryShapeOf(op: Op) BinaryShape {
     return switch (op) {
         .add_reg8_mem8, .add_reg16_mem16, .add_reg32_mem32, .add_reg64_mem64, .sub_reg8_mem8, .sub_reg16_mem16, .sub_reg32_mem32, .sub_reg64_mem64, .and_reg8_mem8, .and_reg16_mem16, .and_reg32_mem32, .and_reg64_mem64, .or_reg8_mem8, .or_reg16_mem16, .or_reg32_mem32, .or_reg64_mem64, .xor_reg8_mem8, .xor_reg16_mem16, .xor_reg32_mem32, .xor_reg64_mem64, .cmp_reg8_mem8, .cmp_reg16_mem16, .cmp_reg32_mem32, .cmp_reg64_mem64, .adc_reg8_mem8, .adc_reg16_mem16, .adc_reg32_mem32, .adc_reg64_mem64, .sbb_reg8_mem8, .sbb_reg16_mem16, .sbb_reg32_mem32, .sbb_reg64_mem64 => .reg_mem,
-        .add_mem8_reg8, .add_mem16_reg16, .add_mem32_reg32, .add_mem64_reg64, .sub_mem8_reg8, .sub_mem16_reg16, .sub_mem32_reg32, .sub_mem64_reg64, .and_mem8_reg8, .and_mem16_reg16, .and_mem32_reg32, .and_mem64_reg64, .or_mem8_reg8, .or_mem16_reg16, .or_mem32_reg32, .or_mem64_reg64, .xor_mem8_reg8, .xor_mem16_reg16, .xor_mem32_reg32, .xor_mem64_reg64, .cmp_mem8_reg8, .cmp_mem16_reg16, .cmp_mem32_reg32, .cmp_mem64_reg64, .test_mem8_reg8, .test_mem16_reg16, .test_mem32_reg32, .test_mem64_reg64 => .mem_reg,
-        .add_mem8_imm8, .add_mem16_imm8, .add_mem32_imm8, .add_mem64_imm8, .add_mem16_imm32, .add_mem32_imm32, .add_mem64_imm32, .sub_mem8_imm8, .sub_mem16_imm8, .sub_mem32_imm8, .sub_mem64_imm8, .sub_mem16_imm32, .sub_mem32_imm32, .sub_mem64_imm32, .and_mem8_imm8, .and_mem16_imm8, .and_mem32_imm8, .and_mem64_imm8, .and_mem16_imm32, .and_mem32_imm32, .and_mem64_imm32, .or_mem8_imm8, .or_mem16_imm8, .or_mem32_imm8, .or_mem64_imm8, .or_mem16_imm32, .or_mem32_imm32, .or_mem64_imm32, .xor_mem8_imm8, .xor_mem16_imm8, .xor_mem32_imm8, .xor_mem64_imm8, .xor_mem16_imm32, .xor_mem32_imm32, .xor_mem64_imm32, .cmp_mem8_imm8, .cmp_mem16_imm8, .cmp_mem32_imm8, .cmp_mem64_imm8, .cmp_mem16_imm32, .cmp_mem32_imm32, .cmp_mem64_imm32, .test_mem8_imm8, .test_mem16_imm16, .test_mem32_imm32, .test_mem64_imm32 => .mem_imm,
+        .add_mem8_reg8, .add_mem16_reg16, .add_mem32_reg32, .add_mem64_reg64, .sub_mem8_reg8, .sub_mem16_reg16, .sub_mem32_reg32, .sub_mem64_reg64, .and_mem8_reg8, .and_mem16_reg16, .and_mem32_reg32, .and_mem64_reg64, .or_mem8_reg8, .or_mem16_reg16, .or_mem32_reg32, .or_mem64_reg64, .xor_mem8_reg8, .xor_mem16_reg16, .xor_mem32_reg32, .xor_mem64_reg64, .cmp_mem8_reg8, .cmp_mem16_reg16, .cmp_mem32_reg32, .cmp_mem64_reg64, .test_mem8_reg8, .test_mem16_reg16, .test_mem32_reg32, .test_mem64_reg64, .adc_mem8_reg8, .adc_mem16_reg16, .adc_mem32_reg32, .adc_mem64_reg64, .sbb_mem8_reg8, .sbb_mem16_reg16, .sbb_mem32_reg32, .sbb_mem64_reg64 => .mem_reg,
+        .add_mem8_imm8, .add_mem16_imm8, .add_mem32_imm8, .add_mem64_imm8, .add_mem16_imm32, .add_mem32_imm32, .add_mem64_imm32, .sub_mem8_imm8, .sub_mem16_imm8, .sub_mem32_imm8, .sub_mem64_imm8, .sub_mem16_imm32, .sub_mem32_imm32, .sub_mem64_imm32, .and_mem8_imm8, .and_mem16_imm8, .and_mem32_imm8, .and_mem64_imm8, .and_mem16_imm32, .and_mem32_imm32, .and_mem64_imm32, .or_mem8_imm8, .or_mem16_imm8, .or_mem32_imm8, .or_mem64_imm8, .or_mem16_imm32, .or_mem32_imm32, .or_mem64_imm32, .xor_mem8_imm8, .xor_mem16_imm8, .xor_mem32_imm8, .xor_mem64_imm8, .xor_mem16_imm32, .xor_mem32_imm32, .xor_mem64_imm32, .cmp_mem8_imm8, .cmp_mem16_imm8, .cmp_mem32_imm8, .cmp_mem64_imm8, .cmp_mem16_imm32, .cmp_mem32_imm32, .cmp_mem64_imm32, .test_mem8_imm8, .test_mem16_imm16, .test_mem32_imm32, .test_mem64_imm32, .adc_mem8_imm8, .adc_mem16_imm8, .adc_mem32_imm8, .adc_mem64_imm8, .adc_mem16_imm32, .adc_mem32_imm32, .adc_mem64_imm32, .sbb_mem8_imm8, .sbb_mem16_imm8, .sbb_mem32_imm8, .sbb_mem64_imm8, .sbb_mem16_imm32, .sbb_mem32_imm32, .sbb_mem64_imm32 => .mem_imm,
         else => if (immediateShapeOf(op) == .none) .reg_reg else .reg_imm,
     };
 }
@@ -989,7 +1168,7 @@ pub fn flagEffects(insn: Insn) FlagEffects {
             const written: u8 = F_CF | F_ZF | F_SF | (if (count == 1) F_OF else 0);
             break :blk .{ .writes = written, .kills = written };
         },
-        .shl_reg_cl, .shr_reg_cl, .sar_reg_cl => .{ .writes = F_CF | F_ZF | F_SF | F_OF },
+        .shl_reg_cl, .shr_reg_cl, .sar_reg_cl, .shl_mem_cl, .shr_mem_cl, .sar_mem_cl => .{ .writes = F_CF | F_ZF | F_SF | F_OF },
         .rol_reg_imm, .ror_reg_imm => blk: {
             const count = @as(u64, shiftCount(d)) % bits(d.size);
             if (count == 0) break :blk .{};
@@ -998,13 +1177,32 @@ pub fn flagEffects(insn: Insn) FlagEffects {
         },
         .rol_reg_cl, .ror_reg_cl => .{ .writes = F_CF | F_OF },
         .imul_reg64_reg64, .imul_reg32_reg32, .imul_reg64_mem64, .imul_reg32_mem32, .imul_reg32_reg32_imm8, .imul_reg32_reg32_imm32, .imul_reg64_reg64_imm8, .imul_reg64_reg64_imm32, .imul_reg32_mem32_imm8, .imul_reg32_mem32_imm32, .imul_reg64_mem64_imm8, .imul_reg64_mem64_imm32 => .{ .writes = F_CF | F_OF, .kills = F_CF | F_OF },
-        .bt_reg_reg, .bts_reg_reg, .btr_reg_reg, .bt_reg_imm, .bts_reg_imm, .btr_reg_imm => .{ .writes = F_CF, .kills = F_CF },
-        .bt_mem_imm, .bts_mem_imm, .btr_mem_imm => .{ .writes = F_CF, .kills = F_CF },
-        .cmpxchg_mem32_reg32, .cmpxchg_mem64_reg64, .xadd_mem32_reg32, .xadd_mem64_reg64 => .{ .writes = F_ALL, .kills = F_ALL },
+        .mul_reg8 => .{ .writes = F_CF | F_OF, .kills = F_CF | F_OF },
+        .popcnt_reg_reg => .{ .writes = F_ALL, .kills = F_ALL },
+        .bt_reg_reg,
+        .bts_reg_reg,
+        .btr_reg_reg,
+        .btc_reg_reg,
+        .bt_reg_imm,
+        .bts_reg_imm,
+        .btr_reg_imm,
+        .btc_reg_imm,
+        .bt_mem_imm,
+        .bts_mem_imm,
+        .btr_mem_imm,
+        .btc_mem_imm,
+        .bt_mem_reg,
+        .bts_mem_reg,
+        .btr_mem_reg,
+        .btc_mem_reg,
+        => .{ .writes = F_CF, .kills = F_CF },
+        .cmpxchg_mem8_reg8, .cmpxchg_mem16_reg16, .cmpxchg_mem32_reg32, .cmpxchg_mem64_reg64, .xadd_mem8_reg8, .xadd_mem32_reg32, .xadd_mem64_reg64 => .{ .writes = F_ALL, .kills = F_ALL },
+        .cmpxchg8b_mem, .cmpxchg16b_mem => .{ .writes = F_ZF, .kills = F_ZF },
         .bsf_reg_reg, .bsr_reg_reg => .{ .writes = F_ZF, .kills = F_ZF },
         .tzcnt_reg_reg, .lzcnt_reg_reg => .{ .writes = F_ZF | F_CF, .kills = F_ZF | F_CF },
         .cmovcc_reg_reg, .cmovcc_reg_mem, .setcc_reg8, .setcc_mem8, .jcc_rel8, .jcc_rel32 => .{ .reads = conditionReads(d.cond) },
         .vucomiss, .vucomisd => .{ .writes = F_ALL, .kills = F_ALL },
+        .vptest, .vtestps, .vtestpd => .{ .writes = F_ALL, .kills = F_ALL },
         else => .{},
     };
 }
@@ -1161,7 +1359,9 @@ fn packedIntegerForm(op: Op) ?struct { lanes: a64.Lanes, kind: VectorBinary } {
 
 const FloatBinary = enum { add, sub, mul, div, min, max };
 
-fn packedFloatForm(op: Op) ?struct { lanes: a64.FpLanes, kind: FloatBinary } {
+const PackedFloatForm = struct { lanes: a64.FpLanes, kind: FloatBinary };
+
+fn packedFloatForm(op: Op) ?PackedFloatForm {
     return switch (op) {
         .vaddps => .{ .lanes = .s4, .kind = .add },
         .vsubps => .{ .lanes = .s4, .kind = .sub },
@@ -1279,26 +1479,193 @@ fn ymmMoveForm(op: Op) ?enum { load, store, register } {
     };
 }
 
-/// The memory read-modify-writes compiled as single LSE atomics. `xchg` with
-/// memory is locked whether or not it carries the prefix, and `cmpxchg` /
-/// `xadd` are the spinlock and counter primitives, so these three are the
-/// ones a second host thread would first need to be real atomics. The
-/// acquire-release forms are sequentially consistent, which is at least as
-/// strong as x86's TSO for a locked operation.
-const AtomicForm = enum { exchange, compare_exchange, exchange_add };
+/// Memory read-modify-writes that must be host-atomic before guest execution
+/// can be split across host threads. `xchg` with memory is locked whether or
+/// not it carries the prefix. The arithmetic/logic update forms use a CAS
+/// loop because ARM's LSE has no single-instruction AND/OR/XOR or SUB form.
+/// Acquire-release atomics preserve the locked operation's ordering edge.
+const AtomicForm = enum {
+    exchange,
+    compare_exchange,
+    compare_exchange8b,
+    compare_exchange16b,
+    exchange_add,
+    update,
+    increment,
+    decrement,
+    negate,
+    bitwise_not,
+    bit_set,
+    bit_reset,
+    bit_complement,
+};
 
 fn atomicForm(op: Op) ?AtomicForm {
     return switch (op) {
-        .xchg_mem32_reg32, .xchg_mem64_reg64 => .exchange,
-        .cmpxchg_mem32_reg32, .cmpxchg_mem64_reg64 => .compare_exchange,
-        .xadd_mem32_reg32, .xadd_mem64_reg64 => .exchange_add,
+        .xchg_mem8_reg8, .xchg_mem32_reg32, .xchg_mem64_reg64 => .exchange,
+        .cmpxchg_mem8_reg8, .cmpxchg_mem16_reg16, .cmpxchg_mem32_reg32, .cmpxchg_mem64_reg64 => .compare_exchange,
+        .cmpxchg8b_mem => .compare_exchange8b,
+        .cmpxchg16b_mem => .compare_exchange16b,
+        .xadd_mem8_reg8, .xadd_mem32_reg32, .xadd_mem64_reg64 => .exchange_add,
+        .bts_mem_imm => .bit_set,
+        .btr_mem_imm => .bit_reset,
+        .btc_mem_imm => .bit_complement,
+        .bts_mem_reg => .bit_set,
+        .btr_mem_reg => .bit_reset,
+        .btc_mem_reg => .bit_complement,
+        .inc_mem8, .inc_mem16, .inc_mem32, .inc_mem64 => .increment,
+        .dec_mem8, .dec_mem16, .dec_mem32, .dec_mem64 => .decrement,
+        .neg_mem8, .neg_mem16, .neg_mem32, .neg_mem64 => .negate,
+        .not_mem8, .not_mem16, .not_mem32, .not_mem64 => .bitwise_not,
+        .add_mem8_reg8,
+        .add_mem16_reg16,
+        .add_mem32_reg32,
+        .add_mem64_reg64,
+        .add_mem8_imm8,
+        .add_mem16_imm8,
+        .add_mem32_imm8,
+        .add_mem64_imm8,
+        .add_mem16_imm32,
+        .add_mem32_imm32,
+        .add_mem64_imm32,
+        .sub_mem8_reg8,
+        .sub_mem16_reg16,
+        .sub_mem32_reg32,
+        .sub_mem64_reg64,
+        .sub_mem8_imm8,
+        .sub_mem16_imm8,
+        .sub_mem32_imm8,
+        .sub_mem64_imm8,
+        .sub_mem16_imm32,
+        .sub_mem32_imm32,
+        .sub_mem64_imm32,
+        .and_mem8_reg8,
+        .and_mem16_reg16,
+        .and_mem32_reg32,
+        .and_mem64_reg64,
+        .and_mem8_imm8,
+        .and_mem16_imm8,
+        .and_mem32_imm8,
+        .and_mem64_imm8,
+        .and_mem16_imm32,
+        .and_mem32_imm32,
+        .and_mem64_imm32,
+        .or_mem8_reg8,
+        .or_mem16_reg16,
+        .or_mem32_reg32,
+        .or_mem64_reg64,
+        .or_mem8_imm8,
+        .or_mem16_imm8,
+        .or_mem32_imm8,
+        .or_mem64_imm8,
+        .or_mem16_imm32,
+        .or_mem32_imm32,
+        .or_mem64_imm32,
+        .xor_mem8_reg8,
+        .xor_mem16_reg16,
+        .xor_mem32_reg32,
+        .xor_mem64_reg64,
+        .xor_mem8_imm8,
+        .xor_mem16_imm8,
+        .xor_mem32_imm8,
+        .xor_mem64_imm8,
+        .xor_mem16_imm32,
+        .xor_mem32_imm32,
+        .xor_mem64_imm32,
+        .adc_mem8_reg8,
+        .adc_mem16_reg16,
+        .adc_mem32_reg32,
+        .adc_mem64_reg64,
+        .adc_mem8_imm8,
+        .adc_mem16_imm8,
+        .adc_mem32_imm8,
+        .adc_mem64_imm8,
+        .adc_mem16_imm32,
+        .adc_mem32_imm32,
+        .adc_mem64_imm32,
+        .sbb_mem8_reg8,
+        .sbb_mem16_reg16,
+        .sbb_mem32_reg32,
+        .sbb_mem64_reg64,
+        .sbb_mem8_imm8,
+        .sbb_mem16_imm8,
+        .sbb_mem32_imm8,
+        .sbb_mem64_imm8,
+        .sbb_mem16_imm32,
+        .sbb_mem32_imm32,
+        .sbb_mem64_imm32,
+        => .update,
         else => null,
     };
+}
+
+/// Whether an explicitly supplied LOCK prefix is architecturally valid for
+/// this decoded form. Valid memory operations may still use the interpreter
+/// when the native path cannot prove alignment or protection state.
+pub fn lockPrefixAllowed(d: DecodedInsn) bool {
+    if (!d.lock) return true;
+    if (d.is_reg_form) return false;
+    if (atomicForm(d.op) != null) return true;
+    switch (d.op) {
+        .adc_mem8_reg8,
+        .adc_mem16_reg16,
+        .adc_mem32_reg32,
+        .adc_mem64_reg64,
+        .sbb_mem8_reg8,
+        .sbb_mem16_reg16,
+        .sbb_mem32_reg32,
+        .sbb_mem64_reg64,
+        .adc_mem8_imm8,
+        .adc_mem16_imm8,
+        .adc_mem32_imm8,
+        .adc_mem64_imm8,
+        .adc_mem16_imm32,
+        .adc_mem32_imm32,
+        .adc_mem64_imm32,
+        .sbb_mem8_imm8,
+        .sbb_mem16_imm8,
+        .sbb_mem32_imm8,
+        .sbb_mem64_imm8,
+        .sbb_mem16_imm32,
+        .sbb_mem32_imm32,
+        .sbb_mem64_imm32,
+        => return true,
+        else => {},
+    }
+    if (d.op == .cmpxchg8b_mem or d.op == .cmpxchg16b_mem or
+        d.op == .bts_mem_reg or d.op == .btr_mem_reg or d.op == .btc_mem_reg)
+    {
+        return true;
+    }
+    if (isIncDec(d.op)) |form| return form.mem;
+    switch (d.op) {
+        .neg_mem8,
+        .neg_mem16,
+        .neg_mem32,
+        .neg_mem64,
+        .not_mem8,
+        .not_mem16,
+        .not_mem32,
+        .not_mem64,
+        => return true,
+        else => {},
+    }
+    if (binaryOpOf(d.op)) |operation| {
+        if (binaryShapeOf(d.op) != .mem_reg and binaryShapeOf(d.op) != .mem_imm) return false;
+        return switch (operation) {
+            .add, .adc, .sub, .sbb, .bit_and, .bit_or, .bit_xor => true,
+            .cmp, .tst => false,
+        };
+    }
+    return false;
 }
 
 pub fn isVectorNative(d: DecodedInsn) bool {
     if (d.is_evex or d.legacy_sse or d.vector_512 or d.opmask != 0 or d.evex_broadcast) return false;
     if (d.vector_256) {
+        if (d.op == .vextractf128) return memoryOperandSupported(d);
+        if (d.op == .vptest or d.op == .vtestps or d.op == .vtestpd) return d.is_reg_form or memoryOperandSupported(d);
+        if (packedFloatForm(d.op) != null or bitwiseForm(d.op) != null) return d.is_reg_form or memoryOperandSupported(d);
         // 2026-09-21: 6.5 million `vcvtps2pd ymm, xmm/m128` fallbacks.
         if (d.op == .vcvtps2pd) return d.is_reg_form or memoryOperandSupported(d);
         const form = ymmMoveForm(d.op) orelse return false;
@@ -1336,6 +1703,8 @@ pub fn isVectorNative(d: DecodedInsn) bool {
         .vcvttss2si, .vcvttsd2si, .vcvtss2si, .vcvtsd2si => (d.size == .bits32 or d.size == .bits64) and (d.is_reg_form or memoryOperandSupported(d)),
         .vucomiss, .vucomisd => d.is_reg_form or memoryOperandSupported(d),
         .vcmpps, .vcmppd => d.is_reg_form or memoryOperandSupported(d),
+        .vptest, .vtestps, .vtestpd => d.is_reg_form or memoryOperandSupported(d),
+        .vextractf128 => d.vector_256 and memoryOperandSupported(d),
         .vroundps, .vroundpd, .vroundss, .vroundsd => d.is_reg_form or memoryOperandSupported(d),
         .vzeroupper => true,
         // 2026-09-21 fallbacks: vpmuludq 19.1M, vinsertps 6.3M, vpblendw
@@ -1479,10 +1848,54 @@ const Compiler = struct {
         try self.emitChecked(a64.addImm(.x64, 29, a64.sp, 0));
         try self.emit(a64.mov(.x64, r_state, 0));
         try self.emit(a64.mov(.x64, r_helpers, 1));
-        try self.emitStateAddress(r_regs, self.layout.regs_offset);
-        try self.emitStateAddress(r_scratch, self.layout.scratch_offset);
-        try self.emitStateAddress(r_tlb, self.layout.tlb_offset);
-        try self.emitStateAddress(r_spare, self.layout.xmm_offset);
+        switch (self.layout.register_files) {
+            .inline_in_state => {
+                try self.emitStateAddress(r_regs, self.layout.regs_offset);
+                try self.emitStateAddress(r_scratch, self.layout.scratch_offset);
+                if (self.layout.tlb_indirect) {
+                    try self.emitStateScalar(.doubleword, r_tlb, self.layout.tlb_offset);
+                } else {
+                    try self.emitStateAddress(r_tlb, self.layout.tlb_offset);
+                }
+                try self.emitStateAddress(r_spare, self.layout.xmm_offset);
+            },
+            .pointers_in_scratch => {
+                // The executing context's record arrives in x2, and its
+                // files are found through it: nothing here reads a binding
+                // another host thread could be rewriting.
+                try self.emit(a64.mov(.x64, r_scratch, 2));
+                try self.emitChecked(a64.ldrImm(.doubleword, r_regs, r_scratch, scratch_regs_file_offset));
+                try self.emitChecked(a64.ldrImm(.doubleword, r_tlb, r_scratch, scratch_tlb_file_offset));
+                try self.emitChecked(a64.ldrImm(.doubleword, r_spare, r_scratch, scratch_xmm_file_offset));
+            },
+        }
+    }
+
+    const VectorFile = enum { ymm_hi, zmm_hi };
+
+    /// `dst` = the address `extra` bytes into the executing context's
+    /// ymm-upper or zmm-upper file.
+    fn emitRegisterFileAddress(self: *Compiler, dst: a64.Reg, file: VectorFile, extra: u32) Error!void {
+        switch (self.layout.register_files) {
+            .inline_in_state => {
+                const offset = switch (file) {
+                    .ymm_hi => self.layout.ymm_hi_offset,
+                    .zmm_hi => self.layout.zmm_hi_offset,
+                };
+                return self.emitStateAddress(dst, offset + extra);
+            },
+            .pointers_in_scratch => try self.emitChecked(a64.ldrImm(.doubleword, dst, r_scratch, switch (file) {
+                .ymm_hi => scratch_ymm_hi_file_offset,
+                .zmm_hi => scratch_zmm_hi_file_offset,
+            })),
+        }
+        if (extra == 0) return;
+        if (extra <= 4095) {
+            try self.emitChecked(a64.addImm(.x64, dst, dst, @intCast(extra)));
+        } else {
+            try self.a.loadConstant(t5, extra);
+            try self.emit(a64.add(.x64, dst, dst, t5));
+        }
     }
 
     fn emitEpilogue(self: *Compiler) Error!void {
@@ -1716,6 +2129,9 @@ const Compiler = struct {
         try self.emitStateOffsetAddress(t3, r_scratch, scratch_chain_log_offset);
         try self.emit(a64.addSubShifted(.x64, .add, false, t3, t3, t1, 4));
         try self.emitChecked(a64.strImm(.doubleword, t2, t3, @offsetOf(ChainLogEntry, "block")));
+        // x0 still holds the exit stub's retired-instruction count here;
+        // preserving it is required for lockstep accounting when this
+        // block transfers directly to a linked successor.
         try self.emitChecked(a64.strImm(.word, 0, t3, @offsetOf(ChainLogEntry, "retired")));
         try self.emitChecked(a64.addImm(.x64, t1, t1, 1));
         try self.emitChecked(a64.strImm(.word, t1, r_scratch, scratch_chain_depth_offset));
@@ -1998,6 +2414,63 @@ const Compiler = struct {
         try self.emit(a64.add(.x64, t4, 1, t4));
     }
 
+    /// Ordered scalar access on a naturally aligned, proven host pointer.
+    /// Acquire/release is sufficient for the shared path's load/load,
+    /// load/store and store/store edges, and also orders more than x86
+    /// requires at a store/load edge. The caller routes legal x86 unaligned
+    /// accesses through the byte-atomic helper before reaching this point.
+    fn emitOrderedScalar(self: *Compiler, is_write: bool, size: Size, data: a64.Reg, host: a64.Reg) Error!void {
+        const ms = memSize(size);
+        try self.emit(if (is_write) a64.stlr(ms, data, host) else a64.ldar(ms, data, host));
+    }
+
+    /// Route a host pointer that does not meet the host atomic instruction's
+    /// natural alignment to the guest memory helper. Guest and host addresses
+    /// preserve the same page offset in the TLB, so testing the translated
+    /// pointer is equivalent to testing the guest operand.
+    fn emitHostAlignmentGuard(self: *Compiler, host: a64.Reg, byte_count: u64, slow: Label) Error!void {
+        if (byte_count <= 1) return;
+        const scratch: a64.Reg = if (host == t5) t6 else t5;
+        try self.emit(a64.logicalImmediate(.x64, .andop, scratch, host, byte_count - 1).?);
+        try self.a.branchIfNonZero(.x64, scratch, slow);
+    }
+
+    /// Form a host pointer into the admitted hoisted page span. The caller
+    /// passes a scratch destination so the hoisted base remains available to
+    /// the other accesses in the same span.
+    fn emitHostOffset(self: *Compiler, destination: a64.Reg, base: a64.Reg, offset: u64) Error!void {
+        if (offset == 0) {
+            try self.emit(a64.mov(.x64, destination, base));
+        } else if (offset <= 4095) {
+            try self.emitChecked(a64.addImm(.x64, destination, base, offset));
+        } else {
+            try self.a.loadConstant(t6, offset);
+            try self.emit(a64.add(.x64, destination, base, t6));
+        }
+    }
+
+    /// Access a vector memory operand as two ordered 64-bit guest accesses.
+    /// X86 does not promise atomicity for arbitrary 128-bit vector operands;
+    /// the scalar lanes avoid host-language data races with scalar accesses
+    /// while retaining the possibility of a torn vector value.
+    fn emitOrderedVectorLoad(self: *Compiler, vector: a64.Reg, host: a64.Reg) Error!void {
+        try self.emit(a64.mov(.x64, t1, host));
+        try self.emitOrderedScalar(false, .bits64, t0, host);
+        try self.emit(a64.vinsGpr(.d2, vector, 0, t0));
+        try self.emitChecked(a64.addImm(.x64, host, t1, 8));
+        try self.emitOrderedScalar(false, .bits64, t2, host);
+        try self.emit(a64.vinsGpr(.d2, vector, 1, t2));
+    }
+
+    fn emitOrderedVectorStore(self: *Compiler, vector: a64.Reg, host: a64.Reg) Error!void {
+        try self.emit(a64.mov(.x64, t1, host));
+        try self.emit(a64.vumov(.d2, t0, vector, 0));
+        try self.emitOrderedScalar(true, .bits64, t0, host);
+        try self.emitChecked(a64.addImm(.x64, host, t1, 8));
+        try self.emit(a64.vumov(.d2, t0, vector, 1));
+        try self.emitOrderedScalar(true, .bits64, t0, host);
+    }
+
     /// x0 = read(state, x1, size), on behalf of instruction `index`: through
     /// the TLB when the page is admitted, through the helper otherwise.
     fn emitRead(self: *Compiler, size: Size, index: u32) Error!void {
@@ -2005,7 +2478,8 @@ const Compiler = struct {
         const slow = try self.a.createLabel();
         const done = try self.a.createLabel();
         try self.emitTlbProbe(false, bits(size) / 8, slow);
-        try self.emitChecked(a64.ldrImm(memSize(size), 0, t4, 0));
+        try self.emitHostAlignmentGuard(t4, bits(size) / 8, slow);
+        try self.emitOrderedScalar(false, size, 0, t4);
         try self.a.branch(done);
         self.a.placeLabel(slow);
         try self.emitCurrentIndex(index);
@@ -2021,7 +2495,8 @@ const Compiler = struct {
         const slow = try self.a.createLabel();
         const done = try self.a.createLabel();
         try self.emitTlbProbe(true, bits(size) / 8, slow);
-        try self.emitChecked(a64.strImm(memSize(size), 3, t4, 0));
+        try self.emitHostAlignmentGuard(t4, bits(size) / 8, slow);
+        try self.emitOrderedScalar(true, size, 3, t4);
         try self.a.branch(done);
         self.a.placeLabel(slow);
         try self.emitCurrentIndex(index);
@@ -2103,18 +2578,18 @@ const Compiler = struct {
         self.a.placeLabel(outside);
     }
 
-    /// Branch to `slow` when the target in `reg` is inside the image and
-    /// either the master switch is on or the hook filter names it. A target
-    /// outside the image carries no hook and falls through. Clobbers t0,
-    /// t2-t4.
+    /// Branch to `slow` for targets outside the loaded PE image, and for
+    /// in-image targets claimed by a runtime hook. The interpreter owns
+    /// import thunks, mapped generated code and invalid external targets; a
+    /// translated block must not install an arbitrary out-of-image value as
+    /// RIP before those boundaries can classify it. Clobbers t0, t2-t4.
     fn emitHookedTargetCheck(self: *Compiler, reg: a64.Reg, slow: Label) Error!void {
-        const plain = try self.a.createLabel();
         try self.emitStateScalar(.doubleword, t0, self.layout.image_low_offset);
         try self.emit(a64.cmp(.x64, reg, t0));
-        try self.a.branchCond(.lo, plain);
+        try self.a.branchCond(.lo, slow);
         try self.emitStateScalar(.doubleword, t0, self.layout.image_high_offset);
         try self.emit(a64.cmp(.x64, reg, t0));
-        try self.a.branchCond(.hs, plain);
+        try self.a.branchCond(.hs, slow);
         try self.emitStateScalar(.byte, t0, self.layout.image_targets_hooked_offset);
         try self.a.branchIfNonZero(.w32, t0, slow);
         try self.a.loadConstant(t2, hook_filter_multiplier);
@@ -2127,7 +2602,6 @@ const Compiler = struct {
         try self.emit(a64.lsrv(.w32, t3, t3, t2));
         try self.emit(a64.logicalImmediate(.w32, .andop, t3, t3, 1).?);
         try self.a.branchIfNonZero(.w32, t3, slow);
-        self.a.placeLabel(plain);
     }
 
     /// Branch to `slow` when the address in `reg` lies inside the guest
@@ -2253,7 +2727,7 @@ const Compiler = struct {
         const full = try self.a.createLabel();
         const resume_at = try self.a.createLabel();
         try self.a.branchIfZero(.x64, hoist_host, full);
-        try self.emitHostAccess(is_write, size, if (is_write) 3 else 0, offset);
+        try self.emitHostAccess(is_write, size, if (is_write) 3 else 0, offset, full);
         self.a.placeLabel(resume_at);
         try self.cold_accesses.append(self.allocator, .{ .full = full, .resume_at = resume_at, .insn = insn, .size = size, .index = index, .is_write = is_write });
         self.touches_memory = true;
@@ -2284,13 +2758,12 @@ const Compiler = struct {
         const full = try self.a.createLabel();
         const resume_at = try self.a.createLabel();
         try self.a.branchIfZero(.x64, hoist_host, full);
-        const word = if (is_write) a64.vstrQ(v, hoist_host, @intCast(offset)) else a64.vldrQ(v, hoist_host, @intCast(offset));
-        if (word) |encoded| {
-            try self.emit(encoded);
+        try self.emitHostOffset(t5, hoist_host, offset);
+        try self.emitHostAlignmentGuard(t5, 8, full);
+        if (is_write) {
+            try self.emitOrderedVectorStore(v, t5);
         } else {
-            try self.a.loadConstant(t5, offset);
-            try self.emit(a64.add(.x64, t5, hoist_host, t5));
-            try self.emitChecked(if (is_write) a64.vstrQ(v, t5, 0) else a64.vldrQ(v, t5, 0));
+            try self.emitOrderedVectorLoad(v, t5);
         }
         self.a.placeLabel(resume_at);
         try self.cold_accesses.append(self.allocator, .{ .full = full, .resume_at = resume_at, .insn = insn, .size = .bits64, .index = index, .is_write = is_write, .vector = v, .vector_offset = byte_offset });
@@ -2299,16 +2772,20 @@ const Compiler = struct {
     }
 
     /// `data` to or from `[x29 + offset]` at `size`.
-    fn emitHostAccess(self: *Compiler, is_write: bool, size: Size, data: a64.Reg, offset: u64) Error!void {
-        const ms = memSize(size);
-        const word = if (is_write) a64.strImm(ms, data, hoist_host, @intCast(offset)) else a64.ldrImm(ms, data, hoist_host, @intCast(offset));
-        if (word) |encoded| {
-            try self.emit(encoded);
+    fn emitHostAccess(self: *Compiler, is_write: bool, size: Size, data: a64.Reg, offset: u64, slow: Label) Error!void {
+        if (offset == 0) {
+            try self.emitHostAlignmentGuard(hoist_host, bits(size) / 8, slow);
+            try self.emitOrderedScalar(is_write, size, data, hoist_host);
             return;
         }
-        try self.a.loadConstant(t5, offset);
-        try self.emit(a64.add(.x64, t5, hoist_host, t5));
-        try self.emitChecked(if (is_write) a64.strImm(ms, data, t5, 0) else a64.ldrImm(ms, data, t5, 0));
+        if (offset <= 4095) {
+            try self.emitChecked(a64.addImm(.x64, t5, hoist_host, @intCast(offset)));
+        } else {
+            try self.a.loadConstant(t5, offset);
+            try self.emit(a64.add(.x64, t5, hoist_host, t5));
+        }
+        try self.emitHostAlignmentGuard(t5, bits(size) / 8, slow);
+        try self.emitOrderedScalar(is_write, size, data, t5);
     }
 
     fn emitLoadOperand(self: *Compiler, insn: Insn, size: Size, index: u32) Error!void {
@@ -2368,6 +2845,16 @@ const Compiler = struct {
         }
         self.native_count += 1;
         if (try self.emitVectorInsn(insn, index)) return .native;
+        // A lock-prefixed arithmetic/logic memory update cannot use the
+        // ordinary load/compute/store template: that would tear under a
+        // concurrent guest execution context. Its CAS loop is the native
+        // implementation of the whole read-modify-write.
+        if (d.lock) {
+            if (atomicForm(d.op)) |form| {
+                try self.emitAtomic(insn, index, form);
+                return .native;
+            }
+        }
         if (binaryOpOf(d.op)) |op| {
             try self.emitGroup1(op, insn, index);
             return .native;
@@ -2496,11 +2983,11 @@ const Compiler = struct {
                 try self.emitEffectiveAddress(t1, insn);
                 try self.storeReg(d.dst_reg, false, d.size, t1);
             },
-            .xchg_reg32_reg32, .xchg_reg64_reg64 => {
-                try self.loadReg(t1, d.dst_reg, false, d.size);
-                try self.loadReg(t2, d.src_reg, false, d.size);
-                try self.storeReg(d.dst_reg, false, d.size, t2);
-                try self.storeReg(d.src_reg, false, d.size, t1);
+            .xchg_reg8_reg8, .xchg_reg32_reg32, .xchg_reg64_reg64 => {
+                try self.loadReg(t1, d.dst_reg, d.dst_high8, d.size);
+                try self.loadReg(t2, d.src_reg, d.src_high8, d.size);
+                try self.storeReg(d.dst_reg, d.dst_high8, d.size, t2);
+                try self.storeReg(d.src_reg, d.src_high8, d.size, t1);
             },
             .xchg_accum_reg => {
                 try self.loadReg(t1, .al_ax_eax_rax, false, d.size);
@@ -2536,7 +3023,8 @@ const Compiler = struct {
                 try self.emitAbortCheck(index);
             },
             .shl_reg_imm, .shr_reg_imm, .sar_reg_imm => try self.emitShift(d),
-            .shl_reg_cl, .shr_reg_cl, .sar_reg_cl => try self.emitShiftCl(d),
+            .shl_reg_cl, .shr_reg_cl, .sar_reg_cl => try self.emitShiftCl(insn, index),
+            .shl_mem_cl, .shr_mem_cl, .sar_mem_cl => try self.emitShiftCl(insn, index),
             .rol_reg_imm, .ror_reg_imm => try self.emitRotateImm(d),
             .rol_reg_cl, .ror_reg_cl => try self.emitRotateCl(d),
             .imul_reg64_reg64, .imul_reg32_reg32 => {
@@ -2587,6 +3075,25 @@ const Compiler = struct {
                 try self.storeReg(.al_ax_eax_rax, false, .bits32, t0);
                 try self.storeReg(.dl_dx_edx_rdx, false, .bits32, t4);
             },
+            .mul_reg8 => {
+                // The byte form multiplies AL by the explicit source and
+                // writes the full unsigned product to AX. Only CF and OF are
+                // defined, both set exactly when the high byte is nonzero.
+                try self.loadReg(t1, .al_ax_eax_rax, false, .bits8);
+                try self.loadReg(t2, d.src_reg, false, .bits8);
+                try self.emit(a64.umull(t0, t1, t2));
+                try self.storeReg(.al_ax_eax_rax, false, .bits16, t0);
+                if (self.emit_flags) {
+                    try self.emit(a64.lsrImm(.x64, t4, t0, 8));
+                    try self.emitChecked(a64.cmpImm(.x64, t4, 0));
+                    try self.emit(a64.cset(.w32, t4, .ne));
+                    try self.loadFlags(t3);
+                    try self.clearFlagBits(t3, RFL_CF | RFL_OF);
+                    try self.orFlagBit(t3, t4, 0);
+                    try self.orFlagBit(t3, t4, 11);
+                    try self.storeFlags(t3);
+                }
+            },
             .mul_reg64, .imul_reg64 => {
                 try self.loadReg(t1, .al_ax_eax_rax, false, .bits64);
                 try self.loadReg(t2, d.src_reg, false, .bits64);
@@ -2606,12 +3113,28 @@ const Compiler = struct {
             .bt_reg_imm => try self.emitBitTest(d, .probe, true),
             .bts_reg_imm => try self.emitBitTest(d, .set, true),
             .btr_reg_imm => try self.emitBitTest(d, .reset, true),
-            .xchg_mem32_reg32, .xchg_mem64_reg64, .cmpxchg_mem32_reg32, .cmpxchg_mem64_reg64, .xadd_mem32_reg32, .xadd_mem64_reg64 => try self.emitAtomic(insn, index, atomicForm(d.op).?),
+            .xchg_mem8_reg8, .xchg_mem32_reg32, .xchg_mem64_reg64 => try self.emitAtomic(insn, index, .exchange),
+            .cmpxchg_mem8_reg8, .cmpxchg_mem16_reg16, .cmpxchg_mem32_reg32, .cmpxchg_mem64_reg64 => if (d.lock)
+                try self.emitAtomic(insn, index, .compare_exchange)
+            else
+                try self.emitNonAtomicCompareExchange(insn, index),
+            .xadd_mem8_reg8, .xadd_mem32_reg32, .xadd_mem64_reg64 => if (d.lock)
+                try self.emitAtomic(insn, index, .exchange_add)
+            else
+                try self.emitNonAtomicExchangeAdd(insn, index),
+            .cmpxchg8b_mem => try self.emitAtomic(insn, index, .compare_exchange8b),
+            .cmpxchg16b_mem => try self.emitAtomic(insn, index, .compare_exchange16b),
             .bt_mem_imm => try self.emitBitTestMemory(insn, index, .probe),
             .bts_mem_imm => try self.emitBitTestMemory(insn, index, .set),
             .btr_mem_imm => try self.emitBitTestMemory(insn, index, .reset),
+            .btc_mem_imm => try self.emitBitTestMemory(insn, index, .complement),
+            .bt_mem_reg => try self.emitBitTestMemoryRegister(insn, index, .probe),
+            .bts_mem_reg => try self.emitBitTestMemoryRegister(insn, index, .set),
+            .btr_mem_reg => try self.emitBitTestMemoryRegister(insn, index, .reset),
+            .btc_mem_reg => try self.emitBitTestMemoryRegister(insn, index, .complement),
             .bsf_reg_reg, .bsr_reg_reg => try self.emitBitScan(d),
             .tzcnt_reg_reg, .lzcnt_reg_reg => try self.emitCountZeros(d),
+            .popcnt_reg_reg => try self.emitPopulationCount(d),
             .cmovcc_reg_reg => {
                 try self.loadFlags(t3);
                 try self.emitCondition(t4, t3, d.cond);
@@ -2728,6 +3251,17 @@ const Compiler = struct {
                 try self.a.branchIfNonZero(.w32, t0, slow);
                 try self.emitStateScalar(.byte, t0, self.layout.trace_transfers_offset);
                 try self.a.branchIfNonZero(.w32, t0, slow);
+                if (insn.milestone_gate) |milestone| {
+                    // Until the glue says this milestone has seen enough, its
+                    // entry is the interpreter's to record. After that only
+                    // the count is kept, here.
+                    try self.emitStateScalar(.byte, t0, self.layout.milestone_saturated_offset + milestone);
+                    try self.a.branchIfZero(.w32, t0, slow);
+                    try self.emitStateAddress(t1, self.layout.milestone_hits_offset + @as(u32, milestone) * 8);
+                    try self.emitChecked(a64.ldrImm(.doubleword, t0, t1, 0));
+                    try self.emitChecked(a64.addImm(.x64, t0, t0, 1));
+                    try self.emitChecked(a64.strImm(.doubleword, t0, t1, 0));
+                }
                 // push(next_rip), exactly as the `push_imm` template does.
                 try self.a.loadConstant(3, next_rip);
                 try self.loadReg(1, .ah_sp_esp_rsp, false, .bits64);
@@ -3087,25 +3621,58 @@ const Compiler = struct {
         try self.storeReg(d.dst_reg, d.dst_high8, size, t0);
     }
 
-    /// Shift by `cl` at 32 or 64 bits: the count is masked, a zero count
-    /// only re-writes the register at its width, and OF is written only
-    /// when the count is one (`setFlagsShl/Shr/Sar`).
-    fn emitShiftCl(self: *Compiler, d: DecodedInsn) Error!void {
+    /// Shift by `cl`: the count is masked, a zero count leaves memory
+    /// untouched (or re-writes a register at its width), and OF is written
+    /// only when the count is one (`setFlagsShl/Shr/Sar`). Narrow operands
+    /// use the interpreter only when the masked count reaches their width,
+    /// where the host's shift and the emulator's undefined-flag convention
+    /// need not agree.
+    fn emitShiftCl(self: *Compiler, insn: Insn, index: u32) Error!void {
+        const d = insn.decoded;
         const size = d.size;
         const width = arm(size);
         const w = bits(size);
-        try self.loadReg(t1, d.dst_reg, false, size);
+        const is_mem = d.op == .shl_mem_cl or d.op == .shr_mem_cl or d.op == .sar_mem_cl;
+        const slow = if (w < 32) try self.a.createLabel() else null;
+        const done = try self.a.createLabel();
+        // The narrow slow edge re-enters the interpreter, which reads
+        // rflags from the guest register file. Materialise a preceding lazy
+        // flag record before either edge can reach that helper.
+        if (slow != null) try self.emitSettleFlags();
         try self.loadReg(t2, .cl_cx_ecx_rcx, false, .bits8);
         try self.emit(a64.logicalImmediate(.w32, .andop, t2, t2, if (size == .bits64) 0x3F else 0x1F).?);
+        if (slow) |label| {
+            try self.a.loadConstant(t5, w);
+            try self.emitChecked(a64.cmp(.w32, t2, t5));
+            try self.a.branchCond(.hs, label);
+        }
+        if (is_mem) {
+            try self.emitLoadOperand(insn, size, index);
+            // emitRead returns the memory value in x0. Like the other
+            // read/modify/write paths, defer the abort check until the write
+            // path unless a zero count takes the no-write branch; preserve the
+            // value first because the abort check uses x0 as scratch.
+            try self.emit(a64.mov(.x64, t1, 0));
+            try self.emitAbortCheck(index);
+            // Effective-address and memory helpers use x2 as scratch, so
+            // recover CL after the read before choosing zero/shift paths.
+            try self.loadReg(t2, .cl_cx_ecx_rcx, false, .bits8);
+            try self.emit(a64.logicalImmediate(.w32, .andop, t2, t2, if (size == .bits64) 0x3F else 0x1F).?);
+        } else {
+            try self.loadReg(t1, d.dst_reg, d.dst_high8, size);
+        }
         const zero = try self.a.createLabel();
-        const done = try self.a.createLabel();
         try self.a.branchIfZero(.w32, t2, zero);
+        if (d.op == .sar_reg_cl or d.op == .sar_mem_cl) {
+            if (w < 32) try self.emit(a64.sbfx(.w32, t1, t1, 0, @intCast(w)));
+        }
         switch (d.op) {
-            .shl_reg_cl => try self.emit(a64.lslv(width, t0, t1, t2)),
-            .shr_reg_cl => try self.emit(a64.lsrv(width, t0, t1, t2)),
-            .sar_reg_cl => try self.emit(a64.asrv(width, t0, t1, t2)),
+            .shl_reg_cl, .shl_mem_cl => try self.emit(a64.lslv(width, t0, t1, t2)),
+            .shr_reg_cl, .shr_mem_cl => try self.emit(a64.lsrv(width, t0, t1, t2)),
+            .sar_reg_cl, .sar_mem_cl => try self.emit(a64.asrv(width, t0, t1, t2)),
             else => unreachable,
         }
+        if (w < 32) try self.emit(a64.logicalImmediate(.w32, .andop, t0, t0, (@as(u64, 1) << @intCast(w)) - 1).?);
         if (self.emit_flags) {
             try self.loadFlags(t3);
             try self.clearFlagBits(t3, RFL_CF | RFL_SF | RFL_ZF);
@@ -3117,7 +3684,7 @@ const Compiler = struct {
             // CF into t6: bit (w - count) of the input for a left shift,
             // bit (count - 1) for a right shift.
             switch (d.op) {
-                .shl_reg_cl => {
+                .shl_reg_cl, .shl_mem_cl => {
                     try self.a.loadConstant(t5, w);
                     try self.emit(a64.sub(.w32, t5, t5, t2));
                 },
@@ -3128,12 +3695,12 @@ const Compiler = struct {
             try self.orFlagBit(t3, t6, 0);
             // OF, only when the count is one; otherwise the old bit stays.
             switch (d.op) {
-                .shl_reg_cl => {
+                .shl_reg_cl, .shl_mem_cl => {
                     try self.emit(a64.ubfx(width, t4, t0, @intCast(w - 1), 1));
                     try self.emit(a64.eorReg(.w32, t4, t4, t6));
                 },
-                .shr_reg_cl => try self.emit(a64.ubfx(width, t4, t1, @intCast(w - 1), 1)),
-                .sar_reg_cl => try self.emit(a64.mov(.w32, t4, a64.wzr)),
+                .shr_reg_cl, .shr_mem_cl => try self.emit(a64.ubfx(width, t4, t1, @intCast(w - 1), 1)),
+                .sar_reg_cl, .sar_mem_cl => try self.emit(a64.mov(.w32, t4, a64.wzr)),
                 else => unreachable,
             }
             try self.emit(a64.ubfx(.w32, t5, t3, 11, 1));
@@ -3143,10 +3710,23 @@ const Compiler = struct {
             try self.orFlagBit(t3, t4, 11);
             try self.storeFlags(t3);
         }
-        try self.storeReg(d.dst_reg, false, size, t0);
+        if (is_mem) {
+            try self.emitStoreOperand(insn, size, index);
+            try self.emitAbortCheck(index);
+        } else {
+            try self.storeReg(d.dst_reg, d.dst_high8, size, t0);
+        }
         try self.a.branch(done);
         self.a.placeLabel(zero);
-        try self.storeReg(d.dst_reg, false, size, t1);
+        // A zero-count memory shift does not write its operand. A register
+        // destination still gets the width-specific write (notably the
+        // zero-extension of a 32-bit register result).
+        if (!is_mem) try self.storeReg(d.dst_reg, d.dst_high8, size, t1);
+        try self.a.branch(done);
+        if (slow) |label| {
+            self.a.placeLabel(label);
+            try self.emitInterpretCall(index);
+        }
         self.a.placeLabel(done);
     }
 
@@ -3311,7 +3891,7 @@ const Compiler = struct {
         self.a.placeLabel(done);
     }
 
-    const BitTestKind = enum { probe, set, reset };
+    const BitTestKind = enum { probe, set, reset, complement };
 
     /// `bt`/`bts`/`btr` on a register (`bit_test.applyRegister`): the index
     /// is reduced modulo the operand width, CF is the selected bit.
@@ -3338,6 +3918,7 @@ const Compiler = struct {
             .probe => {},
             .set => try self.emit(a64.orrReg(width, t0, t1, t5)),
             .reset => try self.emit(a64.bicReg(width, t0, t1, t5)),
+            .complement => try self.emit(a64.eorReg(width, t0, t1, t5)),
         }
         if (self.emit_flags) {
             try self.loadFlags(t3);
@@ -3357,32 +3938,54 @@ const Compiler = struct {
     /// accumulator, sets the flags of `cmp acc, old`, and on a mismatch
     /// loads the accumulator with the old value; `xadd` sets the flags of
     /// the add and returns the old value in the register; `xchg` swaps.
+    /// Locked Group-1 updates use a compare-and-swap retry loop so the
+    /// complete read/compute/write remains atomic even when a future guest
+    /// scheduler runs this context beside another one.
     fn emitAtomic(self: *Compiler, insn: Insn, index: u32, form: AtomicForm) Error!void {
+        if (form == .compare_exchange8b) {
+            try self.emitAtomicCompareExchange8b(insn, index);
+            return;
+        }
+        if (form == .compare_exchange16b) {
+            try self.emitAtomicCompareExchange16b(insn, index);
+            return;
+        }
         const d = insn.decoded;
         const size = d.size;
         const width = arm(size);
         const bytes: u64 = bits(size) / 8;
         self.touches_memory = true;
+        if (form == .bit_set or form == .bit_reset or form == .bit_complement) {
+            try self.emitAtomicBitTest(insn, index, form);
+            return;
+        }
         const slow = try self.a.createLabel();
         const done = try self.a.createLabel();
         try self.emitEffectiveAddress(1, insn);
         try self.emitTlbProbe(true, bytes, slow);
-        try self.emit(a64.logicalImmediate(.x64, .andop, t5, 1, bytes - 1).?);
-        try self.a.branchIfNonZero(.x64, t5, slow);
+        if (bytes > 1) {
+            try self.emit(a64.logicalImmediate(.x64, .andop, t5, 1, bytes - 1).?);
+            try self.a.branchIfNonZero(.x64, t5, slow);
+        }
+        // A LOCK operation is a full ordering fence on x86. LSE's acquire /
+        // release variants provide the atomic update, while these barriers
+        // also order guest accesses on both sides of the transaction.
+        try self.emit(a64.dmbIsh());
         switch (form) {
             .exchange => {
-                try self.loadReg(t0, d.src_reg, false, size);
-                try self.emit(a64.swpal(width, t0, t1, t4));
-                try self.storeReg(d.src_reg, false, size, t1);
+                try self.loadReg(t0, d.src_reg, d.src_high8, size);
+                try self.emit(a64.swpalScalar(memSize(size), t0, t1, t4));
+                try self.storeReg(d.src_reg, d.src_high8, size, t1);
             },
             .compare_exchange => {
                 try self.emit(a64.mov(.x64, 2, t4));
                 try self.loadReg(t1, .al_ax_eax_rax, false, size);
                 try self.emit(a64.mov(width, 3, t1));
                 try self.loadReg(t0, d.src_reg, false, size);
-                try self.emit(a64.casal(width, 3, t0, 2));
+                try self.emit(a64.casalScalar(memSize(size), 3, t0, 2));
                 try self.emit(a64.mov(width, t2, 3));
                 try self.emit(a64.sub(width, t0, t1, t2));
+                if (size == .bits8 or size == .bits16) try self.emit(a64.ubfx(.w32, t0, t0, 0, @intCast(bits(size))));
                 try self.emitArithmeticFlags(.sub, size, t1, t2, t0, false);
                 const matched = try self.a.createLabel();
                 try self.emit(a64.cmp(width, t1, t2));
@@ -3390,18 +3993,416 @@ const Compiler = struct {
                 try self.storeReg(.al_ax_eax_rax, false, size, t2);
                 self.a.placeLabel(matched);
             },
+            .compare_exchange8b => unreachable,
+            .compare_exchange16b => unreachable,
             .exchange_add => {
                 try self.loadReg(t2, d.src_reg, false, size);
-                try self.emit(a64.ldaddal(width, t2, t1, t4));
+                try self.emit(a64.ldaddalScalar(memSize(size), t2, t1, t4));
                 try self.emit(a64.add(width, t0, t1, t2));
+                if (size == .bits8 or size == .bits16) try self.emit(a64.ubfx(.w32, t0, t0, 0, @intCast(bits(size))));
                 try self.emitArithmeticFlags(.add, size, t1, t2, t0, false);
                 try self.storeReg(d.src_reg, false, size, t1);
             },
+            .update => {
+                const op = binaryOpOf(d.op).?;
+                switch (binaryShapeOf(d.op)) {
+                    .mem_reg => try self.loadReg(t2, d.src_reg, d.src_high8, size),
+                    .mem_imm => try self.a.loadConstant(t2, immediateValue(d) & maskFor(size)),
+                    else => unreachable,
+                }
+                const carry_operation = op == .adc or op == .sbb;
+                if (carry_operation) {
+                    // CAS may retry after another guest thread changed the
+                    // word. Keep the instruction's input CF in ip0 (x16),
+                    // which none of the retry arithmetic touches, and only
+                    // publish flags after the operation commits.
+                    try self.loadFlags(t3);
+                    try self.emit(a64.logicalImmediate(.w32, .andop, t5, t3, 1).?);
+                    try self.emit(a64.mov(.x64, 16, t5));
+                }
+                const retry = try self.a.createLabel();
+                self.a.placeLabel(retry);
+                try self.emitChecked(a64.ldrImm(memSize(size), t1, t4, 0).?);
+                switch (op) {
+                    .add => try self.emit(a64.add(width, t0, t1, t2)),
+                    .sub => try self.emit(a64.sub(width, t0, t1, t2)),
+                    .adc, .sbb => try self.emitAtomicCarryResult(size, op == .adc),
+                    .bit_and => try self.emit(a64.andReg(width, t0, t1, t2)),
+                    .bit_or => try self.emit(a64.orrReg(width, t0, t1, t2)),
+                    .bit_xor => try self.emit(a64.eorReg(width, t0, t1, t2)),
+                    else => unreachable,
+                }
+                if (size == .bits8 or size == .bits16) try self.emit(a64.ubfx(.w32, t0, t0, 0, @intCast(bits(size))));
+                try self.emit(a64.mov(width, 3, t1));
+                try self.emit(a64.casalScalar(memSize(size), 3, t0, t4));
+                try self.emit(a64.cmp(width, 3, t1));
+                try self.a.branchCond(.ne, retry);
+                const kind: ArithKind = switch (op) {
+                    .add => .add,
+                    .sub => .sub,
+                    .adc => .add,
+                    .sbb => .sub,
+                    .bit_and, .bit_or, .bit_xor => .logic,
+                    else => unreachable,
+                };
+                try self.emitArithmeticFlags(kind, size, t1, t2, t0, carry_operation);
+            },
+            .increment, .decrement => {
+                const is_inc = form == .increment;
+                const retry = try self.a.createLabel();
+                // Flag synthesis uses t4 as scratch, so keep the admitted
+                // pointer in t6 while the value is loaded and retried.
+                try self.emit(a64.mov(.x64, t6, t4));
+                self.a.placeLabel(retry);
+                try self.emitChecked(a64.ldrImm(memSize(size), t1, t6, 0).?);
+                if (is_inc) {
+                    try self.emitChecked(a64.addImm(width, t0, t1, 1));
+                } else {
+                    try self.emitChecked(a64.subImm(width, t0, t1, 1));
+                }
+                if (size == .bits8 or size == .bits16) {
+                    try self.emit(a64.logicalImmediate(.w32, .andop, t0, t0, maskFor(size)).?);
+                }
+                try self.emit(a64.mov(width, 3, t1));
+                try self.emit(a64.casalScalar(memSize(size), 3, t0, t6));
+                try self.emit(a64.cmp(width, 3, t1));
+                try self.a.branchCond(.ne, retry);
+                // Recompute the committed value and INC/DEC flags from the
+                // successful old value; CF is preserved by this helper.
+                try self.emitIncDecCompute(size, is_inc);
+            },
+            .negate => {
+                const retry = try self.a.createLabel();
+                try self.emit(a64.mov(.x64, t6, t4));
+                try self.emit(a64.mov(width, t2, 31));
+                self.a.placeLabel(retry);
+                try self.emitChecked(a64.ldrImm(memSize(size), t1, t6, 0).?);
+                try self.emit(a64.sub(width, t0, t2, t1));
+                if (size == .bits8 or size == .bits16) {
+                    try self.emit(a64.logicalImmediate(.w32, .andop, t0, t0, maskFor(size)).?);
+                }
+                try self.emit(a64.mov(width, 3, t1));
+                try self.emit(a64.casalScalar(memSize(size), 3, t0, t6));
+                try self.emit(a64.cmp(width, 3, t1));
+                try self.a.branchCond(.ne, retry);
+                try self.emitArithmeticFlags(.sub, size, t2, t1, t0, false);
+            },
+            .bitwise_not => {
+                const retry = try self.a.createLabel();
+                try self.emit(a64.mov(.x64, t6, t4));
+                self.a.placeLabel(retry);
+                try self.emitChecked(a64.ldrImm(memSize(size), t1, t6, 0).?);
+                try self.emit(a64.mvn(width, t0, t1));
+                if (size == .bits8 or size == .bits16) {
+                    try self.emit(a64.logicalImmediate(.w32, .andop, t0, t0, maskFor(size)).?);
+                }
+                try self.emit(a64.mov(width, 3, t1));
+                try self.emit(a64.casalScalar(memSize(size), 3, t0, t6));
+                try self.emit(a64.cmp(width, 3, t1));
+                try self.a.branchCond(.ne, retry);
+            },
+            .bit_set, .bit_reset, .bit_complement => unreachable,
         }
+        try self.emit(a64.dmbIsh());
         try self.a.branch(done);
         self.a.placeLabel(slow);
         try self.emitInterpretCall(index);
         self.a.placeLabel(done);
+    }
+
+    /// CMPXCHG8B compares EDX:EAX against one aligned 64-bit memory value,
+    /// conditionally stores ECX:EBX, and changes only ZF. Keeping the pair
+    /// composition and split in this template avoids an interpreter call for
+    /// this Xenos runtime primitive while one CASAL remains the indivisible
+    /// memory operation.
+    fn emitAtomicCompareExchange8b(self: *Compiler, insn: Insn, index: u32) Error!void {
+        const slow = try self.a.createLabel();
+        const done = try self.a.createLabel();
+        const matched = try self.a.createLabel();
+        try self.emitEffectiveAddress(1, insn);
+        try self.emitTlbProbe(true, 8, slow);
+        try self.emitHostAlignmentGuard(t4, 8, slow);
+        try self.emit(a64.dmbIsh());
+
+        try self.loadReg(t0, .al_ax_eax_rax, false, .bits32);
+        try self.loadReg(t1, .dl_dx_edx_rdx, false, .bits32);
+        try self.emit(a64.lslImm(.x64, t1, t1, 32));
+        try self.emit(a64.orrReg(.x64, t3, t0, t1));
+        try self.emit(a64.mov(.x64, t6, t3));
+
+        try self.loadReg(t0, .bl_bx_ebx_rbx, false, .bits32);
+        try self.loadReg(t1, .cl_cx_ecx_rcx, false, .bits32);
+        try self.emit(a64.lslImm(.x64, t1, t1, 32));
+        try self.emit(a64.orrReg(.x64, t2, t0, t1));
+        // CASAL writes the observed word back into the expected-value
+        // register (t3), whether the exchange succeeds or fails.
+        try self.emit(a64.casalScalar(.doubleword, t3, t2, t4));
+        try self.emit(a64.cmp(.x64, t3, t6));
+        if (self.emit_flags) {
+            try self.emit(a64.cset(.w32, t4, .eq));
+            try self.loadFlags(t0);
+            try self.clearFlagBits(t0, RFL_ZF);
+            try self.orFlagBit(t0, t4, 6);
+            try self.storeFlags(t0);
+        }
+        try self.a.branchCond(.eq, matched);
+
+        // Failure returns the complete observed EDX:EAX pair. The compare
+        // result in t3 and original expected value in t6 stay live until the
+        // branch above; only then are the two architectural registers split.
+        try self.emit(a64.ubfx(.w32, t0, t3, 0, 32));
+        try self.emit(a64.lsrImm(.x64, t1, t3, 32));
+        try self.storeReg(.al_ax_eax_rax, false, .bits32, t0);
+        try self.storeReg(.dl_dx_edx_rdx, false, .bits32, t1);
+        self.a.placeLabel(matched);
+        try self.emit(a64.dmbIsh());
+        try self.a.branch(done);
+        self.a.placeLabel(slow);
+        try self.emitInterpretCall(index);
+        self.a.placeLabel(done);
+    }
+
+    /// CMPXCHG16B compares RDX:RAX with the two adjacent memory words and,
+    /// on a match, stores RCX:RBX. CASPAL consumes even/odd register pairs:
+    /// the expected pair is x10/x11 and the desired pair x12/x13. The
+    /// returned observed pair is used both for the failure registers and for
+    /// the instruction's sole defined flag, ZF.
+    fn emitAtomicCompareExchange16b(self: *Compiler, insn: Insn, index: u32) Error!void {
+        const slow = try self.a.createLabel();
+        const done = try self.a.createLabel();
+        const matched = try self.a.createLabel();
+        try self.emitEffectiveAddress(1, insn);
+        try self.emitTlbProbe(true, 16, slow);
+        try self.emitHostAlignmentGuard(t4, 16, slow);
+        // Preserve the probed host address before t4 is reused to load RCX,
+        // the high half of the desired value pair.
+        try self.emit(a64.mov(.x64, 16, t4));
+        try self.emit(a64.dmbIsh());
+
+        try self.loadReg(t1, .al_ax_eax_rax, false, .bits64);
+        try self.loadReg(t2, .dl_dx_edx_rdx, false, .bits64);
+        try self.emit(a64.mov(.x64, t5, t1));
+        try self.emit(a64.mov(.x64, t6, t2));
+        try self.loadReg(t3, .bl_bx_ebx_rbx, false, .bits64);
+        try self.loadReg(t4, .cl_cx_ecx_rcx, false, .bits64);
+        // x16 is outside the allocated CASP pairs and holds the host address.
+        try self.emit(a64.caspal(t1, t3, 16));
+
+        try self.emit(a64.cmp(.x64, t1, t5));
+        try self.emit(a64.cset(.w32, t0, .eq));
+        try self.emit(a64.cmp(.x64, t2, t6));
+        try self.emit(a64.cset(.w32, t5, .eq));
+        try self.emit(a64.andReg(.w32, t0, t0, t5));
+        if (self.emit_flags) {
+            try self.loadFlags(t4);
+            try self.clearFlagBits(t4, RFL_ZF);
+            try self.orFlagBit(t4, t0, 6);
+            try self.storeFlags(t4);
+        }
+        try self.a.branchIfNonZero(.w32, t0, matched);
+
+        // A mismatch copies the exact memory pair returned by CASPAL into
+        // RDX:RAX; the successful path leaves both registers untouched.
+        try self.storeReg(.al_ax_eax_rax, false, .bits64, t1);
+        try self.storeReg(.dl_dx_edx_rdx, false, .bits64, t2);
+        self.a.placeLabel(matched);
+        try self.emit(a64.dmbIsh());
+        try self.a.branch(done);
+        self.a.placeLabel(slow);
+        try self.emitInterpretCall(index);
+        self.a.placeLabel(done);
+    }
+
+    /// Unprefixed CMPXCHG and XADD are ordinary read/modify/write sequences,
+    /// not indivisible transactions. Use the admitted write page directly
+    /// without paying for a host CAS; a page that needs helper semantics
+    /// still takes the interpreter's complete instruction path.
+    fn emitNonAtomicCompareExchange(self: *Compiler, insn: Insn, index: u32) Error!void {
+        const d = insn.decoded;
+        const size = d.size;
+        const width = arm(size);
+        const slow = try self.a.createLabel();
+        const done = try self.a.createLabel();
+        const mismatch = try self.a.createLabel();
+        try self.emitEffectiveAddress(1, insn);
+        try self.emitTlbProbe(true, bits(size) / 8, slow);
+        try self.emitHostAlignmentGuard(t4, bits(size) / 8, slow);
+        try self.emitOrderedScalar(false, size, t2, t4);
+        // Arithmetic flag materialization uses t4/t5. Preserve the admitted
+        // host address across it so the following ordered store cannot be
+        // redirected through a flag scratch value.
+        try self.emit(a64.mov(.x64, t6, t4));
+        try self.loadReg(t1, .al_ax_eax_rax, false, size);
+        try self.emit(a64.sub(width, t0, t1, t2));
+        if (size == .bits8 or size == .bits16) try self.emit(a64.ubfx(.w32, t0, t0, 0, @intCast(bits(size))));
+        try self.emitArithmeticFlags(.sub, size, t1, t2, t0, false);
+        try self.emit(a64.cmp(width, t1, t2));
+        try self.a.branchCond(.ne, mismatch);
+        try self.loadReg(t0, d.src_reg, false, size);
+        try self.emitOrderedScalar(true, size, t0, t6);
+        try self.a.branch(done);
+        self.a.placeLabel(mismatch);
+        try self.storeReg(.al_ax_eax_rax, false, size, t2);
+        try self.a.branch(done);
+        self.a.placeLabel(slow);
+        try self.emitInterpretCall(index);
+        self.a.placeLabel(done);
+    }
+
+    fn emitNonAtomicExchangeAdd(self: *Compiler, insn: Insn, index: u32) Error!void {
+        const d = insn.decoded;
+        const size = d.size;
+        const width = arm(size);
+        const slow = try self.a.createLabel();
+        const done = try self.a.createLabel();
+        try self.emitEffectiveAddress(1, insn);
+        try self.emitTlbProbe(true, bits(size) / 8, slow);
+        try self.emitHostAlignmentGuard(t4, bits(size) / 8, slow);
+        try self.emitOrderedScalar(false, size, t1, t4);
+        // `emitArithmeticFlags` can reuse t4; the host pointer survives in
+        // the otherwise-unused t6 until the ordered store commits.
+        try self.emit(a64.mov(.x64, t6, t4));
+        try self.loadReg(t2, d.src_reg, false, size);
+        try self.emit(a64.add(width, t0, t1, t2));
+        if (size == .bits8 or size == .bits16) try self.emit(a64.ubfx(.w32, t0, t0, 0, @intCast(bits(size))));
+        try self.emitArithmeticFlags(.add, size, t1, t2, t0, false);
+        try self.emitOrderedScalar(true, size, t0, t6);
+        try self.storeReg(d.src_reg, false, size, t1);
+        try self.a.branch(done);
+        self.a.placeLabel(slow);
+        try self.emitInterpretCall(index);
+        self.a.placeLabel(done);
+    }
+
+    /// Locked BTS/BTR/BTC with an immediate bit index. The CAS retry loop
+    /// publishes the bit change atomically and computes CF from the value
+    /// whose update actually committed.
+    fn emitAtomicBitTest(self: *Compiler, insn: Insn, index: u32, form: AtomicForm) Error!void {
+        const d = insn.decoded;
+        const size = d.size;
+        const width = arm(size);
+        const byte_count = bits(size) / 8;
+        const register_index = d.op == .bts_mem_reg or d.op == .btr_mem_reg or d.op == .btc_mem_reg;
+        const slow = try self.a.createLabel();
+        const done = try self.a.createLabel();
+        const retry = try self.a.createLabel();
+        if (register_index) {
+            try self.emitBitTestMemoryRegisterAddress(insn);
+            try self.emitBitTestMemoryRegisterMask(d, t6);
+        } else {
+            try self.emitEffectiveAddress(1, insn);
+            const bit: u6 = @intCast(d.imm & (bits(size) - 1));
+            try self.a.loadConstant(t6, @as(u64, 1) << bit);
+        }
+        try self.emitTlbProbe(true, byte_count, slow);
+        try self.emitHostAlignmentGuard(t4, byte_count, slow);
+        try self.emit(a64.dmbIsh());
+        self.a.placeLabel(retry);
+        try self.emitChecked(a64.ldrImm(memSize(size), t1, t4, 0));
+        switch (form) {
+            .bit_set => try self.emit(a64.orrReg(width, t0, t1, t6)),
+            .bit_reset => try self.emit(a64.bicReg(width, t0, t1, t6)),
+            .bit_complement => try self.emit(a64.eorReg(width, t0, t1, t6)),
+            else => unreachable,
+        }
+        try self.emit(a64.mov(width, 3, t1));
+        try self.emit(a64.casalScalar(memSize(size), 3, t0, t4));
+        try self.emit(a64.cmp(width, 3, t1));
+        try self.a.branchCond(.ne, retry);
+        if (self.emit_flags) {
+            try self.emit(a64.andReg(width, t0, t1, t6));
+            try self.emitChecked(a64.cmpImm(width, t0, 0));
+            try self.emit(a64.cset(.w32, t4, .ne));
+            try self.loadFlags(t3);
+            try self.clearFlagBits(t3, RFL_CF);
+            try self.orFlagBit(t3, t4, 0);
+            try self.storeFlags(t3);
+        }
+        try self.emit(a64.dmbIsh());
+        try self.a.branch(done);
+        self.a.placeLabel(slow);
+        try self.emitInterpretCall(index);
+        self.a.placeLabel(done);
+    }
+
+    /// Compute the memory element selected by a register bit index. For the
+    /// memory form, the signed high bits select preceding/following elements;
+    /// only the low operand-width bits select the bit inside that element.
+    fn emitBitTestMemoryRegisterAddress(self: *Compiler, insn: Insn) Error!void {
+        const d = insn.decoded;
+        var displacement: u64 = d.addr;
+        if (d.rip_relative) displacement +%= insn.rip +% d.len;
+        try self.a.loadConstant(1, displacement);
+        if (d.sib_has_base) {
+            try self.loadReg(t0, d.sib_base_reg, false, .bits64);
+            try self.emit(a64.add(.x64, 1, 1, t0));
+        }
+        if (d.sib_has_index) {
+            try self.loadReg(t0, d.sib_index_reg, false, .bits64);
+            try self.emit(a64.addSubShifted(.x64, .add, false, 1, 1, t0, d.sib_scale));
+        }
+
+        try self.loadReg(t2, d.src_reg, d.src_high8, d.size);
+        try self.emit(a64.sbfm(.x64, t5, t2, 0, @intCast(bits(d.size) - 1)));
+        const element_shift: u6 = @intCast(@ctz(bits(d.size)));
+        const byte_shift: u6 = @intCast(@ctz(bits(d.size) / 8));
+        try self.emit(a64.asrImm(.x64, t5, t5, element_shift));
+        try self.emit(a64.lslImm(.x64, t5, t5, byte_shift));
+        try self.emit(a64.add(.x64, 1, 1, t5));
+        if (d.has_0x67) try self.emit(a64.mov(.w32, 1, 1));
+        switch (insn.segment) {
+            .fs => {
+                try self.emitChecked(a64.ldrImm(.doubleword, t0, r_regs, fs_base_offset));
+                try self.emit(a64.add(.x64, 1, 1, t0));
+            },
+            .gs => {
+                try self.emitChecked(a64.ldrImm(.doubleword, t0, r_regs, gs_base_offset));
+                try self.emit(a64.add(.x64, 1, 1, t0));
+            },
+            else => {},
+        }
+    }
+
+    /// Compute the width-limited result and carry/borrow out for a locked
+    /// ADC/SBB CAS attempt. x16 contains the instruction's original CF, not
+    /// the flags from a failed attempt. t6 carries the out bit to flag
+    /// synthesis after the compare/exchange succeeds.
+    fn emitAtomicCarryResult(self: *Compiler, size: Size, is_add: bool) Error!void {
+        const width_bits = bits(size);
+        if (is_add) {
+            if (size == .bits64) {
+                try self.emit(a64.adds(.x64, t0, t1, t2));
+                try self.emit(a64.cset(.w32, t5, .hs));
+                try self.emit(a64.adds(.x64, t0, t0, 16));
+                try self.emit(a64.cset(.w32, t6, .hs));
+                try self.emit(a64.orrReg(.w32, t6, t6, t5));
+            } else {
+                try self.emit(a64.add(.x64, t0, t1, t2));
+                try self.emit(a64.add(.x64, t0, t0, 16));
+                try self.emit(a64.ubfx(.x64, t6, t0, @intCast(width_bits), 1));
+                try self.emit(a64.logicalImmediate(.x64, .andop, t0, t0, maskFor(size)).?);
+            }
+        } else if (size == .bits64) {
+            try self.emit(a64.subs(.x64, t0, t1, t2));
+            try self.emit(a64.cset(.w32, t5, .lo));
+            try self.emit(a64.subs(.x64, t0, t0, 16));
+            try self.emit(a64.cset(.w32, t6, .lo));
+            try self.emit(a64.orrReg(.w32, t6, t6, t5));
+        } else {
+            try self.emit(a64.sub(.x64, t0, t1, t2));
+            try self.emit(a64.sub(.x64, t0, t0, 16));
+            try self.emit(a64.ubfx(.x64, t6, t0, @intCast(width_bits), 1));
+            try self.emit(a64.logicalImmediate(.x64, .andop, t0, t0, maskFor(size)).?);
+        }
+    }
+
+    /// `destination = 1 << (index & (operand_bits - 1))` for a memory bit
+    /// operation. `destination` must survive the TLB probe when it is `t6`.
+    fn emitBitTestMemoryRegisterMask(self: *Compiler, d: DecodedInsn, destination: a64.Reg) Error!void {
+        try self.loadReg(t2, d.src_reg, d.src_high8, d.size);
+        try self.emit(a64.logicalImmediate(.x64, .andop, t2, t2, bits(d.size) - 1).?);
+        try self.a.loadConstant(t5, 1);
+        try self.emit(a64.lslv(.x64, destination, t5, t2));
     }
 
     /// `bt`/`bts`/`btr [mem], imm` (`executeBitTestMemory`): the immediate
@@ -3430,8 +4431,44 @@ const Compiler = struct {
             .probe => unreachable,
             .set => try self.emit(a64.orrReg(width, t0, 0, t5)),
             .reset => try self.emit(a64.bicReg(width, t0, 0, t5)),
+            .complement => try self.emit(a64.eorReg(width, t0, 0, t5)),
         }
         try self.emitStoreOperand(insn, size, index);
+        try self.emitAbortCheck(index);
+    }
+
+    /// `bt`/`bts`/`btr`/`btc [mem], reg`. The high signed index bits select
+    /// the addressed operand-sized element. A modifying operation uses the
+    /// ordinary ordered read/write helpers unless LOCK routed it through the
+    /// CAS implementation above.
+    fn emitBitTestMemoryRegister(self: *Compiler, insn: Insn, index: u32, kind: BitTestKind) Error!void {
+        const d = insn.decoded;
+        const width = arm(d.size);
+        try self.emitBitTestMemoryRegisterAddress(insn);
+        try self.emitRead(d.size, index);
+        try self.emitAbortCheck(index);
+        try self.emit(a64.mov(.x64, t1, 0));
+        try self.emitBitTestMemoryRegisterMask(d, t5);
+        if (self.emit_flags) {
+            try self.emit(a64.andReg(width, t4, t1, t5));
+            try self.emitChecked(a64.cmpImm(width, t4, 0));
+            try self.emit(a64.cset(.w32, t4, .ne));
+            try self.loadFlags(t3);
+            try self.clearFlagBits(t3, RFL_CF);
+            try self.orFlagBit(t3, t4, 0);
+            try self.storeFlags(t3);
+        }
+        if (kind == .probe) return;
+        switch (kind) {
+            .probe => unreachable,
+            .set => try self.emit(a64.orrReg(width, t0, t1, t5)),
+            .reset => try self.emit(a64.bicReg(width, t0, t1, t5)),
+            .complement => try self.emit(a64.eorReg(width, t0, t1, t5)),
+        }
+        try self.emit(a64.mov(.x64, t6, t0));
+        try self.emitBitTestMemoryRegisterAddress(insn);
+        try self.emit(a64.mov(.x64, 3, t6));
+        try self.emitWrite(d.size, index);
         try self.emitAbortCheck(index);
     }
 
@@ -3496,6 +4533,49 @@ const Compiler = struct {
         }
     }
 
+    /// Population count for the register forms. The SWAR sequence operates
+    /// on a zero-extended source, so it covers 16-, 32-, and 64-bit operands
+    /// without a memory helper or an architecture-specific host instruction.
+    fn emitPopulationCount(self: *Compiler, d: DecodedInsn) Error!void {
+        try self.loadReg(t1, d.src_reg, false, d.size);
+        try self.emit(a64.mov(.x64, t0, t1));
+
+        // x = x - ((x >> 1) & 0x5555...)
+        try self.emit(a64.lsrImm(.x64, t2, t0, 1));
+        try self.emit(a64.logicalImmediate(.x64, .andop, t2, t2, 0x5555_5555_5555_5555).?);
+        try self.emit(a64.sub(.x64, t0, t0, t2));
+
+        // Sum adjacent 2-bit fields, then 4-bit fields.
+        try self.emit(a64.logicalImmediate(.x64, .andop, t1, t0, 0x3333_3333_3333_3333).?);
+        try self.emit(a64.lsrImm(.x64, t2, t0, 2));
+        try self.emit(a64.logicalImmediate(.x64, .andop, t2, t2, 0x3333_3333_3333_3333).?);
+        try self.emit(a64.add(.x64, t0, t1, t2));
+        try self.emit(a64.lsrImm(.x64, t2, t0, 4));
+        try self.emit(a64.add(.x64, t1, t0, t2));
+        try self.emit(a64.logicalImmediate(.x64, .andop, t0, t1, 0x0F0F_0F0F_0F0F_0F0F).?);
+
+        // Fold each byte into the low byte, then retain the maximum count.
+        try self.emit(a64.lsrImm(.x64, t2, t0, 8));
+        try self.emit(a64.add(.x64, t0, t0, t2));
+        try self.emit(a64.lsrImm(.x64, t2, t0, 16));
+        try self.emit(a64.add(.x64, t0, t0, t2));
+        if (d.size == .bits64) {
+            try self.emit(a64.lsrImm(.x64, t2, t0, 32));
+            try self.emit(a64.add(.x64, t0, t0, t2));
+        }
+        try self.emit(a64.logicalImmediate(.x64, .andop, t0, t0, 0x7F).?);
+
+        if (self.emit_flags) {
+            try self.loadFlags(t3);
+            try self.clearFlagBits(t3, RFL_CF | RFL_PF | RFL_AF | RFL_ZF | RFL_SF | RFL_OF);
+            try self.emitChecked(a64.cmpImm(.x64, t0, 0));
+            try self.emit(a64.cset(.w32, t4, .eq));
+            try self.orFlagBit(t3, t4, 6);
+            try self.storeFlags(t3);
+        }
+        try self.storeReg(d.dst_reg, false, d.size, t0);
+    }
+
     // -- vector register file and memory ------------------------------------------
 
     fn xmmOffset(index: u8) u32 {
@@ -3511,13 +4591,97 @@ const Compiler = struct {
     }
 
     fn loadYmmHigh(self: *Compiler, v: a64.Reg, index: u8) Error!void {
-        try self.emitStateAddress(t0, self.layout.ymm_hi_offset + xmmOffset(index));
+        try self.emitRegisterFileAddress(t0, .ymm_hi, xmmOffset(index));
         try self.emitChecked(a64.vldrQ(v, t0, 0));
     }
 
     fn storeYmmHigh(self: *Compiler, index: u8, v: a64.Reg) Error!void {
-        try self.emitStateAddress(t0, self.layout.ymm_hi_offset + xmmOffset(index));
+        try self.emitRegisterFileAddress(t0, .ymm_hi, xmmOffset(index));
         try self.emitChecked(a64.vstrQ(v, t0, 0));
+    }
+
+    /// Put the OR of a vector's two 64-bit lanes in `result`. A non-zero
+    /// result means at least one bit is set; this is the reduction used by
+    /// VTEST/VTESTP's CF and ZF definitions.
+    fn emitVectorAnySet(self: *Compiler, vector: a64.Reg, result: a64.Reg, scratch: a64.Reg) Error!void {
+        try self.emit(a64.vumov(.d2, result, vector, 0));
+        try self.emit(a64.vumov(.d2, scratch, vector, 1));
+        try self.emit(a64.orrReg(.x64, result, result, scratch));
+    }
+
+    fn emitVectorTest(self: *Compiler, insn: Insn, index: u32) Error!void {
+        const d = insn.decoded;
+        // The interpreter evaluates the complete memory source before it
+        // changes flags. Check each half immediately so a fault never leaves
+        // partial flag state behind.
+        if (!d.is_reg_form) try self.emitSettleFlags();
+        if (d.is_reg_form) {
+            try self.loadXmm(v2, d.xmm_src2);
+            if (d.vector_256) try self.loadYmmHigh(v3, d.xmm_src2);
+        } else {
+            try self.emitLoadVecOffset(insn, index, v2, 0);
+            try self.emitAbortCheck(index);
+            if (d.vector_256) {
+                try self.emitLoadVecOffset(insn, index, v3, 16);
+                try self.emitAbortCheck(index);
+            }
+        }
+        if (!self.emit_flags) return;
+        // Clear flags before the reductions: clearFlagBits may borrow t5 as
+        // its materialised-mask register, while t4/t5 hold the two reduced
+        // predicates below.
+        try self.loadFlags(t3);
+        try self.clearFlagBits(t3, RFL_CF | RFL_PF | RFL_AF | RFL_ZF | RFL_SF | RFL_OF);
+        try self.loadXmm(v1, d.xmm_src);
+        try self.emit(a64.vand(v4, v1, v2));
+        try self.emitVectorAnySet(v4, t4, t0);
+        try self.emit(a64.vbic(v5, v2, v1));
+        try self.emitVectorAnySet(v5, t5, t0);
+        if (d.vector_256) {
+            try self.loadYmmHigh(v1, d.xmm_src);
+            try self.emit(a64.vand(v4, v1, v3));
+            try self.emitVectorAnySet(v4, t6, t0);
+            try self.emit(a64.orrReg(.x64, t4, t4, t6));
+            try self.emit(a64.vbic(v5, v3, v1));
+            try self.emitVectorAnySet(v5, t6, t0);
+            try self.emit(a64.orrReg(.x64, t5, t5, t6));
+        }
+        try self.emitChecked(a64.cmpImm(.x64, t4, 0));
+        try self.emit(a64.cset(.w32, t6, .eq));
+        try self.orFlagBit(t3, t6, 6);
+        try self.emitChecked(a64.cmpImm(.x64, t5, 0));
+        try self.emit(a64.cset(.w32, t6, .eq));
+        try self.orFlagBit(t3, t6, 0);
+        try self.storeFlags(t3);
+    }
+
+    fn emitPackedFloat(self: *Compiler, form: PackedFloatForm, dst: a64.Reg, lhs: a64.Reg, rhs: a64.Reg) Error!void {
+        switch (form.kind) {
+            .add => try self.emit(a64.vfadd(form.lanes, dst, lhs, rhs)),
+            .sub => try self.emit(a64.vfsub(form.lanes, dst, lhs, rhs)),
+            .mul => try self.emit(a64.vfmul(form.lanes, dst, lhs, rhs)),
+            .div => try self.emit(a64.vfdiv(form.lanes, dst, lhs, rhs)),
+            // `applyVexArithmetic`: min is `if (a < b) a else b`, max
+            // `if (a > b) a else b`: the second operand for NaN and ties.
+            .min => {
+                try self.emit(a64.vfcmgt(form.lanes, dst, rhs, lhs));
+                try self.emit(a64.vbsl(dst, lhs, rhs));
+            },
+            .max => {
+                try self.emit(a64.vfcmgt(form.lanes, dst, lhs, rhs));
+                try self.emit(a64.vbsl(dst, lhs, rhs));
+            },
+        }
+    }
+
+    fn emitBitwise(self: *Compiler, kind: VectorBitwise, dst: a64.Reg, lhs: a64.Reg, rhs: a64.Reg) Error!void {
+        try self.emit(switch (kind) {
+            .and_ => a64.vand(dst, lhs, rhs),
+            // `~left & right`.
+            .andn => a64.vbic(dst, rhs, lhs),
+            .or_ => a64.vorr(dst, lhs, rhs),
+            .xor => a64.veor(dst, lhs, rhs),
+        });
     }
 
     /// Clear the upper YMM half of `index` (every VEX.128 write), and the
@@ -3526,10 +4690,10 @@ const Compiler = struct {
     /// laid out in any order, so nothing assumes they follow `xmm`.
     fn clearUpper(self: *Compiler, index: u8, op: Op) Error!void {
         try self.emit(a64.vmoviZero(v7));
-        try self.emitStateAddress(t0, self.layout.ymm_hi_offset + xmmOffset(index));
+        try self.emitRegisterFileAddress(t0, .ymm_hi, xmmOffset(index));
         try self.emitChecked(a64.vstrQ(v7, t0, 0));
         if (evexRouted(op)) {
-            try self.emitStateAddress(t0, self.layout.zmm_hi_offset + @as(u32, index) * 32);
+            try self.emitRegisterFileAddress(t0, .zmm_hi, @as(u32, index) * 32);
             try self.emitChecked(a64.vstrQ(v7, t0, 0));
             try self.emitChecked(a64.vstrQ(v7, t0, 16));
         }
@@ -3560,7 +4724,8 @@ const Compiler = struct {
         const slow = try self.a.createLabel();
         const done = try self.a.createLabel();
         try self.emitTlbProbe(false, 16, slow);
-        try self.emitChecked(a64.vldrQ(v, t4, 0));
+        try self.emitHostAlignmentGuard(t4, 8, slow);
+        try self.emitOrderedVectorLoad(v, t4);
         try self.a.branch(done);
         self.a.placeLabel(slow);
         try self.emitCurrentIndex(index);
@@ -3594,7 +4759,8 @@ const Compiler = struct {
         const slow = try self.a.createLabel();
         const done = try self.a.createLabel();
         try self.emitTlbProbe(true, 16, slow);
-        try self.emitChecked(a64.vstrQ(v, t4, 0));
+        try self.emitHostAlignmentGuard(t4, 8, slow);
+        try self.emitOrderedVectorStore(v, t4);
         try self.a.branch(done);
         self.a.placeLabel(slow);
         try self.emitChecked(a64.vstrQ(v, r_scratch, scratch_vector_offset));
@@ -3762,6 +4928,25 @@ const Compiler = struct {
         if (!isVectorNative(d)) return false;
         self.touches_vectors = true;
         const dst = d.xmm_dst;
+        if (d.op == .vptest or d.op == .vtestps or d.op == .vtestpd) {
+            try self.emitVectorTest(insn, index);
+            return true;
+        }
+        if (d.op == .vextractf128) {
+            if ((d.imm & 1) == 0) {
+                try self.loadXmm(v0, d.xmm_src);
+            } else {
+                try self.loadYmmHigh(v0, d.xmm_src);
+            }
+            if (d.is_reg_form) {
+                try self.storeXmm(dst, v0);
+                try self.clearUpper(dst, d.op);
+            } else {
+                try self.emitStoreVecOffset(insn, index, v0, 0);
+                try self.emitAbortCheck(index);
+            }
+            return true;
+        }
         if (d.vector_256) {
             if (d.op == .vcvtps2pd) {
                 // Four singles from the 128-bit source: the low two to the
@@ -3772,6 +4957,42 @@ const Compiler = struct {
                 try self.storeXmm(dst, v0);
                 try self.storeYmmHigh(dst, v1);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
+                return true;
+            }
+            if (packedFloatForm(d.op)) |form| {
+                if (d.is_reg_form) {
+                    try self.loadXmm(v2, d.xmm_src2);
+                    try self.loadYmmHigh(v3, d.xmm_src2);
+                } else {
+                    try self.emitLoadVecOffset(insn, index, v2, 0);
+                    try self.emitAbortCheck(index);
+                    try self.emitLoadVecOffset(insn, index, v3, 16);
+                    try self.emitAbortCheck(index);
+                }
+                try self.loadXmm(v1, d.xmm_src);
+                try self.emitPackedFloat(form, v0, v1, v2);
+                try self.storeXmm(dst, v0);
+                try self.loadYmmHigh(v1, d.xmm_src);
+                try self.emitPackedFloat(form, v0, v1, v3);
+                try self.storeYmmHigh(dst, v0);
+                return true;
+            }
+            if (bitwiseForm(d.op)) |kind| {
+                if (d.is_reg_form) {
+                    try self.loadXmm(v2, d.xmm_src2);
+                    try self.loadYmmHigh(v3, d.xmm_src2);
+                } else {
+                    try self.emitLoadVecOffset(insn, index, v2, 0);
+                    try self.emitAbortCheck(index);
+                    try self.emitLoadVecOffset(insn, index, v3, 16);
+                    try self.emitAbortCheck(index);
+                }
+                try self.loadXmm(v1, d.xmm_src);
+                try self.emitBitwise(kind, v0, v1, v2);
+                try self.storeXmm(dst, v0);
+                try self.loadYmmHigh(v1, d.xmm_src);
+                try self.emitBitwise(kind, v0, v1, v3);
+                try self.storeYmmHigh(dst, v0);
                 return true;
             }
             // Two 128-bit halves, and no upper-half clear: at 256 bits the
@@ -3829,22 +5050,7 @@ const Compiler = struct {
         if (packedFloatForm(d.op)) |form| {
             try self.loadSource2(insn, index, v2);
             try self.loadXmm(v1, d.xmm_src);
-            switch (form.kind) {
-                .add => try self.emit(a64.vfadd(form.lanes, v0, v1, v2)),
-                .sub => try self.emit(a64.vfsub(form.lanes, v0, v1, v2)),
-                .mul => try self.emit(a64.vfmul(form.lanes, v0, v1, v2)),
-                .div => try self.emit(a64.vfdiv(form.lanes, v0, v1, v2)),
-                // `applyVexArithmetic`: min is `if (a < b) a else b`, max
-                // `if (a > b) a else b`: the second operand for NaN and ties.
-                .min => {
-                    try self.emit(a64.vfcmgt(form.lanes, v0, v2, v1));
-                    try self.emit(a64.vbsl(v0, v1, v2));
-                },
-                .max => {
-                    try self.emit(a64.vfcmgt(form.lanes, v0, v1, v2));
-                    try self.emit(a64.vbsl(v0, v1, v2));
-                },
-            }
+            try self.emitPackedFloat(form, v0, v1, v2);
             try self.storeXmm(dst, v0);
             try self.clearUpper(dst, d.op);
             if (touchesMemory(d)) try self.emitAbortCheck(index);
@@ -3877,13 +5083,7 @@ const Compiler = struct {
         if (bitwiseForm(d.op)) |kind| {
             try self.loadSource2(insn, index, v2);
             try self.loadXmm(v1, d.xmm_src);
-            try self.emit(switch (kind) {
-                .and_ => a64.vand(v0, v1, v2),
-                // `~left & right`.
-                .andn => a64.vbic(v0, v2, v1),
-                .or_ => a64.vorr(v0, v1, v2),
-                .xor => a64.veor(v0, v1, v2),
-            });
+            try self.emitBitwise(kind, v0, v1, v2);
             try self.storeXmm(dst, v0);
             try self.clearUpper(dst, d.op);
             if (touchesMemory(d)) try self.emitAbortCheck(index);
@@ -4406,7 +5606,7 @@ const Compiler = struct {
             },
             .vzeroupper => {
                 try self.emit(a64.vmoviZero(v7));
-                try self.emitStateAddress(t0, self.layout.ymm_hi_offset);
+                try self.emitRegisterFileAddress(t0, .ymm_hi, 0);
                 for (0..32) |register| {
                     try self.emitChecked(a64.vstrQ(v7, t0, xmmOffset(@intCast(register))));
                 }
@@ -4599,7 +5799,7 @@ const TestState = struct {
     iat_high: u64 = 0,
     hook_filter: [hook_filter_bytes]u8 = @splat(0),
     image_targets_hooked: u8 = 1,
-    memory: [4096]u8 = [_]u8{0} ** 4096,
+    memory: [4096]u8 align(16) = [_]u8{0} ** 4096,
 
     const layout = Layout{
         .regs_offset = @offsetOf(TestState, "regs"),
@@ -4752,7 +5952,7 @@ const TestHarness = struct {
         };
         state.scratch.abort = 0;
         state.scratch.block = &self.block;
-        return self.block.entry()(state, &self.block.helpers);
+        return self.block.entry()(state, &self.block.helpers, &state.scratch);
     }
 };
 
@@ -4955,8 +6155,494 @@ test "locked exchange, compare-exchange and exchange-add are single host atomics
     _ = try h.run(&state);
     try testing.expectEqual(@as(u32, 1), state.interprets);
 
-    // Every other locked form is still the interpreter's.
-    try testing.expect(!isNative(.{ .op = .add_mem32_reg32, .size = .bits32, .lock = true }));
+    // Locked arithmetic/logic updates use the CAS loop at their decoded
+    // width, including sub-word updates that must preserve neighbours.
+    var native_add = baseDisp(.add_mem32_reg32, .bits32, .cl_cx_ecx_rcx, 0x20);
+    native_add.lock = true;
+    try testing.expect(isNative(native_add));
+    var narrow_add = baseDisp(.add_mem16_reg16, .bits16, .cl_cx_ecx_rcx, 0x20);
+    narrow_add.lock = true;
+    try testing.expect(isNative(narrow_add));
+    state = TestState{};
+    state.admitMemory(true, true);
+    state.regs.rbx = 0x100;
+    state.regs.rcx = 3;
+    std.mem.writeInt(u16, state.memory[0x120..][0..2], 0xFFFF, .little);
+    state.memory[0x122] = 0xA5;
+    h.insns.clearRetainingCapacity();
+    try h.add(0x1000, 4, narrow_add);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, state.memory[0x120..][0..2], .little));
+    try testing.expectEqual(@as(u8, 0xA5), state.memory[0x122]);
+    try testing.expect(state.regs.rflags & RFL_CF != 0);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+}
+
+test "cmpxchg8b uses one native 64-bit CAS and changes only ZF" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    var state = TestState{};
+    state.admitMemory(true, true);
+    const address = 0x120;
+    const original: u64 = 0x1122_3344_5566_7788;
+    const replacement: u64 = 0xDDEE_FF00_99AA_BBCC;
+    std.mem.writeInt(u64, state.memory[address..][0..8], original, .little);
+    state.regs.rax = @truncate(original);
+    state.regs.rdx = original >> 32;
+    state.regs.rbx = 0x99AA_BBCC;
+    state.regs.rcx = 0xDDEE_FF00;
+    state.regs.rflags = RFL_CF | RFL_SF | 2;
+
+    const cmpxchg: DecodedInsn = .{ .op = .cmpxchg8b_mem, .size = .bits32, .addr = address, .lock = true };
+    try testing.expect(isNative(cmpxchg));
+    try h.add(0x1000, 4, cmpxchg);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+    try testing.expectEqual(replacement, std.mem.readInt(u64, state.memory[address..][0..8], .little));
+    try testing.expectEqual(@as(u64, @truncate(original)), state.regs.rax);
+    try testing.expectEqual(@as(u64, original >> 32), state.regs.rdx);
+    try testing.expect(state.regs.rflags & RFL_ZF != 0);
+    try testing.expect(state.regs.rflags & RFL_CF != 0);
+    try testing.expect(state.regs.rflags & RFL_SF != 0);
+
+    // A mismatch leaves memory alone and returns the observed low/high pair.
+    h.insns.clearRetainingCapacity();
+    state.regs.rax = 0;
+    state.regs.rdx = 0;
+    state.regs.rflags = RFL_ZF | RFL_CF | 2;
+    try h.add(0x1000, 4, cmpxchg);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+    try testing.expectEqual(replacement, std.mem.readInt(u64, state.memory[address..][0..8], .little));
+    try testing.expectEqual(@as(u32, @truncate(replacement)), @as(u32, @truncate(state.regs.rax)));
+    try testing.expectEqual(@as(u32, replacement >> 32), @as(u32, @truncate(state.regs.rdx)));
+    try testing.expect(state.regs.rflags & RFL_ZF == 0);
+    try testing.expect(state.regs.rflags & RFL_CF != 0);
+}
+
+test "cmpxchg16b uses one native paired CAS and changes only ZF" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    var state = TestState{};
+    state.admitMemory(true, true);
+    const address = 0x120;
+    const original_low: u64 = 0x1122_3344_5566_7788;
+    const original_high: u64 = 0x99AA_BBCC_DDEE_FF00;
+    const replacement_low: u64 = 0x2233_4455_6677_8899;
+    const replacement_high: u64 = 0xAABB_CCDD_EEFF_0011;
+    std.mem.writeInt(u64, state.memory[address..][0..8], original_low, .little);
+    std.mem.writeInt(u64, state.memory[address + 8 ..][0..8], original_high, .little);
+    state.regs.rax = original_low;
+    state.regs.rdx = original_high;
+    state.regs.rbx = replacement_low;
+    state.regs.rcx = replacement_high;
+    state.regs.rflags = RFL_CF | RFL_OF | 2;
+
+    const cmpxchg: DecodedInsn = .{ .op = .cmpxchg16b_mem, .size = .bits64, .addr = address, .lock = true };
+    try testing.expect(isNative(cmpxchg));
+    try h.add(0x1000, 5, cmpxchg);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+    try testing.expectEqual(replacement_low, std.mem.readInt(u64, state.memory[address..][0..8], .little));
+    try testing.expectEqual(replacement_high, std.mem.readInt(u64, state.memory[address + 8 ..][0..8], .little));
+    try testing.expectEqual(original_low, state.regs.rax);
+    try testing.expectEqual(original_high, state.regs.rdx);
+    try testing.expect(state.regs.rflags & RFL_ZF != 0);
+    try testing.expect(state.regs.rflags & RFL_CF != 0);
+    try testing.expect(state.regs.rflags & RFL_OF != 0);
+
+    // A mismatch leaves memory unchanged and returns its observed 128-bit
+    // value in RDX:RAX.
+    h.insns.clearRetainingCapacity();
+    state.regs.rax = 0;
+    state.regs.rdx = 0;
+    state.regs.rflags = RFL_ZF | RFL_CF | 2;
+    try h.add(0x1000, 5, cmpxchg);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+    try testing.expectEqual(replacement_low, std.mem.readInt(u64, state.memory[address..][0..8], .little));
+    try testing.expectEqual(replacement_high, std.mem.readInt(u64, state.memory[address + 8 ..][0..8], .little));
+    try testing.expectEqual(replacement_low, state.regs.rax);
+    try testing.expectEqual(replacement_high, state.regs.rdx);
+    try testing.expect(state.regs.rflags & RFL_ZF == 0);
+    try testing.expect(state.regs.rflags & RFL_CF != 0);
+}
+
+test "unlocked compare-exchange and exchange-add avoid unnecessary host atomics" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    var state = TestState{};
+    state.admitMemory(true, true);
+    state.regs.rbx = 0x100;
+    state.regs.rax = 5;
+    state.regs.rcx = 9;
+    std.mem.writeInt(u64, state.memory[0x120..][0..8], 5, .little);
+
+    const cas = baseDisp(.cmpxchg_mem64_reg64, .bits64, .cl_cx_ecx_rcx, 0x20);
+    try h.add(0x1000, 4, cas);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+    try testing.expectEqual(@as(u64, 9), std.mem.readInt(u64, state.memory[0x120..][0..8], .little));
+    try testing.expectEqual(@as(u64, 5), state.regs.rax);
+    try testing.expect(state.regs.rflags & RFL_ZF != 0);
+
+    h.insns.clearRetainingCapacity();
+    state.regs.rsi = 3;
+    const xadd = baseDisp(.xadd_mem32_reg32, .bits32, .dh_si_esi_rsi, 0x20);
+    try h.add(0x1000, 3, xadd);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+    try testing.expectEqual(@as(u32, 12), std.mem.readInt(u32, state.memory[0x120..][0..4], .little));
+    try testing.expectEqual(@as(u64, 9), state.regs.rsi);
+}
+
+test "locked byte and word operations do not widen into adjacent guest bytes" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    var state = TestState{};
+    state.admitMemory(true, true);
+    state.regs.rbx = 0x100;
+    state.regs.rcx = 0x5678;
+    std.mem.writeInt(u16, state.memory[0x120..][0..2], 0x1234, .little);
+    state.memory[0x122] = 0xA5;
+    var exchange = baseDisp(.xchg_mem32_reg32, .bits16, .cl_cx_ecx_rcx, 0x20);
+    exchange.lock = true;
+    try testing.expect(isNative(exchange));
+    try h.add(0x1000, 3, exchange);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u16, 0x5678), std.mem.readInt(u16, state.memory[0x120..][0..2], .little));
+    try testing.expectEqual(@as(u64, 0x1234), state.regs.rcx);
+    try testing.expectEqual(@as(u8, 0xA5), state.memory[0x122]);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+
+    h.insns.clearRetainingCapacity();
+    state.memory[0x130] = 5;
+    state.memory[0x131] = 0xFE;
+    state.memory[0x132] = 0xA5;
+    state.regs.rax = 5;
+    state.regs.rcx = 9;
+    var compare_exchange = baseDisp(.cmpxchg_mem8_reg8, .bits8, .cl_cx_ecx_rcx, 0x30);
+    compare_exchange.lock = true;
+    try testing.expect(isNative(compare_exchange));
+    try h.add(0x1000, 4, compare_exchange);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u8, 9), state.memory[0x130]);
+    try testing.expectEqual(@as(u8, 0xFE), state.memory[0x131]);
+    try testing.expect(state.regs.rflags & RFL_ZF != 0);
+
+    h.insns.clearRetainingCapacity();
+    state.regs.rdx = 4;
+    var exchange_add = baseDisp(.xadd_mem8_reg8, .bits8, .dl_dx_edx_rdx, 0x31);
+    exchange_add.lock = true;
+    try testing.expect(isNative(exchange_add));
+    try h.add(0x1000, 4, exchange_add);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u8, 2), state.memory[0x131]);
+    try testing.expectEqual(@as(u8, 0xA5), state.memory[0x132]);
+    try testing.expectEqual(@as(u64, 0xFE), state.regs.rdx);
+    try testing.expect(state.regs.rflags & RFL_CF != 0);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+}
+
+test "locked bit set reset and complement commit through compare-and-swap" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    var state = TestState{};
+    state.admitMemory(true, true);
+    state.regs.rbx = 0x100;
+    std.mem.writeInt(u32, state.memory[0x120..][0..4], 0b10, .little);
+
+    var bts = baseDisp(.bts_mem_imm, .bits32, .al_ax_eax_rax, 0x20);
+    bts.imm = 5;
+    bts.lock = true;
+    try h.add(0x1000, 4, bts);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u32, 0b10_0010), std.mem.readInt(u32, state.memory[0x120..][0..4], .little));
+    try testing.expect(state.regs.rflags & RFL_CF == 0);
+
+    h.insns.clearRetainingCapacity();
+    var btr = bts;
+    btr.op = .btr_mem_imm;
+    try h.add(0x1000, 4, btr);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u32, 0b10), std.mem.readInt(u32, state.memory[0x120..][0..4], .little));
+    try testing.expect(state.regs.rflags & RFL_CF != 0);
+
+    h.insns.clearRetainingCapacity();
+    var btc = bts;
+    btc.op = .btc_mem_imm;
+    btc.imm = 1;
+    try h.add(0x1000, 4, btc);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, state.memory[0x120..][0..4], .little));
+    try testing.expect(state.regs.rflags & RFL_CF != 0);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+}
+
+test "register-indexed memory bit operations address signed adjacent elements" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+
+    inline for (.{ Size.bits16, Size.bits32, Size.bits64 }) |size| {
+        const width = bits(size);
+        const byte_count: usize = @intCast(width / 8);
+        var state = TestState{};
+        state.admitMemory(true, true);
+        state.regs.rflags |= RFL_CF;
+        const base: usize = 0x200 + ((8 - (@intFromPtr(state.memory[0x200..].ptr) & 7)) & 7);
+        state.regs.rbx = base;
+
+        const selected = base + byte_count;
+        @memset(state.memory[selected..][0..byte_count], 0);
+        state.regs.rcx = width + 3;
+        const set = DecodedInsn{
+            .op = .bts_mem_reg,
+            .size = size,
+            .src_reg = .cl_cx_ecx_rcx,
+            .sib_has_base = true,
+            .sib_base_reg = .bl_bx_ebx_rbx,
+        };
+        try testing.expect(isNative(set));
+        try h.add(0x1000, 4, set);
+        _ = try h.run(&state);
+        try testing.expectEqual(@as(u8, 0x08), state.memory[selected]);
+        try testing.expect(state.regs.rflags & RFL_CF == 0);
+        try testing.expectEqual(@as(u32, 0), state.interprets);
+        try testing.expectEqual(@as(u32, 0), state.reads + state.writes);
+
+        h.insns.clearRetainingCapacity();
+        state.regs.rflags &= ~RFL_CF;
+        const preceding = base - byte_count;
+        @memset(state.memory[preceding..][0..byte_count], 0);
+        state.memory[preceding + byte_count - 1] = 0x80;
+        state.regs.rcx = std.math.maxInt(u64);
+        var reset = set;
+        reset.op = .btr_mem_reg;
+        reset.lock = true;
+        try testing.expect(isNative(reset));
+        try h.add(0x2000, 4, reset);
+        _ = try h.run(&state);
+        try testing.expectEqual(@as(u8, 0), state.memory[preceding + byte_count - 1]);
+        try testing.expect(state.regs.rflags & RFL_CF != 0);
+        try testing.expectEqual(@as(u32, 0), state.interprets);
+        try testing.expectEqual(@as(u32, 0), state.reads + state.writes);
+    }
+}
+
+test "locked arithmetic and logic updates use an atomic CAS loop" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    var state = TestState{};
+    state.admitMemory(true, true);
+    state.regs.rbx = 0x100;
+    state.regs.rcx = 0x20;
+    std.mem.writeInt(u32, state.memory[0x120..][0..4], 0xFFFF_FFF0, .little);
+
+    // lock add dword [rbx + 0x20], ecx: the result wraps and sets CF.
+    var add = baseDisp(.add_mem32_reg32, .bits32, .cl_cx_ecx_rcx, 0x20);
+    add.lock = true;
+    try h.add(0x1000, 4, add);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u32, 0x10), std.mem.readInt(u32, state.memory[0x120..][0..4], .little));
+    try testing.expect(state.regs.rflags & RFL_CF != 0);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+
+    // Group-1 imm8 is sign-extended to the destination width: subtracting
+    // -1 adds one, then AND/OR/XOR exercise the other CAS computations.
+    h.insns.clearRetainingCapacity();
+    var sub = baseDisp(.sub_mem32_imm8, .bits32, .al_ax_eax_rax, 0x20);
+    sub.imm = 0xFF;
+    sub.lock = true;
+    try h.add(0x1000, 4, sub);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u32, 0x11), std.mem.readInt(u32, state.memory[0x120..][0..4], .little));
+
+    h.insns.clearRetainingCapacity();
+    state.regs.rcx = 0x07;
+    var and_update = baseDisp(.and_mem32_reg32, .bits32, .cl_cx_ecx_rcx, 0x20);
+    and_update.lock = true;
+    try h.add(0x1000, 4, and_update);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u32, 0x01), std.mem.readInt(u32, state.memory[0x120..][0..4], .little));
+
+    h.insns.clearRetainingCapacity();
+    var or_update = baseDisp(.or_mem32_imm8, .bits32, .al_ax_eax_rax, 0x20);
+    or_update.imm = 0x10;
+    or_update.lock = true;
+    try h.add(0x1000, 4, or_update);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u32, 0x11), std.mem.readInt(u32, state.memory[0x120..][0..4], .little));
+
+    h.insns.clearRetainingCapacity();
+    var xor_update = baseDisp(.xor_mem32_imm32, .bits32, .al_ax_eax_rax, 0x20);
+    xor_update.imm = 0xFF;
+    xor_update.lock = true;
+    try h.add(0x1000, 6, xor_update);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u32, 0xEE), std.mem.readInt(u32, state.memory[0x120..][0..4], .little));
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+
+    // The 64-bit immediate forms retain x86's sign-extension semantics.
+    h.insns.clearRetainingCapacity();
+    std.mem.writeInt(u64, state.memory[0x128..][0..8], 0x100, .little);
+    var sub64 = baseDisp(.sub_mem64_imm8, .bits64, .al_ax_eax_rax, 0x28);
+    sub64.imm = 1;
+    sub64.lock = true;
+    try h.add(0x1000, 5, sub64);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u64, 0xFF), std.mem.readInt(u64, state.memory[0x128..][0..8], .little));
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+}
+
+test "locked adc and sbb use a stable carry input across width-matched CAS updates" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    var state = TestState{};
+    state.admitMemory(true, true);
+    state.regs.rbx = 0x100;
+
+    // LOCK ADC byte [rbx+0x20], cl: 0x7f + 0 + CF wraps the sign bit and
+    // updates AF/OF/SF while leaving carry clear.
+    state.memory[0x120] = 0x7f;
+    state.regs.rcx = 0;
+    state.regs.rflags = RFL_CF | 2;
+    var adc8 = baseDisp(.adc_mem8_reg8, .bits8, .cl_cx_ecx_rcx, 0x20);
+    adc8.lock = true;
+    try testing.expect(isNative(adc8));
+    try h.add(0x1000, 4, adc8);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u8, 0x80), state.memory[0x120]);
+    try testing.expect(state.regs.rflags & RFL_CF == 0);
+    try testing.expect(state.regs.rflags & RFL_AF != 0);
+    try testing.expect(state.regs.rflags & RFL_OF != 0);
+    try testing.expect(state.regs.rflags & RFL_SF != 0);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+
+    // LOCK SBB word [rbx+0x20], 1 with CF set computes 0x8000-1-1. The
+    // input CF must survive the update until the CAS commits.
+    h.insns.clearRetainingCapacity();
+    state = TestState{};
+    state.admitMemory(true, true);
+    state.regs.rbx = 0x100;
+    state.regs.rflags = RFL_CF | 2;
+    std.mem.writeInt(u16, state.memory[0x120..][0..2], 0x8000, .little);
+    var sbb16 = baseDisp(.sbb_mem16_imm8, .bits16, .al_ax_eax_rax, 0x20);
+    sbb16.imm = 1;
+    sbb16.lock = true;
+    try testing.expect(isNative(sbb16));
+    try h.add(0x1000, 4, sbb16);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u16, 0x7ffe), std.mem.readInt(u16, state.memory[0x120..][0..2], .little));
+    try testing.expect(state.regs.rflags & RFL_CF == 0);
+    try testing.expect(state.regs.rflags & RFL_AF != 0);
+    try testing.expect(state.regs.rflags & RFL_OF != 0);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+
+    // The 32-bit edge covers carry-out of the operand width. LOCK ADC with
+    // both the operand and incoming carry set wraps UINT32_MAX to zero.
+    h.insns.clearRetainingCapacity();
+    state = TestState{};
+    state.admitMemory(true, true);
+    state.regs.rbx = 0x100;
+    state.regs.rflags = RFL_CF | 2;
+    std.mem.writeInt(u32, state.memory[0x120..][0..4], 0xffff_ffff, .little);
+    var adc32 = baseDisp(.adc_mem32_imm8, .bits32, .al_ax_eax_rax, 0x20);
+    adc32.imm = 0;
+    adc32.lock = true;
+    try testing.expect(isNative(adc32));
+    try h.add(0x1000, 4, adc32);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, state.memory[0x120..][0..4], .little));
+    try testing.expect(state.regs.rflags & RFL_CF != 0);
+    try testing.expect(state.regs.rflags & RFL_ZF != 0);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+
+    // For a 64-bit borrow, zero minus zero minus one wraps and sets CF/SF.
+    h.insns.clearRetainingCapacity();
+    state = TestState{};
+    state.admitMemory(true, true);
+    state.regs.rbx = 0x100;
+    state.regs.rflags = RFL_CF | 2;
+    state.regs.rcx = 0;
+    var sbb64 = baseDisp(.sbb_mem64_reg64, .bits64, .cl_cx_ecx_rcx, 0x20);
+    sbb64.lock = true;
+    try testing.expect(isNative(sbb64));
+    try h.add(0x1000, 4, sbb64);
+    _ = try h.run(&state);
+    try testing.expectEqual(std.math.maxInt(u64), std.mem.readInt(u64, state.memory[0x120..][0..8], .little));
+    try testing.expect(state.regs.rflags & RFL_CF != 0);
+    try testing.expect(state.regs.rflags & RFL_SF != 0);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+}
+
+test "locked increment decrement negate and not use width-matched host atomics" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    var state = TestState{};
+    state.admitMemory(true, true);
+    state.regs.rbx = 0x100;
+
+    // INC byte: OF and AF are recomputed, while CF survives the RMW.
+    state.memory[0x120] = 0x7F;
+    state.memory[0x121] = 0xA5;
+    state.regs.rflags = RFL_CF | 2;
+    var inc = baseDisp(.inc_mem8, .bits8, .al_ax_eax_rax, 0x20);
+    inc.lock = true;
+    try testing.expect(isNative(inc));
+    try h.add(0x1000, 4, inc);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u8, 0x80), state.memory[0x120]);
+    try testing.expectEqual(@as(u8, 0xA5), state.memory[0x121]);
+    try testing.expect(state.regs.rflags & RFL_CF != 0);
+    try testing.expect(state.regs.rflags & RFL_OF != 0);
+    try testing.expect(state.regs.rflags & RFL_AF != 0);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+
+    // DEC word: only the two addressed bytes change and CF remains clear.
+    h.insns.clearRetainingCapacity();
+    std.mem.writeInt(u16, state.memory[0x122..][0..2], 0x8000, .little);
+    state.memory[0x124] = 0x5A;
+    state.regs.rflags = 2;
+    var dec = baseDisp(.dec_mem16, .bits16, .al_ax_eax_rax, 0x22);
+    dec.lock = true;
+    try testing.expect(isNative(dec));
+    try h.add(0x1000, 4, dec);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u16, 0x7FFF), std.mem.readInt(u16, state.memory[0x122..][0..2], .little));
+    try testing.expectEqual(@as(u8, 0x5A), state.memory[0x124]);
+    try testing.expect(state.regs.rflags & RFL_CF == 0);
+    try testing.expect(state.regs.rflags & RFL_OF != 0);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+
+    // NEG dword at the signed minimum sets both CF and OF.
+    h.insns.clearRetainingCapacity();
+    std.mem.writeInt(u32, state.memory[0x128..][0..4], 0x8000_0000, .little);
+    state.memory[0x12C] = 0xC3;
+    var neg = baseDisp(.neg_mem32, .bits32, .al_ax_eax_rax, 0x28);
+    neg.lock = true;
+    try testing.expect(isNative(neg));
+    try h.add(0x1000, 4, neg);
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u32, 0x8000_0000), std.mem.readInt(u32, state.memory[0x128..][0..4], .little));
+    try testing.expectEqual(@as(u8, 0xC3), state.memory[0x12C]);
+    try testing.expect(state.regs.rflags & RFL_CF != 0);
+    try testing.expect(state.regs.rflags & RFL_OF != 0);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+
+    // NOT qword preserves the complete arithmetic flag word.
+    h.insns.clearRetainingCapacity();
+    const initial_flags = RFL_CF | RFL_ZF | RFL_SF | 2;
+    const initial_value: u64 = 0x1122_3344_5566_7788;
+    std.mem.writeInt(u64, state.memory[0x130..][0..8], initial_value, .little);
+    var bitwise_not = baseDisp(.not_mem64, .bits64, .al_ax_eax_rax, 0x30);
+    bitwise_not.lock = true;
+    try testing.expect(isNative(bitwise_not));
+    state.regs.rflags = initial_flags;
+    try h.add(0x1000, 4, bitwise_not);
+    _ = try h.run(&state);
+    try testing.expectEqual(~initial_value, std.mem.readInt(u64, state.memory[0x130..][0..8], .little));
+    try testing.expectEqual(initial_flags, state.regs.rflags);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
 }
 
 test "bit tests on memory with an immediate, and narrow immediate shifts, are native" {
@@ -5408,6 +7094,49 @@ test "memory operands reach the helpers with the resolved address and an abort s
     try testing.expectEqual(@as(u64, 0x9005), state.regs.rip);
 }
 
+test "MOVZX byte load honors REX.X and cached RBX plus R9 SIB operands" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    var state = TestState{};
+
+    // Exact instruction from fmt::v12::detail::copy_noinline in the stuck
+    // Xenia run: 46 0F B6 1C 0B = movzx r11d, byte ptr [rbx + r9]. REX.X
+    // extends the SIB index; dropping that prefix would accidentally test RCX
+    // and miss the observed zero-page access. Keep RBX and R9 live in the
+    // block register cache across the helper boundary.
+    const decoded = x64_decoder.decodeLegacyInstruction(&.{ 0x46, 0x0F, 0xB6, 0x1C, 0x0B }, .long64);
+    try testing.expectEqual(Op.movzx_reg32_mem8, decoded.op);
+    try testing.expectEqual(RegId.r11b_r11w_r11d_r11, decoded.dst_reg);
+    try testing.expect(decoded.sib_has_base);
+    try testing.expectEqual(RegId.bl_bx_ebx_rbx, decoded.sib_base_reg);
+    try testing.expect(decoded.sib_has_index);
+    try testing.expectEqual(RegId.r9b_r9w_r9d_r9, decoded.sib_index_reg);
+    try testing.expectEqual(@as(u2, 0), decoded.sib_scale);
+
+    state.regs.rbx = 0x200;
+    state.regs.r9 = 0;
+    state.memory[0x200] = 'Z';
+    try h.add(0x9000, decoded.len, decoded);
+    // Keep both address registers hot across the helper boundary. The tail
+    // makes the block allocator cache RBX and RCX, reproducing the situation
+    // where the fault report's backing register snapshot can lag the values
+    // that the generated block is actually using.
+    for (0..3) |index| {
+        const rip = @as(u64, 0x9005) + @as(u64, @intCast(index)) * 3;
+        try h.add(rip, 3, regReg(.add_reg64_reg64, .bits64, .bl_bx_ebx_rbx, .r9b_r9w_r9d_r9));
+    }
+    const insns = h.insns.items;
+    const last = insns[insns.len - 1];
+    const compiled = try compile(testing.allocator, &h.memory, TestState.layout, insns, last.rip + last.len);
+    try testing.expect(compiled.cached_registers >= 2);
+    try testing.expectEqual(@as(u32, 4), try h.run(&state));
+    try testing.expectEqual(@as(u64, 0x200), state.regs.rbx);
+    try testing.expectEqual(@as(u64, 0), state.regs.r9);
+    try testing.expectEqual(@as(u64, 'Z'), state.regs.r11);
+    try testing.expectEqual(@as(u32, 1), state.reads);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+}
+
 test "an unsupported instruction is handed to the interpreter helper and its exit request ends the block" {
     var h = try TestHarness.init();
     defer h.deinit();
@@ -5483,6 +7212,9 @@ test "the block boundary rules: host-reaching instructions end a block before th
     try testing.expect(!isNative(.{ .op = .shl_reg_imm, .size = .bits16, .imm = 16 }));
     try testing.expect(isNative(.{ .op = .shl_reg_imm, .size = .bits32 }));
     try testing.expect(isNative(.{ .op = .shl_reg_cl, .size = .bits64 }));
+    try testing.expect(isNative(.{ .op = .shl_mem_cl, .size = .bits64, .addr = 0x120 }));
+    try testing.expect(isNative(.{ .op = .shr_mem_cl, .size = .bits32, .addr = 0x120 }));
+    try testing.expect(isNative(.{ .op = .sar_mem_cl, .size = .bits16, .addr = 0x120 }));
     try testing.expect(isNative(.{ .op = .add_mem32_reg32, .size = .bits32 }));
     try testing.expect(isNative(.{ .op = .movbe_reg_mem, .size = .bits32 }));
     try testing.expect(!isNative(.{ .op = .movbe_reg_mem, .size = .bits8 }));
@@ -5494,6 +7226,43 @@ test "the block boundary rules: host-reaching instructions end a block before th
     try testing.expect(!isNative(.{ .op = .call_reg64, .dst_reg = .ah_sp_esp_rsp }));
     try testing.expect(!isNative(.{ .op = .div_reg8, .size = .bits8 }));
     try testing.expect(isNative(.{ .op = .div_reg32, .size = .bits32 }));
+}
+
+test "LOCK prefix validation accepts only architecturally supported memory updates" {
+    try testing.expect(lockPrefixAllowed(.{ .op = .add_mem32_reg32, .lock = true, .is_reg_form = false }));
+    try testing.expect(lockPrefixAllowed(.{ .op = .adc_mem64_reg64, .lock = true, .is_reg_form = false }));
+    try testing.expect(lockPrefixAllowed(.{ .op = .adc_mem64_imm8, .lock = true, .is_reg_form = false }));
+    try testing.expect(lockPrefixAllowed(.{ .op = .xchg_mem64_reg64, .lock = true, .is_reg_form = false }));
+    try testing.expect(lockPrefixAllowed(.{ .op = .bts_mem_reg, .lock = true, .is_reg_form = false }));
+    try testing.expect(lockPrefixAllowed(.{ .op = .cmpxchg16b_mem, .lock = true, .is_reg_form = false }));
+    try testing.expect(lockPrefixAllowed(.{ .op = .add_reg64_reg64, .lock = false, .is_reg_form = true }));
+
+    try testing.expect(!lockPrefixAllowed(.{ .op = .nop, .lock = true, .is_reg_form = true }));
+    try testing.expect(!lockPrefixAllowed(.{ .op = .add_reg64_reg64, .lock = true, .is_reg_form = true }));
+    try testing.expect(!lockPrefixAllowed(.{ .op = .cmp_mem32_reg32, .lock = true, .is_reg_form = false }));
+    try testing.expect(!lockPrefixAllowed(.{ .op = .bt_mem_reg, .lock = true, .is_reg_form = false }));
+    try testing.expect(!isNative(.{ .op = .add_reg64_reg64, .lock = true, .is_reg_form = true }));
+}
+
+test "native byte xchg is an implicit atomic and preserves high-byte aliases" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    var state = TestState{};
+    state.admitMemory(true, true);
+    state.regs.rbx = 0x100;
+    state.regs.rax = 0xAB00;
+    state.memory[0x120] = 0x35;
+    state.memory[0x121] = 0xCC;
+
+    var xchg = baseDisp(.xchg_mem8_reg8, .bits8, .al_ax_eax_rax, 0x20);
+    xchg.src_high8 = true;
+    try h.add(0x1000, 3, xchg);
+    _ = try h.run(&state);
+
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+    try testing.expectEqual(@as(u8, 0xAB), state.memory[0x120]);
+    try testing.expectEqual(@as(u8, 0xCC), state.memory[0x121]);
+    try testing.expectEqual(@as(u8, 0x35), @as(u8, @truncate(state.regs.rax >> 8)));
 }
 
 test "a control transfer is compiled as the block's last instruction and nothing after it is emitted" {
@@ -5774,6 +7543,46 @@ test "the TLB admits, looks up and invalidates by page" {
     try testing.expect(tlb.lookup(false, 0x2004) == null);
 }
 
+test "ordered scalar TLB accesses preserve aligned and unaligned guest values" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    const cases = [_]struct { size: Size, store: Op, load: Op, mask: u64 }{
+        .{ .size = .bits8, .store = .mov_mem8_reg8, .load = .mov_reg8_mem8, .mask = 0xFF },
+        .{ .size = .bits16, .store = .mov_mem16_reg16, .load = .mov_reg16_mem16, .mask = 0xFFFF },
+        .{ .size = .bits32, .store = .mov_mem32_reg32, .load = .mov_reg32_mem32, .mask = 0xFFFF_FFFF },
+        .{ .size = .bits64, .store = .mov_mem64_reg64, .load = .mov_reg64_mem64, .mask = std.math.maxInt(u64) },
+    };
+    for (cases) |case| {
+        for ([_]u64{ 0, 1 }) |misalignment| {
+            var state = TestState{};
+            state.admitMemory(true, true);
+            const backing_alignment: u64 = @intCast(@intFromPtr(&state.memory) & 7);
+            const offset: u64 = 0x100 + ((8 - backing_alignment) & 7) + misalignment;
+            state.regs.rbx = offset;
+            state.regs.rcx = 0x8877_6655_4433_2211;
+            h.insns.clearRetainingCapacity();
+            try h.add(0x1000, 3, baseDisp(case.store, case.size, .cl_cx_ecx_rcx, 0));
+            try h.add(0x1003, 3, baseDisp(case.load, case.size, .al_ax_eax_rax, 0));
+            try testing.expectEqual(@as(u32, 2), try h.run(&state));
+            const helper_accesses: u32 = if (misalignment == 0 or case.size == .bits8) 0 else 1;
+            try testing.expectEqual(helper_accesses, state.reads);
+            try testing.expectEqual(helper_accesses, state.writes);
+            try testing.expectEqual(state.regs.rcx & case.mask, state.regs.rax & case.mask);
+
+            // A single operand cannot share a hoisted translation with
+            // another instruction, so this also exercises the ordinary
+            // per-access TLB probe.
+            h.insns.clearRetainingCapacity();
+            state.regs.rax = 0;
+            try h.add(0x2000, 3, baseDisp(case.load, case.size, .al_ax_eax_rax, 0));
+            try testing.expectEqual(@as(u32, 1), try h.run(&state));
+            try testing.expectEqual(helper_accesses * 2, state.reads);
+            try testing.expectEqual(helper_accesses, state.writes);
+            try testing.expectEqual(state.regs.rcx & case.mask, state.regs.rax & case.mask);
+        }
+    }
+}
+
 test "flag computation is elided only for writers no reader can observe" {
     var h = try TestHarness.init();
     defer h.deinit();
@@ -5931,6 +7740,103 @@ test "shifts by cl and rotates follow the interpreter's count and flag rules" {
     try testing.expectEqual(@as(u32, 0x8D5), state.regs.rflags);
 }
 
+test "narrow cl shifts run natively for in-range counts and guard wide counts" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    var state = TestState{};
+    state.regs.rax = 0x80;
+    state.regs.rcx = 2;
+    state.regs.rflags = 0x2 | RFL_OF | RFL_PF;
+    try h.add(0x1000, 2, .{ .op = .shl_reg_cl, .size = .bits8, .dst_reg = .al_ax_eax_rax, .is_reg_form = true });
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u64, 0), state.regs.rax);
+    try testing.expect(state.regs.rflags & RFL_ZF != 0);
+    try testing.expect(state.regs.rflags & (RFL_CF | RFL_SF) == 0);
+    try testing.expect(state.regs.rflags & (RFL_OF | RFL_PF) == (RFL_OF | RFL_PF));
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+
+    // `sar ax, cl` sign-extends the 16-bit value before the host shift.
+    h.insns.clearRetainingCapacity();
+    state = TestState{};
+    state.regs.rax = 0x8000;
+    state.regs.rcx = 3;
+    try h.add(0x1000, 3, .{ .op = .sar_reg_cl, .size = .bits16, .dst_reg = .al_ax_eax_rax, .is_reg_form = true });
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u64, 0xF000), state.regs.rax);
+    try testing.expect(state.regs.rflags & RFL_SF != 0);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+
+    // A masked count at or beyond an 8-bit operand's width takes the
+    // interpreter escape, which owns the model's undefined-flag behavior.
+    h.insns.clearRetainingCapacity();
+    state = TestState{};
+    state.regs.rax = 0x80;
+    state.regs.rcx = 8;
+    try h.add(0x1000, 2, .{ .op = .shl_reg_cl, .size = .bits8, .dst_reg = .al_ax_eax_rax, .is_reg_form = true });
+    _ = try h.run(&state);
+    try testing.expectEqual(@as(u32, 1), state.interprets);
+}
+
+test "memory shifts by cl use guarded native loads and writes" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    try h.add(0x1000, 5, .{ .op = .shl_mem_cl, .size = .bits64, .addr = 0x120 });
+
+    for ([_]bool{ true, false }) |admitted| {
+        var state = TestState{};
+        if (admitted) state.admitMemory(true, true);
+        state.regs.rcx = 0x41; // masked to one for a 64-bit operand
+        state.regs.rflags = 0x2 | RFL_PF;
+        std.mem.writeInt(u64, state.memory[0x120..][0..8], 0x8000_0000_0000_0001, .little);
+        _ = try h.run(&state);
+
+        try testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, state.memory[0x120..][0..8], .little));
+        try testing.expect(state.regs.rflags & (RFL_CF | RFL_OF) == (RFL_CF | RFL_OF));
+        try testing.expect(state.regs.rflags & (RFL_ZF | RFL_SF) == 0);
+        try testing.expect(state.regs.rflags & RFL_PF != 0);
+        try testing.expectEqual(@as(u32, 0), state.interprets);
+    }
+
+    // A zero count reads the memory operand but leaves both the bytes and
+    // every arithmetic flag untouched.
+    h.insns.clearRetainingCapacity();
+    try h.add(0x1000, 5, .{ .op = .shl_mem_cl, .size = .bits64, .addr = 0x120 });
+    var zero_state = TestState{};
+    zero_state.admitMemory(true, true);
+    zero_state.regs.rcx = 0x40;
+    zero_state.regs.rflags = 0x8D5;
+    std.mem.writeInt(u64, zero_state.memory[0x120..][0..8], 0x8000_0000_0000_0001, .little);
+    _ = try h.run(&zero_state);
+    try testing.expectEqual(@as(u64, 0x8000_0000_0000_0001), std.mem.readInt(u64, zero_state.memory[0x120..][0..8], .little));
+    try testing.expectEqual(@as(u32, 0x8D5), zero_state.regs.rflags);
+
+    h.insns.clearRetainingCapacity();
+    try h.add(0x1000, 4, .{ .op = .shr_mem_cl, .size = .bits32, .addr = 0x120 });
+    var shr_state = TestState{};
+    shr_state.admitMemory(true, true);
+    shr_state.regs.rcx = 1;
+    shr_state.regs.rflags = 0x2;
+    std.mem.writeInt(u32, shr_state.memory[0x120..][0..4], 0x8000_0001, .little);
+    _ = try h.run(&shr_state);
+    try testing.expectEqual(@as(u32, 0x4000_0000), std.mem.readInt(u32, shr_state.memory[0x120..][0..4], .little));
+    try testing.expect(shr_state.regs.rflags & (RFL_CF | RFL_OF) == (RFL_CF | RFL_OF));
+    try testing.expectEqual(@as(u32, 0), shr_state.interprets);
+
+    h.insns.clearRetainingCapacity();
+    try h.add(0x1000, 4, .{ .op = .sar_mem_cl, .size = .bits64, .addr = 0x120 });
+    var sar_state = TestState{};
+    sar_state.admitMemory(true, true);
+    sar_state.regs.rcx = 2;
+    sar_state.regs.rflags = 0x2 | RFL_OF;
+    std.mem.writeInt(u64, sar_state.memory[0x120..][0..8], @bitCast(@as(i64, -8)), .little);
+    _ = try h.run(&sar_state);
+    try testing.expectEqual(@as(u64, @bitCast(@as(i64, -2))), std.mem.readInt(u64, sar_state.memory[0x120..][0..8], .little));
+    try testing.expect(sar_state.regs.rflags & RFL_CF == 0);
+    try testing.expect(sar_state.regs.rflags & RFL_SF != 0);
+    try testing.expect(sar_state.regs.rflags & RFL_OF != 0);
+    try testing.expectEqual(@as(u32, 0), sar_state.interprets);
+}
+
 test "bit tests, bit scans and zero counts follow bit_test and cpu.bitScan" {
     var h = try TestHarness.init();
     defer h.deinit();
@@ -6008,6 +7914,66 @@ test "bit tests, bit scans and zero counts follow bit_test and cpu.bitScan" {
     _ = try h.run(&state);
     try testing.expectEqual(@as(u64, 0), state.regs.rcx);
     try testing.expect(state.regs.rflags & RFL_ZF != 0 and state.regs.rflags & RFL_CF == 0);
+}
+
+test "native byte multiply and population count match x86 register semantics" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+
+    // MUL r/m8 writes the product to AX and sets CF/OF iff the high byte is
+    // nonzero. All other status bits remain unchanged.
+    var multiply = TestState{};
+    multiply.regs.rax = 0x1122_3344_5566_77FF;
+    multiply.regs.rcx = 0xAABB_CCDD_EEFF_FFFF;
+    multiply.regs.rflags = 0x2 | 0x600 | RFL_CF | RFL_PF | RFL_AF | RFL_ZF | RFL_SF;
+    try h.add(0x1000, 2, regReg(.mul_reg8, .bits8, .cl_cx_ecx_rcx, .cl_cx_ecx_rcx));
+    _ = try h.run(&multiply);
+    try testing.expectEqual(@as(u64, 0x1122_3344_5566_FE01), multiply.regs.rax);
+    try testing.expectEqual(@as(u64, (0x2 | 0x600 | RFL_PF | RFL_AF | RFL_ZF | RFL_SF | RFL_CF | RFL_OF)), multiply.regs.rflags);
+    try testing.expectEqual(@as(u32, 0), multiply.interprets);
+
+    h.insns.clearRetainingCapacity();
+    var no_overflow = TestState{};
+    no_overflow.regs.rax = 0x1122_3344_5566_7703;
+    no_overflow.regs.rcx = 4;
+    no_overflow.regs.rflags = 0x2 | 0x600 | RFL_CF | RFL_OF | RFL_PF | RFL_AF | RFL_ZF | RFL_SF;
+    try h.add(0x1000, 2, regReg(.mul_reg8, .bits8, .cl_cx_ecx_rcx, .cl_cx_ecx_rcx));
+    _ = try h.run(&no_overflow);
+    try testing.expectEqual(@as(u64, 0x1122_3344_5566_000C), no_overflow.regs.rax);
+    try testing.expectEqual(@as(u64, 0x2 | 0x600 | RFL_PF | RFL_AF | RFL_ZF | RFL_SF), no_overflow.regs.rflags);
+    try testing.expectEqual(@as(u32, 0), no_overflow.interprets);
+
+    // POPCNT zero-extends its input width, preserves upper destination bits
+    // for a word result, and clears all six arithmetic status flags except
+    // for ZF, which reports whether the source is zero.
+    const popcnt_cases = [_]struct { size: Size, source: u64 }{
+        .{ .size = .bits16, .source = 0xA5A5 },
+        .{ .size = .bits32, .source = 0xF0F0_1234 },
+        .{ .size = .bits64, .source = 0xF0F0_F0F0_1234_5678 },
+        .{ .size = .bits64, .source = 0 },
+    };
+    const status_flags = RFL_CF | RFL_PF | RFL_AF | RFL_ZF | RFL_SF | RFL_OF;
+    for (popcnt_cases) |case| {
+        h.insns.clearRetainingCapacity();
+        var state = TestState{};
+        state.regs.rbx = 0x1122_3344_5566_7788;
+        state.regs.rcx = case.source;
+        state.regs.rflags = 0x2 | 0x600 | status_flags;
+        try h.add(0x2000, 4, regReg(.popcnt_reg_reg, case.size, .bl_bx_ebx_rbx, .cl_cx_ecx_rcx));
+        _ = try h.run(&state);
+
+        const expected_count: u64 = @popCount(case.source & maskFor(case.size));
+        const expected_destination = switch (case.size) {
+            .bits16 => (0x1122_3344_5566_7788 & ~@as(u64, 0xFFFF)) | expected_count,
+            .bits32 => expected_count,
+            .bits64 => expected_count,
+            .bits8 => unreachable,
+        };
+        try testing.expectEqual(expected_destination, state.regs.rbx);
+        const expected_flags = (0x2 | 0x600) | (if ((case.source & maskFor(case.size)) == 0) RFL_ZF else 0);
+        try testing.expectEqual(@as(u64, expected_flags), state.regs.rflags);
+        try testing.expectEqual(@as(u32, 0), state.interprets);
+    }
 }
 
 test "adc and sbb produce highway.addCarry and subBorrow's results at every width" {
@@ -6116,15 +8082,105 @@ test "256-bit moves carry both halves and leave the upper one alone" {
     try testing.expectEqual(@as(u32, 0), state.interprets);
 }
 
-test "a 256-bit form that is not a plain move still goes to the interpreter" {
-    // Only moves are served at 256 bits; anything else would need every lane
-    // template widened, and a half-widened one is worse than none.
+test "256-bit vector support is limited to implemented lane templates" {
     var arithmetic: DecodedInsn = .{ .op = .vpaddd, .size = .bits32, .xmm_dst = 1, .xmm_src = 2, .xmm_src2 = 3, .is_reg_form = true };
     arithmetic.vector_256 = true;
     try testing.expect(!isVectorNative(arithmetic));
     var narrow = arithmetic;
     narrow.vector_256 = false;
     try testing.expect(isVectorNative(narrow));
+    arithmetic.op = .vmulpd;
+    try testing.expect(isVectorNative(arithmetic));
+    arithmetic.op = .vxorps;
+    try testing.expect(isVectorNative(arithmetic));
+    arithmetic.op = .vptest;
+    try testing.expect(isVectorNative(arithmetic));
+    arithmetic.op = .vextractf128;
+    try testing.expect(isVectorNative(arithmetic));
+}
+
+test "256-bit packed float and bitwise instructions update both halves" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    var state = TestState{};
+    state.xmm[1] = doubles64(.{ 2.0, 3.0 });
+    state.ymm_hi[1] = doubles64(.{ 6.0, 7.0 });
+    state.xmm[2] = doubles64(.{ 4.0, 5.0 });
+    state.ymm_hi[2] = doubles64(.{ 8.0, 9.0 });
+    var mul: DecodedInsn = .{ .op = .vmulpd, .size = .bits32, .xmm_dst = 4, .xmm_src = 1, .xmm_src2 = 2, .is_reg_form = true };
+    mul.vector_256 = true;
+    try h.add(0x1000, 4, mul);
+    _ = try h.run(&state);
+    try testing.expectEqualSlices(u8, &doubles64(.{ 8.0, 15.0 }), &state.xmm[4]);
+    try testing.expectEqualSlices(u8, &doubles64(.{ 48.0, 63.0 }), &state.ymm_hi[4]);
+
+    h.insns.clearRetainingCapacity();
+    state = TestState{};
+    state.xmm[1] = @splat(0xAA);
+    state.ymm_hi[1] = @splat(0x5A);
+    state.xmm[2] = @splat(0x0F);
+    state.ymm_hi[2] = @splat(0xF0);
+    var xor: DecodedInsn = .{ .op = .vxorps, .size = .bits32, .xmm_dst = 3, .xmm_src = 1, .xmm_src2 = 2, .is_reg_form = true };
+    xor.vector_256 = true;
+    try h.add(0x1000, 4, xor);
+    _ = try h.run(&state);
+    try testing.expectEqualSlices(u8, &([_]u8{0xA5} ** 16), &state.xmm[3]);
+    try testing.expectEqualSlices(u8, &([_]u8{0xAA} ** 16), &state.ymm_hi[3]);
+}
+
+test "vptest reduces both YMM halves and writes only its defined flags" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    var state = TestState{};
+    state.xmm[1] = @splat(0xFF);
+    state.xmm[2] = @splat(0x0F);
+    state.ymm_hi[1] = @splat(0x00);
+    state.ymm_hi[2] = @splat(0x01);
+    state.regs.rflags = 0x2 | RFL_CF | RFL_PF | RFL_AF | RFL_ZF | RFL_SF | RFL_OF;
+    var test_vec: DecodedInsn = .{ .op = .vptest, .size = .bits32, .xmm_src = 1, .xmm_src2 = 2, .is_reg_form = true };
+    test_vec.vector_256 = true;
+    try h.add(0x1000, 4, test_vec);
+    _ = try h.run(&state);
+    try testing.expect(state.regs.rflags & (RFL_CF | RFL_ZF) == 0);
+    try testing.expect(state.regs.rflags & (RFL_PF | RFL_AF | RFL_SF | RFL_OF) == 0);
+
+    h.insns.clearRetainingCapacity();
+    state = TestState{};
+    state.regs.rflags = 0x2;
+    test_vec.vector_256 = false;
+    test_vec.op = .vtestps;
+    try h.add(0x1000, 4, test_vec);
+    _ = try h.run(&state);
+    try testing.expect(state.regs.rflags & (RFL_CF | RFL_ZF) == (RFL_CF | RFL_ZF));
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+}
+
+test "vextractf128 selects the upper lane for register and memory destinations" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    var state = TestState{};
+    state.xmm[1] = lanes32(.{ 1, 2, 3, 4 });
+    state.ymm_hi[1] = lanes32(.{ 5, 6, 7, 8 });
+    var reg_extract = vecRegs(.vextractf128, 4, 1, 0);
+    reg_extract.vector_256 = true;
+    reg_extract.imm = 1;
+    try h.add(0x1000, 5, reg_extract);
+    _ = try h.run(&state);
+    try testing.expectEqualSlices(u8, &lanes32(.{ 5, 6, 7, 8 }), &state.xmm[4]);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &state.ymm_hi[4]);
+
+    h.insns.clearRetainingCapacity();
+    state = TestState{};
+    state.regs.rbx = 0x100;
+    state.ymm_hi[1] = lanes32(.{ 9, 10, 11, 12 });
+    var mem_extract = vecMem(.vextractf128, 0, 1, 0x20);
+    mem_extract.vector_256 = true;
+    mem_extract.imm = 1;
+    try h.add(0x1000, 6, mem_extract);
+    _ = try h.run(&state);
+    try testing.expectEqualSlices(u8, &lanes32(.{ 9, 10, 11, 12 }), state.memory[0x120..0x130]);
+    try testing.expectEqual(@as(u32, 1), state.writes);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
 }
 
 test "movbe, xchg, one-operand multiply and guarded divide" {
@@ -6698,11 +8754,13 @@ test "ret is native, and every instrument its interpreter arm carries still stop
     }
 }
 
-test "an indirect transfer outside the image is native; inside it, or to zero, the interpreter has it" {
+test "indirect transfers outside the image and hooked image targets use the interpreter" {
     var h = try TestHarness.init();
     defer h.deinit();
     const stack: u64 = 0x200;
-    // call rbx, to a target outside the image: push and jump.
+    // An external function pointer is classified by the interpreter. This
+    // includes import thunks and mapped generated code, and keeps an invalid
+    // data value from being installed as RIP by native translated code.
     {
         var state = TestState{};
         state.admitMemory(true, true);
@@ -6713,10 +8771,9 @@ test "an indirect transfer outside the image is native; inside it, or to zero, t
         h.insns.clearRetainingCapacity();
         try h.add(0xC000, 2, .{ .op = .call_reg64, .dst_reg = .bl_bx_ebx_rbx });
         _ = try h.run(&state);
-        try testing.expectEqual(@as(u32, 0), state.interprets);
-        try testing.expectEqual(@as(u64, 0xA000_1000), state.regs.rip);
-        try testing.expectEqual(stack - 8, state.regs.rsp);
-        try testing.expectEqual(@as(u64, 0xC002), std.mem.readInt(u64, state.memory[stack - 8 ..][0..8], .little));
+        try testing.expectEqual(@as(u32, 1), state.interprets);
+        try testing.expectEqual(@as(u64, 0xC002), state.regs.rip);
+        try testing.expectEqual(stack, state.regs.rsp);
     }
     // The same call into the image, and a jump to zero: handed back with
     // the stack untouched.
@@ -6750,8 +8807,8 @@ test "an indirect transfer outside the image is native; inside it, or to zero, t
         try testing.expectEqual(@as(u32, if (hooked) 1 else 0), state.interprets);
         try testing.expectEqual(if (hooked) stack else stack - 8, state.regs.rsp);
     }
-    // call [rbx + 0x20]: an operand in the import address table is the
-    // dynamic-function shim's; one elsewhere (a vtable) is native.
+    // call [rbx + 0x20]: IAT operands and external function pointers both
+    // reach the interpreter, which owns the import and mapped-code routes.
     for ([_]bool{ true, false }) |in_iat| {
         var state = TestState{};
         state.admitMemory(true, true);
@@ -6764,10 +8821,10 @@ test "an indirect transfer outside the image is native; inside it, or to zero, t
         h.insns.clearRetainingCapacity();
         try h.add(0xC000, 3, baseDisp(.call_mem64, .bits64, .al_ax_eax_rax, 0x20));
         _ = try h.run(&state);
-        try testing.expectEqual(@as(u32, if (in_iat) 1 else 0), state.interprets);
-        if (!in_iat) try testing.expectEqual(@as(u64, 0xA000_3000), state.regs.rip);
+        try testing.expectEqual(@as(u32, 1), state.interprets);
+        try testing.expectEqual(stack, state.regs.rsp);
     }
-    // jmp rbx outside the image sets RIP and pushes nothing.
+    // An external jmp rbx also reaches the interpreter and leaves RSP alone.
     {
         var state = TestState{};
         state.admitMemory(true, true);
@@ -6776,8 +8833,7 @@ test "an indirect transfer outside the image is native; inside it, or to zero, t
         h.insns.clearRetainingCapacity();
         try h.add(0xC000, 2, .{ .op = .jmp_reg64, .dst_reg = .bl_bx_ebx_rbx });
         _ = try h.run(&state);
-        try testing.expectEqual(@as(u32, 0), state.interprets);
-        try testing.expectEqual(@as(u64, 0xA000_2000), state.regs.rip);
+        try testing.expectEqual(@as(u32, 1), state.interprets);
         try testing.expectEqual(stack, state.regs.rsp);
     }
 }
@@ -6932,7 +8988,10 @@ test "emitted code size per instruction, and a trace costing less than its basic
     load.sib_has_base = true;
     load.sib_base_reg = .bl_bx_ebx_rbx;
     const load_cost = try Sizes.single(&h, 0x1000, 3, load) - overhead;
-    try testing.expect(load_cost >= 12 and load_cost <= 40);
+    // The TSO path includes an out-of-line helper branch for legal unaligned
+    // accesses, even though aligned loads take the short LDAR path. Count
+    // both paths in code size, not just the hot path.
+    try testing.expect(load_cost >= 12 and load_cost <= 80);
 
     // Three basic blocks of `cmp; jcc; add` as one trace, against what the
     // same nine instructions cost as three separate blocks. The words saved
