@@ -112,6 +112,8 @@ pub const STRUCTURE_TYPE_RENDERING_INFO: u32 = 1_000_044_001;
 pub const STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO: u32 = 1_000_044_002;
 pub const STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO: u32 = 1_000_044_004;
 pub const STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO: u32 = 1_000_190_000;
+pub const STRUCTURE_TYPE_PIPELINE_TESSELLATION_DOMAIN_ORIGIN_STATE_CREATE_INFO: u32 = 1_000_117_003;
+pub const STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO: u32 = 21;
 pub const STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT: u32 = 1_000_081_000;
 pub const STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK: u32 = 1_000_138_000;
 pub const STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2: u32 = 1_000_059_000;
@@ -129,6 +131,10 @@ pub const STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT:
 pub const STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES: u32 = 1_000_276_000;
 pub const STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES_EXT: u32 = STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES;
 pub const STRUCTURE_TYPE_PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT: u32 = 1_000_422_000;
+
+/// Byte offset in VkPhysicalDeviceFeatures for the sixth VkBool32 field.
+/// VkPhysicalDeviceFeatures orders geometryShader at 16 and tessellationShader at 20.
+pub const PHYSICAL_DEVICE_FEATURES_TESSELLATION_SHADER_OFFSET: usize = 20;
 
 pub const SEMAPHORE_TYPE_BINARY: u32 = 0;
 pub const SEMAPHORE_TYPE_TIMELINE: u32 = 1;
@@ -807,10 +813,16 @@ pub const PipelineInputAssemblyStateCreateInfo = extern struct {
 };
 
 pub const PipelineTessellationStateCreateInfo = extern struct {
-    s_type: u32 = 21,
+    s_type: u32 = STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,
     p_next: ?*const anyopaque = null,
     flags: u32 = 0,
     patch_control_points: u32 = 0,
+};
+
+pub const PipelineTessellationDomainOriginStateCreateInfo = extern struct {
+    s_type: u32 = STRUCTURE_TYPE_PIPELINE_TESSELLATION_DOMAIN_ORIGIN_STATE_CREATE_INFO,
+    p_next: ?*const anyopaque = null,
+    domain_origin: u32 = 0,
 };
 
 pub const PipelineViewportStateCreateInfo = extern struct {
@@ -1684,6 +1696,7 @@ comptime {
     std.debug.assert(@sizeOf(PipelineVertexInputStateCreateInfo) == 48);
     std.debug.assert(@sizeOf(PipelineInputAssemblyStateCreateInfo) == 32);
     std.debug.assert(@sizeOf(PipelineTessellationStateCreateInfo) == 24);
+    std.debug.assert(@sizeOf(PipelineTessellationDomainOriginStateCreateInfo) == 24);
     std.debug.assert(@sizeOf(PipelineViewportStateCreateInfo) == 48);
     std.debug.assert(@sizeOf(PipelineRasterizationStateCreateInfo) == 64);
     std.debug.assert(@sizeOf(PipelineMultisampleStateCreateInfo) == 48);

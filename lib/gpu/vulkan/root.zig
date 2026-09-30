@@ -20,6 +20,7 @@ pub const frame_capture = @import("frame_capture.zig");
 pub const transport_timing = @import("transport_timing.zig");
 pub const texel_custody = @import("texel_custody.zig");
 pub const presenter = @import("presenter.zig");
+pub const spirv_stage = @import("spirv_stage.zig");
 
 pub const Presenter = presenter.Presenter;
 pub const Stage = presenter.Stage;
@@ -43,4 +44,5 @@ test {
     _ = transport_timing;
     _ = texel_custody;
     _ = presenter;
+    _ = spirv_stage;
 }
