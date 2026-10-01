@@ -84,6 +84,15 @@ pub const StoreBuffer = struct {
         return self.count == 0;
     }
 
+    /// Whether the bounded granule filter says a queued store may overlap
+    /// this read. False positives are allowed; false negatives are not.
+    /// Short code-fetch comparisons use this to avoid staging a backing
+    /// snapshot when the executor's buffered stores cannot affect the bytes.
+    pub fn mayForward(self: *const StoreBuffer, address: usize, length: usize) bool {
+        if (self.count == 0 or length == 0) return false;
+        return self.mayOverlap(address, length);
+    }
+
     /// False only when no buffer in the process holds an entry.
     pub fn anyBufferPending() bool {
         return nonempty_buffers.load(.acquire) != 0;
@@ -242,13 +251,15 @@ pub const StoreBuffer = struct {
         }
     }
 
-    /// Make every buffered store visible, in order, then order them before
-    /// whatever the caller does next. Returns the number of entries drained.
+    /// Make every buffered store visible, in order. A drain is a sequence of
+    /// ordered stores, not a full fence: x86 TSO permits a following load to
+    /// pass stores that have not become globally visible yet. SFENCE and
+    /// MFENCE add their own, appropriately scoped barrier after this call.
+    /// Returns the number of entries drained.
     pub fn drain(self: *StoreBuffer) usize {
         const drained = self.count;
         if (drained == 0) return 0;
         while (self.count != 0) self.drainOne();
-        stripes.fullBarrier();
         return drained;
     }
 

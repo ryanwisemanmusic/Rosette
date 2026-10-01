@@ -109,6 +109,18 @@ pub const Helpers = extern struct {
     read128: *const fn (state: *anyopaque, address: u64, out: *[16]u8) callconv(.c) void,
     /// `writeMem128(state, address, value.*)` from the scratch vector slot.
     write128: *const fn (state: *anyopaque, address: u64, value: *const [16]u8) callconv(.c) void,
+    /// Publish prior temporal stores and perform a guest non-temporal vector
+    /// write through the memory-class-aware path. This must not use the
+    /// ordinary direct-TLB store template, which has no store-buffer state.
+    write128_non_temporal: *const fn (state: *anyopaque, address: u64, value: *const [16]u8) callconv(.c) void,
+    /// Whether an otherwise external indirect target is inside the known
+    /// executable Xenia code-cache view and is not owned by a runtime hook.
+    /// Returns 0 to leave the transfer to the interpreter.
+    mapped_transfer: *const fn (state: *anyopaque, target: u64) callconv(.c) u8,
+    /// Execute one raw x87 stack copy/80-bit transfer without entering the
+    /// general instruction interpreter. The helper owns the guest x87 stack
+    /// and memory-fault contract; zero means the translated block may continue.
+    x87_raw_transfer: *const fn (state: *anyopaque, block: *const Block, index: u32) callconv(.c) u32,
     /// Execute instruction `index` of the block through the interpreter.
     /// Returns 0 when the block may continue with the next instruction and
     /// nonzero when it must stop (control transfer, fault, termination).
@@ -125,6 +137,9 @@ const helper_read_offset: u32 = @offsetOf(Helpers, "read");
 const helper_write_offset: u32 = @offsetOf(Helpers, "write");
 const helper_read128_offset: u32 = @offsetOf(Helpers, "read128");
 const helper_write128_offset: u32 = @offsetOf(Helpers, "write128");
+const helper_write128_non_temporal_offset: u32 = @offsetOf(Helpers, "write128_non_temporal");
+const helper_mapped_transfer_offset: u32 = @offsetOf(Helpers, "mapped_transfer");
+const helper_x87_raw_transfer_offset: u32 = @offsetOf(Helpers, "x87_raw_transfer");
 const helper_interpret_offset: u32 = @offsetOf(Helpers, "interpret");
 const helper_block_offset: u32 = @offsetOf(Helpers, "block");
 const helper_flags_offset: u32 = @offsetOf(Helpers, "flags");
@@ -465,6 +480,12 @@ pub const Layout = struct {
     /// Xenia's generated PowerPC code - only pushes and jumps.
     image_low_offset: u32,
     image_high_offset: u32,
+    /// A stable guest-address interval for Xenia's dedicated generated-code
+    /// mapping. Targets inside this view are already known not to be image
+    /// hooks, so emitted transfers can skip the per-target C helper. Zero
+    /// bounds disable the inline admission path.
+    code_cache_low_offset: u32,
+    code_cache_high_offset: u32,
     /// Byte offsets of the `u64` bounds of the import address table, the
     /// only memory an indirect call's operand may not come from natively
     /// (the dynamic-function shim keys on those slots). Zero bounds mean
@@ -537,12 +558,14 @@ const scratch_block_offset: u32 = @offsetOf(Scratch, "block");
 
 pub const FallbackReason = enum(u8) {
     missing_native_template,
+    native_slow_path,
     hook_observation,
     vector_policy_disabled,
 
     pub fn label(self: FallbackReason) []const u8 {
         return switch (self) {
             .missing_native_template => "missing-native-template",
+            .native_slow_path => "native-slow-path",
             .hook_observation => "hook-observation",
             .vector_policy_disabled => "vector-policy-disabled",
         };
@@ -772,41 +795,46 @@ pub fn isNative(d: DecodedInsn) bool {
                 // Xenia's PowerPC backend writes each condition-register bit
                 // with one of these, so a title's every compare reaches it.
                 .setcc_mem8 => !d.is_reg_form and memoryOperandSupported(d),
-                // A fence is a `dmb ish` here; it needs no interpreter step.
+                // Fence widths are lowered separately in emitInsn; none
+                // needs a guest-interpreter round trip.
                 .mfence, .lfence, .sfence => true,
                 .push_reg, .push_imm, .pop_reg => true,
                 .cdqe, .cdq, .cqo => true,
                 .bswap_reg => wide,
                 .jcc_rel8, .jcc_rel32, .jmp_rel8 => true,
-                // 2026-09-20: 2,162,247,062 interpreter fallbacks, 39% of
-                // every one the Halo 3 run made, and the single largest
-                // entry in FALLBACK OPS. A plain `ret` is a pop into RIP;
-                // everything else its interpreter arm does is guarded by
-                // state this template reads for itself. `ret imm16` (0xC2)
-                // also decodes to this op and the interpreter's arm ignores
-                // the pop count, so it stays where it is rather than having
-                // that behaviour reproduced here.
-                .ret => d.imm == 0,
+                // The zero-return marker and optional call/return observers
+                // still hand the operation to the interpreter at runtime.
+                // Both forms of RET apply their architectural stack cleanup
+                // before completing that transfer.
+                .ret => true,
                 // 1,689,686,672 fallbacks, 31%, second only to `ret`. The
                 // glue decides per call site whether the interpreter's arm
                 // has a hook for this target and forces the fallback when it
                 // does, so reaching here means the arm would only push and
                 // jump - see `blockJitCallTargetPlain`.
                 .call_rel32 => true,
-                // 2026-09-21: 84, 89 and 44 million fallbacks. A target
-                // outside the image carries no hook, so the template only
-                // pushes and jumps there and hands everything else to the
-                // interpreter at run time. An operand the push could move
-                // (rsp) or a rip-relative slot (an import table entry, which
-                // the dynamic-function shim keys on) stays interpreted.
+                // The transfer emitter reads and preserves a call target
+                // before it adjusts RSP, so RSP-based operands are safe. IAT
+                // checks, hooks, image policy and external mapping proof
+                // remain runtime gates in the emitted path.
                 .jmp_reg64 => true,
-                .call_reg64 => d.dst_reg != .ah_sp_esp_rsp,
-                .call_mem64 => memoryOperandSupported(d) and !d.rip_relative and
-                    !(d.sib_has_base and d.sib_base_reg == .ah_sp_esp_rsp) and
-                    !(d.sib_has_index and d.sib_index_reg == .ah_sp_esp_rsp),
+                .call_reg64 => true,
+                .call_mem64 => memoryOperandSupported(d),
+                // Exact raw x87 transfers use a focused helper rather than
+                // the general instruction interpreter.
+                .fld_mem80, .fstp_mem80 => !d.is_reg_form and memoryOperandSupported(d),
+                .fld_st, .fstp_st => d.is_reg_form,
                 else => false,
             };
         },
+    };
+}
+
+fn isX87RawTransfer(d: DecodedInsn) bool {
+    return switch (d.op) {
+        .fld_mem80, .fstp_mem80 => !d.is_reg_form and memoryOperandSupported(d),
+        .fld_st, .fstp_st => d.is_reg_form,
+        else => false,
     };
 }
 
@@ -1661,9 +1689,15 @@ pub fn lockPrefixAllowed(d: DecodedInsn) bool {
 }
 
 pub fn isVectorNative(d: DecodedInsn) bool {
-    if (d.is_evex or d.legacy_sse or d.vector_512 or d.opmask != 0 or d.evex_broadcast) return false;
+    if (d.is_evex or d.vector_512 or d.opmask != 0 or d.evex_broadcast) return false;
+    // MOVQ r/m64 -> XMM has identical low-128-bit behavior in its legacy and
+    // VEX forms. The legacy form preserves YMM upper state, so its emitter
+    // deliberately skips the VEX upper-clear below.
+    if (d.legacy_sse) return (d.op == .vmovq_xmm_reg64 or d.op == .vmovq_reg64_xmm or d.op == .movaps_xmm_xmm) and d.is_reg_form;
     if (d.vector_256) {
         if (d.op == .vextractf128) return memoryOperandSupported(d);
+        if (d.op == .vinsertf128 or d.op == .vpermilps) return d.is_reg_form or memoryOperandSupported(d);
+        if (d.op == .vmovmskps or d.op == .vmovmskpd) return d.is_reg_form;
         if (d.op == .vptest or d.op == .vtestps or d.op == .vtestpd) return d.is_reg_form or memoryOperandSupported(d);
         if (packedFloatForm(d.op) != null or bitwiseForm(d.op) != null) return d.is_reg_form or memoryOperandSupported(d);
         // 2026-09-21: 6.5 million `vcvtps2pd ymm, xmm/m128` fallbacks.
@@ -1680,6 +1714,7 @@ pub fn isVectorNative(d: DecodedInsn) bool {
         .vmovntps, .vmovntdq => !d.is_reg_form and memoryOperandSupported(d),
         .vmovd_xmm_reg32, .vmovq_xmm_reg64, .vmovd_reg32_xmm, .vmovq_reg64_xmm, .vmovq_xmm_xmm => true,
         .vmovd_xmm_mem32, .vmovq_xmm_mem64, .vmovd_mem32_xmm, .vmovq_mem64_xmm => memoryOperandSupported(d),
+        .vmovmskps, .vmovmskpd => d.is_reg_form,
         .vmovss_xmm_mem, .vmovsd_xmm_mem, .vmovss_mem_xmm, .vmovsd_mem_xmm => memoryOperandSupported(d),
         .vmovss_xmm_xmm_xmm, .vmovsd_xmm_xmm_xmm => true,
         .vmovlps_xmm_xmm_mem64, .vmovlpd_xmm_xmm_mem64, .vmovhps_xmm_xmm_mem64, .vmovhpd_xmm_xmm_mem64 => memoryOperandSupported(d),
@@ -1696,7 +1731,7 @@ pub fn isVectorNative(d: DecodedInsn) bool {
         .vblendps, .vblendpd => d.is_reg_form or memoryOperandSupported(d),
         .vblendvps, .vblendvpd, .vpblendvb => d.is_reg_form or memoryOperandSupported(d),
         .vbroadcastss, .vpbroadcastw, .vpbroadcastd, .vpbroadcastq => d.is_reg_form or memoryOperandSupported(d),
-        .vsqrtps, .vsqrtpd, .vsqrtss, .vsqrtsd, .vrcpps, .vrsqrtps => d.is_reg_form or memoryOperandSupported(d),
+        .vsqrtps, .vsqrtpd, .vsqrtss, .vsqrtsd, .vrcpps, .vrcpss, .vrsqrtps => d.is_reg_form or memoryOperandSupported(d),
         .vcvtss2sd, .vcvtsd2ss, .vcvtps2pd, .vcvtpd2ps, .vcvtdq2ps, .vcvttps2dq, .vcvtps2dq => d.is_reg_form or memoryOperandSupported(d),
         .vcvtsi2ss_xmm_reg, .vcvtsi2sd_xmm_reg => d.size == .bits32 or d.size == .bits64,
         .vcvtsi2ss_xmm_mem, .vcvtsi2sd_xmm_mem => (d.size == .bits32 or d.size == .bits64) and memoryOperandSupported(d),
@@ -1704,6 +1739,7 @@ pub fn isVectorNative(d: DecodedInsn) bool {
         .vucomiss, .vucomisd => d.is_reg_form or memoryOperandSupported(d),
         .vcmpps, .vcmppd => d.is_reg_form or memoryOperandSupported(d),
         .vptest, .vtestps, .vtestpd => d.is_reg_form or memoryOperandSupported(d),
+        .vpermilps => d.is_reg_form or memoryOperandSupported(d),
         .vextractf128 => d.vector_256 and memoryOperandSupported(d),
         .vroundps, .vroundpd, .vroundss, .vroundsd => d.is_reg_form or memoryOperandSupported(d),
         .vzeroupper => true,
@@ -1755,6 +1791,9 @@ const Compiler = struct {
     /// (it would apply its vector effects twice); the differential tests
     /// cover vector templates instead.
     touches_vectors: bool = false,
+    /// x87 has its own context-resident register file and is outside the GPR
+    /// cross-check, even for register-only stack transfers.
+    touches_x87: bool = false,
     /// The instruction being emitted, whether its flags are wanted at all,
     /// and which of them are still read after it.
     current: u32 = 0,
@@ -2168,7 +2207,10 @@ const Compiler = struct {
         self.a.placeLabel(prove);
         try self.emitChecked(a64.ldrImm(.doubleword, t3, t6, @offsetOf(Link, "slot")));
         try self.a.branchIfZero(.x64, t3, leave);
-        try self.emitChecked(a64.ldrImm(.doubleword, t4, t3, 0));
+        // Mapped code generations are release-published by any guest worker
+        // that writes code. Acquire here so an equal generation proves the
+        // code bytes became visible before this translated chain continues.
+        try self.emit(a64.ldar(.doubleword, t4, t3));
         try self.emitChecked(a64.ldrImm(.doubleword, t5, t6, @offsetOf(Link, "block")));
         try self.emit(a64.cmp(.x64, t4, t5));
         try self.a.branchCond(.ne, leave);
@@ -2578,18 +2620,22 @@ const Compiler = struct {
         self.a.placeLabel(outside);
     }
 
-    /// Branch to `slow` for targets outside the loaded PE image, and for
-    /// in-image targets claimed by a runtime hook. The interpreter owns
-    /// import thunks, mapped generated code and invalid external targets; a
-    /// translated block must not install an arbitrary out-of-image value as
-    /// RIP before those boundaries can classify it. Clobbers t0, t2-t4.
+    /// Branch to `slow` for hooked image targets and external values the
+    /// runtime cannot prove belong to the dedicated generated-code view. A
+    /// proven Xenia code-cache address may take the native transfer template;
+    /// every other out-of-image target remains classified by the interpreter.
+    /// Clobbers x0-x1 and t0-t4; the original target is preserved in scratch.
     fn emitHookedTargetCheck(self: *Compiler, reg: a64.Reg, slow: Label) Error!void {
+        const external = try self.a.createLabel();
+        const external_unmapped = try self.a.createLabel();
+        const external_outside_published_range = try self.a.createLabel();
+        const checked = try self.a.createLabel();
         try self.emitStateScalar(.doubleword, t0, self.layout.image_low_offset);
         try self.emit(a64.cmp(.x64, reg, t0));
-        try self.a.branchCond(.lo, slow);
+        try self.a.branchCond(.lo, external);
         try self.emitStateScalar(.doubleword, t0, self.layout.image_high_offset);
         try self.emit(a64.cmp(.x64, reg, t0));
-        try self.a.branchCond(.hs, slow);
+        try self.a.branchCond(.hs, external);
         try self.emitStateScalar(.byte, t0, self.layout.image_targets_hooked_offset);
         try self.a.branchIfNonZero(.w32, t0, slow);
         try self.a.loadConstant(t2, hook_filter_multiplier);
@@ -2602,6 +2648,41 @@ const Compiler = struct {
         try self.emit(a64.lsrv(.w32, t3, t3, t2));
         try self.emit(a64.logicalImmediate(.w32, .andop, t3, t3, 1).?);
         try self.a.branchIfNonZero(.w32, t3, slow);
+        try self.a.branch(checked);
+
+        self.a.placeLabel(external);
+        // The dedicated code-cache mapping is immutable for the duration of
+        // a translated step (map/unmap takes the guest address-space write
+        // gate). Its published interval is therefore sufficient proof for
+        // the hot Xenia generated-code target. Keep the general callback for
+        // every other external address, where it still checks mapping source,
+        // import stubs, synthetic entries, and hooks.
+        try self.emitStateScalar(.doubleword, t0, self.layout.code_cache_high_offset);
+        try self.a.branchIfZero(.x64, t0, external_unmapped);
+        try self.emit(a64.cmp(.x64, reg, t0));
+        try self.a.branchCond(.hs, external_outside_published_range);
+        try self.emitStateScalar(.doubleword, t0, self.layout.code_cache_low_offset);
+        try self.emit(a64.cmp(.x64, reg, t0));
+        try self.a.branchCond(.lo, external_outside_published_range);
+        try self.a.branch(checked);
+
+        // Once the dedicated code-cache interval is published, the runtime
+        // callback below cannot admit any target outside it: it checks this
+        // exact view and interval again. The run profile showed 11.7M such
+        // helper calls and zero admissions. Keep the callback only for the
+        // bootstrap/unpublished case; a known out-of-range target can go
+        // straight to the interpreter-owned transfer path.
+        self.a.placeLabel(external_outside_published_range);
+        try self.a.branch(slow);
+
+        self.a.placeLabel(external_unmapped);
+        try self.emitChecked(a64.strImm(.doubleword, reg, r_scratch, scratch_transfer_target_offset));
+        try self.emit(a64.mov(.x64, 0, r_state));
+        try self.emitChecked(a64.ldrImm(.doubleword, 1, r_scratch, scratch_transfer_target_offset));
+        try self.emitCallHelper(helper_mapped_transfer_offset);
+        try self.a.branchIfZero(.w32, 0, slow);
+        try self.emitChecked(a64.ldrImm(.doubleword, reg, r_scratch, scratch_transfer_target_offset));
+        self.a.placeLabel(checked);
     }
 
     /// Branch to `slow` when the address in `reg` lies inside the guest
@@ -2639,6 +2720,23 @@ const Compiler = struct {
         // answer and is read next.
         try self.emitCacheLoad();
         // The interpreter may have moved the hoisted base register.
+        self.hoist_live = false;
+        const stub = try self.exitStub(index + 1, null);
+        try self.a.branchIfNonZero(.w32, 0, stub);
+    }
+
+    /// These operations preserve the interpreter's exact raw x87 bytes and
+    /// stack-fault behavior, but bypass its general opcode dispatch and
+    /// fallback accounting. The focused helper returns nonzero only when the
+    /// current block must leave (fault, termination, or modified continuation).
+    fn emitX87RawTransferCall(self: *Compiler, index: u32) Error!void {
+        try self.emitCurrentIndex(index);
+        try self.emitCacheWriteBack();
+        try self.emit(a64.mov(.x64, 0, r_state));
+        try self.emitChecked(a64.ldrImm(.doubleword, 1, r_helpers, helper_block_offset));
+        try self.a.loadConstant(2, index);
+        try self.emitCallHelper(helper_x87_raw_transfer_offset);
+        try self.emitCacheLoad();
         self.hoist_live = false;
         const stub = try self.exitStub(index + 1, null);
         try self.a.branchIfNonZero(.w32, 0, stub);
@@ -2844,6 +2942,12 @@ const Compiler = struct {
             try self.emitSettleFlags();
         }
         self.native_count += 1;
+        if (isX87RawTransfer(d)) {
+            self.touches_x87 = true;
+            self.touches_memory = self.touches_memory or d.op == .fld_mem80 or d.op == .fstp_mem80;
+            try self.emitX87RawTransferCall(index);
+            return .native;
+        }
         if (try self.emitVectorInsn(insn, index)) return .native;
         // A lock-prefixed arithmetic/logic memory update cannot use the
         // ordinary load/compute/store template: that would tear under a
@@ -3171,7 +3275,9 @@ const Compiler = struct {
                 try self.emitWrite(.bits8, index);
                 try self.emitAbortCheck(index);
             },
-            .mfence, .lfence, .sfence => try self.emit(a64.dmbIsh()),
+            .mfence => try self.emit(a64.dmbIsh()),
+            .lfence => try self.emit(a64.dmbIshLd()),
+            .sfence => try self.emit(a64.dmbIshSt()),
             .push_reg, .push_imm => {
                 if (d.op == .push_reg) {
                     try self.loadReg(3, d.src_reg, false, .bits64);
@@ -3349,6 +3455,11 @@ const Compiler = struct {
                 // does rather than reused from x1.
                 try self.loadReg(t1, .ah_sp_esp_rsp, false, .bits64);
                 try self.emitChecked(a64.addImm(.x64, t1, t1, 8));
+                const pop_bytes = d.imm & 0xFFFF;
+                if (pop_bytes != 0) {
+                    try self.a.loadConstant(t5, pop_bytes);
+                    try self.emit(a64.add(.x64, t1, t1, t5));
+                }
                 try self.storeReg(.ah_sp_esp_rsp, false, .bits64, t1);
                 try self.emitChecked(a64.strImm(.doubleword, 0, r_regs, rip_offset));
                 const taken = try self.exitStub(index + 1, null);
@@ -4742,7 +4853,8 @@ const Compiler = struct {
     }
 
     fn emitStoreVecOffset(self: *Compiler, insn: Insn, index: u32, v: a64.Reg, byte_offset: u32) Error!void {
-        if (self.hoist_write) {
+        const non_temporal = insn.decoded.op == .vmovntps or insn.decoded.op == .vmovntdq;
+        if (!non_temporal and self.hoist_write) {
             if (self.hoistedOffsetBytes(insn, 16, byte_offset)) |offset| {
                 try self.emitHoistedVector(insn, index, v, byte_offset, offset, true);
                 return;
@@ -4756,6 +4868,20 @@ const Compiler = struct {
         self.touches_memory = true;
         try self.emitEffectiveAddress(1, insn);
         if (byte_offset != 0) try self.emitChecked(a64.addImm(.x64, 1, 1, byte_offset));
+        if (insn.decoded.op == .vmovntps or insn.decoded.op == .vmovntdq) {
+            // NT stores retire older queued temporal writes, then perform a
+            // synchronous class-aware access. The TLB store template writes
+            // host memory directly and cannot drain the executor's buffer;
+            // protected pages and native device aliases also need their
+            // regular helper policy instead of an ordinary RAM tag.
+            try self.emitChecked(a64.vstrQ(v, r_scratch, scratch_vector_offset));
+            try self.emitCurrentIndex(index);
+            try self.emit(a64.mov(.x64, 0, r_state));
+            try self.emitChecked(a64.addImm(.x64, 2, r_scratch, scratch_vector_offset));
+            try self.emitCallHelper(helper_write128_non_temporal_offset);
+            try self.emitAbortCheck(index);
+            return;
+        }
         const slow = try self.a.createLabel();
         const done = try self.a.createLabel();
         try self.emitTlbProbe(true, 16, slow);
@@ -4922,6 +5048,104 @@ const Compiler = struct {
         };
     }
 
+    fn emitPermilpsImmediate(self: *Compiler, dst: a64.Reg, source: a64.Reg, imm: u64) Error!void {
+        for (0..4) |lane| {
+            const source_lane: u32 = @intCast((imm >> @intCast(lane * 2)) & 3);
+            try self.emit(a64.vinsLane(.s4, dst, @intCast(lane), source, source_lane));
+        }
+    }
+
+    /// Build a byte table index from the low two bits of each control dword.
+    /// Each selected float contributes its four bytes without crossing a
+    /// 128-bit lane, matching VPERMILPS for both XMM and each YMM half.
+    fn emitPermilpsVariable(self: *Compiler, dst: a64.Reg, source: a64.Reg, control: a64.Reg) Error!void {
+        try self.emit(a64.vmoviZero(v4));
+        try self.emit(a64.vmoviZero(v5));
+        for (0..4) |lane| {
+            try self.emit(a64.vumov(.s4, t1, control, @intCast(lane)));
+            try self.emit(a64.logicalImmediate(.w32, .andop, t1, t1, 3).?);
+            try self.emit(a64.lslImm(.w32, t1, t1, 2));
+            try self.emit(a64.vinsGpr(.s4, v4, @intCast(lane), t1));
+            try self.a.loadConstant(t1, 0x0302_0100);
+            try self.emit(a64.vinsGpr(.s4, v5, @intCast(lane), t1));
+        }
+        try self.emit(a64.vadd(.s4, v4, v4, v5));
+        try self.emit(a64.vtbl(dst, source, v4));
+    }
+
+    fn emitVectorMoveMask(self: *Compiler, d: DecodedInsn) Error!void {
+        const packed_double = d.op == .vmovmskpd;
+        const lanes_per_half: u32 = if (packed_double) 2 else 4;
+        const total_lanes = lanes_per_half * (if (d.vector_256) @as(u32, 2) else 1);
+        try self.emit(a64.mov(.w32, 0, a64.wzr));
+        try self.loadXmm(v1, d.xmm_src);
+        if (d.vector_256) try self.loadYmmHigh(v2, d.xmm_src);
+        for (0..total_lanes) |lane| {
+            const vector = if (lane < lanes_per_half) v1 else v2;
+            const vector_lane: u32 = @intCast(lane % lanes_per_half);
+            try self.emit(a64.vumov(if (packed_double) .d2 else .s4, t1, vector, vector_lane));
+            try self.emit(a64.lsrImm(.x64, t1, t1, if (packed_double) 63 else 31));
+            if (lane != 0) try self.emit(a64.lslImm(.w32, t1, t1, @intCast(lane)));
+            try self.emit(a64.orrReg(.w32, 0, 0, t1));
+        }
+        try self.storeReg(d.dst_reg, false, .bits32, 0);
+    }
+
+    fn emitPermilps(self: *Compiler, insn: Insn, index: u32) Error!void {
+        const d = insn.decoded;
+        if (d.uses_imm) {
+            const low_source = v1;
+            const high_source = v2;
+            if (d.vector_256) {
+                if (d.is_reg_form) {
+                    try self.loadXmm(low_source, d.xmm_src);
+                    try self.loadYmmHigh(high_source, d.xmm_src);
+                } else {
+                    try self.emitLoadVecOffset(insn, index, low_source, 0);
+                    try self.emitAbortCheck(index);
+                    try self.emitLoadVecOffset(insn, index, high_source, 16);
+                    try self.emitAbortCheck(index);
+                }
+                try self.emitPermilpsImmediate(v0, low_source, d.imm);
+                try self.emitPermilpsImmediate(v1, high_source, d.imm);
+                try self.storeXmm(d.xmm_dst, v0);
+                try self.storeYmmHigh(d.xmm_dst, v1);
+            } else {
+                try self.loadUnarySource(insn, index, low_source);
+                try self.emitPermilpsImmediate(v0, low_source, d.imm);
+                try self.storeXmm(d.xmm_dst, v0);
+                try self.clearUpper(d.xmm_dst, d.op);
+                if (touchesMemory(d)) try self.emitAbortCheck(index);
+            }
+            return;
+        }
+
+        if (d.vector_256) {
+            if (d.is_reg_form) {
+                try self.loadXmm(v2, d.xmm_src2);
+                try self.loadYmmHigh(v3, d.xmm_src2);
+            } else {
+                try self.emitLoadVecOffset(insn, index, v2, 0);
+                try self.emitAbortCheck(index);
+                try self.emitLoadVecOffset(insn, index, v3, 16);
+                try self.emitAbortCheck(index);
+            }
+            try self.loadXmm(v1, d.xmm_src);
+            try self.emitPermilpsVariable(v0, v1, v2);
+            try self.storeXmm(d.xmm_dst, v0);
+            try self.loadYmmHigh(v1, d.xmm_src);
+            try self.emitPermilpsVariable(v0, v1, v3);
+            try self.storeYmmHigh(d.xmm_dst, v0);
+        } else {
+            try self.loadSource2(insn, index, v2);
+            if (touchesMemory(d)) try self.emitAbortCheck(index);
+            try self.loadXmm(v1, d.xmm_src);
+            try self.emitPermilpsVariable(v0, v1, v2);
+            try self.storeXmm(d.xmm_dst, v0);
+            try self.clearUpper(d.xmm_dst, d.op);
+        }
+    }
+
     /// The vector templates. True when the instruction was emitted here.
     fn emitVectorInsn(self: *Compiler, insn: Insn, index: u32) Error!bool {
         const d = insn.decoded;
@@ -4947,7 +5171,36 @@ const Compiler = struct {
             }
             return true;
         }
+        if (d.op == .vmovmskps or d.op == .vmovmskpd) {
+            try self.emitVectorMoveMask(d);
+            return true;
+        }
+        if (d.op == .vpermilps) {
+            try self.emitPermilps(insn, index);
+            return true;
+        }
         if (d.vector_256) {
+            if (d.op == .vinsertf128) {
+                // Read the XMM/m128 insert source before touching either
+                // destination half. A failed memory read therefore leaves
+                // the architectural vector register unchanged.
+                if (d.is_reg_form) {
+                    try self.loadXmm(v2, d.xmm_src2);
+                } else {
+                    try self.emitLoadVec(insn, index, v2);
+                    try self.emitAbortCheck(index);
+                }
+                try self.loadXmm(v1, d.xmm_src);
+                try self.loadYmmHigh(v3, d.xmm_src);
+                if ((d.imm & 1) == 0) {
+                    try self.storeXmm(dst, v2);
+                    try self.storeYmmHigh(dst, v3);
+                } else {
+                    try self.storeXmm(dst, v1);
+                    try self.storeYmmHigh(dst, v2);
+                }
+                return true;
+            }
             if (d.op == .vcvtps2pd) {
                 // Four singles from the 128-bit source: the low two to the
                 // xmm half, the high two to the upper half.
@@ -5138,6 +5391,10 @@ const Compiler = struct {
             return true;
         }
         switch (d.op) {
+            .movaps_xmm_xmm => {
+                try self.loadXmm(v0, d.xmm_src);
+                try self.storeXmm(dst, v0);
+            },
             .vmovdqu_xmm_xmm, .vmovdqa_xmm_xmm, .vmovups_xmm_xmm, .vmovaps_xmm_xmm, .vmovupd_xmm_xmm, .vmovapd_xmm_xmm => {
                 try self.loadXmm(v0, d.xmm_src);
                 try self.storeXmm(dst, v0);
@@ -5218,7 +5475,7 @@ const Compiler = struct {
                 try self.loadReg(0, d.src_reg, false, if (d.op == .vmovd_xmm_reg32) .bits32 else .bits64);
                 try self.emit(if (d.op == .vmovd_xmm_reg32) a64.fmovSFromW(v0, 0) else a64.fmovFromGpr(v0, 0));
                 try self.storeXmm(dst, v0);
-                try self.clearUpper(dst, d.op);
+                if (!d.legacy_sse) try self.clearUpper(dst, d.op);
             },
             .vmovd_xmm_mem32, .vmovq_xmm_mem64, .vmovss_xmm_mem, .vmovsd_xmm_mem => {
                 const wide = d.op == .vmovq_xmm_mem64 or d.op == .vmovsd_xmm_mem;
@@ -5494,6 +5751,19 @@ const Compiler = struct {
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
+            .vrcpss => {
+                // The interpreter models VRCPSS as the host single-precision
+                // reciprocal. Keep VEX's upper lanes from SRC1 and compute
+                // only lane 0 from SRC2 (or the scalar memory operand).
+                try self.loadScalarSource2(insn, index, .single, v2);
+                try self.loadXmm(v0, d.xmm_src);
+                try self.emit(a64.vfmovOne(v3));
+                try self.emit(a64.fdiv(.single, v3, v3, v2));
+                try self.emit(a64.vinsLane(.s4, v0, 0, v3, 0));
+                try self.storeXmm(dst, v0);
+                try self.clearUpper(dst, d.op);
+                if (touchesMemory(d)) try self.emitAbortCheck(index);
+            },
             .vsqrtss, .vsqrtsd => {
                 const fp: a64.FpWidth = if (d.op == .vsqrtss) .single else .double;
                 try self.loadScalarSource2(insn, index, fp, v2);
@@ -5671,7 +5941,7 @@ pub fn compile(allocator: std.mem.Allocator, memory: *CodeMemory, layout: Layout
         .chain_entry = pass.chain_entry_bytes,
         .native_count = pass.compiler.native_count,
         .fallback_count = pass.compiler.fallback_count,
-        .register_only = !pass.compiler.touches_memory and !pass.compiler.touches_vectors and pass.compiler.fallback_count == 0,
+        .register_only = !pass.compiler.touches_memory and !pass.compiler.touches_vectors and !pass.compiler.touches_x87 and pass.compiler.fallback_count == 0,
         .flags_elided = elided,
         .flags_narrowed = pass.compiler.flags_narrowed,
         .cached_registers = pass.compiler.cache_count,
@@ -5779,7 +6049,9 @@ const TestState = struct {
     zmm_hi: [32][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** 32,
     reads: u32 = 0,
     writes: u32 = 0,
+    non_temporal_writes: u32 = 0,
     interprets: u32 = 0,
+    x87_fast_helpers: u32 = 0,
     flag_completions: u32 = 0,
     last_interpret_index: u32 = 0,
     last_helper_index: u32 = 0,
@@ -5795,8 +6067,12 @@ const TestState = struct {
     return_captures: u32 = 0,
     image_low: u64 = 0,
     image_high: u64 = 0,
+    code_cache_low: u64 = 0,
+    code_cache_high: u64 = 0,
     iat_low: u64 = 0,
     iat_high: u64 = 0,
+    mapped_transfer_allowed: bool = false,
+    mapped_transfer_calls: u32 = 0,
     hook_filter: [hook_filter_bytes]u8 = @splat(0),
     image_targets_hooked: u8 = 1,
     memory: [4096]u8 align(16) = [_]u8{0} ** 4096,
@@ -5813,6 +6089,8 @@ const TestState = struct {
         .trace_transfers_offset = @offsetOf(TestState, "trace_transfers"),
         .image_low_offset = @offsetOf(TestState, "image_low"),
         .image_high_offset = @offsetOf(TestState, "image_high"),
+        .code_cache_low_offset = @offsetOf(TestState, "code_cache_low"),
+        .code_cache_high_offset = @offsetOf(TestState, "code_cache_high"),
         .iat_low_offset = @offsetOf(TestState, "iat_low"),
         .iat_high_offset = @offsetOf(TestState, "iat_high"),
         .hook_filter_offset = @offsetOf(TestState, "hook_filter"),
@@ -5858,6 +6136,28 @@ const TestState = struct {
         if (state.abort_on_access) state.scratch.abort = 1;
         if (address +| 16 > state.memory.len) return;
         @memcpy(state.memory[@intCast(address)..][0..16], value);
+    }
+
+    fn write128NonTemporal(state_ptr: *anyopaque, address: u64, value: *const [16]u8) callconv(.c) void {
+        const state: *TestState = @ptrCast(@alignCast(state_ptr));
+        state.non_temporal_writes += 1;
+        state.last_helper_index = state.scratch.index;
+        if (state.abort_on_access) state.scratch.abort = 1;
+        if (address +| 16 > state.memory.len) return;
+        @memcpy(state.memory[@intCast(address)..][0..16], value);
+    }
+
+    fn mappedTransfer(state_ptr: *anyopaque, target: u64) callconv(.c) u8 {
+        const state: *TestState = @ptrCast(@alignCast(state_ptr));
+        state.mapped_transfer_calls += 1;
+        return @intFromBool(state.mapped_transfer_allowed and target >= 0xA000_0000 and target < 0xB000_0000);
+    }
+
+    fn x87RawTransfer(state_ptr: *anyopaque, block: *const Block, index: u32) callconv(.c) u32 {
+        const state: *TestState = @ptrCast(@alignCast(state_ptr));
+        state.x87_fast_helpers += 1;
+        state.regs.rip = block.insns[index].rip;
+        return 0;
     }
 
     /// Settle the deferred flag record exactly as the glue's helper does,
@@ -5946,6 +6246,9 @@ const TestHarness = struct {
             .write = TestState.write,
             .read128 = TestState.read128,
             .write128 = TestState.write128,
+            .write128_non_temporal = TestState.write128NonTemporal,
+            .mapped_transfer = TestState.mappedTransfer,
+            .x87_raw_transfer = TestState.x87RawTransfer,
             .interpret = TestState.interpret,
             .block = &self.block,
             .flags = TestState.flags,
@@ -6985,6 +7288,21 @@ test "setcc to memory and the fences are translated, not interpreted" {
     }
 }
 
+test "MFENCE LFENCE and SFENCE each use a native block template" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+
+    for ([_]Op{ .mfence, .lfence, .sfence }) |op| {
+        var state = TestState{};
+        h.insns.clearRetainingCapacity();
+        try h.add(0x7100, 3, .{ .op = op });
+        try testing.expectEqual(@as(u32, 1), try h.run(&state));
+        try testing.expectEqual(@as(u32, 0), state.interprets);
+        try testing.expectEqual(@as(u32, 1), h.block.native_count);
+        try testing.expectEqual(@as(u32, 0), h.block.fallback_count);
+    }
+}
+
 test "setcc to memory writes exactly one byte and leaves its neighbours" {
     var h = try TestHarness.init();
     defer h.deinit();
@@ -7174,18 +7492,19 @@ test "a block with nothing native to emit is refused" {
     try h.add(0xB000, 3, .{ .op = .lahf, .size = .bits64, .dst_reg = .al_ax_eax_rax, .is_reg_form = true });
     var state = TestState{};
     try testing.expectError(Error.NothingToCompile, h.run(&state));
-    // A lone control transfer is refused when the transfer itself is a
-    // helper call: the block would buy no native work at all.
+    // RIP-relative indirect calls now compile to the guarded memory-call
+    // template. With unknown image/IAT bounds and an unreadable slot the
+    // runtime guard still routes the call through the interpreter.
     h.insns.clearRetainingCapacity();
-    // `call [rip + slot]` is an import-table call the dynamic-function shim
-    // owns, so it is always the interpreter's.
     try h.add(0xB000, 6, .{ .op = .call_mem64, .rip_relative = true });
-    try testing.expectError(Error.NothingToCompile, h.run(&state));
+    try testing.expectEqual(@as(u32, 1), try h.run(&state));
+    try testing.expectEqual(@as(u32, 1), state.interprets);
     // A lone `ret` is not one of those any more. It compiles to a guarded
     // pop into RIP, which is worth a block on its own: the alternative is a
     // full interpreter step, whose hook gates, hotness probe and decode
     // cache lookup cost more than this block's prologue and epilogue.
     h.insns.clearRetainingCapacity();
+    state = TestState{};
     try h.add(0xB000, 1, .{ .op = .ret });
     state.admitMemory(true, true);
     state.regs.rsp = 0x200;
@@ -7193,6 +7512,108 @@ test "a block with nothing native to emit is refused" {
     try testing.expectEqual(@as(u32, 1), try h.run(&state));
     try testing.expectEqual(@as(u64, 0xFEED), state.regs.rip);
     try testing.expectEqual(@as(u32, 0), state.interprets);
+}
+
+test "raw x87 stack transfers use the focused helper, not the interpreter fallback" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    try h.add(0xB100, 2, .{ .op = .fld_st, .imm = 1, .is_reg_form = true });
+    var state = TestState{};
+    try testing.expectEqual(@as(u32, 1), try h.run(&state));
+    try testing.expectEqual(@as(u32, 1), state.x87_fast_helpers);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+    try testing.expect(!h.block.register_only);
+}
+
+test "RIP-relative indirect calls keep non-IAT function pointers native" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    var state = TestState{};
+    state.admitMemory(true, true);
+    state.regs.rsp = 0x800;
+    state.image_low = 0x100;
+    state.image_high = 0x180;
+    state.iat_low = 0x140;
+    state.iat_high = 0x150;
+    state.image_targets_hooked = 0;
+    state.mapped_transfer_allowed = true;
+    std.mem.writeInt(u64, state.memory[0x126..][0..8], 0xA000_3000, .little);
+    try h.add(0x100, 6, .{ .op = .call_mem64, .size = .bits64, .addr = 0x20, .rip_relative = true });
+    try testing.expectEqual(@as(u32, 1), try h.run(&state));
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+    try testing.expectEqual(@as(u64, 0xA000_3000), state.regs.rip);
+    try testing.expectEqual(@as(u64, 0x7F8), state.regs.rsp);
+    try testing.expectEqual(@as(u64, 0x106), std.mem.readInt(u64, state.memory[0x7F8..][0..8], .little));
+
+    // A real IAT slot must still take the interpreter's import path.
+    state = TestState{};
+    state.admitMemory(true, true);
+    state.regs.rsp = 0x800;
+    state.image_low = 0x100;
+    state.image_high = 0x180;
+    state.iat_low = 0x140;
+    state.iat_high = 0x150;
+    state.image_targets_hooked = 0;
+    state.mapped_transfer_allowed = true;
+    std.mem.writeInt(u64, state.memory[0x144..][0..8], 0xA000_3000, .little);
+    h.insns.clearRetainingCapacity();
+    try h.add(0x100, 6, .{ .op = .call_mem64, .size = .bits64, .addr = 0x3E, .rip_relative = true });
+    try testing.expectEqual(@as(u32, 1), try h.run(&state));
+    try testing.expectEqual(@as(u32, 1), state.interprets);
+    try testing.expectEqual(@as(u64, 0x800), state.regs.rsp);
+
+    // If IAT bounds are unavailable, image-local slots remain conservatively
+    // interpreted so dynamic import shims retain their ownership.
+    state = TestState{};
+    state.admitMemory(true, true);
+    state.regs.rsp = 0x800;
+    state.image_low = 0x100;
+    state.image_high = 0x180;
+    state.image_targets_hooked = 0;
+    state.mapped_transfer_allowed = true;
+    std.mem.writeInt(u64, state.memory[0x126..][0..8], 0xA000_3000, .little);
+    h.insns.clearRetainingCapacity();
+    try h.add(0x100, 6, .{ .op = .call_mem64, .size = .bits64, .addr = 0x20, .rip_relative = true });
+    try testing.expectEqual(@as(u32, 1), try h.run(&state));
+    try testing.expectEqual(@as(u32, 1), state.interprets);
+}
+
+test "published code-cache bounds admit hot transfers without the mapped-transfer helper" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    var state = TestState{};
+    state.admitMemory(true, true);
+    state.regs.rsp = 0x800;
+    state.regs.rbx = 0xA000_3000;
+    state.image_low = 0x1_4000_0000;
+    state.image_high = 0x1_5000_0000;
+    state.code_cache_low = 0xA000_0000;
+    state.code_cache_high = 0xB000_0000;
+    state.image_targets_hooked = 0;
+    // The callback deliberately refuses; the published range is the proof
+    // for Xenia's dedicated mapping and should bypass it.
+    try h.add(0xC000, 2, .{ .op = .call_reg64, .dst_reg = .bl_bx_ebx_rbx });
+    try testing.expectEqual(@as(u32, 1), try h.run(&state));
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+    try testing.expectEqual(@as(u32, 0), state.mapped_transfer_calls);
+    try testing.expectEqual(@as(u64, 0xA000_3000), state.regs.rip);
+    try testing.expectEqual(@as(u64, 0x7F8), state.regs.rsp);
+
+    // A published range proves that an out-of-range target cannot be in the
+    // designated code-cache view, so it takes the interpreter path without a
+    // callback that can only return false.
+    state = TestState{};
+    state.admitMemory(true, true);
+    state.regs.rsp = 0x800;
+    state.regs.rbx = 0xC000_3000;
+    state.image_low = 0x1_4000_0000;
+    state.image_high = 0x1_5000_0000;
+    state.code_cache_low = 0xA000_0000;
+    state.code_cache_high = 0xB000_0000;
+    state.image_targets_hooked = 0;
+    try testing.expectEqual(@as(u32, 1), try h.run(&state));
+    try testing.expectEqual(@as(u32, 1), state.interprets);
+    try testing.expectEqual(@as(u32, 0), state.mapped_transfer_calls);
 }
 
 test "the block boundary rules: host-reaching instructions end a block before themselves, control transfers end it as fallbacks" {
@@ -7223,7 +7644,7 @@ test "the block boundary rules: host-reaching instructions end a block before th
     // a hook for it is a property of the target, not of the encoding.
     try testing.expect(isNative(.{ .op = .call_rel32 }));
     try testing.expect(isNative(.{ .op = .call_reg64, .dst_reg = .bl_bx_ebx_rbx }));
-    try testing.expect(!isNative(.{ .op = .call_reg64, .dst_reg = .ah_sp_esp_rsp }));
+    try testing.expect(isNative(.{ .op = .call_reg64, .dst_reg = .ah_sp_esp_rsp }));
     try testing.expect(!isNative(.{ .op = .div_reg8, .size = .bits8 }));
     try testing.expect(isNative(.{ .op = .div_reg32, .size = .bits32 }));
 }
@@ -7269,8 +7690,8 @@ test "a control transfer is compiled as the block's last instruction and nothing
     var h = try TestHarness.init();
     defer h.deinit();
     // mov rax, rbx ; call [rip + slot] ; add rax, rbx (never part of the
-    // block). An import-table call stays the interpreter's, which is what
-    // this test is about.
+    // block). The call is compiled with a runtime guard; an import-table
+    // target still takes the interpreter-owned import path.
     try h.add(0xC000, 3, regReg(.mov_reg64_reg64, .bits64, .al_ax_eax_rax, .bl_bx_ebx_rbx));
     try h.add(0xC003, 5, .{ .op = .call_mem64, .rip_relative = true });
     try h.add(0xC008, 3, regReg(.add_reg64_reg64, .bits64, .al_ax_eax_rax, .bl_bx_ebx_rbx));
@@ -7282,8 +7703,8 @@ test "a control transfer is compiled as the block's last instruction and nothing
     try testing.expectEqual(@as(u32, 1), state.interprets);
     try testing.expectEqual(@as(u32, 1), state.last_interpret_index);
     try testing.expectEqual(@as(u64, 7), state.regs.rax);
-    try testing.expectEqual(@as(u32, 1), h.block.native_count);
-    try testing.expectEqual(@as(u32, 1), h.block.fallback_count);
+    try testing.expectEqual(@as(u32, 2), h.block.native_count);
+    try testing.expectEqual(@as(u32, 0), h.block.fallback_count);
     // A shim that consumed the call leaves RIP at the next instruction and
     // says "continue": the block still ends there.
     state = TestState{};
@@ -8159,6 +8580,8 @@ test "vextractf128 selects the upper lane for register and memory destinations" 
     var h = try TestHarness.init();
     defer h.deinit();
     var state = TestState{};
+    state.admitMemory(true, true);
+    state.regs.rbx = 0x100;
     state.xmm[1] = lanes32(.{ 1, 2, 3, 4 });
     state.ymm_hi[1] = lanes32(.{ 5, 6, 7, 8 });
     var reg_extract = vecRegs(.vextractf128, 4, 1, 0);
@@ -8421,6 +8844,22 @@ test "vector loads and stores go through the TLB when admitted and through the 1
     try testing.expectEqualSlices(u8, &lanes32(.{ 5, 6, 7, 8 }), state.memory[0x140..0x150]);
 }
 
+test "non-temporal vector stores use the class-aware helper even with a write TLB hit" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    var state = TestState{};
+    state.admitMemory(true, true);
+    state.regs.rbx = 0x100;
+    const payload = lanes32(.{ 0x0123_4567, 0x89AB_CDEF, 0xA5A5_5A5A, 0xDEAD_BEEF });
+    state.xmm[3] = payload;
+    try h.add(0x1000, 5, vecMem(.vmovntps, 0, 3, 0x20));
+
+    try testing.expectEqual(@as(u32, 1), try h.run(&state));
+    try testing.expectEqual(@as(u32, 1), state.non_temporal_writes);
+    try testing.expectEqual(@as(u32, 0), state.writes);
+    try testing.expectEqualSlices(u8, &payload, state.memory[0x120..0x130]);
+}
+
 fn doubles64(values: [2]f64) [16]u8 {
     var bytes: [16]u8 = undefined;
     for (values, 0..) |value, lane| std.mem.writeInt(u64, bytes[lane * 8 ..][0..8], @bitCast(value), .little);
@@ -8537,6 +8976,45 @@ test "shuffles, blends, packs, extends and shifts follow the interpreter's lane 
     try testing.expectEqualSlices(u8, &.{ 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 0, 0, 0 }, &state.xmm[12]);
     try testing.expectEqualSlices(u8, &.{ 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15, 0x80, 1, 0x8F }, &state.xmm[13]);
     try testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &state.zmm_hi[0]); // vpshufb is EVEX-routed: cleared (was zero anyway)
+}
+
+test "VRCpss is native and preserves its VEX source-one upper lanes" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    var state = TestState{};
+    state.xmm[1] = .{ 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 11, 12, 13, 14, 15, 16 };
+    state.xmm[2] = floats32(.{ 4.0, 99.0, 99.0, 99.0 });
+    state.ymm_hi[0] = @splat(0xCC);
+    try h.add(0x1800, 4, vecRegs(.vrcpss, 0, 1, 2));
+    try testing.expectEqual(@as(u32, 1), try h.run(&state));
+    var expected = state.xmm[1];
+    std.mem.writeInt(u32, expected[0..4], @bitCast(@as(f32, 0.25)), .little);
+    try testing.expectEqualSlices(u8, &expected, &state.xmm[0]);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &state.ymm_hi[0]);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+}
+
+test "legacy MOVQ into XMM preserves the YMM upper half" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    var state = TestState{};
+    state.regs.rcx = 0x1234_5678_9ABC_DEF0;
+    state.ymm_hi[3] = @splat(0xA5);
+    var movq: DecodedInsn = .{
+        .op = .vmovq_xmm_reg64,
+        .size = .bits64,
+        .src_reg = .cl_cx_ecx_rcx,
+        .xmm_dst = 3,
+        .is_reg_form = true,
+        .legacy_sse = true,
+    };
+    movq.len = 4;
+    try h.add(0x1900, 4, movq);
+    try testing.expectEqual(@as(u32, 1), try h.run(&state));
+    try testing.expectEqual(@as(u64, 0x1234_5678_9ABC_DEF0), std.mem.readInt(u64, state.xmm[3][0..8], .little));
+    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, state.xmm[3][8..16], .little));
+    try testing.expectEqualSlices(u8, &([_]u8{0xA5} ** 16), &state.ymm_hi[3]);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
 }
 
 test "float templates: min and max ordering, compare predicates, conversions, rounding and compare flags" {
@@ -8680,6 +9158,64 @@ test "general-register transfers, extract, insert and broadcast" {
     _ = &insert;
 }
 
+test "hot vector fallbacks use native moves, permutes, inserts, and movemasks" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    var state = TestState{};
+    state.admitMemory(true, true);
+    state.regs.rbx = 0x100;
+    state.xmm[1] = lanes32(.{ 1, 2, 3, 4 });
+    state.ymm_hi[0] = @splat(0xAA);
+    state.xmm[2] = lanes32(.{ 0x89AB_CDEF, 0x0123_4567, 0, 0 });
+    state.xmm[3] = lanes32(.{ 10, 20, 30, 40 });
+    state.xmm[4] = lanes32(.{ 1, 2, 3, 4 });
+    state.xmm[5] = lanes32(.{ 3, 2, 1, 0 });
+    state.ymm_hi[4] = lanes32(.{ 5, 6, 7, 8 });
+    state.ymm_hi[5] = lanes32(.{ 0, 1, 2, 3 });
+    state.xmm[8] = lanes32(.{ 81, 82, 83, 84 });
+    state.ymm_hi[8] = lanes32(.{ 85, 86, 87, 88 });
+    state.xmm[10] = lanes32(.{ 101, 102, 103, 104 });
+    state.ymm_hi[12] = [_]u8{0} ** 16;
+    std.mem.writeInt(u64, state.xmm[12][0..8], 0x8000_0000_0000_0000, .little);
+    std.mem.writeInt(u64, state.xmm[12][8..16], 0, .little);
+    std.mem.writeInt(u64, state.ymm_hi[12][0..8], 0, .little);
+    std.mem.writeInt(u64, state.ymm_hi[12][8..16], 0x8000_0000_0000_0000, .little);
+    state.xmm[15] = lanes32(.{ 11, 12, 13, 14 });
+    state.ymm_hi[15] = lanes32(.{ 15, 16, 17, 18 });
+    @memcpy(state.memory[0x120..0x130], &lanes32(.{ 21, 22, 23, 24 }));
+    @memcpy(state.memory[0x140..0x150], &lanes32(.{ 31, 32, 33, 34 }));
+
+    try h.add(0x1000, 3, .{ .op = .movaps_xmm_xmm, .legacy_sse = true, .xmm_dst = 0, .xmm_src = 1, .is_reg_form = true });
+    try h.add(0x1003, 4, .{ .op = .vmovq_reg64_xmm, .legacy_sse = true, .size = .bits64, .dst_reg = .dh_si_esi_rsi, .xmm_src = 2, .is_reg_form = true });
+    try h.add(0x1007, 5, .{ .op = .vpermilps, .uses_imm = true, .imm = 0x1B, .xmm_dst = 6, .xmm_src = 3, .is_reg_form = true });
+    try h.add(0x100C, 5, .{ .op = .vpermilps, .xmm_dst = 7, .xmm_src = 4, .xmm_src2 = 5, .is_reg_form = true });
+    try h.add(0x1011, 6, .{ .op = .vinsertf128, .vector_256 = true, .imm = 1, .xmm_dst = 11, .xmm_src = 8, .xmm_src2 = 10, .is_reg_form = true });
+    try h.add(0x1017, 4, .{ .op = .vmovmskpd, .vector_256 = true, .size = .bits32, .dst_reg = .al_ax_eax_rax, .xmm_src = 12, .is_reg_form = true });
+    try h.add(0x101B, 5, .{ .op = .vpermilps, .vector_256 = true, .xmm_dst = 9, .xmm_src = 4, .xmm_src2 = 5, .is_reg_form = true });
+    try h.add(0x1020, 6, .{ .op = .vpermilps, .uses_imm = true, .vector_256 = true, .imm = 0x1B, .xmm_dst = 16, .xmm_src = 15, .is_reg_form = true });
+    try h.add(0x1026, 6, .{ .op = .vpermilps, .uses_imm = true, .imm = 0x1B, .xmm_dst = 13, .addr = 0x20, .sib_has_base = true, .sib_base_reg = .bl_bx_ebx_rbx });
+    try h.add(0x102C, 7, .{ .op = .vinsertf128, .vector_256 = true, .imm = 0, .xmm_dst = 14, .xmm_src = 8, .addr = 0x40, .sib_has_base = true, .sib_base_reg = .bl_bx_ebx_rbx });
+    _ = try h.run(&state);
+
+    try testing.expectEqualSlices(u8, &state.xmm[1], &state.xmm[0]);
+    try testing.expectEqualSlices(u8, &([_]u8{0xAA} ** 16), &state.ymm_hi[0]);
+    try testing.expectEqual(@as(u64, 0x0123_4567_89AB_CDEF), state.regs.rsi);
+    try testing.expectEqualSlices(u8, &lanes32(.{ 40, 30, 20, 10 }), &state.xmm[6]);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &state.ymm_hi[6]);
+    try testing.expectEqualSlices(u8, &lanes32(.{ 4, 3, 2, 1 }), &state.xmm[7]);
+    try testing.expectEqualSlices(u8, &lanes32(.{ 4, 3, 2, 1 }), &state.xmm[9]);
+    try testing.expectEqualSlices(u8, &lanes32(.{ 5, 6, 7, 8 }), &state.ymm_hi[9]);
+    try testing.expectEqualSlices(u8, &lanes32(.{ 14, 13, 12, 11 }), &state.xmm[16]);
+    try testing.expectEqualSlices(u8, &lanes32(.{ 18, 17, 16, 15 }), &state.ymm_hi[16]);
+    try testing.expectEqualSlices(u8, &lanes32(.{ 24, 23, 22, 21 }), &state.xmm[13]);
+    try testing.expectEqualSlices(u8, &state.xmm[8], &state.xmm[11]);
+    try testing.expectEqualSlices(u8, &state.xmm[10], &state.ymm_hi[11]);
+    try testing.expectEqualSlices(u8, &lanes32(.{ 31, 32, 33, 34 }), &state.xmm[14]);
+    try testing.expectEqualSlices(u8, &state.ymm_hi[8], &state.ymm_hi[14]);
+    try testing.expectEqual(@as(u64, 0b1001), state.regs.rax);
+    try testing.expectEqual(@as(u32, 0), state.interprets);
+}
+
 test "ret is native, and every instrument its interpreter arm carries still stops it" {
     var h = try TestHarness.init();
     defer h.deinit();
@@ -8701,6 +9237,22 @@ test "ret is native, and every instrument its interpreter arm carries still stop
         try testing.expectEqual(@as(u32, 1), completed);
         try testing.expectEqual(return_rip, state.regs.rip);
         try testing.expectEqual(stack + 8, state.regs.rsp);
+        try testing.expectEqual(@as(u32, 0), state.interprets);
+    }
+
+    // `ret imm16` pops the return address and then discards the caller's
+    // argument area. The stack adjustment is applied by the native template.
+    {
+        var state = TestState{};
+        state.admitMemory(true, true);
+        state.regs.rsp = stack;
+        std.mem.writeInt(u64, state.memory[stack..][0..8], return_rip, .little);
+        h.insns.clearRetainingCapacity();
+        try h.add(0xB000, 3, .{ .op = .ret, .imm = 0x1234 });
+        const completed = try h.run(&state);
+        try testing.expectEqual(@as(u32, 1), completed);
+        try testing.expectEqual(return_rip, state.regs.rip);
+        try testing.expectEqual(stack + 8 + 0x1234, state.regs.rsp);
         try testing.expectEqual(@as(u32, 0), state.interprets);
     }
 
@@ -8733,10 +9285,7 @@ test "ret is native, and every instrument its interpreter arm carries still stop
         try testing.expectEqual(stack, state.regs.rsp);
     }
 
-    // `ret imm16` decodes to the same op with a pop count the interpreter's
-    // arm does not apply. Reproducing that here would bake the discrepancy
-    // into translated code, so the template declines it.
-    try testing.expect(!isNative(.{ .op = .ret, .imm = 4 }));
+    try testing.expect(isNative(.{ .op = .ret, .imm = 4 }));
     try testing.expect(isNative(.{ .op = .ret, .imm = 0 }));
 
     // A faulting pop leaves through the abort path with the instruction not
@@ -8835,6 +9384,63 @@ test "indirect transfers outside the image and hooked image targets use the inte
         _ = try h.run(&state);
         try testing.expectEqual(@as(u32, 1), state.interprets);
         try testing.expectEqual(stack, state.regs.rsp);
+    }
+
+    // The glue can prove the dedicated Xenia code-cache mapping. In that
+    // case both indirect register and memory calls use the already-compiled
+    // transfer templates and preserve the normal guest stack contract.
+    for ([_]Op{ .call_reg64, .call_mem64 }) |op| {
+        var state = TestState{};
+        state.admitMemory(true, true);
+        state.regs.rsp = stack;
+        state.regs.rbx = if (op == .call_mem64) 0x100 else 0xA000_1000;
+        if (op == .call_mem64) std.mem.writeInt(u64, state.memory[0x120..][0..8], 0xA000_3000, .little);
+        state.image_low = 0x1_4000_0000;
+        state.image_high = 0x1_5000_0000;
+        state.mapped_transfer_allowed = true;
+        h.insns.clearRetainingCapacity();
+        try h.add(0xC000, if (op == .call_mem64) 3 else 2, if (op == .call_mem64)
+            baseDisp(.call_mem64, .bits64, .al_ax_eax_rax, 0x20)
+        else
+            .{ .op = .call_reg64, .dst_reg = .bl_bx_ebx_rbx });
+        _ = try h.run(&state);
+        try testing.expectEqual(@as(u32, 0), state.interprets);
+        try testing.expectEqual(if (op == .call_mem64) @as(u64, 0xA000_3000) else @as(u64, 0xA000_1000), state.regs.rip);
+        try testing.expectEqual(stack - 8, state.regs.rsp);
+        try testing.expectEqual(if (op == .call_mem64) @as(u64, 0xC003) else @as(u64, 0xC002), std.mem.readInt(u64, state.memory[stack - 8 ..][0..8], .little));
+    }
+
+    // The emitter reads a register or [rsp] target before pushing the
+    // return address. Prove both RSP forms use the same mapped-code proof
+    // and preserve the old stack value as the call target/source address.
+    {
+        var state = TestState{};
+        state.admitMemory(true, true);
+        state.regs.rsp = stack;
+        state.code_cache_low = stack;
+        state.code_cache_high = stack + 0x100;
+        h.insns.clearRetainingCapacity();
+        try h.add(0xC000, 2, .{ .op = .call_reg64, .dst_reg = .ah_sp_esp_rsp });
+        _ = try h.run(&state);
+        try testing.expectEqual(@as(u32, 0), state.interprets);
+        try testing.expectEqual(stack, state.regs.rip);
+        try testing.expectEqual(stack - 8, state.regs.rsp);
+        try testing.expectEqual(@as(u64, 0xC002), std.mem.readInt(u64, state.memory[stack - 8 ..][0..8], .little));
+    }
+    {
+        var state = TestState{};
+        state.admitMemory(true, true);
+        state.regs.rsp = stack;
+        state.code_cache_low = 0xA000_0000;
+        state.code_cache_high = 0xA001_0000;
+        std.mem.writeInt(u64, state.memory[stack..][0..8], 0xA000_3000, .little);
+        h.insns.clearRetainingCapacity();
+        try h.add(0xC000, 3, baseDispAt(.call_mem64, .bits64, .ah_sp_esp_rsp, 0));
+        _ = try h.run(&state);
+        try testing.expectEqual(@as(u32, 0), state.interprets);
+        try testing.expectEqual(@as(u64, 0xA000_3000), state.regs.rip);
+        try testing.expectEqual(stack - 8, state.regs.rsp);
+        try testing.expectEqual(@as(u64, 0xC003), std.mem.readInt(u64, state.memory[stack - 8 ..][0..8], .little));
     }
 }
 

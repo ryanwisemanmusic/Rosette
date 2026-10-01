@@ -66,7 +66,7 @@ pub fn tryRijndaelDecrypt(state: anytype, schedule_address: u64, nr_value: u64, 
     const schedule_bytes: u64 = @intCast(word_count * @sizeOf(u32));
     const schedule = state.guestMemoryConst(schedule_address, schedule_bytes) orelse return false;
     const source = state.guestMemoryConst(ciphertext_address, 16) orelse return false;
-    if (state.guestMemory(plaintext_address, 16) == null) return false;
+    if (state.guestMemoryConst(plaintext_address, 16) == null) return false;
 
     var round_keys: [4 * (MAX_AES_ROUNDS + 1)]u32 = undefined;
     for (0..word_count) |index| {
@@ -166,7 +166,6 @@ pub fn trySha1ProcessBlock(state: anytype, this_address: u64) bool {
     const digest_bytes = state.guestMemoryConst(this_address + SHA1_DIGEST_OFFSET, 20) orelse return false;
     const block_bytes = state.guestMemoryConst(this_address + SHA1_BLOCK_OFFSET, 64) orelse return false;
 
-    const output = state.guestMemory(this_address + SHA1_DIGEST_OFFSET, 20) orelse return false;
     const block_index_bytes = state.guestMemoryConst(this_address + SHA1_BLOCK_INDEX_OFFSET, 8) orelse return false;
     const byte_count_bytes = state.guestMemoryConst(this_address + SHA1_BYTE_COUNT_OFFSET, 8) orelse return false;
 
@@ -181,10 +180,9 @@ pub fn trySha1ProcessBlock(state: anytype, this_address: u64) bool {
     var block: [64]u8 = undefined;
     @memcpy(&block, block_bytes);
     const result = sha1Compress(digest, block);
-    for (0..5) |index| {
-        std.mem.writeInt(u32, output[index * 4 ..][0..4], result[index], .little);
-    }
-    return true;
+    var output: [20]u8 = undefined;
+    for (0..5) |index| std.mem.writeInt(u32, output[index * 4 ..][0..4], result[index], .little);
+    return state.copyToGuest(this_address + SHA1_DIGEST_OFFSET, &output);
 }
 
 /// Feed a contiguous byte span into a TinySHA1 object, exactly as the guest's
@@ -250,16 +248,18 @@ pub fn sha1ProcessBytes(
         }
     }
 
-    const digest_out = state.guestMemory(this_address + SHA1_DIGEST_OFFSET, 20) orelse return false;
-    const block_out = state.guestMemory(this_address + SHA1_BLOCK_OFFSET, 64) orelse return false;
-    const index_out = state.guestMemory(this_address + SHA1_BLOCK_INDEX_OFFSET, 8) orelse return false;
-    const count_out = state.guestMemory(this_address + SHA1_BYTE_COUNT_OFFSET, 8) orelse return false;
+    var digest_out: [20]u8 = undefined;
     for (0..5) |index| {
         std.mem.writeInt(u32, digest_out[index * 4 ..][0..4], digest[index], .little);
     }
-    @memcpy(block_out, &block);
-    std.mem.writeInt(u64, index_out[0..8], block_index, .little);
-    std.mem.writeInt(u64, count_out[0..8], byte_count, .little);
+    var index_out: [8]u8 = undefined;
+    var count_out: [8]u8 = undefined;
+    std.mem.writeInt(u64, &index_out, block_index, .little);
+    std.mem.writeInt(u64, &count_out, byte_count, .little);
+    if (!state.copyToGuest(this_address + SHA1_DIGEST_OFFSET, &digest_out)) return false;
+    if (!state.copyToGuest(this_address + SHA1_BLOCK_OFFSET, &block)) return false;
+    if (!state.copyToGuest(this_address + SHA1_BLOCK_INDEX_OFFSET, &index_out)) return false;
+    if (!state.copyToGuest(this_address + SHA1_BYTE_COUNT_OFFSET, &count_out)) return false;
     return true;
 }
 
@@ -286,14 +286,14 @@ pub fn tryXLastXmlLoad(state: anytype, result_address: u64, buffer_address: u64,
 pub fn tryXeniaTabulateString(state: anytype, result_address: u64, table_address: u64) bool {
     if (result_address < 0x100000 or table_address < 0x100000) return false;
     _ = state.guestMemoryConst(table_address, 0x20) orelse return false;
-    const result = state.guestMemory(result_address, 0x20) orelse return false;
+    if (state.guestMemoryConst(result_address, 0x20) == null) return false;
 
     // libstdc++'s 64-bit basic_string stores its data pointer, length, and a
     // 16-byte small-string buffer in this order. An empty SSO string points to
     // its inline buffer and has a zero length plus a terminating zero byte.
-    @memset(result, 0);
+    var result: [0x20]u8 = @splat(0);
     std.mem.writeInt(u64, result[0..8], result_address + 0x10, .little);
-    return true;
+    return state.copyToGuest(result_address, &result);
 }
 
 test "feeding a span byte by byte matches feeding it one block at a time" {
@@ -419,6 +419,12 @@ test "XLast XML bypass is always refused so the guest DOM remains authoritative"
         fn guestMemory(self: *@This(), address: u64, length: u64) ?[]u8 {
             if (address +| length > self.bytes.len) return null;
             return self.bytes[@intCast(address)..@intCast(address + length)];
+        }
+
+        fn copyToGuest(self: *@This(), address: u64, source: []const u8) bool {
+            const destination = self.guestMemory(address, source.len) orelse return false;
+            @memcpy(destination, source);
+            return true;
         }
     };
 

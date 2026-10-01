@@ -164,6 +164,32 @@ pub fn fullBarrier() void {
     }
 }
 
+/// Order loads without forcing unrelated stores through an x86 store buffer.
+/// On ARM64, `dmb ishld` supplies the load/load edge LFENCE requires; the
+/// acquire/release guest-access path already preserves load/store ordering.
+pub fn loadBarrier() void {
+    if (comptime builtin.target.cpu.arch == .aarch64) {
+        asm volatile ("dmb ishld" ::: .{ .memory = true });
+    } else if (comptime builtin.target.cpu.arch == .x86_64) {
+        asm volatile ("lfence" ::: .{ .memory = true });
+    } else {
+        std.atomic.fence(.acquire);
+    }
+}
+
+/// Order stores. The software store buffer is drained by its caller before
+/// this edge, so SFENCE publishes earlier guest stores without imposing a
+/// full load barrier on ARM64.
+pub fn storeBarrier() void {
+    if (comptime builtin.target.cpu.arch == .aarch64) {
+        asm volatile ("dmb ishst" ::: .{ .memory = true });
+    } else if (comptime builtin.target.cpu.arch == .x86_64) {
+        asm volatile ("sfence" ::: .{ .memory = true });
+    } else {
+        std.atomic.fence(.release);
+    }
+}
+
 test "parallel access stripes do not false-share a host cache line" {
     try std.testing.expectEqual(@as(usize, 128), @alignOf(AccessStripe));
     try std.testing.expect(@sizeOf(AccessStripe) >= 128);

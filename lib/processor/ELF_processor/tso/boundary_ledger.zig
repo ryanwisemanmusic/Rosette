@@ -36,6 +36,12 @@ pub const Boundary = enum(u8) {
     thread_exit,
     /// A host slice of guest memory was handed to Rosette code.
     raw_view,
+    /// A read or write reached a native device-backed guest-memory alias.
+    device_access,
+    /// A read or write is being routed through guest page-protection state.
+    fault_routed_access,
+    /// An x86 non-temporal store bypassed the ordinary temporal store queue.
+    non_temporal_store,
     /// MFENCE, SFENCE or a LOCK-prefixed read-modify-write.
     fence,
     /// A store touched executable bytes; decode caches are invalidated next.

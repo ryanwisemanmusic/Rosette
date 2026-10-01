@@ -19,6 +19,7 @@ const store_buffer = @import("tso/store_buffer.zig");
 const guest_buffers = @import("tso/guest_buffers.zig");
 const scalar_access = @import("tso/scalar_access.zig");
 pub const boundary_ledger = @import("tso/boundary_ledger.zig");
+pub const memory_policy = @import("tso/memory_policy.zig");
 
 pub const StoreBuffer = store_buffer.StoreBuffer;
 pub const GuestStoreBuffers = guest_buffers.GuestStoreBuffers;
@@ -38,6 +39,7 @@ test {
     _ = guest_buffers;
     _ = scalar_access;
     _ = boundary_ledger;
+    _ = memory_policy;
 }
 
 /// Bind the current executor's buffer for scalar memory operations. Callers
@@ -100,16 +102,16 @@ fn coordinatedGuestAccess() bool {
 
 /// Place a bulk guest read after earlier guest reads. Slice-based runtime
 /// helpers cannot use one scalar `load`, so they bracket their direct view
-/// with the same conservative ordering edge as the scalar path.
+/// with the load/load edge required by LFENCE.
 pub fn loadFence() void {
-    fullBarrier();
+    stripes.loadBarrier();
 }
 
 /// Order earlier guest stores before a slice-based bulk write. The next
 /// scalar release store or bulk borrow orders this write before later stores.
 pub fn storeFence() void {
     flushActiveStoreBufferFor(.raw_view);
-    fullBarrier();
+    stripes.storeBarrier();
 }
 
 /// MFENCE orders both sides of the operation and makes this executor's
@@ -441,6 +443,98 @@ pub fn copyInCoordinated(destination: []u8, source: []const u8) void {
     copyInMode(destination, source, true, true);
 }
 
+/// Compare cached instruction bytes against live guest code without taking
+/// an address stripe.
+///
+/// A decode cache hit only has to prove the bytes it decoded are the bytes
+/// there now. A torn read of bytes another executor is rewriting either
+/// differs from the cached copy, and the caller refills from a coordinated
+/// snapshot, or equals it, which is an interleaving in which this fetch came
+/// before the write. Either way the decode used is exact for the bytes seen.
+/// This executor's own queued stores still forward, through the coordinated
+/// comparison: a thread sees its own code writes in program order.
+///
+/// The stripe cost two atomic read-modify-writes on a line every executor
+/// decoding the same code shares; on 2026-09-30 that comparison was 5.5% of
+/// the title's main thread and 3% of its render thread.
+pub fn eqlCodeBytes(expected: []const u8, source: []const u8, scratch: []u8) bool {
+    if (expected.len > source.len or scratch.len < expected.len) return false;
+    if (expected.len == 0) return true;
+    if (active_store_buffer) |buffer| {
+        if (buffer.mayForward(@intFromPtr(source.ptr), expected.len)) return eqlCoordinated(expected, source, scratch);
+    }
+    for (expected, source[0..expected.len]) |wanted, *actual| {
+        if (@atomicLoad(u8, actual, .monotonic) != wanted) return false;
+    }
+    return true;
+}
+
+/// Compare guest-backed bytes without staging a copy when the current
+/// executor has no buffered stores. Instruction-cache hits use this while
+/// holding the corresponding decode-cache set lock: it takes the same shared
+/// address stripes as guest writes and compares aligned atomic word chunks
+/// in place. When this executor has a store buffer, keep the snapshot path so
+/// its own stores are forwarded exactly as a normal instruction fetch would
+/// observe them.
+fn eqlAtomicChunk(comptime T: type, expected: []const u8, source_address: usize) bool {
+    const source: *const T = @ptrFromInt(source_address);
+    const actual = littleEndian(@atomicLoad(T, source, .monotonic));
+    const wanted = std.mem.readInt(T, expected[0..@sizeOf(T)], .little);
+    return actual == wanted;
+}
+
+pub fn eqlCoordinated(expected: []const u8, source: []const u8, scratch: []u8) bool {
+    if (expected.len > source.len or scratch.len < expected.len) return false;
+    if (expected.len == 0) return true;
+    if (active_store_buffer) |buffer| {
+        if (buffer.mayForward(@intFromPtr(source.ptr), expected.len)) {
+            const snapshot = scratch[0..expected.len];
+            copyInMode(snapshot, source[0..expected.len], true, true);
+            return std.mem.eql(u8, expected, snapshot);
+        }
+    }
+
+    var offset: usize = 0;
+    while (offset < expected.len) {
+        const address = @intFromPtr(source.ptr) + offset;
+        const line_remaining = cache_line_bytes - (address & (cache_line_bytes - 1));
+        const count = @min(expected.len - offset, line_remaining);
+        const chunk = source[offset..][0..count];
+        const guard = AccessGuard.lockMode(chunk, true, true);
+        var equal = true;
+        var compared: usize = 0;
+        while (compared < count) {
+            const chunk_address = address + compared;
+            const available = count - compared;
+            const width: usize = if (available >= 8 and chunk_address & 7 == 0)
+                8
+            else if (available >= 4 and chunk_address & 3 == 0)
+                4
+            else if (available >= 2 and chunk_address & 1 == 0)
+                2
+            else
+                1;
+            const matched = switch (width) {
+                8 => eqlAtomicChunk(u64, expected[offset + compared ..], chunk_address),
+                4 => eqlAtomicChunk(u32, expected[offset + compared ..], chunk_address),
+                2 => eqlAtomicChunk(u16, expected[offset + compared ..], chunk_address),
+                1 => eqlAtomicChunk(u8, expected[offset + compared ..], chunk_address),
+                else => unreachable,
+            };
+            if (!matched) {
+                equal = false;
+                break;
+            }
+            compared += width;
+        }
+        guard.unlock();
+        if (!equal) return false;
+        offset += count;
+    }
+    fullBarrier();
+    return true;
+}
+
 /// Take a coordinated snapshot of backing bytes without applying the current
 /// executor's store-buffer overlay. This is reserved for fault diagnostics:
 /// comparing it with `copyInCoordinated` distinguishes bytes already
@@ -539,6 +633,14 @@ pub fn loadCoordinated(comptime T: type, bytes: []const u8) T {
     return loadMode(T, bytes, true);
 }
 
+/// Load without forwarding from the executor's ordinary RAM store buffer.
+/// The caller selects coordination from the address class and must name why
+/// the buffer is bypassed. Pending temporal stores are published first.
+pub fn loadUnbuffered(comptime T: type, bytes: []const u8, coordinated: bool, boundary: Boundary) T {
+    flushActiveStoreBufferFor(boundary);
+    return scalar_access.load(T, bytes, coordinated, null);
+}
+
 fn loadMode(comptime T: type, bytes: []const u8, coordinated: bool) T {
     return scalar_access.load(T, bytes, coordinated, active_store_buffer);
 }
@@ -551,6 +653,14 @@ pub fn store(comptime T: type, bytes: []u8, value: T) void {
 /// guest executor's thread-local access scope.
 pub fn storeCoordinated(comptime T: type, bytes: []u8, value: T) void {
     storeMode(T, bytes, value, true);
+}
+
+/// Store directly to the backing memory instead of entering the ordinary
+/// temporal queue. Used for device-backed aliases and non-temporal guest
+/// stores after publishing earlier queued stores.
+pub fn storeUnbuffered(comptime T: type, bytes: []u8, value: T, coordinated: bool, boundary: Boundary) void {
+    flushActiveStoreBufferFor(boundary);
+    scalar_access.store(T, bytes, value, coordinated, null);
 }
 
 fn storeMode(comptime T: type, bytes: []u8, value: T, coordinated: bool) void {
@@ -722,6 +832,52 @@ test "store fence drains the active guest store buffer" {
     storeFence();
     try std.testing.expectEqual(@as(usize, 0), buffer.pendingCount());
     try std.testing.expectEqual(@as(u32, 0xDEAD_BEEF), loadCoordinated(u32, backing[0..4]));
+}
+
+test "unbuffered access publishes earlier temporal stores and never requeues" {
+    var backing: [16]u8 align(8) = [_]u8{0} ** 16;
+    var buffer: StoreBuffer = .{};
+    const prior_mode = setCoordinatedGuestAccess(true);
+    defer _ = setCoordinatedGuestAccess(prior_mode);
+    const prior_buffer = setActiveStoreBuffer(&buffer);
+    defer _ = setActiveStoreBuffer(prior_buffer);
+
+    storeCoordinated(u32, backing[0..4], 0x1122_3344);
+    storeUnbuffered(u32, backing[8..12], 0xAABB_CCDD, true, .device_access);
+    try std.testing.expectEqual(@as(usize, 0), buffer.pendingCount());
+    try std.testing.expectEqual(@as(u32, 0x1122_3344), std.mem.readInt(u32, backing[0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0xAABB_CCDD), loadUnbuffered(u32, backing[8..12], true, .device_access));
+
+    const ledger = boundary_ledger.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), ledger.flushes[@intFromEnum(Boundary.device_access)]);
+    try std.testing.expectEqual(@as(u64, 1), ledger.entries[@intFromEnum(Boundary.device_access)]);
+}
+
+test "load fence preserves pending stores for same-context forwarding" {
+    var backing: [8]u8 align(8) = [_]u8{0} ** 8;
+    var buffer: StoreBuffer = .{};
+    const prior_mode = setCoordinatedGuestAccess(true);
+    defer _ = setCoordinatedGuestAccess(prior_mode);
+    const prior_buffer = setActiveStoreBuffer(&buffer);
+    defer _ = setActiveStoreBuffer(prior_buffer);
+
+    storeCoordinated(u32, backing[0..4], 0xC0DE_CAFE);
+    loadFence();
+    try std.testing.expectEqual(@as(usize, 1), buffer.pendingCount());
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, backing[0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0xC0DE_CAFE), loadCoordinated(u32, backing[0..4]));
+}
+
+test "full memory fence drains pending stores" {
+    var backing: [8]u8 align(8) = [_]u8{0} ** 8;
+    var buffer: StoreBuffer = .{};
+    const prior_buffer = setActiveStoreBuffer(&buffer);
+    defer _ = setActiveStoreBuffer(prior_buffer);
+
+    store(u64, backing[0..8], 0x0123_4567_89AB_CDEF);
+    memoryFence();
+    try std.testing.expectEqual(@as(usize, 0), buffer.pendingCount());
+    try std.testing.expectEqual(@as(u64, 0x0123_4567_89AB_CDEF), std.mem.readInt(u64, backing[0..8], .little));
 }
 
 test "locked compare exchange drains prior guest stores before its atomic update" {
@@ -913,6 +1069,137 @@ test "coordinated unaligned accesses cannot observe a split peer store" {
     try std.testing.expect(!shared.invalid.load(.acquire));
 }
 
+test "mixed-width overlapping buffered stores remain local until publication" {
+    const Shared = struct {
+        bytes: [8]u8 align(8) = [_]u8{0xA5} ** 8,
+        ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        observed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+        fn observe(shared: *@This()) void {
+            const previous_mode = setCoordinatedGuestAccess(true);
+            defer _ = setCoordinatedGuestAccess(previous_mode);
+            while (!shared.ready.load(.acquire)) std.atomic.spinLoopHint();
+            shared.observed.store(loadCoordinated(u64, shared.bytes[0..8]), .release);
+        }
+    };
+
+    var shared = Shared{};
+    var buffer = StoreBuffer{};
+    const previous_mode = setCoordinatedGuestAccess(true);
+    defer _ = setCoordinatedGuestAccess(previous_mode);
+    const previous_buffer = setActiveStoreBuffer(&buffer);
+    defer _ = setActiveStoreBuffer(previous_buffer);
+
+    store(u64, shared.bytes[0..8], 0x8877_6655_4433_2211);
+    store(u32, shared.bytes[2..6], 0xAABB_CCDD);
+    store(u16, shared.bytes[5..7], 0xEEFF);
+    try std.testing.expectEqual(@as(usize, 3), buffer.pendingCount());
+
+    const observer = try std.Thread.spawn(.{}, Shared.observe, .{&shared});
+    shared.ready.store(true, .release);
+
+    var forwarded: [8]u8 = undefined;
+    copyInCoordinated(&forwarded, &shared.bytes);
+    try std.testing.expectEqual([_]u8{ 0x11, 0x22, 0xDD, 0xCC, 0xBB, 0xFF, 0xEE, 0x88 }, forwarded);
+    observer.join();
+
+    const backing_value = std.mem.readInt(u64, &shared.bytes, .little);
+    try std.testing.expectEqual(@as(u64, 0xA5A5_A5A5_A5A5_A5A5), shared.observed.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0xA5A5_A5A5_A5A5_A5A5), backing_value);
+    try std.testing.expectEqual(@as(usize, 3), buffer.drain());
+    try std.testing.expectEqualSlices(u8, &forwarded, &shared.bytes);
+}
+
+test "an unaligned store crossing a cache line drains atomically to peers" {
+    const Shared = struct {
+        bytes: [128]u8 align(64) = [_]u8{0} ** 128,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        invalid: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn observe(shared: *@This()) void {
+            const previous_mode = setCoordinatedGuestAccess(true);
+            defer _ = setCoordinatedGuestAccess(previous_mode);
+            const first: u64 = 0x1122_3344_5566_7788;
+            const second: u64 = 0xAABB_CCDD_EEFF_0011;
+            while (!shared.done.load(.acquire)) {
+                const value = loadCoordinated(u64, shared.bytes[60..68]);
+                if (value != first and value != second) shared.invalid.store(true, .release);
+            }
+            const value = loadCoordinated(u64, shared.bytes[60..68]);
+            if (value != first and value != second) shared.invalid.store(true, .release);
+        }
+    };
+
+    var shared = Shared{};
+    const first: u64 = 0x1122_3344_5566_7788;
+    const second: u64 = 0xAABB_CCDD_EEFF_0011;
+    const previous_mode = setCoordinatedGuestAccess(true);
+    storeCoordinated(u64, shared.bytes[60..68], first);
+    _ = setCoordinatedGuestAccess(previous_mode);
+
+    const observer = try std.Thread.spawn(.{}, Shared.observe, .{&shared});
+    const producer_mode = setCoordinatedGuestAccess(true);
+    var buffer = StoreBuffer{};
+    const previous_buffer = setActiveStoreBuffer(&buffer);
+    for (0..50_000) |iteration| {
+        const value = if (iteration & 1 == 0) second else first;
+        store(u64, shared.bytes[60..68], value);
+        _ = buffer.drain();
+    }
+    shared.done.store(true, .release);
+    _ = setActiveStoreBuffer(previous_buffer);
+    _ = setCoordinatedGuestAccess(producer_mode);
+    observer.join();
+    try std.testing.expect(!shared.invalid.load(.acquire));
+    try std.testing.expect(buffer.isEmpty());
+}
+
+test "a locked exchange publishes buffered stores before a peer observes its handoff" {
+    const Shared = struct {
+        const rounds = 4096;
+        bytes: [64]u8 align(64) = [_]u8{0} ** 64,
+        mismatch: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn consume(shared: *@This()) void {
+            const previous_mode = setCoordinatedGuestAccess(true);
+            defer _ = setCoordinatedGuestAccess(previous_mode);
+            const payload = shared.bytes[0..8];
+            const ready = shared.bytes[8..16];
+            const acknowledged = shared.bytes[16..24];
+            for (1..rounds + 1) |round| {
+                const expected: u64 = @intCast(round);
+                while (loadCoordinated(u64, ready) != expected) std.atomic.spinLoopHint();
+                if (loadCoordinated(u64, payload) != expected) shared.mismatch.store(true, .release);
+                storeCoordinated(u64, acknowledged, expected);
+            }
+        }
+    };
+
+    var shared = Shared{};
+    const consumer = try std.Thread.spawn(.{}, Shared.consume, .{&shared});
+    const previous_mode = setCoordinatedGuestAccess(true);
+    defer _ = setCoordinatedGuestAccess(previous_mode);
+    var buffer = StoreBuffer{};
+    const previous_buffer = setActiveStoreBuffer(&buffer);
+    defer {
+        _ = setActiveStoreBuffer(previous_buffer);
+        _ = buffer.drain();
+    }
+    const payload = shared.bytes[0..8];
+    const ready = shared.bytes[8..16];
+    const acknowledged = shared.bytes[16..24];
+    for (1..Shared.rounds + 1) |round| {
+        const expected: u64 = @intCast(round);
+        while (loadCoordinated(u64, acknowledged) != expected - 1) std.atomic.spinLoopHint();
+        store(u64, payload, expected);
+        const previous = exchangeAny(u64, ready, expected) orelse unreachable;
+        try std.testing.expectEqual(expected - 1, previous);
+    }
+    consumer.join();
+    try std.testing.expect(!shared.mismatch.load(.acquire));
+    try std.testing.expect(buffer.isEmpty());
+}
+
 test "locked atomics retain width and do not overwrite neighboring bytes" {
     var bytes: [32]u8 align(16) = [_]u8{0xA5} ** 32;
     inline for (.{ u8, u16, u32, u64 }) |T| {
@@ -1012,6 +1299,42 @@ test "coordinated locked updates serialize across overlapping operand widths" {
     try std.testing.expectEqual(@as(u64, 20_000), observed);
 }
 
+test "mixed-width locked RMWs serialize with ordinary coordinated stores" {
+    const Shared = struct {
+        const rounds = 20_000;
+        bytes: [64]u8 align(64) = [_]u8{0} ** 64,
+        ready: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+        fn addWide(shared: *@This()) void {
+            const previous_mode = setCoordinatedGuestAccess(true);
+            defer _ = setCoordinatedGuestAccess(previous_mode);
+            _ = shared.ready.fetchAdd(1, .release);
+            while (shared.ready.load(.acquire) != 2) std.atomic.spinLoopHint();
+            for (0..rounds) |_| {
+                _ = updateAny(u64, shared.bytes[0..8], .add, 1, false) orelse unreachable;
+            }
+        }
+    };
+
+    var shared = Shared{};
+    const previous_mode = setCoordinatedGuestAccess(true);
+    defer _ = setCoordinatedGuestAccess(previous_mode);
+    const wide = try std.Thread.spawn(.{}, Shared.addWide, .{&shared});
+    _ = shared.ready.fetchAdd(1, .release);
+    while (shared.ready.load(.acquire) != 2) std.atomic.spinLoopHint();
+    for (1..Shared.rounds + 1) |value| {
+        // The 32-bit store updates the upper half of the same 64-bit word
+        // that the peer changes with a locked update. Both paths must enter
+        // the same exclusive stripe or the CAS can replay a stale upper half.
+        storeCoordinated(u32, shared.bytes[4..8], @intCast(value));
+    }
+    wide.join();
+    try std.testing.expectEqual(
+        (@as(u64, Shared.rounds) << 32) | Shared.rounds,
+        loadCoordinated(u64, shared.bytes[0..8]),
+    );
+}
+
 test "cmpxchg16b is one aligned 128-bit transaction" {
     var bytes: [48]u8 align(16) = [_]u8{0xA5} ** 48;
     const operand = bytes[16..32];
@@ -1067,6 +1390,68 @@ test "forced coordination snapshots bounded strings outside executor mode" {
 
     storeCoordinated(u64, source[32..40], 0x1122_3344_5566_7788);
     try std.testing.expectEqual(@as(u64, 0x1122_3344_5566_7788), loadCoordinated(u64, source[32..40]));
+}
+
+test "coordinated equality compares backing directly and forwards this executor's stores" {
+    var bytes: [64]u8 align(64) = [_]u8{0} ** 64;
+    @memcpy(bytes[10..14], &[_]u8{ 1, 2, 3, 4 });
+    var scratch: [16]u8 = undefined;
+    var buffer: StoreBuffer = .{};
+    const prior_access = setCoordinatedGuestAccess(true);
+    defer _ = setCoordinatedGuestAccess(prior_access);
+    const prior_buffer = setActiveStoreBuffer(null);
+    defer _ = setActiveStoreBuffer(prior_buffer);
+
+    try std.testing.expect(eqlCoordinated(&.{ 1, 2, 3, 4 }, bytes[10..14], &scratch));
+    try std.testing.expect(!eqlCoordinated(&.{ 1, 2, 3, 5 }, bytes[10..14], &scratch));
+    try std.testing.expect(eqlCodeBytes(&.{ 1, 2, 3, 4 }, bytes[10..14], &scratch));
+    try std.testing.expect(!eqlCodeBytes(&.{ 1, 2, 3, 5 }, bytes[10..14], &scratch));
+    try std.testing.expect(!eqlCodeBytes(&.{ 1, 2, 3, 4, 5 }, bytes[10..14], &scratch));
+
+    _ = setActiveStoreBuffer(&buffer);
+    defer _ = buffer.drain();
+    // A bound but empty buffer is the normal worker state and must still
+    // take the no-copy path. Pending stores to an unrelated range also do not
+    // require forwarding into this comparison.
+    try std.testing.expect(eqlCoordinated(&.{ 1, 2, 3, 4 }, bytes[10..14], &scratch));
+    buffer.enqueue(@intFromPtr(&bytes[32]), &.{9});
+    try std.testing.expect(eqlCoordinated(&.{ 1, 2, 3, 4 }, bytes[10..14], &scratch));
+    _ = buffer.drain();
+    buffer.enqueue(@intFromPtr(&bytes[11]), &.{9});
+    try std.testing.expect(eqlCoordinated(&.{ 1, 9, 3, 4 }, bytes[10..14], &scratch));
+    try std.testing.expect(!eqlCoordinated(&.{ 1, 2, 3, 4 }, bytes[10..14], &scratch));
+    // The lock-free comparison forwards this executor's own queued code
+    // write exactly as the coordinated one does.
+    try std.testing.expect(eqlCodeBytes(&.{ 1, 9, 3, 4 }, bytes[10..14], &scratch));
+    try std.testing.expect(!eqlCodeBytes(&.{ 1, 2, 3, 4 }, bytes[10..14], &scratch));
+}
+
+test "coordinated equality uses aligned atomic chunks at every offset and cache-line edge" {
+    var bytes: [128]u8 align(64) = undefined;
+    for (&bytes, 0..) |*byte, index| byte.* = @truncate(index *% 37 +% 11);
+    var scratch: [16]u8 = undefined;
+    var expected: [15]u8 = undefined;
+    const prior_access = setCoordinatedGuestAccess(true);
+    defer _ = setCoordinatedGuestAccess(prior_access);
+    const prior_buffer = setActiveStoreBuffer(null);
+    defer _ = setActiveStoreBuffer(prior_buffer);
+
+    for (0..8) |offset| {
+        const source = bytes[16 + offset ..][0..expected.len];
+        @memcpy(&expected, source);
+        try std.testing.expect(eqlCoordinated(&expected, source, &scratch));
+        for (0..expected.len) |changed_index| {
+            var changed = expected;
+            changed[changed_index] ^= 0x80;
+            try std.testing.expect(!eqlCoordinated(&changed, source, &scratch));
+        }
+    }
+
+    const crossing = bytes[61..76];
+    @memcpy(&expected, crossing);
+    try std.testing.expect(eqlCoordinated(&expected, crossing, &scratch));
+    expected[7] ^= 0x40;
+    try std.testing.expect(!eqlCoordinated(&expected, crossing, &scratch));
 }
 
 test "backing snapshot excludes the current executor store-buffer overlay" {

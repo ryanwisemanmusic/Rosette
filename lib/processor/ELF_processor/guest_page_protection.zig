@@ -50,6 +50,33 @@ const pages_per_chunk: usize = @as(usize, 1) << (chunk_shift - page_shift);
 const pages_per_word: usize = 32;
 pub const words_per_chunk: usize = pages_per_chunk / pages_per_word;
 const Word = std.atomic.Value(u64);
+const protection_cache_count: usize = 256;
+
+comptime {
+    std.debug.assert(std.math.isPowerOfTwo(protection_cache_count));
+}
+
+const ProtectionCacheEntry = struct {
+    table: ?*const Table = null,
+    page: u64 = 0,
+    epoch: u64 = 0,
+    protection: Protection = .accessible,
+};
+
+/// Each executor repeatedly classifies accesses in a small set of hot pages.
+/// Cache the packed table result per host thread so the common case does not
+/// join/leave the reclamation reader set or reload a protection leaf twice.
+/// Protection writers publish a new process-wide epoch after changing pages;
+/// a stale entry therefore cannot survive a completed VirtualProtect call.
+threadlocal var protection_cache: [protection_cache_count]ProtectionCacheEntry = @splat(.{});
+var next_protection_epoch = std.atomic.Value(u64).init(1);
+
+fn protectionCacheIndex(table: *const Table, page: u64) usize {
+    var key = page ^ (@as(u64, @intCast(@intFromPtr(table))) >> 12);
+    key *%= 0x9E37_79B9_7F4A_7C15;
+    key ^= key >> 29;
+    return @intCast(key & (protection_cache_count - 1));
+}
 
 /// What an access to a page is allowed to do.
 ///
@@ -124,6 +151,10 @@ pub const Table = struct {
     /// byte before anything else, so a process that never protects a page
     /// pays one load per memory operand and nothing more.
     active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Nonzero after the first effective mutation. Values come from one
+    /// process-wide counter so destroying/reinitializing a Table at the same
+    /// address cannot make an old thread-local cache entry appear current.
+    protection_epoch: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Leaf pointers are published atomically so an access can read the
     /// table without taking the writer lock. The memory remains alive until
     /// `deinit` closes the table and drains active readers.
@@ -192,23 +223,47 @@ pub const Table = struct {
     }
 
     pub fn get(self: *const Table, address: u64) Protection {
+        // Most pages are outside protected ranges even after Xenia protects a
+        // stack guard or a GPU register page. Hot repeat accesses use this
+        // exact page cache and avoid the reader counter's sequentially
+        // consistent RMW pair.
+        if (!self.active.load(.acquire)) return .accessible;
+        const page = address >> page_shift;
+        const epoch = self.protection_epoch.load(.acquire);
+        const cache_index = protectionCacheIndex(self, page);
+        const cached = &protection_cache[cache_index];
+        if (epoch != 0 and cached.table == self and cached.page == page and cached.epoch == epoch) {
+            return cached.protection;
+        }
+
         // Join the reader set before consulting either the lifecycle flag or
         // the fast inactive flag. If the checks came first, deinit could see
         // zero readers and free a leaf between the `active` load and this
-        // increment. Readers that arrive after closing still touch no leaf.
+        // increment. The initial active/cache fast paths above touch no leaf;
+        // a cache miss joins before consulting the published leaf.
         const mutable_self = @constCast(self);
         _ = mutable_self.readers.fetchAdd(1, .seq_cst);
         defer _ = mutable_self.readers.fetchSub(1, .seq_cst);
         if (self.closing.load(.seq_cst) or !self.active.load(.acquire)) return .accessible;
+        const read_epoch = self.protection_epoch.load(.acquire);
         const chunk = address >> chunk_shift;
         if (chunk >= chunk_count) return .accessible;
         const leaf_address = self.leaves[@intCast(chunk)].load(.acquire);
-        if (leaf_address == 0) return .accessible;
-        const leaf: *[words_per_chunk]Word = @ptrFromInt(leaf_address);
-        const page: usize = @intCast((address >> page_shift) & (pages_per_chunk - 1));
-        const shift: u6 = @intCast((page % pages_per_word) * 2);
-        const word = leaf[page / pages_per_word].load(.monotonic);
-        return @enumFromInt(@as(u2, @truncate(word >> shift)));
+        const protection: Protection = if (leaf_address == 0) .accessible else blk: {
+            const leaf: *[words_per_chunk]Word = @ptrFromInt(leaf_address);
+            const page_index: usize = @intCast(page & (pages_per_chunk - 1));
+            const shift: u6 = @intCast((page_index % pages_per_word) * 2);
+            const word = leaf[page_index / pages_per_word].load(.monotonic);
+            break :blk @enumFromInt(@as(u2, @truncate(word >> shift)));
+        };
+
+        // A mutation may overlap this lookup. Its final epoch publication
+        // invalidates any answer captured from the old packed leaf; only
+        // publish when the epoch remained stable across the read.
+        if (read_epoch != 0 and self.protection_epoch.load(.acquire) == read_epoch) {
+            cached.* = .{ .table = self, .page = page, .epoch = read_epoch, .protection = protection };
+        }
+        return protection;
     }
 
     /// Whether an access of `width` bytes at `address` violates protection.
@@ -281,6 +336,10 @@ pub const Table = struct {
             if (page == std.math.maxInt(u64)) break;
             page += 1;
         }
+        if (outcome.pages_changed != 0) {
+            const epoch = next_protection_epoch.fetchAdd(1, .monotonic) +% 1;
+            self.protection_epoch.store(epoch, .release);
+        }
         self.active.store(self.restrictedPagesUnlocked() != 0, .release);
         return outcome;
     }
@@ -309,6 +368,24 @@ test "an untouched table is inactive and permits everything" {
     try testing.expect(!table.isActive());
     try testing.expectEqual(Protection.accessible, table.get(0x2_7FC8_0714));
     try testing.expect(!table.faults(0x2_7FC8_0714, 4, true));
+}
+
+test "thread-local protection cache is page and table scoped and invalidates on change" {
+    var first = Table{};
+    defer first.deinit(testing.allocator);
+    var second = Table{};
+    defer second.deinit(testing.allocator);
+    const page: u64 = 0x2_1234_5000;
+
+    _ = first.set(testing.allocator, page, page_size, .no_access);
+    _ = second.set(testing.allocator, page, page_size, .read_only);
+    try testing.expectEqual(Protection.no_access, first.get(page + 0x30));
+    try testing.expectEqual(Protection.read_only, second.get(page + 0x30));
+    try testing.expectEqual(Protection.no_access, first.get(page + 0x3F0));
+
+    _ = first.set(testing.allocator, page, page_size, .accessible);
+    try testing.expectEqual(Protection.accessible, first.get(page + 0x30));
+    try testing.expectEqual(Protection.read_only, second.get(page + 0x30));
 }
 
 test "a GPU register page faults on read and write, and nothing beside it does" {

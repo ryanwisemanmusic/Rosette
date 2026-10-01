@@ -86,10 +86,13 @@ const windows_guest_abi = @import("windows_guest/abi.zig");
 const xbox_critical_section = @import("windows_guest/xbox_critical_section.zig");
 const parallelism = @import("parallelism");
 const translated_memory_contract = parallelism.translated_memory_contract;
+const tlb_diagnostics = @import("parallelism/tlb_diagnostics.zig");
 
 /// Which guest pages fault on access. See `guest_page_protection.zig`.
 const guest_page_protection = @import("guest_page_protection.zig");
 const tso_memory = @import("tso_memory");
+const tso_memory_policy = tso_memory.memory_policy;
+const worker_local_decode = @import("decode_cache/worker_local.zig");
 const tso_execution_gate = parallelism.execution_gate;
 const GuestExecutionGate = tso_execution_gate.GuestExecutionGate;
 const GuestExecutionGateTls = tso_execution_gate.OwnerDepthStack;
@@ -133,6 +136,8 @@ const xenia_presenter_attach_milestones = blk: {
 
 test {
     _ = mapped_ranges;
+    _ = tlb_diagnostics;
+    _ = worker_local_decode;
     _ = xenia_clock_probe;
     _ = ui_draw_evidence;
     // Sibling files' tests only run when something roots them.
@@ -2040,7 +2045,9 @@ pub const WindowsFileMapping = struct {
     code_generation: u64 = 1,
     /// Instructions were fetched from this mapping at least once. Its pages
     /// are then never admitted to the translator's write TLB: a store into
-    /// them must reach `bumpWindowsMappedCodeGeneration`.
+    /// them must reach `bumpWindowsMappedCodeGeneration`. Parallel workers
+    /// publish/read this monotonic state atomically because the first decode
+    /// can race a write-TLB fill on another executor.
     code_fetched: bool = false,
 };
 
@@ -2492,6 +2499,14 @@ const WindowsSrwLock = struct {
     owner_thread_id: u64 = 0,
     contentions: u64 = 0,
     handoffs: u64 = 0,
+    acquire_calls: u64 = 0,
+    release_calls: u64 = 0,
+    release_mismatches: u64 = 0,
+    owner_acquired_step: u64 = 0,
+    last_acquire_step: u64 = 0,
+    last_release_step: u64 = 0,
+    last_acquire_thread_id: u64 = 0,
+    last_release_thread_id: u64 = 0,
     /// The owner context has no worker slot to block, so it waits by
     /// retrying at the call site. It still queues, or a pair of workers
     /// trading the lock could starve it indefinitely.
@@ -4210,6 +4225,7 @@ const PE_MAX_INSTRUCTION_LENGTH: usize = 15;
 const PE_DECODE_CACHE_WAYS: usize = 16;
 const PE_DECODE_CACHE_SETS: usize = 1 << 16;
 const PE_DECODE_CACHE_ENTRIES: usize = PE_DECODE_CACHE_SETS * PE_DECODE_CACHE_WAYS;
+const PE_DECODE_CACHE_LOCAL_ENTRIES: usize = worker_local_decode.default_capacity;
 /// A small, set-associative victim bank catches the short-lived eviction
 /// bursts that still occur in a long Xenia run without weakening the primary
 /// cache's full-set diagnostic. Four ways keeps a victim probe bounded: a
@@ -4225,12 +4241,63 @@ const PE_DECODE_CACHE_VICTIM_ENTRIES: usize =
 /// mode bypass generation fast paths and invalidate the tables when the mode
 /// is left, so the generation words themselves do not become racy metadata.
 var coordinated_decode_cache_mutex = HostMutex.init("decode cache (parallel)");
-/// Parallel executors' decode-cache locks: one per group of sets, so two
-/// threads decoding different code rarely meet (`decodeAt`).
-const decode_cache_set_lock_count = 1024;
+/// Parallel executors' decode-cache locks. The old 1024 stripes made 64
+/// unrelated sets serialize on each lock; the 2026-09-27 profile showed the
+/// shared decode path dominating worker time. 4096 stripes cut those false
+/// lock collisions by four while keeping the cache-line-aligned lock table
+/// bounded to roughly half a megabyte.
+const decode_cache_set_lock_count = 4096;
 var decode_cache_set_locks: [decode_cache_set_lock_count]concurrency.mutex.LeanMutex = [_]concurrency.mutex.LeanMutex{.{}} ** decode_cache_set_lock_count;
 /// The victim bank and miss diagnostics span sets; taken after a set lock.
 var decode_cache_miss_mutex = HostMutex.init("decode cache victims and findings");
+
+/// Hot decode-cache counters and primary LRU clocks, sharded by the same
+/// stripe as the corresponding set. Updating one process-wide `hits` counter
+/// and clock on every interpreted instruction made the cache line itself a
+/// coherence bottleneck across workers, and the plain shared writes raced.
+/// Every primary resident in one set shares its shard, so its timestamps stay
+/// directly comparable for replacement.
+const DecodeCacheCounters = struct {
+    hits: u64 = 0,
+    worker_local_hits: u64 = 0,
+    rearms: u64 = 0,
+    misses: u64 = 0,
+    collisions: u64 = 0,
+    vacant_fills: u64 = 0,
+    conflict_fills: u64 = 0,
+    generated_conflict_fills: u64 = 0,
+    image_conflict_fills: u64 = 0,
+    stale_refills: u64 = 0,
+    replacements: u64 = 0,
+    victim_hits: u64 = 0,
+    victim_fills: u64 = 0,
+    victim_stale_rejections: u64 = 0,
+
+    fn accumulate(self: *DecodeCacheCounters, other: DecodeCacheCounters) void {
+        inline for (.{
+            "hits",
+            "rearms",
+            "misses",
+            "collisions",
+            "vacant_fills",
+            "conflict_fills",
+            "generated_conflict_fills",
+            "image_conflict_fills",
+            "stale_refills",
+            "replacements",
+            "victim_hits",
+            "victim_fills",
+            "victim_stale_rejections",
+        }) |field| {
+            @field(self, field) +|= @field(other, field);
+        }
+    }
+};
+
+const DecodeCacheShard = struct {
+    counters: DecodeCacheCounters = .{},
+    age_clock: u64 align(128) = 0,
+};
 
 fn peDecodeCacheSetIndex(address: u64) usize {
     // Instruction starts are not necessarily aligned: a valid x86
@@ -4304,6 +4371,12 @@ const DecodeCacheEntry = struct {
     segment: x64_decoder.Segment = .ds,
     decoded: DecodedInsn = .{},
 };
+
+/// Repeated instructions may be served from a host thread's private working
+/// set before touching the shared set-associative cache. The entry is still
+/// checked against coordinated live bytes in parallel mode; this tier skips
+/// shared-cache locking, not self-modifying-code validation.
+const WorkerLocalDecodeCache = worker_local_decode.Cache(DecodeCacheEntry, PE_DECODE_CACHE_LOCAL_ENTRIES);
 
 const DecodeCacheMissCause = enum {
     vacant_fill,
@@ -4465,11 +4538,20 @@ const BLOCK_JIT_FALLBACK_COST_SAMPLE_PERIOD: u64 = 1024;
 
 /// A guest thread that runs on its own host thread (parallel mode) gets its
 /// own translator state, so no two threads ever share a block table, a code
-/// arena, a chain link or a block's lifetime. Its tables are a sixteenth of
-/// the owner's: one thread's working set, and a run creates dozens of
-/// threads, most of which never get a block hot.
+/// arena, a chain link or a block's lifetime. Its table starts at a
+/// sixteenth of the owner's, because a run creates dozens of threads and
+/// most never get a block hot, and grows fourfold under eviction pressure
+/// up to the owner's size (`BlockJitState.growIfPressed`).
+// 2026-09-30: every worker was capped at the starting size. Halo 3's main
+// thread ran its simulation through 64K slots against a working set the
+// owner-sized table had been grown to hold on 2026-09-21: it spent 84% of
+// its wall time in Rosette, 37% of it in `decodeAt`, re-interpreting
+// evicted code sixteen times before each recompile.
 const BLOCK_JIT_WORKER_TABLE_ENTRIES: usize = 1 << 16;
-const BLOCK_JIT_WORKER_CODE_BYTES: usize = 256 << 20;
+const BLOCK_JIT_WORKER_MAX_TABLE_ENTRIES: usize = BLOCK_JIT_TABLE_ENTRIES;
+/// A worker's code reservation. Virtual until written, like the owner's; a
+/// busy thread at 1.6 KiB of code per block filled 256 MiB and reset.
+const BLOCK_JIT_WORKER_CODE_BYTES: usize = 1024 << 20;
 
 const BlockHotness = struct {
     rip: u64 = 0,
@@ -4500,6 +4582,31 @@ const BlockJitState = struct {
     /// Sets in `blocks` minus one; the table's own size, since a worker's
     /// table is smaller than the owner's.
     set_mask: usize,
+    /// The size `growIfPressed` may take `blocks` to.
+    max_entries: usize = BLOCK_JIT_TABLE_ENTRIES,
+    /// Slot arrays a growth replaced. A chain link records the address of
+    /// the slot its successor sat in; a replaced array is emptied, not
+    /// freed, so such a link reads null, fails its check, and is re-armed
+    /// against the new table the next time the hop is taken.
+    retired_tables: std.ArrayListUnmanaged([]?*block_jit.Block) = .empty,
+    /// Capacity pressure since the table last grew: live blocks evicted to
+    /// seat a new one, and warming hotness entries a new address took over.
+    pressure: u64 = 0,
+    growths: u32 = 0,
+    hotness_replacements: u64 = 0,
+    /// Why `runBlockJit` handed a step to the interpreter: the address had
+    /// not run often enough yet, compiling it was refused, or a reset was
+    /// waiting for the outermost execution. One interpreted step is about a
+    /// hundred times a translated one, so these are the frame-rate counters.
+    interpreted_cold: u64 = 0,
+    interpreted_refused: u64 = 0,
+    interpreted_reset_pending: u64 = 0,
+    /// Where interpreted steps land, one in `interpreted_heat_stride`.
+    interpreted_heat: spin_anatomy.Heat = .{},
+    /// This executor's share of the two process-wide code-fetch ledgers,
+    /// not yet added to them (parallel mode; see `noteBlockJitCodeFetches`).
+    pending_generated_fetches: u64 = 0,
+    pending_title_fetches: u64 = 0,
     hot_threshold: u16 = BLOCK_JIT_DEFAULT_HOT_THRESHOLD,
     compiled: u64 = 0,
     compile_refusals: u64 = 0,
@@ -4538,6 +4645,14 @@ const BlockJitState = struct {
     /// a push and a jump, against those left on the interpreter's arm.
     call_targets_plain: u64 = 0,
     call_targets_hooked: u64 = 0,
+    /// Dynamic indirect targets outside the PE image which reached the
+    /// generated-code proof helper, and those admitted to the dedicated
+    /// Xenia code-cache view.
+    mapped_transfer_checks: u64 = 0,
+    mapped_transfer_native: u64 = 0,
+    /// Exact raw x87 moves handled by the focused helper rather than the
+    /// generic block-JIT interpreter boundary.
+    x87_fast_helpers: u64 = 0,
     /// Conditional branches a block continued across rather than ending at.
     conditionals_followed: u64 = 0,
     /// Deferred flag records actually materialised.
@@ -4553,6 +4668,8 @@ const BlockJitState = struct {
     /// invalidations protection and mapping changes caused.
     tlb_fills: u64 = 0,
     tlb_fill_refusals: u64 = 0,
+    tlb_refusal_stats: tlb_diagnostics.RefusalStats = .{},
+    tlb_refusal_cache: tlb_diagnostics.RefusalCache = .{},
     tlb_invalidations: u64 = 0,
     tlb_flushes: u64 = 0,
     /// Fallback calls by instruction, so the next run says which templates
@@ -4650,8 +4767,76 @@ const BlockJitState = struct {
         self.lifetime.deinit(allocator);
         allocator.free(self.blocks);
         allocator.free(self.hotness);
+        for (self.retired_tables.items) |table| allocator.free(table);
+        self.retired_tables.deinit(allocator);
         self.memory.deinit();
         allocator.destroy(self);
+    }
+
+    const interpreted_heat_stride: u64 = 64;
+
+    /// Grow the table fourfold once capacity pressure since the last growth
+    /// reaches an eighth of its slots, up to `max_entries`. Only between
+    /// executions: a live one may hold a slot index into this table.
+    fn growIfPressed(self: *BlockJitState, allocator: std.mem.Allocator) bool {
+        if (self.blocks.len >= self.max_entries or self.lifetime.live()) return false;
+        if (self.pressure *| 8 < self.blocks.len) return false;
+        return self.grow(allocator, @min(self.blocks.len * 4, self.max_entries));
+    }
+
+    /// Move every block and hotness entry into a table of `entries` slots.
+    ///
+    /// `firstSlot` keeps its hash and only widens the mask, so the new set
+    /// of an address has the old set's index in its low bits: one old set
+    /// feeds each new set, and no more than `BLOCK_JIT_WAYS` entries can
+    /// arrive in any of them. Nothing is evicted by a growth.
+    fn grow(self: *BlockJitState, allocator: std.mem.Allocator, entries: usize) bool {
+        std.debug.assert(std.math.isPowerOfTwo(entries / BLOCK_JIT_WAYS) and entries > self.blocks.len);
+        const blocks = allocator.alloc(?*block_jit.Block, entries) catch return false;
+        const hotness = allocator.alloc(BlockHotness, entries) catch {
+            allocator.free(blocks);
+            return false;
+        };
+        self.retired_tables.ensureUnusedCapacity(allocator, 1) catch {
+            allocator.free(hotness);
+            allocator.free(blocks);
+            return false;
+        };
+        @memset(blocks, null);
+        @memset(hotness, .{});
+        const old_blocks = self.blocks;
+        const old_hotness = self.hotness;
+        self.blocks = blocks;
+        self.hotness = hotness;
+        self.set_mask = entries / BLOCK_JIT_WAYS - 1;
+        for (old_blocks) |maybe| {
+            const block = maybe orelse continue;
+            const base = self.firstSlot(block.start_rip);
+            for (self.blocks[base .. base + BLOCK_JIT_WAYS]) |*slot| {
+                if (slot.* == null) {
+                    slot.* = block;
+                    break;
+                }
+            } else unreachable;
+        }
+        for (old_hotness) |entry| {
+            if (entry.rip == 0) continue;
+            const base = self.firstSlot(entry.rip);
+            for (self.hotness[base .. base + BLOCK_JIT_WAYS]) |*slot| {
+                if (slot.rip == 0) {
+                    slot.* = entry;
+                    break;
+                }
+            } else unreachable;
+        }
+        // Every link into the old table now reads null and falls back to the
+        // dispatcher, which re-arms it against the new slot.
+        @memset(old_blocks, null);
+        self.retired_tables.appendAssumeCapacity(old_blocks);
+        allocator.free(old_hotness);
+        self.pressure = 0;
+        self.growths += 1;
+        return true;
     }
 
     fn liveBlocks(self: *const BlockJitState) usize {
@@ -4751,6 +4936,44 @@ fn blockJitWrite128(state_ptr: *anyopaque, address: u64, value: *const [16]u8) c
     self.blockJitTlbConsider(address, 16, true);
 }
 
+/// `vmovntps`/`vmovntdq` for translated code. The native vector-store template
+/// has no access to the executor's store buffer and would silently treat a
+/// special backing as ordinary RAM. Reuse the interpreter's explicit
+/// non-temporal policy, then offer an ordinary writable page to the TLB for
+/// subsequent temporal stores.
+fn blockJitWrite128NonTemporal(state_ptr: *anyopaque, address: u64, value: *const [16]u8) callconv(.c) void {
+    const self: *ElfState = @ptrCast(@alignCast(state_ptr));
+    self.blockJitNameCurrentInstruction();
+    self.writeMem128NonTemporal(address, value.*);
+    if (self.guestContextField("guest_access_violation_pending").* or self.isTerminated() or self.blockJitContinuationChanged()) {
+        self.blockJitRequestAbort();
+        return;
+    }
+    self.blockJitTlbConsider(address, 16, true);
+}
+
+/// An indirect block-JIT transfer may bypass the interpreter only when the
+/// address is inside Xenia's dedicated code-cache view. This is the same
+/// backing that `decodeAt` accepts for generated instructions; arbitrary
+/// mappings, import thunks, synthetic entries, and invalid external values
+/// stay on the interpreter path. The executing step holds the guest address
+/// space read gate, so view/unmap operations cannot change this metadata while
+/// it is inspected.
+fn blockJitMappedTransferAllowed(state_ptr: *anyopaque, target: u64) callconv(.c) u8 {
+    const self: *ElfState = @ptrCast(@alignCast(state_ptr));
+    const jit = self.currentBlockJit();
+    if (jit) |active| active.mapped_transfer_checks +|= 1;
+    if (self.blockJitTargetHooked(target)) return 0;
+    const view_index = self.windows_code_cache_view orelse return 0;
+    if (view_index >= self.windows_memory_view_count) return 0;
+    const view = self.windows_memory_views[view_index];
+    if (view.length == 0 or target < view.guest_base or target - view.guest_base >= view.length) return 0;
+    const generated = self.windowsMappedCodeMemoryConst(target, PE_MAX_INSTRUCTION_LENGTH) orelse return 0;
+    if (generated.kind != .memory_view or generated.source_index != view.mapping_index) return 0;
+    if (jit) |active| active.mapped_transfer_native +|= 1;
+    return 1;
+}
+
 /// One instruction through the interpreter, in the middle of a block.
 /// Returns nonzero when the block must stop: the interpreter moved RIP
 /// somewhere other than the next instruction, ended the run, left a fault
@@ -4777,15 +5000,172 @@ fn blockJitFlags(state_ptr: *anyopaque) callconv(.c) void {
     if (self.currentBlockJit()) |jit| jit.flag_completions +|= 1;
 }
 
+/// Fast path for the four raw x87 transfers whose observable behavior is
+/// stack bookkeeping plus byte-preserving movement. This deliberately avoids
+/// converting the 80-bit payload through f64: Xenia's CRT also uses m80 as an
+/// opaque ten-byte transport. Memory permissions, access faults, trace writes,
+/// and the store-buffer boundary remain the same as the interpreter path.
+fn blockJitX87RawTransfer(state_ptr: *anyopaque, block: *const block_jit.Block, index: u32) callconv(.c) u32 {
+    const self: *ElfState = @ptrCast(@alignCast(state_ptr));
+    const insn = block.insns[index];
+    self.guestContextField("regs").*.rip = insn.rip;
+    self.guestContextField("last_decoded_op").* = insn.decoded.op;
+    self.guestContextField("last_decoded_len").* = insn.len;
+    self.guestContextField("last_instruction_rip").* = insn.rip;
+    if (self.currentBlockJit()) |jit| jit.x87_fast_helpers +|= 1;
+
+    var d = insn.decoded;
+    d.segment = insn.segment;
+    if (d.op == .fld_mem80 or d.op == .fstp_mem80) {
+        d.addr = x64_decoder.resolveMemoryAddress(&self.guestContextField("regs").*, .{
+            .displacement = d.addr,
+            .has_index = d.sib_has_index,
+            .index_reg = d.sib_index_reg,
+            .scale = d.sib_scale,
+            .has_base = d.sib_has_base,
+            .base_reg = d.sib_base_reg,
+            .rip_relative = d.rip_relative,
+            .segment = d.segment,
+        }, self.guestContextField("regs").*.rip +% d.len, if (d.has_0x67) .bits32 else .bits64, .long64, true);
+    }
+
+    // Match the interpreter fallback boundary. A memory load must see stores
+    // the translated stream retired before it; a memory store must be visible
+    // before the translated stream resumes.
+    tso_memory.flushActiveStoreBufferFor(.jit_helper);
+    defer tso_memory.flushActiveStoreBufferFor(.jit_fallback);
+    switch (d.op) {
+        .fld_st => if (self.x87GetRaw(@truncate(d.imm))) |raw| {
+            _ = self.x87PushRaw(raw);
+        },
+        .fstp_st => if (self.x87GetRaw(0)) |raw| {
+            if (self.x87SetRaw(@truncate(d.imm), raw)) _ = self.x87PopRaw();
+        },
+        .fld_mem80 => {
+            var raw: X87Raw = undefined;
+            if (!self.copyFromGuest(&raw, d.addr)) {
+                self.blockJitRequestAbort();
+                return 1;
+            }
+            _ = self.x87PushRaw(raw);
+        },
+        .fstp_mem80 => {
+            if (self.x87PopRaw()) |raw| {
+                self.traceGuestWrite(d.addr, 10, std.mem.readInt(u64, raw[0..8], .little));
+                if (!self.copyToGuest(d.addr, &raw)) {
+                    self.blockJitRequestAbort();
+                    return 1;
+                }
+            } else if (!self.fillGuestMemory(d.addr, 10, 0)) {
+                self.blockJitRequestAbort();
+                return 1;
+            }
+        },
+        else => unreachable,
+    }
+
+    if (self.isTerminated() or self.guestContextField("guest_access_violation_pending").*) return 1;
+    if (self.blockJitContinuationChanged()) {
+        self.blockJitRequestAbort();
+        return 1;
+    }
+    return 0;
+}
+
+fn blockJitAtomicMemoryWidth(d: DecodedInsn) ?u8 {
+    return switch (d.op) {
+        .xchg_mem8_reg8, .cmpxchg_mem8_reg8, .xadd_mem8_reg8 => 1,
+        .cmpxchg_mem16_reg16 => 2,
+        .bt_mem_imm,
+        .bts_mem_imm,
+        .btr_mem_imm,
+        .btc_mem_imm,
+        .bt_mem_reg,
+        .bts_mem_reg,
+        .btr_mem_reg,
+        .btc_mem_reg,
+        => switch (d.size) {
+            .bits16 => 2,
+            .bits32 => 4,
+            .bits64 => 8,
+            else => null,
+        },
+        .xchg_mem32_reg32, .cmpxchg_mem32_reg32, .xadd_mem32_reg32, .xchg_mem64_reg64, .cmpxchg_mem64_reg64, .xadd_mem64_reg64 => switch (d.size) {
+            .bits16 => 2,
+            .bits32 => 4,
+            .bits64 => 8,
+            else => null,
+        },
+        else => null,
+    };
+}
+
+fn blockJitAtomicAlwaysWrites(op: Op) bool {
+    return switch (op) {
+        .xchg_mem8_reg8, .xchg_mem32_reg32, .xchg_mem64_reg64, .xadd_mem8_reg8, .xadd_mem32_reg32, .xadd_mem64_reg64 => true,
+        .bts_mem_imm, .btr_mem_imm, .btc_mem_imm, .bts_mem_reg, .btr_mem_reg, .btc_mem_reg => true,
+        else => false,
+    };
+}
+
+fn blockJitCompareExchangeWriteCommitted(op: Op, rflags: u64) bool {
+    return switch (op) {
+        .cmpxchg_mem8_reg8, .cmpxchg_mem16_reg16, .cmpxchg_mem32_reg32, .cmpxchg_mem64_reg64 => (rflags & RFL_ZF) != 0,
+        else => false,
+    };
+}
+
+fn blockJitRuntimeFallbackReason(insn: block_jit.Insn) block_jit.FallbackReason {
+    // Native templates can deliberately escape to the interpreter for a
+    // guarded boundary: a TLB miss, watched/protected memory, call tracing,
+    // an import slot, or a transfer target that lacks executable proof.
+    // Attribute those escapes separately so the ledger does not present
+    // them as absent templates.
+    if (!insn.force_fallback and block_jit.isNative(insn.decoded)) return .native_slow_path;
+    return insn.fallback_reason;
+}
+
 fn blockJitInterpret(state_ptr: *anyopaque, block: *const block_jit.Block, index: u32) callconv(.c) u32 {
     const self: *ElfState = @ptrCast(@alignCast(state_ptr));
     const insn = block.insns[index];
+    const atomic_width = blockJitAtomicMemoryWidth(insn.decoded);
+    const resolved_atomic_base = if (atomic_width != null) x64_decoder.resolveMemoryAddress(&self.guestContextField("regs").*, .{
+        .displacement = insn.decoded.addr,
+        .has_index = insn.decoded.sib_has_index,
+        .index_reg = insn.decoded.sib_index_reg,
+        .scale = insn.decoded.sib_scale,
+        .has_base = insn.decoded.sib_has_base,
+        .base_reg = insn.decoded.sib_base_reg,
+        .rip_relative = insn.decoded.rip_relative,
+        .segment = insn.segment,
+    }, insn.rip +% insn.len, if (insn.decoded.has_0x67) .bits32 else .bits64, .long64, true) else 0;
+    const is_bit_test_memory = switch (insn.decoded.op) {
+        .bt_mem_imm,
+        .bts_mem_imm,
+        .btr_mem_imm,
+        .btc_mem_imm,
+        .bt_mem_reg,
+        .bts_mem_reg,
+        .btr_mem_reg,
+        .btc_mem_reg,
+        => true,
+        else => false,
+    };
+    const atomic_address = if (!is_bit_test_memory) resolved_atomic_base else blk: {
+        const operand = if (insn.decoded.op == .bt_mem_imm or insn.decoded.op == .bts_mem_imm or
+            insn.decoded.op == .btr_mem_imm or insn.decoded.op == .btc_mem_imm)
+            x64_decoder.bitTestMemoryOperandImmediate(insn.decoded.size, resolved_atomic_base, insn.decoded.imm)
+        else
+            x64_decoder.bitTestMemoryOperand(insn.decoded.size, resolved_atomic_base, self.regVal(insn.decoded.src_reg, insn.decoded.size));
+        break :blk if (operand) |resolved| resolved.address else 0;
+    };
     const op_index: usize = @intFromEnum(insn.decoded.op);
     var sample_fallback_cost = false;
     if (self.currentBlockJit()) |jit| {
         jit.fallback_calls +|= 1;
         jit.fallback_ops[op_index] +|= 1;
-        jit.fallback_reason_counts[@intFromEnum(insn.fallback_reason)] +|= 1;
+        const fallback_reason = blockJitRuntimeFallbackReason(insn);
+        jit.fallback_reason_counts[@intFromEnum(fallback_reason)] +|= 1;
         const op_calls = jit.fallback_ops[op_index];
         sample_fallback_cost = op_calls == 1 or op_calls % BLOCK_JIT_FALLBACK_COST_SAMPLE_PERIOD == 0;
     }
@@ -4804,6 +5184,17 @@ fn blockJitInterpret(state_ptr: *anyopaque, block: *const block_jit.Block, index
     // so every store an interpreted `movaps`, `fstp m80` or `call [mem]`
     // made inside a block was invisible to the rest of the block.
     tso_memory.flushActiveStoreBufferFor(.jit_fallback);
+    // A native atomic instruction that misses its worker TLB takes the full
+    // interpreter path above. Admit the page after a successful write so the
+    // next execution reaches the inline acquire/release or LSE template
+    // instead of repeating the same interpreter round-trip forever.
+    if (atomic_width) |width| {
+        if (!self.isTerminated() and !self.guestContextField("guest_access_violation_pending").*) {
+            const wrote = blockJitAtomicAlwaysWrites(insn.decoded.op) or
+                blockJitCompareExchangeWriteCommitted(insn.decoded.op, self.guestContextField("regs").*.rflags);
+            if (wrote) self.blockJitTlbConsider(atomic_address, width, true);
+        }
+    }
     if (sample_fallback_cost and sample_started != 0) {
         const sample_finished = monotonicNanoseconds();
         if (sample_finished > sample_started) {
@@ -4961,23 +5352,21 @@ pub const ElfState = struct {
     // initialization temporaries and guest exception frames.
     decode_cache: []DecodeCacheEntry = &.{},
     decode_cache_victims: []DecodeCacheEntry = &.{},
-    decode_cache_hits: u64 = 0,
-    decode_cache_rearms: u64 = 0,
-    decode_cache_misses: u64 = 0,
-    decode_cache_collisions: u64 = 0,
-    decode_cache_vacant_fills: u64 = 0,
-    decode_cache_conflict_fills: u64 = 0,
-    decode_cache_generated_conflict_fills: u64 = 0,
-    decode_cache_image_conflict_fills: u64 = 0,
-    decode_cache_stale_refills: u64 = 0,
-    decode_cache_replacements: u64 = 0,
-    decode_cache_victim_hits: u64 = 0,
-    decode_cache_victim_fills: u64 = 0,
-    decode_cache_victim_stale_rejections: u64 = 0,
+    decode_cache_shards: []DecodeCacheShard = &.{},
+    /// Hits served by the private worker cache. Atomic because several host
+    /// workers may update it, but one counter per process keeps its cost below
+    /// the shared cache's mutex and four-way probe that it replaces.
+    decode_cache_worker_local_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Global only for the small victim-bank updates, all serialized by
+    /// `decode_cache_miss_mutex`. Primary hits use their set shard's clock.
     decode_cache_clock: u64 = 0,
     decode_cache_miss_sites: [DECODE_CACHE_MISS_SITE_CAPACITY]DecodeCacheMissSite = [_]DecodeCacheMissSite{.{}} ** DECODE_CACHE_MISS_SITE_CAPACITY,
     decode_cache_miss_site_count: usize = 0,
     decode_cache_miss_site_overflow: u64 = 0,
+    /// Misses per cause across every shard, for the report throttle only.
+    /// `noteDecodeCacheMiss` is serialized (the miss mutex in parallel mode),
+    /// so plain counters are exact. The sharded counters stay the totals.
+    decode_cache_miss_reports: [std.enums.values(DecodeCacheMissCause).len]u64 = @splat(0),
     /// The addresses `step` must intercept before decoding, as boxes so the
     /// per-instruction question is a compare, not a call. The 2026-09-17
     /// profile of the PE64 route put `windowsImportStubAt` alone at 3.6% of
@@ -5007,7 +5396,7 @@ pub const ElfState = struct {
     /// `windowsImageCodeGenerationFor` (straight-line code stays in one
     /// section).
     windows_executable_box: HookBox = .{},
-    windows_executable_range_hint: usize = 0,
+    windows_executable_range_hint: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     /// The block translator, created at the first step when enabled; null
     /// while disabled or after executable memory was refused.
     block_jit: ?*BlockJitState = null,
@@ -5045,6 +5434,11 @@ pub const ElfState = struct {
     block_jit_tlb_epoch: std.atomic.Value(u64) = .init(0),
     parallel_tlb_cross_invalidations: std.atomic.Value(u64) = .init(0),
     parallel_tlb_raced_fills: std.atomic.Value(u64) = .init(0),
+    parallel_tlb_invalidation_work: tlb_diagnostics.InvalidationWork = .{},
+    /// Parallel `guestMemory` borrows refused because the range may hold
+    /// fetched instructions. Nonzero names a runtime path that writes code
+    /// through a raw view instead of the ordered write API.
+    parallel_code_borrow_refusals: std.atomic.Value(u64) = .init(0),
     /// How many times a helper offered the TLB a page. The 2026-09-19
     /// run reported zero fills *and* zero refusals, which the admission
     /// rules cannot both produce: every path past the first four guards
@@ -5610,7 +6004,14 @@ pub const ElfState = struct {
     windows_com_mta_refcount: u32 = 0,
     windows_raw_input_registered: bool = false,
     windows_raw_input_device_count: u32 = 0,
+    /// The processors the guest is told it has. One while every guest
+    /// thread shares this host thread; the host's processors once the
+    /// parallel executor gives each guest thread its own
+    /// (`guestProcessorMask`). winpthreads counts the process mask for
+    /// `std::thread::hardware_concurrency`, from which Xenia sizes its
+    /// Vulkan pipeline-creation and shader-translation pools (3/4 of it).
     windows_process_affinity_mask: u64 = 1,
+    windows_system_affinity_mask: u64 = 1,
     windows_focus_window: u64 = 0,
     windows_vectored_exception_handler: u64 = 0,
     windows_vectored_exception_token: u64 = 0,
@@ -5633,6 +6034,12 @@ pub const ElfState = struct {
     /// parallel execution. Keep its count separate and atomic so the lock's
     /// diagnostics remain honest and progress accounting still sees it.
     windows_fast_time_import_calls: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// memcpy, memmove and memset served on the lock-free C runtime lane
+    /// (`fast_imports.tryCrtMemory`), by operation.
+    windows_fast_crt_import_calls: [3]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
+    /// QueryPerformanceCounter and QueryPerformanceFrequency served on the
+    /// lock-free time lane, in that order.
+    windows_fast_counter_import_calls: [2]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
     windows_fast_time_imports_reported: u64 = 0,
     windows_unknown_import_calls: u64 = 0,
     windows_import_contract_calls: u64 = 0,
@@ -5758,6 +6165,12 @@ pub const ElfState = struct {
     /// its view so instruction fetches do not walk every ordinary mapping on
     /// each interpreter step.
     windows_code_cache_view: ?usize = null,
+    /// Published bounds for the dedicated Xenia generated-code mapping.
+    /// `block_jit.zig` checks these inline for indirect transfers, avoiding
+    /// a C callback on the common case while preserving that callback for
+    /// every other external target.
+    block_jit_code_cache_guest_low: u64 = 0,
+    block_jit_code_cache_guest_high: u64 = 0,
     windows_generated_code_fetches: u64 = 0,
     windows_title_code_fetches: u64 = 0,
     windows_heap_allocations: []WindowsHeapAllocation = &.{},
@@ -6344,6 +6757,8 @@ pub const ElfState = struct {
         @memset(decode_cache, .{});
         const decode_cache_victims = allocator.alloc(DecodeCacheEntry, PE_DECODE_CACHE_VICTIM_ENTRIES) catch unreachable;
         @memset(decode_cache_victims, .{});
+        const decode_cache_shards = allocator.alloc(DecodeCacheShard, decode_cache_set_lock_count) catch unreachable;
+        @memset(decode_cache_shards, .{});
         const memory_len: usize = @intCast(memory_size);
         const mem = allocator.alloc(u8, memory_len) catch unreachable;
         const trace_storage = allocator.alloc(ElfTraceEntry, TRACE_BUFFER_LEN) catch unreachable;
@@ -6369,6 +6784,7 @@ pub const ElfState = struct {
             .allocator = allocator,
             .decode_cache = decode_cache,
             .decode_cache_victims = decode_cache_victims,
+            .decode_cache_shards = decode_cache_shards,
             .mem = mem,
             .mem_base = MEM_BASE,
             .mem_size = memory_size,
@@ -6501,6 +6917,8 @@ pub const ElfState = struct {
         self.decode_cache = &.{};
         if (self.decode_cache_victims.len != 0) self.allocator.free(self.decode_cache_victims);
         self.decode_cache_victims = &.{};
+        if (self.decode_cache_shards.len != 0) self.allocator.free(self.decode_cache_shards);
+        self.decode_cache_shards = &.{};
         self.guest_kernel_calls.deinit(self.allocator);
         self.guest_page_protection.deinit(self.allocator);
         self.windows_registry.deinit(self.allocator);
@@ -6610,7 +7028,7 @@ pub const ElfState = struct {
             self.terminated;
     }
 
-    fn markTerminated(self: *ElfState) void {
+    pub fn markTerminated(self: *ElfState) void {
         if (self.parallel_guest_execution) {
             self.parallel_guest_termination.store(true, .release);
             // Whoever is asleep - a blocked GetMessage, parked workers - must
@@ -6907,18 +7325,22 @@ pub const ElfState = struct {
     /// taking the mutex protecting the clock's multi-field state. The value
     /// is published from the same clock update path as `windowsGuestClockTicks`.
     pub fn windowsGuestFastFileTime(self: *const ElfState) u64 {
-        // Instruction-derived time changes on every step. Keep that rare
-        // diagnostic mode on the coherent mutex path instead of publishing
-        // an atomic for every retired guest instruction.
-        const ticks = if (self.guest_clock.source == .retired_instructions)
-            self.windowsGuestClockTicks()
-        else
-            self.guest_clock_published_ticks.load();
+        const ticks = self.windowsGuestFastClockTicks();
         const seconds = ticks / WINDOWS_GUEST_CLOCK_HZ;
         const remainder = ticks % WINDOWS_GUEST_CLOCK_HZ;
         return WINDOWS_GUEST_FILETIME_BASE +|
             (seconds *| 10_000_000) +|
             (remainder *| 10_000_000 / WINDOWS_GUEST_CLOCK_HZ);
+    }
+
+    /// The tick count the lock-free QueryPerformanceCounter answers: the same
+    /// value `windowsGuestClockTicks` returns, read without the clock mutex.
+    pub fn windowsGuestFastClockTicks(self: *const ElfState) u64 {
+        // Instruction-derived time changes on every step. Keep that rare
+        // diagnostic mode on the coherent mutex path instead of publishing
+        // an atomic for every retired guest instruction.
+        if (self.guest_clock.source == .retired_instructions) return self.windowsGuestClockTicks();
+        return self.guest_clock_published_ticks.load();
     }
 
     /// The precise-time import may bypass the shared runtime lock only when
@@ -6943,14 +7365,49 @@ pub const ElfState = struct {
         _ = tso_memory.setActiveStoreBuffer(prior);
     }
 
-    pub fn noteWindowsFastTimeImport(self: *ElfState, return_rip: u64) void {
-        _ = self.windows_fast_time_import_calls.fetchAdd(1, .monotonic);
-        self.guestContextField("windows_current_import").* = "GetSystemTimePreciseAsFileTime";
+    /// The C runtime's memcpy/memmove/memset lane needs only what every fast
+    /// import needs: parallel execution, and no runtime dispatch already
+    /// held by this thread. It reads no clock, so the precise-time query's
+    /// clock-source condition does not apply to it.
+    pub fn windowsFastCrtImportMayBypassRuntimeLock(self: *const ElfState) bool {
+        if (!self.parallel_guest_execution) return false;
+        const owner: *anyopaque = @ptrCast(@constCast(self));
+        return windows_runtime_locks.depth(owner) == 0;
+    }
+
+    pub fn noteWindowsFastCrtImport(self: *ElfState, op: anytype) void {
+        const index: usize = @intFromEnum(op);
+        _ = self.windows_fast_crt_import_calls[index].fetchAdd(1, .monotonic);
+        const names = [_][]const u8{ "memcpy", "memmove", "memset" };
+        self.guestContextField("windows_current_import").* = names[index];
+    }
+
+    fn windowsFastCrtImportCalls(self: *const ElfState) u64 {
+        var total: u64 = 0;
+        for (&self.windows_fast_crt_import_calls) |*counter| total +|= counter.load(.acquire);
+        return total;
+    }
+
+    pub fn noteWindowsFastTimeImport(self: *ElfState, return_rip: u64, query: anytype) void {
+        const names = [_][]const u8{ "GetSystemTimePreciseAsFileTime", "QueryPerformanceCounter", "QueryPerformanceFrequency" };
+        const index: usize = @intFromEnum(query);
+        if (index == 0)
+            _ = self.windows_fast_time_import_calls.fetchAdd(1, .monotonic)
+        else
+            _ = self.windows_fast_counter_import_calls[index - 1].fetchAdd(1, .monotonic);
+        self.guestContextField("windows_current_import").* = names[index];
         self.guestContextField("windows_current_import_return").* = return_rip;
     }
 
+    fn windowsFastImportCalls(self: *const ElfState) u64 {
+        return self.windows_fast_time_import_calls.load(.acquire) +%
+            self.windows_fast_counter_import_calls[0].load(.acquire) +%
+            self.windows_fast_counter_import_calls[1].load(.acquire) +%
+            self.windowsFastCrtImportCalls();
+    }
+
     fn windowsImportCallCount(self: *const ElfState) u64 {
-        return self.windows_import_calls +% self.windows_fast_time_import_calls.load(.acquire);
+        return self.windows_import_calls +% self.windowsFastImportCalls();
     }
 
     pub fn clearWindowsFastTimeImportReturn(self: *ElfState) void {
@@ -7424,7 +7881,7 @@ pub const ElfState = struct {
     }
 
     fn ensureWindowsSrwLock(self: *ElfState, address: u64) ?*WindowsSrwLock {
-        if (address == 0 or self.guestMemory(address, 8) == null) return null;
+        if (address == 0 or self.guestMemoryConst(address, 8) == null) return null;
         if (self.windowsSrwLockIndex(address)) |index| return &self.windows_srw_locks[index];
         for (&self.windows_srw_locks) |*lock| {
             if (lock.address == 0) {
@@ -9490,6 +9947,12 @@ pub const ElfState = struct {
             // Either a handoff this thread is now collecting, or the owner
             // context finishing a wait it queued for.
             if (self.guestContextField("windows_active_guest_thread_slot").* == null) lock.owner_waiting = false;
+            // A waiter reaches this path after Rosette has granted ownership.
+            // Keep later guest memory accesses after that grant in TSO mode.
+            tso_memory.memoryFence();
+            lock.acquire_calls +|= 1;
+            lock.last_acquire_step = self.observedExecutionSteps();
+            lock.last_acquire_thread_id = thread_id;
             self.endActiveWindowsSrwWaitAccounting();
             return .acquired;
         }
@@ -9505,6 +9968,11 @@ pub const ElfState = struct {
                 lock.owner_thread_id = thread_id;
                 self.write64(address, 1);
                 self.windows_srw_compatibility_acquires +|= 1;
+                tso_memory.memoryFence();
+                lock.acquire_calls +|= 1;
+                lock.owner_acquired_step = self.observedExecutionSteps();
+                lock.last_acquire_step = lock.owner_acquired_step;
+                lock.last_acquire_thread_id = thread_id;
                 self.endActiveWindowsSrwWaitAccounting();
                 return .acquired;
             }
@@ -9512,6 +9980,11 @@ pub const ElfState = struct {
         }
         lock.owner_thread_id = thread_id;
         self.write64(address, 1);
+        tso_memory.memoryFence();
+        lock.acquire_calls +|= 1;
+        lock.owner_acquired_step = self.observedExecutionSteps();
+        lock.last_acquire_step = lock.owner_acquired_step;
+        lock.last_acquire_thread_id = thread_id;
         if (self.guestContextField("windows_active_guest_thread_slot").* == null) lock.owner_waiting = false;
         self.endActiveWindowsSrwWaitAccounting();
         return .acquired;
@@ -9540,7 +10013,7 @@ pub const ElfState = struct {
     /// enter runs unexcluded, as every enter used to.
     fn ensureCriticalSection(self: *ElfState, address: u64, layout: xbox_critical_section.Layout) ?*WindowsSrwLock {
         const structure = xbox_critical_section.fields(layout);
-        if (address == 0 or self.guestMemory(address, structure.size) == null) return null;
+        if (address == 0 or self.guestMemoryConst(address, structure.size) == null) return null;
         if (self.windowsCriticalSectionIndex(address)) |index| {
             const section = &self.windows_critical_sections[index];
             if (section.critical_section_layout != layout) return null;
@@ -9571,7 +10044,7 @@ pub const ElfState = struct {
     fn publishCriticalSection(self: *ElfState, section: *const WindowsSrwLock) void {
         const layout = section.critical_section_layout orelse return;
         const structure = xbox_critical_section.fields(layout);
-        if (self.guestMemory(section.address, structure.size) == null) return;
+        if (self.guestMemoryConst(section.address, structure.size) == null) return;
         const waiters = self.windowsSrwWaiterCount(section.*);
         const depth = if (section.recursion == 0) 0 else section.recursion - 1;
         const lock_count: i32 = if (section.owner_thread_id == 0)
@@ -10057,7 +10530,7 @@ pub const ElfState = struct {
             section.recursion = 0;
             self.retireIdleWindowsCriticalSection(section);
         }
-        if (address != 0 and self.guestMemory(address, 24) != null) {
+        if (address != 0 and self.guestMemoryConst(address, 24) != null) {
             const lock_count: i32 = -1;
             self.write32(address + 8, @bitCast(lock_count));
             self.write32(address + 12, 0);
@@ -10117,10 +10590,11 @@ pub const ElfState = struct {
         // A critical section's first word is a dispatch header, not an SRW
         // owner word; publish its ABI-specific owner through the common CS
         // mirror instead.
-        const address_is_guest = lock.critical_section_layout == null and self.guestMemory(address, 8) != null;
+        const address_is_guest = lock.critical_section_layout == null and self.guestMemoryConst(address, 8) != null;
         if (lock.owner_waiting and lock.owner_wait_sequence < chosen_sequence) {
             lock.owner_thread_id = 1;
             lock.owner_waiting = false;
+            lock.owner_acquired_step = self.observedExecutionSteps();
             if (address_is_guest) self.write64(address, 1);
             lock.handoffs +|= 1;
             self.noteWindowsLockHandoff(lock, false);
@@ -10132,6 +10606,7 @@ pub const ElfState = struct {
         if (chosen) |index| {
             const thread = &self.windows_guest_threads[index];
             lock.owner_thread_id = thread.thread_id;
+            lock.owner_acquired_step = self.observedExecutionSteps();
             if (address_is_guest) self.write64(address, 1);
             thread.status = .runnable;
             self.noteWindowsThreadWake();
@@ -10197,22 +10672,31 @@ pub const ElfState = struct {
     /// that prevents a different worker from entering during the handoff.
     pub fn releaseWindowsSrwLock(self: *ElfState, address: u64) void {
         const thread_id = self.currentWindowsThreadId();
+        // Publish the guest mutex's owner/recursion updates before making
+        // another execution context runnable.
+        tso_memory.memoryFence();
         if (self.windowsSrwLockIndex(address)) |index| {
             const lock = &self.windows_srw_locks[index];
+            lock.release_calls +|= 1;
+            lock.last_release_step = self.observedExecutionSteps();
+            lock.last_release_thread_id = thread_id;
             if (lock.owner_thread_id == 0 or lock.owner_thread_id == thread_id or self.windows_guest_wait_compatibility) {
                 self.handOffWindowsSrwLock(lock, address);
             } else {
+                lock.release_mismatches +|= 1;
                 self.windows_srw_lock_release_mismatches +|= 1;
             }
+            tso_memory.memoryFence();
             return;
         }
         // A lock can be released after an image-side zeroing operation that
         // Rosetta did not observe. Keep the guest word recoverable, but do
         // not manufacture an ownership record for it.
-        if (self.guestMemory(address, 8) != null) {
+        if (self.guestMemoryConst(address, 8) != null) {
             self.write64(address, 0);
             self.wakeWindowsGuestThreadsForSrwLock(address);
         }
+        tso_memory.memoryFence();
     }
 
     /// Mark the active worker as waiting for an SRW lock.  The import handler
@@ -10799,16 +11283,14 @@ pub const ElfState = struct {
         // The thread's slots start empty. A switch no longer rewrites them
         // from a saved copy, so the vector itself has to begin zeroed rather
         // than inherit whatever the heap block last held.
-        const vector_bytes = self.guestMemory(tls_vector, WINDOWS_TLS_SLOT_COUNT * 8) orelse return null;
-        self.fillGuestBacking(vector_bytes, 0);
+        if (!self.fillGuestMemory(tls_vector, WINDOWS_TLS_SLOT_COUNT * 8, 0)) return null;
 
         if (self.windows_static_tls_template_length != 0) {
             const source = self.guestMemoryConst(
                 self.windows_static_tls_template_start,
                 self.windows_static_tls_template_length,
             ) orelse return null;
-            const destination = self.guestMemory(tls_block, self.windows_static_tls_template_length) orelse return null;
-            self.copyGuestBacking(destination, source);
+            if (!self.copyToGuest(tls_block, source)) return null;
         }
 
         self.write64(teb + WINDOWS_TEB_STACK_BASE_OFFSET, stack_base);
@@ -11088,8 +11570,9 @@ pub const ElfState = struct {
         self.guest_store_buffers.drainContext(slot, .thread_exit);
         const allocation = if (thread.stack_guard_base != 0) thread.stack_guard_base else thread.stack_base;
         if (thread.stack_guard_base != 0) {
-            self.clearGuestPageProtection(thread.stack_guard_base, WINDOWS_GUEST_THREAD_STACK_GUARD);
-            self.blockJitTlbInvalidate(thread.stack_guard_base, WINDOWS_GUEST_THREAD_STACK_GUARD);
+            if (!self.clearGuestPageProtectionAndReportInvalidation(thread.stack_guard_base, WINDOWS_GUEST_THREAD_STACK_GUARD)) {
+                self.blockJitTlbInvalidate(thread.stack_guard_base, WINDOWS_GUEST_THREAD_STACK_GUARD);
+            }
         }
         if (!self.releaseGuestAllocation(allocation)) return false;
         thread.stack_base = 0;
@@ -12553,7 +13036,7 @@ pub const ElfState = struct {
             return false;
         }
         const callback_rsp = return_rsp - 40;
-        if (self.guestMemory(callback_rsp, 40) == null) {
+        if (self.guestMemoryConst(callback_rsp, 40) == null) {
             self.windows_ui_pipeline.noteCallbackFrameRefused(pending_function);
             return false;
         }
@@ -12564,7 +13047,7 @@ pub const ElfState = struct {
         // import-return path does; the callback may change volatile state,
         // including RAX, which is the WndProc result.
         const message_address = self.guestContextField("regs").*.rcx;
-        const message_readable = self.guestMemory(message_address, 48) != null;
+        const message_readable = self.guestMemoryConst(message_address, 48) != null;
         const hwnd = if (message_readable) self.read64(message_address) else 0;
         const message = if (message_readable) self.read32(message_address + 8) else 0;
         const frame_index = self.guestContextField("windows_message_dispatch_frame_count").*;
@@ -12676,7 +13159,7 @@ pub const ElfState = struct {
         const return_rsp = self.guestContextField("regs").*.rsp;
         if (return_rsp < 48) return false;
         const callback_rsp = return_rsp - 48;
-        if (self.guestMemory(callback_rsp, 48) == null) return false;
+        if (self.guestMemoryConst(callback_rsp, 48) == null) return false;
 
         const frame_index = self.guestContextField("windows_audio_callback_frame_count").*;
         self.guestContextField("windows_audio_callback_frames").*[frame_index] = .{
@@ -12750,7 +13233,10 @@ pub const ElfState = struct {
             return;
         };
         const outcome = self.guest_page_protection.set(self.allocator, address, length, protection);
-        self.blockJitTlbInvalidate(address, length);
+        // Repeating an identical VirtualProtect is common in runtime setup
+        // loops. The protection table reports exact page changes; only a
+        // changed decision can make an admitted TLB access stale.
+        if (outcome.pages_changed != 0) self.blockJitTlbInvalidate(address, length);
         if (outcome.allocation_failed) {
             log.warn("PE64 GUEST PAGE PROTECTION: could not allocate a protection page for [0x{x},+0x{x}) from {s}; accesses to it will not fault", .{ address, length, api });
         }
@@ -12785,10 +13271,19 @@ pub const ElfState = struct {
     }
 
     pub fn clearGuestPageProtection(self: *ElfState, address: u64, length: u64) void {
+        _ = self.clearGuestPageProtectionAndReportInvalidation(address, length);
+    }
+
+    /// Clear one guest protection range and say whether that changed the
+    /// protection table enough to invalidate the TLB already. Release paths
+    /// use the result to avoid immediately invalidating the same range twice.
+    fn clearGuestPageProtectionAndReportInvalidation(self: *ElfState, address: u64, length: u64) bool {
         var runtime_guard = self.lockGuestAddressSpaceIfParallel();
         defer if (runtime_guard) |*guard| guard.unlock();
-        _ = self.guest_page_protection.set(self.allocator, address, length, .accessible);
+        const outcome = self.guest_page_protection.set(self.allocator, address, length, .accessible);
+        if (outcome.pages_changed == 0) return false;
         self.blockJitTlbInvalidate(address, length);
+        return true;
     }
 
     /// The Windows `PAGE_*` value recorded for an address.
@@ -13011,8 +13506,8 @@ pub const ElfState = struct {
         const record = pointers + 0x10;
         const context = record + windows_exception_record_bytes;
         const top = context + windows_context_bytes;
-        const frame = self.guestMemory(call_rsp, top - call_rsp) orelse return false;
-        self.fillGuestBacking(frame, 0);
+        if (self.guestMemoryConst(call_rsp, top - call_rsp) == null) return false;
+        if (!self.fillGuestMemory(call_rsp, top - call_rsp, 0)) return false;
 
         self.write64(header, windows_exception_frame_magic);
         self.write64(header + 8, fault.address);
@@ -13128,9 +13623,7 @@ pub const ElfState = struct {
         self.guestContextField("regs").*.r15 = self.read64(context + 0xf0);
         self.guestContextField("regs").*.rflags = self.read32(context + 0x44);
         for (0..16) |index| {
-            if (self.guestMemoryConst(context + 0x1a0 + index * 16, 16)) |source| {
-                self.snapshotGuestBacking(&self.guestContextField("xmm").*[index], source[0..16]);
-            }
+            _ = self.copyFromGuest(&self.guestContextField("xmm").*[index], context + 0x1a0 + index * 16);
         }
         self.guest_exception_dispatches_in_flight -|= 1;
 
@@ -13567,7 +14060,7 @@ pub const ElfState = struct {
             destination.* = .{};
         }
         self.windows_executable_box = box;
-        self.windows_executable_range_hint = 0;
+        self.windows_executable_range_hint.store(0, .monotonic);
         // Pages admitted for writing before a range became executable would
         // skip the image code-generation bump.
         self.blockJitTlbFlush(false, true);
@@ -13632,6 +14125,10 @@ pub const ElfState = struct {
             alias.guest_base = alias.slot_base + native_low;
             alias.bytes = bytes;
             self.native_memory_alias_count = @max(self.native_memory_alias_count, index + 1);
+            // The free slot may retain a direct-TLB translation from an
+            // earlier lifetime. Retire it before publishing the new backing
+            // so every owner/worker resolves the alias to this slice.
+            self.blockJitTlbInvalidate(alias.guest_base, bytes.len);
             return alias.guest_base;
         }
         var candidate = self.native_memory_alias_next;
@@ -13646,6 +14143,7 @@ pub const ElfState = struct {
                     alias.* = .{ .guest_base = candidate + native_low, .bytes = bytes, .reserved_span = span, .slot_base = candidate };
                     self.native_memory_alias_count = @max(self.native_memory_alias_count, index + 1);
                     self.native_memory_alias_next = next;
+                    self.blockJitTlbInvalidate(alias.guest_base, bytes.len);
                     return alias.guest_base;
                 }
                 return null;
@@ -13903,8 +14401,9 @@ pub const ElfState = struct {
             if (self.findGuestHeapAllocation(guest_base)) |index| {
                 const record = self.windows_heap_allocations[index];
                 if (record.active) {
-                    self.clearGuestPageProtection(guest_base, record.length);
-                    self.blockJitTlbInvalidate(guest_base, record.length);
+                    if (!self.clearGuestPageProtectionAndReportInvalidation(guest_base, record.length)) {
+                        self.blockJitTlbInvalidate(guest_base, record.length);
+                    }
                     return self.releaseGuestAllocation(guest_base);
                 }
             }
@@ -13986,6 +14485,8 @@ pub const ElfState = struct {
                     length >= 0x0FFF_F000)
                 {
                     self.windows_code_cache_view = view_index;
+                    self.block_jit_code_cache_guest_low = guest_base;
+                    self.block_jit_code_cache_guest_high = guest_base + length;
                 }
                 const media_mapping = self.windows_file_mappings[mapping_index];
                 if (media_mapping.media_authorized and self.windows_media_mapping_trace_events < 8) {
@@ -14034,7 +14535,11 @@ pub const ElfState = struct {
             self.blockJitTlbInvalidate(view.guest_base, view.length);
             self.blockJitDropMappedSource(.memory_view, mapping_index);
             self.invalidateMappedDecodeCache();
-            if (self.windows_code_cache_view == view_index) self.windows_code_cache_view = null;
+            if (self.windows_code_cache_view == view_index) {
+                self.windows_code_cache_view = null;
+                self.block_jit_code_cache_guest_low = 0;
+                self.block_jit_code_cache_guest_high = 0;
+            }
             view.* = .{};
             self.trimWindowsMemoryViewCount();
             self.releaseClosedWindowsMapping(mapping_index);
@@ -14106,7 +14611,7 @@ pub const ElfState = struct {
                     .length = view.length,
                     .kind = .memory_view,
                     .source_index = view.mapping_index,
-                    .generation = mapping.code_generation,
+                    .generation = if (self.parallel_guest_execution) loadCodeGeneration(&mapping.code_generation) else mapping.code_generation,
                 };
             }
         }
@@ -14126,7 +14631,7 @@ pub const ElfState = struct {
                 .length = view.length,
                 .kind = .memory_view,
                 .source_index = view.mapping_index,
-                .generation = mapping.code_generation,
+                .generation = if (self.parallel_guest_execution) loadCodeGeneration(&mapping.code_generation) else mapping.code_generation,
             };
         }
         for (self.windows_virtual_allocations[0..self.windows_virtual_allocation_count], 0..) |allocation, allocation_index| {
@@ -14142,7 +14647,7 @@ pub const ElfState = struct {
                 .length = allocation.length,
                 .kind = .virtual_allocation,
                 .source_index = allocation_index,
-                .generation = allocation.code_generation,
+                .generation = if (self.parallel_guest_execution) loadCodeGeneration(&allocation.code_generation) else allocation.code_generation,
             };
         }
         return null;
@@ -14247,26 +14752,44 @@ pub const ElfState = struct {
         return @atomicLoad(u64, generation, .acquire);
     }
 
+    /// Retire the mapped-source decodes when a mapping lifetime ends.
+    ///
+    /// A recreated mapping may reuse both a table slot and generation 1, and
+    /// a serial executor trusts a matching generation without comparing
+    /// bytes, so the old lifetime's decodes must go - from the primary sets
+    /// and from the victim bank, which this used to miss. A parallel
+    /// executor compares bytes on every hit, in all three tiers, and the
+    /// switch back to serial execution clears them all, so parallel mode
+    /// skips the sweep.
+    ///
+    /// The translator's blocks are dropped per mapping at the removal sites
+    /// (`blockJitDropMappedSource`), not here: dropping every mapped block on
+    /// every map and unmap threw away the whole translated code cache each
+    /// time a thread stack came or went. Nor are the TLBs flushed here: each
+    /// removal retires its own range first (`blockJitTlbInvalidate`), and a
+    /// range being created cannot be resident in any TLB. A million-entry
+    /// sweep plus every executor's TLB flush on each map and unmap, with the
+    /// world stopped, was 7% of the 2026-09-30 Emulator thread's wall time.
     fn invalidateMappedDecodeCache(self: *ElfState) void {
-        // Recreated mappings may reuse both a table slot and generation 1.
-        // Their old decodes must not survive that lifetime boundary. The
-        // translator's blocks are dropped per mapping at the removal sites
-        // (`blockJitDropMappedSource`), not here: dropping every mapped
-        // block on every map and unmap threw away the whole translated
-        // code cache each time a thread stack came or went.
+        if (self.parallel_guest_execution) return;
         for (self.decode_cache) |*entry| if (entry.mapped_source) {
             entry.valid = false;
             entry.last_used = 0;
         };
-        self.blockJitTlbFlush(true, true);
+        for (self.decode_cache_victims) |*entry| if (entry.mapped_source) {
+            entry.valid = false;
+        };
     }
 
+    /// Publish a new mapped range. Nothing is invalidated: its addresses
+    /// were unmapped until now, so no decode or TLB entry can name them
+    /// (every removal retired its own), and the old lifetime of a reused
+    /// slot was swept when it ended.
     fn indexWindowsMappedRange(self: *ElfState, range: mapped_ranges.Range) bool {
         if (!self.windows_mapped_ranges.insert(range)) {
             log.err("PE64 mapped range index refused: base=0x{x} length={d} kind={s} slot={d}; no backing was published", .{ range.base, range.length, @tagName(range.kind), range.slot });
             return false;
         }
-        self.invalidateMappedDecodeCache();
         return true;
     }
 
@@ -14298,43 +14821,47 @@ pub const ElfState = struct {
     /// are common during bootstrap and must not force every hot image loop to
     /// re-read and compare its instruction bytes.
     fn bumpWindowsImageCodeGeneration(self: *ElfState, address: u64, count: u64) void {
-        if (count == 0 or self.windows_executable_range_count == 0) return;
-        // Every guest store reaches this point. A store that touches no
-        // executable byte, which is nearly all of them, is answered by the
-        // box before the per-range scan.
-        if (!self.windows_executable_box.overlaps(address, count)) return;
-        const end = std.math.add(u64, address, count) catch return;
+        // The bounding box can span non-executable gaps (including the
+        // import table). Publish and trace only a write that overlaps an
+        // actual executable PE range; otherwise ordinary IAT/data updates
+        // would be mislabeled as code writes and needlessly flush a pending
+        // store buffer.
+        if (!self.windowsImageRangeOverlapsCode(address, count)) return;
+        tso_memory.flushActiveStoreBufferFor(.code_write);
+        self.traceWindowsExecutableImageWrite(address, count);
+        if (self.parallel_guest_execution) {
+            self.bumpCodeGenerationShared(&self.windows_image_code_generation);
+            return;
+        }
+        // Saturation would make a later write indistinguishable from the
+        // previous one.  This is practically unreachable, but clearing
+        // the tiny cache makes the invariant explicit even in a fuzzed
+        // or very long-lived PE session.
+        if (self.windows_image_code_generation == std.math.maxInt(u64)) {
+            self.windows_image_code_generation = 1;
+            for (self.decode_cache) |*entry| {
+                entry.valid = false;
+                entry.last_used = 0;
+            }
+            self.blockJitDropAll();
+        } else {
+            self.windows_image_code_generation += 1;
+        }
+    }
+
+    /// Whether a guest range overlaps an executable PE section. Every guest
+    /// store asks through `bumpWindowsImageCodeGeneration`; the bounding box
+    /// answers nearly all of them before the per-range scan.
+    inline fn windowsImageRangeOverlapsCode(self: *const ElfState, address: u64, count: u64) bool {
+        if (count == 0 or self.windows_executable_range_count == 0) return false;
+        if (!self.windows_executable_box.overlaps(address, count)) return false;
+        const end = std.math.add(u64, address, count) catch return false;
         for (self.windows_executable_ranges[0..self.windows_executable_range_count]) |range| {
             if (range.length == 0) continue;
             const range_end = std.math.add(u64, range.guest_base, range.length) catch continue;
-            if (address >= range_end or end <= range.guest_base) continue;
-            // The bounding box can span non-executable gaps (including the
-            // import table). Publish and trace only a write that overlaps an
-            // actual executable PE range; otherwise ordinary IAT/data
-            // updates would be mislabeled as code writes and needlessly
-            // flush a pending store buffer.
-            tso_memory.flushActiveStoreBufferFor(.code_write);
-            self.traceWindowsExecutableImageWrite(address, count);
-            if (self.parallel_guest_execution) {
-                self.bumpCodeGenerationShared(&self.windows_image_code_generation);
-                return;
-            }
-            // Saturation would make a later write indistinguishable from the
-            // previous one.  This is practically unreachable, but clearing
-            // the tiny cache makes the invariant explicit even in a fuzzed
-            // or very long-lived PE session.
-            if (self.windows_image_code_generation == std.math.maxInt(u64)) {
-                self.windows_image_code_generation = 1;
-                for (self.decode_cache) |*entry| {
-                    entry.valid = false;
-                    entry.last_used = 0;
-                }
-                self.blockJitDropAll();
-            } else {
-                self.windows_image_code_generation += 1;
-            }
-            return;
+            if (address < range_end and end > range.guest_base) return true;
         }
+        return false;
     }
 
     fn traceWindowsExecutableImageWrite(self: *ElfState, address: u64, count: u64) void {
@@ -14378,7 +14905,7 @@ pub const ElfState = struct {
         const end = std.math.add(u64, address, @as(u64, @intCast(count))) catch return null;
         // Straight-line code stays inside one section, so the range that
         // answered the previous fetch answers this one almost always.
-        const hint = self.windows_executable_range_hint;
+        const hint = self.windows_executable_range_hint.load(.monotonic);
         if (hint < self.windows_executable_range_count) {
             const range = self.windows_executable_ranges[hint];
             if (range.length != 0 and address >= range.guest_base) {
@@ -14393,7 +14920,7 @@ pub const ElfState = struct {
             if (end <= range_end) {
                 // A hint: several executors may race to write it, and any
                 // value it holds is re-checked before use.
-                self.windows_executable_range_hint = index;
+                self.windows_executable_range_hint.store(index, .monotonic);
                 return loadCodeGeneration(&self.windows_image_code_generation);
             }
         }
@@ -14415,6 +14942,69 @@ pub const ElfState = struct {
         }
     }
 
+    fn guestMemoryClass(self: *const ElfState, address: u64, width: u8, is_write: bool) tso_memory_policy.MemoryClass {
+        const fault_routed = self.guest_page_protection.isActive() and
+            self.guest_page_protection.faults(address, width, is_write);
+        const device_backed = self.nativeMemoryAlias(address, width) != null;
+        return tso_memory_policy.classify(device_backed, fault_routed);
+    }
+
+    /// Classify a bulk access without collapsing protected/device pages into
+    /// the ordinary-RAM store queue. MMIO is represented by Xenia's
+    /// no-access pages and reaches the vectored fault path; protected write-
+    /// watch pages use the same fault-routed ordering boundary.
+    fn guestMemoryRangeClass(self: *const ElfState, address: u64, count: u64, is_write: bool) tso_memory_policy.MemoryClass {
+        if (count == 0) return .ordinary_ram;
+        const end = std.math.add(u64, address, count) catch return .fault_routed;
+        if (self.guest_page_protection.isActive()) {
+            var page = address & ~(guest_page_protection.page_size - 1);
+            while (page < end) {
+                if (self.guest_page_protection.faults(page, 1, is_write)) return .fault_routed;
+                page = std.math.add(u64, page, guest_page_protection.page_size) catch return .fault_routed;
+            }
+        }
+        if (self.nativeMemoryAlias(address, count) != null) return .device_backed;
+        return .ordinary_ram;
+    }
+
+    fn memoryClassBoundary(class: tso_memory_policy.MemoryClass) tso_memory.Boundary {
+        return switch (class) {
+            .ordinary_ram => .unattributed,
+            .device_backed => .device_access,
+            .fault_routed => .fault_routed_access,
+        };
+    }
+
+    fn loadGuestScalarAt(self: *const ElfState, comptime T: type, address: u64, bytes: []const u8) T {
+        const class = self.guestMemoryClass(address, @sizeOf(T), false);
+        if (!tso_memory_policy.bypassStoreBuffer(class)) return self.loadGuestScalar(T, bytes);
+        return tso_memory.loadUnbuffered(
+            T,
+            bytes,
+            tso_memory_policy.requiresCoordinator(class, self.parallel_guest_execution),
+            memoryClassBoundary(class),
+        );
+    }
+
+    fn storeGuestScalarAt(self: *const ElfState, comptime T: type, address: u64, bytes: []u8, value: T, non_temporal: bool) void {
+        const class = self.guestMemoryClass(address, @sizeOf(T), true);
+        if (!tso_memory_policy.bypassStoreBufferForStore(class, non_temporal)) {
+            self.storeGuestScalar(T, bytes, value);
+            return;
+        }
+        const boundary = if (tso_memory_policy.bypassStoreBuffer(class))
+            memoryClassBoundary(class)
+        else
+            .non_temporal_store;
+        tso_memory.storeUnbuffered(
+            T,
+            bytes,
+            value,
+            tso_memory_policy.requiresCoordinator(class, self.parallel_guest_execution),
+            boundary,
+        );
+    }
+
     fn fillGuestBacking(self: *const ElfState, destination: []u8, byte: u8) void {
         if (self.parallel_guest_execution) {
             tso_memory.fillCoordinated(destination, byte);
@@ -14431,6 +15021,41 @@ pub const ElfState = struct {
         }
     }
 
+    /// Runtime bulk writes into device or protected pages are synchronous
+    /// boundaries. Drain ordinary queued stores first, then temporarily
+    /// detach that queue so the copy itself cannot be re-buffered as RAM.
+    fn copyGuestBackingForClass(
+        self: *const ElfState,
+        destination: []u8,
+        source: []const u8,
+        class: tso_memory_policy.MemoryClass,
+    ) void {
+        if (!tso_memory_policy.bypassStoreBuffer(class)) {
+            self.copyGuestBacking(destination, source);
+            return;
+        }
+        tso_memory.flushActiveStoreBufferFor(memoryClassBoundary(class));
+        const previous = tso_memory.setActiveStoreBuffer(null);
+        defer _ = tso_memory.setActiveStoreBuffer(previous);
+        tso_memory.copyCoordinated(destination, source);
+    }
+
+    fn fillGuestBackingForClass(
+        self: *const ElfState,
+        destination: []u8,
+        byte: u8,
+        class: tso_memory_policy.MemoryClass,
+    ) void {
+        if (!tso_memory_policy.bypassStoreBuffer(class)) {
+            self.fillGuestBacking(destination, byte);
+            return;
+        }
+        tso_memory.flushActiveStoreBufferFor(memoryClassBoundary(class));
+        const previous = tso_memory.setActiveStoreBuffer(null);
+        defer _ = tso_memory.setActiveStoreBuffer(previous);
+        tso_memory.fillCoordinated(destination, byte);
+    }
+
     fn snapshotGuestBacking(self: *const ElfState, destination: []u8, source: []const u8) void {
         if (self.parallel_guest_execution) {
             tso_memory.copyInCoordinated(destination, source);
@@ -14440,34 +15065,34 @@ pub const ElfState = struct {
     }
 
     pub fn read8(self: *const ElfState, vaddr: u64) u8 {
-        if (self.addrToOffset(vaddr)) |off| return self.loadGuestScalar(u8, self.mem[off..]);
-        if (self.windowsMappedMemoryConst(vaddr, 1)) |bytes| return self.loadGuestScalar(u8, bytes);
+        if (self.addrToOffset(vaddr)) |off| return self.loadGuestScalarAt(u8, vaddr, self.mem[off..]);
+        if (self.windowsMappedMemoryConst(vaddr, 1)) |bytes| return self.loadGuestScalarAt(u8, vaddr, bytes);
         return 0;
     }
 
     pub fn read16(self: *const ElfState, vaddr: u64) u16 {
         if (self.addrToOffset(vaddr)) |off| {
-            if (off + 2 <= self.mem.len) return self.loadGuestScalar(u16, self.mem[off..]);
+            if (off + 2 <= self.mem.len) return self.loadGuestScalarAt(u16, vaddr, self.mem[off..]);
         } else if (self.windowsMappedMemoryConst(vaddr, 2)) |bytes| {
-            return self.loadGuestScalar(u16, bytes);
+            return self.loadGuestScalarAt(u16, vaddr, bytes);
         }
         return 0;
     }
 
     pub fn read32(self: *const ElfState, vaddr: u64) u32 {
         if (self.addrToOffset(vaddr)) |off| {
-            if (off + 4 <= self.mem.len) return self.loadGuestScalar(u32, self.mem[off..]);
+            if (off + 4 <= self.mem.len) return self.loadGuestScalarAt(u32, vaddr, self.mem[off..]);
         } else if (self.windowsMappedMemoryConst(vaddr, 4)) |bytes| {
-            return self.loadGuestScalar(u32, bytes);
+            return self.loadGuestScalarAt(u32, vaddr, bytes);
         }
         return 0;
     }
 
     pub fn read64(self: *const ElfState, vaddr: u64) u64 {
         if (self.addrToOffset(vaddr)) |off| {
-            if (off + 8 <= self.mem.len) return self.loadGuestScalar(u64, self.mem[off..]);
+            if (off + 8 <= self.mem.len) return self.loadGuestScalarAt(u64, vaddr, self.mem[off..]);
         } else if (self.windowsMappedMemoryConst(vaddr, 8)) |bytes| {
-            return self.loadGuestScalar(u64, bytes);
+            return self.loadGuestScalarAt(u64, vaddr, bytes);
         }
         return 0;
     }
@@ -14476,11 +15101,11 @@ pub const ElfState = struct {
         self.traceGuestWrite(vaddr, 1, val);
         if (self.addrToOffset(vaddr)) |off| {
             if (off < self.mem.len) {
-                self.storeGuestScalar(u8, self.mem[off..], val);
+                self.storeGuestScalarAt(u8, vaddr, self.mem[off..], val, false);
                 self.bumpWindowsImageCodeGeneration(vaddr, 1);
             }
         } else if (self.windowsMappedMemory(vaddr, 1)) |bytes| {
-            self.storeGuestScalar(u8, bytes, val);
+            self.storeGuestScalarAt(u8, vaddr, bytes, val, false);
             self.bumpWindowsMappedCodeGeneration(vaddr, 1);
         }
     }
@@ -14489,11 +15114,11 @@ pub const ElfState = struct {
         self.traceGuestWrite(vaddr, 2, val);
         if (self.addrToOffset(vaddr)) |off| {
             if (off + 2 <= self.mem.len) {
-                self.storeGuestScalar(u16, self.mem[off..], val);
+                self.storeGuestScalarAt(u16, vaddr, self.mem[off..], val, false);
                 self.bumpWindowsImageCodeGeneration(vaddr, 2);
             }
         } else if (self.windowsMappedMemory(vaddr, 2)) |bytes| {
-            self.storeGuestScalar(u16, bytes, val);
+            self.storeGuestScalarAt(u16, vaddr, bytes, val, false);
             self.bumpWindowsMappedCodeGeneration(vaddr, 2);
         }
     }
@@ -14503,11 +15128,11 @@ pub const ElfState = struct {
         self.traceWindowsMappedWrite(vaddr, 4, val);
         if (self.addrToOffset(vaddr)) |off| {
             if (off + 4 <= self.mem.len) {
-                self.storeGuestScalar(u32, self.mem[off..], val);
+                self.storeGuestScalarAt(u32, vaddr, self.mem[off..], val, false);
                 self.bumpWindowsImageCodeGeneration(vaddr, 4);
             }
         } else if (self.windowsMappedMemory(vaddr, 4)) |bytes| {
-            self.storeGuestScalar(u32, bytes, val);
+            self.storeGuestScalarAt(u32, vaddr, bytes, val, false);
             self.bumpWindowsMappedCodeGeneration(vaddr, 4);
         }
     }
@@ -14517,11 +15142,11 @@ pub const ElfState = struct {
         self.traceWindowsMappedWrite(vaddr, 8, val);
         if (self.addrToOffset(vaddr)) |off| {
             if (off + 8 <= self.mem.len) {
-                self.storeGuestScalar(u64, self.mem[off..], val);
+                self.storeGuestScalarAt(u64, vaddr, self.mem[off..], val, false);
                 self.bumpWindowsImageCodeGeneration(vaddr, 8);
             }
         } else if (self.windowsMappedMemory(vaddr, 8)) |bytes| {
-            self.storeGuestScalar(u64, bytes, val);
+            self.storeGuestScalarAt(u64, vaddr, bytes, val, false);
             self.bumpWindowsMappedCodeGeneration(vaddr, 8);
         }
     }
@@ -14669,7 +15294,7 @@ pub const ElfState = struct {
             if (comparison < 0) {
                 const current_address = frame.base + frame.j * frame.element_size;
                 const previous_address = frame.base + (frame.j - 1) * frame.element_size;
-                const current = self.guestMemory(current_address, frame.element_size) orelse {
+                const current = self.guestMemoryConst(current_address, frame.element_size) orelse {
                     self.faulted = true;
                     self.exit_code = 127;
                     self.termination_reason = .runtime_invariant_failure;
@@ -14677,7 +15302,7 @@ pub const ElfState = struct {
                     log.err("Windows qsort comparator produced an invalid current element address=0x{x}", .{current_address});
                     return;
                 };
-                const previous = self.guestMemory(previous_address, frame.element_size) orelse {
+                const previous = self.guestMemoryConst(previous_address, frame.element_size) orelse {
                     self.faulted = true;
                     self.exit_code = 127;
                     self.termination_reason = .runtime_invariant_failure;
@@ -14687,8 +15312,18 @@ pub const ElfState = struct {
                 };
                 const element_size: usize = @intCast(frame.element_size);
                 self.snapshotGuestBacking(frame.scratch[0..element_size], current);
-                self.copyGuestBacking(current, previous);
-                self.copyGuestBacking(previous, frame.scratch[0..element_size]);
+                const current_target = self.guestMemoryTsoWriteTarget(current_address, frame.element_size) orelse {
+                    self.failWindowsQsort(null, "current element became unmapped");
+                    return;
+                };
+                const previous_target = self.guestMemoryTsoWriteTarget(previous_address, frame.element_size) orelse {
+                    self.failWindowsQsort(null, "previous element became unmapped");
+                    return;
+                };
+                self.copyGuestBacking(current_target, previous);
+                self.finishGuestMemoryTsoWrite(current_address, frame.element_size);
+                self.copyGuestBacking(previous_target, frame.scratch[0..element_size]);
+                self.finishGuestMemoryTsoWrite(previous_address, frame.element_size);
                 if (frame.j > 1) {
                     frame.j -= 1;
                 } else {
@@ -14754,7 +15389,7 @@ pub const ElfState = struct {
             self.failWindowsQsort(direct_return_rip, "element range overflows guest address width");
             return true;
         };
-        if (self.guestMemory(base, byte_count) == null) {
+        if (self.guestMemoryConst(base, byte_count) == null) {
             self.failWindowsQsort(direct_return_rip, "element range is outside guest memory");
             return true;
         }
@@ -14793,7 +15428,7 @@ pub const ElfState = struct {
         const globals = &self.windows_crt_globals;
         var rejected = false;
         var rejection_reason: []const u8 = "";
-        if (globals.termination_complete or function == 0 or self.guestMemory(function, 1) == null) {
+        if (globals.termination_complete or function == 0 or self.guestMemoryConst(function, 1) == null) {
             rejected = true;
             rejection_reason = if (globals.termination_complete)
                 "termination-already-complete"
@@ -14949,7 +15584,7 @@ pub const ElfState = struct {
                 self.finishWindowsCrtExit();
                 return;
             }
-            if (self.guestMemory(callback, 1) == null) {
+            if (self.guestMemoryConst(callback, 1) == null) {
                 globals.callback_rejections +|= 1;
                 self.failWindowsCrtExit("callback became invalid before invocation");
                 return;
@@ -14961,7 +15596,7 @@ pub const ElfState = struct {
                 return;
             }
             const callback_rsp = return_rsp - 40;
-            if (self.guestMemory(callback_rsp, 40) == null) {
+            if (self.guestMemoryConst(callback_rsp, 40) == null) {
                 self.failWindowsCrtExit("callback frame is outside guest memory");
                 return;
             }
@@ -15143,7 +15778,7 @@ pub const ElfState = struct {
             self.failWindowsInitTerm(begin, end, "initializer table exceeds bounded entry count");
             return true;
         }
-        if (byte_count != 0 and self.guestMemory(begin, byte_count) == null) {
+        if (byte_count != 0 and self.guestMemoryConst(begin, byte_count) == null) {
             self.failWindowsInitTerm(begin, end, "initializer table is outside guest memory");
             return true;
         }
@@ -19487,14 +20122,36 @@ pub const ElfState = struct {
             shown += 1;
             var lock_text: [guest_symbol_text_bytes]u8 = undefined;
             var owner_text: [96]u8 = undefined;
-            log.info("PE64 LOCK CONTENTION:   lock=0x{x} ({s}) owner={s} waiters={d} contentions={d} handoffs={d}", .{
+            const lock_name = self.describeGuestAddressOrUnnamed(lock.address, &lock_text);
+            log.info("PE64 LOCK CONTENTION:   lock=0x{x} ({s}) owner={s} waiters={d} contentions={d} handoffs={d} acquire/release/mismatch={d}/{d}/{d} owner_since_step={d} last_acquire(thread/step)=0x{x}/{d} last_release(thread/step)=0x{x}/{d}", .{
                 lock.address,
-                self.describeGuestAddressOrUnnamed(lock.address, &lock_text),
+                lock_name,
                 self.describeWindowsSrwOwner(lock.owner_thread_id, &owner_text),
                 waiters,
                 lock.contentions,
                 lock.handoffs,
+                lock.acquire_calls,
+                lock.release_calls,
+                lock.release_mismatches,
+                lock.owner_acquired_step,
+                lock.last_acquire_thread_id,
+                lock.last_acquire_step,
+                lock.last_release_thread_id,
+                lock.last_release_step,
             });
+            if (std.mem.startsWith(u8, lock_name, "_ZZN2xe22global_critical_region5mutexEvE12global_mutex") and
+                self.guestMemoryConst(lock.address, 16) != null)
+            {
+                const xenia_owner = self.read32(lock.address + 8);
+                const xenia_recursion = self.read32(lock.address + 12);
+                log.warn("PE64 XENIA GLOBAL MUTEX: srw_word=0x{x} bridge_owner_thread=0x{x} xenia_owner_thread=0x{x} xenia_recursion={d} waiters={d}; owner=0 and recursion=0 with a nonzero bridge owner means Rosetta missed the release, while nonzero Xenia fields mean its recursive unlock has not completed", .{
+                    self.read64(lock.address),
+                    lock.owner_thread_id,
+                    xenia_owner,
+                    xenia_recursion,
+                    waiters,
+                });
+            }
             for (self.windows_guest_threads) |thread| {
                 if (thread.thread_id == 0 or thread.thread_id != lock.owner_thread_id) continue;
                 if (thread.status != .completed and thread.status != .failed) continue;
@@ -20184,30 +20841,21 @@ pub const ElfState = struct {
     }
 
     fn noteGuestMilestoneEntry(self: *ElfState, target: u64) void {
-        const bit = guestMilestoneFilterBit(target);
-        const slot = self.guest_milestone_slot[bit];
-        if (slot == 0) return;
+        if (self.guest_milestone_slot[guestMilestoneFilterBit(target)] == 0) return;
+        // The filter and the addresses are written once, at load
+        // (`armGuestMilestones`), so the exact match needs no lock; only
+        // recording an entry does. Locking first charged every filter
+        // collision the runtime lock - 17,090 of them on 2026-09-30, from
+        // 60 milestones sharing 256 bits with every hot call target.
+        const index = self.guestMilestoneIndexOf(target) orelse {
+            _ = @atomicRmw(u64, &self.guest_milestone_filter_misses, .Add, 1, .monotonic);
+            return;
+        };
         var runtime_guard = self.lockGuestRuntimeMutationIfParallel();
         defer {
             if (runtime_guard) |*guard| guard.unlock();
         }
-        if (slot != milestone_slot_collision) {
-            // The common case: this bit belongs to exactly one armed address,
-            // so a filter hit costs one comparison rather than a scan.
-            const index = @as(usize, slot) - 1;
-            if (self.guest_milestone_addresses[index] != target) {
-                self.guest_milestone_filter_misses +|= 1;
-                return;
-            }
-            self.recordGuestMilestone(index, target);
-            return;
-        }
-        for (self.guest_milestone_addresses, 0..) |address, index| {
-            if (address != target) continue;
-            self.recordGuestMilestone(index, target);
-            return;
-        }
-        self.guest_milestone_filter_misses +|= 1;
+        self.recordGuestMilestone(index, target);
     }
 
     /// Arm a separate call/return witness for the outer setup function. A
@@ -20445,18 +21093,23 @@ pub const ElfState = struct {
             self.armGuestReturnCapture(.ui_font_rgba, 0);
             self.activeReturnCapture().outputs = .{ self.guestContextField("regs").*.rdx, self.guestContextField("regs").*.r8, self.guestContextField("regs").*.r9, 0 };
         } else if (index == xenia_presenter_attach_milestones.lists) {
-            self.ui_evidence.noteLists(self.guestMemoryConst(self.guestContextField("regs").*.rdx, 64));
+            var snapshot: [64]u8 = undefined;
+            const readable = self.copyFromGuest(&snapshot, self.guestContextField("regs").*.rdx);
+            self.ui_evidence.noteLists(if (readable) snapshot[0..] else null);
             self.noteUiDrawDataBuffers(self.guestContextField("regs").*.rdx);
         } else if (index == xenia_presenter_attach_milestones.draw) {
-            self.ui_evidence.noteDraw(self.guestMemoryConst(self.guestContextField("regs").*.rdx, 44));
+            var snapshot: [44]u8 = undefined;
+            const readable = self.copyFromGuest(&snapshot, self.guestContextField("regs").*.rdx);
+            self.ui_evidence.noteDraw(if (readable) snapshot[0..] else null);
         } else if (index == xenia_presenter_attach_milestones.scissor) {
             // Before CALL pushes the return: fifth/sixth args follow the
             // caller's 32-byte Windows x64 shadow space.
-            const stack_args = self.guestMemoryConst(self.guestContextField("regs").*.rsp +| 32, 16);
+            var stack_args: [16]u8 = undefined;
+            const stack_args_readable = self.copyFromGuest(&stack_args, self.guestContextField("regs").*.rsp +| 32);
             self.armGuestReturnCapture(.ui_scissor, 0);
             self.activeReturnCapture().outputs = .{
-                self.guestContextField("regs").*.r8,                               self.guestContextField("regs").*.r9,
-                if (stack_args) |b| std.mem.readInt(u64, b[0..8], .little) else 0, if (stack_args) |b| std.mem.readInt(u64, b[8..16], .little) else 0,
+                self.guestContextField("regs").*.r8,                                             self.guestContextField("regs").*.r9,
+                if (stack_args_readable) std.mem.readInt(u64, stack_args[0..8], .little) else 0, if (stack_args_readable) std.mem.readInt(u64, stack_args[8..16], .little) else 0,
             };
         } else if (index == xenia_presenter_attach_milestones.pipelines) {
             self.armGuestReturnCapture(.ui_pipelines, 0);
@@ -20523,7 +21176,8 @@ pub const ElfState = struct {
     /// viewport. Counts are used only as labels; the reads remain bounded to
     /// one command and one vertex.
     fn noteUiDrawDataBuffers(self: *ElfState, draw_data: u64) void {
-        const draw_data_bytes = self.guestMemoryConst(draw_data, 64) orelse return;
+        var draw_data_bytes: [64]u8 = undefined;
+        if (!self.copyFromGuest(&draw_data_bytes, draw_data)) return;
         // ImDrawData::CmdLists is an ImVector at +16. Xenia's ImVector is
         // laid out as { Size: i32, Capacity: i32, Data: pointer }; the
         // pointer is therefore at +24, not +16. Following the size as a
@@ -20531,10 +21185,12 @@ pub const ElfState = struct {
         // makes the diagnostic itself report fabricated counts.
         const command_lists = std.mem.readInt(u64, draw_data_bytes[24..32], .little);
         if (command_lists == 0) return;
-        const first_list_bytes = self.guestMemoryConst(command_lists, 8) orelse return;
+        var first_list_bytes: [8]u8 = undefined;
+        if (!self.copyFromGuest(&first_list_bytes, command_lists)) return;
         const first_list = std.mem.readInt(u64, first_list_bytes[0..8], .little);
         if (first_list == 0) return;
-        const list_bytes = self.guestMemoryConst(first_list, 168) orelse return;
+        var list_bytes: [168]u8 = undefined;
+        if (!self.copyFromGuest(&list_bytes, first_list)) return;
         // ImDrawList stores three ImVector values before Flags. Each vector
         // is { Size: i32, Capacity: i32, Data: pointer } on this 64-bit
         // build: CmdBuffer at +0 (Data +8), IdxBuffer at +16 (Data +24),
@@ -20544,22 +21200,32 @@ pub const ElfState = struct {
         const vertex_count = std.mem.readInt(u32, list_bytes[32..36], .little);
         const vertex_data = std.mem.readInt(u64, list_bytes[40..48], .little);
         const shared_data = std.mem.readInt(u64, list_bytes[56..64], .little);
+        var command_bytes: [16]u8 = undefined;
+        const command_bytes_readable = command_data != 0 and command_count != 0 and
+            self.copyFromGuest(&command_bytes, command_data);
+        var vertex_bytes: [8]u8 = undefined;
+        const vertex_bytes_readable = vertex_data != 0 and vertex_count != 0 and
+            self.copyFromGuest(&vertex_bytes, vertex_data);
+        var shared_bytes: [16]u8 = undefined;
+        const shared_bytes_readable = shared_data != 0 and
+            self.copyFromGuest(&shared_bytes, shared_data +| 48);
+        var clip_bytes: [16]u8 = undefined;
+        const clip_address = std.mem.readInt(u64, list_bytes[160..168], .little);
+        const clip_bytes_readable = std.mem.readInt(i32, list_bytes[152..156], .little) > 0 and
+            clip_address != 0 and self.copyFromGuest(&clip_bytes, clip_address);
         self.ui_evidence.noteRawBuffers(
             first_list,
             command_data,
             vertex_data,
             command_count,
             vertex_count,
-            if (command_data != 0 and command_count != 0) self.guestMemoryConst(command_data, 16) else null,
-            if (vertex_data != 0 and vertex_count != 0) self.guestMemoryConst(vertex_data, 8) else null,
+            if (command_bytes_readable) command_bytes[0..] else null,
+            if (vertex_bytes_readable) vertex_bytes[0..] else null,
         );
         self.ui_evidence.noteRawListInternals(
-            list_bytes,
-            self.guestMemoryConst(shared_data +| 48, 16),
-            if (std.mem.readInt(i32, list_bytes[152..156], .little) > 0)
-                self.guestMemoryConst(std.mem.readInt(u64, list_bytes[160..168], .little), 16)
-            else
-                null,
+            list_bytes[0..],
+            if (shared_bytes_readable) shared_bytes[0..] else null,
+            if (clip_bytes_readable) clip_bytes[0..] else null,
         );
     }
 
@@ -20611,18 +21277,21 @@ pub const ElfState = struct {
             .none => {},
             .call_probe => self.noteCallProbeReturn(finished),
             .ui_font_rgba => {
-                const p = self.guestMemoryConst(finished.outputs[0], 8);
-                const w = self.guestMemoryConst(finished.outputs[1], 4);
-                const h = self.guestMemoryConst(finished.outputs[2], 4);
-                if (p == null or w == null or h == null) {
+                var pixel_pointer_bytes: [8]u8 = undefined;
+                var width_bytes: [4]u8 = undefined;
+                var height_bytes: [4]u8 = undefined;
+                if (!self.copyFromGuest(&pixel_pointer_bytes, finished.outputs[0]) or
+                    !self.copyFromGuest(&width_bytes, finished.outputs[1]) or
+                    !self.copyFromGuest(&height_bytes, finished.outputs[2]))
+                {
                     self.ui_evidence.font_returns +|= 1;
                     self.ui_evidence.font_unreadable_returns +|= 1;
                     self.ui_evidence.font_last_valid = false;
                     return;
                 }
-                const pixels = std.mem.readInt(u64, p.?[0..8], .little);
-                const width = std.mem.readInt(i32, w.?[0..4], .little);
-                const height = std.mem.readInt(i32, h.?[0..4], .little);
+                const pixels = std.mem.readInt(u64, pixel_pointer_bytes[0..8], .little);
+                const width = std.mem.readInt(i32, width_bytes[0..4], .little);
+                const height = std.mem.readInt(i32, height_bytes[0..4], .little);
                 const readable = if (ui_draw_evidence.Evidence.atlasByteCount(width, height)) |n|
                     self.guestMemoryConst(pixels, n) != null
                 else
@@ -20633,9 +21302,10 @@ pub const ElfState = struct {
                 const accepted = @as(u8, @truncate(self.guestContextField("regs").*.rax)) != 0;
                 var rect: [4]u32 = undefined;
                 var readable = accepted;
+                var bytes: [4][4]u8 = undefined;
                 if (accepted) for (finished.outputs, 0..) |address, index| {
-                    if (self.guestMemoryConst(address, 4)) |b| {
-                        rect[index] = std.mem.readInt(u32, b[0..4], .little);
+                    if (self.copyFromGuest(bytes[index][0..], address)) {
+                        rect[index] = std.mem.readInt(u32, bytes[index][0..4], .little);
                     } else readable = false;
                 };
                 self.ui_evidence.noteScissorReturn(accepted, if (readable) rect else null);
@@ -20846,7 +21516,11 @@ pub const ElfState = struct {
         }
 
         pub fn readDword(self: GpuRingSource, ring_index: u64) ?u32 {
-            const bytes = self.state.guestMemoryConst(self.membase + 0x1_0000_0000 + self.physicalAddress(ring_index), 4) orelse return null;
+            // This is a scalar guest load, not a borrowed snapshot. Resolve
+            // backing directly so the active executor can forward its own
+            // queued stores instead of draining the queue once per ring
+            // dword; the scalar helper supplies the required TSO ordering.
+            const bytes = self.state.guestMemorySourceConst(self.membase + 0x1_0000_0000 + self.physicalAddress(ring_index), 4) orelse return null;
             return @byteSwap(self.state.loadGuestScalar(u32, bytes));
         }
 
@@ -20858,7 +21532,7 @@ pub const ElfState = struct {
             // and 0xC0000000 onto the same mapping offsets as the physical
             // view; a title writes its ring through one of them.
             for ([_]u64{ 0xA000_0000, 0xC000_0000 }) |alias| {
-                const bytes = self.state.guestMemoryConst(self.membase + alias + self.physicalAddress(ring_index), 4) orelse continue;
+                const bytes = self.state.guestMemorySourceConst(self.membase + alias + self.physicalAddress(ring_index), 4) orelse continue;
                 checked += 1;
                 if (@byteSwap(self.state.loadGuestScalar(u32, bytes)) != physical_value) mismatched += 1;
             }
@@ -21060,12 +21734,13 @@ pub const ElfState = struct {
     fn noteGuestVfsResolveEntry(self: *ElfState) void {
         self.guest_vfs_resolve_calls +|= 1;
         const view_address = self.guestContextField("regs").*.rdx;
-        if (self.guestMemoryConst(view_address, 16) == null) {
+        var view_bytes: [16]u8 = undefined;
+        if (!self.copyFromGuest(&view_bytes, view_address)) {
             self.guest_vfs_resolve_unreadable +|= 1;
             return;
         }
-        const length = self.read64(view_address);
-        const data = self.read64(view_address +| 8);
+        const length = std.mem.readInt(u64, view_bytes[0..8], .little);
+        const data = std.mem.readInt(u64, view_bytes[8..16], .little);
         if (length > 4096) {
             self.guest_vfs_resolve_unreadable +|= 1;
             return;
@@ -21074,11 +21749,10 @@ pub const ElfState = struct {
         var path_storage: [GUEST_VFS_PATH_BYTES]u8 = undefined;
         const shown_len: usize = @intCast(shown);
         if (shown_len != 0) {
-            const path_source = self.guestMemoryConst(data, shown) orelse {
+            if (!self.copyFromGuest(path_storage[0..shown_len], data)) {
                 self.guest_vfs_resolve_unreadable +|= 1;
                 return;
-            };
-            tso_memory.copyInCoordinated(path_storage[0..shown_len], path_source);
+            }
         }
         const path = path_storage[0..shown_len];
         const slot = blk: {
@@ -21426,10 +22100,9 @@ pub const ElfState = struct {
         self.audio_title_frames_seen +|= 1;
         const seen = self.audio_title_frames_seen;
         if (seen > 4096 and seen % 16 != 0) return;
-        const bytes = self.guestMemoryConst(samples, 6 * 256 * 4) orelse return;
-        self.audio_title_frames_checked +|= 1;
         var snapshot: [6 * 256 * 4]u8 = undefined;
-        self.snapshotGuestBacking(snapshot[0..], bytes);
+        if (!self.copyFromGuest(&snapshot, samples)) return;
+        self.audio_title_frames_checked +|= 1;
         for (snapshot) |byte| {
             if (byte == 0) continue;
             self.audio_title_frames_nonzero +|= 1;
@@ -22041,7 +22714,10 @@ pub const ElfState = struct {
     }
 
     fn readHostU64(self: *const ElfState, address: u64) ?u64 {
-        const bytes = self.guestMemoryConst(address, 8) orelse return null;
+        // Scalar loads already forward this executor's store buffer and use
+        // the acquire/stripe path in parallel mode. Returning a borrowed
+        // view here would unnecessarily publish all of its queued stores.
+        const bytes = self.guestMemorySourceConst(address, 8) orelse return null;
         return self.loadGuestScalar(u64, bytes);
     }
 
@@ -22195,7 +22871,7 @@ pub const ElfState = struct {
     /// no input hook.
     pub fn writeWindowsXInputState(self: *ElfState, output: u64) bool {
         const value = self.readWindowsInputState() orelse return false;
-        if (output == 0 or self.guestMemory(output, 16) == null) return false;
+        if (output == 0 or self.guestMemoryConst(output, 16) == null) return false;
         self.write32(output, value.packet_number);
         self.write16(output + 4, value.buttons);
         self.write8(output + 6, value.left_trigger);
@@ -23586,7 +24262,9 @@ pub const ElfState = struct {
     /// binding; dynamic imports require an exact registered GetProcAddress
     /// stub. Traced runs and diagnostic clock modes use the ordinary path.
     fn tryWindowsFastImportStub(self: *ElfState, stub_address: u64) bool {
-        if (!self.windowsFastImportMayBypassRuntimeLock()) return false;
+        // The weakest condition any fast import has; each one checks its
+        // own on top (`windows_runtime.tryWindowsFastFunction`).
+        if (!self.windowsFastCrtImportMayBypassRuntimeLock()) return false;
         const stub = self.windowsImportStubAt(stub_address) orelse return false;
         if (stub.is_dynamic) {
             if (stub.iat_address != 0) return false;
@@ -24801,12 +25479,53 @@ pub const ElfState = struct {
         return buffer[0..0];
     }
 
-    fn touchDecodeCacheEntry(self: *ElfState, entry: *DecodeCacheEntry) void {
-        // The counter is per state rather than per entry. It gives the
-        // replacement policy a cheap, monotonic age without putting a host
-        // timestamp or a branchy clock read in the PE hot path.
+    /// Worker-local decode hits, with the calling thread's unpublished
+    /// remainder (`WorkerLocalDecodeCache.noteHit` publishes in batches).
+    fn decodeCacheWorkerLocalHits(self: *const ElfState) u64 {
+        const counter = @constCast(&self.decode_cache_worker_local_hits);
+        WorkerLocalDecodeCache.publishHits(counter);
+        return counter.load(.monotonic);
+    }
+
+    fn decodeCacheCounts(self: *const ElfState) DecodeCacheCounters {
+        var total: DecodeCacheCounters = .{};
+        // Workers update each shard under its matching set lock. Take that
+        // lock while sampling so periodic telemetry does not race the hot
+        // path's plain counters; only one lock is held at a time.
+        for (self.decode_cache_shards, 0..) |shard, index| {
+            const lock = &decode_cache_set_locks[index];
+            lock.lock();
+            total.accumulate(shard.counters);
+            lock.unlock();
+        }
+        total.worker_local_hits = self.decodeCacheWorkerLocalHits();
+        total.hits +|= total.worker_local_hits;
+        return total;
+    }
+
+    fn logWorkerLocalDecodeCache(self: *const ElfState, counts: DecodeCacheCounters, lookups: u64) void {
+        const hit_share_ppm = if (lookups == 0) 0 else @divTrunc(counts.worker_local_hits *| 1_000_000, lookups);
+        log.info("PE64 DECODE CACHE WORKER LOCAL: entries={d} hits={d} share_of_all_lookups_ppm={d} parallel={}; the private tier still validates instruction bytes through coordinated access before using a decode", .{
+            PE_DECODE_CACHE_LOCAL_ENTRIES,
+            counts.worker_local_hits,
+            hit_share_ppm,
+            self.parallel_guest_execution,
+        });
+    }
+
+    fn touchDecodeCachePrimaryEntry(entry: *DecodeCacheEntry, shard: *DecodeCacheShard) void {
+        // Each cache set always maps to one shard and is protected by that
+        // shard's mutex in parallel mode. Its sixteen residents therefore
+        // have comparable recency without a process-wide write on every hit.
+        shard.age_clock +|= 1;
+        entry.last_used = shard.age_clock;
+    }
+
+    fn touchDecodeCacheVictimEntry(self: *ElfState, entry: *DecodeCacheEntry) void {
+        // Victim sets combine evictions from multiple primary shards, so they
+        // retain one LRU clock under `decode_cache_miss_mutex`. This runs only
+        // on misses, never on the hot primary hit path.
         if (self.decode_cache_clock == std.math.maxInt(u64)) {
-            for (self.decode_cache) |*candidate| candidate.last_used = 0;
             for (self.decode_cache_victims) |*candidate| candidate.last_used = 0;
             self.decode_cache_clock = 1;
         } else {
@@ -24833,7 +25552,7 @@ pub const ElfState = struct {
     /// strict PE run, terminates on) a capacity conflict. The victim bank only
     /// makes a later return to an evicted address cheap when the policy is in
     /// diagnostic/continue mode or when a caller explicitly allows recovery.
-    fn saveDecodeCacheVictim(self: *ElfState, evicted: *const DecodeCacheEntry) void {
+    fn saveDecodeCacheVictim(self: *ElfState, evicted: *const DecodeCacheEntry, shard: *DecodeCacheShard) void {
         if (!evicted.valid) return;
         const set_base = peDecodeCacheVictimIndex(evicted.fetch_address);
         const ways = self.decode_cache_victims[set_base..][0..PE_DECODE_CACHE_VICTIM_WAYS];
@@ -24850,8 +25569,8 @@ pub const ElfState = struct {
             }
         }
         selected.?.* = evicted.*;
-        self.touchDecodeCacheEntry(selected.?);
-        self.decode_cache_victim_fills +|= 1;
+        self.touchDecodeCacheVictimEntry(selected.?);
+        shard.counters.victim_fills +|= 1;
     }
 
     const DecodeCacheVictimHit = struct {
@@ -24869,6 +25588,7 @@ pub const ElfState = struct {
         bytes: []const u8,
         remaining: usize,
         mapped_code: ?WindowsMappedCodeSlice,
+        shard: *DecodeCacheShard,
     ) ?DecodeCacheVictimHit {
         const set_base = peDecodeCacheVictimIndex(fetch_address);
         const ways = self.decode_cache_victims[set_base..][0..PE_DECODE_CACHE_VICTIM_WAYS];
@@ -24878,7 +25598,7 @@ pub const ElfState = struct {
             const same_source = cached_len != 0 and cached_len <= remaining and
                 cached_len <= PE_MAX_INSTRUCTION_LENGTH;
             if (!same_source) continue;
-            const image_generation: ?u64 = if (mapped_code == null)
+            const image_generation: ?u64 = if (mapped_code == null and !self.parallel_guest_execution)
                 self.windowsImageCodeGenerationFor(fetch_address, cached_len)
             else
                 null;
@@ -24900,7 +25620,7 @@ pub const ElfState = struct {
                 return .{ .entry = candidate, .rearmed = rearmed };
             }
             candidate.valid = false;
-            self.decode_cache_victim_stale_rejections +|= 1;
+            shard.counters.victim_stale_rejections +|= 1;
         }
         return null;
     }
@@ -24913,19 +25633,20 @@ pub const ElfState = struct {
         resident_addresses: [PE_DECODE_CACHE_WAYS]u64,
         resident_count: usize,
         mapped_code: ?WindowsMappedCodeSlice,
+        shard: *DecodeCacheShard,
     ) void {
         switch (cause) {
-            .vacant_fill => self.decode_cache_vacant_fills +|= 1,
+            .vacant_fill => shard.counters.vacant_fills +|= 1,
             .capacity_conflict => {
-                self.decode_cache_conflict_fills +|= 1;
-                self.decode_cache_collisions +|= 1;
+                shard.counters.conflict_fills +|= 1;
+                shard.counters.collisions +|= 1;
                 if (mapped_code != null) {
-                    self.decode_cache_generated_conflict_fills +|= 1;
+                    shard.counters.generated_conflict_fills +|= 1;
                 } else {
-                    self.decode_cache_image_conflict_fills +|= 1;
+                    shard.counters.image_conflict_fills +|= 1;
                 }
             },
-            .stale_bytes => self.decode_cache_stale_refills +|= 1,
+            .stale_bytes => shard.counters.stale_refills +|= 1,
         }
 
         // A compulsory fill is expected. A full-set replacement or a source
@@ -24933,44 +25654,54 @@ pub const ElfState = struct {
         // the execution stream could not be reused safely. Keep the warning
         // sparse, but route every decisive event through the same fatal-point
         // policy used by the PE wait/import/memory diagnostics.
-        const occurrence = switch (cause) {
-            .vacant_fill => self.decode_cache_vacant_fills,
-            .capacity_conflict => self.decode_cache_conflict_fills,
-            .stale_bytes => self.decode_cache_stale_refills,
-        };
+        //
+        // The throttle counts across every shard. Counting per shard let
+        // each of the 4096 shards report its own first fills: on 2026-09-30
+        // that was 20,000 of the log's 22,014 lines, written while this path
+        // held a set lock and the miss mutex, so the owner spent 82% of its
+        // wall time in writev and every other executor's miss queued behind.
+        const report = &self.decode_cache_miss_reports[@intFromEnum(cause)];
+        report.* +|= 1;
+        const occurrence = report.*;
 
         const source_index = if (mapped_code) |source| source.source_index else 0;
         const source_kind = if (mapped_code) |source| source.kind else .memory_view;
         const source_generation = if (mapped_code) |source| source.generation else 0;
+        // A compulsory fill is the working set arriving: counted, never
+        // listed. The run's first 256 instructions used to take every site,
+        // so a later conflict or stale refill - the findings this table
+        // exists to name - could only ever be counted as overflow.
         var site: ?*DecodeCacheMissSite = null;
-        for (self.decode_cache_miss_sites[0..self.decode_cache_miss_site_count]) |*candidate| {
-            if (candidate.cause == cause and candidate.fetch_address == fetch_address and
-                candidate.set_index == set_index and candidate.mapped_source == (mapped_code != null) and
-                candidate.source_kind == source_kind and candidate.source_index == source_index)
-            {
-                site = candidate;
-                break;
+        if (cause != .vacant_fill) {
+            for (self.decode_cache_miss_sites[0..self.decode_cache_miss_site_count]) |*candidate| {
+                if (candidate.cause == cause and candidate.fetch_address == fetch_address and
+                    candidate.set_index == set_index and candidate.mapped_source == (mapped_code != null) and
+                    candidate.source_kind == source_kind and candidate.source_index == source_index)
+                {
+                    site = candidate;
+                    break;
+                }
             }
-        }
-        if (site == null and self.decode_cache_miss_site_count < self.decode_cache_miss_sites.len) {
-            site = &self.decode_cache_miss_sites[self.decode_cache_miss_site_count];
-            self.decode_cache_miss_site_count += 1;
-            site.?.* = .{
-                .cause = cause,
-                .fetch_address = fetch_address,
-                .set_index = set_index,
-                .mapped_source = mapped_code != null,
-                .source_kind = source_kind,
-                .source_index = source_index,
-                .source_generation = source_generation,
-                .resident_addresses = resident_addresses,
-                .resident_count = resident_count,
-                .occurrences = 0,
-                .first_step = self.observedExecutionSteps(),
-                .first_rip = self.guestContextField("regs").*.rip,
-            };
-        } else if (site == null) {
-            self.decode_cache_miss_site_overflow +|= 1;
+            if (site == null and self.decode_cache_miss_site_count < self.decode_cache_miss_sites.len) {
+                site = &self.decode_cache_miss_sites[self.decode_cache_miss_site_count];
+                self.decode_cache_miss_site_count += 1;
+                site.?.* = .{
+                    .cause = cause,
+                    .fetch_address = fetch_address,
+                    .set_index = set_index,
+                    .mapped_source = mapped_code != null,
+                    .source_kind = source_kind,
+                    .source_index = source_index,
+                    .source_generation = source_generation,
+                    .resident_addresses = resident_addresses,
+                    .resident_count = resident_count,
+                    .occurrences = 0,
+                    .first_step = self.observedExecutionSteps(),
+                    .first_rip = self.guestContextField("regs").*.rip,
+                };
+            } else if (site == null) {
+                self.decode_cache_miss_site_overflow +|= 1;
+            }
         }
         if (site) |entry| {
             entry.occurrences +|= 1;
@@ -25027,21 +25758,22 @@ pub const ElfState = struct {
     }
 
     fn reportDecodeCacheMissSites(self: *const ElfState) void {
-        if (self.decode_cache_misses == 0) return;
-        const lookups = self.decode_cache_hits +| self.decode_cache_rearms +| self.decode_cache_misses;
-        const miss_rate_ppm = if (lookups == 0) 0 else @divTrunc(self.decode_cache_misses *| 1_000_000, lookups);
-        const conflict_rate_ppm = if (lookups == 0) 0 else @divTrunc(self.decode_cache_conflict_fills *| 1_000_000, lookups);
+        const counts = self.decodeCacheCounts();
+        if (counts.misses == 0) return;
+        const lookups = counts.hits +| counts.rearms +| counts.misses;
+        const miss_rate_ppm = if (lookups == 0) 0 else @divTrunc(counts.misses *| 1_000_000, lookups);
+        const conflict_rate_ppm = if (lookups == 0) 0 else @divTrunc(counts.conflict_fills *| 1_000_000, lookups);
         log.info("PE64 DECODE CACHE FINDINGS: distinct_sites={d} overflow={d} lookups={d} miss_rate_ppm={d} conflict_rate_ppm={d} totals(vacant/conflict/stale)={d}/{d}/{d} conflict_sources(generated/image)={d}/{d}; conflicts and stale-byte refills are fatal when the PE fatal-point policy is armed", .{
             self.decode_cache_miss_site_count,
             self.decode_cache_miss_site_overflow,
             lookups,
             miss_rate_ppm,
             conflict_rate_ppm,
-            self.decode_cache_vacant_fills,
-            self.decode_cache_conflict_fills,
-            self.decode_cache_stale_refills,
-            self.decode_cache_generated_conflict_fills,
-            self.decode_cache_image_conflict_fills,
+            counts.vacant_fills,
+            counts.conflict_fills,
+            counts.stale_refills,
+            counts.generated_conflict_fills,
+            counts.image_conflict_fills,
         });
         for (self.decode_cache_miss_sites[0..self.decode_cache_miss_site_count]) |site| {
             const classification = switch (site.cause) {
@@ -25190,6 +25922,33 @@ pub const ElfState = struct {
         return true;
     }
 
+    inline fn resolveDecodedAddress(
+        self: *ElfState,
+        decoded: DecodedInsn,
+        decoded_segment: x64_decoder.Segment,
+    ) DecodedInsn {
+        var d = decoded;
+        d.segment = decoded_segment;
+        const addr_size: Size = if (d.has_0x67) .bits32 else .bits64;
+        const relative_control = switch (d.op) {
+            .call_rel32, .jmp_rel8, .jcc_rel8, .jcc_rel32 => true,
+            else => false,
+        };
+        if (!relative_control and !d.is_reg_form) {
+            d.addr = x64_decoder.resolveMemoryAddress(&self.guestContextField("regs").*, .{
+                .displacement = d.addr,
+                .has_index = d.sib_has_index,
+                .index_reg = d.sib_index_reg,
+                .scale = d.sib_scale,
+                .has_base = d.sib_has_base,
+                .base_reg = d.sib_base_reg,
+                .rip_relative = d.rip_relative,
+                .segment = d.segment,
+            }, self.guestContextField("regs").*.rip +% d.len, addr_size, .long64, d.op != .lea_reg_mem);
+        }
+        return d;
+    }
+
     fn decodeAt(self: *ElfState) ?DecodedInsn {
         self.guestContextField("decode_failure_is_invalid_control_target").* = false;
         const fetch_address = self.guestContextField("regs").*.rip +% x64_decoder.segmentBase(&self.guestContextField("regs").*, .cs, .long64);
@@ -25236,12 +25995,6 @@ pub const ElfState = struct {
             return null;
         }
         var coordinated_instruction_bytes: [PE_MAX_INSTRUCTION_LENGTH]u8 = undefined;
-        if (self.parallel_guest_execution) {
-            const count = @min(remaining, coordinated_instruction_bytes.len);
-            self.snapshotGuestBacking(coordinated_instruction_bytes[0..count], bytes[0..count]);
-            bytes = coordinated_instruction_bytes[0..count];
-            remaining = count;
-        }
         if (remaining == 0) {
             if (self.windows_runtime_enabled) {
                 log.err("PE64 decode fetch at guest-image end: rip=0x{x} fetch=0x{x} off=0x{x} mem_len=0x{x} thread=0x{x}", .{
@@ -25255,13 +26008,37 @@ pub const ElfState = struct {
             return null;
         }
         const cache_set = peDecodeCacheSetIndex(fetch_address);
+        if (self.parallel_guest_execution) {
+            // The private tier preserves the shared cache's exact-byte check,
+            // which is the final guard for executable aliases and
+            // self-modifying code; it compares without an address stripe
+            // (`tso_memory.eqlCodeBytes`).
+            const owner: *anyopaque = @ptrCast(self);
+            const local_entries = WorkerLocalDecodeCache.entriesFor(owner);
+            const local_entry = &local_entries[cache_set & (PE_DECODE_CACHE_LOCAL_ENTRIES - 1)];
+            if (decodeCacheEntryHasIdentity(local_entry, fetch_address, mapped_code)) {
+                const cached_len = @as(usize, local_entry.decoded.len);
+                const same_source = cached_len != 0 and cached_len <= remaining and
+                    cached_len <= PE_MAX_INSTRUCTION_LENGTH;
+                if (same_source and tso_memory.eqlCodeBytes(
+                    local_entry.bytes[0..cached_len],
+                    bytes[0..cached_len],
+                    coordinated_instruction_bytes[0..cached_len],
+                )) {
+                    WorkerLocalDecodeCache.noteHit(&self.decode_cache_worker_local_hits);
+                    return self.resolveDecodedAddress(local_entry.decoded, local_entry.segment);
+                }
+                if (same_source) local_entry.valid = false;
+            }
+        }
         const cache_index = peDecodeCacheIndex(fetch_address);
-        // Parallel executors share the cache set by set: one lock per group
-        // of sets, taken only for the scan and fill of this instruction's own
-        // set. The whole cache used to sit behind one mutex, which every
-        // interpreted instruction on every thread took.
+        const shard_index = cache_set % decode_cache_set_lock_count;
+        const shard = &self.decode_cache_shards[shard_index];
+        // Parallel executors share a striped set lock. The expanded stripe
+        // table prevents unrelated sets from serializing, while each stripe
+        // also owns the hot counters and LRU clock for its residents.
         const set_lock: ?*concurrency.mutex.LeanMutex = if (self.parallel_guest_execution)
-            &decode_cache_set_locks[cache_set % decode_cache_set_lock_count]
+            &decode_cache_set_locks[shard_index]
         else
             null;
         if (set_lock) |lock| lock.lock();
@@ -25300,12 +26077,14 @@ pub const ElfState = struct {
             const cached_len = @as(usize, candidate.decoded.len);
             const same_source = cached_len != 0 and cached_len <= remaining and
                 cached_len <= PE_MAX_INSTRUCTION_LENGTH;
-            const image_generation: ?u64 = if (mapped_code == null and same_source)
+            const image_generation: ?u64 = if (mapped_code == null and same_source and !self.parallel_guest_execution)
                 self.windowsImageCodeGenerationFor(fetch_address, cached_len)
             else
                 null;
+            const parallel_bytes_match = same_source and self.parallel_guest_execution and
+                tso_memory.eqlCodeBytes(candidate.bytes[0..cached_len], bytes[0..cached_len], coordinated_instruction_bytes[0..cached_len]);
             const cache_hit = same_source and (if (self.parallel_guest_execution)
-                std.mem.eql(u8, candidate.bytes[0..cached_len], bytes[0..cached_len])
+                parallel_bytes_match
             else if (mapped_code) |generated|
                 candidate.source_generation == generated.generation
             else if (image_generation) |generation|
@@ -25323,15 +26102,17 @@ pub const ElfState = struct {
             // function was emitted. Re-check the old bytes before paying for
             // a fresh decode: most such changes are unrelated to this entry,
             // so the old decode can simply be re-armed for the new generation.
-            const bytes_match = same_source and
-                std.mem.eql(u8, candidate.bytes[0..cached_len], bytes[0..cached_len]);
+            const bytes_match = same_source and (if (self.parallel_guest_execution)
+                parallel_bytes_match
+            else
+                std.mem.eql(u8, candidate.bytes[0..cached_len], bytes[0..cached_len]));
             if (bytes_match) {
                 cache_entry = candidate;
                 rearmed = true;
                 d = candidate.decoded;
                 decoded_segment = candidate.segment;
                 if (mapped_code) |generated| candidate.source_generation = generated.generation;
-                if (mapped_code == null) {
+                if (mapped_code == null and !self.parallel_guest_execution) {
                     if (self.windowsImageCodeGenerationFor(fetch_address, cached_len)) |generation| {
                         candidate.source_generation = generation;
                     }
@@ -25345,6 +26126,16 @@ pub const ElfState = struct {
         }
 
         if (cache_entry == null) {
+            // The overwhelmingly common path above compares backing bytes
+            // under their shared access stripe without copying them to a
+            // temporary. Only a miss needs a stable byte snapshot for victim
+            // validation or a fresh decode.
+            if (self.parallel_guest_execution) {
+                const count = @min(remaining, coordinated_instruction_bytes.len);
+                self.snapshotGuestBacking(coordinated_instruction_bytes[0..count], bytes[0..count]);
+                bytes = coordinated_instruction_bytes[0..count];
+                remaining = count;
+            }
             // A primary miss is not necessarily a fresh decode. A recent
             // conflict may have displaced this exact instruction into the
             // bounded victim bank. Restore it into the same primary set so
@@ -25353,7 +26144,7 @@ pub const ElfState = struct {
             // their own lock, always taken after a set lock.
             if (set_lock != null) decode_cache_miss_mutex.lock();
             defer if (set_lock != null) decode_cache_miss_mutex.unlock();
-            if (self.findDecodeCacheVictim(fetch_address, bytes, remaining, mapped_code)) |victim| {
+            if (self.findDecodeCacheVictim(fetch_address, bytes, remaining, mapped_code, shard)) |victim| {
                 const selected_entry = stale_entry orelse vacant_entry orelse oldest_entry;
                 if (selected_entry) |selected| {
                     selected.* = victim.entry.*;
@@ -25368,15 +26159,15 @@ pub const ElfState = struct {
         }
 
         if (cache_entry) |entry| {
-            if (victim_restored) self.decode_cache_victim_hits +|= 1;
+            if (victim_restored) shard.counters.victim_hits +|= 1;
             if (rearmed or victim_rearmed) {
-                self.decode_cache_rearms +|= 1;
+                shard.counters.rearms +|= 1;
             } else {
-                self.decode_cache_hits +|= 1;
+                shard.counters.hits +|= 1;
             }
-            self.touchDecodeCacheEntry(entry);
+            touchDecodeCachePrimaryEntry(entry, shard);
         } else {
-            self.decode_cache_misses +|= 1;
+            shard.counters.misses +|= 1;
             const selected_entry = stale_entry orelse vacant_entry orelse oldest_entry orelse return null;
             const cause: DecodeCacheMissCause = if (stale_entry != null)
                 .stale_bytes
@@ -25384,12 +26175,12 @@ pub const ElfState = struct {
                 .vacant_fill
             else
                 .capacity_conflict;
-            if (cause == .capacity_conflict) self.decode_cache_replacements +|= 1;
+            if (cause == .capacity_conflict) shard.counters.replacements +|= 1;
             {
                 if (set_lock != null) decode_cache_miss_mutex.lock();
                 defer if (set_lock != null) decode_cache_miss_mutex.unlock();
-                if (cause == .capacity_conflict) self.saveDecodeCacheVictim(selected_entry);
-                self.noteDecodeCacheMiss(cause, fetch_address, cache_set, resident_addresses, resident_count, mapped_code);
+                if (cause == .capacity_conflict) self.saveDecodeCacheVictim(selected_entry, shard);
+                self.noteDecodeCacheMiss(cause, fetch_address, cache_set, resident_addresses, resident_count, mapped_code, shard);
             }
             if (self.isTerminated()) return null;
 
@@ -25405,7 +26196,9 @@ pub const ElfState = struct {
                     .mapped_source = mapped_code != null,
                     .source_kind = if (mapped_code) |generated| generated.kind else .memory_view,
                     .source_index = if (mapped_code) |generated| generated.source_index else 0,
-                    .source_generation = if (mapped_code) |generated|
+                    .source_generation = if (self.parallel_guest_execution)
+                        0
+                    else if (mapped_code) |generated|
                         generated.generation
                     else if (self.windowsImageCodeGenerationFor(fetch_address, decoded_len)) |generation|
                         generation
@@ -25415,7 +26208,8 @@ pub const ElfState = struct {
                     .decoded = d,
                 };
                 @memcpy(selected_entry.bytes[0..decoded_len], bytes[0..decoded_len]);
-                self.touchDecodeCacheEntry(selected_entry);
+                touchDecodeCachePrimaryEntry(selected_entry, shard);
+                cache_entry = selected_entry;
             }
         }
         // The shared decoder records the address-size bit in `d`, but the
@@ -25452,6 +26246,15 @@ pub const ElfState = struct {
                 .rip_relative = d.rip_relative,
                 .segment = d.segment,
             }, self.guestContextField("regs").*.rip +% d.len, addr_size, .long64, d.op != .lea_reg_mem);
+        }
+        if (self.parallel_guest_execution) {
+            if (cache_entry) |entry| {
+                if (entry.valid and entry.fetch_address == fetch_address and entry.decoded.len != 0) {
+                    const owner: *anyopaque = @ptrCast(self);
+                    const local_entries = WorkerLocalDecodeCache.entriesFor(owner);
+                    local_entries[cache_set & (PE_DECODE_CACHE_LOCAL_ENTRIES - 1)] = entry.*;
+                }
+            }
         }
         return d;
     }
@@ -25554,6 +26357,8 @@ pub const ElfState = struct {
         .trace_transfers_offset = @offsetOf(ElfState, "block_jit_transfer_traced"),
         .image_low_offset = @offsetOf(ElfState, "image_low"),
         .image_high_offset = @offsetOf(ElfState, "image_high"),
+        .code_cache_low_offset = @offsetOf(ElfState, "block_jit_code_cache_guest_low"),
+        .code_cache_high_offset = @offsetOf(ElfState, "block_jit_code_cache_guest_high"),
         .iat_low_offset = @offsetOf(ElfState, "windows_iat_low"),
         .iat_high_offset = @offsetOf(ElfState, "windows_iat_high"),
         .hook_filter_offset = @offsetOf(ElfState, "block_jit_hook_filter"),
@@ -25655,6 +26460,7 @@ pub const ElfState = struct {
             return null;
         };
         jit.hot_threshold = self.block_jit_hot_threshold;
+        jit.max_entries = BLOCK_JIT_WORKER_MAX_TABLE_ENTRIES;
         thread.parallel_block_jit = jit;
         return jit;
     }
@@ -25953,6 +26759,13 @@ pub const ElfState = struct {
             }
             if (entry.count < jit.hotness[coldest].count) coldest = slot;
         }
+        // Taking a counting entry from another address is the thrash that
+        // keeps both on the interpreter; one still warming up is pressure.
+        const replaced = jit.hotness[coldest];
+        if (replaced.rip != 0 and replaced.count != 0 and !replaced.refused) {
+            jit.hotness_replacements +|= 1;
+            if (replaced.count < jit.hot_threshold) jit.pressure +|= 1;
+        }
         jit.hotness[coldest] = .{ .rip = rip, .count = 0 };
         return &jit.hotness[coldest];
     }
@@ -26037,11 +26850,12 @@ pub const ElfState = struct {
     /// After a helper served a plain access, decide whether emitted code
     /// may touch the page directly from now on. Admission requires: no
     /// trace watch on stores; the access inside one page; the page backed
-    /// by the image, a native alias or an indexed mapping; not restricted
+    /// by the image or an indexed mapping; not restricted
     /// for that direction; and, for writes, neither executable image bytes
     /// nor a mapping instructions were ever fetched from, because a store
-    /// into those must bump the decode generation. Everything refused here
-    /// keeps taking the helper, which is the interpreter's own path.
+    /// into those must bump the decode generation. Native aliases stay
+    /// helper-only so their device boundary is preserved. Everything refused
+    /// here keeps taking the interpreter's own path.
     /// Whether a live store trace still needs to see every write, which the
     /// write TLB would hide by letting translated code store directly.
     ///
@@ -26059,6 +26873,19 @@ pub const ElfState = struct {
         }
         if (!self.trace_windows_memory or self.windows_memory_trace_events >= windows_memory_trace_budget) return false;
         return page +| page_bytes > windows_memory_trace_floor and self.addrToOffset(page) == null;
+    }
+
+    fn noteBlockJitTlbRefusal(
+        jit: *BlockJitState,
+        reason: tlb_diagnostics.RefusalReason,
+        page: u64,
+        is_write: bool,
+        epoch: u64,
+        cacheable: bool,
+    ) void {
+        jit.tlb_fill_refusals +|= 1;
+        jit.tlb_refusal_stats.record(reason, page);
+        if (cacheable) jit.tlb_refusal_cache.record(page, is_write, epoch, reason);
     }
 
     fn blockJitTlbConsider(self: *ElfState, address: u64, width: u8, is_write: bool) void {
@@ -26093,39 +26920,69 @@ pub const ElfState = struct {
             self.bumpTlbCounter(&self.block_jit_tlb_bail_null_page);
             return;
         }
-        if (self.guest_page_protection.isActive()) {
-            const protection = self.guest_page_protection.get(page);
-            if (protection == .no_access or (is_write and protection != .accessible)) {
-                jit.tlb_fill_refusals +|= 1;
+        // Most Xenia helper misses revisit a small set of host-device aliases.
+        // Remember the stable refusal per executor so it need not rescan the
+        // native alias table and repeat the other mapping proofs on every
+        // access. A hit is still refused: the guest operation itself continues
+        // through the ordered, class-aware helper below the JIT.
+        if (parallel) {
+            if (jit.tlb_refusal_cache.lookup(page, is_write, epoch)) |reason| {
+                noteBlockJitTlbRefusal(jit, reason, page, is_write, epoch, false);
                 return;
             }
         }
+        if (self.guest_page_protection.isActive()) {
+            const protection = self.guest_page_protection.get(page);
+            if (protection == .no_access) {
+                noteBlockJitTlbRefusal(jit, .guest_no_access, page, is_write, epoch, parallel);
+                return;
+            }
+            if (is_write and protection != .accessible) {
+                noteBlockJitTlbRefusal(jit, .guest_write_protected, page, is_write, epoch, parallel);
+                return;
+            }
+        }
+        // Native aliases expose storage also read or written by Xenia's host
+        // device code. A generated direct-TLB access would skip this
+        // class-sensitive helper and silently give the alias ordinary RAM
+        // semantics, including bypassing its synchronous ordering boundary.
+        // Keep both directions helper-routed; the helper can distinguish the
+        // alias and publish the appropriate device boundary.
+        if (self.nativeMemoryAlias(page, page_bytes) != null) {
+            noteBlockJitTlbRefusal(jit, .native_device_alias, page, is_write, epoch, parallel);
+            return;
+        }
+
         const host: [*]u8 = blk: {
             if (self.addrToOffset(page)) |off| {
                 const offset: usize = @intCast(off);
                 if (offset + page_bytes > self.mem.len) {
-                    jit.tlb_fill_refusals +|= 1;
+                    noteBlockJitTlbRefusal(jit, .process_backing_bounds, page, is_write, epoch, parallel);
                     return;
                 }
-                if (is_write and self.windows_executable_box.overlaps(page, page_bytes)) {
-                    jit.tlb_fill_refusals +|= 1;
+                // The exact executable ranges, not their bounding box: the
+                // box runs from .text to .cold across .rdata and .data, so
+                // it refused every write to Xenia's globals - its global
+                // critical region's mutex among them, taken 1.65 million
+                // times on 2026-09-30 - and sent each through the helper.
+                if (is_write and self.windowsImageRangeOverlapsCode(page, page_bytes)) {
+                    noteBlockJitTlbRefusal(jit, .executable_image_write, page, is_write, epoch, parallel);
                     return;
                 }
                 break :blk self.mem.ptr + offset;
             }
-            if (self.nativeMemoryAlias(page, page_bytes)) |bytes| break :blk bytes.ptr;
             if (self.windows_mapped_ranges.find(page, page_bytes)) |range| {
                 if (is_write and self.mappedRangeCodeFetched(range)) {
-                    jit.tlb_fill_refusals +|= 1;
+                    noteBlockJitTlbRefusal(jit, .mapped_code_write, page, is_write, epoch, parallel);
                     return;
                 }
                 const slice = self.windowsIndexedMemory(page, page_bytes) orelse {
-                    jit.tlb_fill_refusals +|= 1;
+                    noteBlockJitTlbRefusal(jit, .mapped_range_unbacked, page, is_write, epoch, parallel);
                     return;
                 };
                 break :blk @constCast(slice.bytes.ptr);
             }
-            jit.tlb_fill_refusals +|= 1;
+            noteBlockJitTlbRefusal(jit, .unmapped_page, page, is_write, epoch, parallel);
             return;
         };
         const tlb = self.activeBlockJitTlb();
@@ -26150,6 +27007,22 @@ pub const ElfState = struct {
             }
         }
         return self.block_jit_tlb_active orelse &self.block_jit_tlb;
+    }
+
+    /// The affinity mask the parallel executor reports: one bit per host
+    /// processor, at most 64. `ROSETTE_PE64_GUEST_CPUS=N` overrides it (1
+    /// restores the cooperative answer for an A/B run). With one processor
+    /// reported, Xenia created one Vulkan pipeline-creation thread however
+    /// many cores the executor could have run them on.
+    fn guestProcessorMask() u64 {
+        const requested: ?u64 = blk: {
+            const raw = std.c.getenv("ROSETTE_PE64_GUEST_CPUS") orelse break :blk null;
+            const value = std.fmt.parseUnsigned(u64, std.mem.sliceTo(raw, 0), 10) catch break :blk null;
+            break :blk if (value == 0) null else value;
+        };
+        const host: u64 = @intCast(std.Thread.getCpuCount() catch 1);
+        const count = @min(requested orelse host, 64);
+        return if (count >= 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(count)) - 1;
     }
 
     /// Whether PE launches run guest threads on their own host threads.
@@ -26397,17 +27270,20 @@ pub const ElfState = struct {
         const races = self.context_race_findings.load(.monotonic);
         const lost_wakeups = self.parallel_guest_wake_hub.lost_wakeups.load(.monotonic);
         const longest_hold_ms: u64 = if (self.runtime_lock_ledger.longestSingleHold()) |entry| entry.max_held_ns / std.time.ns_per_ms else 0;
+        const code_borrow_refusals = self.parallel_code_borrow_refusals.load(.monotonic);
         const verdict: []const u8 = if (races != 0)
             "DEFECT: another host thread wrote a guest thread's registers; read PE64 CONTEXT RACE for the thread, the values and who held the runtime lock"
         else if (lost_wakeups != 0)
             "DEFECT: a parked worker was made runnable without being woken; read PE64 CONCURRENCY worker_wakes"
+        else if (code_borrow_refusals != 0)
+            "DEFECT: a runtime path asked for a raw view of executable bytes and was refused; PE64 PARALLEL CODE BORROW REFUSED names the address and caller"
         else if (self.windows_get_message_unreleasable != 0)
             "COST: GetMessage could not release the runtime lock and returned WM_NULL instead of sleeping; its first_depth/first_pinned in PE64 CONCURRENCY WAITS name the lock level that pinned it"
         else if (longest_hold_ms >= 1000)
             "COST: one call held the runtime lock for a second or more; PE64 RUNTIME LOCK HOLDS names it"
         else
             "clean: no context race, no lost wakeup, GetMessage slept, no call held the runtime lock for a second";
-        const format = "PE64 PARALLEL HAZARDS: context_races={d} first(thread/expected_rip/found_rip/lock_holder)=0x{x}/0x{x}/0x{x}/0x{x} lost_wakeups={d} get_message_unreleasable={d} longest_runtime_lock_hold_ms={d} thread_pulse_lines={d} verdict={s}";
+        const format = "PE64 PARALLEL HAZARDS: context_races={d} first(thread/expected_rip/found_rip/lock_holder)=0x{x}/0x{x}/0x{x}/0x{x} lost_wakeups={d} code_borrow_refusals={d} get_message_unreleasable={d} longest_runtime_lock_hold_ms={d} thread_pulse_lines={d} verdict={s}";
         const args = .{
             races,
             self.context_race_first_thread,
@@ -26415,12 +27291,13 @@ pub const ElfState = struct {
             self.context_race_first_found_rip,
             self.context_race_first_holder,
             lost_wakeups,
+            code_borrow_refusals,
             self.windows_get_message_unreleasable,
             longest_hold_ms,
             self.thread_pulse_lines,
             verdict,
         };
-        if (races != 0 or lost_wakeups != 0) {
+        if (races != 0 or lost_wakeups != 0 or code_borrow_refusals != 0) {
             if (comptime !@import("builtin").is_test) log.err(format, args);
         } else {
             log.info(format, args);
@@ -26458,15 +27335,26 @@ pub const ElfState = struct {
         }
     }
 
+    /// Every lock-free import lane, at each checkpoint where one moved and at
+    /// the end. Checkpoints matter: a run that ends in ExitProcess never
+    /// reaches the final report, which is how the 2026-09-30 run printed no
+    /// C runtime line at all.
     fn reportWindowsFastImports(self: *ElfState, final: bool) void {
-        const total = self.windows_fast_time_import_calls.load(.acquire);
+        const total = self.windowsFastImportCalls();
         const newly_observed = total -| self.windows_fast_time_imports_reported;
         if (newly_observed == 0 and !final) return;
         self.windows_fast_time_imports_reported = total;
         if (total == 0) return;
-        log.info("PE64 WINDOWS FAST IMPORTS: GetSystemTimePreciseAsFileTime calls={d} new_since_report={d} shared_runtime_lock_bypassed=true clock_snapshot=atomic guest_output_store=coordinated; exact dynamic proc-address stubs and direct imports with verified IAT bindings are eligible, while diagnostics use the ordinary locked path", .{
-            total,
+        log.info("PE64 WINDOWS FAST IMPORTS: GetSystemTimePreciseAsFileTime calls={d} QueryPerformanceCounter={d} QueryPerformanceFrequency={d} new_since_report={d} shared_runtime_lock_bypassed=true clock_snapshot=atomic guest_output_store=coordinated; exact dynamic proc-address stubs and direct imports with verified IAT bindings are eligible, while diagnostics use the ordinary locked path", .{
+            self.windows_fast_time_import_calls.load(.acquire),
+            self.windows_fast_counter_import_calls[0].load(.acquire),
+            self.windows_fast_counter_import_calls[1].load(.acquire),
             newly_observed,
+        });
+        if (self.windowsFastCrtImportCalls() != 0) log.info("PE64 WINDOWS FAST IMPORTS: crt memcpy={d} memmove={d} memset={d} shared_runtime_lock_bypassed=true; each ran through copyGuestRange/fillGuestMemory, and a range either refused went back to the ordinary locked handler", .{
+            self.windows_fast_crt_import_calls[0].load(.acquire),
+            self.windows_fast_crt_import_calls[1].load(.acquire),
+            self.windows_fast_crt_import_calls[2].load(.acquire),
         });
     }
 
@@ -26543,6 +27431,13 @@ pub const ElfState = struct {
         if (enabled) {
             self.resolveXeniaAcceleratorTargets();
             self.rebuildBlockJitHookFilter();
+            // A mask the guest set for itself is its own; only the
+            // cooperative default grows to the host's processors.
+            if (self.windows_process_affinity_mask == 1 and self.windows_system_affinity_mask == 1) {
+                const mask = guestProcessorMask();
+                self.windows_process_affinity_mask = mask;
+                self.windows_system_affinity_mask = mask;
+            }
         }
         // This transition is a stop-the-world boundary. Decode entries
         // populated under generation tracking cannot be reused by the
@@ -26627,13 +27522,31 @@ pub const ElfState = struct {
     /// switch and gives a future executor an owned TLB to carry with it.
     fn ensureWindowsGuestThreadTlb(self: *ElfState, index: usize) ?*block_jit.Tlb {
         const thread = &self.windows_guest_threads[index];
-        if (self.windows_guest_thread_tlbs[index] == null) {
+        const tlb_slot = &self.windows_guest_thread_tlbs[index];
+        const existing = if (self.parallel_guest_execution)
+            @atomicLoad(?*block_jit.Tlb, tlb_slot, .acquire)
+        else
+            tlb_slot.*;
+        if (existing == null) {
             const tlb = self.allocator.create(block_jit.Tlb) catch return null;
             tlb.* = block_jit.Tlb.empty;
-            self.windows_guest_thread_tlbs[index] = tlb;
+            if (self.parallel_guest_execution) {
+                // Invalidators read this table from other host threads. The
+                // release publication makes the initialized empty TLB
+                // visible before an acquire load can retire its tags.
+                @atomicStore(?*block_jit.Tlb, tlb_slot, tlb, .release);
+            } else {
+                tlb_slot.* = tlb;
+            }
         }
-        thread.context.block_jit_tlb = self.windows_guest_thread_tlbs[index];
-        return self.windows_guest_thread_tlbs[index];
+        const tlb = if (existing) |value|
+            value
+        else if (self.parallel_guest_execution)
+            @atomicLoad(?*block_jit.Tlb, tlb_slot, .acquire) orelse return null
+        else
+            tlb_slot.* orelse return null;
+        thread.context.block_jit_tlb = tlb;
+        return tlb;
     }
 
     fn invalidateAllBlockJitTlbs(self: *ElfState, base: u64, length: u64) void {
@@ -26644,11 +27557,22 @@ pub const ElfState = struct {
             if (!self.parallel_direct_tlb) return;
             _ = self.block_jit_tlb_epoch.fetchAdd(1, .seq_cst);
             self.block_jit_tlb.invalidateRangeOrdered(base, length);
+            var table_count: u64 = 1;
             for (&self.windows_guest_thread_tlbs) |*tlb_slot| {
                 if (@atomicLoad(?*block_jit.Tlb, tlb_slot, .acquire)) |tlb| {
-                    if (tlb != &self.block_jit_tlb) tlb.invalidateRangeOrdered(base, length);
+                    if (tlb != &self.block_jit_tlb) {
+                        tlb.invalidateRangeOrdered(base, length);
+                        table_count +|= 1;
+                    }
                 }
             }
+            const pages = if (length == 0) 0 else ((base +| (length - 1)) >> block_jit.Tlb.page_shift) - (base >> block_jit.Tlb.page_shift) + 1;
+            self.parallel_tlb_invalidation_work.noteRange(
+                pages,
+                table_count,
+                block_jit.Tlb.entries,
+                block_jit.Tlb.invalidate_scan_limit,
+            );
             _ = self.parallel_tlb_cross_invalidations.fetchAdd(1, .monotonic);
             return;
         }
@@ -26665,11 +27589,16 @@ pub const ElfState = struct {
             if (!self.parallel_direct_tlb) return;
             _ = self.block_jit_tlb_epoch.fetchAdd(1, .seq_cst);
             self.block_jit_tlb.flushOrdered(reads, writes);
+            var table_count: u64 = 1;
             for (&self.windows_guest_thread_tlbs) |*tlb_slot| {
                 if (@atomicLoad(?*block_jit.Tlb, tlb_slot, .acquire)) |tlb| {
-                    if (tlb != &self.block_jit_tlb) tlb.flushOrdered(reads, writes);
+                    if (tlb != &self.block_jit_tlb) {
+                        tlb.flushOrdered(reads, writes);
+                        table_count +|= 1;
+                    }
                 }
             }
+            self.parallel_tlb_invalidation_work.noteFlush(reads, writes, table_count, block_jit.Tlb.entries);
             _ = self.parallel_tlb_cross_invalidations.fetchAdd(1, .monotonic);
             return;
         }
@@ -26699,9 +27628,25 @@ pub const ElfState = struct {
             .memory_view => if (slice.source_index < self.windows_file_mappings.len) &self.windows_file_mappings[slice.source_index].code_fetched else return,
             .virtual_allocation => if (slice.source_index < self.windows_virtual_allocations.len) &self.windows_virtual_allocations[slice.source_index].code_fetched else return,
         };
-        if (flag.*) return;
-        flag.* = true;
+        // Only the executor that changes false -> true needs to retire write
+        // translations. A release publication pairs with
+        // `mappedRangeCodeFetched` on every other worker before it admits a
+        // write page; that worker's epoch check also retires a fill that
+        // started just before this flush.
+        if (self.parallel_guest_execution) {
+            if (@cmpxchgStrong(bool, flag, false, true, .acq_rel, .acquire) != null) return;
+        } else {
+            if (flag.*) return;
+            flag.* = true;
+        }
         self.blockJitTlbFlush(false, true);
+    }
+
+    fn mappedCodeWasFetched(self: *const ElfState, flag: *const bool) bool {
+        return if (self.parallel_guest_execution)
+            @atomicLoad(bool, flag, .acquire)
+        else
+            flag.*;
     }
 
     fn mappedRangeCodeFetched(self: *const ElfState, range: mapped_ranges.Range) bool {
@@ -26709,9 +27654,9 @@ pub const ElfState = struct {
             .memory_view => blk: {
                 if (range.slot >= self.windows_memory_views.len) break :blk true;
                 const mapping_index = self.windows_memory_views[range.slot].mapping_index;
-                break :blk mapping_index >= self.windows_file_mappings.len or self.windows_file_mappings[mapping_index].code_fetched;
+                break :blk mapping_index >= self.windows_file_mappings.len or self.mappedCodeWasFetched(&self.windows_file_mappings[mapping_index].code_fetched);
             },
-            .virtual_allocation => range.slot >= self.windows_virtual_allocations.len or self.windows_virtual_allocations[range.slot].code_fetched,
+            .virtual_allocation => range.slot >= self.windows_virtual_allocations.len or self.mappedCodeWasFetched(&self.windows_virtual_allocations[range.slot].code_fetched),
         };
     }
 
@@ -26932,7 +27877,18 @@ pub const ElfState = struct {
             return null;
         };
         block.* = .{
-            .helpers = .{ .read = blockJitRead, .write = blockJitWrite, .read128 = blockJitRead128, .write128 = blockJitWrite128, .interpret = blockJitInterpret, .block = block, .flags = blockJitFlags },
+            .helpers = .{
+                .read = blockJitRead,
+                .write = blockJitWrite,
+                .read128 = blockJitRead128,
+                .write128 = blockJitWrite128,
+                .write128_non_temporal = blockJitWrite128NonTemporal,
+                .mapped_transfer = blockJitMappedTransferAllowed,
+                .x87_raw_transfer = blockJitX87RawTransfer,
+                .interpret = blockJitInterpret,
+                .block = block,
+                .flags = blockJitFlags,
+            },
             .start_rip = rip,
             .end_rip = address,
             .insns = owned_insns,
@@ -26978,10 +27934,58 @@ pub const ElfState = struct {
         self.guestContextField("last_decoded_op").* = last.decoded.op;
         self.guestContextField("last_decoded_len").* = last.len;
         if (block.source_mapped) {
-            self.windows_generated_code_fetches +|= retired;
-            self.noteWindowsTitleCodeFetches(block.start_rip, retired);
+            if (self.parallel_guest_execution) {
+                const title: u64 = if (self.windowsTitleCodeRange()) |range|
+                    (if (block.start_rip >= range.low and block.start_rip - range.low < range.length) retired else 0)
+                else
+                    0;
+                self.noteBlockJitCodeFetches(jit, retired, title);
+            } else {
+                self.windows_generated_code_fetches +|= retired;
+                self.noteWindowsTitleCodeFetches(block.start_rip, retired);
+            }
         }
         return retired;
+    }
+
+    const TitleCodeRange = struct { low: u64, length: u64 };
+
+    /// The code-cache view `noteWindowsTitleCodeFetches` counts against,
+    /// when the executing thread has entered the title.
+    fn windowsTitleCodeRange(self: *ElfState) ?TitleCodeRange {
+        const slot = self.guestContextField("windows_active_guest_thread_slot").* orelse return null;
+        if (!self.windows_guest_threads[slot].entered_xenia_title) return null;
+        const index = self.windows_code_cache_view orelse return null;
+        const view = &self.windows_memory_views[index];
+        return .{ .low = view.guest_base, .length = view.length };
+    }
+
+    /// Instructions per executor between additions to the process-wide
+    /// code-fetch ledgers in parallel mode.
+    const block_jit_fetch_publish_batch: u64 = 1 << 16;
+
+    /// The code-fetch ledgers from translated code. They are process-wide,
+    /// and every executor added to them at every exit from translated code,
+    /// so in parallel mode their cache line moved between the busy threads on
+    /// each exit. A parallel executor now batches its share in its own
+    /// translator state. A ledger still at zero is published at once,
+    /// because readiness reads "non-zero"; reports may trail by less than a
+    /// batch per executor.
+    fn noteBlockJitCodeFetches(self: *ElfState, jit: *BlockJitState, generated: u64, title: u64) void {
+        if (!self.parallel_guest_execution) {
+            self.windows_generated_code_fetches +|= generated;
+            self.windows_title_code_fetches +|= title;
+            return;
+        }
+        jit.pending_generated_fetches +|= generated;
+        jit.pending_title_fetches +|= title;
+        if (jit.pending_generated_fetches < block_jit_fetch_publish_batch and
+            @atomicLoad(u64, &self.windows_generated_code_fetches, .monotonic) != 0 and
+            (jit.pending_title_fetches == 0 or @atomicLoad(u64, &self.windows_title_code_fetches, .monotonic) != 0)) return;
+        _ = @atomicRmw(u64, &self.windows_generated_code_fetches, .Add, jit.pending_generated_fetches, .monotonic);
+        _ = @atomicRmw(u64, &self.windows_title_code_fetches, .Add, jit.pending_title_fetches, .monotonic);
+        jit.pending_generated_fetches = 0;
+        jit.pending_title_fetches = 0;
     }
 
     /// `accountBlockJit` over a whole native chain, with what is the same for
@@ -26995,17 +27999,9 @@ pub const ElfState = struct {
         std.debug.assert(entries.len != 0);
         // `noteWindowsTitleCodeFetches`, decided once: the thread and the
         // code-cache view cannot change while this loop runs.
-        var title_low: u64 = 0;
-        var title_length: u64 = 0;
-        if (self.guestContextField("windows_active_guest_thread_slot").*) |slot| {
-            if (self.windows_guest_threads[slot].entered_xenia_title) {
-                if (self.windows_code_cache_view) |index| {
-                    const view = &self.windows_memory_views[index];
-                    title_low = view.guest_base;
-                    title_length = view.length;
-                }
-            }
-        }
+        const title_range = self.windowsTitleCodeRange() orelse TitleCodeRange{ .low = 0, .length = 0 };
+        const title_low = title_range.low;
+        const title_length = title_range.length;
         var retired_total: u64 = 0;
         var mapped_total: u64 = 0;
         var title_total: u64 = 0;
@@ -27026,8 +28022,7 @@ pub const ElfState = struct {
         }
         jit.executions +|= entries.len;
         jit.instructions_retired +|= retired_total;
-        self.windows_generated_code_fetches +|= mapped_total;
-        self.windows_title_code_fetches +|= title_total;
+        if (mapped_total != 0) self.noteBlockJitCodeFetches(jit, mapped_total, title_total);
         const final = &last.insns[@min(last_retired, @as(u32, @intCast(last.insns.len))) - 1];
         self.guestContextField("last_instruction_rip").* = final.rip;
         self.guestContextField("last_decoded_op").* = final.decoded.op;
@@ -27082,7 +28077,7 @@ pub const ElfState = struct {
             .slot = @intFromPtr(&jit.blocks[slot]),
             .block = @intFromPtr(to),
             .gen_ptr = @intFromPtr(generation),
-            .generation = generation.*,
+            .generation = if (self.parallel_guest_execution) loadCodeGeneration(generation) else generation.*,
         };
         jit.links_armed +|= 1;
     }
@@ -27101,13 +28096,12 @@ pub const ElfState = struct {
     fn logHotspotBytes(self: *const ElfState, handle: u64, address: u64) void {
         // One region and the one after it: a loop that starts near the end
         // of its 256-byte region closes in the next.
-        const bytes = self.guestMemoryConst(address, 512) orelse self.guestMemoryConst(address, 256) orelse return;
-        // `@min` against a comptime bound narrows to the smallest integer
-        // that holds it, and `count * 2` then wrapped to zero in ReleaseFast:
-        // every dump printed `bytes=`.
-        const count: usize = @min(bytes.len, 512);
         var snapshot: [512]u8 = undefined;
-        tso_memory.copyInCoordinated(snapshot[0..count], bytes[0..count]);
+        const count: usize = if (self.copyFromGuest(snapshot[0..], address)) 512 else blk: {
+            if (!self.copyFromGuest(snapshot[0..256], address)) return;
+            break :blk 256;
+        };
+        // Keep one explicit byte count for both the snapshot and hex output.
         var hex: [1024]u8 = undefined;
         const digits = "0123456789abcdef";
         for (snapshot[0..count], 0..) |byte, i| {
@@ -27384,24 +28378,46 @@ pub const ElfState = struct {
             break;
         }
         const hot = blockJitHotness(jit, rip);
-        if (hot.refused) return null;
+        if (hot.refused) {
+            jit.interpreted_refused +|= 1;
+            return null;
+        }
         hot.count +|= 1;
-        if (hot.count < jit.hot_threshold) return null;
+        if (hot.count < jit.hot_threshold) {
+            jit.interpreted_cold +|= 1;
+            if (jit.interpreted_cold % BlockJitState.interpreted_heat_stride == 0) jit.interpreted_heat.sample(rip);
+            return null;
+        }
         // The code memory is full and cannot be reset under the execution
         // this step is nested in; compile once it has been.
-        if (jit.lifetime.reset_pending) return null;
+        if (jit.lifetime.reset_pending) {
+            jit.interpreted_reset_pending +|= 1;
+            return null;
+        }
         const block = self.compileBlockJit(jit, rip) orelse {
             // Out of code memory under a live execution is not this
             // address's failure: keep it hot, not refused.
-            if (jit.lifetime.reset_pending) return null;
+            if (jit.lifetime.reset_pending) {
+                jit.interpreted_reset_pending +|= 1;
+                return null;
+            }
             hot.refused = true;
             jit.compile_refusals +|= 1;
+            jit.interpreted_refused +|= 1;
             return null;
         };
+        // A full set is capacity pressure. Enough of it grows the table,
+        // which moves this address to a set with room: a growth never
+        // evicts, and each new set is fed by one old one.
+        var seat_base = base;
+        if (blockJitSetFull(jit, seat_base)) {
+            jit.pressure +|= 1;
+            if (jit.growIfPressed(self.allocator)) seat_base = jit.firstSlot(rip);
+        }
         // An empty way, else the way that has run least.
-        var chosen: usize = base;
+        var chosen: usize = seat_base;
         var chosen_executions: u64 = std.math.maxInt(u64);
-        for (base..base + BLOCK_JIT_WAYS) |slot_index| {
+        for (seat_base..seat_base + BLOCK_JIT_WAYS) |slot_index| {
             if (jit.blocks[slot_index]) |resident| {
                 if (resident.executions < chosen_executions) {
                     chosen = slot_index;
@@ -27416,9 +28432,21 @@ pub const ElfState = struct {
         if (jit.blocks[chosen] != null) {
             jit.slot_evictions +|= 1;
             self.dropBlockJitSlot(jit, chosen);
+            // Age the survivors. A block that was hot once must not keep its
+            // way for the rest of the run against code that is hot now.
+            for (jit.blocks[seat_base .. seat_base + BLOCK_JIT_WAYS]) |maybe| {
+                if (maybe) |resident| resident.executions >>= 1;
+            }
         }
         jit.blocks[chosen] = block;
         return self.executeBlockJit(jit, block, chosen);
+    }
+
+    fn blockJitSetFull(jit: *const BlockJitState, base: usize) bool {
+        for (jit.blocks[base .. base + BLOCK_JIT_WAYS]) |slot| {
+            if (slot == null) return false;
+        }
+        return true;
     }
 
     fn reportBlockJit(self: *ElfState) void {
@@ -27470,11 +28498,12 @@ pub const ElfState = struct {
             jit.links_armed,
         });
         const fallback_percent = if (jit.instructions_retired == 0) 0 else @divTrunc(jit.fallback_calls *| 100, jit.instructions_retired);
-        log.info("PE64 BLOCK JIT LANE: chained={d} ({d}% of executions entered from the previous block) fallback_calls={d} ({d}% of retired) aborts={d} continuation_write_aborts={d} revalidations={d} verified={d} mismatches={d} tlb(considers/fills/refused/invalidations/flushes)={d}/{d}/{d}/{d}/{d} tlb_bail(traced/straddle/null_page)={d}/{d}/{d} direct_calls(native/hooked)={d}/{d} code_bytes(used/capacity)={d}/{d}; high fallback_calls indicate blocks are not buying native work (see FALLBACK OPS); direct_calls counts call sites, not executions, and a hooked one keeps the interpreter's arm because its target carries a milestone, a kernel export, an accelerator or a symbol a shim may claim; integer/register verification does not cover all vector or memory effects; mismatches must read zero", .{
+        log.info("PE64 BLOCK JIT LANE: chained={d} ({d}% of executions entered from the previous block) fallback_calls={d} ({d}% of retired) x87_raw_helpers={d} aborts={d} continuation_write_aborts={d} revalidations={d} verified={d} mismatches={d} tlb(considers/fills/refused/invalidations/flushes)={d}/{d}/{d}/{d}/{d} tlb_bail(traced/straddle/null_page)={d}/{d}/{d} direct_calls(native/hooked)={d}/{d} code_bytes(used/capacity)={d}/{d}; x87_raw_helpers are focused byte-preserving paths outside the general interpreter fallback counter; direct_calls counts call sites, not executions, and hooked targets retain their interpreter-owned shims; integer/register verification does not cover all vector or memory effects; mismatches must read zero", .{
             jit.chained,
             if (jit.executions == 0) 0 else @divTrunc(jit.chained *| 100, jit.executions),
             jit.fallback_calls,
             fallback_percent,
+            jit.x87_fast_helpers,
             jit.aborts,
             jit.continuation_write_aborts,
             jit.revalidations,
@@ -27493,6 +28522,7 @@ pub const ElfState = struct {
             jit.memory.used,
             jit.memory.capacity(),
         });
+        self.reportBlockJitTlbRefusalReasons("", jit.tlb_refusal_stats);
         // How much of the guest register file the translated code kept in
         // host registers. Per block it is at most four; a mean near zero
         // means blocks are too short, or too spread across registers, for
@@ -27537,12 +28567,26 @@ pub const ElfState = struct {
         var nested: u64 = 0;
         var tlb_fills: u64 = 0;
         var tlb_refusals: u64 = 0;
+        var tlb_refusal_cache_lookups: u64 = 0;
+        var tlb_refusal_cache_hits: u64 = 0;
+        var tlb_refusal_cache_misses: u64 = 0;
+        var tlb_refusal_stats: tlb_diagnostics.RefusalStats = .{};
+        var mapped_transfer_checks: u64 = 0;
+        var mapped_transfer_native: u64 = 0;
+        var x87_fast_helpers: u64 = 0;
         for (self.windows_guest_threads) |thread| {
             if (thread.parallel_block_jit_refused) refused += 1;
             const jit = thread.parallel_block_jit orelse continue;
             states += 1;
             tlb_fills +|= jit.tlb_fills;
             tlb_refusals +|= jit.tlb_fill_refusals;
+            tlb_refusal_cache_lookups +|= jit.tlb_refusal_cache.lookups;
+            tlb_refusal_cache_hits +|= jit.tlb_refusal_cache.hits;
+            tlb_refusal_cache_misses +|= jit.tlb_refusal_cache.misses;
+            tlb_refusal_stats.merge(jit.tlb_refusal_stats);
+            mapped_transfer_checks +|= jit.mapped_transfer_checks;
+            mapped_transfer_native +|= jit.mapped_transfer_native;
+            x87_fast_helpers +|= jit.x87_fast_helpers;
             live += jit.liveBlocks();
             compiled +|= jit.compiled;
             compile_refusals +|= jit.compile_refusals;
@@ -27553,9 +28597,12 @@ pub const ElfState = struct {
             mismatches +|= jit.mismatches;
             nested +|= jit.lifetime.stats.nested_executions;
         }
-        if (states == 0 and refused == 0) return;
+        if (states == 0 and refused == 0) {
+            self.reportParallelTlbInvalidationWork();
+            return;
+        }
         const worker_steps = self.windowsWorkerSteps();
-        log.info("PE64 BLOCK JIT WORKERS: states={d} refused={d} blocks(live/compiled/refused)={d}/{d}/{d} executions={d} retired={d} ({d}% of worker instructions) fallback_calls={d} resets={d} mismatches={d} nested={d}; each guest thread on its own host thread translates into its own cache, and mismatches must read zero", .{
+        log.info("PE64 BLOCK JIT WORKERS: states={d} refused={d} blocks(live/compiled/refused)={d}/{d}/{d} executions={d} retired={d} ({d}% of worker instructions) fallback_calls={d} x87_raw_helpers={d} mapped_transfer_helper(checks/accepted)={d}/{d} resets={d} mismatches={d} nested={d}; inline code-cache range admissions bypass the helper counters; x87_raw_helpers bypass the general interpreter fallback while preserving raw state; each worker uses its own translator cache", .{
             states,
             refused,
             live,
@@ -27565,18 +28612,115 @@ pub const ElfState = struct {
             retired,
             if (worker_steps == 0) 0 else @min(100, @divTrunc(retired *| 100, worker_steps)),
             fallback_calls,
+            x87_fast_helpers,
+            mapped_transfer_checks,
+            mapped_transfer_native,
             resets,
             mismatches,
             nested,
         });
-        log.info("PE64 BLOCK JIT WORKER TLB: direct_route={} fills={d} refused={d} cross_thread_invalidations={d} raced_fills_retired={d}; with the direct route a translated access that hits its thread's TLB is one LDAR/STLR on the host page (x86-TSO on ARM64) and a miss takes the coordinated helper, which then offers the page; fills=0 with direct_route=true means no worker page was ever admitted", .{
+        log.info("PE64 BLOCK JIT WORKER TLB: direct_route={} fills={d} refused={d} refusal_cache(lookups/hits/misses)={d}/{d}/{d} cross_thread_invalidations={d} raced_fills_retired={d}; a refusal-cache hit only skips the repeated TLB admission proof: the guest access still takes its ordered helper, so native device aliases never receive ordinary-RAM semantics", .{
             self.parallelDirectTlbActive(),
             tlb_fills,
             tlb_refusals,
+            tlb_refusal_cache_lookups,
+            tlb_refusal_cache_hits,
+            tlb_refusal_cache_misses,
             self.parallel_tlb_cross_invalidations.load(.monotonic),
             self.parallel_tlb_raced_fills.load(.monotonic),
         });
+        self.reportBlockJitTlbRefusalReasons("WORKER ", tlb_refusal_stats);
+        self.reportParallelTlbInvalidationWork();
+        self.reportParallelWorkerBlockJitThreads();
         self.reportParallelWorkerFallbackOps();
+    }
+
+    /// Each busy worker's translator on its own line: how big its table
+    /// grew, how hard it was pressed, and why its interpreted steps were
+    /// interpreted, with where they land. The totals above cannot say which
+    /// thread is still on the interpreter; on 2026-09-30 it was the title's
+    /// main thread, at 84% of its wall time in Rosette.
+    fn reportParallelWorkerBlockJitThreads(self: *ElfState) void {
+        const shown = 8;
+        var ranked: [shown]?usize = @splat(null);
+        var ranked_interpreted: [shown]u64 = @splat(0);
+        for (self.windows_guest_threads, 0..) |thread, slot| {
+            const jit = thread.parallel_block_jit orelse continue;
+            const interpreted = jit.interpreted_cold +| jit.interpreted_refused +| jit.interpreted_reset_pending;
+            if (interpreted == 0 and jit.growths == 0) continue;
+            for (0..shown) |rank| {
+                if (ranked[rank] != null and interpreted <= ranked_interpreted[rank]) continue;
+                var move: usize = shown - 1;
+                while (move > rank) : (move -= 1) {
+                    ranked[move] = ranked[move - 1];
+                    ranked_interpreted[move] = ranked_interpreted[move - 1];
+                }
+                ranked[rank] = slot;
+                ranked_interpreted[rank] = interpreted;
+                break;
+            }
+        }
+        for (ranked) |maybe_slot| {
+            const slot = maybe_slot orelse break;
+            const thread = &self.windows_guest_threads[slot];
+            const jit = thread.parallel_block_jit.?;
+            log.info("PE64 BLOCK JIT WORKER THREAD: slot={d} name='{s}' table={d} growths={d} live={d} compiled={d} evictions={d} hotness_replacements={d} resets={d} code_mib(used/reserved)={d}/{d} executions={d} retired={d} interpreted(cold/refused/reset_pending)={d}/{d}/{d} fallback_calls={d} revalidations={d} dropped_stale={d}; an interpreted step costs about a hundred translated instructions: cold means the address had not run hot_threshold times since it took its hotness entry, and hotness_replacements beside it is the table thrashing", .{
+                slot,
+                if (thread.name_len != 0) thread.nameText() else "<unnamed>",
+                jit.blocks.len,
+                jit.growths,
+                jit.liveBlocks(),
+                jit.compiled,
+                jit.slot_evictions,
+                jit.hotness_replacements,
+                jit.resets,
+                jit.memory.used >> 20,
+                jit.memory.capacity() >> 20,
+                jit.executions,
+                jit.instructions_retired,
+                jit.interpreted_cold,
+                jit.interpreted_refused,
+                jit.interpreted_reset_pending,
+                jit.fallback_calls,
+                jit.revalidations,
+                jit.dropped_stale,
+            });
+            var text: [guest_symbol_text_bytes]u8 = undefined;
+            for (jit.interpreted_heat.top(), 0..) |hotspot, rank| {
+                if (hotspot.count == 0) break;
+                log.info("PE64 BLOCK JIT WORKER THREAD:   slot={d} interpreted rank={d} region=0x{x} at={s} samples={d}..{d} of {d} (one per {d} cold steps)", .{
+                    slot,
+                    rank + 1,
+                    hotspot.address,
+                    self.describeGuestAddressOrUnnamed(hotspot.address, &text),
+                    hotspot.count - hotspot.error_bound,
+                    hotspot.count,
+                    jit.interpreted_heat.samples,
+                    BlockJitState.interpreted_heat_stride,
+                });
+            }
+        }
+    }
+
+    fn reportBlockJitTlbRefusalReasons(self: *ElfState, label: []const u8, stats: tlb_diagnostics.RefusalStats) void {
+        _ = self;
+        var text: [1024]u8 = undefined;
+        log.info("PE64 BLOCK JIT {s}TLB REFUSAL REASONS:{s}; counts are exact per helper admission attempt; each address is the first guest page refused for that reason", .{
+            label,
+            stats.format(&text),
+        });
+    }
+
+    fn reportParallelTlbInvalidationWork(self: *const ElfState) void {
+        const work = self.parallel_tlb_invalidation_work.snapshot();
+        log.info("PE64 BLOCK JIT TLB INVALIDATION WORK: range_calls={d} requested_pages={d} wide_range_flushes={d} explicit_flushes={d} table_visits={d} tag_slots_touched={d}; tag_slots counts the tags probed or written across executor tables and exposes broad invalidation fanout", .{
+            work.range_calls,
+            work.requested_pages,
+            work.wide_range_flushes,
+            work.explicit_flushes,
+            work.table_visits,
+            work.tag_slots_touched,
+        });
     }
 
     /// The workers' interpreted instructions, summed by op. In a parallel
@@ -27589,6 +28733,11 @@ pub const ElfState = struct {
             samples: [ElfState.op_value_limit]u64 = @splat(0),
             nanos: [ElfState.op_value_limit]u64 = @splat(0),
             reasons: [@typeInfo(block_jit.FallbackReason).@"enum".fields.len]u64 = @splat(0),
+            transfer_imports: u64 = 0,
+            transfer_hooked: u64 = 0,
+            transfer_plain: u64 = 0,
+            transfer_target_overflow: u64 = 0,
+            transfer_targets: [BlockJitState.transfer_target_slots]BlockJitState.TransferTarget = @splat(.{}),
         };
         const sums = self.allocator.create(Sums) catch return;
         defer self.allocator.destroy(sums);
@@ -27602,6 +28751,29 @@ pub const ElfState = struct {
             for (&sums.samples, jit.fallback_cost_sample_count) |*sum, value| sum.* +|= value;
             for (&sums.nanos, jit.fallback_cost_sampled_nanos) |*sum, value| sum.* +|= value;
             for (&sums.reasons, jit.fallback_reason_counts) |*sum, value| sum.* +|= value;
+            sums.transfer_imports +|= jit.transfer_fallback_imports;
+            sums.transfer_hooked +|= jit.transfer_fallback_hooked;
+            sums.transfer_plain +|= jit.transfer_fallback_plain;
+            sums.transfer_target_overflow +|= jit.transfer_target_overflow;
+            for (jit.transfer_targets) |entry| {
+                if (entry.count == 0) continue;
+                var matching: ?*BlockJitState.TransferTarget = null;
+                var vacant: ?*BlockJitState.TransferTarget = null;
+                for (&sums.transfer_targets) |*candidate| {
+                    if (candidate.count != 0 and candidate.target == entry.target and candidate.op == entry.op) {
+                        matching = candidate;
+                        break;
+                    }
+                    if (candidate.count == 0 and vacant == null) vacant = candidate;
+                }
+                if (matching) |candidate| {
+                    candidate.count +|= entry.count;
+                } else if (vacant) |candidate| {
+                    candidate.* = entry;
+                } else {
+                    sums.transfer_target_overflow +|= entry.count;
+                }
+            }
         }
         if (!any) return;
         reportBlockJitFallbackView(.{
@@ -27612,6 +28784,14 @@ pub const ElfState = struct {
             .nanos = &sums.nanos,
             .reasons = &sums.reasons,
         });
+        self.reportBlockJitTransferFallbackSummary(
+            "WORKER ",
+            sums.transfer_imports,
+            sums.transfer_hooked,
+            sums.transfer_plain,
+            &sums.transfer_targets,
+            sums.transfer_target_overflow,
+        );
     }
 
     /// The interpreter's share of the translated lane, by instruction: the
@@ -27647,7 +28827,7 @@ pub const ElfState = struct {
     fn reportBlockJitFallbackView(view: BlockJitFallbackView) void {
         if (view.calls == 0) {
             log.info("PE64 BLOCK JIT {s}FALLBACK OPS: none", .{view.label});
-            log.info("PE64 BLOCK JIT {s}FALLBACK LEDGER: calls=0 reasons(missing_native_template/hook_observation/vector_policy_disabled)=0/0/0 samples=0 sampled_host_ns=0 estimated_interpreter_ns=0 per_op_sample_period={d}", .{ view.label, BLOCK_JIT_FALLBACK_COST_SAMPLE_PERIOD });
+            log.info("PE64 BLOCK JIT {s}FALLBACK LEDGER: calls=0 reasons(missing_native_template/native_slow_path/hook_observation/vector_policy_disabled)=0/0/0/0 samples=0 sampled_host_ns=0 estimated_interpreter_ns=0 per_op_sample_period={d}", .{ view.label, BLOCK_JIT_FALLBACK_COST_SAMPLE_PERIOD });
             return;
         }
         var ranked: [12]usize = undefined;
@@ -27689,10 +28869,11 @@ pub const ElfState = struct {
             const estimate = (@as(u128, view.nanos[op_index]) * @as(u128, count)) / @as(u128, samples);
             estimated_total +|= @intCast(@min(estimate, @as(u128, std.math.maxInt(u64))));
         }
-        log.info("PE64 BLOCK JIT {s}FALLBACK LEDGER: calls={d} reasons(missing_native_template/hook_observation/vector_policy_disabled)={d}/{d}/{d} samples={d} sampled_host_ns={d} estimated_interpreter_ns={d} per_op_sample_period={d}; hook and vector-policy reasons preserve explicit runtime boundaries; estimated time is an in-run count-weighted sample, not guest time", .{
+        log.info("PE64 BLOCK JIT {s}FALLBACK LEDGER: calls={d} reasons(missing_native_template/native_slow_path/hook_observation/vector_policy_disabled)={d}/{d}/{d}/{d} samples={d} sampled_host_ns={d} estimated_interpreter_ns={d} per_op_sample_period={d}; native_slow_path counts translated templates that escaped through a runtime guard, while hook and vector-policy reasons preserve explicit interpreter boundaries; estimated time is an in-run count-weighted sample, not guest time", .{
             view.label,
             view.calls,
             view.reasons[@intFromEnum(block_jit.FallbackReason.missing_native_template)],
+            view.reasons[@intFromEnum(block_jit.FallbackReason.native_slow_path)],
             view.reasons[@intFromEnum(block_jit.FallbackReason.hook_observation)],
             view.reasons[@intFromEnum(block_jit.FallbackReason.vector_policy_disabled)],
             sampled_calls,
@@ -27706,6 +28887,18 @@ pub const ElfState = struct {
     /// interpreted; a hooked target is interpreted by design; a plain one is
     /// a template that declined for a reason its site did not need.
     fn reportBlockJitTransferFallbacks(self: *ElfState, jit: *const BlockJitState) void {
+        self.reportBlockJitCallRefusals();
+        self.reportBlockJitTransferFallbackSummary(
+            "",
+            jit.transfer_fallback_imports,
+            jit.transfer_fallback_hooked,
+            jit.transfer_fallback_plain,
+            &jit.transfer_targets,
+            jit.transfer_target_overflow,
+        );
+    }
+
+    fn reportBlockJitCallRefusals(self: *ElfState) void {
         var refusal_text: [512]u8 = undefined;
         var refusal_written: usize = 0;
         for (0..self.block_jit_call_refusals.len) |index| {
@@ -27716,20 +28909,32 @@ pub const ElfState = struct {
             refusal_written += piece.len;
         }
         log.info("PE64 BLOCK JIT CALL REFUSALS (compile-time, all translators):{s}; each is a direct call compiled as an interpreter fallback for the life of its block, and the first sites of each reason are named by PE64 BLOCK JIT CALL REFUSAL lines", .{refusal_text[0..refusal_written]});
-        const total = jit.transfer_fallback_imports +| jit.transfer_fallback_hooked +| jit.transfer_fallback_plain;
+    }
+
+    fn reportBlockJitTransferFallbackSummary(
+        self: *ElfState,
+        label: []const u8,
+        imports: u64,
+        hooked: u64,
+        plain: u64,
+        targets: *const [BlockJitState.transfer_target_slots]BlockJitState.TransferTarget,
+        target_overflow: u64,
+    ) void {
+        const total = imports +| hooked +| plain;
         if (total == 0) return;
-        log.info("PE64 BLOCK JIT TRANSFER FALLBACKS: imports={d} hooked={d} plain={d} target_overflow={d}; hooked is a target a shim, milestone, census entry or hook-filter collision claims, plain is one no hook claims", .{
-            jit.transfer_fallback_imports,
-            jit.transfer_fallback_hooked,
-            jit.transfer_fallback_plain,
-            jit.transfer_target_overflow,
+        log.info("PE64 BLOCK JIT {s}TRANSFER FALLBACKS: imports={d} hooked={d} plain={d} target_overflow={d}; hooked is a target a shim, milestone, census entry or hook-filter collision claims, plain is one no hook claims", .{
+            label,
+            imports,
+            hooked,
+            plain,
+            target_overflow,
         });
         var ranked: [10]usize = undefined;
         var ranked_count: usize = 0;
-        for (jit.transfer_targets, 0..) |entry, entry_index| {
+        for (targets.*, 0..) |entry, entry_index| {
             if (entry.count == 0) continue;
             var position = ranked_count;
-            while (position > 0 and jit.transfer_targets[ranked[position - 1]].count < entry.count) : (position -= 1) {}
+            while (position > 0 and targets[ranked[position - 1]].count < entry.count) : (position -= 1) {}
             if (position >= ranked.len) continue;
             var cursor = @min(ranked_count, ranked.len - 1);
             while (cursor > position) : (cursor -= 1) ranked[cursor] = ranked[cursor - 1];
@@ -27737,13 +28942,14 @@ pub const ElfState = struct {
             if (ranked_count < ranked.len) ranked_count += 1;
         }
         for (ranked[0..ranked_count], 1..) |entry_index, rank| {
-            const entry = jit.transfer_targets[entry_index];
+            const entry = targets[entry_index];
             var name_buffer: [256]u8 = undefined;
             const name = self.describeGuestAddressOrUnnamed(entry.target, &name_buffer);
             const milestone = self.isGuestMilestoneAddress(entry.target);
             const census = self.guest_kernel_calls.exportAt(entry.target) != null;
             const filter_hit = block_jit.hookFilterHas(&self.block_jit_hook_filter, entry.target);
-            log.info("PE64 BLOCK JIT TRANSFER FALLBACKS:   rank={d} op={s} target=0x{x} ({s}) calls={d} hooked={} milestone={} census={} filter_bit={}", .{
+            log.info("PE64 BLOCK JIT {s}TRANSFER FALLBACKS:   rank={d} op={s} target=0x{x} ({s}) calls={d} hooked={} milestone={} census={} filter_bit={}", .{
+                label,
                 rank,
                 op_names[entry.op] orelse "?",
                 entry.target,
@@ -27871,16 +29077,13 @@ pub const ElfState = struct {
             // executor's interpreted stores before entering them so their
             // direct memory loads observe the same state as guest loads.
             tso_memory.flushActiveStoreBufferFor(.jit_entry);
-            // Each executor's block table and code arena are its own, and in
-            // parallel mode a code write bumps no generation (those paths
-            // return early), so nothing frees or rewrites a block another
-            // thread is running; blocks revalidate by their bytes instead.
-            // Translated memory accesses cannot bypass the TSO coordinator
-            // either: parallel mode admits no TLB entry, so every probe -
-            // hoisted or not - misses into the coordinated helper. Translated
-            // blocks therefore run on every thread at once. The owner's used
-            // to stop the world, once per block: on 2026-09-25 that was every
-            // few of its instructions, and no worker ran in between.
+            // Each executor's block table and code arena are its own. A guest
+            // code write publishes its bytes before advancing the shared
+            // source generation, so blocks can invalidate on re-entry without
+            // freeing a block another executor may still be running. The
+            // parallel TLB is executor-local; ordered invalidation retires its
+            // tags, while misses use the coordinated memory helper. The owner
+            // no longer stops the world on every block boundary.
             if (self.runBlockJit()) |continued| return continued;
         }
         const decoded = self.decodeAt() orelse {
@@ -28749,39 +29952,41 @@ pub const ElfState = struct {
         // (a miss is a fresh decode, a rearm is a byte comparison after a
         // generation moved) and how often the RIP boxes admitted an address
         // no handler then claimed.
-        const decode_total = self.decode_cache_hits +| self.decode_cache_rearms +| self.decode_cache_misses;
-        const decode_miss_rate_ppm = if (decode_total == 0) 0 else @divTrunc(self.decode_cache_misses *| 1_000_000, decode_total);
-        const decode_conflict_rate_ppm = if (decode_total == 0) 0 else @divTrunc(self.decode_cache_conflict_fills *| 1_000_000, decode_total);
+        const decode_counts = self.decodeCacheCounts();
+        const decode_total = decode_counts.hits +| decode_counts.rearms +| decode_counts.misses;
+        const decode_miss_rate_ppm = if (decode_total == 0) 0 else @divTrunc(decode_counts.misses *| 1_000_000, decode_total);
+        const decode_conflict_rate_ppm = if (decode_total == 0) 0 else @divTrunc(decode_counts.conflict_fills *| 1_000_000, decode_total);
         log.info("PE64 STEP OVERHEAD: decode_cache(entries/sets/ways hits/rearms/misses/collisions)={d}/{d}/{d} {d}/{d}/{d}/{d} miss_causes(vacant/conflict/stale)={d}/{d}/{d} conflict_sources(generated/image)={d}/{d} rates(lookups/miss_ppm/conflict_ppm)={d}/{d}/{d} replacements={d} victim(entries/sets/ways hits/fills/stale)={d}/{d}/{d}/{d}/{d}/{d} hit_percent={d} hook_false_positives(total/synthetic/stub/compat)={d}/{d}/{d}/{d} generated_code_fetches={d}; victim hits recover short eviction bursts, while primary full-set conflicts and stale-byte refills remain visible and fatal under the default PE policy", .{
             PE_DECODE_CACHE_ENTRIES,
             PE_DECODE_CACHE_SETS,
             PE_DECODE_CACHE_WAYS,
-            self.decode_cache_hits,
-            self.decode_cache_rearms,
-            self.decode_cache_misses,
-            self.decode_cache_collisions,
-            self.decode_cache_vacant_fills,
-            self.decode_cache_conflict_fills,
-            self.decode_cache_stale_refills,
-            self.decode_cache_generated_conflict_fills,
-            self.decode_cache_image_conflict_fills,
+            decode_counts.hits,
+            decode_counts.rearms,
+            decode_counts.misses,
+            decode_counts.collisions,
+            decode_counts.vacant_fills,
+            decode_counts.conflict_fills,
+            decode_counts.stale_refills,
+            decode_counts.generated_conflict_fills,
+            decode_counts.image_conflict_fills,
             decode_total,
             decode_miss_rate_ppm,
             decode_conflict_rate_ppm,
-            self.decode_cache_replacements,
+            decode_counts.replacements,
             PE_DECODE_CACHE_VICTIM_ENTRIES,
             PE_DECODE_CACHE_VICTIM_SETS,
             PE_DECODE_CACHE_VICTIM_WAYS,
-            self.decode_cache_victim_hits,
-            self.decode_cache_victim_fills,
-            self.decode_cache_victim_stale_rejections,
-            windowsTimedWaitPercent(self.decode_cache_hits +| self.decode_cache_rearms, decode_total),
+            decode_counts.victim_hits,
+            decode_counts.victim_fills,
+            decode_counts.victim_stale_rejections,
+            windowsTimedWaitPercent(decode_counts.hits +| decode_counts.rearms, decode_total),
             self.step_hook_box_false_positives,
             self.step_synthetic_hook_false_positives,
             self.step_windows_stub_false_positives,
             self.step_windows_compat_hook_false_positives,
             self.windows_generated_code_fetches,
         });
+        self.logWorkerLocalDecodeCache(decode_counts, decode_total);
         if (include_jit) self.reportBlockJit();
     }
 
@@ -29371,36 +30576,38 @@ pub const ElfState = struct {
             self.xenia_sha1_kernel_feed_bytes *| 11,
         });
         log.info("PE64 generated code: instruction_fetches={d}", .{self.windows_generated_code_fetches});
-        const decode_lookups = self.decode_cache_hits +| self.decode_cache_rearms +| self.decode_cache_misses;
-        const decode_miss_rate_ppm = if (decode_lookups == 0) 0 else @divTrunc(self.decode_cache_misses *| 1_000_000, decode_lookups);
-        const decode_conflict_rate_ppm = if (decode_lookups == 0) 0 else @divTrunc(self.decode_cache_conflict_fills *| 1_000_000, decode_lookups);
+        const decode_counts = self.decodeCacheCounts();
+        const decode_lookups = decode_counts.hits +| decode_counts.rearms +| decode_counts.misses;
+        const decode_miss_rate_ppm = if (decode_lookups == 0) 0 else @divTrunc(decode_counts.misses *| 1_000_000, decode_lookups);
+        const decode_conflict_rate_ppm = if (decode_lookups == 0) 0 else @divTrunc(decode_counts.conflict_fills *| 1_000_000, decode_lookups);
         log.info("PE64 DECODE CACHE: entries={d} sets={d} ways={d} lookups={d} hits={d} generation_rearms={d} fresh_decodes={d} address_collisions={d} rates(miss_ppm/conflict_ppm)={d}/{d} miss_causes(vacant/conflict/stale)={d}/{d}/{d} conflict_sources(generated/image)={d}/{d} replacements={d} victim(entries/sets/ways hits/fills/stale)={d}/{d}/{d}/{d}/{d}/{d} hit_percent={d}; full source address/kind/index/generation checked; victim recovery is bounded and does not suppress a primary capacity finding; mapped_ranges={d} range_mutations={d} lookup=set_scan", .{
             PE_DECODE_CACHE_ENTRIES,
             PE_DECODE_CACHE_SETS,
             PE_DECODE_CACHE_WAYS,
             decode_lookups,
-            self.decode_cache_hits,
-            self.decode_cache_rearms,
-            self.decode_cache_misses,
-            self.decode_cache_collisions,
+            decode_counts.hits,
+            decode_counts.rearms,
+            decode_counts.misses,
+            decode_counts.collisions,
             decode_miss_rate_ppm,
             decode_conflict_rate_ppm,
-            self.decode_cache_vacant_fills,
-            self.decode_cache_conflict_fills,
-            self.decode_cache_stale_refills,
-            self.decode_cache_generated_conflict_fills,
-            self.decode_cache_image_conflict_fills,
-            self.decode_cache_replacements,
+            decode_counts.vacant_fills,
+            decode_counts.conflict_fills,
+            decode_counts.stale_refills,
+            decode_counts.generated_conflict_fills,
+            decode_counts.image_conflict_fills,
+            decode_counts.replacements,
             PE_DECODE_CACHE_VICTIM_ENTRIES,
             PE_DECODE_CACHE_VICTIM_SETS,
             PE_DECODE_CACHE_VICTIM_WAYS,
-            self.decode_cache_victim_hits,
-            self.decode_cache_victim_fills,
-            self.decode_cache_victim_stale_rejections,
-            windowsTimedWaitPercent(self.decode_cache_hits +| self.decode_cache_rearms, self.decode_cache_hits +| self.decode_cache_rearms +| self.decode_cache_misses),
+            decode_counts.victim_hits,
+            decode_counts.victim_fills,
+            decode_counts.victim_stale_rejections,
+            windowsTimedWaitPercent(decode_counts.hits +| decode_counts.rearms, decode_counts.hits +| decode_counts.rearms +| decode_counts.misses),
             self.windows_mapped_ranges.count,
             self.windows_mapped_ranges.mutations,
         });
+        self.logWorkerLocalDecodeCache(decode_counts, decode_lookups);
         log.info("PE64 guest scheduler: enabled={} quantum={d} slice={d} explicit_stride={d} scheduler_calls={d} scheduler_steps={d} explicit_calls={d} explicit_steps={d} explicit_skips={d} worker_calls={d} worker_yields={d} backstop_calls={d} blocked={d} unblocked={d}", .{
             self.windows_scheduler.enabled,
             self.windows_scheduler.quantum,
@@ -29484,8 +30691,16 @@ pub const ElfState = struct {
         if (!self.windows_audio_host_connected or length == 0) return;
         const hooks = self.windows_audio_hooks;
         const submit = hooks.submit orelse return;
-        const bytes = self.guestMemoryConst(data, length) orelse return;
-        const accepted = submit(hooks.context, bytes.ptr, length);
+        const snapshot = self.allocator.alloc(u8, @intCast(length)) catch {
+            self.windows_audio_host_bytes_dropped +|= length;
+            return;
+        };
+        defer self.allocator.free(snapshot);
+        if (!self.copyFromGuest(snapshot, data)) return;
+        // The host callback may enqueue or inspect the buffer while another
+        // guest executor updates the original wave memory. Keep that borrow
+        // inside Rosette-owned storage for the callback's full duration.
+        const accepted = submit(hooks.context, snapshot.ptr, length);
         self.windows_audio_host_bytes_accepted +|= accepted;
         self.windows_audio_host_bytes_dropped +|= (length -| accepted);
     }
@@ -30428,7 +31643,11 @@ pub const ElfState = struct {
     fn reportGuestNullPageAccess(self: *const ElfState, address: u64, size: Size, is_write: bool, occurrence: u64) void {
         var at_text: [guest_symbol_text_bytes]u8 = undefined;
         const slot_plus_one: u8 = if (self.guestContextField("windows_active_guest_thread_slot").*) |slot| @intCast(@min(slot + 1, 255)) else 0;
-        const bytes = self.guestMemoryConst(self.guestContextField("regs").*.rip, 16) orelse &[_]u8{};
+        var instruction_bytes: [16]u8 = undefined;
+        const bytes: []const u8 = if (self.copyFromGuest(&instruction_bytes, self.guestContextField("regs").*.rip))
+            instruction_bytes[0..]
+        else
+            &[_]u8{};
         log.err("PE64 NULL-PAGE ACCESS: kind={s} address=0x{x} size={s} occurrence={d} step={d} rip=0x{x} at={s} last_op={s} thread={s} regs=[rax=0x{x},rbx=0x{x},rcx=0x{x},rdx=0x{x},rsi=0x{x},rdi=0x{x},rbp=0x{x},rsp=0x{x},r8=0x{x},r9=0x{x},r10=0x{x},r11=0x{x},r12=0x{x},r13=0x{x},r14=0x{x},r15=0x{x}] bytes={any}; the register holding a value at or below 0x{x} is the null pointer, and whatever was meant to store it is the finding", .{
             if (is_write) "write" else "read",
             address,
@@ -30489,7 +31708,9 @@ pub const ElfState = struct {
     /// operands, not proof that the saved register values were live.
     fn reportGuestNullPageAddressCheck(self: *const ElfState, supplied_address: u64) void {
         const instruction_rip = self.guestContextField("last_instruction_rip").*;
-        const bytes = self.guestMemoryConst(instruction_rip, 16) orelse return;
+        var instruction_bytes: [16]u8 = undefined;
+        if (!self.copyFromGuest(&instruction_bytes, instruction_rip)) return;
+        const bytes = instruction_bytes[0..];
         const decoded = decodeInsn(bytes);
         if (decoded.op != .movzx_reg32_mem8 or decoded.is_reg_form or decoded.len == 0) return;
 
@@ -31337,9 +32558,13 @@ pub const ElfState = struct {
 
     pub fn readMem128(self: *ElfState, addr: u64) [16]u8 {
         var value = [_]u8{0} ** 16;
-        const source = self.guestMemoryConst(addr, 16) orelse return value;
+        const source = self.guestMemorySourceConst(addr, 16) orelse return value;
+        // A vector snapshot is a bulk load, not a raw borrowed view. Keep
+        // this executor's pending stores buffered and forward them through
+        // the two scalar-width loads, just as ordinary scalar loads do.
+        tso_memory.loadFence();
         inline for (.{ 0, 8 }) |offset| {
-            const lane = self.loadGuestScalar(u64, source[offset..]);
+            const lane = self.loadGuestScalarAt(u64, addr +| offset, source[offset..]);
             std.mem.writeInt(u64, value[offset..][0..8], lane, .little);
         }
         // Same contract as `readMemVal`: the backing bytes are returned and
@@ -31349,16 +32574,34 @@ pub const ElfState = struct {
     }
 
     pub fn writeMem128(self: *ElfState, addr: u64, value: [16]u8) void {
+        self.writeMem128WithPolicy(addr, value, false);
+    }
+
+    fn writeMem128NonTemporal(self: *ElfState, addr: u64, value: [16]u8) void {
+        self.writeMem128WithPolicy(addr, value, true);
+    }
+
+    fn writeMem128WithPolicy(self: *ElfState, addr: u64, value: [16]u8, non_temporal: bool) void {
+        if (non_temporal) tso_memory.flushActiveStoreBufferFor(.non_temporal_store);
         self.traceGuestVectorWrite(addr, value);
         // A protected store is withheld until the fault is resolved, as in
         // `writeMemVal`.
         if (self.guest_page_protection.isActive() and self.wide_access_watch_enabled and self.noteGuestWideAccess(addr, true, value)) return;
-        const destination = self.guestMemory(addr, 16) orelse return;
-        if (self.parallel_guest_execution) {
-            tso_memory.copyCoordinated(destination, value[0..]);
-        } else {
-            tso_memory.copy(destination, value[0..]);
+        const destination = self.guestMemoryTsoWriteTarget(addr, 16) orelse return;
+        // The vector value is local register state. Emit two width-preserving
+        // guest stores even when the host address of `value` is only byte
+        // aligned; routing through generic memcpy would then degrade to 16
+        // byte stores and inflate the per-executor queue.
+        inline for (.{ 0, 8 }) |offset| {
+            self.storeGuestScalarAt(
+                u64,
+                addr +| offset,
+                destination[offset..],
+                std.mem.readInt(u64, value[offset..][0..8], .little),
+                non_temporal,
+            );
         }
+        self.finishGuestMemoryTsoWrite(addr, 16);
     }
 
     fn traceGuestVectorWrite(self: *const ElfState, addr: u64, value: [16]u8) void {
@@ -31380,17 +32623,46 @@ pub const ElfState = struct {
         });
     }
 
+    /// Return a raw mutable view of guest memory for a synchronous runtime
+    /// path: an import shim or a bridge filling its caller's out-parameters.
+    ///
+    /// Parallel mode hands out the same view for data. The bytes written
+    /// through it are ordinary stores by the executing guest thread, made in
+    /// its program order after `storeFence` drained its queue, and published
+    /// to the other executors by that thread's next ordered guest store (an
+    /// STLR on the direct route, a stripe release on the helper route). That
+    /// is the x86-TSO contract of a Windows API writing a caller's buffer; a
+    /// peer reading the buffer without synchronizing races on hardware too.
+    ///
+    /// A range that may hold fetched instructions is still refused in
+    /// parallel mode. Its generation has to move after its bytes do, or a
+    /// peer could translate the old bytes under the new generation and keep
+    /// running them. Code writers use `copyToGuest`, `fillGuestMemory` or
+    /// scalar stores, which end in `finishGuestMemoryTsoWrite`.
+    ///
+    /// On 2026-09-30 every parallel view was refused while 219 runtime
+    /// callers still asked for one. `vkGetPhysicalDeviceProperties` and
+    /// `vkGetPhysicalDeviceFeatures` then wrote nothing: Xenia read an empty
+    /// adapter name and no independentBlend, rejected the Apple GPU, and its
+    /// GPU thread faulted on the null device in
+    /// `VulkanCommandProcessor::SetupContext`. The same refusal answered
+    /// SHGetKnownFolderPath with E_INVALIDARG (no fonts directory) and
+    /// refused every registry open.
     pub fn guestMemory(self: *ElfState, addr: u64, count: u64) ?[]u8 {
+        if (self.parallel_guest_execution and self.guestRangeMayHoldFetchedCode(addr, count)) {
+            self.noteParallelCodeBorrowRefused(addr, count);
+            return null;
+        }
         if (count > std.math.maxInt(usize)) return null;
         const count_usize: usize = @intCast(count);
         if (self.guest_page_protection.isActive()) self.noteProtectedBulkBorrow(addr, count);
         if (self.addrToOffset(addr)) |off| {
             const off_usize: usize = @intCast(off);
             if (off_usize > self.mem.len or count_usize > self.mem.len - off_usize) return null;
-            // A mutable borrow is a possible synchronous bulk write (CRT
-            // memcpy/memset, file I/O, SIMD stores). Publish its generation
-            // before returning storage, so these routes cannot leave a
-            // previously cached instruction valid. Pure readers use Const.
+            // Serial callers may mutate this borrowed slice directly. The
+            // code-generation bump can precede that mutation because no
+            // other executor can decode until this synchronous runtime path
+            // returns. A parallel borrow reaching here holds no code bytes.
             self.bumpWindowsImageCodeGeneration(addr, count);
             tso_memory.storeFence();
             return self.mem[off_usize .. off_usize + count_usize];
@@ -31401,42 +32673,137 @@ pub const ElfState = struct {
         return bytes;
     }
 
-    /// Copy a byte sequence into guest memory using the same ordered scalar
-    /// accesses as translated stores. Runtime helpers should use this rather
-    /// than writing through a borrowed guest slice: a raw `@memcpy` would
-    /// bypass the shared-access coordinator once guest workers run in
-    /// parallel.
-    pub fn copyToGuest(self: *ElfState, addr: u64, source: []const u8) bool {
-        const destination = self.guestMemory(addr, @intCast(source.len)) orelse return false;
-        if (self.parallel_guest_execution) {
-            tso_memory.copyCoordinated(destination, source);
-        } else {
-            tso_memory.copy(destination, source);
+    /// Whether a guest range may hold instructions an executor fetched: an
+    /// executable PE section, or a mapping some executor has decoded from.
+    /// The write TLB refuses admission on the same two predicates.
+    fn guestRangeMayHoldFetchedCode(self: *const ElfState, addr: u64, count: u64) bool {
+        if (count == 0) return false;
+        if (self.addrToOffset(addr) != null) return self.windowsImageRangeOverlapsCode(addr, count);
+        const range = self.windows_mapped_ranges.find(addr, count) orelse return false;
+        return self.mappedRangeCodeFetched(range);
+    }
+
+    fn noteParallelCodeBorrowRefused(self: *ElfState, addr: u64, count: u64) void {
+        const occurrence = self.parallel_code_borrow_refusals.fetchAdd(1, .monotonic) + 1;
+        if (comptime @import("builtin").is_test) return;
+        if (!shouldReportWindowsPointOccurrence(occurrence)) return;
+        log.warn("PE64 PARALLEL CODE BORROW REFUSED: address=0x{x} count={d} occurrence={d} rip=0x{x} thread=0x{x}; a runtime path asked for a mutable view of executable bytes while guest threads run in parallel; it has to write through copyToGuest or fillGuestMemory so the code generation moves after the bytes", .{
+            addr,
+            count,
+            occurrence,
+            self.guestContextField("regs").*.rip,
+            self.guestContextField("active_guest_thread").*,
+        });
+    }
+
+    /// Resolve a guest write target for an operation that will write through
+    /// the TSO access API rather than mutate this slice directly. Unlike
+    /// `guestMemory`, this does not drain the active store buffer. Call
+    /// `finishGuestMemoryTsoWrite` after the ordered write so executable-code
+    /// generations advance only after the written bytes are visible.
+    fn guestMemoryTsoWriteTarget(self: *ElfState, addr: u64, count: u64) ?[]u8 {
+        if (count > std.math.maxInt(usize)) return null;
+        const count_usize: usize = @intCast(count);
+        if (self.guest_page_protection.isActive()) self.noteProtectedBulkBorrow(addr, count);
+        if (self.addrToOffset(addr)) |off| {
+            const off_usize: usize = @intCast(off);
+            if (off_usize > self.mem.len or count_usize > self.mem.len - off_usize) return null;
+            return self.mem[off_usize .. off_usize + count_usize];
         }
+        return self.windowsMappedMemory(addr, count);
+    }
+
+    /// Complete a TSO-aware bulk write. Code-generation helpers drain the
+    /// active queue before publishing a new generation when the destination
+    /// can contain executable bytes; ordinary data writes stay buffered.
+    fn finishGuestMemoryTsoWrite(self: *ElfState, addr: u64, count: u64) void {
+        if (self.addrToOffset(addr) != null) {
+            self.bumpWindowsImageCodeGeneration(addr, count);
+        } else {
+            self.bumpWindowsMappedCodeGeneration(addr, count);
+        }
+    }
+
+    /// Copy a byte sequence into guest memory through the executor's TSO
+    /// route. Ordinary RAM preserves the current context's store forwarding;
+    /// device-backed and fault-routed ranges drain that queue and publish
+    /// synchronously. Executable-code generations move after the bytes are
+    /// visible, never before.
+    pub fn copyToGuest(self: *ElfState, addr: u64, source: []const u8) bool {
+        const count: u64 = @intCast(source.len);
+        const destination = self.guestMemoryTsoWriteTarget(addr, count) orelse return false;
+        self.copyGuestBackingForClass(
+            destination,
+            source,
+            self.guestMemoryRangeClass(addr, count, true),
+        );
+        self.finishGuestMemoryTsoWrite(addr, count);
+        return true;
+    }
+
+    /// Copy between guest addresses without exposing mutable guest slices to
+    /// parallel callers. This is the CRT memcpy/memmove route: mapping checks,
+    /// alias-aware overlap direction, device/fault boundaries, TSO
+    /// coordination, and executable-write generations all stay in one place.
+    pub fn copyGuestRange(self: *ElfState, destination_address: u64, source_address: u64, count: u64) bool {
+        if (count == 0) return true;
+        const destination = self.guestMemoryTsoWriteTarget(destination_address, count) orelse return false;
+        const source = self.guestMemorySourceConst(source_address, count) orelse return false;
+        if (destination_address == source_address) return true;
+
+        const destination_class = self.guestMemoryRangeClass(destination_address, count, true);
+        const source_class = self.guestMemoryRangeClass(source_address, count, false);
+        const destination_bypasses_buffer = tso_memory_policy.bypassStoreBuffer(destination_class);
+        const source_bypasses_buffer = tso_memory_policy.bypassStoreBuffer(source_class);
+        const overlaps_backwards = destination_address > source_address and
+            destination_address - source_address < count;
+
+        if (destination_bypasses_buffer or source_bypasses_buffer) {
+            const boundary = if (destination_bypasses_buffer)
+                memoryClassBoundary(destination_class)
+            else
+                memoryClassBoundary(source_class);
+            tso_memory.flushActiveStoreBufferFor(boundary);
+            const previous = tso_memory.setActiveStoreBuffer(null);
+            defer _ = tso_memory.setActiveStoreBuffer(previous);
+            tso_memory.copyDirectionalCoordinated(destination, source, overlaps_backwards);
+        } else if (self.parallel_guest_execution) {
+            tso_memory.copyDirectionalCoordinated(destination, source, overlaps_backwards);
+        } else {
+            tso_memory.copyDirectional(destination, source, overlaps_backwards);
+        }
+
+        self.finishGuestMemoryTsoWrite(destination_address, count);
         return true;
     }
 
     /// Fill guest memory with ordered byte/word stores. This keeps runtime
     /// zero-initialization on the same TSO path as ordinary guest writes.
     pub fn fillGuestMemory(self: *ElfState, addr: u64, count: u64, byte: u8) bool {
-        const destination = self.guestMemory(addr, count) orelse return false;
-        if (self.parallel_guest_execution) {
-            tso_memory.fillCoordinated(destination, byte);
-        } else {
-            tso_memory.fill(destination, byte);
-        }
+        const destination = self.guestMemoryTsoWriteTarget(addr, count) orelse return false;
+        self.fillGuestBackingForClass(
+            destination,
+            byte,
+            self.guestMemoryRangeClass(addr, count, true),
+        );
+        self.finishGuestMemoryTsoWrite(addr, count);
         return true;
     }
 
     /// Snapshot guest bytes into executor-owned storage. In coordinated mode
     /// this works even for a diagnostic caller outside the guest worker's
-    /// thread-local access scope.
+    /// thread-local access scope. Unlike a borrowed raw view, this path can
+    /// forward the current executor's queued stores without publishing them.
     pub fn copyFromGuest(self: *const ElfState, destination: []u8, addr: u64) bool {
-        const source = self.guestMemoryConst(addr, @intCast(destination.len)) orelse return false;
-        if (self.parallel_guest_execution) {
-            tso_memory.copyInCoordinated(destination, source);
+        const source = self.guestMemorySourceConst(addr, @intCast(destination.len)) orelse return false;
+        const class = self.guestMemoryRangeClass(addr, @intCast(destination.len), false);
+        if (tso_memory_policy.bypassStoreBuffer(class)) {
+            tso_memory.flushActiveStoreBufferFor(memoryClassBoundary(class));
+            tso_memory.loadFence();
+            tso_memory.copyBackingCoordinated(destination, source);
         } else {
-            tso_memory.copyIn(destination, source);
+            tso_memory.loadFence();
+            self.snapshotGuestBacking(destination, source);
         }
         return true;
     }
@@ -31463,14 +32830,27 @@ pub const ElfState = struct {
         mutable_self.flushAllGuestStoreBuffers(.raw_view);
     }
 
+    /// Return a borrowed view into guest backing. In parallel mode, use
+    /// `copyFromGuest` before parsing or retaining multi-byte contents: this
+    /// slice has no lifetime-long read lock and a peer executor can update it
+    /// after this function returns. Scalar `read*` helpers remain the right
+    /// choice for one value at a time.
     pub fn guestMemoryConst(self: *const ElfState, addr: u64, count: u64) ?[]const u8 {
         if (count > std.math.maxInt(usize)) return null;
-        const count_usize: usize = @intCast(count);
         // A returned slice cannot overlay this executor's buffered stores.
         // Publish them before handing out a direct view so runtime readers
         // observe the same bytes as scalar x86 loads.
         self.flushGuestMemorySnapshotStores();
         tso_memory.loadFence();
+        return self.guestMemorySourceConst(addr, count);
+    }
+
+    /// Resolve a bounded guest-memory source without publishing the active
+    /// store buffer. Snapshot callers must copy through `snapshotGuestBacking`
+    /// so this executor's buffered bytes are forwarded into owned storage.
+    fn guestMemorySourceConst(self: *const ElfState, addr: u64, count: u64) ?[]const u8 {
+        if (count > std.math.maxInt(usize)) return null;
+        const count_usize: usize = @intCast(count);
         if (self.addrToOffset(addr)) |off| {
             const off_usize: usize = @intCast(off);
             if (off_usize > self.mem.len or count_usize > self.mem.len - off_usize) return null;
@@ -31489,6 +32869,14 @@ pub const ElfState = struct {
         if (maximum == 0) return null;
         self.flushGuestMemorySnapshotStores();
         tso_memory.loadFence();
+        return self.guestMemorySourceTailConst(addr, maximum);
+    }
+
+    /// Resolve a tail view without publishing the active executor's store
+    /// buffer. Callers that need contents must immediately snapshot the bytes
+    /// into their own storage before parsing them.
+    fn guestMemorySourceTailConst(self: *const ElfState, addr: u64, maximum: usize) ?[]const u8 {
+        if (maximum == 0) return null;
         if (self.nativeMemoryAlias(addr, 1) != null) {
             for (self.native_memory_aliases[0..self.native_memory_alias_count]) |alias| {
                 const bytes = alias.bytes orelse continue;
@@ -31539,10 +32927,21 @@ pub const ElfState = struct {
     /// slice that could race a peer guest store during parallel execution.
     pub fn copyGuestCString(self: *const ElfState, addr: u64, maximum: usize, destination: []u8) ?usize {
         if (addr == 0 or maximum == 0) return null;
-        const tail = self.guestMemoryTailConst(addr, maximum) orelse return null;
-        const length = tso_memory.findCStringEndCoordinated(tail) orelse return null;
+        const source = self.guestMemorySourceTailConst(addr, maximum) orelse return null;
+        const class = self.guestMemoryRangeClass(addr, @intCast(source.len), false);
+        if (tso_memory_policy.bypassStoreBuffer(class)) {
+            tso_memory.flushActiveStoreBufferFor(memoryClassBoundary(class));
+        }
+        tso_memory.loadFence();
+        const length = tso_memory.findCStringEndCoordinated(source) orelse return null;
         if (length > destination.len) return null;
-        if (length != 0) tso_memory.copyInCoordinated(destination[0..length], tail[0..length]);
+        if (length != 0) {
+            if (tso_memory_policy.bypassStoreBuffer(class)) {
+                tso_memory.copyBackingCoordinated(destination[0..length], source[0..length]);
+            } else {
+                self.snapshotGuestBacking(destination[0..length], source[0..length]);
+            }
+        }
         return length;
     }
 
@@ -31570,8 +32969,10 @@ pub const ElfState = struct {
         if (!self.trace_syscall_bytes) return;
         if (syscallResult(result) <= 0) return;
         const available = @min(count, result);
-        const data = self.guestMemoryConst(addr, available) orelse return;
-        self.traceDataPreview(operation, fd, data);
+        var preview: [96]u8 = undefined;
+        const preview_length: usize = @intCast(@min(available, preview.len));
+        if (preview_length != 0 and !self.copyFromGuest(preview[0..preview_length], addr)) return;
+        self.traceDataPreview(operation, fd, preview[0..preview_length], available);
     }
 
     fn traceSyscall(self: *const ElfState, comptime fmt: []const u8, args: anytype) void {
@@ -31614,7 +33015,7 @@ pub const ElfState = struct {
         return true;
     }
 
-    fn traceDataPreview(self: *const ElfState, operation: []const u8, fd: u64, data: []const u8) void {
+    fn traceDataPreview(self: *const ElfState, operation: []const u8, fd: u64, data: []const u8, total_length: u64) void {
         if (!self.trace_syscall_bytes) return;
         var preview: [96]u8 = undefined;
         const n = @min(preview.len, data.len);
@@ -31629,7 +33030,7 @@ pub const ElfState = struct {
         log.info("runtime io bytes: {s}(fd={d}) {d} byte preview \"{s}\"", .{
             operation,
             fd,
-            data.len,
+            total_length,
             preview[0..n],
         });
     }
@@ -32296,10 +33697,12 @@ pub const ElfState = struct {
     fn executeCleoVectorMove(self: *ElfState, d: DecodedInsn) bool {
         switch (d.op) {
             .vmovntps, .vmovntdq => {
-                // A non-temporal store is a store; the hint only concerns the
-                // host cache, which an interpreter does not have.
-                self.writeMem128(d.addr, self.guestContextField("xmm").*[d.xmm_src]);
-                if (d.vector_256) self.writeMem128(d.addr +% 16, self.guestContextField("ymm_hi").*[d.xmm_src]);
+                // A non-temporal store bypasses the ordinary temporal queue.
+                // Publish earlier queued stores first; this is stronger than
+                // x86's weak NT ordering but preserves a safe, explicit tier
+                // boundary on the ARM host.
+                self.writeMem128NonTemporal(d.addr, self.guestContextField("xmm").*[d.xmm_src]);
+                if (d.vector_256) self.writeMem128NonTemporal(d.addr +% 16, self.guestContextField("ymm_hi").*[d.xmm_src]);
                 return true;
             },
             .vpsadbw => {
@@ -35574,6 +36977,10 @@ pub const ElfState = struct {
             },
             .ret => {
                 const return_rip = self.pop();
+                // C2 iw performs RET's normal eight-byte pop followed by an
+                // unsigned 16-bit caller-argument cleanup. Use wrapping
+                // arithmetic, as the architectural RSP update is 64-bit.
+                self.guestContextField("regs").*.rsp +%= (d.imm & 0xFFFF);
                 if (self.guest_return_captures_armed != 0) self.completeGuestReturnCapture();
                 self.noteXeniaEmulatorSetupReturn(return_rip);
                 if (self.trace_string_memory and
@@ -35598,7 +37005,7 @@ pub const ElfState = struct {
                     // return boundary and completes the worker after the
                     // instruction.  It is not an execution error unless a
                     // non-worker reaches the same null return.
-                    log.info("Windows guest ret produced the worker completion marker: thread=0x{x} source_rip=0x{x} rsp_after_pop=0x{x} rbp=0x{x} stack_next=0x{x}", .{
+                    log.info("Windows guest ret produced the worker completion marker: thread=0x{x} source_rip=0x{x} rsp_after_return=0x{x} rbp=0x{x} stack_next=0x{x}", .{
                         self.guestContextField("active_guest_thread").*,
                         self.guestContextField("regs").*.rip,
                         self.guestContextField("regs").*.rsp,
@@ -36259,7 +37666,7 @@ pub const ElfState = struct {
         };
         const addr = self.guestContextField("regs").*.rsi;
         const count = self.guestContextField("regs").*.rdx;
-        const destination = self.guestMemory(addr, count) orelse {
+        const destination = self.guestMemoryTsoWriteTarget(addr, count) orelse {
             self.guestContextField("regs").*.rax = x64_syscalls.errnoValue(.bad_address);
             self.traceGuestIo("read", fd_raw, addr, count, self.guestContextField("regs").*.rax);
             return;
@@ -36276,7 +37683,12 @@ pub const ElfState = struct {
             self.guestContextField("regs").*.rax = x64_syscalls.errnoValue(.io);
         } else {
             const copied: usize = @intCast(n);
-            self.copyGuestBacking(destination[0..copied], staging[0..copied]);
+            self.copyGuestBackingForClass(
+                destination[0..copied],
+                staging[0..copied],
+                self.guestMemoryRangeClass(addr, @intCast(copied), true),
+            );
+            self.finishGuestMemoryTsoWrite(addr, @intCast(copied));
             self.guestContextField("regs").*.rax = @intCast(n);
         }
         self.traceGuestIo("read", fd_raw, addr, count, self.guestContextField("regs").*.rax);
@@ -36744,6 +38156,21 @@ test "decode call ret and extended stack forms" {
     d = decodeInsn(&[_]u8{0xC3});
     try testing.expectEqual(Op.ret, d.op);
 
+    d = decodeInsn(&[_]u8{ 0xC2, 0x34, 0x12 });
+    try testing.expectEqual(Op.ret, d.op);
+    try testing.expectEqual(@as(u8, 3), d.len);
+    try testing.expectEqual(@as(u64, 0x1234), d.imm);
+
+    var ret_state = ElfState.init(testing.allocator);
+    defer ret_state.deinit();
+    const stack = MEM_BASE + 0x1000;
+    const return_target = MEM_BASE + 0x2000;
+    ret_state.write64(stack, return_target);
+    ret_state.regs.rsp = stack;
+    ret_state.execute(d);
+    try testing.expectEqual(return_target, ret_state.regs.rip);
+    try testing.expectEqual(stack + 8 + 0x1234, ret_state.regs.rsp);
+
     d = decodeInsn(&[_]u8{ 0x41, 0x54 });
     try testing.expectEqual(Op.push_reg, d.op);
     try testing.expectEqual(RegId.r12b_r12w_r12d_r12, d.src_reg);
@@ -36751,6 +38178,35 @@ test "decode call ret and extended stack forms" {
     d = decodeInsn(&[_]u8{ 0x41, 0x5F });
     try testing.expectEqual(Op.pop_reg, d.op);
     try testing.expectEqual(RegId.r15b_r15w_r15d_r15, d.dst_reg);
+}
+
+test "block JIT fallback ledger distinguishes missing templates from native slow paths" {
+    const missing_native_template: block_jit.FallbackReason = .missing_native_template;
+    const native_ret = block_jit.Insn{
+        .rip = 0x1000,
+        .len = 1,
+        .decoded = .{ .op = .ret },
+        .segment = .ds,
+    };
+    try testing.expectEqual(.native_slow_path, blockJitRuntimeFallbackReason(native_ret));
+
+    const missing_template = block_jit.Insn{
+        .rip = 0x1000,
+        .len = 1,
+        .decoded = .{ .op = .invalid },
+        .segment = .ds,
+    };
+    try testing.expectEqual(missing_native_template, blockJitRuntimeFallbackReason(missing_template));
+
+    const policy_fallback = block_jit.Insn{
+        .rip = 0x1000,
+        .len = 5,
+        .decoded = .{ .op = .call_rel32 },
+        .segment = .ds,
+        .force_fallback = true,
+        .fallback_reason = .hook_observation,
+    };
+    try testing.expectEqual(.hook_observation, blockJitRuntimeFallbackReason(policy_fallback));
 }
 
 test "decode REX-aware arithmetic and move-extension registers" {
@@ -37235,6 +38691,84 @@ test "decode and execute xorps zero then movaps store" {
     try testing.expectEqualSlices(u8, &([_]u8{0} ** 16), stored[0..]);
 }
 
+test "wide guest snapshots and writes forward without draining the TSO buffer" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.parallel_guest_execution = true;
+
+    var buffer: tso_memory.StoreBuffer = .{};
+    const prior_mode = tso_memory.setCoordinatedGuestAccess(true);
+    defer _ = tso_memory.setCoordinatedGuestAccess(prior_mode);
+    const prior_buffer = tso_memory.setActiveStoreBuffer(&buffer);
+    defer _ = tso_memory.setActiveStoreBuffer(prior_buffer);
+    defer _ = buffer.drain();
+
+    // The 16-byte access straddles a 64-byte cache-line boundary. Each
+    // executor-local store remains buffered, and both 8-byte lanes must
+    // forward into vector and owned-runtime snapshots without publication.
+    const address = MEM_BASE + 0x3F8;
+    const low: u64 = 0x1122_3344_AABB_CCDD;
+    const high: u64 = 0x8877_6655_DDEE_FF00;
+    state.write64(address, low);
+    state.write64(address + 8, high);
+    try testing.expectEqual(@as(usize, 2), buffer.pendingCount());
+
+    var expected: [16]u8 = undefined;
+    std.mem.writeInt(u64, expected[0..8], low, .little);
+    std.mem.writeInt(u64, expected[8..16], high, .little);
+    const wide_readback = state.readMem128(address);
+    try testing.expectEqualSlices(u8, &expected, &wide_readback);
+    try testing.expectEqual(@as(usize, 2), buffer.pendingCount());
+
+    var snapshot: [16]u8 = undefined;
+    try testing.expect(state.copyFromGuest(&snapshot, address));
+    try testing.expectEqualSlices(u8, &expected, &snapshot);
+    try testing.expectEqual(@as(usize, 2), buffer.pendingCount());
+
+    // Vector stores use two width-matched lanes even if the host copy of the
+    // register is byte-aligned. Data writes retain TSO buffering; the
+    // corresponding backing bytes stay untouched until an explicit drain.
+    const vector_address = MEM_BASE + 0x600;
+    const vector = [_]u8{0xA5} ** 16;
+    state.writeMem128(vector_address, vector);
+    try testing.expectEqual(@as(usize, 4), buffer.pendingCount());
+    const vector_offset: usize = @intCast(state.addrToOffset(vector_address).?);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 16), state.mem[vector_offset..][0..16]);
+    const vector_readback = state.readMem128(vector_address);
+    try testing.expectEqualSlices(u8, &vector, &vector_readback);
+    try testing.expectEqual(@as(usize, 4), buffer.pendingCount());
+
+    // A bulk fill also emits bounded ordered stores without a pre-write drain.
+    const fill_address = MEM_BASE + 0x800;
+    try testing.expect(state.fillGuestMemory(fill_address, 16, 0x5A));
+    try testing.expectEqual(@as(usize, 6), buffer.pendingCount());
+    try testing.expectEqual(@as(u8, 0x5A), state.read8(fill_address));
+    const fill_offset: usize = @intCast(state.addrToOffset(fill_address).?);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 16), state.mem[fill_offset..][0..16]);
+}
+
+test "a runtime scalar probe forwards buffered bytes without draining the queue" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.parallel_guest_execution = true;
+
+    var buffer: tso_memory.StoreBuffer = .{};
+    const prior_mode = tso_memory.setCoordinatedGuestAccess(true);
+    defer _ = tso_memory.setCoordinatedGuestAccess(prior_mode);
+    const prior_buffer = tso_memory.setActiveStoreBuffer(&buffer);
+    defer _ = tso_memory.setActiveStoreBuffer(prior_buffer);
+    defer _ = buffer.drain();
+
+    const address = MEM_BASE + 0xA00;
+    const value: u64 = 0xD4C3_B2A1_8877_6655;
+    state.write64(address, value);
+    const backing_offset: usize = @intCast(state.addrToOffset(address).?);
+    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, state.mem[backing_offset..][0..8], .little));
+    try testing.expectEqual(@as(?u64, value), state.readHostU64(address));
+    try testing.expectEqual(@as(usize, 1), buffer.pendingCount());
+    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, state.mem[backing_offset..][0..8], .little));
+}
+
 test "decode and execute shared bit scan instructions" {
     const bsr = decodeInsn(&[_]u8{ 0x48, 0x0F, 0xBD, 0xC0 });
     try testing.expectEqual(Op.bsr_reg_reg, bsr.op);
@@ -37498,6 +39032,72 @@ test "in parallel mode an executable write still moves the generation translated
     state.write8(code + 0x20, 0xCC);
     try testing.expectEqual(initial_generation + 1, state.windows_image_code_generation);
     try testing.expectEqual(@as(?u64, initial_generation + 1), state.windowsImageCodeGenerationFor(code, 4));
+}
+
+test "a buffered executable write publishes bytes before its decode generation" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    const code = MEM_BASE + 0x1A00;
+    state.configureWindowsExecutableRanges(&[_]WindowsExecutableRange{
+        .{ .guest_base = code, .length = 0x100 },
+    });
+    state.windows_runtime_enabled = true;
+    state.windows_fatal_point_terminate = false;
+    state.setParallelGuestExecution(true);
+    defer state.setParallelGuestExecution(false);
+
+    state.write8(code, 0xB8); // MOV EAX, imm32.
+    state.write32(code + 1, 1);
+    state.regs.rip = code;
+    try testing.expectEqual(@as(u64, 1), (state.decodeAt() orelse return error.ExpectedInstruction).imm);
+
+    var buffer: tso_memory.StoreBuffer = .{};
+    const prior_mode = tso_memory.setCoordinatedGuestAccess(true);
+    defer _ = tso_memory.setCoordinatedGuestAccess(prior_mode);
+    const prior_buffer = tso_memory.setActiveStoreBuffer(&buffer);
+    defer _ = tso_memory.setActiveStoreBuffer(prior_buffer);
+
+    const generation = state.windowsImageCodeGenerationFor(code, 5).?;
+    const backing_offset: usize = @intCast(state.addrToOffset(code + 1).?);
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, state.mem[backing_offset..][0..4], .little));
+
+    // write32 enqueues the bytes first. The executable-write boundary must
+    // drain them before releasing the generation that makes other decoders
+    // trust the newly published instruction.
+    state.write32(code + 1, 2);
+    try testing.expect(buffer.isEmpty());
+    try testing.expectEqual(generation + 1, state.windowsImageCodeGenerationFor(code, 5).?);
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, state.mem[backing_offset..][0..4], .little));
+    try testing.expectEqual(@as(u64, 2), (state.decodeAt() orelse return error.ExpectedInstruction).imm);
+}
+
+test "parallel worker-local decode cache avoids shared lookup and observes changed bytes" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    const code = MEM_BASE + 0x1800;
+    state.configureWindowsExecutableRanges(&[_]WindowsExecutableRange{
+        .{ .guest_base = code, .length = 0x100 },
+    });
+    state.windows_runtime_enabled = true;
+    state.windows_fatal_point_terminate = false;
+    state.write8(code, 0xB8); // MOV EAX, imm32.
+    state.write32(code + 1, 1);
+    state.setParallelGuestExecution(true);
+    defer state.setParallelGuestExecution(false);
+
+    state.regs.rip = code;
+    try testing.expectEqual(@as(u64, 1), (state.decodeAt() orelse return error.ExpectedInstruction).imm);
+    try testing.expectEqual(@as(u64, 1), (state.decodeAt() orelse return error.ExpectedInstruction).imm);
+    try testing.expectEqual(@as(u64, 1), state.decodeCacheWorkerLocalHits());
+
+    // The private tier must keep the exact-byte validation used by the
+    // shared tier. A write after cache fill declines the stale local decode;
+    // after the shared refill, the new bytes can be cached locally.
+    state.write32(code + 1, 2);
+    try testing.expectEqual(@as(u64, 2), (state.decodeAt() orelse return error.ExpectedInstruction).imm);
+    try testing.expectEqual(@as(u64, 1), state.decodeCacheWorkerLocalHits());
+    try testing.expectEqual(@as(u64, 2), (state.decodeAt() orelse return error.ExpectedInstruction).imm);
+    try testing.expectEqual(@as(u64, 2), state.decodeCacheWorkerLocalHits());
 }
 
 test "arch_prctl sets and reads architectural FS and GS bases" {
@@ -39820,6 +41420,72 @@ test "guest bulk helpers snapshot and publish memory in coordinated TSO mode" {
     try testing.expectEqual(@as(u8, 0x5A), state.read8(destination + 23));
 }
 
+test "parallel CRT memcpy memmove and memset use coordinated guest memory routes" {
+    var state = ElfState.initWithMemory(testing.allocator, 0x10000);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+
+    const source = state.mem_base + 0x100;
+    const destination = state.mem_base + 0x200;
+    // Executable bytes are the one range a parallel raw view is refused
+    // for, so marking the buffers executable proves that every route below
+    // writes through the ordered API rather than a borrowed slice.
+    state.configureWindowsExecutableRanges(&[_]WindowsExecutableRange{
+        .{ .guest_base = source, .length = 0x200 },
+    });
+    const initial = "abcdefgh";
+    try testing.expect(state.copyToGuest(source, initial));
+    state.parallel_guest_execution = true;
+    try testing.expect(state.guestMemory(source, initial.len) == null);
+
+    const return_rip = state.mem_base + 0x1000;
+    state.regs.rcx = destination;
+    state.regs.rdx = source;
+    state.regs.r8 = initial.len;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ucrtbase.dll", "memcpy", return_rip));
+    try testing.expectEqual(destination, state.regs.rax);
+
+    var copied: [8]u8 = undefined;
+    try testing.expect(state.copyFromGuest(&copied, destination));
+    try testing.expectEqualSlices(u8, initial, &copied);
+
+    // memmove must use guest virtual-address overlap direction even though
+    // the guest backing is only available through coordinated access.
+    state.regs.rcx = source + 2;
+    state.regs.rdx = source;
+    state.regs.r8 = 6;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ucrtbase.dll", "memmove", return_rip));
+    var moved: [8]u8 = undefined;
+    try testing.expect(state.copyFromGuest(&moved, source));
+    try testing.expectEqualSlices(u8, "ababcdef", &moved);
+
+    state.regs.rcx = destination;
+    state.regs.rdx = 0x5A;
+    state.regs.r8 = 8;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ucrtbase.dll", "memset", return_rip));
+    var filled: [8]u8 = undefined;
+    try testing.expect(state.copyFromGuest(&filled, destination));
+    try testing.expectEqualSlices(u8, &.{ 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A }, &filled);
+
+    // std::regex's classic locale calls strxfrm. Its terminator must also
+    // use the coordinated writer; checking only guestMemory would silently
+    // leave a stale byte here because these executable bytes refuse a
+    // parallel mutable borrow.
+    const collation_source = source + 0x40;
+    const collation_destination = destination + 0x40;
+    try testing.expect(state.copyToGuest(collation_source, "regex"));
+    try testing.expect(state.fillGuestMemory(collation_destination, 6, 0xAA));
+    state.regs.rcx = collation_destination;
+    state.regs.rdx = collation_source;
+    state.regs.r8 = 6;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ucrtbase.dll", "strxfrm", return_rip));
+    try testing.expectEqual(@as(u64, 5), state.regs.rax);
+    var transformed: [6]u8 = undefined;
+    try testing.expect(state.copyFromGuest(&transformed, collation_destination));
+    try testing.expectEqualSlices(u8, "regex\x00", &transformed);
+    try testing.expectEqual(@as(u64, 0), state.windows_crt_unreadable_pointers);
+}
+
 test "a C runtime import handed an unreadable pointer stops the run, and a zero-byte copy does not" {
     var state = ElfState.init(testing.allocator);
     defer state.deinit();
@@ -40818,6 +42484,65 @@ test "precise time imports bypass the runtime mutex for verified direct static I
     try testing.expect(!state.tryWindowsFastImportStub(stub_address));
     guard.unlock();
     try testing.expectEqual(@as(u64, 1), state.windows_fast_time_import_calls.load(.acquire));
+}
+
+test "C runtime memcpy and memset bypass the runtime mutex through verified IAT stubs" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    state.setParallelGuestExecution(true);
+    defer state.setParallelGuestExecution(false);
+
+    const copy_stub = MEM_BASE + 0x700;
+    const fill_stub = MEM_BASE + 0x710; // direct stubs sit on a 16-byte stride
+    const copy_iat = MEM_BASE + 0x900;
+    const fill_iat = MEM_BASE + 0x908;
+    const stack = MEM_BASE + 0x1000;
+    const source = MEM_BASE + 0x1100;
+    const destination = MEM_BASE + 0x1200;
+    const return_rip = MEM_BASE + 0x1300;
+    try testing.expect(state.registerWindowsImportStubAtIat(copy_stub, "api-ms-win-crt-private-l1-1-0.dll", "memcpy", copy_iat));
+    try testing.expect(state.registerWindowsImportStubAtIat(fill_stub, "api-ms-win-crt-string-l1-1-0.dll", "memset", fill_iat));
+    state.windows_direct_stub_base = copy_stub;
+    state.windows_direct_stub_count = 2;
+    state.write64(copy_iat, copy_stub);
+    state.write64(fill_iat, fill_stub);
+    state.write64(stack, return_rip);
+    try testing.expect(state.copyToGuest(source, "Rosette!"));
+
+    state.regs = .{ .rip = copy_stub, .rsp = stack, .rcx = destination, .rdx = source, .r8 = 8, .rbx = 0xBADC_0FFE };
+    try testing.expect(state.tryWindowsFastImportStub(copy_stub));
+    try testing.expectEqual(return_rip, state.regs.rip);
+    try testing.expectEqual(stack + 8, state.regs.rsp);
+    try testing.expectEqual(destination, state.regs.rax);
+    try testing.expectEqual(@as(u64, 0xBADC_0FFE), state.regs.rbx);
+    var copied: [8]u8 = undefined;
+    try testing.expect(state.copyFromGuest(&copied, destination));
+    try testing.expectEqualStrings("Rosette!", &copied);
+
+    state.write64(stack, return_rip);
+    state.regs = .{ .rip = fill_stub, .rsp = stack, .rcx = destination, .rdx = 0x2A, .r8 = 4 };
+    try testing.expect(state.tryWindowsFastImportStub(fill_stub));
+    try testing.expectEqual(destination, state.regs.rax);
+    try testing.expectEqual(@as(u32, 0x2A2A_2A2A), state.read32(destination));
+    try testing.expectEqual(@as(u64, 2), state.windowsFastCrtImportCalls());
+    try testing.expectEqual(@as(u64, 0), state.windows_runtime_mutex.inner.stats.acquisitions.load(.monotonic));
+
+    // An unmapped destination returns to the ordinary handler untouched: it
+    // is the one that reports the unreadable pointer.
+    state.write64(stack, return_rip);
+    state.regs = .{ .rip = copy_stub, .rsp = stack, .rcx = 0x7777_0000_0000, .rdx = source, .r8 = 8 };
+    try testing.expect(!state.tryWindowsFastImportStub(copy_stub));
+    try testing.expectEqual(copy_stub, state.regs.rip);
+    try testing.expectEqual(stack, state.regs.rsp);
+    try testing.expectEqual(@as(u64, 2), state.windowsFastCrtImportCalls());
+
+    // So does a caller already inside a runtime dispatch.
+    state.regs = .{ .rip = copy_stub, .rsp = stack, .rcx = destination, .rdx = source, .r8 = 8 };
+    var guard = state.lockWindowsRuntimeForDispatch();
+    try testing.expect(!state.tryWindowsFastImportStub(copy_stub));
+    guard.unlock();
+    try testing.expectEqual(@as(u64, 2), state.windowsFastCrtImportCalls());
 }
 
 test "precise time fast path accepts exact dynamic proc stubs but rejects other dynamic imports" {
@@ -41897,6 +43622,118 @@ test "every SHGetKnownFolderPath result is the caller's to free exactly once" {
     try testing.expectEqual(@as(u64, 0), state.windows_heap_double_frees);
 }
 
+test "a parallel raw view is served for data and refused only for fetched code" {
+    var state = ElfState.initWithMemory(testing.allocator, 0x10000);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    const code = state.mem_base + 0x1000;
+    state.configureWindowsExecutableRanges(&[_]WindowsExecutableRange{
+        .{ .guest_base = code, .length = 0x100 },
+    });
+    const allocation_base: u64 = 0x2_0000_0000;
+    try testing.expect(state.createWindowsVirtualAllocation(allocation_base, 0x10000));
+    state.parallel_guest_execution = true;
+
+    // An out-parameter on a data page. Refusing this view is what dropped
+    // the Vulkan adapter's properties on 2026-09-30.
+    const data = state.mem_base + 0x4000;
+    const view = state.guestMemory(data, 8) orelse return error.DataViewRefused;
+    std.mem.writeInt(u64, view[0..8], 0x1122_3344_5566_7788, .little);
+    try testing.expectEqual(@as(u64, 0x1122_3344_5566_7788), state.read64(data));
+
+    // Executable bytes, including a borrow that only straddles into them,
+    // have to move their generation after the write.
+    try testing.expect(state.guestMemory(code + 0x10, 4) == null);
+    try testing.expect(state.guestMemory(code - 2, 4) == null);
+    try testing.expectEqual(@as(u64, 2), state.parallel_code_borrow_refusals.load(.monotonic));
+    const generation = ElfState.loadCodeGeneration(&state.windows_image_code_generation);
+    try testing.expect(state.copyToGuest(code + 0x10, &.{ 0x90, 0x90, 0x90, 0xC3 }));
+    try testing.expect(ElfState.loadCodeGeneration(&state.windows_image_code_generation) != generation);
+    try testing.expectEqual(@as(u8, 0xC3), state.read8(code + 0x13));
+
+    // A mapping is data until an executor fetches from it.
+    try testing.expect(state.guestMemory(allocation_base + 0x40, 8) != null);
+    const slot = state.windows_mapped_ranges.find(allocation_base, 1).?.slot;
+    state.windows_virtual_allocations[slot].code_fetched = true;
+    try testing.expect(state.guestMemory(allocation_base + 0x40, 8) == null);
+    try testing.expectEqual(@as(u64, 3), state.parallel_code_borrow_refusals.load(.monotonic));
+}
+
+test "parallel runtime calls fill the out-parameters the 2026-09-30 run lost" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    state.parallel_guest_execution = true;
+    const return_rip = MEM_BASE + 0x980;
+
+    // Xenia's font probe: E_INVALIDARG left *ppszPath unwritten, and
+    // LoadWindowsFont then freed the stale stack word it held.
+    const fonts_guid = [_]u8{ 0xB7, 0x8C, 0x22, 0xFD, 0x11, 0xAE, 0xE3, 0x4A, 0x86, 0x4C, 0x16, 0xF3, 0x91, 0x0A, 0xB8, 0xFE };
+    const guid = state.guestAlloc(16, 8).?;
+    for (fonts_guid, 0..) |byte, index| state.write8(guid + index, byte);
+    const path_output = state.guestAlloc(8, 8).?;
+    state.regs.rcx = guid;
+    state.regs.r9 = path_output;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "SHELL32.dll", "SHGetKnownFolderPath", return_rip));
+    try testing.expectEqual(@as(u64, 0), state.regs.rax); // S_OK
+    const path = state.read64(path_output);
+    try testing.expectEqual(@as(u16, 'C'), state.read16(path));
+    state.regs.rcx = path;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ole32.dll", "CoTaskMemFree", return_rip));
+    try testing.expectEqual(@as(u64, 0), state.windows_heap_double_frees);
+
+    // `GetPersistentEmulatorFlags`: RegOpenKeyA answered
+    // ERROR_INVALID_PARAMETER, then RegCreateKeyA did, so RegSetValueExA,
+    // RegFlushKey and RegCloseKey all ran on a null key.
+    const subkey = state.guestAlloc(32, 1).?;
+    const key_name = "Software\\Xenia";
+    for (key_name, 0..) |character, index| state.write8(subkey + @as(u64, @intCast(index)), character);
+    state.write8(subkey + key_name.len, 0);
+    const key_output = state.guestAlloc(8, 8).?;
+    state.regs.rcx = 0xFFFF_FFFF_8000_0001; // HKEY_CURRENT_USER
+    state.regs.rdx = subkey;
+    state.regs.r8 = key_output;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ADVAPI32.dll", "RegCreateKeyA", return_rip));
+    try testing.expectEqual(@as(u64, 0), state.regs.rax); // ERROR_SUCCESS
+    const key = state.read64(key_output);
+    try testing.expect(key != 0);
+    state.regs.rcx = key;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ADVAPI32.dll", "RegCloseKey", return_rip));
+    try testing.expectEqual(@as(u64, 0), state.regs.rax);
+}
+
+test "the parallel executor reports the host's processors and the cooperative one reports one" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    const return_rip = MEM_BASE + 0x980;
+    const info = state.guestAlloc(48, 8).?;
+    const process_mask = state.guestAlloc(8, 8).?;
+    const system_mask = state.guestAlloc(8, 8).?;
+
+    state.regs.rcx = info;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "KERNEL32.dll", "GetSystemInfo", return_rip));
+    try testing.expectEqual(@as(u32, 1), state.read32(info + 32));
+
+    state.setParallelGuestExecution(true);
+    defer state.setParallelGuestExecution(false);
+    const expected = ElfState.guestProcessorMask();
+    state.regs.rcx = info;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "KERNEL32.dll", "GetSystemInfo", return_rip));
+    try testing.expectEqual(@as(u32, @popCount(expected)), state.read32(info + 32));
+    try testing.expectEqual(expected, state.read64(info + 24));
+
+    // winpthreads counts these bits for std::thread::hardware_concurrency;
+    // the 2026-09-30 run refused the call 133 times, which reads as one.
+    state.regs.rcx = 0xFFFF_FFFF_FFFF_FFFF;
+    state.regs.rdx = process_mask;
+    state.regs.r8 = system_mask;
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "KERNEL32.dll", "GetProcessAffinityMask", return_rip));
+    try testing.expectEqual(@as(u64, 1), state.regs.rax);
+    try testing.expectEqual(expected, state.read64(process_mask));
+    try testing.expectEqual(expected, state.read64(system_mask));
+}
+
 test "Windows path shims publish wide paths before returning under hybrid TSO" {
     var state = ElfState.init(testing.allocator);
     defer state.deinit();
@@ -42482,6 +44319,39 @@ test "an SRW release hands the lock to its longest waiter instead of letting the
     state.windows_guest_threads[2].status = .running;
     try testing.expectEqual(ElfState.WindowsSrwAcquireResult.acquired, state.acquireWindowsSrwLock(lock_address));
     state.releaseWindowsSrwLock(lock_address);
+    try testing.expectEqual(@as(u64, 6), state.windows_srw_locks[state.windowsSrwLockIndex(lock_address).?].owner_thread_id);
+}
+
+test "SRW acquire and release publish the TSO store buffer around ownership transfer" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    const lock_address = MEM_BASE + 0x2200;
+    state.windows_guest_threads[0] = .{ .status = .running, .handle = 0x10, .thread_id = 5 };
+    state.windows_guest_threads[1] = .{ .status = .running, .handle = 0x11, .thread_id = 6 };
+    var published: [4]u8 align(4) = [_]u8{0} ** 4;
+    var queue: tso_memory.StoreBuffer = .{};
+    const previous_queue = tso_memory.setActiveStoreBuffer(&queue);
+    defer _ = tso_memory.setActiveStoreBuffer(previous_queue);
+
+    // Acquire is an acquire boundary: following code must not observe stale
+    // state after it takes ownership.
+    tso_memory.store(u32, published[0..], 0xA1B2_C3D4);
+    state.windows_active_guest_thread_slot = 0;
+    try testing.expectEqual(ElfState.WindowsSrwAcquireResult.acquired, state.acquireWindowsSrwLock(lock_address));
+    try testing.expectEqual(@as(usize, 0), queue.pendingCount());
+    try testing.expectEqual(@as(u32, 0xA1B2_C3D4), std.mem.readInt(u32, published[0..], .little));
+
+    state.windows_active_guest_thread_slot = 1;
+    try testing.expectEqual(ElfState.WindowsSrwAcquireResult.contended, state.acquireWindowsSrwLock(lock_address));
+    try testing.expect(state.blockWindowsGuestThreadOnSrwLock(lock_address));
+
+    // Release publishes the protected data before it grants the lock to the
+    // waiter, which retries at the original import call site.
+    tso_memory.store(u32, published[0..], 0xD4C3_B2A1);
+    state.windows_active_guest_thread_slot = 0;
+    state.releaseWindowsSrwLock(lock_address);
+    try testing.expectEqual(@as(usize, 0), queue.pendingCount());
+    try testing.expectEqual(@as(u32, 0xD4C3_B2A1), std.mem.readInt(u32, published[0..], .little));
     try testing.expectEqual(@as(u64, 6), state.windows_srw_locks[state.windowsSrwLockIndex(lock_address).?].owner_thread_id);
 }
 
@@ -43237,6 +45107,8 @@ test "NtProtectVirtualMemory is the ntdll spelling of VirtualProtect and arms th
     state.regs.r8 = size_slot;
     state.regs.r9 = 0x02; // PAGE_READONLY, the write watch
     state.write64(state.regs.rsp + 32, old_slot);
+    // Xenia's workers make this call while other guest threads run.
+    state.parallel_guest_execution = true;
     try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ntdll.dll", "NtProtectVirtualMemory", return_rip));
     try testing.expectEqual(@as(u64, 0), state.regs.rax); // STATUS_SUCCESS
     // The kernel rounds the base down and the end up and writes both back.
@@ -43302,6 +45174,7 @@ test "NtQueryVirtualMemory reports the protection this run recorded" {
     // the length is a lower bound and never an equality.
     state.write64(state.regs.rsp + 32, 0x1000);
     state.write64(state.regs.rsp + 40, result_slot);
+    state.parallel_guest_execution = true;
     try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ntdll.dll", "NtQueryVirtualMemory", return_rip));
     try testing.expectEqual(@as(u64, 0), state.regs.rax);
     try testing.expectEqual(page, state.read64(buffer + 0)); // BaseAddress
@@ -44028,12 +45901,12 @@ test "decode cache observes alias stores bulk writes rollover and mapping-kind l
     state.regs.rip = base;
     try testing.expectEqual(@as(u64, 1), state.decodeAt().?.imm);
     _ = state.decodeAt().?;
-    try testing.expectEqual(@as(u64, 1), state.decode_cache_hits);
+    try testing.expectEqual(@as(u64, 1), state.decodeCacheCounts().hits);
     state.write32(alias + 1, 2);
     try testing.expectEqual(@as(u64, 2), state.decodeAt().?.imm);
     state.write8(alias + 0x100, 0x90); // Unrelated emission only re-arms.
     try testing.expectEqual(@as(u64, 2), state.decodeAt().?.imm);
-    try testing.expectEqual(@as(u64, 1), state.decode_cache_rearms);
+    try testing.expectEqual(@as(u64, 1), state.decodeCacheCounts().rearms);
     const mutable_bytes = state.guestMemory(alias + 1, 4).?;
     std.mem.writeInt(u32, mutable_bytes[0..4], 3, .little);
     try testing.expectEqual(@as(u64, 3), state.decodeAt().?.imm);
@@ -44099,7 +45972,7 @@ test "decode cache keeps aligned JIT page addresses spread across sets" {
     try testing.expectEqual(@as(u64, 22), state.decodeAt().?.imm);
     state.regs.rip = first;
     try testing.expectEqual(@as(u64, 11), state.decodeAt().?.imm);
-    try testing.expectEqual(@as(u64, 0), state.decode_cache_collisions);
+    try testing.expectEqual(@as(u64, 0), state.decodeCacheCounts().collisions);
     // The image generation fast path has the same bulk/SIMD obligations.
     state.windows_runtime_enabled = true;
     state.configureWindowsExecutableRanges(&.{.{ .guest_base = first, .length = 0x100 }});
@@ -44161,8 +46034,34 @@ test "decode cache makes a full set an explicit fatal point" {
     try testing.expect(state.terminated);
     try testing.expect(state.faulted);
     try testing.expectEqual(exit_diagnostics.TerminationReason.runtime_invariant_failure, state.termination_reason);
-    try testing.expectEqual(@as(u64, 1), state.decode_cache_collisions);
-    try testing.expectEqual(@as(u64, 1), state.decode_cache_conflict_fills);
+    try testing.expectEqual(@as(u64, 1), state.decodeCacheCounts().collisions);
+    try testing.expectEqual(@as(u64, 1), state.decodeCacheCounts().conflict_fills);
+    // The conflict is the one listed site; the sixteen fills before it are
+    // counted only.
+    try testing.expectEqual(@as(usize, 1), state.decode_cache_miss_site_count);
+    try testing.expectEqual(DecodeCacheMissCause.capacity_conflict, state.decode_cache_miss_sites[0].cause);
+    try testing.expectEqual(@as(u64, PE_DECODE_CACHE_WAYS), state.decode_cache_miss_reports[@intFromEnum(DecodeCacheMissCause.vacant_fill)]);
+}
+
+test "decode-cache miss reports count across shards and list no compulsory fill" {
+    var state = ElfState.initWithMemory(testing.allocator, 0x10000);
+    defer state.deinit();
+    // Misses in different sets land in different shards. A per-shard count
+    // called each of them the first, which is how 4096 shards each reported
+    // their own first fills on 2026-09-30.
+    var shards: [4]usize = undefined;
+    var address = state.mem_base + 0x100;
+    for (&shards) |*shard| {
+        state.write8(address, 0x90);
+        state.regs.rip = address;
+        _ = state.decodeAt() orelse return error.ExpectedInstruction;
+        shard.* = peDecodeCacheSetIndex(address) % decode_cache_set_lock_count;
+        address += 0x40;
+    }
+    try testing.expect(shards[0] != shards[1] or shards[1] != shards[2] or shards[2] != shards[3]);
+    try testing.expectEqual(@as(u64, 4), state.decode_cache_miss_reports[@intFromEnum(DecodeCacheMissCause.vacant_fill)]);
+    try testing.expectEqual(@as(usize, 0), state.decode_cache_miss_site_count);
+    try testing.expectEqual(@as(u64, 0), state.decode_cache_miss_site_overflow);
 }
 
 test "decode cache victim bank recovers a recently displaced instruction" {
@@ -44196,13 +46095,13 @@ test "decode cache victim bank recovers a recently displaced instruction" {
         state.regs.rip = address;
         try testing.expectEqual(@as(u64, @intCast(index + 1)), state.decodeAt().?.imm);
     }
-    try testing.expectEqual(@as(u64, 1), state.decode_cache_collisions);
-    try testing.expectEqual(@as(u64, 1), state.decode_cache_victim_fills);
+    try testing.expectEqual(@as(u64, 1), state.decodeCacheCounts().collisions);
+    try testing.expectEqual(@as(u64, 1), state.decodeCacheCounts().victim_fills);
 
     state.regs.rip = addresses[0];
     try testing.expectEqual(@as(u64, 1), state.decodeAt().?.imm);
-    try testing.expectEqual(@as(u64, 1), state.decode_cache_victim_hits);
-    try testing.expectEqual(@as(u64, addresses.len), state.decode_cache_misses);
+    try testing.expectEqual(@as(u64, 1), state.decodeCacheCounts().victim_hits);
+    try testing.expectEqual(@as(u64, addresses.len), state.decodeCacheCounts().misses);
 }
 
 test "a file failure is classified by what it means, and only an actionable one warns" {
@@ -45965,12 +47864,16 @@ test "cooperative guest contexts keep separate TLBs and mapping changes invalida
     const owner_host = state.mem.ptr + 0x20000;
     const owner_tlb = &state.block_jit_tlb;
     const worker_tlb = state.ensureWindowsGuestThreadTlb(0) orelse return error.OutOfMemory;
+    const second_worker_tlb = state.ensureWindowsGuestThreadTlb(1) orelse return error.OutOfMemory;
 
     try testing.expect(worker_tlb != owner_tlb);
+    try testing.expect(second_worker_tlb != owner_tlb and second_worker_tlb != worker_tlb);
     owner_tlb.fill(true, page, owner_host);
     worker_tlb.fill(true, page, owner_host);
+    second_worker_tlb.fill(true, page, owner_host);
     try testing.expect(owner_tlb.lookup(true, page) != null);
     try testing.expect(worker_tlb.lookup(true, page) != null);
+    try testing.expect(second_worker_tlb.lookup(true, page) != null);
 
     state.block_jit_tlb_active = worker_tlb;
     const worker_context = state.captureWindowsGuestContext();
@@ -45982,6 +47885,45 @@ test "cooperative guest contexts keep separate TLBs and mapping changes invalida
     state.invalidateAllBlockJitTlbs(page, block_jit.Tlb.page_bytes);
     try testing.expect(owner_tlb.lookup(true, page) == null);
     try testing.expect(worker_tlb.lookup(true, page) == null);
+    try testing.expect(second_worker_tlb.lookup(true, page) == null);
+}
+
+test "idempotent page protections do not invalidate live owner or worker TLB entries" {
+    var state = ElfState.initWithMemory(testing.allocator, 0x80000);
+    defer state.deinit();
+    const page = MEM_BASE + 0x30000;
+    const host = state.mem.ptr + 0x30000;
+    const worker_tlb = state.ensureWindowsGuestThreadTlb(0) orelse return error.OutOfMemory;
+
+    state.noteGuestPageProtection(page, block_jit.Tlb.page_bytes, 0x02, "VirtualProtect", 0);
+    state.block_jit_tlb.fill(false, page, host);
+    worker_tlb.fill(false, page, host);
+    state.noteGuestPageProtection(page, block_jit.Tlb.page_bytes, 0x02, "VirtualProtect", 0);
+    try testing.expect(state.block_jit_tlb.lookup(false, page) != null);
+    try testing.expect(worker_tlb.lookup(false, page) != null);
+
+    state.clearGuestPageProtection(page, block_jit.Tlb.page_bytes);
+    state.block_jit_tlb.fill(true, page, host);
+    worker_tlb.fill(true, page, host);
+    state.clearGuestPageProtection(page, block_jit.Tlb.page_bytes);
+    try testing.expect(state.block_jit_tlb.lookup(true, page) != null);
+    try testing.expect(worker_tlb.lookup(true, page) != null);
+}
+
+test "clearing page protection reports when it already invalidated the TLB" {
+    var state = ElfState.initWithMemory(testing.allocator, 0x80000);
+    defer state.deinit();
+    state.setParallelGuestExecution(true);
+    defer state.setParallelGuestExecution(false);
+
+    const page = MEM_BASE + 0x38000;
+    state.noteGuestPageProtection(page, block_jit.Tlb.page_bytes, 0x01, "test protection", 0);
+    const before_clear = state.parallel_tlb_cross_invalidations.load(.monotonic);
+
+    try testing.expect(state.clearGuestPageProtectionAndReportInvalidation(page, block_jit.Tlb.page_bytes));
+    try testing.expectEqual(before_clear + 1, state.parallel_tlb_cross_invalidations.load(.monotonic));
+    try testing.expect(!state.clearGuestPageProtectionAndReportInvalidation(page, block_jit.Tlb.page_bytes));
+    try testing.expectEqual(before_clear + 1, state.parallel_tlb_cross_invalidations.load(.monotonic));
 }
 
 test "parallel mode admits pages to the executing context's TLB and retires them across threads" {
@@ -46040,6 +47982,420 @@ test "parallel mode admits pages to the executing context's TLB and retires them
     try testing.expect(state.activeGuestTsoStoreBuffer() != null);
     state.blockJitTlbConsider(page, 4, false);
     try testing.expect(state.block_jit_tlb.lookup(false, page) == null);
+}
+
+test "native device aliases bypass direct TLBs and invalidate every worker on reuse" {
+    if (!block_jit.CodeMemory.available()) return error.SkipZigTest;
+    var state = ElfState.initWithMemory(testing.allocator, 0x80000);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    if (state.blockJitActive() == null) return error.SkipZigTest;
+    const first_worker = state.ensureWindowsGuestThreadTlb(0) orelse return error.OutOfMemory;
+    const second_worker = state.ensureWindowsGuestThreadTlb(1) orelse return error.OutOfMemory;
+    const owner = &state.block_jit_tlb;
+    const tlbs = [_]*block_jit.Tlb{ owner, first_worker, second_worker };
+    const protected_page = state.mem_base + 0x30000;
+    state.noteGuestPageProtection(protected_page, block_jit.Tlb.page_bytes, 0x01, "VirtualProtect", 0);
+    try testing.expectEqual(tso_memory_policy.MemoryClass.fault_routed, state.guestMemoryClass(protected_page, 4, true));
+
+    state.setParallelGuestExecution(true);
+    defer state.setParallelGuestExecution(false);
+    try testing.expect(state.parallelDirectTlbActive());
+
+    var device_bytes: [block_jit.Tlb.page_bytes * 2]u8 align(4096) = @splat(0);
+    const alias = state.borrowNativeMemory(&device_bytes) orelse return error.OutOfMemory;
+    const page_bytes: u64 = block_jit.Tlb.page_bytes;
+    try testing.expectEqual(@as(u64, 0), alias & (page_bytes - 1));
+    try testing.expectEqual(tso_memory_policy.MemoryClass.device_backed, state.guestMemoryRangeClass(alias, 4, true));
+
+    // A direct translation would skip `storeGuestScalarAt` and give this
+    // host-shared device memory ordinary RAM ordering. Every context must
+    // therefore miss in both directions and use the class-aware helper.
+    for (tlbs) |tlb| {
+        state.block_jit_tlb_active = tlb;
+        state.blockJitTlbConsider(alias, 4, false);
+        state.blockJitTlbConsider(alias, 4, true);
+        try testing.expect(tlb.lookup(false, alias) == null);
+        try testing.expect(tlb.lookup(true, alias) == null);
+    }
+    state.block_jit_tlb_active = null;
+    const alias_jit = state.tlbFillBlockJit() orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u64, 6), alias_jit.tlb_refusal_cache.lookups);
+    try testing.expectEqual(@as(u64, 4), alias_jit.tlb_refusal_cache.hits);
+    try testing.expectEqual(@as(u64, 2), alias_jit.tlb_refusal_cache.misses);
+    try testing.expectEqual(@as(u64, 6), alias_jit.tlb_fill_refusals);
+
+    // Release and re-publish both retire stale owner/worker entries. The
+    // second fill simulates a translation admitted at the lifetime edge;
+    // publication must still revoke it before the slot exposes new bytes.
+    for (tlbs) |tlb| {
+        tlb.fillOrdered(false, alias, &device_bytes);
+        tlb.fillOrdered(true, alias, &device_bytes);
+    }
+    state.releaseNativeMemory(alias);
+    for (tlbs) |tlb| {
+        try testing.expect(tlb.lookup(false, alias) == null);
+        try testing.expect(tlb.lookup(true, alias) == null);
+        tlb.fillOrdered(false, alias, &device_bytes);
+        tlb.fillOrdered(true, alias, &device_bytes);
+    }
+    const reused_alias = state.borrowNativeMemory(&device_bytes) orelse return error.OutOfMemory;
+    try testing.expectEqual(alias, reused_alias);
+    for (tlbs) |tlb| {
+        try testing.expect(tlb.lookup(false, alias) == null);
+        try testing.expect(tlb.lookup(true, alias) == null);
+    }
+    // Reuse advances the TLB epoch, so old negative admissions are checked
+    // again before being memoized for the new alias lifetime.
+    state.blockJitTlbConsider(reused_alias, 4, false);
+    state.blockJitTlbConsider(reused_alias, 4, true);
+    try testing.expectEqual(@as(u64, 4), alias_jit.tlb_refusal_cache.misses);
+    try testing.expectEqual(@as(u64, 4), alias_jit.tlb_refusal_cache.hits);
+
+    // A device operation publishes an earlier temporal RAM store, performs
+    // its own direct update, and leaves no device write in the RAM queue.
+    var queue: tso_memory.StoreBuffer = .{};
+    const previous_queue = tso_memory.setActiveStoreBuffer(&queue);
+    defer _ = tso_memory.setActiveStoreBuffer(previous_queue);
+    tso_memory.store(u32, state.mem[0x100..], 0xA1B2_C3D4);
+    try testing.expectEqual(@as(usize, 1), queue.pendingCount());
+    state.write32(reused_alias + 0x20, 0x1122_3344);
+    try testing.expectEqual(@as(usize, 0), queue.pendingCount());
+    try testing.expectEqual(@as(u32, 0xA1B2_C3D4), std.mem.readInt(u32, state.mem[0x100..][0..4], .little));
+    try testing.expectEqual(@as(u32, 0x1122_3344), std.mem.readInt(u32, device_bytes[0x20..][0..4], .little));
+}
+
+test "non-temporal vector stores publish earlier RAM stores and bypass requeueing" {
+    var state = ElfState.initWithMemory(testing.allocator, 0x80000);
+    defer state.deinit();
+    var queue: tso_memory.StoreBuffer = .{};
+    const previous_queue = tso_memory.setActiveStoreBuffer(&queue);
+    defer _ = tso_memory.setActiveStoreBuffer(previous_queue);
+
+    tso_memory.store(u32, state.mem[0x100..], 0xA1B2_C3D4);
+    try testing.expectEqual(@as(usize, 1), queue.pendingCount());
+    const address = state.mem_base + 0x2000;
+    const payload: [16]u8 = .{ 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F };
+    state.writeMem128NonTemporal(address, payload);
+
+    try testing.expectEqual(@as(usize, 0), queue.pendingCount());
+    try testing.expectEqual(@as(u32, 0xA1B2_C3D4), std.mem.readInt(u32, state.mem[0x100..][0..4], .little));
+    try testing.expectEqualSlices(u8, &payload, state.mem[0x2000..][0..payload.len]);
+}
+
+test "parallel first mapped-code fetch atomically retires every worker write TLB" {
+    if (!block_jit.CodeMemory.available()) return error.SkipZigTest;
+    var state = ElfState.initWithMemory(testing.allocator, 0x80000);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    if (state.blockJitActive() == null) return error.SkipZigTest;
+
+    const mapping: u64 = 0xFFFF_F000_0000_0F21;
+    const code_page: u64 = 0x6000_0000;
+    try testing.expect(state.createWindowsMemoryMapping(mapping, 0x10000, std.math.maxInt(u64)));
+    _ = state.mapWindowsMemoryView(mapping, code_page, 0x10000, 0).?;
+    const first_worker = state.ensureWindowsGuestThreadTlb(0) orelse return error.OutOfMemory;
+    const second_worker = state.ensureWindowsGuestThreadTlb(1) orelse return error.OutOfMemory;
+
+    state.setParallelGuestExecution(true);
+    defer state.setParallelGuestExecution(false);
+    const host = state.windowsMappedMemoryConst(code_page, block_jit.Tlb.page_bytes).?.ptr;
+    const tlbs = [_]*block_jit.Tlb{ &state.block_jit_tlb, first_worker, second_worker };
+    for (tlbs) |tlb| {
+        tlb.fillOrdered(false, code_page, @constCast(host));
+        tlb.fillOrdered(true, code_page, @constCast(host));
+    }
+    const range = state.windows_mapped_ranges.find(code_page, 1).?;
+    try testing.expect(!state.mappedRangeCodeFetched(range));
+    const invalidations_before = state.parallel_tlb_cross_invalidations.load(.monotonic);
+
+    const ConcurrentFetch = struct {
+        state: *ElfState,
+        source: WindowsMappedCodeSlice,
+        ready: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        start: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+        fn mark(self: *@This()) void {
+            _ = self.ready.fetchAdd(1, .release);
+            while (self.start.load(.acquire) == 0) std.atomic.spinLoopHint();
+            self.state.noteMappedCodeFetched(self.source);
+        }
+    };
+    const source = state.windowsMappedCodeMemoryConst(code_page, 1).?;
+    var concurrent = ConcurrentFetch{ .state = &state, .source = source };
+    const first = try std.Thread.spawn(.{}, ConcurrentFetch.mark, .{&concurrent});
+    const second = try std.Thread.spawn(.{}, ConcurrentFetch.mark, .{&concurrent});
+    while (concurrent.ready.load(.acquire) != 2) std.atomic.spinLoopHint();
+    concurrent.start.store(1, .release);
+    first.join();
+    second.join();
+
+    try testing.expect(state.mappedRangeCodeFetched(range));
+    try testing.expectEqual(invalidations_before + 1, state.parallel_tlb_cross_invalidations.load(.monotonic));
+    for (tlbs) |tlb| {
+        try testing.expect(tlb.lookup(false, code_page) != null);
+        try testing.expect(tlb.lookup(true, code_page) == null);
+    }
+}
+
+test "parallel mapped alias write publishes code bytes before its shared generation" {
+    var state = ElfState.initWithMemory(testing.allocator, 0x80000);
+    defer state.deinit();
+    const mapping: u64 = 0xFFFF_F000_0000_0F22;
+    const code: u64 = 0x6000_0000;
+    const alias: u64 = 0x7000_0000;
+    try testing.expect(state.createWindowsMemoryMapping(mapping, 0x10000, std.math.maxInt(u64)));
+    _ = state.mapWindowsMemoryView(mapping, code, 0x10000, 0).?;
+    _ = state.mapWindowsMemoryView(mapping, alias, 0x10000, 0).?;
+    const mapping_index = state.windowsMappingIndex(mapping).?;
+    const initial_generation = ElfState.loadCodeGeneration(&state.windows_file_mappings[mapping_index].code_generation);
+    state.parallel_guest_execution = true;
+    defer state.parallel_guest_execution = false;
+
+    const Shared = struct {
+        state: *ElfState,
+        generation: *const u64,
+        initial_generation: u64,
+        code_address: u64,
+        expected: [8]u8,
+        ready: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        start: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        result: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+
+        fn observe(self: *@This()) void {
+            _ = self.ready.fetchAdd(1, .release);
+            while (self.start.load(.acquire) == 0) std.atomic.spinLoopHint();
+            for (0..2_000_000) |_| {
+                if (ElfState.loadCodeGeneration(self.generation) <= self.initial_generation) {
+                    std.atomic.spinLoopHint();
+                    continue;
+                }
+                self.result.store(if (self.state.guestCodeRangeMatches(self.code_address, &self.expected)) 1 else 2, .release);
+                return;
+            }
+            self.result.store(3, .release);
+        }
+    };
+    var shared = Shared{
+        .state = &state,
+        .generation = &state.windows_file_mappings[mapping_index].code_generation,
+        .initial_generation = initial_generation,
+        .code_address = code,
+        .expected = .{ 0x48, 0xB8, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 },
+    };
+    const observer = try std.Thread.spawn(.{}, Shared.observe, .{&shared});
+    while (shared.ready.load(.acquire) != 1) std.atomic.spinLoopHint();
+    shared.start.store(1, .release);
+    const copied = state.copyToGuest(alias, &shared.expected);
+    observer.join();
+    try testing.expect(copied);
+    try testing.expectEqual(@as(u8, 1), shared.result.load(.acquire));
+    try testing.expectEqual(initial_generation + 1, ElfState.loadCodeGeneration(shared.generation));
+}
+
+test "a translator table grows fourfold without evicting and empties the slots links named" {
+    if (!block_jit.CodeMemory.available()) return error.SkipZigTest;
+    var state = ElfState.initWithMemory(testing.allocator, 0x80000);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    const jit = BlockJitState.createSized(testing.allocator, 16, 64 << 20) orelse return error.SkipZigTest;
+    defer jit.destroy(testing.allocator);
+    jit.max_entries = 64;
+
+    // Four sets of four ways; seat what fits, as `runBlockJit` would.
+    const program = [_]u8{ 0x48, 0x83, 0xC0, 0x01, 0xC3 }; // add rax, 1 ; ret
+    var seated: usize = 0;
+    var linked_slot: ?*?*block_jit.Block = null;
+    for (0..12) |index| {
+        const rip = state.mem_base + 0x1000 + index * 0x40;
+        try testing.expect(state.copyToGuest(rip, &program));
+        const block = state.compileBlockJit(jit, rip) orelse return error.TestUnexpectedResult;
+        const base = jit.firstSlot(rip);
+        for (jit.blocks[base .. base + BLOCK_JIT_WAYS]) |*slot| {
+            if (slot.* == null) {
+                slot.* = block;
+                seated += 1;
+                linked_slot = slot;
+                break;
+            }
+        } else BlockJitState.freeBlock(testing.allocator, block);
+        jit.hotness[base] = .{ .rip = rip, .count = 20 };
+    }
+    const hot_before = blk: {
+        var count: usize = 0;
+        for (jit.hotness) |entry| {
+            if (entry.rip != 0) count += 1;
+        }
+        break :blk count;
+    };
+
+    // Not while a translated execution is live, and not below an eighth.
+    jit.pressure = 1;
+    try testing.expect(!jit.growIfPressed(testing.allocator));
+    jit.pressure = 2;
+    jit.lifetime.enter();
+    try testing.expect(!jit.growIfPressed(testing.allocator));
+    _ = jit.lifetime.leave(testing.allocator);
+    try testing.expect(jit.growIfPressed(testing.allocator));
+
+    try testing.expectEqual(@as(usize, 64), jit.blocks.len);
+    try testing.expectEqual(@as(u32, 1), jit.growths);
+    try testing.expectEqual(@as(u64, 0), jit.pressure);
+    try testing.expectEqual(seated, jit.liveBlocks());
+    for (jit.blocks, 0..) |maybe, index| {
+        const block = maybe orelse continue;
+        const base = jit.firstSlot(block.start_rip);
+        try testing.expect(index >= base and index < base + BLOCK_JIT_WAYS);
+    }
+    var hot_after: usize = 0;
+    for (jit.hotness) |entry| {
+        if (entry.rip != 0) hot_after += 1;
+    }
+    try testing.expectEqual(hot_before, hot_after);
+    // A chain link into the old table now reads null and is re-armed.
+    try testing.expect(linked_slot.?.* == null);
+    try testing.expectEqual(@as(usize, 1), jit.retired_tables.items.len);
+
+    // The ceiling holds.
+    jit.pressure = 1 << 20;
+    try testing.expect(!jit.growIfPressed(testing.allocator));
+    try testing.expectEqual(@as(usize, 64), jit.blocks.len);
+}
+
+test "a parallel executor batches its code-fetch ledger additions but publishes a ledger still at zero at once" {
+    if (!block_jit.CodeMemory.available()) return error.SkipZigTest;
+    const jit = BlockJitState.createSized(testing.allocator, 16, 64 << 20) orelse return error.SkipZigTest;
+    defer jit.destroy(testing.allocator);
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.setParallelGuestExecution(true);
+    defer state.setParallelGuestExecution(false);
+
+    // The first fetches publish at once: readiness reads "non-zero".
+    state.noteBlockJitCodeFetches(jit, 10, 0);
+    try testing.expectEqual(@as(u64, 10), state.windows_generated_code_fetches);
+    state.noteBlockJitCodeFetches(jit, 10, 4);
+    try testing.expectEqual(@as(u64, 4), state.windows_title_code_fetches);
+
+    // After that the executor's share waits in its own state for a batch.
+    state.noteBlockJitCodeFetches(jit, 100, 100);
+    try testing.expectEqual(@as(u64, 20), state.windows_generated_code_fetches);
+    try testing.expectEqual(@as(u64, 4), state.windows_title_code_fetches);
+    state.noteBlockJitCodeFetches(jit, ElfState.block_jit_fetch_publish_batch, 0);
+    try testing.expectEqual(@as(u64, 120 + ElfState.block_jit_fetch_publish_batch), state.windows_generated_code_fetches);
+    try testing.expectEqual(@as(u64, 104), state.windows_title_code_fetches);
+    try testing.expectEqual(@as(u64, 0), jit.pending_generated_fetches);
+}
+
+test "a hotness entry taken from a warming address counts as table pressure" {
+    if (!block_jit.CodeMemory.available()) return error.SkipZigTest;
+    const jit = BlockJitState.createSized(testing.allocator, 16, 64 << 20) orelse return error.SkipZigTest;
+    defer jit.destroy(testing.allocator);
+
+    // Five addresses in one set: the fifth must take a way from a warming one.
+    var same_set: [BLOCK_JIT_WAYS + 1]u64 = undefined;
+    var found: usize = 0;
+    var candidate: u64 = 0x1_4000_0000;
+    const target_base = jit.firstSlot(candidate);
+    while (found < same_set.len) : (candidate += 2) {
+        if (jit.firstSlot(candidate) != target_base) continue;
+        same_set[found] = candidate;
+        found += 1;
+    }
+    for (same_set[0..BLOCK_JIT_WAYS]) |rip| {
+        const hot = ElfState.blockJitHotness(jit, rip);
+        hot.count = 3;
+    }
+    try testing.expectEqual(@as(u64, 0), jit.hotness_replacements);
+    const newcomer = ElfState.blockJitHotness(jit, same_set[BLOCK_JIT_WAYS]);
+    try testing.expectEqual(same_set[BLOCK_JIT_WAYS], newcomer.rip);
+    try testing.expectEqual(@as(u64, 1), jit.hotness_replacements);
+    try testing.expectEqual(@as(u64, 1), jit.pressure);
+}
+
+test "unmapping generated-code aliases retires owner and worker block caches" {
+    if (!block_jit.CodeMemory.available()) return error.SkipZigTest;
+    var state = ElfState.initWithMemory(testing.allocator, 0x80000);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    const mapping: u64 = 0xFFFF_F000_0000_0F23;
+    const owner_code: u64 = 0x6000_0000;
+    const worker_code: u64 = 0x7000_0000;
+    try testing.expect(state.createWindowsMemoryMapping(mapping, 0x10000, std.math.maxInt(u64)));
+    _ = state.mapWindowsMemoryView(mapping, owner_code, 0x10000, 0).?;
+    _ = state.mapWindowsMemoryView(mapping, worker_code, 0x10000, 0).?;
+    const program = [_]u8{ 0x48, 0x83, 0xC0, 0x01, 0xC3 }; // add rax, 1 ; ret
+    try testing.expect(state.copyToGuest(owner_code, &program));
+
+    const owner_jit = state.blockJitActive() orelse return error.SkipZigTest;
+    state.parallel_guest_execution = true;
+    defer state.parallel_guest_execution = false;
+    const worker_jit = state.parallelWorkerBlockJit(0) orelse return error.SkipZigTest;
+    const mapping_index = state.windowsMappingIndex(mapping).?;
+    const owner_block = state.compileBlockJit(owner_jit, owner_code) orelse return error.TestUnexpectedResult;
+    const worker_block = state.compileBlockJit(worker_jit, worker_code) orelse return error.TestUnexpectedResult;
+    try testing.expect(owner_block.source_mapped and worker_block.source_mapped);
+    try testing.expectEqual(mapping_index, owner_block.source_index);
+    try testing.expectEqual(mapping_index, worker_block.source_index);
+
+    const owner_slot = owner_jit.firstSlot(owner_code);
+    const worker_slot = worker_jit.firstSlot(worker_code);
+    owner_jit.blocks[owner_slot] = owner_block;
+    worker_jit.blocks[worker_slot] = worker_block;
+    try testing.expectEqual(@as(usize, 1), owner_jit.liveBlocks());
+    try testing.expectEqual(@as(usize, 1), worker_jit.liveBlocks());
+
+    try testing.expect(state.unmapWindowsMemoryView(worker_code));
+    try testing.expect(owner_jit.blocks[owner_slot] == null);
+    try testing.expect(worker_jit.blocks[worker_slot] == null);
+    try testing.expectEqual(@as(u64, 1), owner_jit.dropped_unmapped);
+    try testing.expectEqual(@as(u64, 1), worker_jit.dropped_unmapped);
+}
+
+test "parallel executable alias writes stale owner and worker translations by generation" {
+    if (!block_jit.CodeMemory.available()) return error.SkipZigTest;
+    var state = ElfState.initWithMemory(testing.allocator, 0x80000);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+    const mapping: u64 = 0xFFFF_F000_0000_0F24;
+    const owner_code: u64 = 0x6000_0000;
+    const worker_code: u64 = 0x7000_0000;
+    const writer_alias: u64 = 0x8000_0000;
+    try testing.expect(state.createWindowsMemoryMapping(mapping, 0x10000, std.math.maxInt(u64)));
+    _ = state.mapWindowsMemoryView(mapping, owner_code, 0x10000, 0).?;
+    _ = state.mapWindowsMemoryView(mapping, worker_code, 0x10000, 0).?;
+    _ = state.mapWindowsMemoryView(mapping, writer_alias, 0x10000, 0).?;
+    const original = [_]u8{ 0x48, 0x83, 0xC0, 0x01, 0xC3 }; // add rax, 1 ; ret
+    const replacement = [_]u8{ 0x48, 0x83, 0xC0, 0x02, 0xC3 }; // add rax, 2 ; ret
+    try testing.expect(state.copyToGuest(owner_code, &original));
+
+    const owner_jit = state.blockJitActive() orelse return error.SkipZigTest;
+    state.parallel_guest_execution = true;
+    defer state.parallel_guest_execution = false;
+    const worker_jit = state.parallelWorkerBlockJit(0) orelse return error.SkipZigTest;
+    const mapping_index = state.windowsMappingIndex(mapping).?;
+    const owner_block = state.compileBlockJit(owner_jit, owner_code) orelse return error.TestUnexpectedResult;
+    const worker_block = state.compileBlockJit(worker_jit, worker_code) orelse return error.TestUnexpectedResult;
+    try testing.expect(owner_block.source_mapped and worker_block.source_mapped);
+    try testing.expectEqual(mapping_index, owner_block.source_index);
+    try testing.expectEqual(mapping_index, worker_block.source_index);
+    const initial_generation = ElfState.loadCodeGeneration(&state.windows_file_mappings[mapping_index].code_generation);
+
+    const owner_slot = owner_jit.firstSlot(owner_code);
+    const worker_slot = worker_jit.firstSlot(worker_code);
+    owner_jit.blocks[owner_slot] = owner_block;
+    worker_jit.blocks[worker_slot] = worker_block;
+    try testing.expectEqual(@as(usize, 1), owner_jit.liveBlocks());
+    try testing.expectEqual(@as(usize, 1), worker_jit.liveBlocks());
+
+    // Write through a third alias. The mapping-wide release generation must
+    // make both executors reject their cached old bytes on their next entry.
+    try testing.expect(state.copyToGuest(writer_alias, &replacement));
+    try testing.expectEqual(initial_generation + 1, ElfState.loadCodeGeneration(&state.windows_file_mappings[mapping_index].code_generation));
+    try testing.expect(state.blockJitFindValidSlot(owner_jit, owner_code) == null);
+    try testing.expect(state.blockJitFindValidSlot(worker_jit, worker_code) == null);
+    try testing.expectEqual(@as(u64, 1), owner_jit.dropped_stale);
+    try testing.expectEqual(@as(u64, 1), worker_jit.dropped_stale);
 }
 
 test "parallel PE scheduler starts a private guest context on a host worker" {
