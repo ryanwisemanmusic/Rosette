@@ -86,10 +86,10 @@ typedef struct RosetteMachONativeWindowGeometry {
   uint32_t reserved_screen;
 } RosetteMachONativeWindowGeometry;
 
-// A keyboard-backed virtual XInput/Xam controller. The first sixteen bytes
-// intentionally match XINPUT_STATE; the trailing counters stay on the host
-// side and make an input report actionable without exposing AppKit objects to
-// the guest.
+// A host-backed XInput/Xam controller snapshot. The first sixteen bytes
+// intentionally match XINPUT_STATE; trailing diagnostics identify keyboard
+// focus and physical-controller delivery without exposing Apple framework
+// objects to the guest.
 typedef struct RosetteMachOKeyboardControllerState {
   uint32_t packet_number;
   uint16_t buttons;
@@ -109,9 +109,13 @@ typedef struct RosetteMachOKeyboardControllerState {
   uint64_t rejected_key_events;
   uint32_t last_key_code;
   uint32_t input_contract_version;
+  uint32_t physical_controller_connected;
+  uint32_t physical_controller_reserved;
+  uint64_t physical_controller_events;
+  char physical_controller_name[64];
 } RosetteMachOKeyboardControllerState;
-_Static_assert(sizeof(RosetteMachOKeyboardControllerState) == 80,
-               "keyboard controller state must match the Zig input hook");
+_Static_assert(sizeof(RosetteMachOKeyboardControllerState) == 160,
+               "keyboard/gamepad controller state must match the Zig input hook");
 
 // The Zig mirror in lib/gpu/window_geometry.zig is filled by writing through
 // a pointer to this type, so the two layouts have to be the same object. A
@@ -131,6 +135,10 @@ int rosette_macho_native_window_read_controller_state(
 int rosette_macho_native_application_ensure(void);
 int rosette_macho_native_window_ensure(uint32_t width, uint32_t height,
                                       const char *title);
+// Publish successful native presents for the input latch and their measured
+// WSI cadence for a passive, low-frequency on-window HUD.
+void rosette_macho_native_window_set_frame_counter(uint64_t raw_frame,
+                                                   uint64_t presented_fps_milli);
 int rosette_macho_native_window_set_title(const char *title);
 int rosette_macho_native_window_set_size(uint32_t width, uint32_t height);
 int rosette_macho_native_window_show(void);

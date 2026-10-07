@@ -1,8 +1,11 @@
 #import "native_window_bridge.h"
+#import "input_controller_bridge.h"
 
 #import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/CATextLayer.h>
+#import <QuartzCore/CATransaction.h>
 #import <dispatch/dispatch.h>
 #include <math.h>
 #include <stdio.h>
@@ -14,6 +17,8 @@
 #include <time.h>
 
 static void RosetteMachOUpdateMetalDrawable(void);
+static void RosetteMachOActivateWindowForInput(void);
+static void RosetteMachOUpdateFPSHUDTextOnMainThread(void);
 
 @interface RosetteMachOMetalView : NSView <CALayerDelegate>
 @end
@@ -84,19 +89,10 @@ static void RosetteMachOApplyKeyboardEvent(NSEvent *event, BOOL down);
 - (void)mouseDown:(NSEvent *)event {
   NSWindow *window = self.window;
   if (window != nil) {
-    // A content click is the user's explicit request to interact. This is
-    // deliberately not done during creation: the emulator may start behind
-    // another application, but clicking it must behave like any normal Cocoa
-    // window and make keyboard delivery possible.
-    if (!window.isKeyWindow) {
-      // This is an explicit user gesture.  Passing NO leaves a background
-      // Rosetta process inactive on macOS, so AppKit can play its blocked
-      // action sound while the window still appears to have been clicked.
-      // Do not use this during creation: the launch path is intentionally
-      // allowed to start behind another application.
-      [NSApp activateIgnoringOtherApps:YES];
-      [window makeKeyAndOrderFront:nil];
-    }
+    // A content click is an explicit request to interact. The same activation
+    // helper is used when the guest window is first created, so a game launched
+    // from a shell does not appear live while silently discarding all input.
+    RosetteMachOActivateWindowForInput();
     [window makeFirstResponder:self];
   }
   [super mouseDown:event];
@@ -108,6 +104,7 @@ static NSApplication *g_application;
 static NSWindow *g_window;
 static RosetteMachOMetalView *g_view;
 static CAMetalLayer *g_metal_layer;
+static CATextLayer *g_fps_hud_layer;
 static _Atomic(uintptr_t) g_native_metal_layer_pointer = ATOMIC_VAR_INIT(0);
 static id<MTLDevice> g_metal_device;
 static id<MTLCommandQueue> g_metal_command_queue;
@@ -169,21 +166,15 @@ static uint64_t g_keyboard_focus_loss_events;
 static uint64_t g_keyboard_rejected_key_events;
 static uint32_t g_keyboard_last_key_code;
 static BOOL g_reported_keyboard_mapping;
+static _Atomic uint64_t g_presented_fps_milli = ATOMIC_VAR_INIT(0);
+static _Atomic BOOL g_presented_fps_valid = ATOMIC_VAR_INIT(false);
 
-// A press must outlive the guest's polling interval. At a few frames a second
-// the guest samples its controllers once per frame, so a 100 ms tap lands
-// between two samples and the title never sees it. Each down edge therefore
-// latches the key until the presented frame count has advanced twice, which
-// spans at least one whole inter-frame interval and so at least one poll. The
-// wall-clock cap keeps a key from sticking if presents stop, and without a
-// frame clock (a route that never presents through Vulkan) the latch is a
-// short fixed hold instead.
-static const uint64_t kRosetteKeyboardLatchFrames = 2u;
-static const uint64_t kRosetteKeyboardLatchCapNs = 3000000000ull;
-static const uint64_t kRosetteKeyboardLatchNoClockNs = 150000000ull;
-static _Atomic uint64_t g_guest_frame_clock;
+// A quick tap that begins and ends between guest polls needs one snapshot to
+// be observed. It must not persist across presented frames, or a slow guest
+// menu can interpret one press as several navigation requests.
+static const uint64_t kRosetteKeyboardQuickTapExpiryNs = 3000000000ull;
 static BOOL g_keyboard_latched[128];
-static uint64_t g_keyboard_press_frame[128];
+static BOOL g_keyboard_press_observed[128];
 static uint64_t g_keyboard_press_ns[128];
 // The last state handed out, so a latch that expires between two physical
 // events still changes the packet number. XInput callers may skip a packet
@@ -195,6 +186,7 @@ static int16_t g_keyboard_reported_axes[4];
 static void RosetteMachOClearKeyboardStateLocked(void) {
   memset(g_keyboard_keys, 0, sizeof(g_keyboard_keys));
   memset(g_keyboard_latched, 0, sizeof(g_keyboard_latched));
+  memset(g_keyboard_press_observed, 0, sizeof(g_keyboard_press_observed));
 }
 
 static void RosetteMachOUpdateKeyboardFocusOnMainThread(void) {
@@ -213,6 +205,7 @@ static void RosetteMachOUpdateKeyboardFocusOnMainThread(void) {
 
   const BOOL focused = g_window.isKeyWindow;
   pthread_mutex_lock(&g_keyboard_lock);
+  const BOOL focus_changed = focused != g_keyboard_focused;
   if (focused && !g_keyboard_focused) {
     ++g_keyboard_focus_gain_events;
     ++g_keyboard_packet;
@@ -227,6 +220,20 @@ static void RosetteMachOUpdateKeyboardFocusOnMainThread(void) {
   g_keyboard_window_available = YES;
   g_keyboard_focused = focused;
   pthread_mutex_unlock(&g_keyboard_lock);
+  if (focus_changed) RosetteMachOUpdateFPSHUDTextOnMainThread();
+}
+
+/// Make the guest's own window the interactive foreground window. Rosette is
+/// launched explicitly by the user for a game session; showing its first game
+/// window without activating it left Xenia rendering a menu while every
+/// XamInput poll saw an unfocused, all-zero controller. Subsequent ShowWindow
+/// calls remain non-activating so guest visibility changes cannot steal focus.
+static void RosetteMachOActivateWindowForInput(void) {
+  if (!g_application || !g_window) return;
+  [g_application activateIgnoringOtherApps:YES];
+  [g_window makeKeyAndOrderFront:nil];
+  if (g_view) [g_window makeFirstResponder:g_view];
+  RosetteMachOUpdateKeyboardFocusOnMainThread();
 }
 
 static void RosetteMachOApplyKeyboardEvent(NSEvent *event, BOOL down) {
@@ -252,14 +259,17 @@ static void RosetteMachOApplyKeyboardEvent(NSEvent *event, BOOL down) {
     if (!was_down) {
       g_keyboard_keys[key_code] = YES;
       g_keyboard_latched[key_code] = YES;
-      g_keyboard_press_frame[key_code] =
-          atomic_load_explicit(&g_guest_frame_clock, memory_order_relaxed);
+      g_keyboard_press_observed[key_code] = NO;
       g_keyboard_press_ns[key_code] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
       ++g_keyboard_packet;
       ++g_keyboard_key_down_events;
     }
   } else if (was_down) {
     g_keyboard_keys[key_code] = NO;
+    // A press the guest already sampled has been delivered. Keep a released
+    // key only when press and release both happened between snapshots.
+    g_keyboard_latched[key_code] = !g_keyboard_press_observed[key_code];
+    g_keyboard_press_observed[key_code] = NO;
     ++g_keyboard_packet;
     ++g_keyboard_key_up_events;
   }
@@ -268,23 +278,44 @@ static void RosetteMachOApplyKeyboardEvent(NSEvent *event, BOOL down) {
 
 static BOOL RosetteMachOKeyboardKeyDownLocked(NSUInteger key_code) {
   if (key_code >= 128u) return NO;
-  if (g_keyboard_keys[key_code]) return YES;
+  if (g_keyboard_keys[key_code]) {
+    g_keyboard_press_observed[key_code] = YES;
+    return YES;
+  }
   if (!g_keyboard_latched[key_code]) return NO;
-  const uint64_t clock =
-      atomic_load_explicit(&g_guest_frame_clock, memory_order_relaxed);
   const uint64_t held_ns =
       clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - g_keyboard_press_ns[key_code];
-  const BOOL frame_clock_running = clock != 0u;
-  const BOOL still_latched =
-      frame_clock_running
-          ? (clock - g_keyboard_press_frame[key_code] <
-                 kRosetteKeyboardLatchFrames &&
-             held_ns < kRosetteKeyboardLatchCapNs)
-          : held_ns < kRosetteKeyboardLatchNoClockNs;
-  if (!still_latched) {
+  if (held_ns >= kRosetteKeyboardQuickTapExpiryNs) {
     g_keyboard_latched[key_code] = NO;
+    g_keyboard_press_observed[key_code] = NO;
     return NO;
   }
+  g_keyboard_press_observed[key_code] = YES;
+  return YES;
+}
+
+// D-pad navigation is a button press, not a sustained movement axis. Return
+// one edge for each physical key-down (or one coalesced quick tap), even when
+// the guest polls XInput repeatedly while AppKit still considers the key held.
+// This prevents a slow frame loop from interpreting one arrow press as many
+// menu navigation requests.
+static BOOL RosetteMachOKeyboardKeyPressedLocked(NSUInteger key_code) {
+  if (key_code >= 128u) return NO;
+  if (g_keyboard_keys[key_code]) {
+    if (g_keyboard_press_observed[key_code]) return NO;
+    g_keyboard_press_observed[key_code] = YES;
+    return YES;
+  }
+  if (!g_keyboard_latched[key_code]) return NO;
+  const uint64_t held_ns =
+      clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - g_keyboard_press_ns[key_code];
+  if (held_ns >= kRosetteKeyboardQuickTapExpiryNs) {
+    g_keyboard_latched[key_code] = NO;
+    g_keyboard_press_observed[key_code] = NO;
+    return NO;
+  }
+  if (g_keyboard_press_observed[key_code]) return NO;
+  g_keyboard_press_observed[key_code] = YES;
   return YES;
 }
 
@@ -341,6 +372,7 @@ static BOOL RosetteMachOHasFinitePositiveRect(NSRect rect) {
 static BOOL RosetteMachOEnsureWindowOnMainThread(uint32_t width,
                                                  uint32_t height,
                                                  NSString *title);
+static void RosetteMachOEnsureFPSHUDOnMainThread(void);
 
 static void RosetteMachOEnforceLockedWindowSizeOnMainThread(const char *reason);
 
@@ -536,6 +568,32 @@ static void RosetteMachOConfigureOrdinaryWindowPolicy(void) {
   g_window.hidesOnDeactivate = NO;
 }
 
+static void RosetteMachOUpdateFPSHUDTextOnMainThread(void) {
+  if (!g_fps_hud_layer) return;
+
+  pthread_mutex_lock(&g_keyboard_lock);
+  const BOOL focused = g_keyboard_focused;
+  pthread_mutex_unlock(&g_keyboard_lock);
+
+  NSString *text = nil;
+  if (!focused) {
+    text = @"CLICK TO FOCUS";
+  } else if (atomic_load_explicit(&g_presented_fps_valid,
+                                  memory_order_acquire)) {
+    const double fps = (double)atomic_load_explicit(
+                           &g_presented_fps_milli, memory_order_relaxed) /
+                       1000.0;
+    text = [NSString stringWithFormat:@"FPS %.1f", fps];
+  } else {
+    text = @"FPS --.-";
+  }
+
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  g_fps_hud_layer.string = text;
+  [CATransaction commit];
+}
+
 static void RosetteMachOShowWindowOnMainThread(const char *reason) {
   if (!g_window || !g_application) {
     return;
@@ -545,15 +603,19 @@ static void RosetteMachOShowWindowOnMainThread(const char *reason) {
   if (g_window.isMiniaturized) {
     [g_window deminiaturize:nil];
   }
-  // Only creation or an explicit guest ShowWindow reaches here. Neither
-  // event is permission to activate over the user's currently focused app.
-  // `orderFront:` is ignored for a background application on some AppKit
-  // paths, which left the swapchain fully alive but the host window absent
-  // from the screen. `orderFrontRegardless` performs the non-activating
-  // ordering operation we need: it does not make the window always-on-top,
-  // key, or immovable, and the user can still put another application above
-  // it normally.
-  [g_window orderFrontRegardless];
+  // The user explicitly launched this game runner. Activate the first game
+  // window so its virtual controller can receive input; this avoids a visible
+  // but permanently idle menu when a shell-launched app is not the active
+  // application. Later guest ShowWindow calls preserve user focus.
+  const BOOL initial_window = reason && strcmp(reason, "created") == 0;
+  if (initial_window) {
+    RosetteMachOActivateWindowForInput();
+  } else {
+    // `orderFront:` is ignored for a background application on some AppKit
+    // paths. This still makes an explicitly shown guest window observable
+    // without reactivating the app or changing the user's foreground choice.
+    [g_window orderFrontRegardless];
+  }
   RosetteMachOPlaceWindowSafely();
   RosetteMachOUpdateMetalDrawable();
   ++g_foreground_reassertions;
@@ -562,10 +624,12 @@ static void RosetteMachOShowWindowOnMainThread(const char *reason) {
   if (sparse_report) {
     fprintf(stderr,
             "macho-processor: AppKit window shown: reason=%s count=%llu "
-            "level=normal ordering=front_regardless activation=unchanged "
+            "level=normal ordering=%s activation=%s "
             "visible=%d on_screen=%d key=%d occlusion=%lu "
             "occlusion_policy=user_owned\n",
             reason ? reason : "unspecified", (unsigned long long)count,
+            initial_window ? "key_and_front" : "front_regardless",
+            initial_window ? "initial_window" : "unchanged",
             g_window.isVisible ? 1 : 0, g_window.screen != nil ? 1 : 0,
             g_window.isKeyWindow ? 1 : 0,
             (unsigned long)g_window.occlusionState);
@@ -738,6 +802,41 @@ static void RosetteMachOUpdateMetalDrawable(void) {
   (void)backing_scale;
 }
 
+/// A passive Core Animation overlay sublayer keeps the FPS text out of the
+/// guest's Vulkan image and avoids an extra window, readback, or per-frame
+/// AppKit hop. Coordinates are points; the locked window keeps the drawable
+/// at 1280x720 while the HUD stays inset from the content layer's lower-right.
+static void RosetteMachOEnsureFPSHUDOnMainThread(void) {
+  if (!g_metal_layer) {
+    return;
+  }
+  if (!g_fps_hud_layer) {
+    g_fps_hud_layer = [CATextLayer layer];
+    g_fps_hud_layer.name = @"Rosette FPS";
+    g_fps_hud_layer.anchorPoint = CGPointMake(1.0, 0.0);
+    g_fps_hud_layer.bounds = CGRectMake(0.0, 0.0, 132.0, 22.0);
+    g_fps_hud_layer.font = (__bridge CFTypeRef)
+        [NSFont monospacedDigitSystemFontOfSize:12.0 weight:NSFontWeightMedium];
+    g_fps_hud_layer.fontSize = 12.0;
+    g_fps_hud_layer.alignmentMode = kCAAlignmentRight;
+    g_fps_hud_layer.foregroundColor = NSColor.whiteColor.CGColor;
+    g_fps_hud_layer.backgroundColor =
+        [NSColor colorWithCalibratedWhite:0.0 alpha:0.58].CGColor;
+    g_fps_hud_layer.cornerRadius = 4.0;
+    g_fps_hud_layer.masksToBounds = YES;
+    g_fps_hud_layer.string = @"CLICK TO FOCUS";
+    g_fps_hud_layer.zPosition = 1000.0;
+    [g_metal_layer addSublayer:g_fps_hud_layer];
+  }
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  g_fps_hud_layer.contentsScale = MAX(g_metal_layer.contentsScale, 1.0);
+  g_fps_hud_layer.position = CGPointMake(
+      CGRectGetMaxX(g_metal_layer.bounds) - 12.0, 12.0);
+  [CATransaction commit];
+  RosetteMachOUpdateFPSHUDTextOnMainThread();
+}
+
 int rosette_macho_native_window_set_drawable_owner(int owned_by_swapchain) {
   __block BOOL changed = NO;
   @autoreleasepool {
@@ -833,6 +932,7 @@ int rosette_macho_native_window_prepare_drawable_size(uint32_t width,
 
 static BOOL RosetteMachOEnsureApplicationOnMainThread(void) {
   if (g_application) {
+    rosette_macho_input_controller_ensure();
     return YES;
   }
   g_application = [NSApplication sharedApplication];
@@ -841,6 +941,7 @@ static BOOL RosetteMachOEnsureApplicationOnMainThread(void) {
   }
   [g_application setActivationPolicy:NSApplicationActivationPolicyRegular];
   [g_application finishLaunching];
+  rosette_macho_input_controller_ensure();
   return YES;
 }
 
@@ -852,6 +953,7 @@ static BOOL RosetteMachOEnsureWindowOnMainThread(uint32_t width,
   }
   if (g_window && g_view && g_metal_layer && g_metal_device) {
     RosetteMachOConfigureWindowPlacementPolicyOnMainThread();
+    RosetteMachOEnsureFPSHUDOnMainThread();
     if (title.length) {
       g_window.title = title;
     }
@@ -958,6 +1060,7 @@ static BOOL RosetteMachOEnsureWindowOnMainThread(uint32_t width,
   pthread_mutex_unlock(&g_keyboard_lock);
   RosetteMachOPlaceWindowSafely();
   RosetteMachOUpdateMetalDrawable();
+  RosetteMachOEnsureFPSHUDOnMainThread();
   RosetteMachOShowWindowOnMainThread("created");
   return YES;
 }
@@ -994,19 +1097,17 @@ int rosette_macho_native_window_ensure(uint32_t width, uint32_t height,
 /// The main window's title is Rosette's, not the guest's: "Rosette — frame N".
 ///
 /// Once set, a guest SetWindowText no longer replaces it, because the guest
-/// title (Xenia's) carries nothing the frame count does not already say and
-/// the frame count is the only live progress readout on screen.
+/// title (Xenia's) carries nothing useful for this runner. Successful native
+/// Vulkan presentation cadence is shown separately in the lower-right HUD.
 ///
 /// Asynchronous on purpose. Every guest thread runs on the one host thread
 /// that calls this, so a synchronous hop to the main thread would stall the
 /// whole emulation for however long AppKit takes to repaint a title bar.
 static BOOL g_rosette_frame_title_owned = NO;
 static uint64_t g_rosette_frame_title_last_ns;
-void rosette_macho_native_window_set_frame_counter(uint64_t frame) {
+void rosette_macho_native_window_set_frame_counter(uint64_t frame,
+                                                   uint64_t presented_fps_milli) {
   g_rosette_frame_title_owned = YES;
-  // Every present advances the keyboard latch's clock; only the title is
-  // throttled.
-  atomic_store_explicit(&g_guest_frame_clock, frame, memory_order_relaxed);
   const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
   if (g_rosette_frame_title_last_ns != 0u &&
       now - g_rosette_frame_title_last_ns < 250000000ull) {
@@ -1014,11 +1115,25 @@ void rosette_macho_native_window_set_frame_counter(uint64_t frame) {
   }
   g_rosette_frame_title_last_ns = now;
   const unsigned long long value = (unsigned long long)frame;
+  const BOOL has_present_rate = frame >= 2u && presented_fps_milli != 0u;
+  atomic_store_explicit(&g_presented_fps_milli, presented_fps_milli,
+                        memory_order_relaxed);
+  atomic_store_explicit(&g_presented_fps_valid, has_present_rate,
+                        memory_order_release);
   dispatch_async(dispatch_get_main_queue(), ^{
     if (!g_window) return;
     g_window.title = [NSString stringWithFormat:@"Rosette — frame %llu", value];
+    RosetteMachOUpdateFPSHUDTextOnMainThread();
   });
 }
+
+// The Mach-O forwarder resolves this bridge function by name so tests that do
+// not link AppKit stay independent of the window implementation. ReleaseFast
+// dead-strips functions reachable only through dlsym, so retain a relocation
+// to keep the callback in the final exported symbol table.
+__attribute__((used, retain))
+static void (*const g_frame_counter_dlsym_anchor)(uint64_t, uint64_t) =
+    rosette_macho_native_window_set_frame_counter;
 
 int rosette_macho_native_window_set_title(const char *title) {
   if (!title) {
@@ -1431,9 +1546,11 @@ int rosette_macho_native_window_read_controller_state(
     return 0;
   }
   memset(out, 0, sizeof(*out));
+  RosetteMachOPhysicalControllerState physical = {0};
+  rosette_macho_input_controller_read(&physical);
   pthread_mutex_lock(&g_keyboard_lock);
   ++g_keyboard_snapshot_reads;
-  out->connected = g_keyboard_window_available ? 1u : 0u;
+  out->connected = (g_keyboard_window_available || physical.connected) ? 1u : 0u;
   out->focused = g_keyboard_focused ? 1u : 0u;
   out->key_down_events = g_keyboard_key_down_events;
   out->key_up_events = g_keyboard_key_up_events;
@@ -1442,7 +1559,11 @@ int rosette_macho_native_window_read_controller_state(
   out->focus_loss_events = g_keyboard_focus_loss_events;
   out->rejected_key_events = g_keyboard_rejected_key_events;
   out->last_key_code = g_keyboard_last_key_code;
-  out->input_contract_version = 2u;
+  out->physical_controller_connected = physical.connected;
+  out->physical_controller_events = physical.value_events;
+  memcpy(out->physical_controller_name, physical.name,
+         sizeof(out->physical_controller_name));
+  out->input_contract_version = 5u;
   if (g_keyboard_window_available && g_keyboard_focused) {
     // Left stick: WASD. XInput's positive Y is up.
     out->thumb_lx = RosetteMachOAxisLocked(0u, 2u);   // A / D
@@ -1451,10 +1572,14 @@ int rosette_macho_native_window_read_controller_state(
     out->thumb_rx = RosetteMachOAxisLocked(38u, 37u); // J / L
     out->thumb_ry = RosetteMachOAxisLocked(40u, 34u); // K / I
 
-    if (ROSETTE_KEYS_DOWN(kRosetteKeysDpadUp)) out->buttons |= 0x0001u;
-    if (ROSETTE_KEYS_DOWN(kRosetteKeysDpadDown)) out->buttons |= 0x0002u;
-    if (ROSETTE_KEYS_DOWN(kRosetteKeysDpadLeft)) out->buttons |= 0x0004u;
-    if (ROSETTE_KEYS_DOWN(kRosetteKeysDpadRight)) out->buttons |= 0x0008u;
+    if (RosetteMachOKeyboardKeyPressedLocked(kRosetteKeysDpadUp[0]))
+      out->buttons |= 0x0001u;
+    if (RosetteMachOKeyboardKeyPressedLocked(kRosetteKeysDpadDown[0]))
+      out->buttons |= 0x0002u;
+    if (RosetteMachOKeyboardKeyPressedLocked(kRosetteKeysDpadLeft[0]))
+      out->buttons |= 0x0004u;
+    if (RosetteMachOKeyboardKeyPressedLocked(kRosetteKeysDpadRight[0]))
+      out->buttons |= 0x0008u;
     if (ROSETTE_KEYS_DOWN(kRosetteKeysStart)) out->buttons |= 0x0010u;
     if (ROSETTE_KEYS_DOWN(kRosetteKeysBack)) out->buttons |= 0x0020u;
     if (ROSETTE_KEYS_DOWN(kRosetteKeysLThumb)) out->buttons |= 0x0040u;
@@ -1468,6 +1593,29 @@ int rosette_macho_native_window_read_controller_state(
     if (ROSETTE_KEYS_DOWN(kRosetteKeysY)) out->buttons |= 0x8000u;
     if (ROSETTE_KEYS_DOWN(kRosetteKeysLT)) out->left_trigger = 255u;
     if (ROSETTE_KEYS_DOWN(kRosetteKeysRT)) out->right_trigger = 255u;
+  }
+  // Every mapping has sampled the same controller snapshot. Retire a
+  // released quick-tap latch now so the next XInput poll sees the release.
+  for (NSUInteger key_code = 0; key_code < 128u; ++key_code) {
+    if (!g_keyboard_keys[key_code] && g_keyboard_latched[key_code] &&
+        g_keyboard_press_observed[key_code]) {
+      g_keyboard_latched[key_code] = NO;
+      g_keyboard_press_observed[key_code] = NO;
+    }
+  }
+  // A physical controller is independent of keyboard focus. This keeps a
+  // gamepad usable when the window is not key, while keyboard input remains
+  // focus-gated to avoid sending unrelated typing to the guest.
+  if (physical.connected) {
+    out->buttons |= physical.buttons;
+    if (physical.left_trigger > out->left_trigger)
+      out->left_trigger = physical.left_trigger;
+    if (physical.right_trigger > out->right_trigger)
+      out->right_trigger = physical.right_trigger;
+    if (physical.thumb_lx != 0) out->thumb_lx = physical.thumb_lx;
+    if (physical.thumb_ly != 0) out->thumb_ly = physical.thumb_ly;
+    if (physical.thumb_rx != 0) out->thumb_rx = physical.thumb_rx;
+    if (physical.thumb_ry != 0) out->thumb_ry = physical.thumb_ry;
   }
   const BOOL changed =
       out->buttons != g_keyboard_reported_buttons ||
@@ -1488,12 +1636,12 @@ int rosette_macho_native_window_read_controller_state(
     g_keyboard_reported_axes[3] = out->thumb_ry;
   }
   out->packet_number = g_keyboard_packet;
-  const BOOL available = g_keyboard_window_available;
+  const BOOL available = g_keyboard_window_available || physical.connected;
   pthread_mutex_unlock(&g_keyboard_lock);
 
   if (!g_reported_keyboard_mapping && available) {
     fprintf(stderr,
-            "macho-processor: INPUT BRIDGE: virtual keyboard controller active on user 0 only; mapping=" ROSETTE_KEYBOARD_MAPPING_TEXT "; a press is held until two frames have been presented so a slow guest still polls it; the controller reports zero state when unfocused\n");
+            "macho-processor: INPUT BRIDGE: user 0 combines a focus-gated virtual keyboard pad and the first connected physical extended gamepad; mapping=" ROSETTE_KEYBOARD_MAPPING_TEXT "; D-pad arrows are one-shot per key-down (auto-repeat suppressed), other mapped keys stay down until key-up, an unseen quick tap is delivered in one controller snapshot (maximum stale age 3 s), and physical controller state is independent of window focus\n");
     g_reported_keyboard_mapping = YES;
   }
   return available ? 1 : 0;

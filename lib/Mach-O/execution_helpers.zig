@@ -204,14 +204,14 @@ pub fn executeRotate(self: anytype, d: DecodedInsn) void {
     if (count == 0) return;
 
     const mask = maskForSize(d.size);
-    const old = (if (is_mem) self.readMemVal(d.addr, d.size) else self.regVal(d.dst_reg, d.size)) & mask;
+    const old = (if (is_mem) self.readMemVal(d.addr, d.size) else self.regOperandVal(d.dst_reg, d.size, d.dst_high8)) & mask;
     const inverse: u6 = @intCast(width - count);
     const result = if (rotate_left)
         ((old << count) | (old >> inverse)) & mask
     else
         ((old >> count) | (old << inverse)) & mask;
 
-    if (is_mem) self.writeMemVal(d.addr, d.size, result) else self.setReg(d.dst_reg, d.size, result);
+    if (is_mem) self.writeMemVal(d.addr, d.size, result) else self.setRegOperand(d.dst_reg, d.size, d.dst_high8, result);
     if (rotate_left) {
         const carry = (result & 1) != 0;
         self.setFlag(RFL_CF, carry);
