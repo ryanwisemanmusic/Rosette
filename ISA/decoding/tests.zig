@@ -595,6 +595,162 @@ test "VEX operand roles cover arithmetic moves and scalar lane forms" {
     try std.testing.expect(extract_q.is_reg_form);
 }
 
+test "VEX.W selects the operand width wherever x86 says it does" {
+    // A W1 form decoded as its W0 sibling is the silent kind of decoder
+    // defect: both are valid, so nothing faults, and only the data is wrong.
+    // 0F3A 22 W1 (VPINSRQ) decoded as VPINSRD inserted a dword into lane 1
+    // instead of a qword into the upper half; Xenia's deque iterator rebuild
+    // turned that into the 2026-10-03 campaign-launch heap walk.
+    const Case = struct { bytes: []const u8, op: types.Op, size: types.Size };
+    const cases = [_]Case{
+        .{ .bytes = &.{ 0xC4, 0xE1, 0x79, 0x6E, 0xC0 }, .op = .vmovd_xmm_reg32, .size = .bits32 }, // vmovd xmm0, eax
+        .{ .bytes = &.{ 0xC4, 0xC1, 0xF9, 0x6E, 0xC6 }, .op = .vmovq_xmm_reg64, .size = .bits64 }, // vmovq xmm0, r14
+        .{ .bytes = &.{ 0xC4, 0xE1, 0x79, 0x7E, 0xC0 }, .op = .vmovd_reg32_xmm, .size = .bits32 }, // vmovd eax, xmm0
+        .{ .bytes = &.{ 0xC4, 0xE1, 0xF9, 0x7E, 0xC0 }, .op = .vmovq_reg64_xmm, .size = .bits64 }, // vmovq rax, xmm0
+        .{ .bytes = &.{ 0xC4, 0xE3, 0x79, 0x16, 0xC0, 0x01 }, .op = .vpextrd, .size = .bits32 }, // vpextrd eax, xmm0, 1
+        .{ .bytes = &.{ 0xC4, 0xE3, 0xF9, 0x16, 0xC0, 0x01 }, .op = .vpextrq, .size = .bits64 }, // vpextrq rax, xmm0, 1
+        .{ .bytes = &.{ 0xC4, 0xE3, 0x71, 0x22, 0xCB, 0x01 }, .op = .vpinsrd, .size = .bits32 }, // vpinsrd xmm1, xmm1, ebx, 1
+        .{ .bytes = &.{ 0xC4, 0xE3, 0xF1, 0x22, 0xCB, 0x01 }, .op = .vpinsrq, .size = .bits64 }, // vpinsrq xmm1, xmm1, rbx, 1
+        .{ .bytes = &.{ 0xC4, 0xE3, 0xF1, 0x22, 0x08, 0x01 }, .op = .vpinsrq, .size = .bits64 }, // vpinsrq xmm1, xmm1, [rax], 1
+        .{ .bytes = &.{ 0xC4, 0xE1, 0x7A, 0x2A, 0xC0 }, .op = .vcvtsi2ss_xmm_reg, .size = .bits32 }, // vcvtsi2ss xmm0, xmm0, eax
+        .{ .bytes = &.{ 0xC4, 0xE1, 0xFA, 0x2A, 0xC0 }, .op = .vcvtsi2ss_xmm_reg, .size = .bits64 }, // vcvtsi2ss xmm0, xmm0, rax
+        .{ .bytes = &.{ 0xC4, 0xE1, 0x7B, 0x2A, 0xC0 }, .op = .vcvtsi2sd_xmm_reg, .size = .bits32 }, // vcvtsi2sd xmm0, xmm0, eax
+        .{ .bytes = &.{ 0xC4, 0xE1, 0xFB, 0x2A, 0xC0 }, .op = .vcvtsi2sd_xmm_reg, .size = .bits64 }, // vcvtsi2sd xmm0, xmm0, rax
+        .{ .bytes = &.{ 0xC4, 0xE1, 0x7A, 0x2C, 0xC0 }, .op = .vcvttss2si, .size = .bits32 }, // vcvttss2si eax, xmm0
+        .{ .bytes = &.{ 0xC4, 0xE1, 0xFA, 0x2C, 0xC0 }, .op = .vcvttss2si, .size = .bits64 }, // vcvttss2si rax, xmm0
+        .{ .bytes = &.{ 0xC4, 0xE1, 0xFB, 0x2C, 0xC0 }, .op = .vcvttsd2si, .size = .bits64 }, // vcvttsd2si rax, xmm0
+        .{ .bytes = &.{ 0xC4, 0xE1, 0xFA, 0x2D, 0xC0 }, .op = .vcvtss2si, .size = .bits64 }, // vcvtss2si rax, xmm0
+        .{ .bytes = &.{ 0xC4, 0xE1, 0xFB, 0x2D, 0xC0 }, .op = .vcvtsd2si, .size = .bits64 }, // vcvtsd2si rax, xmm0
+        .{ .bytes = &.{ 0xC4, 0xE2, 0x60, 0xF2, 0xC1 }, .op = .andn, .size = .bits32 }, // andn eax, ebx, ecx
+        .{ .bytes = &.{ 0xC4, 0xE2, 0xE0, 0xF2, 0xC1 }, .op = .andn, .size = .bits64 }, // andn rax, rbx, rcx
+        .{ .bytes = &.{ 0xC4, 0xE2, 0x71, 0xF7, 0xC3 }, .op = .shlx, .size = .bits32 }, // shlx eax, ebx, ecx
+        .{ .bytes = &.{ 0xC4, 0xE2, 0xF1, 0xF7, 0xC3 }, .op = .shlx, .size = .bits64 }, // shlx rax, rbx, rcx
+        .{ .bytes = &.{ 0xC4, 0xE2, 0xF3, 0xF7, 0xC3 }, .op = .shrx, .size = .bits64 }, // shrx rax, rbx, rcx
+        .{ .bytes = &.{ 0xC4, 0xE2, 0xF2, 0xF7, 0xC3 }, .op = .sarx, .size = .bits64 }, // sarx rax, rbx, rcx
+        .{ .bytes = &.{ 0xC4, 0xE3, 0x7B, 0xF0, 0xC3, 0x03 }, .op = .rorx, .size = .bits32 }, // rorx eax, ebx, 3
+        .{ .bytes = &.{ 0xC4, 0xE3, 0xFB, 0xF0, 0xC3, 0x03 }, .op = .rorx, .size = .bits64 }, // rorx rax, rbx, 3
+        .{ .bytes = &.{ 0xC4, 0xE2, 0xF0, 0xF5, 0xC3 }, .op = .bzhi, .size = .bits64 }, // bzhi rax, rbx, rcx
+        .{ .bytes = &.{ 0xC4, 0xE2, 0xE3, 0xF6, 0xC1 }, .op = .mulx, .size = .bits64 }, // mulx rax, rbx, rcx
+    };
+    for (cases) |case| {
+        const decoded = legacy.decodeLegacyInstruction(case.bytes, .long64);
+        if (decoded.op != case.op or decoded.size != case.size or decoded.len != case.bytes.len) {
+            std.debug.print("VEX.W: bytes={any} decoded op={s} size={s} len={d}, expected op={s} size={s} len={d}\n", .{
+                case.bytes, @tagName(decoded.op), @tagName(decoded.size), decoded.len, @tagName(case.op), @tagName(case.size), case.bytes.len,
+            });
+            return error.TestUnexpectedResult;
+        }
+    }
+    // 0F3A 23 and 2A are not VEX instructions; VPINSRW lives at 0F C4.
+    try std.testing.expectEqual(types.Op.invalid, legacy.decodeLegacyInstruction(&.{ 0xC4, 0xE3, 0xF1, 0x23, 0xCB, 0x01 }, .long64).op);
+    try std.testing.expectEqual(types.Op.invalid, legacy.decodeLegacyInstruction(&.{ 0xC4, 0xE3, 0x71, 0x2A, 0xC8, 0x01 }, .long64).op);
+    try std.testing.expectEqual(types.Op.vpinsrw, legacy.decodeLegacyInstruction(&.{ 0xC5, 0xF1, 0xC4, 0xC8, 0x03 }, .long64).op);
+}
+
+/// Whether an operation's tag names a byte register operand (`_reg8`).
+fn tagHasByteRegister(name: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, name, '_');
+    while (parts.next()) |part| {
+        if (std.mem.eql(u8, part, "reg8")) return true;
+    }
+    return false;
+}
+
+test "without REX a byte register operand is AH..BH, never SPL..DIL" {
+    // `RegId.highByte()` is false, so a raw id 4-7 in a byte operand reads
+    // SPL/BPL/SIL/DIL. Without a REX prefix x86 means AH/CH/DH/BH there, which
+    // `decodeRegister` encodes as ids 0-3 with the high8 flag. Five decode
+    // paths kept the raw id: F6 (libstdc++'s `testb $8, %ah` tested RSP's low
+    // byte), 84, the C0/D0/D2 shifts, 0F B0/C0 and FE. Every one-byte and 0F
+    // opcode, every register ModR/M and every memory form's reg field, is
+    // held to the rule here.
+    var checked: usize = 0;
+    for ([_]bool{ false, true }) |two_byte| {
+        var opcode: u16 = 0;
+        while (opcode <= 0xFF) : (opcode += 1) {
+            if (two_byte and (opcode == 0x38 or opcode == 0x3A)) continue;
+            var modrm: u16 = 0;
+            while (modrm <= 0xFF) : (modrm += 1) {
+                // Register forms, plus `[rax]` for each reg field.
+                if (modrm < 0xC0 and (modrm & 0xC7) != 0) continue;
+                var bytes = [_]u8{0} ** 8;
+                var count: usize = 0;
+                if (two_byte) {
+                    bytes[count] = 0x0F;
+                    count += 1;
+                }
+                bytes[count] = @intCast(opcode);
+                bytes[count + 1] = @intCast(modrm);
+                // Room for any immediate.
+                count += 6;
+                const decoded = legacy.decodeLegacyInstruction(bytes[0..count], .long64);
+                if (decoded.op == .invalid) continue;
+                const name = @tagName(decoded.op);
+                if (decoded.size != .bits8 and !tagHasByteRegister(name)) continue;
+                checked += 1;
+                // MOVZX/MOVSX write a full register from a byte source.
+                const wide_destination = std.mem.startsWith(u8, name, "movzx") or std.mem.startsWith(u8, name, "movsx");
+                const dst = @intFromEnum(decoded.dst_reg);
+                const src = @intFromEnum(decoded.src_reg);
+                const dst_misread = !wide_destination and dst >= 4 and dst <= 7 and !decoded.dst_high8;
+                const src_misread = src >= 4 and src <= 7 and !decoded.src_high8;
+                if (dst_misread or src_misread) {
+                    std.debug.print("byte register without REX decoded as SPL..DIL: {s}{x:0>2} {x:0>2} -> {s} dst={s}{s} src={s}{s}\n", .{
+                        if (two_byte) "0F " else "", opcode,                                   modrm,
+                        name,                        @tagName(decoded.dst_reg),                if (decoded.dst_high8) "(high8)" else "",
+                        @tagName(decoded.src_reg),   if (decoded.src_high8) "(high8)" else "",
+                    });
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+    }
+    // A census that admitted nothing would pass vacuously.
+    try std.testing.expect(checked > 4000);
+
+    // With any REX prefix the same codes are SPL..DIL.
+    const spl = legacy.decodeLegacyInstruction(&.{ 0x40, 0xFE, 0xC4 }, .long64);
+    try std.testing.expectEqual(types.Op.inc_reg8, spl.op);
+    try std.testing.expectEqual(@as(u8, 4), @intFromEnum(spl.dst_reg));
+    try std.testing.expect(!spl.dst_high8);
+    const ah = legacy.decodeLegacyInstruction(&.{ 0xF6, 0xC4, 0x08 }, .long64);
+    try std.testing.expectEqual(types.Op.test_reg8_imm8, ah.op);
+    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(ah.dst_reg));
+    try std.testing.expect(ah.dst_high8);
+}
+
+test "fixed-width opcodes keep their width whatever the prefixes say" {
+    // FE is INC/DEC r/m8 and 84 is TEST r/m8 under every prefix; 66 0F AF is
+    // a 16-bit IMUL; and FF's INC/DEC carry their width in `size`, which the
+    // LOCK paths size their atomics from.
+    const Case = struct { bytes: []const u8, op: types.Op, size: types.Size };
+    const cases = [_]Case{
+        .{ .bytes = &.{ 0xFE, 0x00 }, .op = .inc_mem8, .size = .bits8 }, // incb [rax]
+        .{ .bytes = &.{ 0x66, 0xFE, 0x08 }, .op = .dec_mem8, .size = .bits8 }, // 66 is ignored
+        .{ .bytes = &.{ 0x48, 0xFE, 0xC1 }, .op = .inc_reg8, .size = .bits8 }, // REX.W is ignored
+        .{ .bytes = &.{ 0xFE, 0xCD }, .op = .dec_reg8, .size = .bits8 }, // decb %ch
+        .{ .bytes = &.{ 0xFF, 0x00 }, .op = .inc_mem32, .size = .bits32 },
+        .{ .bytes = &.{ 0x66, 0xFF, 0x00 }, .op = .inc_mem16, .size = .bits16 },
+        .{ .bytes = &.{ 0xF0, 0x48, 0xFF, 0x43, 0x20 }, .op = .inc_mem64, .size = .bits64 }, // lock incq [rbx+0x20]
+        .{ .bytes = &.{ 0xF0, 0x48, 0xFF, 0x08 }, .op = .dec_mem64, .size = .bits64 }, // lock decq [rax]
+        .{ .bytes = &.{ 0x48, 0x84, 0xC0 }, .op = .test_reg8_reg8, .size = .bits8 },
+        .{ .bytes = &.{ 0x66, 0x84, 0x00 }, .op = .test_mem8_reg8, .size = .bits8 },
+        .{ .bytes = &.{ 0x66, 0x0F, 0xAF, 0xD1 }, .op = .imul_reg16_reg16, .size = .bits16 }, // imul dx, cx
+        .{ .bytes = &.{ 0x66, 0x44, 0x0F, 0xAF, 0x4C, 0x50, 0xFA }, .op = .imul_reg16_mem16, .size = .bits16 }, // xenia_canary.exe
+        .{ .bytes = &.{ 0x0F, 0xAF, 0xD1 }, .op = .imul_reg32_reg32, .size = .bits32 },
+        .{ .bytes = &.{ 0x48, 0x0F, 0xAF, 0xD1 }, .op = .imul_reg64_reg64, .size = .bits64 },
+    };
+    for (cases) |case| {
+        const decoded = legacy.decodeLegacyInstruction(case.bytes, .long64);
+        if (decoded.op != case.op or decoded.size != case.size or decoded.len != case.bytes.len) {
+            std.debug.print("fixed width: bytes={any} decoded op={s} size={s} len={d}, expected op={s} size={s} len={d}\n", .{
+                case.bytes, @tagName(decoded.op), @tagName(decoded.size), decoded.len, @tagName(case.op), @tagName(case.size), case.bytes.len,
+            });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 test "every decoder family analyzes cleanly (refAllDecls)" {
     std.testing.refAllDecls(types);
     std.testing.refAllDecls(coverage);

@@ -387,7 +387,7 @@ pub fn decodeGroup1Imm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: 
     return d;
 }
 
-pub fn decodeGroup2Shift(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode: u8) DecodedInsn {
+pub fn decodeGroup2Shift(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode: u8, has_rex: bool) DecodedInsn {
     var d = DecodedInsn{};
     var pos = start_pos + 1;
     if (pos >= bytes.len) return .{};
@@ -449,7 +449,10 @@ pub fn decodeGroup2Shift(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x
     if (is_mem) {
         d.addr = rm.addr;
     } else {
-        d.dst_reg = addressing.rmRegister(rm.addr);
+        // Byte shifts name AH..BH by codes 4-7 unless a REX prefix is present.
+        const register = decodeRegister(modrm & 7, rex_b, is_byte, has_rex);
+        d.dst_reg = register.id;
+        d.dst_high8 = register.high8;
     }
     d.len = @intCast(pos);
     return d;
@@ -509,7 +512,7 @@ pub fn decodeMovMemImm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: 
     return d;
 }
 
-pub fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode: u8) DecodedInsn {
+pub fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode: u8, has_rex: bool) DecodedInsn {
     var d = DecodedInsn{};
     var pos = start_pos + 1;
     if (pos >= bytes.len) return .{};
@@ -519,6 +522,11 @@ pub fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
     const is_mem = modrm < 0xC0;
     const sz: Size = if (opcode == 0xF6) .bits8 else if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
+    // F6's register operand is a byte register: AH/CH/DH/BH without REX,
+    // SPL/BPL/SIL/DIL with one (decodeRegister). The raw ModRM id named
+    // SPL for AH, so libstdc++'s `testb $8, %ah` (showpos, in
+    // __num_base::_S_format_float) tested RSP's low byte instead.
+    const rm_register = decodeRegister(modrm & 7, rex_b, sz == .bits8, has_rex);
 
     if (group == 2) {
         const base_op: Op = if (is_mem) .not_mem8 else .not_reg8;
@@ -527,7 +535,8 @@ pub fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
         if (is_mem) {
             d.addr = rm.addr;
         } else {
-            d.dst_reg = addressing.rmRegister(rm.addr);
+            d.dst_reg = rm_register.id;
+            d.dst_high8 = rm_register.high8;
         }
         d.len = @intCast(pos);
         return d;
@@ -540,7 +549,8 @@ pub fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
         if (is_mem) {
             d.addr = rm.addr;
         } else {
-            d.dst_reg = addressing.rmRegister(rm.addr);
+            d.dst_reg = rm_register.id;
+            d.dst_high8 = rm_register.high8;
         }
         d.len = @intCast(pos);
         return d;
@@ -556,8 +566,10 @@ pub fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
         }
         d.op = @enumFromInt(@intFromEnum(Op.mul_reg8) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
         d.size = sz;
-        d.dst_reg = addressing.rmRegister(rm.addr);
-        d.src_reg = addressing.rmRegister(rm.addr);
+        d.dst_reg = rm_register.id;
+        d.dst_high8 = rm_register.high8;
+        d.src_reg = rm_register.id;
+        d.src_high8 = rm_register.high8;
         d.len = @intCast(pos);
         return d;
     }
@@ -572,8 +584,10 @@ pub fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
         }
         d.op = @enumFromInt(@intFromEnum(Op.imul_reg8) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
         d.size = sz;
-        d.dst_reg = addressing.rmRegister(rm.addr);
-        d.src_reg = addressing.rmRegister(rm.addr);
+        d.dst_reg = rm_register.id;
+        d.dst_high8 = rm_register.high8;
+        d.src_reg = rm_register.id;
+        d.src_high8 = rm_register.high8;
         d.len = @intCast(pos);
         return d;
     }
@@ -582,8 +596,14 @@ pub fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
         const base_op: Op = if (is_mem) .div_mem8 else .div_reg8;
         d.op = @enumFromInt(@intFromEnum(base_op) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
         d.size = sz;
-        if (is_mem) d.addr = rm.addr else d.dst_reg = addressing.rmRegister(rm.addr);
-        if (!is_mem) d.src_reg = addressing.rmRegister(rm.addr);
+        if (is_mem) {
+            d.addr = rm.addr;
+        } else {
+            d.dst_reg = rm_register.id;
+            d.dst_high8 = rm_register.high8;
+            d.src_reg = rm_register.id;
+            d.src_high8 = rm_register.high8;
+        }
         d.len = @intCast(pos);
         return d;
     }
@@ -591,8 +611,14 @@ pub fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
         const base_op: Op = if (is_mem) .idiv_mem8 else .idiv_reg8;
         d.op = @enumFromInt(@intFromEnum(base_op) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
         d.size = sz;
-        if (is_mem) d.addr = rm.addr else d.dst_reg = addressing.rmRegister(rm.addr);
-        if (!is_mem) d.src_reg = addressing.rmRegister(rm.addr);
+        if (is_mem) {
+            d.addr = rm.addr;
+        } else {
+            d.dst_reg = rm_register.id;
+            d.dst_high8 = rm_register.high8;
+            d.src_reg = rm_register.id;
+            d.src_high8 = rm_register.high8;
+        }
         d.len = @intCast(pos);
         return d;
     }
@@ -622,14 +648,15 @@ pub fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
     if (is_mem) {
         d.addr = rm.addr;
     } else {
-        d.dst_reg = addressing.rmRegister(rm.addr);
+        d.dst_reg = rm_register.id;
+        d.dst_high8 = rm_register.high8;
         d.is_reg_form = true;
     }
     d.len = @intCast(pos);
     return d;
 }
 
-pub fn decodeGroup4_5(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode: u8) DecodedInsn {
+pub fn decodeGroup4_5(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode: u8, has_rex: bool) DecodedInsn {
     var d = DecodedInsn{};
     var pos = start_pos + 1;
     if (pos >= bytes.len) return .{};
@@ -640,22 +667,24 @@ pub fn decodeGroup4_5(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: b
     const sz: Size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
 
     if (opcode == 0xFE) {
-        const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
-        if (group == 0) {
+        // FE is INC/DEC r/m8 whatever the prefixes say; only FF follows the
+        // operand-size attribute (the rule 0F B0 follows for CMPXCHG). Sizing
+        // FE from the attribute decoded every `incb`/`decb` as a 32-bit
+        // update: a byte counter that wrapped carried into its neighbours, a
+        // `decb` countdown kept going past zero, and `incb %ah` became
+        // `inc %esp`.
+        const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, .bits8);
+        d.size = .bits8;
+        if (group == 0 or group == 1) {
+            const is_inc = group == 0;
             if (is_mem) {
-                d.op = @enumFromInt(@intFromEnum(Op.inc_mem8) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
+                d.op = if (is_inc) .inc_mem8 else .dec_mem8;
                 d.addr = rm.addr;
             } else {
-                d.op = @enumFromInt(@intFromEnum(Op.inc_reg8) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
-                d.dst_reg = addressing.rmRegister(rm.addr);
-            }
-        } else if (group == 1) {
-            if (is_mem) {
-                d.op = @enumFromInt(@intFromEnum(Op.dec_mem8) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
-                d.addr = rm.addr;
-            } else {
-                d.op = @enumFromInt(@intFromEnum(Op.dec_reg8) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
-                d.dst_reg = addressing.rmRegister(rm.addr);
+                d.op = if (is_inc) .inc_reg8 else .dec_reg8;
+                const register = decodeRegister(modrm & 7, rex_b, true, has_rex);
+                d.dst_reg = register.id;
+                d.dst_high8 = register.high8;
             }
         } else {
             d.op = .invalid;
@@ -668,6 +697,11 @@ pub fn decodeGroup4_5(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: b
         const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
         switch (group) {
             0 => {
+                // The op tag names the width, but both executors' LOCK paths
+                // size the atomic from `d.size`: left at its bits32 default,
+                // Xenia's 25 `lock incq`/`lock decq` sites ran as 32-bit
+                // atomics in the interpreter and in translated code.
+                d.size = sz;
                 if (is_mem) {
                     d.op = @enumFromInt(@intFromEnum(Op.inc_mem8) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
                     d.addr = rm.addr;
@@ -677,6 +711,7 @@ pub fn decodeGroup4_5(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: b
                 }
             },
             1 => {
+                d.size = sz;
                 if (is_mem) {
                     d.op = @enumFromInt(@intFromEnum(Op.dec_mem8) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
                     d.addr = rm.addr;
@@ -746,15 +781,19 @@ pub fn decodeGroup4_5(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: b
     return d;
 }
 
-pub fn decodeTestRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode: u8) DecodedInsn {
+pub fn decodeTestRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode: u8, has_rex: bool) DecodedInsn {
     var d = DecodedInsn{};
     var pos = start_pos + 1;
     if (pos >= bytes.len) return .{};
     const modrm = bytes[pos];
-    const sz: Size = if (rex_w) .bits64 else if (has_66) .bits16 else if (opcode == 0x84) .bits8 else .bits32;
+    // 84 is TEST r/m8, r8 whatever the prefixes say; only 85 follows the
+    // operand-size attribute.
+    const sz: Size = if (opcode == 0x84) .bits8 else if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
     const is_mem = modrm < 0xC0;
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
     d.size = sz;
+    // Without REX, byte register codes 4-7 are AH/CH/DH/BH.
+    const reg_operand = decodeRegister((modrm >> 3) & 7, rex_r, sz == .bits8, has_rex);
 
     if (is_mem) {
         d.op = switch (sz) {
@@ -764,7 +803,8 @@ pub fn decodeTestRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: 
             .bits64 => .test_mem64_reg64,
         };
         d.addr = rm.addr;
-        d.src_reg = rm.reg;
+        d.src_reg = reg_operand.id;
+        d.src_high8 = reg_operand.high8;
     } else {
         d.op = switch (sz) {
             .bits8 => .test_reg8_reg8,
@@ -772,8 +812,11 @@ pub fn decodeTestRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: 
             .bits32 => .test_reg32_reg32,
             .bits64 => .test_reg64_reg64,
         };
-        d.dst_reg = rm.reg;
-        d.src_reg = addressing.rmRegister(rm.addr);
+        const rm_operand = decodeRegister(modrm & 7, rex_b, sz == .bits8, has_rex);
+        d.dst_reg = reg_operand.id;
+        d.dst_high8 = reg_operand.high8;
+        d.src_reg = rm_operand.id;
+        d.src_high8 = rm_operand.high8;
     }
 
     d.len = @as(u8, @intCast(pos));
@@ -888,20 +931,26 @@ pub fn decodeImulTwoOp(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: 
     const sz: Size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
 
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
+    // 66 0F AF is IMUL r16, r/m16: it writes only the low word. It used to
+    // fall into the 32-bit tags, which wrote 32 bits (zeroing 32-63 of the
+    // destination) and read four bytes of memory.
+    d.size = sz;
 
     if (is_mem) {
         d.op = switch (sz) {
+            .bits16 => .imul_reg16_mem16,
             .bits32 => .imul_reg32_mem32,
             .bits64 => .imul_reg64_mem64,
-            else => .imul_reg32_mem32,
+            .bits8 => unreachable,
         };
         d.dst_reg = rm.reg;
         d.addr = rm.addr;
     } else {
         d.op = switch (sz) {
+            .bits16 => .imul_reg16_reg16,
             .bits32 => .imul_reg32_reg32,
             .bits64 => .imul_reg64_reg64,
-            else => .imul_reg32_reg32,
+            .bits8 => unreachable,
         };
         d.dst_reg = rm.reg;
         d.src_reg = addressing.rmRegister(rm.addr);
@@ -911,7 +960,7 @@ pub fn decodeImulTwoOp(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: 
     return d;
 }
 
-pub fn decodeCmpxchg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode2: u8) DecodedInsn {
+pub fn decodeCmpxchg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode2: u8, has_rex: bool) DecodedInsn {
     var d = DecodedInsn{};
     var pos = start_pos + 1;
     if (pos >= bytes.len) return .{};
@@ -936,6 +985,8 @@ pub fn decodeCmpxchg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bo
     const modrm = bytes[pos];
     const is_mem = modrm < 0xC0;
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
+    // Without REX, byte register codes 4-7 are AH/CH/DH/BH.
+    const reg_operand = decodeRegister((modrm >> 3) & 7, rex_r, sz == .bits8, has_rex);
 
     if (is_mem) {
         d.op = switch (sz) {
@@ -945,7 +996,8 @@ pub fn decodeCmpxchg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bo
             .bits64 => .cmpxchg_mem64_reg64,
         };
         d.addr = rm.addr;
-        d.src_reg = rm.reg;
+        d.src_reg = reg_operand.id;
+        d.src_high8 = reg_operand.high8;
     } else {
         d.op = switch (sz) {
             .bits8 => .cmpxchg_reg8_reg8,
@@ -953,8 +1005,11 @@ pub fn decodeCmpxchg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bo
             .bits32 => .cmpxchg_reg32_reg32,
             .bits64 => .cmpxchg_reg64_reg64,
         };
-        d.dst_reg = addressing.rmRegister(rm.addr);
-        d.src_reg = rm.reg;
+        const rm_operand = decodeRegister(modrm & 7, rex_b, sz == .bits8, has_rex);
+        d.dst_reg = rm_operand.id;
+        d.dst_high8 = rm_operand.high8;
+        d.src_reg = reg_operand.id;
+        d.src_high8 = reg_operand.high8;
         d.is_reg_form = true;
     }
 
@@ -1024,7 +1079,7 @@ pub fn decodeMovsx(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
     return d;
 }
 
-pub fn decodeXadd(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode2: u8) DecodedInsn {
+pub fn decodeXadd(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode2: u8, has_rex: bool) DecodedInsn {
     var d = DecodedInsn{};
     var pos = start_pos + 1;
     if (pos >= bytes.len) return .{};
@@ -1043,7 +1098,10 @@ pub fn decodeXadd(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool,
             else => .xadd_mem32_reg32,
         };
         d.addr = rm.addr;
-        d.src_reg = rm.reg;
+        // Without REX, byte register codes 4-7 are AH/CH/DH/BH.
+        const reg_operand = decodeRegister((modrm >> 3) & 7, rex_r, is_byte, has_rex);
+        d.src_reg = reg_operand.id;
+        d.src_high8 = reg_operand.high8;
     }
 
     d.len = @as(u8, @intCast(pos));

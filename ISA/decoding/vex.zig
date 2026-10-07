@@ -4649,8 +4649,18 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
-    // VPINSRD/VPINSRQ/VPINSRW: VEX.NDS.LIG.66.0F38.WIG 22/23/2A /r ib
-    if (opcode_map == 3 and (opcode == 0x22 or opcode == 0x23 or opcode == 0x2A) and prefix == 1 and !vector_256) {
+    // VPINSRD/VPINSRQ: VEX.128.66.0F3A.W0/W1 22 /r ib. One opcode; VEX.W
+    // picks the dword or the qword form, exactly as it picks VPEXTRD/VPEXTRQ
+    // at 0F3A 16. VPINSRW is VEX.66.0F C4 and is decoded with map 1.
+    //
+    // This used to read 22 as VPINSRD whatever W said, and took 0F3A 23 and
+    // 2A - neither of which is a VEX instruction - for VPINSRQ and VPINSRW.
+    // Xenia's libstdc++ deque erase rebuilds an iterator with
+    // `vpinsrq xmm1, xmm1, rbx, 1`; as a dword insert into lane 1 it left the
+    // block-start pointer where the node pointer belongs, and the next erase
+    // of Vulkan's pending-fence deque walked the heap into a stack guard:
+    // the 2026-10-03 campaign-launch crash.
+    if (opcode_map == 3 and opcode == 0x22 and prefix == 1 and !vector_256) {
         var decoded = DecodedInsn{ .vector_256 = vector_256 };
         var pos = start_pos + 4;
         if (pos >= bytes.len) return .{};
@@ -4659,12 +4669,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         decoded.xmm_dst = @intFromEnum(rm.reg);
         decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
         decoded.is_reg_form = !is_memory;
-        decoded.size = switch (opcode) {
-            0x22 => .bits32,
-            0x23 => .bits64,
-            0x2A => .bits16,
-            else => unreachable,
-        };
+        decoded.size = if (rex_w) .bits64 else .bits32;
         if (is_memory) {
             decoded.addr = rm.addr;
         } else {
@@ -4675,12 +4680,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         if (pos >= bytes.len) return .{};
         decoded.imm = bytes[pos];
         pos += 1;
-        decoded.op = switch (opcode) {
-            0x22 => .vpinsrd,
-            0x23 => .vpinsrq,
-            0x2A => .vpinsrw,
-            else => unreachable,
-        };
+        decoded.op = if (rex_w) .vpinsrq else .vpinsrd;
         decoded.len = @intCast(pos);
         return decoded;
     }

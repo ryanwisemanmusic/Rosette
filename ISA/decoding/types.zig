@@ -1170,6 +1170,10 @@ pub const Op = enum(u16) {
     // x87 environment through them.
     fstenv_mem,
     fldenv_mem,
+    // IMUL r16, r/m16 (66 0F AF). It had no tag and decoded as the 32-bit
+    // form, which writes all of the destination's low 32 bits.
+    imul_reg16_reg16,
+    imul_reg16_mem16,
 };
 
 fn canonicalMnemonic(op: Op, buffer: *[32]u8) ?[]const u8 {

@@ -235,7 +235,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
     }
 
     if (opcode2 == 0xB0 or opcode2 == 0xB1) {
-        return decodeCmpxchg(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
+        return decodeCmpxchg(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2, rex != 0);
     }
 
     if (opcode2 == 0xA3 or opcode2 == 0xAB or opcode2 == 0xB3 or opcode2 == 0xBB) {
@@ -385,7 +385,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
     }
 
     if (opcode2 == 0xC0 or opcode2 == 0xC1) {
-        return decodeXadd(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
+        return decodeXadd(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2, rex != 0);
     }
 
     if (opcode2 >= 0xC8 and opcode2 <= 0xCF) {

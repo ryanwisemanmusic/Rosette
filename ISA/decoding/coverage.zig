@@ -690,9 +690,16 @@ test "an unsupported encoding is named by its opcode-map coordinates" {
 /// shifts), 0D (VPERMILPD), 78/79 (byte and word broadcast), 8C/8E
 /// (VPMASKMOV), 90-93 (gathers); VEX.0F3A 00-02 (VPERMQ, VPERMPD, VPBLENDD),
 /// 40/41 (VDPPS, VDPPD), 46 (VPERM2I128), 1D (VCVTPS2PH).
+///
+/// VEX.0F3A dropped from 29 slots to 27 on 2026-10-03 without losing an
+/// instruction: 23 and 2A were never VEX opcodes. The decoder had taken them
+/// for VPINSRQ and VPINSRW while it decoded the real VPINSRQ (22 with VEX.W
+/// set) as VPINSRD, which crashed Halo 3's campaign launch. The floor is
+/// therefore 10%, and the insert/extract family test below pins those slots
+/// by name, since a percentage of 256 slots cannot see a single one.
 pub const vex_0f_floor: u16 = 40;
 pub const vex_0f38_floor: u16 = 22;
-pub const vex_0f3a_floor: u16 = 11;
+pub const vex_0f3a_floor: u16 = 10;
 
 test "the VEX opcode maps hold their coverage floors" {
     const result = vexCensus();
@@ -730,6 +737,20 @@ test "the VEX blend and select family has no hole between its members" {
     // The arithmetic block in the 0F map is contiguous and complete.
     for ([_]u8{ 0x58, 0x59, 0x5C, 0x5D, 0x5E, 0x5F }) |opcode| {
         try std.testing.expectEqual(SlotState.decoded, vexProbe(.zero_f, opcode));
+    }
+}
+
+test "the VEX insert and extract family decodes where x86 defines it and nowhere else" {
+    // VPEXTRB/W/D(Q) and EXTRACTPS at 14-17, VPINSRB, VINSERTPS and
+    // VPINSRD(Q) at 20-22. VEX.W picks the D or Q form at 16 and 22, and
+    // ISA/decoding/tests.zig checks that width form by form.
+    for ([_]u8{ 0x14, 0x15, 0x16, 0x17, 0x20, 0x21, 0x22 }) |opcode| {
+        try std.testing.expectEqual(SlotState.decoded, vexProbe(.zero_f3a, opcode));
+    }
+    // Not VEX instructions. Decoding them hid the missing VPINSRQ until the
+    // pending-fence deque corrupted itself on 2026-10-03.
+    for ([_]u8{ 0x23, 0x2A }) |opcode| {
+        try std.testing.expectEqual(SlotState.refused, vexProbe(.zero_f3a, opcode));
     }
 }
 

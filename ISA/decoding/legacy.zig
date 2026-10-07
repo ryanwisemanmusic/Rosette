@@ -1628,7 +1628,7 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
         },
 
         0x84, 0x85 => {
-            return decodeTestRmReg(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode);
+            return decodeTestRmReg(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode, rex != 0);
         },
 
         0x86, 0x87 => {
@@ -1678,11 +1678,11 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
         },
 
         0xC0, 0xC1, 0xD0, 0xD1, 0xD2, 0xD3 => {
-            return decodeGroup2Shift(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode);
+            return decodeGroup2Shift(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode, rex != 0);
         },
 
         0xF6, 0xF7 => {
-            return decodeGroup3(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode);
+            return decodeGroup3(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode, rex != 0);
         },
 
         0xB0...0xB7 => {
@@ -1836,7 +1836,7 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
         },
 
         0xFE, 0xFF => {
-            return decodeGroup4_5(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode);
+            return decodeGroup4_5(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode, rex != 0);
         },
 
         0x98 => {
