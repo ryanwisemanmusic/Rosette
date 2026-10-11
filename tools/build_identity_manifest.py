@@ -15,6 +15,7 @@ missing input for a matching one.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -36,8 +37,49 @@ SKIP_DIRS = {
     "build",
     "out",
     "obj",
+    # Xenia's top-level .rosette directory contains runtime logs, captures,
+    # caches, and per-run evidence. It is not part of the source tree. Xenia's
+    # .gitignore does not consistently hide it, so an untracked directory can
+    # otherwise make every shell update hash tens of thousands of run files.
+    ".rosette",
 }
 RUNTIME_INPUT_SUFFIXES = {".iso", ".xiso", ".xex"}
+XENIA_GENERATED_ROOTS = {".rosette"}
+
+
+def is_xenia_generated_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    normalized = normalized.rstrip("/")
+    return any(
+        normalized == generated or normalized.startswith(generated + "/")
+        for generated in XENIA_GENERATED_ROOTS
+    )
+
+
+def filter_xenia_status(status: str) -> str:
+    """Drop runtime-owned Xenia output roots from source status identity."""
+    kept: list[str] = []
+    for line in status.splitlines():
+        path_text = line[3:] if len(line) > 3 else ""
+        path_text = path_text.strip()
+        if len(path_text) >= 2 and path_text[0] == '"' and path_text[-1] == '"':
+            try:
+                path_text = ast.literal_eval(path_text)
+            except (SyntaxError, ValueError):
+                pass
+        if is_xenia_generated_path(path_text):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def filter_xenia_paths(paths: str) -> str:
+    """Drop generated roots from a newline-delimited Git path list."""
+    return "\n".join(
+        line for line in paths.splitlines() if not is_xenia_generated_path(line)
+    )
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -270,6 +312,9 @@ def hash_git_tree(root: Path, label: str) -> tuple[str, int, list[str]]:
             "--porcelain=v1",
             "--untracked-files=normal",
             "--ignore-submodules=all",
+            "--",
+            ".",
+            ":(exclude).rosette",
         ]
     )
     deleted, deleted_error = command_text(
@@ -282,6 +327,12 @@ def hash_git_tree(root: Path, label: str) -> tuple[str, int, list[str]]:
         ]
     if not head:
         return HEX_ZERO, 0, ["git identity query returned an empty HEAD"]
+
+    # `.rosette` is a Rosette runtime-data directory in the adjacent Xenia
+    # checkout, not Xenia source. Filter it consistently from the status
+    # witness and content delta so logs/captures cannot dominate shell-update.
+    status = filter_xenia_status(status)
+    deleted = filter_xenia_paths(deleted)
 
     digest = hashlib.sha256()
     digest.update(b"git-head\0" + head.encode() + b"\0")
@@ -307,7 +358,7 @@ def hash_git_tree(root: Path, label: str) -> tuple[str, int, list[str]]:
         if " -> " in path_text:
             path_text = path_text.split(" -> ", 1)[1]
         relative_text = path_text.strip().strip('"').replace("\\", "/")
-        if relative_text:
+        if relative_text and not is_xenia_generated_path(relative_text):
             delta_paths[relative_text] = status_code
 
     for relative_text, status_code in sorted(delta_paths.items()):
@@ -505,6 +556,9 @@ def git_info(root: Path | None) -> dict:
             "--porcelain=v1",
             "--untracked-files=normal",
             "--ignore-submodules=all",
+            "--",
+            ".",
+            ":(exclude).rosette",
         ]
     )
     status_lines = [line for line in (status_text or "").splitlines() if line]

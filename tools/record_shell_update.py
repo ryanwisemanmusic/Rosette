@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,6 +30,9 @@ def main() -> int:
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--census", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--verification-mode", choices=("full", "incremental", "relink"), default="full")
+    parser.add_argument("--verification-scope", default="all")
+    parser.add_argument("--verification-check", action="append", default=[])
     args = parser.parse_args()
     root = args.root.resolve()
 
@@ -52,11 +56,21 @@ def main() -> int:
             tree_hash.update(path.read_bytes())
         tree_hash.update(b"\0")
 
+    # Keep this digest identical to build_identity_manifest.tree_identity's
+    # Rosette source-tree digest. Incremental verification is only admissible
+    # for the exact source snapshot that was checked and installed.
+    sys.path.insert(0, str(root / "tools"))
+    from build_identity_manifest import hash_tree
+
+    source_hash, _, source_missing = hash_tree(
+        [root / name for name in ("ISA", "lib", "src", "pkg", "include")],
+        "rosette-source",
+    )
     output = args.output if args.output.is_absolute() else root / args.output
     census = args.census if args.census.is_absolute() else root / args.census
     output.parent.mkdir(parents=True, exist_ok=True)
     record = {
-        "schema_version": 1,
+        "schema_version": 2,
         "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
         "root": str(root),
         "profile": os.environ.get("ROSETTE_EXECUTION_PROFILE", "authentic"),
@@ -71,6 +85,16 @@ def main() -> int:
         "test_census": str(census.resolve()),
         "test_census_sha256": digest(census.resolve()),
         "build_inputs_sha256": tree_hash.hexdigest(),
+        "verification": {
+            "mode": args.verification_mode,
+            "scope": args.verification_scope,
+            "source_tree_sha256": source_hash,
+            "source_tree_complete": not source_missing,
+            "checks": [
+                {"name": item.rsplit("=", 1)[0], "exit_code": int(item.rsplit("=", 1)[1])}
+                for item in args.verification_check
+            ],
+        },
     }
     output.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(

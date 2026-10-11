@@ -20,9 +20,13 @@ from collections import Counter
 from pathlib import Path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ZERO_HASH = "0" * 64
-SKIP_DIRS = {".git", ".zig-cache", "zig-cache", "build", "out", "obj"}
+# Xenia's adjacent `.rosette` tree is runtime output owned by Rosette. It can
+# contain captures and per-run diagnostics, so neither Git-mode deltas nor an
+# extracted filesystem tree may treat it as emulator source.
+GENERATED_ROOTS = {".rosette"}
+SKIP_DIRS = {".git", ".zig-cache", "zig-cache", "build", "out", "obj", *GENERATED_ROOTS}
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -58,6 +62,17 @@ def decode_git_path(value: str) -> str:
         except (SyntaxError, ValueError):
             pass
     return value
+
+
+def is_generated_runtime_path(value: str) -> bool:
+    normalized = value.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    normalized = normalized.rstrip("/")
+    return any(
+        normalized == generated or normalized.startswith(generated + "/")
+        for generated in GENERATED_ROOTS
+    )
 
 
 def classify(path: str, content: bytes | None) -> tuple[str, str]:
@@ -395,14 +410,31 @@ def build_manifest(root: Path, requested_base: str | None) -> dict:
             "--porcelain=v1",
             "--untracked-files=normal",
             "--ignore-submodules=all",
+            "--",
+            ".",
+            ":(exclude).rosette",
         ]
     )
     if status_text is None:
         return unavailable_report(root, status_error or "git status failed")
 
+    parsed_status = parse_status(status_text)
+    excluded_generated_roots = sorted(
+        generated for generated in GENERATED_ROOTS if (root / generated).exists()
+    )
+    # Hash only source-bearing worktree entries. Runtime logs/captures can
+    # change during a run and must not invalidate the source manifest.
+    source_status = "\n".join(
+        line
+        for line in status_text.splitlines()
+        if not is_generated_runtime_path(parse_status(line)[0][0])
+    )
+
     entries: list[dict] = []
     missing: list[str] = []
-    for path_text, status in parse_status(status_text):
+    for path_text, status in parsed_status:
+        if is_generated_runtime_path(path_text):
+            continue
         relative = Path(path_text).as_posix()
         path = root / relative
         content = read_content(path)
@@ -432,9 +464,9 @@ def build_manifest(root: Path, requested_base: str | None) -> dict:
     # expensive base-range diff is not needed for this source-only manifest;
     # hash the current worktree status as the local-delta witness instead.
     diff_hash = sha256_bytes(
-        b"worktree-status-v1\0" + (base or "HEAD").encode() + b"\0" + status_text.encode()
+        b"worktree-status-v2\0" + (base or "HEAD").encode() + b"\0" + source_status.encode()
     )
-    status_hash = sha256_bytes(status_text.encode())
+    status_hash = sha256_bytes(source_status.encode())
     canonical_entries = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode()
     identity_hash = sha256_bytes(
         b"xenia-fork\0"
@@ -462,6 +494,7 @@ def build_manifest(root: Path, requested_base: str | None) -> dict:
         "status_hash": status_hash,
         "diff_name_status_hash": diff_hash,
         "status_path_count": len(entries),
+        "excluded_generated_roots": excluded_generated_roots,
         "classification_counts": dict(sorted(counts.items())),
         "missing": missing,
         "submodules": submodules or "",

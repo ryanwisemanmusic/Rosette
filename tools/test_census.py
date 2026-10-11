@@ -42,6 +42,9 @@ RUN_ALIAS_RE = re.compile(
 )
 RUN_REFERENCE_RE = re.compile(r"check_step\.dependOn\(&\s*(\w+)\.step\)")
 COMPILE_REFERENCE_RE = re.compile(r"check_step\.dependOn\(&\s*(\w+)\.step\)")
+ANY_DEPENDENCY_RE = re.compile(
+    r"\b(\w+)\.dependOn\(&\s*(?:b\.addRunArtifact\(\s*(\w+)\s*\)|(\w+))\.step\)"
+)
 PASS_RE = re.compile(r"\brun test (\d+) pass\b")
 BUILD_SUMMARY_RE = re.compile(r"Build Summary:\s*(.*)")
 IMPORT_RE = re.compile(r'@import\("([^"]+)"\)')
@@ -221,6 +224,22 @@ def parse_artifacts(root: Path, text: str, modules: dict[str, str | None]) -> li
     compile_artifacts: set[str] = set(COMPILE_REFERENCE_RE.findall(text))
     compile_artifacts.difference_update(aliases)
 
+    # Tests attached to a named focused build target (for example
+    # `block-jit-check`) are intentional test artifacts, but they do not run
+    # as part of the repository-wide `check` census. Record them explicitly
+    # so they are not mistaken for either default-check tests or unconnected
+    # tests. The default check variable is `check_step` in build/build.zig.
+    focused_artifacts: set[str] = set()
+    for step_name, inline_artifact, dependency in ANY_DEPENDENCY_RE.findall(text):
+        if step_name == "check_step":
+            continue
+        if inline_artifact:
+            focused_artifacts.add(inline_artifact)
+        elif dependency in aliases:
+            focused_artifacts.add(aliases[dependency])
+        elif dependency:
+            focused_artifacts.add(dependency)
+
     for artifact in artifacts:
         name = artifact["name"]
         base_name = name.split("[", 1)[0].split("#", 1)[0]
@@ -238,6 +257,8 @@ def parse_artifacts(root: Path, text: str, modules: dict[str, str | None]) -> li
             modes.append("run")
         if compile_only_dynamic or name in compile_artifacts or base_name in compile_artifacts:
             modes.append("compile-only")
+        if name in focused_artifacts or base_name in focused_artifacts:
+            modes.append("focused-only")
         if not modes:
             modes = ["unwired"]
         artifact["expected_modes"] = modes

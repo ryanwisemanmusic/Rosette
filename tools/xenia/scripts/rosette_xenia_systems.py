@@ -1281,6 +1281,36 @@ def manifest_artifact_gate(manifest: dict[str, Any], root: pathlib.Path) -> list
             findings.append("Zig test census is not complete and passing")
         if shell_update.get("test_census_sha256") != test_hash:
             findings.append("global shell update does not record the current Zig test census")
+        verification = shell_update.get("verification") or {}
+        verification_mode = verification.get("mode")
+        if verification_mode in ("incremental", "relink"):
+            identity_source_hash = (
+                identity_path.is_file()
+                and json.loads(identity_path.read_text(encoding="utf-8"))
+                .get("rosette", {})
+                .get("source_tree", {})
+                .get("hash")
+            )
+            if not verification.get("source_tree_complete") or verification.get("source_tree_sha256") != identity_source_hash:
+                findings.append("shell update verification does not match the build identity's exact Rosetta source tree")
+            checks = verification.get("checks") or []
+            if any(item.get("exit_code") != 0 for item in checks if isinstance(item, dict)):
+                findings.append("a focused shell update check did not pass")
+            if verification_mode == "incremental":
+                required_checks = {
+                    "elf-processor-process-impl": {"elf-check"},
+                    "elf-processor": {"elf-check"},
+                    "macho-processor": {"macho-processor-check"},
+                }.get(verification.get("scope"))
+                passed_checks = {
+                    item.get("name")
+                    for item in checks
+                    if isinstance(item, dict) and item.get("exit_code") == 0
+                }
+                if required_checks is None or not required_checks.issubset(passed_checks):
+                    findings.append("focused shell update verification is missing its required processor regression suite")
+            elif verification.get("scope") != "unchanged-source-relink":
+                findings.append("relink verification does not prove that source inputs were unchanged")
     if shell_update_path.is_file():
         shell_update = json.loads(shell_update_path.read_text(encoding="utf-8"))
         if not shell_update.get("installed_matches_built", False):
