@@ -108,6 +108,20 @@ const ResourceImageState = struct {
     /// that wrote this image, so a presenter's blit into the swapchain and
     /// a gamma pass into its source can each be followed one link upstream.
     pass_sources: [max_pass_sources]u64 = @splat(0),
+    pass_views: [max_pass_sources]PassSourceView = @splat(.{}),
+};
+
+/// Copied sampling metadata at submission. Image bytes read by a transfer
+/// have not undergone this view's component mapping.
+pub const PassSourceView = struct {
+    image: u64 = 0,
+    view: u64 = 0,
+    format: u32 = 0,
+    components: [4]u32 = @splat(0),
+    base_mip: u32 = 0,
+    base_layer: u32 = 0,
+    view_type: u32 = 0,
+    known: bool = false,
 };
 
 /// Sampled sources retained per written image. Two covers the presenter's
@@ -805,12 +819,29 @@ pub const Chain = struct {
     /// host image identities. Called at queue submission, when the descriptor
     /// sets the pass bound have been resolved to images.
     pub fn noteRenderPassSource(self: *Chain, target: u64, sampled: u64) void {
+        self.noteRenderPassSourceView(target, .{ .image = sampled });
+    }
+
+    pub fn noteRenderPassSourceView(self: *Chain, target: u64, sampling: PassSourceView) void {
+        const sampled = sampling.image;
         if (target == 0 or sampled == 0 or target == sampled) return;
         const state = self.mutableResourceImage(target) orelse return;
-        if (state.pass_sources[0] == sampled) return;
+        if (state.pass_sources[0] == sampled) {
+            state.pass_views[0] = sampling;
+            return;
+        }
         var index: usize = state.pass_sources.len - 1;
-        while (index > 0) : (index -= 1) state.pass_sources[index] = state.pass_sources[index - 1];
+        while (index > 0) : (index -= 1) {
+            state.pass_sources[index] = state.pass_sources[index - 1];
+            state.pass_views[index] = state.pass_views[index - 1];
+        }
         state.pass_sources[0] = sampled;
+        state.pass_views[0] = sampling;
+    }
+
+    pub fn passSourceViewsOf(self: *const Chain, image: u64) [max_pass_sources]PassSourceView {
+        const state = self.resourceImageState(image) orelse return @splat(.{});
+        return state.pass_views;
     }
 
     /// The images the most recent render passes into `image` sampled, newest
@@ -1521,4 +1552,18 @@ test "one owner standing down settles a contested layer" {
     try std.testing.expectEqual(@as(u64, 0), chain.layerOfSwapchainOwnedBy(.rosette));
     try std.testing.expectEqual(layer, chain.layerOfSwapchainOwnedBy(.guest));
     try std.testing.expectEqual(@as(usize, 1), chain.liveSwapchains());
+}
+
+test "FSI sample view provenance keeps submit-time components across view changes and unknown sources" {
+    var chain: Chain = .{};
+    chain.noteRenderPassSourceView(0x100, .{ .image = 0x200, .view = 0x300, .format = 64, .components = .{ 5, 4, 3, 0 }, .known = true });
+    try std.testing.expectEqualDeep([4]u32{ 5, 4, 3, 0 }, chain.passSourceViewsOf(0x100)[0].components);
+    chain.noteRenderPassSourceView(0x100, .{ .image = 0x200, .view = 0x301, .format = 64, .known = true });
+    try std.testing.expectEqual(@as(u64, 0x301), chain.passSourceViewsOf(0x100)[0].view);
+    chain.noteRenderPassSourceView(0x100, .{ .image = 0x400, .view = 0x500, .format = 37, .known = true });
+    try std.testing.expectEqual(@as(u64, 0x301), chain.passSourceViewsOf(0x100)[1].view);
+    chain.noteRenderPassSource(0x100, 0x400);
+    try std.testing.expect(!chain.passSourceViewsOf(0x100)[0].known);
+    try std.testing.expectEqual(@as(u64, 0), chain.passSourceViewsOf(0x100)[0].view);
+    try std.testing.expectEqual([2]u64{ 0x400, 0x200 }, chain.passSourcesOf(0x100));
 }

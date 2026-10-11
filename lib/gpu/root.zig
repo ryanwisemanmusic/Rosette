@@ -104,6 +104,8 @@ pub const handles = @import("handles.zig");
 pub const hardware_description = @import("hardware_description.zig");
 pub const runtime = @import("runtime.zig");
 pub const vulkan = @import("vulkan/root.zig");
+pub const metal = @import("metal/root.zig");
+pub const metal_backend_health = @import("metal/backend_health.zig");
 
 pub const BringupGate = bringup_gate.Gate;
 pub const BringupBoundary = bringup_gate.Boundary;
@@ -277,6 +279,7 @@ pub const PresentTargetKind = present_chain.TargetKind;
 pub const PresentPixelEvidence = present_chain.PixelEvidence;
 pub const PresentTransferKind = present_chain.TransferKind;
 pub const PresentResourceTransfer = present_chain.ResourceTransfer;
+pub const PresentPassSourceView = present_chain.PassSourceView;
 /// What a Vulkan command can put into the image it targets. The forwarder
 /// classifies each command it forwards so a frame built only from clears is
 /// never counted as a frame that carried a picture.
@@ -389,4 +392,5 @@ test {
     _ = hardware_description;
     _ = runtime;
     _ = vulkan;
+    _ = metal;
 }
