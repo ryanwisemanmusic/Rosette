@@ -614,7 +614,10 @@ pub fn decodeVexInstruction(bytes: []const u8) ?DecodedInsn {
                 .size = .bits64,
                 .len = @intCast(pos),
                 .xmm_dst = modrm_decoded.dst_xmm,
-                .xmm_src = modrm_decoded.src_xmm,
+                // The executors read the operand from xmm_src2; the scalar
+                // form merges vvvv's upper lanes, the packed one has no vvvv.
+                .xmm_src = if (vex.has_f3_prefix) vex.vvvv else modrm_decoded.src_xmm,
+                .xmm_src2 = modrm_decoded.src_xmm,
                 .is_reg_form = modrm_decoded.is_reg_form,
                 .addr = modrm_decoded.addr,
                 .vector_256 = vex.l,
@@ -627,7 +630,10 @@ pub fn decodeVexInstruction(bytes: []const u8) ?DecodedInsn {
                 .size = .bits64,
                 .len = @intCast(pos),
                 .xmm_dst = modrm_decoded.dst_xmm,
-                .xmm_src = modrm_decoded.src_xmm,
+                // The executors read the operand from xmm_src2; the scalar
+                // form merges vvvv's upper lanes, the packed one has no vvvv.
+                .xmm_src = if (vex.has_f3_prefix) vex.vvvv else modrm_decoded.src_xmm,
+                .xmm_src2 = modrm_decoded.src_xmm,
                 .is_reg_form = modrm_decoded.is_reg_form,
                 .addr = modrm_decoded.addr,
                 .vector_256 = vex.l,
@@ -1269,6 +1275,19 @@ fn decodeVexUnaryImmReturn(vex: VexPrefix, pos: usize, op_enum: Op, modrm: anyty
     };
 }
 
+/// VROUNDPS/VROUNDPD take one source, the r/m operand; VEX.vvvv is
+/// reserved (1111b, which reads as register 0). The executors read the
+/// source from `xmm_src2`, the r/m slot of the three-operand forms, so it
+/// names the r/m register too. Leaving it at 0 made every executor round
+/// xmm0 instead: Xenia's `vrfin` in Halo 3's clear-colour packer returned
+/// the scalar left in xmm0, (2^bits - 1, 0, 0, 0), so the HDR target
+/// cleared to pure red and the normal buffer to 0x3FF.
+fn decodeVexRoundPackedReturn(vex: VexPrefix, pos: usize, op_enum: Op, modrm: anytype, imm: u8) ?DecodedInsn {
+    var decoded = decodeVexUnaryImmReturn(vex, pos, op_enum, modrm, imm) orelse return null;
+    decoded.xmm_src2 = decoded.xmm_src;
+    return decoded;
+}
+
 fn decodeVexBroadcastReturn(
     vex: VexPrefix,
     pos: usize,
@@ -1652,6 +1671,27 @@ fn decodeVexMinPositionReturn(vex: VexPrefix, pos: usize, modrm: anytype) ?Decod
         .addr = modrm.addr,
         .vector_256 = false,
     };
+}
+
+/// Carry the memory operand that `readModRM` recorded in `memory` (base,
+/// index, scale, RIP-relative, segment) onto an instruction built by one of
+/// the constructor-style helpers below, which only know the displacement.
+/// Without it the executor resolves `[r13+0x168]` as the absolute address
+/// 0x168: Xenia's `vperm2f128 ymm1, ymm1, [r13+0x168], 2` read zeros instead
+/// of its tessellation shader handles, and every VINSERTF128/VEXTRACTF128
+/// memory form addressed through a register did the same.
+fn withMemoryOperand(result: DecodedInsn, memory: DecodedInsn) DecodedInsn {
+    var d = result;
+    if (d.is_reg_form) return d;
+    d.sib_has_index = memory.sib_has_index;
+    d.sib_index_reg = memory.sib_index_reg;
+    d.sib_scale = memory.sib_scale;
+    d.sib_has_base = memory.sib_has_base;
+    d.sib_base_reg = memory.sib_base_reg;
+    d.rip_relative = memory.rip_relative;
+    d.segment = memory.segment;
+    d.has_0x67 = memory.has_0x67;
+    return d;
 }
 
 /// Decode VPERM2F128's two 256-bit source operands and immediate. The
@@ -2055,11 +2095,11 @@ fn decodeVexMap3A(vex: VexPrefix, pos: usize, opcode: u8, modrm: anytype, imm: u
         else
             null, // VPERMILPD immediate form
         0x08 => if (vex.has_66_prefix and !vex.w and vex.vvvv == 0)
-            decodeVexUnaryImmReturn(vex, pos, .vroundps, modrm, imm)
+            decodeVexRoundPackedReturn(vex, pos, .vroundps, modrm, imm)
         else
             null, // VROUNDPS
         0x09 => if (vex.has_66_prefix and !vex.w and vex.vvvv == 0)
-            decodeVexUnaryImmReturn(vex, pos, .vroundpd, modrm, imm)
+            decodeVexRoundPackedReturn(vex, pos, .vroundpd, modrm, imm)
         else
             null, // VROUNDPD
         0x0A => decodeVexNdsImm(vex, pos, .vroundss, modrm, imm), // VROUNDSS (VEX.128.66.0F3A.W0 0A)
@@ -2136,9 +2176,13 @@ fn decodeVex2Table(bytes: []const u8, start_pos: usize) DecodedInsn {
     const rex_r = (vex & 0x80) == 0;
     const vector_256 = (vex & 0x04) != 0;
     const prefix = vex & 0x03;
+    // The two-byte prefix carries R: without it, every form decoded through
+    // this prefix (VMOVMSKPS/PD, VCVTPS2PD/VCVTPD2PS, VPMADDWD) wrote
+    // register n-8 when ModRM.reg named xmm8-15 or r8-r15.
     const mask_vex = VexPrefix{
         .len = 2,
         .is_2byte = true,
+        .r = rex_r,
         .has_66_prefix = prefix == 1,
         .has_f2_prefix = prefix == 3,
         .has_f3_prefix = prefix == 2,
@@ -3447,8 +3491,13 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
     if (opcode_map == 3 and prefix == 1 and !rex_w) {
         switch (opcode) {
             0x0F => return decodeVex3Nds(bytes, start_pos, vex, .vpalignr, true) orelse .{},
-            0x08 => if (vex.vvvv == 0) return decodeVex3Unary(bytes, start_pos, vex, .vroundps, true) orelse .{},
-            0x09 => if (vex.vvvv == 0) return decodeVex3Unary(bytes, start_pos, vex, .vroundpd, true) orelse .{},
+            0x08, 0x09 => if (vex.vvvv == 0) {
+                // One source, the r/m operand, in both source slots (see
+                // decodeVexRoundPackedReturn).
+                var decoded = decodeVex3Unary(bytes, start_pos, vex, if (opcode == 0x08) .vroundps else .vroundpd, true) orelse return .{};
+                decoded.xmm_src2 = decoded.xmm_src;
+                return decoded;
+            },
             0x0A => if (!vector_256) return decodeVex3Nds(bytes, start_pos, vex, .vroundss, true) orelse .{},
             0x0B => if (!vector_256) return decodeVex3Nds(bytes, start_pos, vex, .vroundsd, true) orelse .{},
             0x04 => if (vex.vvvv == 0) return decodeVex3Unary(bytes, start_pos, vex, .vpermilps, true) orelse .{},
@@ -4265,7 +4314,8 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
             .is_reg_form = decoded.is_reg_form,
             .addr = rm.addr,
         };
-        return decodeVexPermute2x128(vex, pos + 1, modrm, bytes[pos]) orelse .{};
+        const permute = decodeVexPermute2x128(vex, pos + 1, modrm, bytes[pos]) orelse return .{};
+        return withMemoryOperand(permute, decoded);
     }
 
     if (opcode_map == 3 and (opcode == 0x18 or opcode == 0x19 or opcode == 0x38 or opcode == 0x39) and prefix == 1) {
@@ -4288,7 +4338,8 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
             .is_reg_form = decoded.is_reg_form,
             .addr = rm.addr,
         };
-        return decodeVexLane128(vex, pos + 1, op, modrm, bytes[pos]) orelse .{};
+        const lane = decodeVexLane128(vex, pos + 1, op, modrm, bytes[pos]) orelse return .{};
+        return withMemoryOperand(lane, decoded);
     }
 
     if (opcode_map == 3 and opcode == 0x05 and prefix == 1 and !rex_w and vex.vvvv == 0) {
@@ -4600,6 +4651,8 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
             decoded.addr = rm.addr;
         } else {
             decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
+            // The packed forms have no vvvv operand: their one source is r/m.
+            if (!is_scalar) decoded.xmm_src = decoded.xmm_src2;
         }
         decoded.imm = bytes[pos];
         pos += 1;

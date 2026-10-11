@@ -1674,7 +1674,10 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
         },
 
         0x80...0x83 => {
-            return decodeGroup1Imm(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, rex != 0, opcode);
+            // Group helpers create their own DecodedInsn. Return through the
+            // common LOCK finalization below: losing F0 makes shared counters
+            // (including Xenia's XObject references) ordinary load/store pairs.
+            d = decodeGroup1Imm(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, rex != 0, opcode);
         },
 
         0xC0, 0xC1, 0xD0, 0xD1, 0xD2, 0xD3 => {
@@ -1682,7 +1685,7 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
         },
 
         0xF6, 0xF7 => {
-            return decodeGroup3(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode, rex != 0);
+            d = decodeGroup3(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode, rex != 0);
         },
 
         0xB0...0xB7 => {
@@ -1836,7 +1839,7 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
         },
 
         0xFE, 0xFF => {
-            return decodeGroup4_5(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode, rex != 0);
+            d = decodeGroup4_5(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode, rex != 0);
         },
 
         0x98 => {

@@ -751,6 +751,38 @@ test "fixed-width opcodes keep their width whatever the prefixes say" {
     }
 }
 
+test "LOCK prefix survives grouped arithmetic and Xenia reference-count decoding" {
+    // These are the shipped XObject::Retain/Release bytes. Losing LOCK turns
+    // each reference update into a load/store race between title workers.
+    const Case = struct { bytes: []const u8, op: types.Op, size: types.Size };
+    const cases = [_]Case{
+        .{ .bytes = &.{ 0xF0, 0xFF, 0x41, 0x18 }, .op = .inc_mem32, .size = .bits32 },
+        .{ .bytes = &.{ 0xF0, 0xFF, 0x49, 0x18 }, .op = .dec_mem32, .size = .bits32 },
+        .{ .bytes = &.{ 0xF0, 0xFE, 0x01 }, .op = .inc_mem8, .size = .bits8 },
+        .{ .bytes = &.{ 0xF0, 0x66, 0xFF, 0x09 }, .op = .dec_mem16, .size = .bits16 },
+        .{ .bytes = &.{ 0xF0, 0x48, 0xFF, 0x01 }, .op = .inc_mem64, .size = .bits64 },
+        .{ .bytes = &.{ 0xF0, 0x83, 0x41, 0x18, 0x01 }, .op = .add_mem32_imm8, .size = .bits32 },
+        .{ .bytes = &.{ 0xF0, 0x81, 0x69, 0x18, 0x01, 0, 0, 0 }, .op = .sub_mem32_imm32, .size = .bits32 },
+        .{ .bytes = &.{ 0xF0, 0xF6, 0x19 }, .op = .neg_mem8, .size = .bits8 },
+        .{ .bytes = &.{ 0xF0, 0x48, 0xF7, 0x11 }, .op = .not_mem64, .size = .bits64 },
+    };
+    for (cases) |case| {
+        const decoded = legacy.decodeLegacyInstruction(case.bytes, .long64);
+        try std.testing.expectEqual(case.op, decoded.op);
+        try std.testing.expectEqual(case.size, decoded.size);
+        try std.testing.expectEqual(case.bytes.len, decoded.len);
+        try std.testing.expectEqual(types.RegId.cl_cx_ecx_rcx, decoded.sib_base_reg);
+        try std.testing.expect(decoded.sib_has_base);
+        try std.testing.expect(decoded.lock);
+        // The unprefixed form must remain unprefixed.
+        try std.testing.expect(!legacy.decodeLegacyInstruction(case.bytes[1..], .long64).lock);
+    }
+    // Preserve illegal LOCK too, so executors reject it rather than silently
+    // accepting a register-only update or an indirect control transfer.
+    try std.testing.expect(legacy.decodeLegacyInstruction(&.{ 0xF0, 0xFF, 0xC1 }, .long64).lock);
+    try std.testing.expect(legacy.decodeLegacyInstruction(&.{ 0xF0, 0xFF, 0x11 }, .long64).lock);
+}
+
 test "every decoder family analyzes cleanly (refAllDecls)" {
     std.testing.refAllDecls(types);
     std.testing.refAllDecls(coverage);

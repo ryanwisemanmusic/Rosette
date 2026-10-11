@@ -22,6 +22,7 @@ const prefix = @import("prefix.zig");
 const twobyte = @import("twobyte.zig");
 const types = @import("types.zig");
 const vex = @import("vex.zig");
+pub const vectorTestPredicates = @import("vector_test.zig").predicates;
 
 pub const decodeRegister = addressing.decodeRegister;
 pub const defaultSegment = addressing.defaultSegment;
