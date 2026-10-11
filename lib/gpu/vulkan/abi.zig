@@ -135,6 +135,8 @@ pub const STRUCTURE_TYPE_PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT: u32
 /// Byte offset in VkPhysicalDeviceFeatures for the sixth VkBool32 field.
 /// VkPhysicalDeviceFeatures orders geometryShader at 16 and tessellationShader at 20.
 pub const PHYSICAL_DEVICE_FEATURES_TESSELLATION_SHADER_OFFSET: usize = 20;
+pub const PHYSICAL_DEVICE_FEATURES_SAMPLE_RATE_SHADING_OFFSET: usize = 24;
+pub const PHYSICAL_DEVICE_FEATURES_FRAGMENT_STORES_AND_ATOMICS_OFFSET: usize = 104;
 
 pub const SEMAPHORE_TYPE_BINARY: u32 = 0;
 pub const SEMAPHORE_TYPE_TIMELINE: u32 = 1;
@@ -146,6 +148,8 @@ pub const QUERY_RESULT_WAIT_BIT: u32 = 0x0000_0002;
 pub const QUERY_RESULT_WITH_AVAILABILITY_BIT: u32 = 0x0000_0004;
 pub const QUERY_RESULT_PARTIAL_BIT: u32 = 0x0000_0008;
 pub const DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK: u32 = 1_000_138_000;
+pub const DESCRIPTOR_TYPE_UNIFORM_BUFFER: u32 = 6;
+pub const DESCRIPTOR_TYPE_STORAGE_BUFFER: u32 = 7;
 pub const DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET: u32 = 0;
 pub const CONDITIONAL_RENDERING_INVERTED_BIT_EXT: u32 = 0x0000_0001;
 
@@ -241,6 +245,8 @@ pub const FORMAT_FEATURE_TRANSFER_DST_BIT: u32 = 0x0000_8000;
 
 pub const BUFFER_USAGE_TRANSFER_SRC_BIT: u32 = 0x0000_0001;
 pub const BUFFER_USAGE_TRANSFER_DST_BIT: u32 = 0x0000_0002;
+pub const BUFFER_USAGE_UNIFORM_BUFFER_BIT: u32 = 0x0000_0010;
+pub const BUFFER_USAGE_STORAGE_BUFFER_BIT: u32 = 0x0000_0020;
 
 pub const SHARING_MODE_EXCLUSIVE: u32 = 0;
 
@@ -383,11 +389,60 @@ pub const physical_device_properties_bytes: usize = 1024;
 /// Native 64-bit Vulkan C layout, checked against the vendored header by the
 /// capture fixture. Both size_t and VkDeviceSize have eight-byte alignment.
 pub const min_memory_map_alignment_offset: usize = 600;
+
+/// Native 64-bit VkPhysicalDeviceProperties fields used by Xenia's Vulkan
+/// FSI admission check. These live in VkPhysicalDeviceLimits after the
+/// 296-byte properties prefix; offsets are checked against the vendored
+/// Vulkan headers by the ABI contract test.
+pub const physical_device_max_storage_buffer_range_offset: usize = 324;
+pub const physical_device_max_per_stage_storage_buffers_offset: usize = 372;
+pub const physical_device_standard_sample_locations_offset: usize = 768;
+
+pub const FsiPhysicalDeviceLimits = struct {
+    max_storage_buffer_range: u32,
+    max_per_stage_storage_buffers: u32,
+    standard_sample_locations: bool,
+};
+
+pub fn fsiPhysicalDeviceLimits(properties: []const u8) ?FsiPhysicalDeviceLimits {
+    const end = physical_device_standard_sample_locations_offset + 4;
+    if (properties.len < end) return null;
+    return .{
+        .max_storage_buffer_range = std.mem.readInt(
+            u32,
+            properties[physical_device_max_storage_buffer_range_offset..][0..4],
+            .little,
+        ),
+        .max_per_stage_storage_buffers = std.mem.readInt(
+            u32,
+            properties[physical_device_max_per_stage_storage_buffers_offset..][0..4],
+            .little,
+        ),
+        .standard_sample_locations = std.mem.readInt(
+            u32,
+            properties[physical_device_standard_sample_locations_offset..][0..4],
+            .little,
+        ) != 0,
+    };
+}
+
 pub fn nativeMemoryMapAlignment(properties: []const u8) ?u64 {
     if (properties.len < min_memory_map_alignment_offset + 8) return null;
     const alignment = std.mem.readInt(u64, properties[min_memory_map_alignment_offset..][0..8], .little);
     if (alignment == 0 or alignment > 0x1_0000_0000 or (alignment & (alignment - 1)) != 0) return null;
     return alignment;
+}
+
+test "FSI physical-device limits are read at native Vulkan offsets" {
+    var properties: [physical_device_properties_bytes]u8 = @splat(0);
+    std.mem.writeInt(u32, properties[physical_device_max_storage_buffer_range_offset..][0..4], 512 * 1024 * 1024, .little);
+    std.mem.writeInt(u32, properties[physical_device_max_per_stage_storage_buffers_offset..][0..4], 31, .little);
+    std.mem.writeInt(u32, properties[physical_device_standard_sample_locations_offset..][0..4], 1, .little);
+    const limits = fsiPhysicalDeviceLimits(&properties).?;
+    try std.testing.expectEqual(@as(u32, 512 * 1024 * 1024), limits.max_storage_buffer_range);
+    try std.testing.expectEqual(@as(u32, 31), limits.max_per_stage_storage_buffers);
+    try std.testing.expect(limits.standard_sample_locations);
+    try std.testing.expect(fsiPhysicalDeviceLimits(properties[0 .. physical_device_standard_sample_locations_offset + 3]) == null);
 }
 
 test "native map alignment is bounded and read at the 64-bit Vulkan header offset" {

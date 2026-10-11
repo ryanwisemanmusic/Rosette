@@ -479,7 +479,9 @@ pub const Bridge = struct {
             "vkCreateMetalSurfaceEXT"
         else
             name;
-        if (!dynamic_forwarder.isForwardableVulkanSymbol(forward_name)) {
+        // `owns(name)` already checked every ordinary Vulkan spelling. Only
+        // the Win32-to-Metal surface alias needs validation after substitution.
+        if (is_surface_call and !dynamic_forwarder.isForwardableVulkanSymbol(forward_name)) {
             self.dispatch_failures +|= 1;
             trace_outcome = "symbol_not_forwardable";
             return false;
@@ -614,7 +616,7 @@ pub const Bridge = struct {
             noteNativeForwarding(state, name, native_objects_ready);
             noteLogicalContract(state, name, result);
         }
-        noteForwarderFrameEvidence(self, state);
+        if (isForwarderFrameEvidenceBoundary(name)) noteForwarderFrameEvidence(self, state);
         finishWindowsCall(state, direct_return_rip);
         trace_outcome = if (reached_native_command) "forwarded" else "handled_native_refused";
         return true;
@@ -669,6 +671,13 @@ fn owns(name: []const u8) bool {
         std.mem.eql(u8, name, "vkGetDeviceProcAddr")) return false;
     if (std.mem.eql(u8, name, "vkCreateWin32SurfaceKHR")) return true;
     return dynamic_forwarder.isForwardableVulkanSymbol(name);
+}
+
+fn isForwarderFrameEvidenceBoundary(name: []const u8) bool {
+    return std.mem.eql(u8, name, "vkQueueSubmit") or
+        std.mem.eql(u8, name, "vkQueueSubmit2") or
+        std.mem.eql(u8, name, "vkQueueSubmit2KHR") or
+        std.mem.eql(u8, name, "vkQueuePresentKHR");
 }
 
 fn ensureWindow(state: anytype) bool {
@@ -767,6 +776,15 @@ test "Windows Vulkan adapter owns real forwarder names but not proc lookup" {
     try std.testing.expect(owns("vkCreateWin32SurfaceKHR"));
     try std.testing.expect(owns("vkCreateInstance"));
     try std.testing.expect(!owns("vkNameRosetteDoesNotImplement"));
+}
+
+test "Windows frame evidence refresh is limited to submit and present boundaries" {
+    try std.testing.expect(isForwarderFrameEvidenceBoundary("vkQueueSubmit"));
+    try std.testing.expect(isForwarderFrameEvidenceBoundary("vkQueueSubmit2"));
+    try std.testing.expect(isForwarderFrameEvidenceBoundary("vkQueueSubmit2KHR"));
+    try std.testing.expect(isForwarderFrameEvidenceBoundary("vkQueuePresentKHR"));
+    try std.testing.expect(!isForwarderFrameEvidenceBoundary("vkCmdDrawIndexed"));
+    try std.testing.expect(!isForwarderFrameEvidenceBoundary("vkCreateImageView"));
 }
 
 test "Windows surface adapter exposes the stable Metal layer token" {

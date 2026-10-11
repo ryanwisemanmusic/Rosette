@@ -692,8 +692,7 @@ test "PE rectangle tag rides only on draws indexed from Xenia's built-in expansi
     forwarder.real_vulkan.buffer_map[1] = .{ .synthetic = 0x702, .real = 0x802 };
     // 0x601 was built from a rewritten vertex shader with the strip-and-restart
     // topology; 0x801 is the built-in index buffer.
-    forwarder.rect_expand_pipelines[0] = 0x601;
-    forwarder.rect_expand_pipeline_count = 1;
+    try std.testing.expectEqual(.inserted, forwarder.rect_expand_pipeline_registry.insert(0x601));
     forwarder.rect_expand_builtin_index_buffer = 0x801;
     forwarder.real_vulkan.fn_ptrs.cmd_bind_pipeline = Capture.bindPipeline;
     forwarder.real_vulkan.fn_ptrs.cmd_bind_index_buffer = Capture.bindIndex;

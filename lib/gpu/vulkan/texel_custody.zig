@@ -54,12 +54,17 @@ pub const Stats = struct {
     min: [3]u32 = @splat(std.math.maxInt(u32)),
     max: [3]u32 = @splat(0),
     shape: Shape = .unknown_size,
-    /// The red channel's output on a 0..1023 scale for the reference inputs.
+    /// RGB output on a 0..1023 scale for the reference inputs. The PWL ramp is
+    /// channel-specific, so retaining only red can hide a green/blue curve
+    /// that contributes to a strong tint.
     /// For the 256-entry table the inputs are the same patterns divided by
     /// four, since that path indexes with an 8-bit value.
-    out_max: u16 = 0,
-    out_7e3_one: u16 = 0,
-    out_mid: u16 = 0,
+    out_max_rgb: [3]u16 = .{ 0, 0, 0 },
+    out_7e3_one_rgb: [3]u16 = .{ 0, 0, 0 },
+    out_mid_rgb: [3]u16 = .{ 0, 0, 0 },
+    /// Full-table channel comparison, not just three landmarks. Counts G/B
+    /// pairs that differ from R (base+delta for PWL, values for table).
+    channel_pairs_differ: ?u32 = null,
 };
 
 /// Number of 32-bit words a complete table of each format holds.
@@ -94,21 +99,36 @@ pub fn analyze(bytes: []const u8, format: u32) !Stats {
         }
     }
     if (stats.entries < table_entries) return stats;
+    stats.channel_pairs_differ = 0;
+    switch (format) {
+        81 => for (0..128) |segment| {
+            const red = word(bytes, segment * 3);
+            stats.channel_pairs_differ.? += @intFromBool(word(bytes, segment * 3 + 1) != red);
+            stats.channel_pairs_differ.? += @intFromBool(word(bytes, segment * 3 + 2) != red);
+        },
+        64 => for (0..256) |entry| {
+            const value = word(bytes, entry);
+            const red = (value >> 20) & 1023;
+            stats.channel_pairs_differ.? += @intFromBool(((value >> 10) & 1023) != red);
+            stats.channel_pairs_differ.? += @intFromBool((value & 1023) != red);
+        },
+        else => unreachable,
+    }
     if (stats.nonzero_bytes == 0) {
         stats.shape = .zero;
         return stats;
     }
     switch (format) {
         64 => {
-            stats.out_max = tableOutput(bytes, input_max >> 2);
-            stats.out_7e3_one = tableOutput(bytes, input_7e3_one >> 2);
-            stats.out_mid = tableOutput(bytes, input_mid >> 2);
+            stats.out_max_rgb = tableOutputRgb(bytes, input_max >> 2);
+            stats.out_7e3_one_rgb = tableOutputRgb(bytes, input_7e3_one >> 2);
+            stats.out_mid_rgb = tableOutputRgb(bytes, input_mid >> 2);
             stats.shape = if (tableIsXeniaDefault(bytes)) .xenia_default_linear else .programmed;
         },
         81 => {
-            stats.out_max = pwlOutput(bytes, input_max);
-            stats.out_7e3_one = pwlOutput(bytes, input_7e3_one);
-            stats.out_mid = pwlOutput(bytes, input_mid);
+            stats.out_max_rgb = pwlOutputRgb(bytes, input_max);
+            stats.out_7e3_one_rgb = pwlOutputRgb(bytes, input_7e3_one);
+            stats.out_mid_rgb = pwlOutputRgb(bytes, input_mid);
             stats.shape = if (pwlIsXeniaDefault(bytes)) .xenia_default_linear else .programmed;
         },
         else => unreachable,
@@ -120,11 +140,16 @@ fn word(bytes: []const u8, index: usize) u32 {
     return std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little);
 }
 
-/// Red output of the 256-entry table for an 8-bit input. Xenia packs
+/// RGB output of the 256-entry table for an 8-bit input. Xenia packs
 /// `DC_LUT_30_COLOR` as blue in bits 0-9, green in 10-19 and red in 20-29,
-/// and its shader undoes that with a `.bgr` swizzle, so red is the top field.
-fn tableOutput(bytes: []const u8, input: u16) u16 {
-    return @intCast((word(bytes, input) >> 20) & 1023);
+/// and its shader undoes that with a `.bgr` swizzle.
+fn tableOutputRgb(bytes: []const u8, input: u16) [3]u16 {
+    const packed_word = word(bytes, input);
+    return .{
+        @intCast((packed_word >> 20) & 1023),
+        @intCast((packed_word >> 10) & 1023),
+        @intCast(packed_word & 1023),
+    };
 }
 
 /// The 256-entry ramp `CommandProcessor::CommandProcessor` seeds: every
@@ -137,17 +162,21 @@ fn tableIsXeniaDefault(bytes: []const u8) bool {
     return true;
 }
 
-/// Red output of the PWL ramp for a 10-bit input, as Xenia's
+/// RGB output of the PWL ramp for a 10-bit input, as Xenia's
 /// `apply_gamma_pwl` shader computes it: segment `input >> 3`, then
 /// `(base + (input & 7) * delta / 8) / (64 * 1023)` normalized, here scaled
 /// back to 0..1023 and saturated.
-fn pwlOutput(bytes: []const u8, input: u16) u16 {
+fn pwlOutputRgb(bytes: []const u8, input: u16) [3]u16 {
     const segment: usize = @as(usize, input >> 3);
-    const entry = word(bytes, segment * 3);
-    const base: u32 = entry & 0xFFFF;
-    const delta: u32 = entry >> 16;
-    const value = (base + ((@as(u32, input) & 7) * delta) / 8) / 64;
-    return @intCast(@min(value, 1023));
+    var output: [3]u16 = undefined;
+    for (0..3) |channel| {
+        const entry = word(bytes, segment * 3 + channel);
+        const base: u32 = entry & 0xFFFF;
+        const delta: u32 = entry >> 16;
+        const value = (base + ((@as(u32, input) & 7) * delta) / 8) / 64;
+        output[channel] = @intCast(@min(value, 1023));
+    }
+    return output;
 }
 
 /// The PWL ramp Xenia seeds: segment `i` has `base = (i * 65535 / 127) & ~63`
@@ -217,9 +246,9 @@ test "Xenia's default PWL ramp is recognised and reads as the identity" {
     // Linear: the 7e3 pattern for 1.0 comes out as the ~38% grey it is as a
     // fixed-point value (segment 48 of 127), which is exactly the dark
     // picture a 7e3 title shows when its own ramp never arrived.
-    try std.testing.expectEqual(@as(u16, 387), stats.out_7e3_one);
-    try std.testing.expectEqual(@as(u16, 516), stats.out_mid);
-    try std.testing.expectEqual(@as(u16, 1023), stats.out_max);
+    try std.testing.expectEqual([3]u16{ 387, 387, 387 }, stats.out_7e3_one_rgb);
+    try std.testing.expectEqual([3]u16{ 516, 516, 516 }, stats.out_mid_rgb);
+    try std.testing.expectEqual([3]u16{ 1023, 1023, 1023 }, stats.out_max_rgb);
 }
 
 test "a title-programmed PWL ramp is not the default and its outputs follow the shader" {
@@ -231,16 +260,45 @@ test "a title-programmed PWL ramp is not the default and its outputs follow the 
     const stats = try analyze(&bytes, 81);
     try std.testing.expectEqual(Shape.programmed, stats.shape);
     // Segment 127, sub-index 7: (0xFBC0 + 7 * 0x400 / 8) / 64 = 1021.
-    try std.testing.expectEqual(@as(u16, 1021), stats.out_max);
+    try std.testing.expectEqual([3]u16{ 1021, 1023, 1023 }, stats.out_max_rgb);
 }
 
 test "Xenia's default 256-entry table is recognised" {
     const bytes = xeniaDefaultTable();
     const stats = try analyze(&bytes, 64);
     try std.testing.expectEqual(Shape.xenia_default_linear, stats.shape);
-    try std.testing.expectEqual(@as(u16, 1023), stats.out_max);
-    try std.testing.expectEqual(@as(u16, 0x60 * 0x3FF / 0xFF), stats.out_7e3_one);
+    try std.testing.expectEqual([3]u16{ 1023, 1023, 1023 }, stats.out_max_rgb);
+    const one = @as(u16, 0x60 * 0x3FF / 0xFF);
+    try std.testing.expectEqual([3]u16{ one, one, one }, stats.out_7e3_one_rgb);
     var programmed = bytes;
     std.mem.writeInt(u32, programmed[255 * 4 ..][0..4], 0, .little);
     try std.testing.expectEqual(Shape.programmed, (try analyze(&programmed, 64)).shape);
+}
+
+test "gamma custody keeps distinct red green and blue transfer curves" {
+    var bytes = xeniaDefaultPwl();
+    // Give the three channels intentionally different curves at the 7e3-one
+    // input and ensure the report does not silently repeat the red lane.
+    const segment = @as(usize, input_7e3_one >> 3);
+    const entries = [_]u32{ 0x0400_3000, 0x0800_6000, 0x0C00_9000 };
+    for (entries, 0..) |entry, channel| {
+        std.mem.writeInt(u32, bytes[(segment * 3 + channel) * 4 ..][0..4], entry, .little);
+    }
+    const stats = try analyze(&bytes, 81);
+    try std.testing.expectEqual([3]u16{ 192, 384, 576 }, stats.out_7e3_one_rgb);
+}
+
+test "FSI gamma channel contract finds unequal curves away from the three landmarks" {
+    var bytes = xeniaDefaultPwl();
+    const before = try analyze(&bytes, 81);
+    try std.testing.expectEqual(@as(?u32, 0), before.channel_pairs_differ);
+    // Segment 20 is not max, 7e3 one or mid: a three-point check misses it.
+    std.mem.writeInt(u32, bytes[(20 * 3 + 1) * 4 ..][0..4], 0x0100_0020, .little);
+    const after = try analyze(&bytes, 81);
+    try std.testing.expectEqual(@as(?u32, 1), after.channel_pairs_differ);
+    try std.testing.expectEqualDeep(before.out_max_rgb, after.out_max_rgb);
+    try std.testing.expectEqualDeep(before.out_7e3_one_rgb, after.out_7e3_one_rgb);
+    try std.testing.expectEqualDeep(before.out_mid_rgb, after.out_mid_rgb);
+    const incomplete = try analyze(bytes[0..8], 81);
+    try std.testing.expect(incomplete.channel_pairs_differ == null);
 }

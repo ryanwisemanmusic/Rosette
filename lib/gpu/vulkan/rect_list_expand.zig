@@ -44,18 +44,25 @@
 //!     it, so the guest body reads whatever index this shader chooses;
 //!   - makes the old entry point an ordinary function and writes a new one;
 //!   - in the new entry point: untagged, store the index and call the body
-//!     once; tagged, decode `i = index >> 2` and `j = index & 3`, and for
-//!     `j < 3` call the body with guest vertex `3 * i + j`;
-//!   - for `j == 3`, call the body three times - with `3i`, `3i + 1`,
-//!     `3i + 2` - reading the shader's outputs back between calls, and write
-//!     `A + C - B` into every float-typed output. Output variables are
+//!     once; tagged, decode `i = index >> 2` and `j = index & 3`, call the
+//!     body with each of `3i`, `3i + 1`, `3i + 2`, and choose the strip's
+//!     orientation from the longest edge;
+//!   - select an original corner for `j < 3`, or write
+//!     `(second - first) + third` into every float-typed output for `j == 3`,
+//!     with Xenia's NoContraction decorations. Output variables are
 //!     readable in SPIR-V, so the corner is derived from the shaded values
 //!     rather than from vertex data whose layout lives in fetch constants
 //!     this bridge cannot see.
 //!
 //! Only float scalars and float vectors are combined, including float members
 //! of a block such as `gl_PerVertex`. Anything else keeps the value the third
-//! call left, which is the closest vertex to the derived corner.
+//! call left, which is the closest vertex to the derived corner. A
+//! `CullDistance` output is normally refused: the transformed helper entry
+//! point makes that output explicit, but MoltenVK's Metal backend does not
+//! support that output. A conservative prepass can remove a trailing
+//! CullDistance member only when it proves the member is unused and the block
+//! has no escaping aliases. Active or uncertain cull output remains unchanged,
+//! preserving guest semantics and valid MSL.
 //!
 //! ## What it refuses
 //!
@@ -95,6 +102,10 @@ pub const Refusal = enum {
     /// that path and it *is* implemented in the SPIR-V translator; expanding
     /// it a second time would break it.
     already_expanded,
+    /// The output interface contains `CullDistance`, which MoltenVK's Metal
+    /// backend does not expose. Calling the old entry point from the rewritten
+    /// wrapper makes SPIRV-Cross emit invalid MSL for that output.
+    cull_distance_output,
 
     pub fn label(self: Refusal) []const u8 {
         return switch (self) {
@@ -107,8 +118,18 @@ pub const Refusal = enum {
             .too_many_outputs => "too-many-outputs",
             .id_space => "id-space-exhausted",
             .already_expanded => "already-expanded-by-the-guest",
+            .cull_distance_output => "cull-distance-output-metal-unsupported",
         };
     }
+};
+
+/// Location of the CullDistance decoration that prevented a rectangle
+/// shader rewrite. `member_index` is null when BuiltIn is attached directly
+/// to the output variable; otherwise `interface_type` is the output block.
+pub const CullDistanceSite = struct {
+    variable: u32 = 0,
+    interface_type: u32 = 0,
+    member_index: ?u32 = null,
 };
 
 pub const Result = struct {
@@ -120,12 +141,18 @@ pub const Result = struct {
     combined_outputs: u32 = 0,
     /// Loads of the vertex index that were repointed at the private copy.
     repointed_loads: u32 = 0,
+    /// Populated only for `.cull_distance_output`, to make the unsupported
+    /// output shape visible without changing the guest module.
+    cull_distance_site: ?CullDistanceSite = null,
+    /// A dead trailing CullDistance interface member was removed before the
+    /// rectangle transform. Set only when the transformed module was built.
+    removed_unused_cull_distance: bool = false,
 };
 
 // -- SPIR-V opcodes and enumerants this transform needs ----------------------
 
-const op_nop: u16 = 0;
 const op_name: u16 = 5;
+const op_member_name: u16 = 6;
 const op_entry_point: u16 = 15;
 const op_execution_mode: u16 = 16;
 const op_execution_mode_id: u16 = 331;
@@ -134,6 +161,7 @@ const op_type_bool: u16 = 20;
 const op_type_int: u16 = 21;
 const op_type_float: u16 = 22;
 const op_type_vector: u16 = 23;
+const op_type_array: u16 = 28;
 const op_type_struct: u16 = 30;
 const op_type_pointer: u16 = 32;
 const op_type_function: u16 = 33;
@@ -145,8 +173,11 @@ const op_variable: u16 = 59;
 const op_load: u16 = 61;
 const op_store: u16 = 62;
 const op_access_chain: u16 = 65;
+const op_in_bounds_access_chain: u16 = 66;
+const op_group_member_decorate: u16 = 75;
 const op_decorate: u16 = 71;
 const op_composite_extract: u16 = 81;
+const op_composite_construct: u16 = 80;
 const op_i_sub: u16 = 130;
 const op_f_mul: u16 = 133;
 const op_select: u16 = 169;
@@ -172,8 +203,10 @@ const storage_class_input: u32 = 1;
 const storage_class_output: u32 = 3;
 const storage_class_private: u32 = 6;
 const decoration_builtin: u32 = 11;
+const decoration_no_contraction: u32 = 42;
 const builtin_vertex_index: u32 = 42;
 const builtin_position: u32 = 0;
+const builtin_cull_distance: u32 = 4;
 const execution_model_vertex: u32 = 0;
 const selection_control_none: u32 = 0;
 const function_control_none: u32 = 0;
@@ -200,6 +233,8 @@ const Combinable = struct {
     variable: u32,
     /// Member index within a block, or null for a whole variable.
     member: ?u32,
+    /// A scalar/vector element of an output array (including a block member).
+    element: ?u32 = null,
     /// The value type being combined.
     value_type: u32,
 };
@@ -219,13 +254,219 @@ const Module = struct {
     type_bool: u32 = 0,
 };
 
+const UnusedCullDistance = struct {
+    variable: u32,
+    structure: u32,
+    member: u32,
+    member_count: u32,
+};
+
+/// Remove a trailing CullDistance member only when the output is provably
+/// dead: the sole output variable has one access-chain path to non-CullDistance
+/// members, and no pointer escapes or whole-struct operation use it. This is
+/// needed because MoltenVK's MSL backend cannot declare that output. Any
+/// uncertain interface stays byte-for-byte unchanged.
+fn stripUnusedCullDistanceOutput(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemory}!?[]u32 {
+    if (words.len < 5 or words[0] != magic) return null;
+
+    var pointer_storage = std.AutoHashMap(u32, u32).init(allocator);
+    defer pointer_storage.deinit();
+    var pointer_pointee = std.AutoHashMap(u32, u32).init(allocator);
+    defer pointer_pointee.deinit();
+    var variable_type = std.AutoHashMap(u32, u32).init(allocator);
+    defer variable_type.deinit();
+    var variable_storage = std.AutoHashMap(u32, u32).init(allocator);
+    defer variable_storage.deinit();
+    var structure_member_counts = std.AutoHashMap(u32, u32).init(allocator);
+    defer structure_member_counts.deinit();
+    var constant_values = std.AutoHashMap(u32, u32).init(allocator);
+    defer constant_values.deinit();
+    var cull_members = std.AutoHashMap(u32, u32).init(allocator);
+    defer cull_members.deinit();
+    var direct_cull_variables = std.AutoHashMap(u32, void).init(allocator);
+    defer direct_cull_variables.deinit();
+
+    var offset: usize = 5;
+    while (offset < words.len) {
+        const count = wordCountOf(words[offset]);
+        if (count == 0 or offset + count > words.len) return null;
+        const opcode = opcodeOf(words[offset]);
+        const operands = words[offset + 1 .. offset + count];
+        switch (opcode) {
+            op_type_pointer => if (operands.len >= 3) {
+                try pointer_storage.put(operands[0], operands[1]);
+                try pointer_pointee.put(operands[0], operands[2]);
+            },
+            op_variable => if (operands.len >= 3) {
+                try variable_type.put(operands[1], operands[0]);
+                try variable_storage.put(operands[1], operands[2]);
+            },
+            op_type_struct => if (operands.len >= 1) {
+                try structure_member_counts.put(operands[0], @intCast(operands.len - 1));
+            },
+            op_constant => if (operands.len >= 3) {
+                try constant_values.put(operands[1], operands[2]);
+            },
+            op_member_decorate => if (operands.len >= 4 and operands[2] == decoration_builtin and operands[3] == builtin_cull_distance) {
+                if (cull_members.contains(operands[0])) return null;
+                try cull_members.put(operands[0], operands[1]);
+            },
+            op_decorate => if (operands.len >= 3 and operands[1] == decoration_builtin and operands[2] == builtin_cull_distance) {
+                try direct_cull_variables.put(operands[0], {});
+            },
+            else => {},
+        }
+        offset += count;
+    }
+    // A single dead interface field is the only case this pass repairs. If
+    // the module has another CullDistance output, leave all of it untouched.
+    if (offset != words.len or cull_members.count() != 1) return null;
+
+    var candidate: ?UnusedCullDistance = null;
+    var output_iter = variable_storage.iterator();
+    while (output_iter.next()) |entry| {
+        if (entry.value_ptr.* != storage_class_output) continue;
+        const variable = entry.key_ptr.*;
+        if (direct_cull_variables.contains(variable)) return null;
+        const pointer = variable_type.get(variable) orelse continue;
+        const structure = pointer_pointee.get(pointer) orelse continue;
+        const member = cull_members.get(structure) orelse continue;
+        const member_count = structure_member_counts.get(structure) orelse return null;
+        if (member_count == 0 or member + 1 != member_count) return null;
+        if (candidate != null) return null;
+        candidate = .{ .variable = variable, .structure = structure, .member = member, .member_count = member_count };
+    }
+    const site = candidate orelse return null;
+
+    // The block type must only have its one Output pointer type. A function,
+    // input, or storage-buffer use would make deleting the final member an
+    // ABI change beyond this shader's unused stage output.
+    var matching_pointer_types: u32 = 0;
+    var pointer_iter = pointer_pointee.iterator();
+    while (pointer_iter.next()) |entry| {
+        if (entry.value_ptr.* != site.structure) continue;
+        matching_pointer_types += 1;
+        if (pointer_storage.get(entry.key_ptr.*) != storage_class_output) return null;
+    }
+    if (matching_pointer_types != 1) return null;
+
+    // No whole-struct reads/writes, pointer copies, function arguments, or
+    // unknown escapes are allowed. Access chains are safe only when their
+    // first literal member index is a known, non-CullDistance member.
+    offset = 5;
+    while (offset < words.len) {
+        const count = wordCountOf(words[offset]);
+        const opcode = opcodeOf(words[offset]);
+        const operands = words[offset + 1 .. offset + count];
+        if (opcode == op_access_chain or opcode == op_in_bounds_access_chain) {
+            if (operands.len >= 4 and operands[2] == site.variable) {
+                const member = constant_values.get(operands[3]) orelse return null;
+                if (member >= site.member_count or member == site.member) return null;
+                for (operands[0..2]) |operand| if (operand == site.variable) return null;
+                for (operands[4..]) |operand| if (operand == site.variable) return null;
+                offset += count;
+                continue;
+            }
+        }
+        if (opcode == op_variable and operands.len >= 2 and operands[1] == site.variable) {
+            offset += count;
+            continue;
+        }
+        if (opcode == op_name and operands.len >= 1 and operands[0] == site.variable) {
+            offset += count;
+            continue;
+        }
+        if (opcode == op_decorate and operands.len >= 1 and operands[0] == site.variable) {
+            offset += count;
+            continue;
+        }
+        if (opcode == op_entry_point and operands.len >= 3) {
+            var string_end: ?usize = null;
+            var word_index: usize = 2;
+            while (word_index < operands.len and string_end == null) : (word_index += 1) {
+                const string_word = operands[word_index];
+                for (0..4) |byte_index| {
+                    if (@as(u8, @truncate(string_word >> @intCast(byte_index * 8))) == 0) {
+                        string_end = word_index + 1;
+                        break;
+                    }
+                }
+            }
+            const interface_start = string_end orelse return null;
+            if (interface_start <= operands.len and
+                std.mem.indexOfScalar(u32, operands[interface_start..], site.variable) != null)
+            {
+                offset += count;
+                continue;
+            }
+        }
+        if (opcode == op_member_name and operands.len >= 2 and operands[0] == site.structure and operands[1] == site.member) {
+            offset += count;
+            continue;
+        }
+        if (opcode == op_member_decorate and operands.len >= 2 and operands[0] == site.structure and operands[1] == site.member) {
+            offset += count;
+            continue;
+        }
+        if (opcode == op_group_member_decorate) {
+            var pair: usize = 1;
+            while (pair + 1 < operands.len) : (pair += 2) {
+                if (operands[pair] == site.structure and operands[pair + 1] == site.member) return null;
+            }
+        }
+        if (std.mem.indexOfScalar(u32, operands, site.variable) != null) return null;
+        offset += count;
+    }
+
+    var stripped: std.ArrayList(u32) = .empty;
+    errdefer stripped.deinit(allocator);
+    try stripped.appendSlice(allocator, words[0..5]);
+    offset = 5;
+    while (offset < words.len) {
+        const count = wordCountOf(words[offset]);
+        const opcode = opcodeOf(words[offset]);
+        const operands = words[offset + 1 .. offset + count];
+        if ((opcode == op_member_name or opcode == op_member_decorate) and operands.len >= 2 and
+            operands[0] == site.structure and operands[1] == site.member)
+        {
+            offset += count;
+            continue;
+        }
+        if (opcode == op_type_struct and operands.len == site.member_count + 1 and operands[0] == site.structure) {
+            try stripped.append(allocator, instructionWord(op_type_struct, @intCast(count - 1)));
+            try stripped.appendSlice(allocator, operands[0 .. operands.len - 1]);
+        } else {
+            try stripped.appendSlice(allocator, words[offset .. offset + count]);
+        }
+        offset += count;
+    }
+    return try stripped.toOwnedSlice(allocator);
+}
+
 pub fn expand(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemory}!Result {
+    if (try stripUnusedCullDistanceOutput(allocator, words)) |stripped| {
+        defer allocator.free(stripped);
+        var result = try expandModule(allocator, stripped);
+        if (result.refusal == .none) result.removed_unused_cull_distance = true;
+        return result;
+    }
+    return expandModule(allocator, words);
+}
+
+fn expandModule(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemory}!Result {
     if (words.len < 5 or words[0] != magic) return .{ .refusal = .not_spirv };
 
     var module = Module{ .words = words, .id_bound = words[3] };
 
     // ---- pass one: learn the module's shape --------------------------------
     var builtin_vertex_index_id: u32 = 0;
+    // Both `OpDecorate %variable BuiltIn CullDistance` and
+    // `OpMemberDecorate %block %member BuiltIn CullDistance` are recorded in
+    // this ID set. SPIR-V IDs are module-global and unique, so the later
+    // output-interface check can test either form without another map.
+    const CullDistanceDecoration = struct { member_index: ?u32 = null };
+    var cull_distance_builtins = std.AutoHashMap(u32, CullDistanceDecoration).init(allocator);
+    defer cull_distance_builtins.deinit();
     // id -> defining instruction offset, for types and variables.
     var pointer_storage = std.AutoHashMap(u32, u32).init(allocator);
     defer pointer_storage.deinit();
@@ -241,6 +482,8 @@ pub fn expand(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemor
     defer vector_of_float.deinit();
     var vector_component = std.AutoHashMap(u32, u32).init(allocator);
     defer vector_component.deinit();
+    var vector_length = std.AutoHashMap(u32, u32).init(allocator);
+    defer vector_length.deinit();
     // Which output carries `gl_Position`. Xenia picks the strip's orientation
     // from the shaded positions, so without it there is no orientation to
     // pick and the canonical strip is the only option.
@@ -249,6 +492,12 @@ pub fn expand(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemor
     var position_struct: u32 = 0;
     var struct_members = std.AutoHashMap(u32, []const u32).init(allocator);
     defer struct_members.deinit();
+    var array_element_types = std.AutoHashMap(u32, u32).init(allocator);
+    defer array_element_types.deinit();
+    var array_length_ids = std.AutoHashMap(u32, u32).init(allocator);
+    defer array_length_ids.deinit();
+    var constant_values = std.AutoHashMap(u32, u32).init(allocator);
+    defer constant_values.deinit();
     var int_types = std.AutoHashMap(u32, void).init(allocator);
     defer int_types.deinit();
     // Results of loading the vertex index, and whether any of them is shifted
@@ -285,9 +534,13 @@ pub fn expand(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemor
                 if (operands.len >= 3 and operands[1] == decoration_builtin) {
                     if (operands[2] == builtin_vertex_index) builtin_vertex_index_id = operands[0];
                     if (operands[2] == builtin_position) position_variable = operands[0];
+                    if (operands[2] == builtin_cull_distance) try cull_distance_builtins.put(operands[0], .{});
                 }
             },
             op_member_decorate => {
+                if (operands.len >= 4 and operands[2] == decoration_builtin and operands[3] == builtin_cull_distance) {
+                    try cull_distance_builtins.put(operands[0], .{ .member_index = operands[1] });
+                }
                 if (operands.len >= 4 and operands[2] == decoration_builtin and
                     operands[3] == builtin_position)
                 {
@@ -307,12 +560,17 @@ pub fn expand(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemor
             op_type_float => if (operands.len >= 1) {
                 try float_types.put(operands[0], {});
             },
-            op_type_vector => if (operands.len >= 2) {
+            op_type_vector => if (operands.len >= 3) {
                 if (float_types.contains(operands[1])) try vector_of_float.put(operands[0], {});
                 try vector_component.put(operands[0], operands[1]);
+                try vector_length.put(operands[0], operands[2]);
             },
             op_type_struct => if (operands.len >= 1) {
                 try struct_members.put(operands[0], operands[1..]);
+            },
+            op_type_array => if (operands.len >= 3) {
+                try array_element_types.put(operands[0], operands[1]);
+                try array_length_ids.put(operands[0], operands[2]);
             },
             op_type_pointer => if (operands.len >= 3) {
                 try pointer_storage.put(operands[0], operands[1]);
@@ -321,6 +579,7 @@ pub fn expand(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemor
             },
             op_constant => if (operands.len >= 3) {
                 try existing_constant.put((@as(u64, operands[0]) << 32) | operands[2], operands[1]);
+                try constant_values.put(operands[1], operands[2]);
             },
             op_type_function => if (operands.len == 2) {
                 if (operands[1] == module.type_void) existing_void_fn = operands[0];
@@ -359,6 +618,27 @@ pub fn expand(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemor
     if (!int_types.contains(module.vertex_index_value_type)) return .{ .refusal = .vertex_index_shape };
     if (module.type_void == 0) return .{ .refusal = .vertex_index_shape };
 
+    // The wrapper calls the original entry point as a helper so it can shade
+    // the three source vertices and combine their outputs. In the current
+    // SPIR-V-to-MSL route, the helper's explicit output structure cannot
+    // represent this CullDistance interface shape. Keep the module
+    // byte-for-byte untouched and report the exact decorated location.
+    var output_variables = variable_storage.iterator();
+    while (output_variables.next()) |entry| {
+        if (entry.value_ptr.* != storage_class_output) continue;
+        const variable = entry.key_ptr.*;
+        const pointer = variable_type.get(variable) orelse continue;
+        const pointee = pointer_pointee.get(pointer) orelse continue;
+        if (cull_distance_builtins.get(variable)) |decoration| return .{
+            .refusal = .cull_distance_output,
+            .cull_distance_site = .{ .variable = variable, .interface_type = pointee, .member_index = decoration.member_index },
+        };
+        if (cull_distance_builtins.get(pointee)) |decoration| return .{
+            .refusal = .cull_distance_output,
+            .cull_distance_site = .{ .variable = variable, .interface_type = pointee, .member_index = decoration.member_index },
+        };
+    }
+
     // ---- the outputs whose fourth corner is derived -------------------------
     var combinable: [max_outputs]Combinable = undefined;
     var combinable_count: usize = 0;
@@ -368,20 +648,30 @@ pub fn expand(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemor
         const variable = entry.key_ptr.*;
         const pointer = variable_type.get(variable) orelse continue;
         const pointee = pointer_pointee.get(pointer) orelse continue;
-        if (float_types.contains(pointee) or vector_of_float.contains(pointee)) {
-            if (combinable_count == max_outputs) return .{ .refusal = .too_many_outputs };
-            combinable[combinable_count] = .{ .variable = variable, .member = null, .value_type = pointee };
-            combinable_count += 1;
-            continue;
-        }
-        if (struct_members.get(pointee)) |members| {
-            for (members, 0..) |member_type, index| {
-                if (!float_types.contains(member_type) and !vector_of_float.contains(member_type)) continue;
+        const members = struct_members.get(pointee) orelse &[_]u32{pointee};
+        for (members, 0..) |member_type, index| {
+            const member: ?u32 = if (struct_members.contains(pointee)) @intCast(index) else null;
+            if (float_types.contains(member_type) or vector_of_float.contains(member_type)) {
                 if (combinable_count == max_outputs) return .{ .refusal = .too_many_outputs };
+                combinable[combinable_count] = .{ .variable = variable, .member = member, .value_type = member_type };
+                combinable_count += 1;
+                continue;
+            }
+            // gl_PerVertex's ClipDistance and CullDistance are float arrays.
+            // Every emitted corner needs its own distance for every plane;
+            // keeping the third guest vertex's distances clips a different
+            // shape than the generated position and tears the rectangle.
+            const element_type = array_element_types.get(member_type) orelse continue;
+            if (!float_types.contains(element_type) and !vector_of_float.contains(element_type)) continue;
+            const length_id = array_length_ids.get(member_type) orelse continue;
+            const length = constant_values.get(length_id) orelse continue;
+            if (length > max_outputs - combinable_count) return .{ .refusal = .too_many_outputs };
+            for (0..length) |element| {
                 combinable[combinable_count] = .{
                     .variable = variable,
-                    .member = @intCast(index),
-                    .value_type = member_type,
+                    .member = member,
+                    .element = @intCast(element),
+                    .value_type = element_type,
                 };
                 combinable_count += 1;
             }
@@ -394,6 +684,7 @@ pub fn expand(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemor
     for (0..combinable_count) |index| {
         const entry = combinable[index];
         if (entry.member) |member| {
+            if (entry.element != null) continue;
             const pointer = variable_type.get(entry.variable) orelse continue;
             const pointee = pointer_pointee.get(pointer) orelse continue;
             if (position_struct != 0 and pointee == position_struct and position_member == member) {
@@ -426,6 +717,22 @@ pub fn expand(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemor
     const private_index = ids.take();
     const bool_type = if (module.type_bool != 0) module.type_bool else ids.take();
     const need_bool_type = module.type_bool == 0;
+    var bool_vector_type: [5]u32 = @splat(0);
+    var bool_vector_new: [5]bool = @splat(false);
+    var vector_iter = vector_component.iterator();
+    while (vector_iter.next()) |entry| {
+        if (entry.value_ptr.* != bool_type) continue;
+        const length = vector_length.get(entry.key_ptr.*) orelse continue;
+        if (length >= 2 and length <= 4) bool_vector_type[length] = entry.key_ptr.*;
+    }
+    for (combinable[0..combinable_count]) |entry| {
+        const length = vector_length.get(entry.value_type) orelse continue;
+        if (length < 2 or length > 4) return .{ .refusal = .vertex_index_shape };
+        if (bool_vector_type[length] == 0) {
+            bool_vector_type[length] = ids.take();
+            bool_vector_new[length] = true;
+        }
+    }
     const fn_void_type = if (existing_void_fn != 0) existing_void_fn else ids.take();
     const need_fn_void_type = existing_void_fn == 0;
     const new_main = ids.take();
@@ -456,12 +763,18 @@ pub fn expand(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemor
     var member_pointer_is_new: [max_outputs]bool = undefined;
     var member_constant: [max_outputs]u32 = undefined;
     var member_constant_is_new: [max_outputs]bool = undefined;
+    var element_constant: [max_outputs]u32 = undefined;
+    var element_constant_is_new: [max_outputs]bool = undefined;
     for (0..combinable_count) |index| {
         member_pointer_is_new[index] = false;
         member_constant_is_new[index] = false;
+        element_constant_is_new[index] = false;
         member_pointer_type[index] = 0;
         member_constant[index] = 0;
-        const member = combinable[index].member orelse continue;
+        element_constant[index] = 0;
+        const member = combinable[index].member;
+        const element = combinable[index].element;
+        if (member == null and element == null) continue;
         const pointer_key = (@as(u64, storage_class_output) << 32) | combinable[index].value_type;
         if (existing_pointer.get(pointer_key)) |found| {
             member_pointer_type[index] = found;
@@ -470,20 +783,33 @@ pub fn expand(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemor
             member_pointer_is_new[index] = true;
             try existing_pointer.put(pointer_key, member_pointer_type[index]);
         }
-        const constant_key = (@as(u64, int_type) << 32) | member;
-        if (existing_constant.get(constant_key)) |found| {
-            member_constant[index] = found;
-        } else {
-            member_constant[index] = ids.take();
-            member_constant_is_new[index] = true;
-            try existing_constant.put(constant_key, member_constant[index]);
+        if (member) |member_index| {
+            const constant_key = (@as(u64, int_type) << 32) | member_index;
+            if (existing_constant.get(constant_key)) |found| {
+                member_constant[index] = found;
+            } else {
+                member_constant[index] = ids.take();
+                member_constant_is_new[index] = true;
+                try existing_constant.put(constant_key, member_constant[index]);
+            }
+        }
+        if (element) |element_index| {
+            const constant_key = (@as(u64, int_type) << 32) | element_index;
+            if (existing_constant.get(constant_key)) |found| {
+                element_constant[index] = found;
+            } else {
+                element_constant[index] = ids.take();
+                element_constant_is_new[index] = true;
+                try existing_constant.put(constant_key, element_constant[index]);
+            }
         }
     }
 
     // ---- build -------------------------------------------------------------
     var out: std.ArrayList(u32) = .empty;
     defer out.deinit(allocator);
-    errdefer out.deinit(allocator);
+    var precise_decorations: std.ArrayList(u32) = .empty;
+    defer precise_decorations.deinit(allocator);
 
     try out.appendSlice(allocator, words[0..5]);
 
@@ -507,6 +833,11 @@ pub fn expand(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemor
             declarations_emitted = true;
             if (need_bool_type) {
                 try out.appendSlice(allocator, &.{ instructionWord(op_type_bool, 2), bool_type });
+            }
+            for (2..5) |length| {
+                if (bool_vector_new[length]) try out.appendSlice(allocator, &.{
+                    instructionWord(op_type_vector, 4), bool_vector_type[length], bool_type, @intCast(length),
+                });
             }
             if (need_private_pointer_type) try out.appendSlice(allocator, &.{
                 instructionWord(op_type_pointer, 4), private_pointer_type, storage_class_private, int_type,
@@ -532,6 +863,9 @@ pub fn expand(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemor
                 });
                 if (member_constant_is_new[index]) try out.appendSlice(allocator, &.{
                     instructionWord(op_constant, 4), int_type, member_constant[index], combinable[index].member.?,
+                });
+                if (element_constant_is_new[index]) try out.appendSlice(allocator, &.{
+                    instructionWord(op_constant, 4), int_type, element_constant[index], combinable[index].element.?,
                 });
             }
         }
@@ -563,8 +897,8 @@ pub fn expand(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemor
             repointed += 1;
         } else if (opcode == op_name and count >= 3 and instruction[1] == module.entry_function) {
             // The old entry point keeps its body and loses its name, so two
-            // functions are not both called "main".
-            for (0..count) |_| try out.append(allocator, instructionWord(op_nop, 1));
+            // functions are not both called "main". An OpNop here is invalid:
+            // a Nop may occur only in a function block, not among decorations.
         } else {
             try out.appendSlice(allocator, instruction);
         }
@@ -610,16 +944,15 @@ pub fn expand(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemor
     //   e0 = |v1 - v2|^2, e1 = |v2 - v0|^2, e2 = |v0 - v1|^2
     //   first = (e0 > e1 && e0 > e2) ? 0 : (e1 > e2 ? 1 : 2)
     //   strip  = first, (first + 1) % 3, (first + 2) % 3, derived
-    //   derived = v[first+1] + v[first+2] - v[first]
-    //           = v0 + v1 + v2 - 2 * v[first]
+    //   derived = (v[first+1] - v[first]) + v[first+2]
     //
     // Xenia's own comment in `vulkan_pipeline_cache.cc` states it for the
     // common case: edge 1-2 longest, "v3 = -v0 + v1 + v2". The first version
-    // of this transform subtracted `v[first]` once instead of twice, which put
+    // of this transform omitted the subtraction of `v[first]`, which put
     // every derived corner exactly `v[first]` away from the rectangle: one
     // triangle of each rectangle right and the other cut along its diagonal -
     // the split across Halo 3's title screen. `fourthCorner` below is the same
-    // arithmetic in plain Zig, so the formula is tested numerically rather
+    // evaluation order in plain Zig, so the formula is tested numerically rather
     // than only by the shape of the SPIR-V that implements it.
     //
     // Taking the canonical strip instead would shear every rectangle whose
@@ -655,6 +988,7 @@ pub fn expand(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemor
                 combinable[index],
                 member_pointer_type[index],
                 member_constant[index],
+                element_constant[index],
                 &ids,
             );
         }
@@ -748,45 +1082,76 @@ pub fn expand(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemor
     try out.appendSlice(allocator, &.{ instructionWord(op_i_equal, 5), bool_type, pick_is_0, pick, const_zero });
     try out.appendSlice(allocator, &.{ instructionWord(op_i_equal, 5), bool_type, pick_is_1, pick, const_one });
 
+    const scalar_conditions = [_]u32{ first_is_1, first_is_0, pick_is_1, pick_is_0, is_derived };
+    var vector_conditions: [5][5]u32 = @splat(@splat(0));
+    for (2..5) |length| {
+        if (bool_vector_type[length] == 0) continue;
+        for (scalar_conditions, 0..) |condition, condition_index| {
+            const vector_condition = ids.take();
+            vector_conditions[condition_index][length] = vector_condition;
+            try out.append(allocator, instructionWord(op_composite_construct, @intCast(3 + length)));
+            try out.appendSlice(allocator, &.{ bool_vector_type[length], vector_condition });
+            for (0..length) |_| try out.append(allocator, condition);
+        }
+    }
+
     for (0..combinable_count) |index| {
         const value_type = combinable[index].value_type;
+        const length = vector_length.get(value_type) orelse 0;
+        const select_conditions = if (length == 0) scalar_conditions else [5]u32{
+            vector_conditions[0][length], vector_conditions[1][length], vector_conditions[2][length],
+            vector_conditions[3][length], vector_conditions[4][length],
+        };
         const tail_first = ids.take();
         const at_first = ids.take();
         const tail_pick = ids.take();
         const at_pick = ids.take();
-        const partial = ids.take();
-        const total = ids.take();
-        const without_first = ids.take();
+        const tail_second = ids.take();
+        const at_second = ids.take();
+        const tail_third = ids.take();
+        const at_third = ids.take();
+        const difference = ids.take();
         const derived = ids.take();
         const selected = ids.take();
         try out.appendSlice(allocator, &.{
-            instructionWord(op_select, 6), value_type, tail_first, first_is_1, shaded[1][index], shaded[2][index],
+            instructionWord(op_select, 6), value_type, tail_first, select_conditions[0], shaded[1][index], shaded[2][index],
         });
         try out.appendSlice(allocator, &.{
-            instructionWord(op_select, 6), value_type, at_first, first_is_0, shaded[0][index], tail_first,
+            instructionWord(op_select, 6), value_type, at_first, select_conditions[1], shaded[0][index], tail_first,
         });
         try out.appendSlice(allocator, &.{
-            instructionWord(op_select, 6), value_type, tail_pick, pick_is_1, shaded[1][index], shaded[2][index],
+            instructionWord(op_select, 6), value_type, tail_pick, select_conditions[2], shaded[1][index], shaded[2][index],
         });
         try out.appendSlice(allocator, &.{
-            instructionWord(op_select, 6), value_type, at_pick, pick_is_0, shaded[0][index], tail_pick,
+            instructionWord(op_select, 6), value_type, at_pick, select_conditions[3], shaded[0][index], tail_pick,
         });
         try out.appendSlice(allocator, &.{
-            instructionWord(op_f_add, 5), value_type, partial, shaded[0][index], shaded[1][index],
+            instructionWord(op_select, 6), value_type, tail_second, select_conditions[0], shaded[2][index], shaded[0][index],
         });
         try out.appendSlice(allocator, &.{
-            instructionWord(op_f_add, 5), value_type, total, partial, shaded[2][index],
-        });
-        // v0 + v1 + v2 - 2 * v[first]: `v[first]` is subtracted twice, once
-        // to leave the other two corners and once to mirror across them.
-        try out.appendSlice(allocator, &.{
-            instructionWord(op_f_sub, 5), value_type, without_first, total, at_first,
+            instructionWord(op_select, 6), value_type, at_second, select_conditions[1], shaded[1][index], tail_second,
         });
         try out.appendSlice(allocator, &.{
-            instructionWord(op_f_sub, 5), value_type, derived, without_first, at_first,
+            instructionWord(op_select, 6), value_type, tail_third, select_conditions[0], shaded[0][index], shaded[1][index],
         });
         try out.appendSlice(allocator, &.{
-            instructionWord(op_select, 6), value_type, selected, is_derived, derived, at_pick,
+            instructionWord(op_select, 6), value_type, at_third, select_conditions[1], shaded[2][index], tail_third,
+        });
+        // Match Xenia's geometry shader's floating-point evaluation exactly:
+        // (second - first) + third, with both operations NoContraction.
+        // Summing all three then subtracting first twice loses low bits of
+        // positions, UVs and lighting interpolants through cancellation.
+        try out.appendSlice(allocator, &.{
+            instructionWord(op_f_sub, 5), value_type, difference, at_second, at_first,
+        });
+        try out.appendSlice(allocator, &.{
+            instructionWord(op_f_add, 5), value_type, derived, difference, at_third,
+        });
+        for ([_]u32{ difference, derived }) |precise_id| try precise_decorations.appendSlice(allocator, &.{
+            instructionWord(op_decorate, 3), precise_id, decoration_no_contraction,
+        });
+        try out.appendSlice(allocator, &.{
+            instructionWord(op_select, 6), value_type, selected, select_conditions[4], derived, at_pick,
         });
         try emitOutputStore(
             allocator,
@@ -794,6 +1159,7 @@ pub fn expand(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemor
             combinable[index],
             member_pointer_type[index],
             member_constant[index],
+            element_constant[index],
             selected,
             &ids,
         );
@@ -805,6 +1171,16 @@ pub fn expand(allocator: std.mem.Allocator, words: []const u32) error{OutOfMemor
     try out.appendSlice(allocator, &.{ instructionWord(op_label, 2), label_merge });
     try out.appendSlice(allocator, &.{instructionWord(op_return, 1)});
     try out.appendSlice(allocator, &.{instructionWord(op_function_end, 1)});
+
+    // Decorations belong before the type/constant/function declarations,
+    // including when their targets are results in the new wrapper.
+    var annotation_end: usize = 5;
+    while (annotation_end < out.items.len) {
+        const op = opcodeOf(out.items[annotation_end]);
+        if (op >= op_type_void and op <= 39) break;
+        annotation_end += wordCountOf(out.items[annotation_end]);
+    }
+    try out.insertSlice(allocator, annotation_end, precise_decorations.items);
 
     const produced = try out.toOwnedSlice(allocator);
     produced[3] = next_id;
@@ -823,16 +1199,18 @@ fn emitOutputLoad(
     target: Combinable,
     member_pointer: u32,
     member_index: u32,
+    element_index: u32,
     ids: anytype,
 ) error{OutOfMemory}!u32 {
-    if (target.member == null) {
+    if (target.member == null and target.element == null) {
         try out.appendSlice(allocator, &.{ instructionWord(op_load, 4), target.value_type, result, target.variable });
         return result;
     }
     const chain = ids.take();
-    try out.appendSlice(allocator, &.{
-        instructionWord(op_access_chain, 5), member_pointer, chain, target.variable, member_index,
-    });
+    const index_count: u16 = @as(u16, @intFromBool(target.member != null)) + @as(u16, @intFromBool(target.element != null));
+    try out.appendSlice(allocator, &.{ instructionWord(op_access_chain, 4 + index_count), member_pointer, chain, target.variable });
+    if (target.member != null) try out.append(allocator, member_index);
+    if (target.element != null) try out.append(allocator, element_index);
     try out.appendSlice(allocator, &.{ instructionWord(op_load, 4), target.value_type, result, chain });
     return result;
 }
@@ -843,17 +1221,19 @@ fn emitOutputStore(
     target: Combinable,
     member_pointer: u32,
     member_index: u32,
+    element_index: u32,
     value: u32,
     ids: anytype,
 ) error{OutOfMemory}!void {
-    if (target.member == null) {
+    if (target.member == null and target.element == null) {
         try out.appendSlice(allocator, &.{ instructionWord(op_store, 3), target.variable, value });
         return;
     }
     const chain = ids.take();
-    try out.appendSlice(allocator, &.{
-        instructionWord(op_access_chain, 5), member_pointer, chain, target.variable, member_index,
-    });
+    const index_count: u16 = @as(u16, @intFromBool(target.member != null)) + @as(u16, @intFromBool(target.element != null));
+    try out.appendSlice(allocator, &.{ instructionWord(op_access_chain, 4 + index_count), member_pointer, chain, target.variable });
+    if (target.member != null) try out.append(allocator, member_index);
+    if (target.element != null) try out.append(allocator, element_index);
     try out.appendSlice(allocator, &.{ instructionWord(op_store, 3), chain, value });
 }
 
@@ -884,7 +1264,7 @@ const SyntheticShader = struct {
     const id_block = 13;
     const id_ptr_output_block = 14;
     const id_position_var = 15;
-    const id_bound = 16;
+    const id_bound = 24;
 
     fn emit(self: *SyntheticShader, allocator: std.mem.Allocator, opcode: u16, operands: []const u32) !void {
         try self.words.append(allocator, instructionWord(opcode, @intCast(operands.len + 1)));
@@ -903,10 +1283,21 @@ const SyntheticShader = struct {
         execution_mode: bool = false,
         /// Decorate the block member as `gl_Position`.
         position_builtin: bool = true,
+        clip_distances: bool = false,
+        cull_distances: bool = false,
+        cull_distance_use: bool = false,
     };
 
     const id_ptr_private_int = 17;
     const id_const_two = 18;
+    const id_array_float = 19;
+    const id_uint = 20;
+    const id_clip_count = 21;
+    const id_ptr_output_float = 22;
+    const id_cull_member_index = 23;
+    const id_cull_element_index = 24;
+    const id_cull_access = 25;
+    const id_float_zero = 26;
 
     fn build(allocator: std.mem.Allocator, options: Options) !std.ArrayList(u32) {
         const vertex = options.vertex;
@@ -937,12 +1328,27 @@ const SyntheticShader = struct {
         }
         try self.emit(allocator, op_type_void, &.{id_void});
         try self.emit(allocator, op_type_int, &.{ id_int, 32, 1 });
+        if (options.clip_distances or options.cull_distances) {
+            try self.emit(allocator, op_type_int, &.{ id_uint, 32, 0 });
+            try self.emit(allocator, op_constant, &.{ id_uint, id_clip_count, 2 });
+        }
         try self.emit(allocator, op_type_float, &.{ id_float, 32 });
         try self.emit(allocator, op_type_vector, &.{ id_vec4, id_float, 4 });
-        try self.emit(allocator, op_type_struct, &.{ id_block, id_vec4 });
+        if (options.clip_distances or options.cull_distances) {
+            try self.emit(allocator, op_type_array, &.{ id_array_float, id_float, id_clip_count });
+            try self.emit(allocator, op_type_struct, &.{ id_block, id_vec4, id_array_float });
+        } else {
+            try self.emit(allocator, op_type_struct, &.{ id_block, id_vec4 });
+        }
+        if (options.cull_distances) {
+            try self.emit(allocator, op_member_decorate, &.{ id_block, 1, decoration_builtin, builtin_cull_distance });
+        }
         try self.emit(allocator, op_type_pointer, &.{ id_ptr_input_int, storage_class_input, id_int });
         try self.emit(allocator, op_type_pointer, &.{ id_ptr_output_vec4, storage_class_output, id_vec4 });
         try self.emit(allocator, op_type_pointer, &.{ id_ptr_output_block, storage_class_output, id_block });
+        if (options.cull_distance_use) {
+            try self.emit(allocator, op_type_pointer, &.{ id_ptr_output_float, storage_class_output, id_float });
+        }
         if (options.predeclare) {
             try self.emit(allocator, op_type_pointer, &.{ id_ptr_private_int, storage_class_private, id_int });
         }
@@ -950,12 +1356,21 @@ const SyntheticShader = struct {
         if (options.predeclare) {
             try self.emit(allocator, op_constant, &.{ id_int, id_const_two, 2 });
         }
+        if (options.cull_distance_use) {
+            try self.emit(allocator, op_constant, &.{ id_uint, id_cull_member_index, 1 });
+            try self.emit(allocator, op_constant, &.{ id_uint, id_cull_element_index, 0 });
+            try self.emit(allocator, op_constant, &.{ id_float, id_float_zero, 0 });
+        }
         try self.emit(allocator, op_variable, &.{ id_ptr_input_int, id_vertex_index, storage_class_input });
         try self.emit(allocator, op_variable, &.{ id_ptr_output_vec4, id_interpolator, storage_class_output });
         try self.emit(allocator, op_variable, &.{ id_ptr_output_block, id_position_var, storage_class_output });
         try self.emit(allocator, op_function, &.{ id_void, id_main, function_control_none, id_fn_void });
         try self.emit(allocator, op_label, &.{id_label});
         try self.emit(allocator, op_load, &.{ id_int, id_loaded, id_vertex_index });
+        if (options.cull_distance_use) {
+            try self.emit(allocator, op_access_chain, &.{ id_ptr_output_float, id_cull_access, id_position_var, id_cull_member_index, id_cull_element_index });
+            try self.emit(allocator, op_store, &.{ id_cull_access, id_float_zero });
+        }
         try self.emit(allocator, op_return, &.{});
         try self.emit(allocator, op_function_end, &.{});
         return self.words;
@@ -998,6 +1413,28 @@ fn countOpcode(words: []const u32, opcode: u16) u32 {
     return found;
 }
 
+fn countCullDistanceDecorations(words: []const u32) u32 {
+    var found: u32 = 0;
+    var offset: usize = 5;
+    while (offset < words.len) {
+        const header = words[offset];
+        const opcode = opcodeOf(header);
+        const count = wordCountOf(header);
+        if (opcode == op_member_decorate and count >= 5 and
+            words[offset + 3] == decoration_builtin and words[offset + 4] == builtin_cull_distance)
+        {
+            found += 1;
+        }
+        if (opcode == op_decorate and count >= 4 and
+            words[offset + 2] == decoration_builtin and words[offset + 3] == builtin_cull_distance)
+        {
+            found += 1;
+        }
+        offset += count;
+    }
+    return found;
+}
+
 test "a vertex shader gains a rectangle-expanding entry point and keeps its body" {
     var source = try SyntheticShader.build(testing.allocator, .{});
     defer source.deinit(testing.allocator);
@@ -1021,6 +1458,107 @@ test "a vertex shader gains a rectangle-expanding entry point and keeps its body
     try testing.expectEqual(@as(u32, 2), result.combined_outputs);
     // The id bound covers every id the transform introduced.
     try testing.expect(result.words[3] > SyntheticShader.id_bound);
+}
+
+test "clip-distance array elements follow the generated rectangle corner" {
+    var source = try SyntheticShader.build(testing.allocator, .{ .clip_distances = true });
+    defer source.deinit(testing.allocator);
+    const result = try expand(testing.allocator, source.items);
+    defer testing.allocator.free(result.words);
+    try testing.expectEqual(Refusal.none, result.refusal);
+    try testing.expect(walkable(result.words));
+    // Plain interpolator, gl_Position, and both clip planes. Without array
+    // handling this was 2, and the generated corner kept the third vertex's
+    // distances even though its position had been mirrored.
+    try testing.expectEqual(@as(u32, 4), result.combined_outputs);
+    var array_accesses: u32 = 0;
+    var offset: usize = 5;
+    while (offset < result.words.len) {
+        const header = result.words[offset];
+        if (opcodeOf(header) == op_access_chain and wordCountOf(header) == 6) array_accesses += 1;
+        offset += wordCountOf(header);
+    }
+    try testing.expectEqual(@as(u32, 8), array_accesses);
+}
+
+test "unused trailing CullDistance is removed before rectangle expansion" {
+    var source = try SyntheticShader.build(testing.allocator, .{ .cull_distances = true });
+    defer source.deinit(testing.allocator);
+
+    const original = try testing.allocator.dupe(u32, source.items);
+    defer testing.allocator.free(original);
+
+    const result = try expand(testing.allocator, source.items);
+    defer testing.allocator.free(result.words);
+    try testing.expectEqual(Refusal.none, result.refusal);
+    try testing.expect(result.removed_unused_cull_distance);
+    try testing.expect(walkable(result.words));
+    try testing.expectEqual(@as(u32, 0), countCullDistanceDecorations(result.words));
+    try testing.expectEqualSlices(u32, original, source.items);
+}
+
+test "active CullDistance remains unchanged and refuses rectangle expansion" {
+    var source = try SyntheticShader.build(testing.allocator, .{
+        .cull_distances = true,
+        .cull_distance_use = true,
+    });
+    defer source.deinit(testing.allocator);
+
+    const original = try testing.allocator.dupe(u32, source.items);
+    defer testing.allocator.free(original);
+
+    const result = try expand(testing.allocator, source.items);
+    defer testing.allocator.free(result.words);
+    try testing.expectEqual(Refusal.cull_distance_output, result.refusal);
+    try testing.expect(!result.removed_unused_cull_distance);
+    try testing.expectEqual(@as(usize, 0), result.words.len);
+    try testing.expectEqualSlices(u32, original, source.items);
+    try testing.expectEqualStrings("cull-distance-output-metal-unsupported", result.refusal.label());
+    const site = result.cull_distance_site orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, SyntheticShader.id_position_var), site.variable);
+    try testing.expectEqual(@as(u32, SyntheticShader.id_block), site.interface_type);
+    try testing.expectEqual(@as(?u32, 1), site.member_index);
+}
+
+test "the renamed entry point emits no module-scope Nop" {
+    var source = try SyntheticShader.build(testing.allocator, .{});
+    defer source.deinit(testing.allocator);
+    const result = try expand(testing.allocator, source.items);
+    defer testing.allocator.free(result.words);
+    try testing.expectEqual(Refusal.none, result.refusal);
+    var offset: usize = 5;
+    while (offset < result.words.len) {
+        const opcode = opcodeOf(result.words[offset]);
+        if (opcode == op_function) break;
+        try testing.expect(opcode != 0);
+        offset += wordCountOf(result.words[offset]);
+    }
+}
+
+test "vector selections use vector boolean conditions" {
+    var source = try SyntheticShader.build(testing.allocator, .{});
+    defer source.deinit(testing.allocator);
+    const result = try expand(testing.allocator, source.items);
+    defer testing.allocator.free(result.words);
+    var conditions: [5]u32 = @splat(0);
+    var condition_count: usize = 0;
+    var vector_selects: usize = 0;
+    var offset: usize = 5;
+    while (offset < result.words.len) {
+        const opcode = opcodeOf(result.words[offset]);
+        if (opcode == op_composite_construct and condition_count < conditions.len) {
+            conditions[condition_count] = result.words[offset + 2];
+            condition_count += 1;
+        }
+        if (opcode == op_select and result.words[offset + 1] == SyntheticShader.id_vec4) {
+            const condition = result.words[offset + 3];
+            try testing.expect(std.mem.indexOfScalar(u32, conditions[0..condition_count], condition) != null);
+            vector_selects += 1;
+        }
+        offset += wordCountOf(result.words[offset]);
+    }
+    try testing.expectEqual(@as(usize, 5), condition_count);
+    try testing.expectEqual(@as(usize, 18), vector_selects);
 }
 
 test "an ordinary vertex shades once and a rectangle shades all three of its vertices" {
@@ -1110,7 +1648,7 @@ test "a module this transform cannot read is returned untouched rather than half
 test "every refusal names itself" {
     // A refusal that cannot be read back is indistinguishable from a silent
     // pass-through, which is how this fallback went unnoticed in Xenia.
-    for ([_]Refusal{ .none, .not_spirv, .not_vertex, .no_vertex_index, .vertex_index_shape, .entry_function, .too_many_outputs, .id_space, .already_expanded }) |refusal| {
+    for ([_]Refusal{ .none, .not_spirv, .not_vertex, .no_vertex_index, .vertex_index_shape, .entry_function, .too_many_outputs, .id_space, .already_expanded, .cull_distance_output }) |refusal| {
         try testing.expect(refusal.label().len != 0);
     }
 }
@@ -1282,7 +1820,7 @@ pub fn fourthCorner(v: [3][2]f32) struct { first: u32, corner: [2]f32 } {
     const a = v[(first + 1) % 3];
     const b = v[(first + 2) % 3];
     const f = v[first];
-    return .{ .first = first, .corner = .{ a[0] + b[0] - f[0], a[1] + b[1] - f[1] } };
+    return .{ .first = first, .corner = .{ (a[0] - f[0]) + b[0], (a[1] - f[1]) + b[1] } };
 }
 
 test "the derived corner completes the rectangle in every orientation Xenia names" {
@@ -1316,13 +1854,33 @@ test "the derived corner completes the rectangle in every orientation Xenia name
     try testing.expectEqual([2]f32{ 4, 5 }, tilted.corner);
 }
 
-test "the emitted corner subtracts the strip's first vertex twice" {
+test "rectangle corner preserves translated coordinates without cancelling low bits" {
+    const large: f32 = 8_388_608;
+    const r = fourthCorner(.{ .{ large, large }, .{ large + 1, large }, .{ large, large + 1 } });
+    try testing.expectEqual(@as(u32, 0), r.first);
+    try testing.expectEqual([2]f32{ large + 1, large + 1 }, r.corner);
+
+    var source = try SyntheticShader.build(testing.allocator, .{});
+    defer source.deinit(testing.allocator);
+    const expanded = try expand(testing.allocator, source.items);
+    defer testing.allocator.free(expanded.words);
+    var precise: usize = 0;
+    var offset: usize = 5;
+    while (offset < expanded.words.len) : (offset += wordCountOf(expanded.words[offset])) {
+        if (opcodeOf(expanded.words[offset]) == op_decorate and
+            wordCountOf(expanded.words[offset]) == 3 and
+            expanded.words[offset + 2] == decoration_no_contraction) precise += 1;
+    }
+    try testing.expectEqual(@as(usize, expanded.combined_outputs * 2), precise);
+}
+
+test "the emitted corner uses Xenia's subtract-then-add evaluation" {
     var source = try SyntheticShader.build(testing.allocator, .{});
     defer source.deinit(testing.allocator);
     const result = try expand(testing.allocator, source.items);
     defer testing.allocator.free(result.words);
     // Three edges of two components are subtracted to measure the diagonal;
-    // then every combined output subtracts `v[first]` twice. Subtracting it
-    // once is the bug `fourthCorner` documents.
-    try testing.expectEqual(@as(u32, 6 + 2 * result.combined_outputs), countOpcode(result.words, op_f_sub));
+    // then each output computes (second - first) + third.
+    try testing.expectEqual(@as(u32, 6 + result.combined_outputs), countOpcode(result.words, op_f_sub));
+    try testing.expectEqual(@as(u32, 3 + result.combined_outputs), countOpcode(result.words, op_f_add));
 }

@@ -78,6 +78,8 @@ pub const Stats = struct {
     batches: u64,
     max_batch_size: usize,
     max_depth: usize,
+    work_signals: u64,
+    drain_broadcasts: u64,
     last_submitted_sequence: u64,
     completed_sequence: u64,
 };
@@ -93,8 +95,15 @@ pub const Worker = struct {
     max_depth: usize = 0,
     max_batch: usize = 0,
     batches: u64 = 0,
+    work_signals: u64 = 0,
+    drain_broadcasts: u64 = 0,
+    drain_waiters: usize = 0,
     last_submitted_sequence: u64 = 0,
     completed_sequence: u64 = 0,
+    /// The worker publishes completion after executing every Vulkan command
+    /// in that sequence. Barriers can check the common already-drained case
+    /// without taking the worker mutex a second time.
+    completed_sequence_atomic: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     submitted: u64 = 0,
     completed: u64 = 0,
     saturated_submissions: u64 = 0,
@@ -120,6 +129,7 @@ pub const Worker = struct {
             return .full;
         }
 
+        const was_empty = self.count == 0;
         self.last_submitted_sequence +|= 1;
         const sequence = self.last_submitted_sequence;
         self.slots[self.write_index] = .{ .sequence = sequence, .command = job };
@@ -127,7 +137,13 @@ pub const Worker = struct {
         self.count += 1;
         self.max_depth = @max(self.max_depth, self.count);
         self.submitted +|= 1;
-        signal(&self.work_available);
+        // The worker sleeps only while the queue is empty. Submissions to a
+        // nonempty queue are already covered by that first wake and need no
+        // pthread condition signal (millions of redundant calls per run).
+        if (was_empty) {
+            signal(&self.work_available);
+            self.work_signals +|= 1;
+        }
         unlock(&self.mutex);
         return .{ .queued = sequence };
     }
@@ -140,10 +156,22 @@ pub const Worker = struct {
         return sequence;
     }
 
+    /// Lock-free completion watermark for a checkpoint returned by
+    /// `checkpoint`. A true result proves every command through that point
+    /// has finished; a false result must still go through `drainThrough`.
+    pub fn completedThrough(self: *const Worker, sequence: u64) bool {
+        return self.completed_sequence_atomic.load(.acquire) >= sequence;
+    }
+
     /// Wait until all calls through `sequence` have run on the Vulkan thread.
     pub fn drainThrough(self: *Worker, sequence: u64) void {
+        if (self.completedThrough(sequence)) return;
         lock(&self.mutex);
-        while (self.completed_sequence < sequence) wait(&self.drained, &self.mutex);
+        if (self.completed_sequence < sequence) {
+            self.drain_waiters += 1;
+            defer self.drain_waiters -= 1;
+            while (self.completed_sequence < sequence) wait(&self.drained, &self.mutex);
+        }
         unlock(&self.mutex);
     }
 
@@ -164,6 +192,8 @@ pub const Worker = struct {
             .batches = self.batches,
             .max_batch_size = self.max_batch,
             .max_depth = self.max_depth,
+            .work_signals = self.work_signals,
+            .drain_broadcasts = self.drain_broadcasts,
             .last_submitted_sequence = self.last_submitted_sequence,
             .completed_sequence = self.completed_sequence,
         };
@@ -209,9 +239,13 @@ fn workerMain(worker: *Worker) void {
         lock(&worker.mutex);
         worker.completed +|= batch_len;
         worker.completed_sequence = batch[batch_len - 1].sequence;
+        worker.completed_sequence_atomic.store(worker.completed_sequence, .release);
         worker.batches +|= 1;
         worker.max_batch = @max(worker.max_batch, batch_len);
-        broadcast(&worker.drained);
+        if (worker.drain_waiters != 0) {
+            broadcast(&worker.drained);
+            worker.drain_broadcasts +|= 1;
+        }
         unlock(&worker.mutex);
     }
 }
@@ -246,6 +280,17 @@ fn captureDraw(_: abi.CommandBuffer, _: u32, _: u32, first_vertex: u32, _: u32) 
     if (index < order.len) order[index] = first_vertex;
 }
 
+fn captureEndRenderPass(_: abi.CommandBuffer) callconv(.c) void {
+    const index = order_len.fetchAdd(1, .monotonic);
+    if (index < order.len) order[index] = 0xffff_fffe;
+}
+
+fn captureEndCommandBuffer(_: abi.CommandBuffer) callconv(.c) abi.Result {
+    const index = order_len.fetchAdd(1, .monotonic);
+    if (index < order.len) order[index] = 0xffff_ffff;
+    return abi.SUCCESS;
+}
+
 fn captureBlockingDraw(_: abi.CommandBuffer, _: u32, _: u32, _: u32, _: u32) callconv(.c) void {
     blocking_started.store(true, .release);
     while (!blocking_released.load(.acquire)) std.atomic.spinLoopHint();
@@ -277,6 +322,8 @@ test "bounded Vulkan command worker preserves FIFO order and drains" {
         }
     }
     worker.drainThrough(last_sequence);
+    try std.testing.expect(worker.completedThrough(last_sequence));
+    try std.testing.expect(!worker.completedThrough(last_sequence + 1));
 
     const stats = worker.stats();
     try std.testing.expectEqual(@as(u64, order.len), stats.submitted);
@@ -287,6 +334,31 @@ test "bounded Vulkan command worker preserves FIFO order and drains" {
     try std.testing.expect(stats.max_batch_size > 0 and stats.max_batch_size <= max_batch_size);
     try std.testing.expectEqual(@as(usize, order.len), order_len.load(.monotonic));
     for (order, 0..) |value, index| try std.testing.expectEqual(@as(u32, @intCast(index)), value);
+}
+
+test "drain completes queued Vulkan draws before a synchronous FSI split boundary" {
+    order_len.store(0, .monotonic);
+    var worker: Worker = .{};
+    try worker.start();
+    defer worker.deinit();
+
+    const draw = worker.trySubmit(.{ .draw = .{
+        .function = captureDraw,
+        .command_buffer = null,
+        .vertex_count = 3,
+        .instance_count = 1,
+        .first_vertex = 7,
+        .first_instance = 0,
+    } });
+    try std.testing.expect(draw == .queued);
+    worker.drain();
+    captureEndRenderPass(null);
+    try std.testing.expectEqual(abi.SUCCESS, captureEndCommandBuffer(null));
+
+    try std.testing.expectEqual(@as(usize, 3), order_len.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 7), order[0]);
+    try std.testing.expectEqual(@as(u32, 0xffff_fffe), order[1]);
+    try std.testing.expectEqual(@as(u32, 0xffff_ffff), order[2]);
 }
 
 test "full Vulkan worker queue requests ordered synchronous fallback" {
@@ -327,11 +399,16 @@ test "full Vulkan worker queue requests ordered synchronous fallback" {
         .first_vertex = 0,
         .first_instance = 0,
     } }) == .full);
+    try std.testing.expect(!worker.completedThrough(worker.checkpoint()));
 
     blocking_released.store(true, .release);
     worker.drain();
+    try std.testing.expect(worker.completedThrough(worker.checkpoint()));
     const stats = worker.stats();
     try std.testing.expectEqual(@as(u64, queue_capacity + 1), stats.submitted);
     try std.testing.expectEqual(@as(u64, queue_capacity + 1), stats.completed);
     try std.testing.expectEqual(@as(u64, 1), stats.saturated_submissions);
+    // The blocked native call keeps the worker busy while the entire queue
+    // fills. Only the two empty-to-nonempty transitions need a wake signal.
+    try std.testing.expectEqual(@as(u64, 2), stats.work_signals);
 }

@@ -46,6 +46,7 @@ pub const Stats = struct {
     pixel_count: u64 = 0,
     visible_pixels: u64 = 0, // max(R,G,B) > 16
     bright_pixels: u64 = 0, // max(R,G,B) > 64
+    white_pixels: u64 = 0, // all RGB channels >= 240, independent of alpha
     transparent_pixels: u64 = 0, // alpha < 255
     rgb_different_pixels: u64 = 0, // RGB differs from the first pixel
     rgb_sum: [3]u64 = .{ 0, 0, 0 },
@@ -66,6 +67,10 @@ pub const Stats = struct {
     pub fn hasRgbDetail(self: Stats) bool {
         return self.pixel_count != 0 and self.rgb_different_pixels != 0 and self.peak() != 0;
     }
+
+    pub fn nearWhite(self: Stats) bool {
+        return self.pixel_count != 0 and self.white_pixels * 10 >= self.pixel_count * 9;
+    }
 };
 
 /// How a four-byte pixel is laid out. Every format the probe reads back is
@@ -80,6 +85,36 @@ pub const Layout = enum {
     /// A 30-31. Xenia's guest output image and its 10-bit front buffer.
     a2b10g10r10,
 };
+
+/// Raw transfer statistics can be permuted exactly only when the sampled
+/// RGB components are a permutation of R/G/B. Constants, alpha, replication
+/// and format reinterpretation require actual pixel sampling instead.
+pub fn sampledRgbPermutation(components: [4]u32) ?[3]usize {
+    var result: [3]usize = undefined;
+    var mask: u8 = 0;
+    for (components[0..3], 0..) |component, channel| {
+        const source: usize = switch (component) {
+            0 => channel, // VK_COMPONENT_SWIZZLE_IDENTITY
+            3, 4, 5 => component - 3, // R, G, B
+            else => return null,
+        };
+        const bit = @as(u8, 1) << @as(u3, @intCast(source));
+        if ((mask & bit) != 0) return null;
+        mask |= bit;
+        result[channel] = source;
+    }
+    return result;
+}
+
+test "FSI sample view RGB permutations distinguish raw transfer bytes from sampled colour" {
+    try std.testing.expectEqualDeep([3]usize{ 0, 1, 2 }, sampledRgbPermutation(.{ 0, 0, 0, 0 }).?);
+    try std.testing.expectEqualDeep([3]usize{ 2, 1, 0 }, sampledRgbPermutation(.{ 5, 4, 3, 0 }).?);
+    try std.testing.expect(sampledRgbPermutation(.{ 3, 3, 3, 0 }) == null);
+    try std.testing.expect(sampledRgbPermutation(.{ 6, 4, 3, 0 }) == null);
+    try std.testing.expect(sampledRgbPermutation(.{ 1, 4, 3, 0 }) == null);
+    try std.testing.expect(sampledRgbPermutation(.{ 2, 4, 3, 0 }) == null);
+    try std.testing.expect(sampledRgbPermutation(.{ 100, 4, 3, 0 }) == null);
+}
 
 pub fn layoutFor(format: u32) ?Layout {
     return switch (format) {
@@ -129,6 +164,7 @@ pub fn analyze(bytes: []const u8, width: u32, height: u32, format: u32) !Stats {
         const peak = @max(channels[0], channels[1], channels[2]);
         if (peak > 16) stats.visible_pixels += 1;
         if (peak > 64) stats.bright_pixels += 1;
+        if (channels[0] >= 240 and channels[1] >= 240 and channels[2] >= 240) stats.white_pixels += 1;
         if (alpha(pixel, layout) < 255) stats.transparent_pixels += 1;
         for (channels, 0..) |value, channel| {
             stats.rgb_sum[channel] += value;
@@ -344,6 +380,17 @@ test "ten-bit packed pixels are measured on the eight-bit scale" {
     // The preview cannot take this layout; the probe must not hand it over.
     try std.testing.expect(isBgra(64) == null);
     try std.testing.expect(layoutFor(64) == .a2b10g10r10);
+}
+
+test "near-white frame evidence ignores alpha and keeps isolated HUD colour" {
+    var pixels: [40]u8 = undefined;
+    for (0..9) |index| @memcpy(pixels[index * 4 ..][0..4], &[_]u8{ 248, 245, 250, 0 });
+    @memcpy(pixels[36..40], &[_]u8{ 255, 0, 0, 255 });
+    const stats = try analyze(&pixels, 10, 1, 37);
+    try std.testing.expectEqual(@as(u64, 9), stats.white_pixels);
+    try std.testing.expect(stats.nearWhite());
+    @memcpy(pixels[32..36], &[_]u8{ 239, 250, 250, 255 });
+    try std.testing.expect(!(try analyze(&pixels, 10, 1, 37)).nearWhite());
 }
 
 test "malformed and excessive frame sizes are refused before memory access" {

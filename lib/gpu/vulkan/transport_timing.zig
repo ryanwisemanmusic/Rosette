@@ -126,6 +126,28 @@ pub const Recent = struct {
         if (self.total_ns == 0) return 0;
         return @intCast(@min(@as(u128, std.math.maxInt(u64)), @as(u128, self.count) * 1_000_000_000_000 / self.total_ns));
     }
+    /// Nearest-rank 95th percentile of the bounded interval window. This is
+    /// report-time work only; callers should not scan the ring on the hot path.
+    pub fn p95Ns(self: *const Recent) u64 {
+        if (self.count == 0) return 0;
+        var sorted = self.samples;
+        var index: usize = 1;
+        while (index < self.count) : (index += 1) {
+            const value = sorted[index];
+            var insert_at = index;
+            while (insert_at > 0 and sorted[insert_at - 1] > value) : (insert_at -= 1) {
+                sorted[insert_at] = sorted[insert_at - 1];
+            }
+            sorted[insert_at] = value;
+        }
+        const rank = (@as(u16, @intCast(self.count)) * 95 + 99) / 100;
+        return sorted[@min(@as(usize, @intCast(rank - 1)), self.count - 1)];
+    }
+    pub fn maxSampleNs(self: *const Recent) u64 {
+        var result: u64 = 0;
+        for (self.samples[0..self.count]) |sample| result = @max(result, sample);
+        return result;
+    }
     pub fn activeFpsMilli(self: *const Recent, last: u64, now: u64) u64 {
         if (last == 0 or self.count == 0) return 0;
         const stale_after = @max(@as(u64, 5_000_000_000), (self.total_ns / self.count) *| 4);
@@ -196,6 +218,9 @@ pub const Ledger = struct {
     last_present_ns: u64 = 0,
     intervals: Cost = .{},
     recent: Recent = .{},
+    accepted_presents: u64 = 0,
+    last_accepted_present_ns: u64 = 0,
+    accepted_present_recent: Recent = .{},
     first_content_ns: u64 = 0,
     last_content_ns: u64 = 0,
     content_frames: u64 = 0,
@@ -213,6 +238,16 @@ pub const Ledger = struct {
             self.recent.note(now - self.last_present_ns);
         }
         self.last_present_ns = now;
+    }
+    /// Successful native WSI presents are the source for the on-window FPS
+    /// counter. Keep them separate from ingress requests and content proof.
+    pub fn acceptedPresent(self: *Ledger, now: u64) void {
+        if (now == 0) return;
+        if (self.last_accepted_present_ns != 0 and now >= self.last_accepted_present_ns) {
+            self.accepted_present_recent.note(now - self.last_accepted_present_ns);
+        }
+        self.last_accepted_present_ns = now;
+        self.accepted_presents +|= 1;
     }
     pub fn content(self: *Ledger, now: u64) void {
         if (now == 0) return;
@@ -255,6 +290,26 @@ test "present ingress measures generation gaps independently of driver costs" {
     try std.testing.expectEqual(@as(u64, 11_000), ledger.intervals.total_ns);
     try std.testing.expectEqual(@as(u64, 10_000), ledger.intervals.max_ns);
     try std.testing.expectEqual(@as(u64, 0), ledger.costs[@intFromEnum(Stage.wsi_present)].calls);
+}
+test "accepted present cadence is independent of picture qualification" {
+    var ledger = Ledger{};
+    ledger.acceptedPresent(1_000_000_000);
+    ledger.acceptedPresent(1_040_000_000);
+    ledger.acceptedPresent(1_080_000_000);
+    try std.testing.expectEqual(@as(u64, 3), ledger.accepted_presents);
+    try std.testing.expectEqual(@as(u64, 2), ledger.accepted_present_recent.count);
+    try std.testing.expectEqual(@as(u64, 25_000), ledger.accepted_present_recent.fpsMilli());
+    try std.testing.expectEqual(@as(u64, 40_000_000), ledger.accepted_present_recent.p95Ns());
+}
+test "recent interval window reports tail and maximum without changing samples" {
+    var recent = Recent{};
+    recent.note(10);
+    recent.note(100);
+    recent.note(20);
+    recent.note(30);
+    try std.testing.expectEqual(@as(u64, 100), recent.p95Ns());
+    try std.testing.expectEqual(@as(u64, 100), recent.maxSampleNs());
+    try std.testing.expectEqual(@as(u64, 10), recent.samples[0]);
 }
 test "preview sampling is wall-clock bounded without dropping guest presents" {
     try std.testing.expect(previewDue(0, 1, 250_000_000));
