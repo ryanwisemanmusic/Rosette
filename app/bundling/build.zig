@@ -55,6 +55,14 @@ pub fn build(b: *std.Build) void {
             b,
             target,
             optimize,
+            b.path("../../lib/Mach-O/input_controller_bridge.m"),
+            "windows_route_input_controller_bridge.o",
+            &[_][]const u8{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
+        ));
+        helper_mod.addObjectFile(compileCObject(
+            b,
+            target,
+            optimize,
             b.path("../../lib/Mach-O/native_audio_bridge.m"),
             "windows_route_native_audio_bridge.o",
             &[_][]const u8{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
@@ -62,6 +70,7 @@ pub fn build(b: *std.Build) void {
         helper_mod.linkFramework("AppKit", .{});
         helper_mod.linkFramework("QuartzCore", .{});
         helper_mod.linkFramework("Metal", .{});
+        helper_mod.linkFramework("GameController", .{});
         helper_mod.linkFramework("AudioToolbox", .{});
     }
     const app_bundle_parser_mod = b.createModule(.{
@@ -714,6 +723,7 @@ pub fn build(b: *std.Build) void {
     });
     windows_gpu_module.addImport("device_tree", windows_device_tree_module);
     windows_gpu_module.addImport("window_geometry", windows_window_geometry_module);
+    windows_gpu_module.addAnonymousImport("rosette_live_metal_source", .{ .root_source_file = b.path("../../lib/metal/textures/live_source.zig") });
     windows_gpu_module.addImport("frame_content_contract", windows_frame_content_contract_module);
     windows_gpu_module.addImport("screen_validity", windows_screen_validity_module);
 
@@ -841,6 +851,14 @@ pub fn build(b: *std.Build) void {
             b,
             target,
             optimize,
+            b.path("../../lib/Mach-O/input_controller_bridge.m"),
+            "standalone_windows_route_input_controller_bridge.o",
+            &[_][]const u8{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
+        ));
+        exe_runner_mod.addObjectFile(compileCObject(
+            b,
+            target,
+            optimize,
             b.path("../../lib/Mach-O/native_audio_bridge.m"),
             "standalone_windows_route_native_audio_bridge.o",
             &[_][]const u8{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
@@ -848,6 +866,7 @@ pub fn build(b: *std.Build) void {
         exe_runner_mod.linkFramework("AppKit", .{});
         exe_runner_mod.linkFramework("QuartzCore", .{});
         exe_runner_mod.linkFramework("Metal", .{});
+        exe_runner_mod.linkFramework("GameController", .{});
         exe_runner_mod.linkFramework("AudioToolbox", .{});
     }
 
