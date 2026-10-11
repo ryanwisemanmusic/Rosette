@@ -1,0 +1,13 @@
+#version 450
+layout(local_size_x=64) in;
+layout(set=0,binding=0,std430) readonly buffer Input { uvec4 rows[]; } input_data;
+layout(set=0,binding=1,std430) writeonly buffer Output { uvec4 rows[]; } output_data;
+void main() {
+    uint index=gl_GlobalInvocationID.x;
+    if(index>=input_data.rows.length())return;
+    uvec4 v=input_data.rows[index];
+    // The exact primitive used in XeResolveUnpack{32,64}bpp*Samples.
+    vec2 decoded=unpackHalf2x16(v.x);
+    vec2 scaled=decoded*uintBitsToFloat(v.y);
+    output_data.rows[index]=uvec4(floatBitsToUint(decoded),floatBitsToUint(scaled));
+}

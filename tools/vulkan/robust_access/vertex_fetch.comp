@@ -1,0 +1,13 @@
+#version 450
+// Xenia's vertex fetch (src/xenia/gpu/spirv_shader_translator_fetch.cc): the
+// word is loaded first, and only afterwards replaced by zero when it lies past
+// the fetch constant's end. The load itself is what reaches outside memory.
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std430) restrict readonly buffer XeSharedMemory { uint shared_memory[]; };
+layout(set = 0, binding = 1, std430) buffer Result { uint words[]; } result;
+layout(push_constant) uniform Push { int address; int fetch_end; } push;
+void main() {
+  uint loaded = shared_memory[push.address];
+  result.words[0] = loaded;
+  result.words[1] = uint(push.address) < uint(push.fetch_end) ? loaded : 0u;
+}

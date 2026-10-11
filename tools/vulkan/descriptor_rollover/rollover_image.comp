@@ -1,0 +1,13 @@
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+// The same check for sampled images, the descriptor type Xenia rolls over.
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) uniform texture2D t0;
+layout(set = 0, binding = 1) uniform texture2D t1;
+layout(set = 0, binding = 2) uniform texture2D t2;
+layout(set = 0, binding = 3) uniform texture2D t3;
+layout(std430, set = 0, binding = 4) buffer Out { vec4 v[4]; } result;
+void main() {
+  result.v[0] = texelFetch(t0, ivec2(0), 0); result.v[1] = texelFetch(t1, ivec2(0), 0);
+  result.v[2] = texelFetch(t2, ivec2(0), 0); result.v[3] = texelFetch(t3, ivec2(0), 0);
+}

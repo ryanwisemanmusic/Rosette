@@ -1,0 +1,64 @@
+#version 450
+// Synthetic bounded reproduction of Xenia's Float7e3To32 and
+// PreClampedFloat32To7e3 operations (spirv_shader_translator_rb.cc).
+// Every code and every rounding midpoint is checked against an independent
+// arithmetic oracle in probe.c. No game shader or game resource is used.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) buffer Result { uint words[]; } result;
+layout(set = 0, binding = 1) uniform texture2D identity_view;
+layout(set = 0, binding = 2) uniform texture2D swap_view;
+layout(set = 0, binding = 3) uniform sampler image_sampler;
+
+uint decode7e3(uint packed, int shift) {
+    uint exponent = bitfieldExtract(packed, shift + 7, 3);
+    uint mantissa = bitfieldExtract(packed, shift, 7);
+    uint msb = uint(findMSB(mantissa));
+    uint denormal_exponent = msb - 6u;
+    uint denormal_mantissa = mantissa << (7u - msb);
+    if (mantissa == 0u) {
+        denormal_exponent = uint(-124);
+        denormal_mantissa = 0u;
+    }
+    uint unbiased = exponent != 0u ? exponent : denormal_exponent;
+    uint fraction = exponent != 0u ? mantissa : denormal_mantissa;
+    return bitfieldInsert(fraction, unbiased + 124u, 7, 8) << 16;
+}
+
+uint encode7e3(float value) {
+    uint bits = floatBitsToUint(value);
+    uint denormal = bitfieldInsert(bits, 1u, 23, 9);
+    denormal >>= min(125u - (bits >> 23), 24u);
+    uint normal = bits - (124u << 23);
+    uint biased = bits < 0x3e800000u ? denormal : normal;
+    return bitfieldExtract(biased + 0x7fffu + bitfieldExtract(biased, 16, 1), 16, 10);
+}
+
+void main() {
+    uint code = gl_GlobalInvocationID.x;
+    if (code >= 1024u) return;
+    uint base = code * 16u;
+    uint decoded = decode7e3(code, 0);
+    result.words[base] = decoded;
+    result.words[base + 1u] = encode7e3(uintBitsToFloat(decoded));
+    float next = uintBitsToFloat(decode7e3(min(code + 1u, 1023u), 0));
+    result.words[base + 2u] = encode7e3((uintBitsToFloat(decoded) + next) * 0.5);
+    uint packed = code | (((code * 7u) & 1023u) << 10) |
+                  (((code * 23u) & 1023u) << 20) | ((code & 3u) << 30);
+    uint red = decode7e3(packed, 0);
+    uint green = decode7e3(packed, 10);
+    uint blue = decode7e3(packed, 20);
+    result.words[base + 3u] = red;
+    result.words[base + 4u] = green;
+    result.words[base + 5u] = blue;
+    result.words[base + 6u] = encode7e3(uintBitsToFloat(red)) |
+                            (encode7e3(uintBitsToFloat(green)) << 10) |
+                            (encode7e3(uintBitsToFloat(blue)) << 20) | (packed & 0xc0000000u);
+    result.words[base + 7u] = floatBitsToUint(float(packed >> 30) / 3.0);
+    ivec2 texel = ivec2(code % 32u, code / 32u);
+    uvec4 identity = floatBitsToUint(texelFetch(sampler2D(identity_view, image_sampler), texel, 0));
+    uvec4 swapped = floatBitsToUint(texelFetch(sampler2D(swap_view, image_sampler), texel, 0));
+    for (uint channel = 0u; channel < 4u; ++channel) {
+        result.words[base + 8u + channel] = identity[channel];
+        result.words[base + 12u + channel] = swapped[channel];
+    }
+}

@@ -1,0 +1,11 @@
+#version 450
+// Each of four single-descriptor bindings holds one buffer; the shader reports
+// the first word of each, so the CPU sees which buffer every binding holds
+// after one vkUpdateDescriptorSets write that rolls over bindings 0..3.
+layout(local_size_x = 1) in;
+layout(std430, set = 0, binding = 0) readonly buffer B0 { uint v; } b0;
+layout(std430, set = 0, binding = 1) readonly buffer B1 { uint v; } b1;
+layout(std430, set = 0, binding = 2) readonly buffer B2 { uint v; } b2;
+layout(std430, set = 0, binding = 3) readonly buffer B3 { uint v; } b3;
+layout(std430, set = 0, binding = 4) buffer Out { uint v[4]; } result;
+void main() { result.v[0] = b0.v; result.v[1] = b1.v; result.v[2] = b2.v; result.v[3] = b3.v; }

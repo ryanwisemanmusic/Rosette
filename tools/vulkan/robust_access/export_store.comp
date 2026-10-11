@@ -1,0 +1,10 @@
+#version 450
+// A memexport-style store (src/xenia/gpu/spirv_shader_translator_memexport.cc):
+// the dword address is formed in the shader and written with no clamp to the
+// shared memory size.
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std430) restrict buffer XeSharedMemory { uint shared_memory[]; };
+layout(push_constant) uniform Push { int address; uint value; } push;
+void main() {
+  shared_memory[push.address] = push.value;
+}

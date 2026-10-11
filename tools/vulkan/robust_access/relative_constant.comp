@@ -1,0 +1,9 @@
+#version 450
+// Xenia's relative constant addressing: float_constants[a0 + 16] with no clamp.
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std140) uniform XeFloatConstants { vec4 float_constants[256]; };
+layout(set = 0, binding = 1, std430) buffer Result { uint words[]; } result;
+layout(push_constant) uniform Push { int a0; } push;
+void main() {
+  result.words[0] = floatBitsToUint(float_constants[push.a0 + 16].x);
+}

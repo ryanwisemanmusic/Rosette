@@ -1,0 +1,37 @@
+#version 450
+// Special-value semantics Xenia's translated Xenos shaders depend on.
+// Inputs come from a buffer so nothing folds at compile time.
+layout(local_size_x = 1) in;
+layout(std430, binding = 0) buffer Data {
+  float in_zero;      // 0
+  float in_inf;       // +inf
+  float in_nan;       // quiet NaN
+  float in_one;       // 1
+  float out_v[16];
+};
+void main() {
+  float z = in_zero, inf = in_inf, nan_v = in_nan, one = in_one;
+  // 0: isnan(NaN) -- finite-math-only compilers fold this to false.
+  out_v[0] = isnan(nan_v) ? 1.0 : 0.0;
+  // 1: isinf(+inf).
+  out_v[1] = isinf(inf) ? 1.0 : 0.0;
+  // 2: Xenia legacy multiply: select(min(|a|,|b|) == 0, 0, a*b) with 0 * inf.
+  precise float product = z * inf;
+  out_v[2] = (min(abs(z), abs(inf)) == 0.0) ? 0.0 : product;
+  // 3: raw IEEE 0 * inf (NaN when IEEE semantics are kept).
+  out_v[3] = isnan(product) ? 1.0 : 0.0;
+  // 4: clamp(NaN, 0, 31.875) as used by the 7e3 pack (IEEE fmin/fmax -> 0).
+  float c = clamp(nan_v, 0.0, 31.875);
+  out_v[4] = c;
+  // 5: max(NaN, 0) then min(.., 31.875) spelled out.
+  out_v[5] = min(max(nan_v, 0.0), 31.875);
+  // 6: inf - inf is NaN.
+  out_v[6] = isnan(inf - inf) ? 1.0 : 0.0;
+  // 7: exp2(-inf) == 0, 8: log2(0) == -inf.
+  out_v[7] = exp2(-inf);
+  out_v[8] = (log2(z) < -3.0e38) ? 1.0 : 0.0;
+  // 9: NaN != NaN must be true.
+  out_v[9] = (nan_v != nan_v) ? 1.0 : 0.0;
+  // 10: 1 / 0 == +inf.
+  out_v[10] = isinf(one / z) ? 1.0 : 0.0;
+}
