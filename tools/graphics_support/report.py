@@ -10,7 +10,7 @@ from .offline_report import OFFLINE_SCRIPT, offline_view, texture_view
 from .native_metal import native_view, verify_native
 from .live_metal import live_view, verify_live
 from .tag_checks import tag_view
-from .run_view import run_overview
+from .run_view import run_overview, performance_overview, performance_measurements
 from .progress import progress_view
 from .offline_checks import checks_view, verify_checks
 from .hdr_chain import chain_view, verify_chain
@@ -95,7 +95,7 @@ body{{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui}}m
 <div class="scroll"><table><thead><tr><th>Check on matched guest modules</th><th>Pass</th><th>Fail</th><th>Unknown / not run</th></tr></thead><tbody>{''.join(stage_rows)}</tbody></table></div>
 <p class="note">These GPU modules have no verified mapping to ISO shader tags. Compilation percentages never increase the ISO rendering coverage counter. No game shaders are dispatched by this tool.</p>
 <details><summary>Offline tool identities and rewrite provenance</summary><pre>{esc(json.dumps(archive.get('offline_check', {}), indent=2))}</pre></details></section>
-<section><h2>Timing and health evidence</h2>{run_overview(run)}<p>Run {esc(run.get('run_id', 'none'))} · {esc(json.dumps(run.get('driver')))}. {esc(run.get('cadence_scope', 'No runtime log'))}. Horizontal position is the present counter, not elapsed time.</p><svg id="cadence" role="img" aria-label="Observed presentation cadence by present counter" viewBox="0 0 1000 170"></svg>
+<section><h2>Timing and health evidence</h2>{run_overview(run)}{performance_overview(run)}{performance_measurements(snapshot.get('performance_measurements'))}<p>Run {esc(run.get('run_id', 'none'))} · {esc(json.dumps(run.get('driver')))}. {esc(run.get('cadence_scope', 'No runtime log'))}. Horizontal position is the present counter, not elapsed time.</p><svg id="cadence" role="img" aria-label="Observed presentation cadence by present counter" viewBox="0 0 1000 170"></svg>
 <p>Host costs are cumulative final snapshots. Queue-submit time includes bridge backpressure. These timers overlap; adding them would double-count time. Fence observation is an upper bound including CPU and queue delay, not a GPU timestamp.</p>
 <div class="scroll"><table><thead><tr><th>Host stage</th><th>Calls</th><th>Total</th><th>Maximum call</th></tr></thead><tbody>{host}</tbody></table></div>
 <details><summary>Guard, robustness and CPU route counters</summary><pre>{snapshots}</pre></details>

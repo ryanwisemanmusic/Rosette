@@ -1,5 +1,9 @@
 """Rendering-relevant facts from one supplied run log, stated as observed and never as proof."""
 import html
+import hashlib
+from pathlib import Path
+import re
+import statistics
 
 
 TESSELLATION_WARNING_FINDING = (
@@ -27,6 +31,67 @@ def native_dispatch_total(run):
     """Total native texture dispatches recorded by the final cumulative counter line."""
     observed = ((run or {}).get("snapshots") or {}).get("native_textures") or {}
     return sum(_counts(observed.get("dispatches(ctx1/dxt1/dxt3/dxt5)", "")))
+
+
+def performance_overview(run):
+    snaps = (run or {}).get("snapshots", {})
+    policy = snaps.get("policy", {})
+    submits = snaps.get("guard_submission", {})
+    fence = snaps.get("fence_route", {})
+    ingress_ms = _int(snaps.get("present_intervals", {}).get("total_ms"))
+    submit_us = _int((run or {}).get("host_cost", {}).get("queue_submit", {}).get("total_us"))
+    share = f"{100 * submit_us / (ingress_ms * 1000):.1f}%" if ingress_ms else "unknown"
+    calls = _int(submits.get("driver_queue_submit_calls"))
+    infos = _int(submits.get("driver_submit_infos"))
+    waits = _int(policy.get("room_waits"))
+    wait_ms = _int(policy.get("room_wait_ms"))
+    mean_wait = f"{wait_ms / waits:.3f} ms" if waits else "unknown"
+    esc = lambda value: html.escape(str(value))
+    return f"""<h3 id="performance">FSI submission bottleneck</h3>
+<p>{calls:,} native queue calls · {infos:,} separate submit infos · {waits:,} room sleeps.
+Submission/backpressure occupied {share} of the measured present-interval time; these overlapping host timers are not a CPU/GPU utilization breakdown or an FPS forecast.
+Average room-wait observation: {mean_wait}.</p>
+<p>Current work cap: {esc(policy.get('adaptive_sample_work_cap', 'unknown'))} sample units;
+shader bounds verified: {esc(policy.get('shader_bounds_verified', 'unknown'))}.
+Already-completed fence checks/retirements: {esc(fence.get('ready_checks', 'unknown'))}/{esc(fence.get('ready_completions', 'unknown'))}.
+Missing route counters mean this log cannot measure that optimization. Smaller chunk/fence counts matter only alongside matched scene cadence and retained watchdog health.</p>"""
+
+
+def performance_measurements(evidence):
+    """Only display saved offline measurements while their inputs still match."""
+    if not evidence:
+        return ""
+    try:
+        sources, logs = evidence["sources"], evidence["logs"]
+        if not sources or not logs:
+            raise ValueError("missing measurement inputs")
+        for record in sources + logs:
+            data = Path(record["path"]).read_bytes()
+            if hashlib.sha256(data).hexdigest() != record["sha256"]:
+                raise ValueError("changed measurement input")
+        samples = []
+        for record in logs:
+            text = Path(record["path"]).read_text()
+            gate = re.search(r"Build Summary: (\d+)/(\d+) steps succeeded; (\d+)/(\d+) tests passed", text)
+            if not gate or gate[1] != gate[2] or gate[3] != gate[4]:
+                raise ValueError("focused checks incomplete")
+            match = re.search(r"FSI ready fence benchmark: groups=(\d+) watcher_ns=(\d+) ready_ns=(\d+)", text)
+            if not match or int(match[1]) != 20000 or min(int(match[2]), int(match[3])) <= 0:
+                raise ValueError("benchmark missing")
+            if "chunks_1x(before/after)=1000/500 chunks_4x=1000 draw_cap=4 recovery_max_work=2097152" not in text:
+                raise ValueError("recovery proof missing")
+            samples.append((int(match[2]), int(match[3])))
+        before = statistics.median(s[0] for s in samples) / 1e6
+        after = statistics.median(s[1] for s in samples) / 1e6
+        return f"""<h3>Offline performance checks · current source hashes</h3>
+<p>Median of {len(samples)} runs, 20,000 already-signaled stub fences each:
+watcher handoff {before:.3f} ms → submitter retirement {after:.3f} ms.
+This tests the production monitor's CPU path, without GPU execution; it cannot predict gameplay FPS.</p>
+<p>Representative 1,000 full-screen 1x draws: 1,000 → 500 chunks after sustained qualification.
+Full-screen 4x draws: 1,000 → 1,000 (still isolated).
+The four-draw limit, two-command-buffer queue bound, warning thresholds and 30 FPS ceiling remain in place.</p>"""
+    except (OSError, ValueError, TypeError, KeyError):
+        return '<p class="note">Offline performance measurements withdrawn: source or benchmark evidence changed or is incomplete. Gameplay benefit remains unverified.</p>'
 
 
 def run_overview(run):

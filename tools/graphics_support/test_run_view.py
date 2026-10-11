@@ -2,9 +2,10 @@
 from pathlib import Path
 import tempfile
 import unittest
+import hashlib
 
 from .evidence import parse_log
-from .run_view import native_dispatch_total, run_overview
+from .run_view import native_dispatch_total, run_overview, performance_overview, performance_measurements
 
 HEADER = ["# run_id = test-run", "# build_identity_sha256 = " + "ab" * 32, "# started_utc = 2026-10-09T00:00:00Z", "media = /tmp/x.iso"]
 
@@ -17,6 +18,47 @@ def parsed(lines):
 
 
 class RunLogTests(unittest.TestCase):
+    def test_offline_performance_counts_are_withdrawn_if_source_or_log_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.zig"
+            log = Path(directory) / "benchmark.log"
+            source.write_text("measured source")
+            log.write_text("Build Summary: 5/5 steps succeeded; 108/108 tests passed\n"
+                           "FSI ready fence benchmark: groups=20000 watcher_ns=80000000 ready_ns=2000000\n"
+                           "chunks_1x(before/after)=1000/500 chunks_4x=1000 draw_cap=4 recovery_max_work=2097152\n")
+            record = lambda path: {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            evidence = {"sources": [record(source)], "logs": [record(log)]}
+            self.assertIn("80.000 ms", performance_measurements(evidence))
+            self.assertIn("cannot predict gameplay FPS", performance_measurements(evidence))
+            source.write_text("changed")
+            self.assertIn("withdrawn", performance_measurements(evidence))
+            evidence["sources"] = [record(source)]
+            log.write_text("incomplete gate")
+            evidence["logs"] = [record(log)]
+            self.assertIn("withdrawn", performance_measurements(evidence))
+
+    def test_performance_uses_final_host_counters_and_keeps_new_routes_unknown(self):
+        run = parsed([
+            "FRAME HOST COST: present_intervals=10 total_ms=1000 mean_ms=100 max_ms=200",
+            "FRAME HOST COST: stage=queue_submit calls=20 total_us=800000 max_us=50000",
+            "VULKAN FSI GUARD: submission expanded_submits=1 segments=20 driver_queue_submit_calls=10 driver_submit_infos=20",
+            "METAL COMMAND BUFFER POLICY: room_waits=100 room_wait_ms=200 adaptive_sample_work_cap=615384 shader_bounds_verified=true",
+        ])
+        text = performance_overview(run)
+        self.assertIn("80.0%", text)
+        self.assertIn("2.000 ms", text)
+        self.assertIn("unknown/unknown", text)
+        self.assertIn("not a CPU/GPU utilization breakdown or an FPS forecast", text)
+
+    def test_ready_fence_counters_are_cumulative_and_missing_cost_is_unknown(self):
+        run = parsed([
+            "VULKAN FSI FENCE ROUTE: ready_checks=20 ready_completions=3",
+            "VULKAN FSI FENCE ROUTE: ready_checks=30 ready_completions=7",
+        ])
+        text = performance_overview(run)
+        self.assertIn("30/7", text)
+        self.assertIn("occupied unknown", text)
+
     def test_vertex_typed_texture_fetch_warnings_are_counted_once_per_xenia_line(self):
         run = parsed([
             "w> 0100000C Texture fetch constant (051B5583 1000001A 00000000 00000000 00000000 00000000) is completely invalid!",

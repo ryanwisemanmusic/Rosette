@@ -45,6 +45,7 @@ def parse_log(path: Path) -> dict:
     media = re.search(r"^media = (.+)$", text, re.M)
     markers = {"VULKAN FSI GUARD:": "guard", "METAL COMMAND BUFFER POLICY:": "policy",
                "VULKAN FSI CPU ROUTE:": "cpu_route", "VULKAN ROBUST ACCESS:": "robust",
+               "VULKAN FSI FENCE ROUTE:": "fence_route",
                "VULKAN FSI PIXEL FREQUENCY: enabled=": "fsi_pixel_frequency",
                "VULKAN HDR RESOLVE: enabled=": "hdr_resolve",
                "VULKAN FSI RASTER": "raster", "VULKAN FSI GUARD SAFETY:": "safety",
