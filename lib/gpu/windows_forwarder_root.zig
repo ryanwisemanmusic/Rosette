@@ -16,6 +16,8 @@ pub const provenance = @import("provenance.zig");
 pub const runtime = @import("runtime.zig");
 pub const xenos_texture = @import("xenos_texture.zig");
 pub const vulkan = @import("vulkan/root.zig");
+pub const metal = @import("metal/root.zig");
+pub const metal_backend_health = @import("metal/backend_health.zig");
 
 pub const ForwardingContract = forwarding.Contract;
 pub const FrameSource = frame_source.Descriptor;
@@ -33,6 +35,7 @@ pub const PresentChainOwner = present_chain.Owner;
 pub const PresentSwapchainRecord = present_chain.SwapchainRecord;
 pub const PresentTargetKind = present_chain.TargetKind;
 pub const PresentPixelEvidence = present_chain.PixelEvidence;
+pub const PresentPassSourceView = present_chain.PassSourceView;
 pub const PresentTransferKind = present_chain.TransferKind;
 pub const PresentResourceTransfer = present_chain.ResourceTransfer;
 /// What a Vulkan command can put into the image it targets. The forwarder
@@ -70,4 +73,5 @@ test {
     _ = runtime;
     _ = xenos_texture;
     _ = vulkan;
+    _ = metal_backend_health;
 }

@@ -104,6 +104,17 @@ pub const Format = enum(u8) {
         };
     }
 
+    pub fn encodingLabel(self: Format) []const u8 {
+        return switch (self) {
+            .k_8_8_8_8, .k_8_8_8_8_as_16_16_16_16 => "unorm_8_8_8_8",
+            .k_2_10_10_10, .k_2_10_10_10_as_16_16_16_16 => "unorm_10_10_10_2",
+            .k_8_8_8_8_gamma_edram => "gamma_8_8_8_8",
+            .k_16_16_16_16 => "unorm_16_16_16_16",
+            .k_2_10_10_10_float_edram => "xenos_7e3",
+            else => "unknown",
+        };
+    }
+
     pub fn supported(self: Format) bool {
         return switch (self) {
             .k_8_8_8_8,
@@ -116,6 +127,13 @@ pub const Format = enum(u8) {
             .k_2_10_10_10_float_edram => false,
             _ => false,
         };
+    }
+
+    /// Whether this front-buffer format carries Xenos 7e3 values in its
+    /// packed 10-bit colour channels. The ordinary 2:10:10:10 formats (7 and
+    /// 54) are fixed-point UNORM; their bits must never be decoded as floats.
+    pub fn uses7e3Color(self: Format) bool {
+        return self == .k_2_10_10_10_float_edram;
     }
 
     /// Bytes per texel for the CPU-readable front-buffer subset. Returning
@@ -715,6 +733,14 @@ test "front-buffer format numbers and strides match Xenos" {
         .format = .k_16_16_16_16,
         .tiled = false,
     }).requiredBytes());
+}
+
+test "fixed 2:10:10:10 front buffers are not Xenos 7e3" {
+    try std.testing.expect(!Format.k_2_10_10_10.uses7e3Color());
+    try std.testing.expect(!Format.k_2_10_10_10_as_16_16_16_16.uses7e3Color());
+    try std.testing.expect(Format.k_2_10_10_10_float_edram.uses7e3Color());
+    try std.testing.expectEqualStrings("unorm_10_10_10_2", Format.k_2_10_10_10_as_16_16_16_16.encodingLabel());
+    try std.testing.expectEqualStrings("xenos_7e3", Format.k_2_10_10_10_float_edram.encodingLabel());
 }
 
 test "a 16-bit RGBA front buffer narrows to BGRA8 without falling through as 32-bit" {
