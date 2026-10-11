@@ -2360,6 +2360,24 @@ pub fn build(b: *std.Build) void {
         });
         const block_jit_bench = b.step("block-jit-bench", "Measure the block translator on fixed programs (ROSETTE_BLOCK_JIT_BENCH=1, -Doptimize=ReleaseFast)");
         block_jit_bench.dependOn(&b.addRunArtifact(block_jit_bench_test).step);
+        const throughput_test = b.addTest(.{
+            .root_module = elf_processor_test_mod,
+            .filters = &.{ "hoist", "upper clear", "256-bit", "vector moves", "legacy scalar", "TLB", "chain", "cached", "constructor", "memory operands reach", "vector loads and stores", "non-temporal vector stores", "Halo 3's clear-colour", "SSE oracle", "native hop", "busy guest registers", "emitted code writes", "graphics ledger", "native guest forwarding", "host event pump", "ready native window", "native Vulkan refusal", "shader advisory", "virtual controller" },
+        });
+        const throughput_check = b.step("throughput-check", "Check page hoists, ordered memory, block chaining and Halo clear semantics without the full suite");
+        throughput_check.dependOn(&b.addRunArtifact(throughput_test).step);
+        const graphics_ledger_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/processor/ELF_processor/windows_graphics.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        graphics_ledger_mod.addImport("frame_content_contract", frame_content_contract_mod);
+        const graphics_ledger_check = b.step("graphics-ledger-check", "Check the host graphics contract independently of the ELF/PE executor");
+        const graphics_ledger_test = b.addTest(.{ .root_module = graphics_ledger_mod });
+        const run_graphics_ledger_test = b.addRunArtifact(graphics_ledger_test);
+        graphics_ledger_check.dependOn(&run_graphics_ledger_test.step);
+        check_step.dependOn(&run_graphics_ledger_test.step);
         const pe64_runtime_test_mod = b.createModule(.{
             .root_source_file = b.path("../src/tooling/exe_parser/pe64_runtime.zig"),
             .target = target,
