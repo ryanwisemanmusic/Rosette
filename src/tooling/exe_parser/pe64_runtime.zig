@@ -1369,6 +1369,14 @@ pub fn loadAndRun(allocator: std.mem.Allocator, bytes: []const u8, image: *const
     }
     state.dynamic_relocations = dynamic_relocations;
     state.dynamic_relocation_lookup.clear();
+    // Every direct slot is bound: index them for the translator's and the
+    // interpreter's `call [IAT]`/`jmp [IAT]` lookups.
+    state.indexWindowsIatStubs();
+    // Before any worker starts: workers read and bump these words, and
+    // the table can only be allocated while nothing else runs.
+    state.ensureCodePageGenerations();
+    state.ensureImportHistogram();
+    state.configureBlockJitMemoryVerify();
     state.windows_runtime_enabled = true;
     state.configureWindowsTraceRing();
     state.windows_unknown_imports_fatal = unknownImportsFatal();
