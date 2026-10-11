@@ -2294,6 +2294,19 @@ pub fn build(b: *std.Build) void {
         elf_processor_test_mod.addImport("tso_memory", tso_memory_mod);
         elf_processor_test_mod.addImport("concurrency", concurrency_mod);
         elf_processor_test_mod.addImport("parallelism", parallelism_mod);
+        // The ARM64 translator has an independent focused check. Its tests
+        // share the production implementation module but do not need to compile
+        // the full PE process graph when only block-jit files change.
+        const block_jit_test_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/processor/ELF_processor/block_jit.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        block_jit_test_mod.addImport("arm64_encode", arm64_encode_module);
+        block_jit_test_mod.addImport("x64_decoder", x64_decoder_mod);
+        const block_jit_test = b.addTest(.{ .root_module = block_jit_test_mod });
+        const block_jit_check = b.step("block-jit-check", "Run the ARM64 block translator's focused regression suite");
+        block_jit_check.dependOn(&b.addRunArtifact(block_jit_test).step);
         // Rooted so the frontier classification rules execute rather than
         // only compile as the ELF processor's dependency. A shadowed rule is
         // invisible at runtime and only shows up as a workload nobody names.
