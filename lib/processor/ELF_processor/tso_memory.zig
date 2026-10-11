@@ -454,17 +454,43 @@ pub fn copyInCoordinated(destination: []u8, source: []const u8) void {
 /// This executor's own queued stores still forward, through the coordinated
 /// comparison: a thread sees its own code writes in program order.
 ///
-/// The stripe cost two atomic read-modify-writes on a line every executor
-/// decoding the same code shares; on 2026-09-30 that comparison was 5.5% of
-/// the title's main thread and 3% of its render thread.
+/// Aligned atomic chunks keep the no-store-buffer hit path lock-free while
+/// reducing the byte-at-a-time loads. The exact comparison is retained so a
+/// code write still invalidates a cached instruction immediately.
 pub fn eqlCodeBytes(expected: []const u8, source: []const u8, scratch: []u8) bool {
     if (expected.len > source.len or scratch.len < expected.len) return false;
     if (expected.len == 0) return true;
     if (active_store_buffer) |buffer| {
         if (buffer.mayForward(@intFromPtr(source.ptr), expected.len)) return eqlCoordinated(expected, source, scratch);
     }
-    for (expected, source[0..expected.len]) |wanted, *actual| {
-        if (@atomicLoad(u8, actual, .monotonic) != wanted) return false;
+    var offset: usize = 0;
+    while (offset < expected.len) {
+        const address = @intFromPtr(source.ptr) + offset;
+        const line_remaining = cache_line_bytes - (address & (cache_line_bytes - 1));
+        const count = @min(expected.len - offset, line_remaining);
+        var compared: usize = 0;
+        while (compared < count) {
+            const chunk_address = address + compared;
+            const available = count - compared;
+            const width: usize = if (available >= 8 and chunk_address & 7 == 0)
+                8
+            else if (available >= 4 and chunk_address & 3 == 0)
+                4
+            else if (available >= 2 and chunk_address & 1 == 0)
+                2
+            else
+                1;
+            const matched = switch (width) {
+                8 => eqlAtomicChunk(u64, expected[offset + compared ..], chunk_address),
+                4 => eqlAtomicChunk(u32, expected[offset + compared ..], chunk_address),
+                2 => eqlAtomicChunk(u16, expected[offset + compared ..], chunk_address),
+                1 => eqlAtomicChunk(u8, expected[offset + compared ..], chunk_address),
+                else => unreachable,
+            };
+            if (!matched) return false;
+            compared += width;
+        }
+        offset += count;
     }
     return true;
 }
@@ -1452,6 +1478,34 @@ test "coordinated equality uses aligned atomic chunks at every offset and cache-
     try std.testing.expect(eqlCoordinated(&expected, crossing, &scratch));
     expected[7] ^= 0x40;
     try std.testing.expect(!eqlCoordinated(&expected, crossing, &scratch));
+}
+
+test "lock-free code equality uses aligned atomic chunks at every offset and cache-line edge" {
+    var bytes: [128]u8 align(64) = undefined;
+    for (&bytes, 0..) |*byte, index| byte.* = @truncate(index *% 37 +% 11);
+    var scratch: [16]u8 = undefined;
+    var expected: [15]u8 = undefined;
+    const prior_access = setCoordinatedGuestAccess(false);
+    defer _ = setCoordinatedGuestAccess(prior_access);
+    const prior_buffer = setActiveStoreBuffer(null);
+    defer _ = setActiveStoreBuffer(prior_buffer);
+
+    for (0..8) |offset| {
+        const source = bytes[16 + offset ..][0..expected.len];
+        @memcpy(&expected, source);
+        try std.testing.expect(eqlCodeBytes(&expected, source, &scratch));
+        for (0..expected.len) |changed_index| {
+            var changed = expected;
+            changed[changed_index] ^= 0x80;
+            try std.testing.expect(!eqlCodeBytes(&changed, source, &scratch));
+        }
+    }
+
+    const crossing = bytes[61..76];
+    @memcpy(&expected, crossing);
+    try std.testing.expect(eqlCodeBytes(&expected, crossing, &scratch));
+    expected[7] ^= 0x40;
+    try std.testing.expect(!eqlCodeBytes(&expected, crossing, &scratch));
 }
 
 test "backing snapshot excludes the current executor store-buffer overlay" {

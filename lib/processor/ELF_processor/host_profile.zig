@@ -77,27 +77,82 @@ var sampler: Sampler = .{};
 
 /// Guest worker slots the sampler follows, one table each.
 pub const max_workers: usize = 64;
-const worker_table_bits = 12;
+/// The owner occupies the final slot in frame-window storage. Worker slots
+/// retain their existing guest-slot indices.
+pub const owner_frame_slot: usize = max_workers;
+/// Keep the most recent host-side frame intervals. The profiler is opt-in,
+/// and a fixed small ring avoids allocations while guest workers are live.
+pub const frame_window_count: usize = 16;
+/// A frame often samples many distinct PCs; the bounded histogram keeps the
+/// hot entries and counts any tail it could not retain.
+pub const frame_pc_capacity: usize = 24;
+/// 2026-09-30: a 4096-entry table filled early in a 188 s run and dropped
+/// 68% of Halo 3's main-thread samples - the code that ran after it filled,
+/// which is the title's own translated code, was the part that went missing,
+/// and the wall-time split printed beside it was computed from what was left.
+/// A table is allocated per slot on first use, so 1.5 MiB is paid only by
+/// slots that ran a thread.
+const worker_table_bits = 16;
 const worker_table_len: usize = 1 << worker_table_bits;
 
 const WorkerTarget = struct {
     /// The worker's host thread while it runs, zero when none is registered.
     port: std.atomic.Value(mach_port_t) = .init(0),
+    /// Guest thread occupying this worker slot. Zero for non-guest callers.
+    guest_handle: std.atomic.Value(u64) = .init(0),
     samples: u64 = 0,
     dropped: u64 = 0,
     failures: u64 = 0,
-    table: [worker_table_len]Entry = @splat(.{}),
+    /// Published before the port, so the sampler never sees a registered
+    /// thread without a table.
+    table: std.atomic.Value(?[*]Entry) = .init(null),
 };
 
 var worker_targets: [max_workers]WorkerTarget = @splat(.{});
+
+pub const FrameTotals = struct {
+    epoch: u64,
+    guest_handle: u64,
+    mixed_guest_handles: bool,
+    samples: u64,
+    dropped: u64,
+    failures: u64,
+    distinct: usize,
+};
+
+const FrameBucket = struct {
+    epoch: u64 = 0,
+    guest_handle: u64 = 0,
+    mixed_guest_handles: bool = false,
+    samples: u64 = 0,
+    dropped: u64 = 0,
+    failures: u64 = 0,
+    entries: [frame_pc_capacity]Entry = @splat(.{}),
+};
+
+var frame_epoch: std.atomic.Value(u64) = .init(0);
+var frame_buckets: [max_workers + 1][frame_window_count]FrameBucket = @splat(@splat(.{}));
 
 /// Follow the calling thread as guest worker `index` until it unregisters.
 /// Samples accumulate per slot: a recycled slot keeps its predecessor's
 /// samples, and the report names the slot's latest thread.
 pub fn registerWorker(index: usize) void {
+    registerWorkerWithGuestHandle(index, 0);
+}
+
+/// Follow a worker slot with the guest identity it currently executes. The
+/// per-frame bucket marks intervals that cross a recycled guest slot.
+pub fn registerWorkerWithGuestHandle(index: usize, guest_handle: u64) void {
     if (comptime !supported) return;
     if (index >= max_workers) return;
-    const previous = worker_targets[index].port.swap(mach_thread_self(), .acq_rel);
+    const target = &worker_targets[index];
+    if (target.table.load(.acquire) == null) {
+        // Fresh pages are zero, which is an empty table.
+        const table = std.heap.page_allocator.alloc(Entry, worker_table_len) catch return;
+        target.table.store(table.ptr, .release);
+    }
+    target.guest_handle.store(guest_handle, .release);
+    const previous = target.port.swap(mach_thread_self(), .acq_rel);
     if (previous != 0) _ = std.c.mach_port_deallocate(std.c.mach_task_self(), previous);
 }
 
@@ -105,13 +160,14 @@ pub fn unregisterWorker(index: usize) void {
     if (comptime !supported) return;
     if (index >= max_workers) return;
     const previous = worker_targets[index].port.swap(0, .acq_rel);
+    worker_targets[index].guest_handle.store(0, .release);
     if (previous != 0) _ = std.c.mach_port_deallocate(std.c.mach_task_self(), previous);
 }
 
 pub fn workerTotals(index: usize) Totals {
     const target = &worker_targets[index];
     var distinct: usize = 0;
-    for (target.table) |entry| {
+    for (workerEntries(index)) |entry| {
         if (entry.count != 0) distinct += 1;
     }
     return .{
@@ -126,7 +182,8 @@ pub fn workerTotals(index: usize) Totals {
 
 /// One worker slot's sampled program counters. Read only after `stop`.
 pub fn workerEntries(index: usize) []const Entry {
-    return &worker_targets[index].table;
+    const table = worker_targets[index].table.load(.acquire) orelse return &.{};
+    return table[0..worker_table_len];
 }
 
 /// Start sampling the calling thread. Idempotent; false when this host
@@ -134,6 +191,8 @@ pub fn workerEntries(index: usize) []const Entry {
 pub fn startOnCurrentThread(interval_ns: u64) bool {
     if (comptime !supported) return false;
     if (sampler.running.load(.acquire)) return true;
+    frame_epoch.store(0, .release);
+    for (&frame_buckets) |*slots| @memset(slots, .{});
     sampler.target = mach_thread_self();
     sampler.interval_ns = @max(interval_ns, 100_000);
     sampler.started_ns = monotonicNanoseconds();
@@ -157,6 +216,88 @@ pub fn stop() void {
 
 pub fn active() bool {
     return sampler.running.load(.acquire);
+}
+
+/// Advance the host sample epoch at a guest frame boundary and return the
+/// interval that just ended. Zero denotes the first boundary, which is only
+/// a baseline and has no complete preceding interval.
+pub fn noteFrameBoundary() u64 {
+    if (!active()) return 0;
+    return frame_epoch.fetchAdd(1, .acq_rel);
+}
+
+/// Host PCs sampled during the requested frame interval. Call only after the
+/// sampler has stopped; the sampler is the sole writer of these buckets.
+pub fn frameEntries(slot: usize, epoch: u64) []const Entry {
+    if (slot > owner_frame_slot or epoch == 0) return &.{};
+    const bucket = &frame_buckets[slot][epoch % frame_window_count];
+    if (bucket.epoch != epoch) return &.{};
+    return &bucket.entries;
+}
+
+pub fn frameTotals(slot: usize, epoch: u64) FrameTotals {
+    if (slot > owner_frame_slot or epoch == 0) return .{ .epoch = epoch, .guest_handle = 0, .mixed_guest_handles = false, .samples = 0, .dropped = 0, .failures = 0, .distinct = 0 };
+    const bucket = &frame_buckets[slot][epoch % frame_window_count];
+    if (bucket.epoch != epoch) return .{ .epoch = epoch, .guest_handle = 0, .mixed_guest_handles = false, .samples = 0, .dropped = 0, .failures = 0, .distinct = 0 };
+    var distinct: usize = 0;
+    for (bucket.entries) |entry| if (entry.count != 0) {
+        distinct += 1;
+    };
+    return .{ .epoch = epoch, .guest_handle = bucket.guest_handle, .mixed_guest_handles = bucket.mixed_guest_handles, .samples = bucket.samples, .dropped = bucket.dropped, .failures = bucket.failures, .distinct = distinct };
+}
+
+/// Sampling suspends the owner and every registered worker to read host PCs,
+/// so normal throughput runs leave the profiler off unless explicitly opted in.
+pub fn enabledSetting(value: ?[]const u8) bool {
+    const setting = value orelse return false;
+    if (setting.len == 0) return false;
+    return std.mem.eql(u8, setting, "1") or
+        std.ascii.eqlIgnoreCase(setting, "true") or
+        std.ascii.eqlIgnoreCase(setting, "yes") or
+        std.ascii.eqlIgnoreCase(setting, "on");
+}
+
+test "host profiling is opt-in because sampling suspends guest workers" {
+    try std.testing.expect(!enabledSetting(null));
+    try std.testing.expect(!enabledSetting(""));
+    try std.testing.expect(!enabledSetting("0"));
+    try std.testing.expect(!enabledSetting("false"));
+    try std.testing.expect(!enabledSetting("off"));
+    try std.testing.expect(enabledSetting("1"));
+    try std.testing.expect(enabledSetting("true"));
+    try std.testing.expect(enabledSetting("YES"));
+    try std.testing.expect(enabledSetting("on"));
+}
+
+test "frame host samples stay isolated by worker slot and epoch" {
+    const slot = max_workers - 1;
+    const saved = frame_buckets[slot];
+    defer frame_buckets[slot] = saved;
+    frame_buckets[slot] = @splat(.{});
+    recordFrame(slot, 17, 0x10, 0x1234, 0x5678);
+    recordFrame(slot, 17, 0x10, 0x1234, 0x9999);
+    recordFrame(slot, 18, 0x20, 0xABCD, 0x9876);
+    const frame = frameTotals(slot, 17);
+    try std.testing.expectEqual(@as(u64, 17), frame.epoch);
+    try std.testing.expectEqual(@as(u64, 2), frame.samples);
+    try std.testing.expectEqual(@as(usize, 1), frame.distinct);
+    try std.testing.expectEqual(@as(u32, 2), frameEntries(slot, 17)[0].count);
+    try std.testing.expectEqual(@as(u64, 0x10), frame.guest_handle);
+    try std.testing.expect(!frame.mixed_guest_handles);
+    try std.testing.expectEqual(@as(u64, 0), frameTotals(slot, 16).samples);
+    try std.testing.expectEqual(@as(u64, 1), frameTotals(slot, 18).samples);
+}
+
+test "frame host bucket marks guest worker slot reuse as mixed identity" {
+    const slot = max_workers - 1;
+    const saved = frame_buckets[slot];
+    defer frame_buckets[slot] = saved;
+    frame_buckets[slot] = @splat(.{});
+    recordFrame(slot, 21, 0x10, 0x1234, 0);
+    recordFrame(slot, 21, 0x20, 0x5678, 0);
+    const frame = frameTotals(slot, 21);
+    try std.testing.expect(frame.mixed_guest_handles);
+    try std.testing.expectEqual(@as(u64, 2), frame.samples);
 }
 
 pub const Totals = struct {
@@ -222,23 +363,72 @@ fn sampleThread(target: mach_port_t) ?Sample {
 }
 
 fn sampleOnce() void {
+    const owner_epoch = frame_epoch.load(.acquire);
     if (sampleThread(sampler.target)) |sample| {
         record(sample.pc, sample.lr);
+        recordFrame(owner_frame_slot, owner_epoch, 0, sample.pc, sample.lr);
     } else {
         sampler.failures +|= 1;
+        recordFrameFailure(owner_frame_slot, owner_epoch, 0);
     }
-    for (&worker_targets) |*target| {
+    for (&worker_targets, 0..) |*target, slot| {
         const port = target.port.load(.acquire);
         if (port == 0) continue;
+        const worker_epoch = frame_epoch.load(.acquire);
+        const guest_handle = target.guest_handle.load(.acquire);
         // A worker that ended between the load and the suspend fails the
         // suspend; that is a failure count, never a stale sample.
         const sample = sampleThread(port) orelse {
             target.failures +|= 1;
+            recordFrameFailure(slot, worker_epoch, guest_handle);
             continue;
         };
+        // Do not attach this PC to either identity if the worker was
+        // unregistered or reused while its host thread was suspended.
+        if (target.port.load(.acquire) != port or target.guest_handle.load(.acquire) != guest_handle) {
+            target.failures +|= 1;
+            recordFrameFailure(slot, worker_epoch, guest_handle);
+            continue;
+        }
         target.samples +|= 1;
-        if (!recordInto(&target.table, sample.pc, sample.lr)) target.dropped +|= 1;
+        const table = target.table.load(.acquire) orelse {
+            target.dropped +|= 1;
+            continue;
+        };
+        if (!recordInto(table[0..worker_table_len], sample.pc, sample.lr)) target.dropped +|= 1;
+        recordFrame(slot, worker_epoch, guest_handle, sample.pc, sample.lr);
     }
+}
+
+fn recordFrame(slot: usize, epoch: u64, guest_handle: u64, pc: u64, lr: u64) void {
+    if (epoch == 0 or slot > owner_frame_slot) return;
+    const bucket = &frame_buckets[slot][epoch % frame_window_count];
+    if (bucket.epoch != epoch) bucket.* = .{ .epoch = epoch, .guest_handle = guest_handle };
+    if (bucket.guest_handle != guest_handle) bucket.mixed_guest_handles = true;
+    bucket.samples +|= 1;
+    if (pc == 0) {
+        bucket.dropped +|= 1;
+        return;
+    }
+    for (&bucket.entries) |*entry| {
+        if (entry.pc == pc) {
+            entry.count +|= 1;
+            return;
+        }
+        if (entry.pc == 0) {
+            entry.* = .{ .pc = pc, .lr = lr, .count = 1 };
+            return;
+        }
+    }
+    bucket.dropped +|= 1;
+}
+
+fn recordFrameFailure(slot: usize, epoch: u64, guest_handle: u64) void {
+    if (epoch == 0 or slot > owner_frame_slot) return;
+    const bucket = &frame_buckets[slot][epoch % frame_window_count];
+    if (bucket.epoch != epoch) bucket.* = .{ .epoch = epoch, .guest_handle = guest_handle };
+    if (bucket.guest_handle != guest_handle) bucket.mixed_guest_handles = true;
+    bucket.failures +|= 1;
 }
 
 fn record(pc: u64, lr: u64) void {

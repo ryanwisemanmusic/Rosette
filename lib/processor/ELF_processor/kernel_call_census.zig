@@ -98,7 +98,30 @@ pub const Slot = struct {
     subsystem: shim_map.Subsystem = .other,
     /// The boot phase this export places the title in, when it is a marker.
     phase: ?shim_map.BootPhase = null,
+    /// Whether translated code still leaves for the interpreter to count
+    /// calls to this export. See `Saturation`.
+    saturation: Saturation = .counting,
 };
+
+/// An armed export's hook exists only to count it, and every translated call
+/// to it pays an exit from translated code for that count: on 2026-09-30
+/// KeRaiseIrqlToDpcLevel, KeAcquireSpinLockAtRaisedIrql,
+/// KeReleaseSpinLockFromRaisedIrql and KfLowerIrql took 600,000 such exits
+/// each and XamUserGetSigninState 451,000. Once an export has been counted
+/// `saturation_calls` times its first and busiest facts are known; the hook
+/// filter drops it, and later calls counted by the interpreter still add to
+/// `hits`, which becomes a lower bound.
+pub const Saturation = enum(u8) {
+    counting,
+    /// Dropped from the translator's hook filter.
+    saturated,
+    /// Never dropped: something other than the count acts on this export
+    /// (a functional shim or bridge).
+    pinned,
+};
+
+/// Calls counted before a diagnostic-only export hook saturates.
+pub const saturation_calls: u64 = 1 << 16;
 
 /// The armed set and what it has seen.
 pub const Census = struct {
@@ -492,6 +515,39 @@ pub const Census = struct {
         return filled;
     }
 
+    /// Whether the slot has been counted `saturation_calls` times and has
+    /// not yet been decided. Two atomic loads: on the interpreter's call path.
+    pub fn saturationDue(self: *const Census, index_plus_one: u32) bool {
+        const slot = self.slotAt(index_plus_one) orelse return false;
+        return @atomicLoad(Saturation, &slot.saturation, .acquire) == .counting and
+            @atomicLoad(u64, &slot.hits, .monotonic) >= saturation_calls;
+    }
+
+    /// Decide a due slot once: true for exactly one caller, the one that
+    /// moved it from counting to `decision`.
+    pub fn decideSaturation(self: *Census, index_plus_one: u32, decision: Saturation) bool {
+        if (index_plus_one == 0) return false;
+        const index: usize = @as(usize, index_plus_one) - 1;
+        if (index >= self.slots.len or self.slots[index].address == 0) return false;
+        return @cmpxchgStrong(Saturation, &self.slots[index].saturation, .counting, decision, .acq_rel, .monotonic) == null;
+    }
+
+    /// Whether translated code no longer leaves for the interpreter to count
+    /// calls to `address`.
+    pub fn saturatedAt(self: *const Census, address: u64) bool {
+        const slot = self.exportAt(address) orelse return false;
+        return @atomicLoad(Saturation, &slot.saturation, .acquire) == .saturated;
+    }
+
+    /// Exports dropped from the hook filter so far.
+    pub fn saturatedCount(self: *const Census) u32 {
+        var count: u32 = 0;
+        for (self.slots) |*slot| {
+            if (slot.address != 0 and @atomicLoad(Saturation, &slot.saturation, .acquire) == .saturated) count += 1;
+        }
+        return count;
+    }
+
     pub fn slotAt(self: *const Census, index_plus_one: u32) ?*const Slot {
         if (index_plus_one == 0) return null;
         const index: usize = @as(usize, index_plus_one) - 1;
@@ -635,6 +691,37 @@ test "a trampoline is armed once and counted from the call path" {
     try testing.expectEqual(@as(u64, 4242), census.findExport("VdQueryVideoMode").?.first_step);
     try testing.expectEqual(@as(u64, 9000), census.findExport("VdQueryVideoMode").?.last_step);
     try testing.expectEqualStrings("VdQueryVideoMode", census.slotAt(census.last_slot).?.export_name);
+}
+
+test "an export saturates once, after enough calls, and a pinned one never does" {
+    var census = Census{};
+    defer census.deinit(testing.allocator);
+    armVideoMode(&census, testing.allocator, 0x1409cb000);
+    const slot = census.note(0x1409cb000, 1);
+    try testing.expect(slot != 0);
+    try testing.expect(!census.saturationDue(slot));
+
+    // Hits reach the threshold: due, decided by exactly one caller.
+    @atomicStore(u64, &census.slots[slot - 1].hits, saturation_calls, .monotonic);
+    try testing.expect(census.saturationDue(slot));
+    try testing.expect(census.decideSaturation(slot, .saturated));
+    try testing.expect(!census.decideSaturation(slot, .pinned));
+    try testing.expect(!census.saturationDue(slot));
+    try testing.expect(census.saturatedAt(0x1409cb000));
+    try testing.expectEqual(@as(u32, 1), census.saturatedCount());
+    // Calls the interpreter still makes keep counting.
+    _ = census.note(0x1409cb000, 2);
+    try testing.expectEqual(saturation_calls + 1, census.hitsFor("VdQueryVideoMode"));
+
+    // A pinned export stays hooked however often it is called.
+    var pinned = Census{};
+    defer pinned.deinit(testing.allocator);
+    armVideoMode(&pinned, testing.allocator, 0x1409cb000);
+    const pinned_slot = pinned.note(0x1409cb000, 1);
+    @atomicStore(u64, &pinned.slots[pinned_slot - 1].hits, saturation_calls, .monotonic);
+    try testing.expect(pinned.decideSaturation(pinned_slot, .pinned));
+    try testing.expect(!pinned.saturatedAt(0x1409cb000));
+    try testing.expect(!pinned.saturationDue(pinned_slot));
 }
 
 test "one guest call is never counted twice when both symbols are armed" {

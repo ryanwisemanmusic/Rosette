@@ -29,6 +29,8 @@ pub const Kind = enum(u8) {
     fatal_point,
     /// A Rosette runtime check refused to continue.
     runtime_invariant,
+    /// The guest executed an invalid instruction (including UD2).
+    guest_invalid_instruction,
     /// A guest thread overflowed its stack into the no-access guard.
     guest_stack_overflow,
     /// The guest accessed memory it may not, and nothing handled it.
@@ -44,6 +46,7 @@ pub fn kindLabel(kind: Kind) []const u8 {
         .guest_terminate => "guest C++ runtime terminated (std::terminate / pure virtual call)",
         .fatal_point => "Rosette fatal-point policy",
         .runtime_invariant => "Rosette runtime invariant",
+        .guest_invalid_instruction => "guest executed an invalid instruction",
         .guest_stack_overflow => "guest stack overflow",
         .guest_access_violation => "unhandled guest access violation",
         .guest_exit => "guest exit",
@@ -182,6 +185,15 @@ test "the first terminal event of a run is the one kept" {
     try std.testing.expectEqualStrings("operator new was refused", event.detail());
     try std.testing.expectEqual(@as(u64, 10), event.site.step);
     try std.testing.expectEqual(@as(u32, 2), event.decisions);
+}
+
+test "invalid-instruction terminal events retain their distinct classification" {
+    var event: TerminalEvent = .{};
+    try std.testing.expect(event.record(.guest_invalid_instruction, "ud2", "invalid opcode at 0x1400", .{ .step = 17, .rip = 0x1400, .thread_slot = 3 }));
+    try std.testing.expectEqual(Kind.guest_invalid_instruction, event.kind);
+    try std.testing.expectEqualStrings("guest executed an invalid instruction", kindLabel(event.kind));
+    try std.testing.expectEqual(@as(u64, 17), event.site.step);
+    try std.testing.expectEqual(@as(?u16, 3), event.site.thread_slot);
 }
 
 test "long labels and details are truncated, never overflowed" {
