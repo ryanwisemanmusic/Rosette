@@ -1943,16 +1943,21 @@ test "SIMD compare predicates produce lane masks and reject what is not modelled
     try std.testing.expect(VexComparePredicate.fromImmediate(7).?.evaluate(@as(f32, 1.0), 2.0));
     try std.testing.expect(!VexComparePredicate.fromImmediate(7).?.evaluate(quiet_nan, @as(f32, 1.0)));
 
-    // The signalling and extended variants select the same relation; only the
-    // exception behaviour differs, and that is not modelled here.
-    try std.testing.expectEqual(
-        VexComparePredicate.equal,
-        VexComparePredicate.fromImmediate(0x08).?,
-    );
-    try std.testing.expectEqual(
-        VexComparePredicate.not_equal,
-        VexComparePredicate.fromImmediate(0x14).?,
-    );
+    // Bit 4 selects only the signalling variant of the same relation; bit 3
+    // selects eight more relations, which differ on an unordered pair.
+    try std.testing.expectEqual(VexComparePredicate.not_equal, VexComparePredicate.fromImmediate(0x14).?);
+    try std.testing.expectEqual(VexComparePredicate.equal_or_unordered, VexComparePredicate.fromImmediate(0x08).?);
+    try std.testing.expectEqual(VexComparePredicate.greater_or_equal, VexComparePredicate.fromImmediate(0x1D).?);
+    // GE_OS and GT_OS (Xenia's vcmpgeps/vcmpgtps) are false for a NaN lane;
+    // NLT_US and NLE_US, what masking with 7 gave them, are true.
+    try std.testing.expect(!VexComparePredicate.fromImmediate(13).?.evaluate(quiet_nan, @as(f32, 1.0)));
+    try std.testing.expect(!VexComparePredicate.fromImmediate(14).?.evaluate(@as(f32, 1.0), quiet_nan));
+    try std.testing.expect(VexComparePredicate.fromImmediate(13).?.evaluate(@as(f32, 2.0), 2.0));
+    try std.testing.expect(VexComparePredicate.fromImmediate(14).?.evaluate(@as(f32, 3.0), 2.0));
+    try std.testing.expect(VexComparePredicate.fromImmediate(9).?.evaluate(quiet_nan, @as(f32, 1.0)));
+    try std.testing.expect(!VexComparePredicate.fromImmediate(11).?.evaluate(@as(f32, 1.0), 1.0));
+    try std.testing.expect(VexComparePredicate.fromImmediate(15).?.evaluate(quiet_nan, quiet_nan));
+    try std.testing.expect(!VexComparePredicate.fromImmediate(12).?.evaluate(quiet_nan, @as(f32, 1.0)));
 
     // A whole-vector mask: `vcmpps ..., 4` (NEQ) over four lanes, two equal.
     var left: [16]u8 = undefined;

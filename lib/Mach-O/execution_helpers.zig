@@ -796,22 +796,33 @@ pub fn executeVexBlendVariable(self: anytype, d: DecodedInsn, lane_bits: u8) voi
 }
 
 pub fn executeVexPackedShift(self: anytype, d: DecodedInsn, lane_bits: u8, left: bool, arithmetic: bool, whole_bytes: bool) void {
-    const source_low = vexSource128(self, d, d.xmm_src, !d.is_reg_form, false);
-    const shift = if (whole_bytes)
-        packed_ops.shiftPackedBytes(source_low, d.imm, left)
-    else if (arithmetic)
-        packed_ops.arithmeticShiftPackedElements(source_low, lane_bits, d.imm)
+    // The immediate forms (0F 71/72/73) shift r/m by imm8. The others
+    // (0F D1-D3, E1-E2, F1-F3) shift vvvv by the low 64 bits of r/m, so a
+    // count of the lane width or more zeroes (or sign-fills) every element.
+    // Using the immediate for those too made Xenia's uniform-amount vector
+    // shifts (`vpslld xmm, xmm, xmm`) shift by nothing.
+    const by_immediate = d.uses_imm or whole_bytes;
+    const count: u64 = if (by_immediate)
+        d.imm
     else
-        packed_ops.shiftPackedElements(source_low, lane_bits, d.imm, left);
+        std.mem.readInt(u64, vexSource128(self, d, d.xmm_src2, !d.is_reg_form, false)[0..8], .little);
+    const data_in_memory = by_immediate and !d.is_reg_form;
+    const source_low = vexSource128(self, d, d.xmm_src, data_in_memory, false);
+    const shift = if (whole_bytes)
+        packed_ops.shiftPackedBytes(source_low, count, left)
+    else if (arithmetic)
+        packed_ops.arithmeticShiftPackedElements(source_low, lane_bits, count)
+    else
+        packed_ops.shiftPackedElements(source_low, lane_bits, count, left);
     contextField(self, "xmm")[d.xmm_dst] = shift;
     if (d.vector_256) {
-        const source_high = vexSource128(self, d, d.xmm_src, !d.is_reg_form, true);
+        const source_high = vexSource128(self, d, d.xmm_src, data_in_memory, true);
         contextField(self, "ymm_hi")[d.xmm_dst] = if (whole_bytes)
-            packed_ops.shiftPackedBytes(source_high, d.imm, left)
+            packed_ops.shiftPackedBytes(source_high, count, left)
         else if (arithmetic)
-            packed_ops.arithmeticShiftPackedElements(source_high, lane_bits, d.imm)
+            packed_ops.arithmeticShiftPackedElements(source_high, lane_bits, count)
         else
-            packed_ops.shiftPackedElements(source_high, lane_bits, d.imm, left);
+            packed_ops.shiftPackedElements(source_high, lane_bits, count, left);
     } else {
         @memset(&contextField(self, "ymm_hi")[d.xmm_dst], 0);
     }

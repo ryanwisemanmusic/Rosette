@@ -400,17 +400,19 @@ test "CMPXCHG decoder preserves opcode-selected operand width" {
 
 /// The AVX comparison predicate an immediate selects.
 ///
-/// Only the low five bits are the predicate. The first eight are the SSE set
-/// and the rest are the AVX extension; the difference between an `_OQ` and an
-/// `_OS` form is whether a quiet NaN raises the invalid-operation exception,
-/// which is an FP-exception distinction this interpreter does not model — the
-/// *result* of the comparison is the same either way, and the result is what
-/// the mask is built from.
+/// Only the low five bits are the predicate. The first eight are the SSE set;
+/// bit 3 selects eight more relations (EQ_UQ, NGE_US, NGT_US, FALSE_OQ,
+/// NEQ_OQ, GE_OS, GT_OS, TRUE_UQ) that differ from the first eight in what an
+/// unordered pair gives, or entirely. Bit 4 flips only whether a quiet NaN
+/// raises the invalid-operation exception, which this interpreter does not
+/// model; the result, which is what the mask is built from, is the same.
+/// Masking with 7 instead turned Xenia's `vcmpgeps`/`vcmpgtps` (PowerPC
+/// `vcmpgefp`/`vcmpgtfp`) into NLT_US/NLE_US, which are true for a NaN lane.
 ///
 /// Returned as an optional so an encoding this does not model produces "not
 /// executed" rather than a mask computed from a guessed predicate. A wrong mask
 /// is a wrong branch in the guest with nothing to show for it.
-pub const VexComparePredicate = enum {
+pub const VexComparePredicate = enum(u4) {
     equal,
     less_than,
     less_or_equal,
@@ -419,22 +421,17 @@ pub const VexComparePredicate = enum {
     not_less_than,
     not_less_or_equal,
     ordered,
+    equal_or_unordered,
+    not_greater_or_equal,
+    not_greater_than,
+    always_false,
+    ordered_not_equal,
+    greater_or_equal,
+    greater_than,
+    always_true,
 
     pub fn fromImmediate(immediate: u8) ?VexComparePredicate {
-        // Bit 3 of the AVX predicate selects the signalling variant and bit 4
-        // the extended set; both leave the comparison itself unchanged for the
-        // eight base relations, so they are masked off rather than rejected.
-        return switch (immediate & 0x07) {
-            0 => .equal,
-            1 => .less_than,
-            2 => .less_or_equal,
-            3 => .unordered,
-            4 => .not_equal,
-            5 => .not_less_than,
-            6 => .not_less_or_equal,
-            7 => .ordered,
-            else => null,
-        };
+        return @enumFromInt(@as(u4, @truncate(immediate)));
     }
 
     pub fn evaluate(self: VexComparePredicate, left: anytype, right: @TypeOf(left)) bool {
@@ -448,6 +445,14 @@ pub const VexComparePredicate = enum {
             .not_less_than => unordered_pair or !(left < right),
             .not_less_or_equal => unordered_pair or !(left <= right),
             .ordered => !unordered_pair,
+            .equal_or_unordered => unordered_pair or left == right,
+            .not_greater_or_equal => unordered_pair or !(left >= right),
+            .not_greater_than => unordered_pair or !(left > right),
+            .always_false => false,
+            .ordered_not_equal => !unordered_pair and left != right,
+            .greater_or_equal => !unordered_pair and left >= right,
+            .greater_than => !unordered_pair and left > right,
+            .always_true => true,
         };
     }
 };
@@ -487,13 +492,21 @@ pub const integer_indefinite: i32 = std.math.minInt(i32);
 
 fn convertFloatToDword(value: f32, comptime truncate_toward_zero: bool) i32 {
     if (std.math.isNan(value)) return integer_indefinite;
-    const rounded: f32 = if (truncate_toward_zero) @trunc(value) else @round(value);
-    if (!(rounded >= @as(f32, @floatFromInt(std.math.minInt(i32)))) or
-        rounded > @as(f32, @floatFromInt(std.math.maxInt(i32))))
-    {
-        return integer_indefinite;
-    }
+    const rounded: f32 = if (truncate_toward_zero) @trunc(value) else roundHalfEven(value);
+    // 2^31 is the first single past the range: maxInt(i32) has no f32 and
+    // rounds up to it, so `> maxInt` let 2^31 through to @intFromFloat.
+    if (!(rounded >= -2147483648.0) or rounded >= 2147483648.0) return integer_indefinite;
     return @intFromFloat(rounded);
+}
+
+/// Round to nearest, ties to even: MXCSR's default mode, and what Xenia
+/// loads for both its VMX and its FPU modes unless a title changes FPSCR.RN.
+/// `@round` takes ties away from zero (2.5 to 3, where x86 gives 2).
+pub fn roundHalfEven(value: anytype) @TypeOf(value) {
+    const nearest = @round(value);
+    if (@abs(value - @trunc(value)) != 0.5) return nearest;
+    const even = if (@mod(nearest, 2.0) == 0) nearest else nearest - std.math.sign(value);
+    return std.math.copysign(even, value);
 }
 
 /// VCVTPS2DQ / VCVTTPS2DQ — four packed singles to four packed signed dwords.
