@@ -184,7 +184,12 @@ fn applyBinaryScalar(comptime T: type, lhs: T, rhs: T, comptime op: BinaryOp, la
             break :blk @intCast(std.math.clamp(big, std.math.minInt(T), std.math.maxInt(T)));
         },
         .subus => blk: {
-            break :blk if (lhs >= rhs) lhs - rhs else @as(T, 0);
+            // PSUBUS* lanes are unsigned whatever lane type the caller maps
+            // them as: compare and subtract the same bits as unsigned.
+            const UnsignedT = std.meta.Int(.unsigned, @bitSizeOf(T));
+            const a: UnsignedT = @bitCast(lhs);
+            const b: UnsignedT = @bitCast(rhs);
+            break :blk @bitCast(if (a >= b) a - b else @as(UnsignedT, 0));
         },
         .addsub => if ((lane & 1) == 0)
             (if (@typeInfo(T) == .float) lhs - rhs else lhs -% rhs)
