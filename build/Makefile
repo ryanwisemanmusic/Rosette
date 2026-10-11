@@ -144,6 +144,8 @@ XENIA_RUN_SYSTEMS_TEST := $(ROOT_DIR)/tools/test_xenia_run_systems.py
 XENIA_RUN_LAUNCHER := $(ROOT_DIR)/tools/xenia/scripts/rosette-xenia-run.sh
 SHELL_UPDATE_RECORD_SCRIPT := $(ROOT_DIR)/tools/record_shell_update.py
 SHELL_UPDATE_RECORD_OUT := $(ROOT_DIR)/.rosette/shell-update.json
+SHELL_UPDATE_SMART_SCRIPT := $(ROOT_DIR)/tools/smart_shell_update.py
+SHELL_UPDATE_SYSTEM_TEST := $(ROOT_DIR)/tools/test_shell_update.py
 BUILD_IDENTITY_SCRIPT := $(ROOT_DIR)/tools/build_identity_manifest.py
 BUILD_IDENTITY_OUT := $(ROOT_DIR)/.rosette/build-identity.json
 AUDIT_PHASE_COVERAGE_SCRIPT := $(ROOT_DIR)/tools/audit_phase_coverage.py
@@ -293,7 +295,7 @@ ISO_BIN := $(ZIG_OUT_DIR)/bin/rosette-iso
 ISO_SRC := $(ROOT_DIR)/src/tooling/iso/main.zig
 XBOX360_MEDIA_TOOL := $(ROOT_DIR)/tools/xbox360_media.py
 
-.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build link-audit-build pkg-boundary-audit isa-execution-audit build-routes-audit dll-coverage-audit guest-context-audit vendor-library-audit vendor-audit diagnostic-audit shell-helper-build test-census xenia-run-systems-check audit-phase-coverage xenia-fork-manifest xenia-windows-prepare xenia-windows-build build-identity evidence-fixture replay-evidence shell shell-update shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse iso-build iso-run app-wrapper installer uninstaller app-all release notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
+.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build dyld-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build link-audit-build pkg-boundary-audit isa-execution-audit build-routes-audit dll-coverage-audit guest-context-audit vendor-library-audit vendor-audit diagnostic-audit shell-helper-build test-census xenia-run-systems-check shell-update-system-check audit-phase-coverage xenia-fork-manifest xenia-windows-prepare xenia-windows-build build-identity evidence-fixture replay-evidence shell shell-update shell-update-all shell-update-relink shell-update-elf-processor shell-update-elf-processor-process-impl shell-update-elf-processor-windows-runtime shell-update-elf-processor-block-jit shell-update-macho-processor shell-update-dyld-forwarder shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse iso-build iso-run app-wrapper installer uninstaller app-all release notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
 
 all: headers-check zig-build test-run
 
@@ -316,7 +318,15 @@ help:
 		'  make window-lib  Build native Cocoa console-emulation window library (librosette_window.a)' \
 		'  make snake-window Build snake game with native Cocoa window' \
 		'  make shell       Install transparent Rosette make-time shell checks' \
-		'  make shell-update Refresh the Rosette shell helper/snippet/wrappers and record its identity' \
+		'  make shell-update Smart change-aware refresh; unknown changes use the full sanity path' \
+		'  make shell-update-relink Refresh installed shell integration from already-built artifacts' \
+		'  make shell-update-elf-processor-process-impl Check/build/install only ELF process implementation changes' \
+		'  make shell-update-elf-processor-windows-runtime Check/build/install ELF Win32 runtime changes' \
+		'  make shell-update-elf-processor Check/build/install ELF processor changes' \
+		'  make shell-update-elf-processor-block-jit Check/build/install block translator changes' \
+		'  make shell-update-macho-processor Check/build/install Mach-O processor changes' \
+		'  make shell-update-dyld-forwarder Check/build/install dyld forwarder changes' \
+		'  make shell-update-all Full sanity check (complete Zig census and audits; allow 20 minutes or longer)' \
 		'  make test-census  Execute zig build check and write the source/artifact test census' \
 		'  make xenia-run-systems-check  Verify Rosetta run manager, benchmark, and admission tooling' \
 		'  make xenia-fork-manifest  Record the pinned Xenia base and classify every fork path' \
@@ -409,6 +419,11 @@ elf-processor-build:
 macho-processor-build:
 	@mkdir -p "$(ZIG_CACHE_DIR)/global"
 	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build --build-file build/build.zig --prefix "$(ZIG_OUT_DIR)" -Doptimize="$(ROSETTE_RUNTIME_OPTIMIZE)" macho-processor
+
+# The dyld forwarder is shared by ELF and Mach-O processor roots. Rebuild both
+# consumers after its focused test so either installed processor sees the same
+# source revision.
+dyld-processor-build: elf-processor-build macho-processor-build
 
 elf-processor-dylib:
 	@mkdir -p "$(ZIG_OUT_DIR)/lib"
@@ -505,11 +520,15 @@ shell-helper-build: pkg-boundary-audit isa-execution-audit build-routes-audit dl
 # the verbose test summary; a successful process exit remains authoritative
 # because several negative-path tests print "failed command" deliberately.
 test-census:
+	@cd "$(ROOT_DIR)" && python3 "$(ROOT_DIR)/tools/test_test_census.py"
 	@cd "$(ROOT_DIR)" && python3 "$(TEST_CENSUS_SCRIPT)" --root "$(ROOT_DIR)" --output "$(TEST_CENSUS_OUT)" --run-check --strict
 
 xenia-run-systems-check:
 	@cd "$(ROOT_DIR)" && python3 "$(XENIA_RUN_SYSTEMS_TEST)"
 	@bash -n "$(XENIA_RUN_LAUNCHER)"
+
+shell-update-system-check:
+	@cd "$(ROOT_DIR)" && python3 "$(SHELL_UPDATE_SYSTEM_TEST)"
 
 # The six-phase matrix is source-only and deliberately does not inspect or
 # execute Xenia. Its hash is included in build identity so a green test census
@@ -555,20 +574,58 @@ replay-evidence: evidence-fixture
 	@cd "$(ROOT_DIR)" && python3 "$(EVIDENCE_REPLAY_SCRIPT)" "$(EVIDENCE_REPLAY_JOURNAL)" --json > "$(EVIDENCE_REPLAY_OUT)"
 	@cd "$(ROOT_DIR)" && python3 "$(EVIDENCE_REPLAY_SCRIPT)" "$(EVIDENCE_REPLAY_JOURNAL)"
 
-shell shell-update: override ROSETTE_RUNTIME_OPTIMIZE := ReleaseFast
+shell shell-update shell-update-all shell-update-relink shell-update-elf-processor shell-update-elf-processor-process-impl shell-update-elf-processor-windows-runtime shell-update-elf-processor-block-jit shell-update-macho-processor shell-update-dyld-forwarder: override ROSETTE_RUNTIME_OPTIMIZE := ReleaseFast
 
 shell: shell-helper-build
 	@"$(SHELL_HELPER_BIN)" install "$(ROOT_DIR)"
 
-# Please for the life of me, utilize this command on the regular
-# If you are reading through this Makefile, and wonder what commands
-# I use most, this is one of the biggest go-to.
-# It enables you to update your global shell if you are trying to debug
-# something
-shell-update: shell-helper-build test-census xenia-run-systems-check audit-phase-coverage xenia-fork-manifest replay-evidence
-	@"$(SHELL_HELPER_BIN)" update "$(ROOT_DIR)"
-	@cd "$(ROOT_DIR)" && python3 "$(SHELL_UPDATE_RECORD_SCRIPT)" --root "$(ROOT_DIR)" --helper "$(SHELL_HELPER_BIN)" --source "$(SHELL_HELPER_SRC)" --census "$(TEST_CENSUS_OUT)" --output "$(SHELL_UPDATE_RECORD_OUT)"
-	@cd "$(ROOT_DIR)" && python3 "$(BUILD_IDENTITY_SCRIPT)" --root "$(ROOT_DIR)" --xenia-root "$(XENIA_ROOT)" --helper "$(SHELL_HELPER_BIN)" --census "$(TEST_CENSUS_OUT)" --shell-update "$(SHELL_UPDATE_RECORD_OUT)" --fork-manifest "$(XENIA_FORK_MANIFEST_OUT)" --phase-coverage "$(AUDIT_PHASE_COVERAGE_OUT)" --evidence-replay "$(EVIDENCE_REPLAY_OUT)" --output "$(BUILD_IDENTITY_OUT)"
+# Smart shell update model for agents and maintainers:
+# - `shell-update` fingerprints Git-visible source changes and compares them
+#   with `.rosette/shell-update-state.json`, plus toolchain/config/Xenia
+#   identities. Known ELF/Mach-O/dyld scopes run their focused Zig regression
+#   target, rebuild the affected processor, and then relink/install. Missing
+#   state, changed build graphs, unknown paths, external identity changes, or
+#   missing artifacts fail closed to `shell-update-all`.
+# - Explicit `shell-update-elf-processor-process-impl`,
+#   `shell-update-elf-processor-windows-runtime`,
+#   `shell-update-elf-processor-block-jit` and sibling targets force a declared
+#   scope, but still fall back to the full path if pending source changes escape
+#   that scope. `shell-update-relink` refreshes shell
+#   integration when source inputs match the last successful snapshot.
+# - `shell-update-dyld-forwarder` runs the dyld bridge suite and rebuilds both
+#   ELF and Mach-O consumers because the forwarder is shared by both roots.
+# - `shell-update-all` is the old complete sanity route: full `zig build
+#   check`, shell/build audits, Xenia source manifest, install, and identities.
+#   Expect about 20 minutes or longer. Use it periodically and after changes
+#   to the updater/dependency model; it is intentionally not the default.
+shell-update:
+	@cd "$(ROOT_DIR)" && python3 "$(SHELL_UPDATE_SMART_SCRIPT)" --root "$(ROOT_DIR)" --xenia-root "$(XENIA_ROOT)" --scope auto
+
+shell-update-relink:
+	@cd "$(ROOT_DIR)" && python3 "$(SHELL_UPDATE_SMART_SCRIPT)" --root "$(ROOT_DIR)" --xenia-root "$(XENIA_ROOT)" --scope relink
+
+shell-update-elf-processor:
+	@cd "$(ROOT_DIR)" && python3 "$(SHELL_UPDATE_SMART_SCRIPT)" --root "$(ROOT_DIR)" --xenia-root "$(XENIA_ROOT)" --scope elf-processor
+
+shell-update-elf-processor-process-impl:
+	@cd "$(ROOT_DIR)" && python3 "$(SHELL_UPDATE_SMART_SCRIPT)" --root "$(ROOT_DIR)" --xenia-root "$(XENIA_ROOT)" --scope elf-processor-process-impl
+
+shell-update-elf-processor-windows-runtime:
+	@cd "$(ROOT_DIR)" && python3 "$(SHELL_UPDATE_SMART_SCRIPT)" --root "$(ROOT_DIR)" --xenia-root "$(XENIA_ROOT)" --scope elf-processor-windows-runtime
+
+shell-update-elf-processor-block-jit:
+	@cd "$(ROOT_DIR)" && python3 "$(SHELL_UPDATE_SMART_SCRIPT)" --root "$(ROOT_DIR)" --xenia-root "$(XENIA_ROOT)" --scope elf-processor-block-jit
+
+shell-update-macho-processor:
+	@cd "$(ROOT_DIR)" && python3 "$(SHELL_UPDATE_SMART_SCRIPT)" --root "$(ROOT_DIR)" --xenia-root "$(XENIA_ROOT)" --scope macho-processor
+
+shell-update-dyld-forwarder:
+	@cd "$(ROOT_DIR)" && python3 "$(SHELL_UPDATE_SMART_SCRIPT)" --root "$(ROOT_DIR)" --xenia-root "$(XENIA_ROOT)" --scope dyld-forwarder
+
+# Full sanity target. The Python coordinator prints the long-run warning before
+# it starts prerequisites and primes the incremental baseline only on success.
+shell-update-all:
+	@cd "$(ROOT_DIR)" && python3 "$(SHELL_UPDATE_SMART_SCRIPT)" --root "$(ROOT_DIR)" --xenia-root "$(XENIA_ROOT)" --scope all
 
 shell-uninstall: shell-helper-build
 	@"$(SHELL_HELPER_BIN)" uninstall
