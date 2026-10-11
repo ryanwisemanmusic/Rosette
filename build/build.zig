@@ -1980,12 +1980,12 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&run_decoder_family_tests.step);
     const setcc_stack_regression_test = b.addTest(.{
         .root_module = decoder_family_tests_mod,
-        .filters = &.{"SETcc uses the ModRM r/m field for AH versus SPL"},
+        .filters = &.{ "SETcc uses the ModRM r/m field for AH versus SPL", "LOCK prefix survives" },
     });
     const run_setcc_stack_regression_test = b.addRunArtifact(setcc_stack_regression_test);
     const decoder_family_check_step = b.step(
         "decoder-family-check",
-        "Run the focused SETcc stack-corruption decoder regression",
+        "Run the focused stack and reference-count decoder regressions",
     );
     decoder_family_check_step.dependOn(&run_setcc_stack_regression_test.step);
     const isa_highway_test = b.addTest(.{ .root_module = isa_highway_module });
@@ -2141,6 +2141,17 @@ pub fn build(b: *std.Build) void {
     // so none of its tests ever ran.
     const tso_memory_test = b.addTest(.{ .root_module = tso_memory_mod });
     check_step.dependOn(&b.addRunArtifact(tso_memory_test).step);
+    // Parallel TSO litmus/stress suite. Keeping the runner separate allows
+    // the tests to exercise the public memory API without creating an import
+    // cycle from tso_memory.zig back into its own test module.
+    const tso_litmus_mod = b.createModule(.{
+        .root_source_file = b.path("../lib/processor/ELF_processor/tso/litmus.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tso_litmus_mod.addImport("tso_memory", tso_memory_mod);
+    const tso_litmus_test = b.addTest(.{ .root_module = tso_litmus_mod });
+    check_step.dependOn(&b.addRunArtifact(tso_litmus_test).step);
     // Host-thread concurrency: futex parking, the stop-the-world gate, the
     // main-thread service hook and the stall watchdog the PE executor's
     // guest threads coordinate through.
@@ -2300,6 +2311,37 @@ pub fn build(b: *std.Build) void {
         const windows_graphics_contract_check = b.step("windows-graphics-check", "Run PE graphics evidence and native routing regression tests");
         windows_graphics_contract_check.dependOn(&b.addRunArtifact(windows_graphics_contract_test).step);
         const elf_processor_test = b.addTest(.{ .root_module = elf_processor_test_mod });
+        const render_cpu_check = b.step("render-cpu-check", "Run vector memory and vector-test regressions without the full check suite");
+        const render_cpu_test = b.addTest(.{
+            .root_module = elf_processor_test_mod,
+            .filters = &.{ "ordered vector TLB", "VTEST sign", "vptest reduces", "vector loads and stores", "plain [base+disp]", "non-temporal vector stores", "legacy MOVUPS", "parallel PAUSE batches", "PAUSE fast dispatch", "SRW import lane", "SRW owner stack", "SRW acquire and release", "an SRW release hands", "Vulkan queue waits", "MXCSR flush", "Xenia's hot vector and MXCSR" },
+        });
+        // The image-corpus executor sweeps run thousands of interpreted and
+        // translated programs; `check` skips them and this step turns them on.
+        const render_cpu_run = b.addRunArtifact(render_cpu_test);
+        render_cpu_run.setEnvironmentVariable("ROSETTE_EXECUTOR_SWEEP", "1");
+        render_cpu_check.dependOn(&render_cpu_run.step);
+        // Replays of Xenia's own compiled code for Halo 3's clear path, quick
+        // to rerun while chasing a CPU defect the GPU only shows as a colour.
+        const halo3_clear_check = b.step("halo3-clear-check", "Replay Xenia's compiled Halo 3 clear-colour code and check every VEX form's operand sources");
+        const halo3_clear_test = b.addTest(.{
+            .root_module = elf_processor_test_mod,
+            .filters = &.{ "Halo 3's clear-colour", "operand sources", "SSE oracle", "shifts by an xmm count" },
+        });
+        halo3_clear_check.dependOn(&b.addRunArtifact(halo3_clear_test).step);
+        const sse_oracle_check = b.step("sse-oracle-check", "Compare every VEX.128 register form Xenia's JIT emits with native SSE results");
+        const sse_oracle_test = b.addTest(.{
+            .root_module = elf_processor_test_mod,
+            .filters = &.{"SSE oracle"},
+        });
+        sse_oracle_check.dependOn(&b.addRunArtifact(sse_oracle_test).step);
+        const reference_count_check = b.step("reference-count-check", "Run grouped LOCK decoding and concurrent Xenia object lifetime regressions");
+        const reference_count_test = b.addTest(.{
+            .root_module = elf_processor_test_mod,
+            .filters = &.{ "Xenia reference-count", "Xenia XObject release" },
+        });
+        reference_count_check.dependOn(&b.addRunArtifact(reference_count_test).step);
+        reference_count_check.dependOn(&run_setcc_stack_regression_test.step);
         check_step.dependOn(&b.addRunArtifact(elf_processor_test).step);
         // The PE execution core on its own: the processor, the guest memory
         // model and the Win32 runtime, without the rest of `check`.
@@ -2308,6 +2350,16 @@ pub fn build(b: *std.Build) void {
         elf_check.dependOn(&b.addRunArtifact(tso_memory_test).step);
         elf_check.dependOn(&b.addRunArtifact(concurrency_test).step);
         elf_check.dependOn(&b.addRunArtifact(windows_runtime_test).step);
+        // The translator's own costs - a native hop, a relink through the
+        // glue, a guest memory access - on fixed x86-64 programs. Run it
+        // with `ROSETTE_BLOCK_JIT_BENCH=1 zig build block-jit-bench
+        // -Doptimize=ReleaseFast`; without the variable the test skips.
+        const block_jit_bench_test = b.addTest(.{
+            .root_module = elf_processor_test_mod,
+            .filters = &.{"block jit benchmark"},
+        });
+        const block_jit_bench = b.step("block-jit-bench", "Measure the block translator on fixed programs (ROSETTE_BLOCK_JIT_BENCH=1, -Doptimize=ReleaseFast)");
+        block_jit_bench.dependOn(&b.addRunArtifact(block_jit_bench_test).step);
         const pe64_runtime_test_mod = b.createModule(.{
             .root_source_file = b.path("../src/tooling/exe_parser/pe64_runtime.zig"),
             .target = target,
@@ -2760,6 +2812,9 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         gpu_mod.addImport("window_geometry", window_geometry_mod);
+        gpu_mod.addAnonymousImport("rosette_live_metal_source", .{
+            .root_source_file = b.path("../lib/metal/textures/live_source.zig"),
+        });
         gpu_mod.addImport("frame_content_contract", frame_content_contract_mod);
         gpu_mod.addImport("screen_validity", screen_validity_mod);
         const window_geometry_test = b.addTest(.{ .root_module = window_geometry_mod });
@@ -2924,6 +2979,18 @@ pub fn build(b: *std.Build) void {
         const dyld_check = b.step("dyld-check", "Run the dynamic linker and Vulkan loader bridge tests");
         dyld_check.dependOn(&run_dyld_test.step);
         check_step.dependOn(&run_dyld_test.step);
+        // A small gate for the FSI bridge that avoids the full CPU/OS suite.
+        // The full check still includes these tests through gpu_test/dyld_test.
+        const fsi_check = b.step("fsi-check", "Run the FSI support and forwarder regression tests");
+        const fsi_gpu_test = b.addTest(.{ .root_module = gpu_mod, .filters = &.{ "FSI", "Fsi", "fsi", "presentation ceiling" } });
+        const fsi_dyld_test = b.addTest(.{ .root_module = dyld_mod, .filters = &.{ "FSI", "Fsi", "fsi", "presentation ceiling" } });
+        fsi_check.dependOn(&b.addRunArtifact(fsi_gpu_test).step);
+        fsi_check.dependOn(&b.addRunArtifact(fsi_dyld_test).step);
+        const metal_live_check = b.step("metal-live-check", "Run native Metal live texture routing regression tests");
+        const metal_live_gpu_test = b.addTest(.{ .root_module = gpu_mod, .filters = &.{"native Metal live texture"} });
+        const metal_live_dyld_test = b.addTest(.{ .root_module = dyld_mod, .filters = &.{"native Metal live texture"} });
+        metal_live_check.dependOn(&b.addRunArtifact(metal_live_gpu_test).step);
+        metal_live_check.dependOn(&b.addRunArtifact(metal_live_dyld_test).step);
         // Xenia's log phrases and the comptime rare-character filter over them.
         const xenia_log_phrase_map_mod = b.createModule(.{
             .root_source_file = b.path("../pkg/common/xenia/log-phrase-map/src/root.zig"),
@@ -3136,9 +3203,14 @@ pub fn build(b: *std.Build) void {
                 .file = b.path("../lib/Mach-O/native_window_bridge.m"),
                 .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
             });
+            guest_abi_test_mod.addCSourceFile(.{
+                .file = b.path("../lib/Mach-O/input_controller_bridge.m"),
+                .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
+            });
             guest_abi_test_mod.linkFramework("AppKit", .{});
             guest_abi_test_mod.linkFramework("QuartzCore", .{});
             guest_abi_test_mod.linkFramework("Metal", .{});
+            guest_abi_test_mod.linkFramework("GameController", .{});
         }
         const guest_abi_test = b.addTest(.{ .root_module = guest_abi_test_mod });
         check_step.dependOn(&b.addRunArtifact(guest_abi_test).step);
@@ -3472,6 +3544,10 @@ pub fn build(b: *std.Build) void {
                 .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
             });
             macho_processor_mod.addCSourceFile(.{
+                .file = b.path("../lib/Mach-O/input_controller_bridge.m"),
+                .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
+            });
+            macho_processor_mod.addCSourceFile(.{
                 .file = b.path("../lib/Mach-O/xenia_heap_exports_anchor.c"),
                 .flags = &.{ "-Wall", "-Wextra" },
             });
@@ -3494,6 +3570,7 @@ pub fn build(b: *std.Build) void {
             macho_processor_mod.linkFramework("AppKit", .{});
             macho_processor_mod.linkFramework("QuartzCore", .{});
             macho_processor_mod.linkFramework("Metal", .{});
+            macho_processor_mod.linkFramework("GameController", .{});
         }
         // The Mach-O runtime carries the full MachOState struct (hundreds of
         // diagnostics/ledger fields) as a stack local inside MachOState.init and
@@ -3582,9 +3659,14 @@ pub fn build(b: *std.Build) void {
                 .file = b.path("../lib/Mach-O/native_window_bridge.m"),
                 .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
             });
+            macho_processor_test_mod.addCSourceFile(.{
+                .file = b.path("../lib/Mach-O/input_controller_bridge.m"),
+                .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
+            });
             macho_processor_test_mod.linkFramework("AppKit", .{});
             macho_processor_test_mod.linkFramework("QuartzCore", .{});
             macho_processor_test_mod.linkFramework("Metal", .{});
+            macho_processor_test_mod.linkFramework("GameController", .{});
         }
         const macho_processor_test = b.addTest(.{ .root_module = macho_processor_test_mod });
         const macho_processor_check = b.step(
