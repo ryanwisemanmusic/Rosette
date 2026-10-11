@@ -8,12 +8,20 @@ const guest_context = @import("guest_context");
 const guest_sleep = @import("scheduler").guest_sleep;
 const rosette_gpu = @import("gpu");
 const abi = @import("gpu").vulkan.abi;
+const native_texture = @import("gpu").metal.live_texture;
 const marshal = @import("gpu").vulkan.marshal;
+const fsi_diagnostics = @import("gpu").vulkan.fsi_diagnostics;
+const fsi_rasterization = @import("gpu").vulkan.fsi.rasterization;
+const device_loss_diagnostics = @import("gpu").vulkan.device_loss_diagnostics;
 const gpu_vulkan = @import("gpu").vulkan;
 const async_vulkan_command = gpu_vulkan.async_command_worker;
 const frame_capture = @import("gpu").vulkan.frame_capture;
 const transport_timing = @import("gpu").vulkan.transport_timing;
+const present_pacing = @import("gpu").vulkan.present_pacing;
 const tier_consistency = @import("gpu").vulkan.tier_consistency;
+const capture_plan = @import("gpu").vulkan.capture_plan;
+const driver_identity = @import("gpu").vulkan.driver_identity;
+const queue_api_gate = @import("gpu").vulkan.queue_api_gate;
 const instance_extensions = @import("vulkan/instance_extensions.zig");
 const surface_path_ledger = @import("vulkan/surface_path_ledger.zig");
 const guest_memory_geometry = @import("guest_memory_geometry.zig");
@@ -40,6 +48,7 @@ fn sparseVulkanSuccessLog(count: u64) bool {
 }
 
 pub const MAX_GUEST_SYMBOLS = 256;
+const GUEST_SYMBOL_LOOKUP_CACHE_SIZE = 256;
 const GUEST_LIBRARY_HANDLE_BASE: u64 = 0xFFFF_FC00_0000_0000;
 pub const GUEST_SYMBOL_THUNK_BASE: u64 = 0xFFFF_FB00_0000_0000;
 // Darwin's RTLD_DEFAULT is (void *)-2. A translated Xenia call to dlsym uses
@@ -81,7 +90,7 @@ const HostFrameCaptureFn = *const fn (*const frame_capture.Frame) callconv(.c) u
 /// `rosette_macho_native_window_set_frame_counter`, resolved at run time so a
 /// test build that links no window bridge still links.
 const HostFrameCounterResolver = struct {
-    const Fn = *const fn (u64) callconv(.c) void;
+    const Fn = *const fn (u64, u64) callconv(.c) void;
     var callback: ?Fn = null;
     var resolved: bool = false;
 
@@ -274,21 +283,26 @@ test "only Xenia's built-in index buffer is recognised as rectangle expansion in
 /// A value the user already exported wins; `ROSETTE_MOLTENVK_DEFAULTS=0`
 /// applies none of them.
 ///
-/// - `MVK_CONFIG_RESUME_LOST_DEVICE=1`: a command buffer the GPU watchdog
-///   kills (a hang or a timeout) loses its own work instead of marking the
-///   whole VkDevice lost. Xenia treats device loss as fatal and exits, so
-///   without this one bad frame ends the run.
+/// - `MVK_CONFIG_RESUME_LOST_DEVICE=0`: report the first failed GPU command
+///   buffer as device loss. Continuing after discarded EDRAM writes makes
+///   Xenia consume invalid results and can repeatedly reset the system GPU.
 /// - `MVK_CONFIG_FAST_MATH_ENABLED=0`: Xenia's shaders declare
 ///   SignedZeroInfNanPreserve and emulate Xenos NaN, infinity and signed-zero
 ///   rules explicitly. Metal fast math may assume none of those values exist
 ///   and compile the emulation away; the MoltenVK this runs on predates the
 ///   on-demand mode that honours the declaration.
 pub const moltenvk_runtime_defaults = [_]struct { name: [*:0]const u8, value: [*:0]const u8 }{
-    .{ .name = "MVK_CONFIG_RESUME_LOST_DEVICE", .value = "1" },
+    .{ .name = "MVK_CONFIG_RESUME_LOST_DEVICE", .value = "0" },
     .{ .name = "MVK_CONFIG_FAST_MATH_ENABLED", .value = "0" },
 };
 
 var moltenvk_runtime_defaults_applied = false;
+
+test "FSI MoltenVK defaults preserve shader arithmetic and stop after GPU device loss" {
+    for (moltenvk_runtime_defaults) |setting| {
+        try std.testing.expectEqualStrings("0", std.mem.span(setting.value));
+    }
+}
 
 fn applyMoltenVKRuntimeDefaults() void {
     if (moltenvk_runtime_defaults_applied) return;
@@ -310,8 +324,234 @@ fn applyMoltenVKRuntimeDefaults() void {
     }
 }
 
+/// GFXReconstruct capture of the real Vulkan stream (`gpu/vulkan/capture_plan.zig`).
+/// Prepared once, before the loader opens: the loader reads its layer search
+/// path, and the layer its settings, at vkCreateInstance.
+const VulkanCaptureState = enum {
+    not_requested,
+    invalid_plan,
+    layer_missing,
+    output_path_invalid,
+    prepared,
+    loader_layer_missing,
+    instance_create_failed,
+    active,
+};
+
+const VulkanCapture = struct {
+    plan: capture_plan.Plan = .{},
+    state: VulkanCaptureState = .not_requested,
+    /// Preserve the user's request when parsing or layer discovery fails.
+    requested: bool = false,
+    /// The layer was found and its settings exported; ensureRealInstance
+    /// still has to find it in the loader's list before enabling it.
+    prepared: bool = false,
+    /// The real instance has the layer: every mapping is flushed before each
+    /// submit, which is what assisted memory tracking records.
+    active: bool = false,
+    loader_layer_listed: bool = false,
+    instance_layer_requested: bool = false,
+    instance_create_failures: u64 = 0,
+    flush_calls: u64 = 0,
+    flush_failures: u64 = 0,
+    layer_directory: [1024:0]u8 = [_:0]u8{0} ** 1024,
+};
+
+var vulkan_capture: VulkanCapture = .{};
+var vulkan_capture_checked = false;
+
+fn copyTerminated(buffer: *[1024:0]u8, text: []const u8) ?[]const u8 {
+    if (text.len >= buffer.len) return null;
+    @memcpy(buffer[0..text.len], text);
+    buffer[text.len] = 0;
+    return buffer[0..text.len];
+}
+
+fn captureLayerManifestIn(directory: []const u8) bool {
+    var path: [1200:0]u8 = undefined;
+    const joined = std.fmt.bufPrintZ(&path, "{s}/{s}", .{ directory, capture_plan.layer_manifest }) catch return false;
+    return std.c.access(joined, 0) == 0;
+}
+
+/// The newest GFXReconstruct layer on this Mac: an explicit
+/// ROSETTE_VULKAN_GFXR_LAYER_PATH, then the newest ~/VulkanSDK/<version>,
+/// then VULKAN_SDK, then /usr/local. The newest SDK goes before VULKAN_SDK
+/// because that variable commonly still names an old SDK (on 2026-10-04 it
+/// named the January 2024 one) and a newer layer records more extensions.
+fn findCaptureLayerDirectory(buffer: *[1024:0]u8) ?[]const u8 {
+    if (std.c.getenv(capture_plan.layer_path_environment)) |raw| {
+        const directory = std.mem.span(raw);
+        if (captureLayerManifestIn(directory)) return copyTerminated(buffer, directory);
+    }
+    if (std.c.getenv("HOME")) |home| {
+        var root_buffer: [1024:0]u8 = undefined;
+        if (std.fmt.bufPrintZ(&root_buffer, "{s}/VulkanSDK", .{std.mem.span(home)})) |root| {
+            if (std.c.opendir(root)) |directory| {
+                defer _ = std.c.closedir(directory);
+                var best: [256]u8 = undefined;
+                var best_len: usize = 0;
+                while (std.c.readdir(directory)) |entry| {
+                    const name = entry.name[0..entry.namlen];
+                    if (name.len > best.len or !capture_plan.versionNewer(name, best[0..best_len])) continue;
+                    var candidate: [1024]u8 = undefined;
+                    const layer_directory = std.fmt.bufPrint(&candidate, "{s}/{s}/macOS/share/vulkan/explicit_layer.d", .{ root, name }) catch continue;
+                    if (!captureLayerManifestIn(layer_directory)) continue;
+                    @memcpy(best[0..name.len], name);
+                    best_len = name.len;
+                }
+                if (best_len != 0) {
+                    var candidate: [1024]u8 = undefined;
+                    if (std.fmt.bufPrint(&candidate, "{s}/{s}/macOS/share/vulkan/explicit_layer.d", .{ root, best[0..best_len] })) |found| {
+                        return copyTerminated(buffer, found);
+                    } else |_| {}
+                }
+            }
+        } else |_| {}
+    }
+    if (std.c.getenv("VULKAN_SDK")) |raw| {
+        var candidate: [1024]u8 = undefined;
+        if (std.fmt.bufPrint(&candidate, "{s}/share/vulkan/explicit_layer.d", .{std.mem.span(raw)})) |directory| {
+            if (captureLayerManifestIn(directory)) return copyTerminated(buffer, directory);
+        } else |_| {}
+    }
+    const system = "/usr/local/share/vulkan/explicit_layer.d";
+    if (captureLayerManifestIn(system)) return copyTerminated(buffer, system);
+    return null;
+}
+
+/// Export one GFXReconstruct setting unless the user already exported it.
+fn setCaptureDefault(name: [*:0]const u8, value: []const u8) void {
+    if (std.c.getenv(name) != null) return;
+    var buffer: [1200:0]u8 = undefined;
+    const terminated = std.fmt.bufPrintZ(&buffer, "{s}", .{value}) catch return;
+    _ = setenv(name, terminated, 0);
+}
+
+/// Append a capture-layer directory without hiding the user's Vulkan layer
+/// paths. Older Vulkan loaders use VK_LAYER_PATH and ignore VK_ADD_LAYER_PATH;
+/// newer loaders may honor both, so publish the directory to each variable.
+fn appendVulkanLayerPath(name: [*:0]const u8, directory: []const u8) void {
+    const existing_raw = std.c.getenv(name) orelse {
+        setCaptureDefault(name, directory);
+        return;
+    };
+    const existing = std.mem.span(existing_raw);
+    var entries = std.mem.splitScalar(u8, existing, ':');
+    while (entries.next()) |entry| {
+        if (std.mem.eql(u8, entry, directory)) return;
+    }
+    var buffer: [4096:0]u8 = undefined;
+    const terminated = std.fmt.bufPrintZ(&buffer, "{s}:{s}", .{ existing, directory }) catch {
+        machoCapturePrint("macho-processor: VULKAN CAPTURE: could not append {s} to {s}; current_length={d} addition_length={d}\n", .{ directory, std.mem.span(name), existing.len, directory.len });
+        return;
+    };
+    _ = setenv(name, terminated, 1);
+}
+
+fn captureRunDirectory() []const u8 {
+    if (std.c.getenv("ROSETTE_RUN_DIR")) |directory| return std.mem.span(directory);
+    if (std.c.getenv("ROSETTE_TRACE_PATH")) |path| return capture_plan.runDirectory(std.mem.span(path));
+    if (std.c.getenv("ROSETTE_XENIA_TRACE_LOG")) |path| return capture_plan.runDirectory(std.mem.span(path));
+    if (std.c.getenv("ROSETTE_XENIA_RUN_LOG")) |path| return capture_plan.runDirectory(std.mem.span(path));
+    return ".";
+}
+
+fn exportedOrNone(name: [*:0]const u8) []const u8 {
+    return if (std.c.getenv(name)) |value| std.mem.span(value) else "<unset>";
+}
+
+fn prepareVulkanCapture() void {
+    if (vulkan_capture_checked) return;
+    vulkan_capture_checked = true;
+    const raw = std.c.getenv(capture_plan.environment);
+    const plan = capture_plan.parse(if (raw) |value| std.mem.span(value) else null);
+    vulkan_capture.plan = plan;
+    vulkan_capture.requested = plan.armed() or plan.rejected;
+    if (plan.rejected) {
+        vulkan_capture.state = .invalid_plan;
+        machoCapturePrint("macho-processor: VULKAN CAPTURE: refused {s}={s}; use 1, hotkey, hotkey:<F1-F12|TAB|CONTROL> or frames:<ascending 1-based list such as 3000,4600-4601>\n", .{ capture_plan.environment, std.mem.span(raw.?) });
+        return;
+    }
+    if (!plan.armed()) {
+        vulkan_capture.state = .not_requested;
+        return;
+    }
+    const directory = findCaptureLayerDirectory(&vulkan_capture.layer_directory) orelse {
+        vulkan_capture.state = .layer_missing;
+        machoCapturePrint("macho-processor: VULKAN CAPTURE: no {s} under {s}, ~/VulkanSDK/<version>/macOS/share/vulkan/explicit_layer.d, VULKAN_SDK or /usr/local/share/vulkan/explicit_layer.d; capture disabled\n", .{ capture_plan.layer_manifest, capture_plan.layer_path_environment });
+        return;
+    };
+    // Keep VK_LAYER_PATH for the loader used by the current MoltenVK SDK;
+    // VK_ADD_LAYER_PATH is an additive hint for loaders that support it.
+    appendVulkanLayerPath("VK_LAYER_PATH", directory);
+    appendVulkanLayerPath("VK_ADD_LAYER_PATH", directory);
+
+    const run_directory = captureRunDirectory();
+    var file_buffer: [1100]u8 = undefined;
+    var log_buffer: [1100]u8 = undefined;
+    const file = std.fmt.bufPrint(&file_buffer, "{s}/rosette-vulkan.gfxr", .{run_directory}) catch {
+        vulkan_capture.state = .output_path_invalid;
+        machoCapturePrint("macho-processor: VULKAN CAPTURE: output path exceeds the bridge limit; run_directory={s} max_path_bytes={d}; capture disabled\n", .{ run_directory, file_buffer.len });
+        return;
+    };
+    const log_file = std.fmt.bufPrint(&log_buffer, "{s}/gfxrecon.log", .{run_directory}) catch {
+        vulkan_capture.state = .output_path_invalid;
+        machoCapturePrint("macho-processor: VULKAN CAPTURE: log path exceeds the bridge limit; run_directory={s} max_path_bytes={d}; capture disabled\n", .{ run_directory, log_buffer.len });
+        return;
+    };
+    setCaptureDefault("GFXRECON_CAPTURE_FILE", file);
+    setCaptureDefault("GFXRECON_LOG_FILE", log_file);
+    setCaptureDefault("GFXRECON_MEMORY_TRACKING_MODE", "assisted");
+    setCaptureDefault("GFXRECON_CAPTURE_COMPRESSION_TYPE", "LZ4");
+    switch (plan.mode) {
+        .hotkey => {
+            setCaptureDefault("GFXRECON_CAPTURE_TRIGGER", plan.key);
+            setCaptureDefault("GFXRECON_CAPTURE_TRIGGER_FRAMES", "1");
+        },
+        .frames => setCaptureDefault("GFXRECON_CAPTURE_FRAMES", plan.frames),
+        .off => unreachable,
+    }
+    vulkan_capture.prepared = true;
+    vulkan_capture.state = .prepared;
+    machoCapturePrint(
+        "macho-processor: VULKAN CAPTURE: prepared mode={s} trigger={s} frames={s} layer_directory={s} file={s} log={s} memory_tracking={s}; the GFXReconstruct layer is enabled on the real instance at vkCreateInstance if the loader lists it\n",
+        .{
+            @tagName(plan.mode),
+            exportedOrNone("GFXRECON_CAPTURE_TRIGGER"),
+            exportedOrNone("GFXRECON_CAPTURE_FRAMES"),
+            directory,
+            exportedOrNone("GFXRECON_CAPTURE_FILE"),
+            exportedOrNone("GFXRECON_LOG_FILE"),
+            exportedOrNone("GFXRECON_MEMORY_TRACKING_MODE"),
+        },
+    );
+}
+
+const VkLayerProperties = extern struct {
+    layer_name: [256]u8 = [_]u8{0} ** 256,
+    spec_version: u32 = 0,
+    implementation_version: u32 = 0,
+    description: [256]u8 = [_]u8{0} ** 256,
+};
+const PfnVkEnumerateInstanceLayerProperties = *const fn (*u32, ?[*]VkLayerProperties) callconv(.c) i32;
+
+/// Whether the native loader lists the capture layer.
+fn hostLoaderListsCaptureLayer(library: *anyopaque) bool {
+    const address = dlsym(library, "vkEnumerateInstanceLayerProperties") orelse return false;
+    const enumerate: PfnVkEnumerateInstanceLayerProperties = @ptrCast(@alignCast(address));
+    var layers: [64]VkLayerProperties = [_]VkLayerProperties{.{}} ** 64;
+    var count: u32 = layers.len;
+    const result = enumerate(&count, &layers);
+    if (result != abi.SUCCESS and result != abi.INCOMPLETE) return false;
+    for (layers[0..@min(count, layers.len)]) |*layer| {
+        if (std.mem.eql(u8, driver_identity.cString(&layer.layer_name), capture_plan.layer_name)) return true;
+    }
+    return false;
+}
+
 fn vulkanLoaderCandidates(requested_path: []const u8) VulkanLoaderCandidates {
     applyMoltenVKRuntimeDefaults();
+    prepareVulkanCapture();
     var candidates = VulkanLoaderCandidates{};
     if (std.c.getenv("ROSETTE_VULKAN_LIBRARY")) |raw| candidates.add(std.mem.span(raw));
     if (requested_path.len != 0) candidates.add(requested_path);
@@ -463,6 +703,18 @@ const GuestSymbol = struct {
     loader_lookup_logged: bool = false,
     loader_lookup_repeats: u64 = 0,
 };
+
+const GuestSymbolLookupCacheEntry = struct {
+    library_token: u64 = 0,
+    name_hash: u64 = 0,
+    symbol_index: u16 = 0,
+    name_length: u8 = 0,
+};
+
+fn guestSymbolLookupCacheIndex(library_token: u64, name_hash: u64) usize {
+    const mixed = name_hash ^ (library_token *% 0x9E37_79B9_7F4A_7C15);
+    return @intCast(mixed % GUEST_SYMBOL_LOOKUP_CACHE_SIZE);
+}
 
 const VulkanLookupMiss = struct {
     library_token: u64 = 0,
@@ -678,7 +930,7 @@ const MAX_REAL_FRAMEBUFFERS = 256;
 const MAX_REAL_PIPELINES = 4096;
 const MAX_REAL_SHADER_MODULES = 1024;
 const MAX_RECT_EXPAND_MODULES = 256;
-const MAX_RECT_EXPAND_PIPELINES = 512;
+const MAX_RECT_EXPAND_PIPELINES = 2048;
 /// One row per distinct `vkCreate*`/`vkAllocate*` entry point the guest
 /// reaches. Bounded because the set is bounded by the API, not by the run.
 const MAX_VULKAN_CREATE_LEDGER = 48;
@@ -764,142 +1016,7 @@ const SwapchainRecord = struct {
 /// ABI; non-dispatchable handles are u64. Both are stored as u64 for uniform
 /// mapping table access.
 const RealHandle = u64;
-
-/// Mapping from a synthetic guest handle to a real Vulkan handle. The synthetic
-/// handle is the value written into guest memory; the real handle is the value
-/// the driver returned. A null real handle means the slot is unused.
-const HandleLookupEntry = struct { base: usize = 0, synthetic: u64 = 0, index: u32 = 0 };
-const handle_lookup_bits = 14;
-/// One Rosette host thread forwards every Vulkan call, so the cache needs no
-/// lock; a stale entry is detected by the slot check in `findIndex`.
-var handle_lookup_cache: [1 << handle_lookup_bits]HandleLookupEntry = @splat(.{});
-
-fn handleLookupSlot(base: usize, synthetic: u64) usize {
-    const mixed = (synthetic ^ (@as(u64, base) >> 4)) *% 0x9E37_79B9_7F4A_7C15;
-    return @intCast(mixed >> (64 - handle_lookup_bits));
-}
-
-const HandleMap = struct {
-    synthetic: u64 = 0,
-    real: RealHandle = 0,
-    /// Descriptor sets are children of a descriptor pool.  Keeping the guest
-    /// pool token on the mapping itself lets pool reset/destruction reclaim
-    /// every child even when the optional provenance record was not available.
-    /// Other map families leave this zero.
-    owner: u64 = 0,
-
-    pub const InsertResult = enum {
-        inserted,
-        existing,
-        replaced,
-        invalid,
-        exhausted,
-    };
-
-    pub fn findSlot(self: []HandleMap, synthetic: u64) ?*HandleMap {
-        const index = HandleMap.findIndex(self, synthetic) orelse return null;
-        return &self[index];
-    }
-
-    pub fn findReal(self: []const HandleMap, synthetic: u64) ?RealHandle {
-        const index = HandleMap.findIndex(self, synthetic) orelse return null;
-        return self[index].real;
-    }
-
-    /// Every forwarded `vkCmd*` translates its command buffer, and a
-    /// descriptor update translates a set, a view and a sampler per write:
-    /// millions of lookups a run, each a scan of a fixed table of up to
-    /// 16384 slots. A hit in this cache is checked against the table slot
-    /// itself, so a released or reused slot can only miss, never answer
-    /// for a different handle.
-    fn findIndex(self: []const HandleMap, synthetic: u64) ?usize {
-        if (synthetic == 0) return null;
-        const base = @intFromPtr(self.ptr);
-        const cached = &handle_lookup_cache[handleLookupSlot(base, synthetic)];
-        if (cached.synthetic == synthetic and cached.base == base and cached.index < self.len and
-            self[cached.index].synthetic == synthetic)
-        {
-            return cached.index;
-        }
-        for (self, 0..) |entry, index| {
-            if (entry.synthetic == synthetic) {
-                cached.* = .{ .base = base, .synthetic = synthetic, .index = @intCast(index) };
-                return index;
-            }
-        }
-        return null;
-    }
-
-    pub fn alloc(self: []HandleMap, synthetic: u64, real: RealHandle) InsertResult {
-        return HandleMap.allocOrFindOwned(self, synthetic, real, 0);
-    }
-
-    pub fn allocOrFind(self: []HandleMap, synthetic: u64, real: RealHandle) InsertResult {
-        return HandleMap.allocOrFindOwned(self, synthetic, real, 0);
-    }
-
-    pub fn allocOrFindOwned(self: []HandleMap, synthetic: u64, real: RealHandle, owner: u64) InsertResult {
-        // This used to panic from a live guest allocation path.  A bounded
-        // bridge table is a resource contract, not a reason to take down the
-        // whole process; callers turn the result into a Vulkan failure and
-        // keep the run's diagnostics alive.
-        if (synthetic == 0 or real == 0) return .invalid;
-        if (HandleMap.findIndex(self, synthetic)) |index| {
-            const entry = &self[index];
-            const unchanged = entry.real == real and entry.owner == owner;
-            entry.real = real;
-            entry.owner = owner;
-            return if (unchanged) .existing else .replaced;
-        }
-        for (self, 0..) |*entry, index| {
-            if (entry.synthetic == 0) {
-                entry.* = .{ .synthetic = synthetic, .real = real, .owner = owner };
-                handle_lookup_cache[handleLookupSlot(@intFromPtr(self.ptr), synthetic)] =
-                    .{ .base = @intFromPtr(self.ptr), .synthetic = synthetic, .index = @intCast(index) };
-                return .inserted;
-            }
-        }
-        return .exhausted;
-    }
-
-    pub fn freeSlots(self: []const HandleMap) usize {
-        var free: usize = 0;
-        for (self) |entry| {
-            if (entry.synthetic == 0) free += 1;
-        }
-        return free;
-    }
-
-    pub fn occupied(self: []const HandleMap) usize {
-        return self.len - HandleMap.freeSlots(self);
-    }
-
-    /// Remove all mappings owned by one parent object.  This is deliberately
-    /// generic so a pool reset can invalidate descriptor-set mappings without
-    /// relying on a second, best-effort side table.
-    pub fn removeOwned(self: []HandleMap, owner: u64) usize {
-        if (owner == 0) return 0;
-        var removed: usize = 0;
-        for (self) |*entry| {
-            if (entry.synthetic != 0 and entry.owner == owner) {
-                entry.* = .{};
-                removed += 1;
-            }
-        }
-        return removed;
-    }
-
-    pub fn remove(self: []HandleMap, synthetic: u64) bool {
-        if (synthetic == 0) return false;
-        for (self) |*entry| {
-            if (entry.synthetic == synthetic) {
-                entry.* = .{};
-                return true;
-            }
-        }
-        return false;
-    }
-};
+const HandleMap = gpu_vulkan.handle_map_registry.Entry;
 
 const DescriptorUpdateTemplateRecord = struct {
     entry_count: u8 = 0,
@@ -1323,8 +1440,9 @@ const RealVulkanState = struct {
     }
 
     fn descriptorUpdateTemplateIndex(self: *const RealVulkanState, synthetic: u64) ?usize {
-        for (self.descriptor_update_template_map, 0..) |entry, index| {
-            if (entry.synthetic == synthetic and entry.real != 0) return index;
+        for (&self.descriptor_update_template_map, 0..) |*entry, index| {
+            const mapped = HandleMap.snapshot(entry) orelse continue;
+            if (mapped.synthetic == synthetic and mapped.real != 0) return index;
         }
         return null;
     }
@@ -1410,24 +1528,48 @@ const VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP: u32 = 4;
 const VK_DYNAMIC_STATE_VIEWPORT: u32 = 0;
 const VK_DYNAMIC_STATE_SCISSOR: u32 = 1;
 const VK_SHADER_STAGE_VERTEX_BIT: u32 = 0x0000_0001;
+const VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT: u32 = 0x0000_0002;
+const VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: u32 = 0x0000_0004;
 const VK_PIPELINE_BIND_POINT_GRAPHICS: u32 = 0;
 
 const RECT_EXPAND_COMMAND_STATES = 8;
 const RectExpandCommandState = struct {
     command_buffer: u64 = 0,
+    pipeline: u64 = 0,
+    index_buffer: u64 = 0,
+    index_offset: u64 = 0,
+    index_type: u32 = 0,
     marked_pipeline: bool = false,
     builtin_indices: bool = false,
+};
+
+const RectForeignIndexSample = struct {
+    command_buffer: u64 = 0,
+    pipeline: u64 = 0,
+    index_buffer: u64 = 0,
+    index_offset: u64 = 0,
+    index_type: u32 = 0,
+    index_count: u32 = 0,
+    first_index: u32 = 0,
+    vertex_offset: i32 = 0,
+    instance_count: u32 = 0,
 };
 
 const TrackedImageView = struct {
     synthetic: u64 = 0,
     image: u64 = 0,
+    format: u32 = 0,
+    components: [4]u32 = @splat(0),
+    base_mip: u32 = 0,
+    base_layer: u32 = 0,
+    view_type: u32 = 0,
 };
 
 const TrackedDescriptorImage = struct {
     binding: u32 = 0,
     array_element: u32 = 0,
     image: u64 = 0,
+    image_view: u64 = 0,
 };
 
 const TrackedDescriptorSet = struct {
@@ -1467,6 +1609,319 @@ const TrackedFramebuffer = struct {
     attachment_count: u8 = 0,
     attachments: [MAX_TRACKED_TARGET_ATTACHMENTS]u64 = [_]u64{0} ** MAX_TRACKED_TARGET_ATTACHMENTS,
 };
+
+const fsi_chain = gpu_vulkan.fsi.chain;
+const fsi_timing = gpu_vulkan.fsi.timing;
+const fsi_contract = gpu_vulkan.fsi.contract;
+
+const fsi_recording_capacity = 32;
+const fsi_command_buffer_directory_capacity = 512;
+const fsi_render_pass_capacity = 64;
+const fsi_segment_command_capacity = 256;
+const fsi_block_reason_count = @typeInfo(fsi_chain.Block).@"enum".fields.len;
+
+/// How a vkCmd* call relates to splitting an FSI recording
+/// (`gpu/vulkan/fsi/chain.zig`). `recorded` commands are followed by the
+/// shadow or by the recording itself, `neutral` ones leave no state a later
+/// draw reads, and anything else makes the recording unsplittable until the
+/// guest begins it again.
+const FsiCommandClass = enum { draw, recorded, neutral, blocks };
+
+const fsi_draw_commands = [_][]const u8{
+    "vkCmdDraw",              "vkCmdDrawIndexed",              "vkCmdDrawIndirect",         "vkCmdDrawIndexedIndirect",
+    "vkCmdDrawIndirectCount", "vkCmdDrawIndexedIndirectCount", "vkCmdDrawIndirectCountKHR", "vkCmdDrawIndexedIndirectCountKHR",
+};
+const fsi_recorded_commands = [_][]const u8{
+    "vkCmdBindPipeline",               "vkCmdBindDescriptorSets",  "vkCmdPushConstants",       "vkCmdSetViewport",
+    "vkCmdSetScissor",                 "vkCmdSetBlendConstants",   "vkCmdSetDepthBias",        "vkCmdSetDepthBounds",
+    "vkCmdSetStencilCompareMask",      "vkCmdSetStencilWriteMask", "vkCmdSetStencilReference", "vkCmdBindIndexBuffer",
+    "vkCmdBindVertexBuffers",          "vkCmdBeginRenderPass",     "vkCmdEndRenderPass",       "vkCmdEndRenderPass2",
+    "vkCmdEndRenderPass2KHR",          "vkCmdBeginQuery",          "vkCmdEndQuery",            "vkCmdBeginConditionalRenderingEXT",
+    "vkCmdEndConditionalRenderingEXT",
+};
+const fsi_neutral_commands = [_][]const u8{
+    "vkCmdDispatch",               "vkCmdDispatchIndirect",  "vkCmdDispatchBase",         "vkCmdCopyBuffer",
+    "vkCmdCopyImage",              "vkCmdCopyBufferToImage", "vkCmdCopyImageToBuffer",    "vkCmdBlitImage",
+    "vkCmdFillBuffer",             "vkCmdUpdateBuffer",      "vkCmdResolveImage",         "vkCmdClearColorImage",
+    "vkCmdClearDepthStencilImage", "vkCmdClearAttachments",  "vkCmdPipelineBarrier",      "vkCmdPipelineBarrier2",
+    "vkCmdPipelineBarrier2KHR",    "vkCmdResetQueryPool",    "vkCmdCopyQueryPoolResults", "vkCmdWriteTimestamp",
+    "vkCmdExecuteCommands",        "vkCmdSetEvent",          "vkCmdResetEvent",           "vkCmdWaitEvents",
+};
+
+fn fsiCommandClass(name_hash: u64, name: []const u8) FsiCommandClass {
+    @setEvalBranchQuota(20_000);
+    inline for (fsi_draw_commands) |entry| {
+        if (name_hash == (comptime vulkanNameHash(entry)) and std.mem.eql(u8, name, entry)) return .draw;
+    }
+    inline for (fsi_recorded_commands) |entry| {
+        if (name_hash == (comptime vulkanNameHash(entry)) and std.mem.eql(u8, name, entry)) return .recorded;
+    }
+    inline for (fsi_neutral_commands) |entry| {
+        if (name_hash == (comptime vulkanNameHash(entry)) and std.mem.eql(u8, name, entry)) return .neutral;
+    }
+    return .blocks;
+}
+
+const FsiCommandBufferEntry = struct {
+    guest: u64 = 0,
+    guest_pool: u64 = 0,
+    primary: bool = false,
+};
+
+/// What the GPU-timing watcher needs to wait on and reset a fence
+/// (`gpu/vulkan/fsi/timing.zig`).
+const FsiFenceContext = struct {
+    device: abi.Device = null,
+    wait: ?abi.PfnWaitForFences = null,
+    reset: ?abi.PfnResetFences = null,
+};
+
+/// One VkSubmitInfo the guard builds from a guest submission: the guest's
+/// batch boundaries and semaphores, cut again at every chunk boundary.
+const FsiSegment = struct {
+    wait_count: u32 = 0,
+    wait_semaphores: ?[*]const abi.Semaphore = null,
+    wait_stages: ?[*]const u32 = null,
+    signal_count: u32 = 0,
+    signal_semaphores: ?[*]const abi.Semaphore = null,
+    command_count: u32 = 0,
+    draws: u32 = 0,
+    scissor_pixels: u64 = 0,
+    max_draw_scissor_pixels: u64 = 0,
+    sample_work: u64 = 0,
+    max_draw_sample_work: u64 = 0,
+    guest_command_buffer: u64 = 0,
+    segment_in_guest: u16 = 0,
+    guest_segments: u16 = 0,
+    first_pipeline: u64 = 0,
+    last_pipeline: u64 = 0,
+    isolated: bool = false,
+};
+
+/// Two adjacent chunks from one guest command buffer can share the host
+/// `vkQueueSubmit` call while remaining separate VkSubmitInfo batches (and,
+/// on MoltenVK, separate Metal command buffers). Do not coalesce across a
+/// guest wait/signal boundary, a mixed command-buffer batch, or an ambiguous
+/// segment identity.
+fn fsiCanCoalesceSegments(first: FsiSegment, second: FsiSegment) bool {
+    return !first.isolated and !second.isolated and first.guest_command_buffer != 0 and
+        first.guest_command_buffer == second.guest_command_buffer and
+        first.command_count == 1 and second.command_count == 1 and
+        @as(u32, first.segment_in_guest) + 1 == second.segment_in_guest and
+        first.signal_count == 0 and second.wait_count == 0;
+}
+
+test "FSI coalesces only adjacent single-buffer chunks without a semaphore dependency crossing" {
+    const first = FsiSegment{
+        .command_count = 1,
+        .guest_command_buffer = 0x501,
+        .segment_in_guest = 0,
+        .guest_segments = 3,
+    };
+    const second = FsiSegment{
+        .command_count = 1,
+        .guest_command_buffer = 0x501,
+        .segment_in_guest = 1,
+        .guest_segments = 3,
+    };
+    try std.testing.expect(fsiCanCoalesceSegments(first, second));
+    var isolated = first;
+    isolated.isolated = true;
+    try std.testing.expect(!fsiCanCoalesceSegments(isolated, second));
+    isolated = second;
+    isolated.isolated = true;
+    try std.testing.expect(!fsiCanCoalesceSegments(first, isolated));
+    try std.testing.expect(!fsiCanCoalesceSegments(first, .{ .command_count = 1, .guest_command_buffer = 0x502, .segment_in_guest = 1 }));
+    try std.testing.expect(!fsiCanCoalesceSegments(first, .{ .command_count = 1, .guest_command_buffer = 0x501, .segment_in_guest = 2 }));
+    try std.testing.expect(!fsiCanCoalesceSegments(.{ .command_count = 2, .guest_command_buffer = 0x501 }, second));
+    try std.testing.expect(!fsiCanCoalesceSegments(first, .{ .command_count = 2, .guest_command_buffer = 0x501, .segment_in_guest = 1 }));
+    try std.testing.expect(!fsiCanCoalesceSegments(.{ .command_count = 1, .guest_command_buffer = 0x501, .signal_count = 1 }, second));
+    try std.testing.expect(!fsiCanCoalesceSegments(first, .{ .command_count = 1, .guest_command_buffer = 0x501, .segment_in_guest = 1, .wait_count = 1 }));
+    try std.testing.expect(!fsiCanCoalesceSegments(.{ .command_count = 1, .segment_in_guest = 0 }, .{ .command_count = 1, .segment_in_guest = 1 }));
+}
+
+/// Rosette's guard for Xenia's FSI render backend (`gpu/vulkan/fsi`): FSI
+/// command buffers are split into chunks that each become their own Metal
+/// command buffer, bounded by measured time, draw count, scissor area, and
+/// in-flight queue depth to reduce macOS GPU watchdog risk.
+/// Allocated on the first vkAllocateCommandBuffers; armed only by Xenia's FSI
+/// render pass, so a host render target run never splits or times anything.
+const FsiGuard = struct {
+    protected_batching_enabled: bool = true,
+    armed: bool = false,
+    directory: [fsi_command_buffer_directory_capacity]FsiCommandBufferEntry = [_]FsiCommandBufferEntry{.{}} ** fsi_command_buffer_directory_capacity,
+    directory_overflow: u64 = 0,
+    recordings: [fsi_recording_capacity]fsi_chain.Recording = [_]fsi_chain.Recording{.{}} ** fsi_recording_capacity,
+    recording_overflow: u64 = 0,
+    splittable_render_passes: [fsi_render_pass_capacity]u64 = [_]u64{0} ** fsi_render_pass_capacity,
+    splittable_render_pass_count: usize = 0,
+    splittable_render_pass_overflow: u64 = 0,
+    xenia_fsi_render_passes: u64 = 0,
+    xenia_fsi_framebuffers: u64 = 0,
+    framebuffer_width: u32 = 0,
+    framebuffer_height: u32 = 0,
+    chunk_pool: fsi_chain.ChunkPool = .{},
+    command_pool: abi.CommandPool = 0,
+    command_pool_failed: bool = false,
+    monitor: fsi_timing.Monitor = .{},
+    monitor_started: bool = false,
+    monitor_start_failed: bool = false,
+    fence_context: FsiFenceContext = .{},
+    fsi_draws: u64 = 0,
+    /// FSI continuation mutates Vulkan command-buffer/render-pass state. Keep
+    /// that boundary serialized with all queued draw/bind work so MoltenVK
+    /// never encodes a split draw concurrently with ending or reopening its
+    /// pass (the observed crash was MVKCmdDrawIndexed::encode -> getSubpass).
+    serialized_split_boundaries: u64 = 0,
+    split_worker_drains: u64 = 0,
+    /// Guest FSI recordings refused before an over-budget draw could be
+    /// submitted without a safe continuation boundary.
+    recording_aborts: u64 = 0,
+    aborted_fsi_draws: u64 = 0,
+    /// The pixels an FSI draw can touch: its scissor clipped to the
+    /// 8192-square render area. Nothing else bounds an interlocked
+    /// triangle, so these say whether a slow chunk drew far outside the
+    /// picture.
+    max_scissor_pixels: u64 = 0,
+    oversized_scissor_draws: u64 = 0,
+    unscissored_draws: u64 = 0,
+    splits: u64 = 0,
+    split_failures: u64 = 0,
+    replay_missing_functions: u64 = 0,
+    blocked_splits: [fsi_block_reason_count]u64 = [_]u64{0} ** fsi_block_reason_count,
+    expanded_submits: u64 = 0,
+    segments_submitted: u64 = 0,
+    driver_queue_submit_calls: u64 = 0,
+    driver_submit_infos: u64 = 0,
+    coalesced_submit_groups: u64 = 0,
+    max_segments_per_submit: u64 = 0,
+    untimed_segments: u64 = 0,
+    timing_fences_created: u64 = 0,
+    timing_fence_failures: u64 = 0,
+    slow_chunk_submit_aborts: u64 = 0,
+    escalation_dumps: u64 = 0,
+};
+
+/// Re-issues an FSI recording's bound state into a new chunk
+/// (`fsi_chain.Shadow.replay`).
+const FsiReplayOps = struct {
+    fns: *const DeviceFnPtrs,
+    command_buffer: abi.CommandBuffer,
+    missing: u32 = 0,
+
+    pub fn bindPipeline(self: *FsiReplayOps, bind_point: u32, pipeline: u64) void {
+        const function = self.fns.cmd_bind_pipeline orelse return self.noteMissing();
+        function(self.command_buffer, bind_point, pipeline);
+    }
+    pub fn bindDescriptorSets(self: *FsiReplayOps, bind: *const fsi_chain.DescriptorBind) void {
+        const function = self.fns.cmd_bind_descriptor_sets orelse return self.noteMissing();
+        function(self.command_buffer, bind.bind_point, bind.layout, bind.first_set, bind.set_count, &bind.sets, bind.dynamic_count, if (bind.dynamic_count == 0) null else &bind.dynamic_offsets);
+    }
+    pub fn pushConstants(self: *FsiReplayOps, write: *const fsi_chain.PushConstants) void {
+        const function = self.fns.cmd_push_constants orelse return self.noteMissing();
+        function(self.command_buffer, write.layout, write.stages, write.offset, write.size, if (write.size == 0) null else &write.bytes);
+    }
+    pub fn setViewports(self: *FsiReplayOps, first: u32, viewports: []const abi.Viewport) void {
+        const function = self.fns.cmd_set_viewport orelse return self.noteMissing();
+        function(self.command_buffer, first, @intCast(viewports.len), viewports.ptr);
+    }
+    pub fn setScissors(self: *FsiReplayOps, first: u32, scissors: []const abi.Rect2D) void {
+        const function = self.fns.cmd_set_scissor orelse return self.noteMissing();
+        function(self.command_buffer, first, @intCast(scissors.len), scissors.ptr);
+    }
+    pub fn setBlendConstants(self: *FsiReplayOps, constants: *const [4]f32) void {
+        const function = self.fns.cmd_set_blend_constants orelse return self.noteMissing();
+        function(self.command_buffer, constants);
+    }
+    pub fn setDepthBias(self: *FsiReplayOps, constant: f32, clamp: f32, slope: f32) void {
+        const function = self.fns.cmd_set_depth_bias orelse return self.noteMissing();
+        function(self.command_buffer, constant, clamp, slope);
+    }
+    pub fn setDepthBounds(self: *FsiReplayOps, min: f32, max: f32) void {
+        const function = self.fns.cmd_set_depth_bounds orelse return self.noteMissing();
+        function(self.command_buffer, min, max);
+    }
+    pub fn setStencilCompareMask(self: *FsiReplayOps, face: u32, value: u32) void {
+        const function = self.fns.cmd_set_stencil_compare_mask orelse return self.noteMissing();
+        function(self.command_buffer, face, value);
+    }
+    pub fn setStencilWriteMask(self: *FsiReplayOps, face: u32, value: u32) void {
+        const function = self.fns.cmd_set_stencil_write_mask orelse return self.noteMissing();
+        function(self.command_buffer, face, value);
+    }
+    pub fn setStencilReference(self: *FsiReplayOps, face: u32, value: u32) void {
+        const function = self.fns.cmd_set_stencil_reference orelse return self.noteMissing();
+        function(self.command_buffer, face, value);
+    }
+    pub fn bindIndexBuffer(self: *FsiReplayOps, buffer: u64, offset: u64, index_type: u32) void {
+        const function = self.fns.cmd_bind_index_buffer orelse return self.noteMissing();
+        function(self.command_buffer, buffer, offset, index_type);
+    }
+    pub fn bindVertexBuffers(self: *FsiReplayOps, first: u32, buffers: []const u64, offsets: []const u64) void {
+        const function = self.fns.cmd_bind_vertex_buffers orelse return self.noteMissing();
+        function(self.command_buffer, first, @intCast(buffers.len), buffers.ptr, offsets.ptr);
+    }
+    pub fn noteMissing(self: *FsiReplayOps) void {
+        self.missing += 1;
+    }
+
+    /// Check replay prerequisites before ending the live guest recording. A
+    /// missing function can no longer be discovered after the old command
+    /// buffer has been closed without losing guest state.
+    fn supports(self: *const FsiReplayOps, shadow: *const fsi_chain.Shadow) bool {
+        if (shadow.pipelines[0] != 0 and self.fns.cmd_bind_pipeline == null) return false;
+        if (shadow.pipelines[1] != 0 and self.fns.cmd_bind_pipeline == null) return false;
+        if (shadow.descriptor_bind_count != 0 and self.fns.cmd_bind_descriptor_sets == null) return false;
+        if (shadow.push_constant_count != 0 and self.fns.cmd_push_constants == null) return false;
+        if (shadow.viewport_mask != 0 and self.fns.cmd_set_viewport == null) return false;
+        if (shadow.scissor_mask != 0 and self.fns.cmd_set_scissor == null) return false;
+        if (shadow.blend_constants != null and self.fns.cmd_set_blend_constants == null) return false;
+        if (shadow.depth_bias != null and self.fns.cmd_set_depth_bias == null) return false;
+        if (shadow.depth_bounds != null and self.fns.cmd_set_depth_bounds == null) return false;
+        if ((shadow.stencil_compare_mask[0] != null or shadow.stencil_compare_mask[1] != null) and self.fns.cmd_set_stencil_compare_mask == null) return false;
+        if ((shadow.stencil_write_mask[0] != null or shadow.stencil_write_mask[1] != null) and self.fns.cmd_set_stencil_write_mask == null) return false;
+        if ((shadow.stencil_reference[0] != null or shadow.stencil_reference[1] != null) and self.fns.cmd_set_stencil_reference == null) return false;
+        if (shadow.index != null and self.fns.cmd_bind_index_buffer == null) return false;
+        if (shadow.vertex_mask != 0 and self.fns.cmd_bind_vertex_buffers == null) return false;
+        return true;
+    }
+};
+
+fn fsiFenceWait(context: *anyopaque, fence: u64, timeout_ns: u64) fsi_timing.WaitResult {
+    const fences: *FsiFenceContext = @ptrCast(@alignCast(context));
+    const wait = fences.wait orelse return .failed;
+    const handles = [_]abi.Fence{fence};
+    return switch (wait(fences.device, 1, &handles, 1, timeout_ns)) {
+        abi.SUCCESS => .signaled,
+        abi.TIMEOUT => .timeout,
+        else => .failed,
+    };
+}
+
+fn fsiFenceReset(context: *anyopaque, fence: u64) bool {
+    const fences: *FsiFenceContext = @ptrCast(@alignCast(context));
+    const reset = fences.reset orelse return false;
+    const handles = [_]abi.Fence{fence};
+    return reset(fences.device, 1, &handles) == abi.SUCCESS;
+}
+
+fn fsiFenceNow(context: *anyopaque) u64 {
+    _ = context;
+    return transport_timing.nowNs();
+}
+
+/// Printed on the timing watcher's thread while the chunk is still running.
+fn fsiWatcherReport(report: fsi_timing.Report) void {
+    const meaning = switch (report.kind) {
+        .risk => "submission-to-observation latency crossed the risk bound; normal calibration ceilings were reduced for this run; emergency recovery starts over at minimum work and can earn at most the original conservative sample quantum",
+        .severe => if (report.completion_observed) "completion was observed beyond the severe bound; work returns to minimum and only a later protected recovery streak may earn the original conservative quantum; a completed fence alone does not pause the queue" else "an outstanding timing group crossed the severe bound; new FSI submissions wait until all outstanding fences complete and reset successfully, then resume at minimum work; draw cap stays pinned and only a later protected recovery streak may earn the original conservative work quantum; actual fence failures stop the run. Splitting cannot subdivide a single oversized draw",
+        .failed => if (report.failure_stage == .reset_fences) "vkResetFences failed after completion; the fence is not recycled and later FSI queue submissions are stopped" else "vkWaitForFences failed on the timing watcher, which normally means the Metal-backed Vulkan device was lost; subsequent FSI submissions are stopped",
+    };
+    machoCapturePrint(
+        "macho-processor: VULKAN FSI WATCHDOG {s}: serial={d} queue_submit={d} guest_command_buffer=0x{x} segment={d}/{d} timing_group_submit_infos={d} fsi_draws={d} scissor_pixels={d} max_draw_scissor_pixels={d} sample_work={d} max_draw_sample_work={d} running_ms={d} completion_observed={} cap_now={d} outstanding_groups={d} pipelines(first/last)=0x{x}/0x{x} timing_basis=submit_to_fence_observation_upper_bound; {s}\n",
+        .{ @tagName(report.kind), report.entry.serial, report.entry.queue_submit, report.entry.guest_command_buffer, report.entry.segment + 1, report.entry.segments, report.entry.submit_infos, report.entry.draws, report.entry.scissor_pixels, report.entry.max_draw_scissor_pixels, report.entry.sample_work, report.entry.max_draw_sample_work, report.running_ns / 1_000_000, report.completion_observed, report.cap, report.outstanding, report.entry.first_pipeline_hash, report.entry.last_pipeline_hash, meaning },
+    );
+}
 
 const TrackedRenderPass = struct {
     synthetic: u64 = 0,
@@ -1532,6 +1987,7 @@ const TrackedGraphicsPipeline = struct {
     layout: u64 = 0,
     repair_real: u64 = 0,
     guest_output_candidate: bool = false,
+    fsi: fsi_diagnostics.PipelineIdentity = .{},
     topology: u32 = 0,
     topology_known: bool = false,
     stage_count: u32 = 0,
@@ -1571,6 +2027,7 @@ const TrackedCommandTargets = struct {
     /// descriptor set bound inside that pass can be attributed to the image
     /// the pass writes. Zero outside a render pass.
     current_pass_target: u64 = 0,
+    current_pass_target_source: fsi_diagnostics.TargetSource = .unknown,
     pass_edge_count: u8 = 0,
     pass_edges: [MAX_TRACKED_PASS_EDGES]TrackedPassEdge = @splat(.{}),
     graphics_state: GraphicsStateTrace = .{},
@@ -1602,6 +2059,17 @@ const DescriptorUpdateRefusal = enum(u8) {
     unmapped_buffer,
     unmapped_buffer_view,
     descriptor_type,
+};
+
+/// Exact guest-side location and handle behind a refused descriptor update.
+/// `write_index` stays max when admission fails before any VkWrite is read.
+const DescriptorUpdateFailureDetails = struct {
+    write_index: u64 = std.math.maxInt(u64),
+    descriptor_type: u32 = 0,
+    binding: u32 = 0,
+    descriptor_set: u64 = 0,
+    resource: u64 = 0,
+    element_index: u64 = std.math.maxInt(u64),
 };
 
 /// A target-overflow count is only useful when it says which bounded ledger
@@ -1717,6 +2185,15 @@ const PixelProbeState = struct {
     probe_schedule: transport_timing.ProbeCadence = .{},
 };
 
+/// A private Vulkan storage buffer used only if Xenia's initial FSI ZPD
+/// descriptor unexpectedly names a null counter sink. It is independent of
+/// guest resources and lives until the guest device is destroyed.
+const FsiZpdSinkState = struct {
+    buffer: abi.Buffer = 0,
+    memory: abi.DeviceMemory = 0,
+    range: u64 = 0,
+};
+
 /// Where along Xenia's present path the picture's brightness is lost, read
 /// from three images in one present: the swap texture the texture cache hands
 /// the gamma pass, the guest output image the gamma pass writes, and the
@@ -1732,8 +2209,9 @@ const BrightnessLoss = enum {
     /// Bright out of the gamma pass, dark on the swapchain: the presenter's
     /// paint (format, colour space, sampler).
     present_paint,
-    /// The swapchain is bright; there is no loss to place.
-    none,
+    /// The swapchain has at least one channel above the ladder's dark
+    /// threshold. This is not a judgment that the rendered colours are right.
+    swapchain_signal_present,
 
     pub fn label(self: BrightnessLoss) []const u8 {
         return switch (self) {
@@ -1741,7 +2219,7 @@ const BrightnessLoss = enum {
             .before_gamma_pass => "before_gamma_pass",
             .gamma_pass => "gamma_pass",
             .present_paint => "present_paint",
-            .none => "none",
+            .swapchain_signal_present => "swapchain_signal_present",
         };
     }
 
@@ -1751,7 +2229,7 @@ const BrightnessLoss = enum {
             .before_gamma_pass => "the swap texture Xenia's texture cache handed to the gamma pass is already dark when read as UNORM: read the swap_texture line's as_7e3 figures first, because a 10-bit front buffer holding 7e3 float patterns is dim as UNORM by construction (1.0 is 384/1023) and the programmed ramp is what turns it into intensities; if as_7e3 is dim too, the loss is in the title's render/resolve or in the CPU-side state Xenia computed for them",
             .gamma_pass => "the swap texture is bright and the gamma pass's output is dark: read ramp_shape and ramp_out on the TEXEL CUSTODY line, the lookup table is where the brightness went",
             .present_paint => "the gamma pass's output is bright and the swapchain image is dark: the presenter's paint from guest output to swapchain (format, colour space or sampler) is where the brightness went",
-            .none => "the presented image is bright; no brightness loss to place",
+            .swapchain_signal_present => "the swapchain has a channel above the ladder's dark threshold; this does not establish correct colour or identify the render pass that produced it",
         };
     }
 };
@@ -1764,9 +2242,9 @@ const LadderStage = struct {
     width: u32 = 0,
     height: u32 = 0,
     stats: ?frame_capture.Stats = null,
-    /// The same bytes read as Xenos 7e3 float, for a 10-bit image: Halo 3's
-    /// front buffer holds float bit patterns, and a UNORM reading of them
-    /// is dim by construction (1.0 is 384/1023).
+    /// Optional Xenos 7e3 interpretation of the pre-gamma swap texture.
+    /// `guest_output` is the gamma pass result and is measured as normalized
+    /// output only, even when Vulkan stores it in the same 10-bit format.
     seven_e3: ?frame_capture.SevenE3Stats = null,
     status: []const u8 = "not_reached",
 };
@@ -1782,6 +2260,8 @@ const BrightnessLadderState = struct {
     /// Peak channel value (8-bit scale) at each stage of the last sample:
     /// swap texture, guest output, swapchain. 256 means unread.
     last_peaks: [3]u16 = .{ 256, 256, 256 },
+    last_swapchain_near_white: bool = false,
+    white_transitions: u64 = 0,
     probe_schedule: transport_timing.ProbeCadence = .{},
 };
 
@@ -1796,6 +2276,20 @@ fn imageReadbackAugmentable(usage: u32, format: u32, image_type: u32, samples: u
 
 const PIXEL_PROBE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const PIXEL_PROBE_INITIAL_SAMPLES: u64 = 4;
+
+/// Bounded colour checkpoints through the title/campaign transition. The
+/// previous 1536-frame first checkpoint never ran when MoltenVK hung at
+/// frame 1286, leaving frame 9 as the last measured image. These checkpoints
+/// are sparse because each one drains the queue for an image readback.
+const render_diagnostic_frames = [_]u64{ 256, 512, 768, 896, 1024, 1152, 1280, 1536, 2048, 2304, 2560, 3072, 4608 };
+
+fn campaignDiagnosticFrame(frame: u64) bool {
+    for (render_diagnostic_frames) |checkpoint| {
+        if (frame == checkpoint) return true;
+    }
+    return false;
+}
+
 const PIXEL_PROBE_CONTENT_SAMPLES: u64 = 8;
 
 fn shouldForceContentPixelProbe(probe: *const PixelProbeState, write_kind: WriteKind) bool {
@@ -1890,6 +2384,46 @@ const FeatureChainScratch = struct {
     addresses: [feature_chain_max]u64 = [_]u64{0} ** feature_chain_max,
     count: usize = 0,
 };
+
+const FsiGuestChainStatus = enum { absent, present, unreadable, too_deep };
+
+const FsiGuestFeatureRequest = struct {
+    status: FsiGuestChainStatus = .absent,
+    sample: bool = false,
+    pixel: bool = false,
+    shading_rate: bool = false,
+};
+
+fn featureChainBoolAt(bytes: []const u8, index: usize) bool {
+    const offset = 16 + index * 4;
+    if (offset + 4 > bytes.len) return false;
+    return std.mem.readInt(u32, bytes[offset..][0..4], .little) != 0;
+}
+
+/// Read only the FSI feature node from a guest-owned chain. This intentionally
+/// tolerates other nodes so diagnostics can still say whether Xenia requested
+/// interlock when a separate, unsupported pNext node makes device creation
+/// fail.
+fn fsiGuestFeatureRequest(state: anytype, guest_p_next: u64) FsiGuestFeatureRequest {
+    var node = guest_p_next;
+    for (0..16) |_| {
+        if (node == 0) return .{ .status = .absent };
+        if (state.guestMemoryConst(node, 16) == null) return .{ .status = .unreadable };
+        const s_type = state.read32(node);
+        const next = state.read64(node + 8);
+        if (s_type == abi.STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT) {
+            const bytes = state.guestMemoryConst(node, 28) orelse return .{ .status = .unreadable };
+            return .{
+                .status = .present,
+                .sample = featureChainBoolAt(bytes, 0),
+                .pixel = featureChainBoolAt(bytes, 1),
+                .shading_rate = featureChainBoolAt(bytes, 2),
+            };
+        }
+        node = next;
+    }
+    return .{ .status = if (node == 0) .absent else .too_deep };
+}
 
 const property_chain_max = 3;
 
@@ -2321,6 +2855,9 @@ pub const Forwarder = struct {
     library_count: usize = 0,
     guest_libraries: [MAX_GUEST_LIBRARIES]GuestLibrary = [_]GuestLibrary{.{}} ** MAX_GUEST_LIBRARIES,
     guest_symbols: [MAX_GUEST_SYMBOLS]GuestSymbol = [_]GuestSymbol{.{}} ** MAX_GUEST_SYMBOLS,
+    guest_symbol_lookup_cache: [GUEST_SYMBOL_LOOKUP_CACHE_SIZE]GuestSymbolLookupCacheEntry = [_]GuestSymbolLookupCacheEntry{.{}} ** GUEST_SYMBOL_LOOKUP_CACHE_SIZE,
+    guest_symbol_lookup_cache_hits: u64 = 0,
+    guest_symbol_lookup_cache_misses: u64 = 0,
     guest_open_count: u64 = 0,
     guest_close_count: u64 = 0,
     guest_lookup_count: u64 = 0,
@@ -2369,6 +2906,10 @@ pub const Forwarder = struct {
     graphics_report_brightness: ?BrightnessLoss = null,
     graphics_report_picture_started: bool = false,
     picture_sequence: transport_timing.PictureSequence = .{},
+    frame_hud_last_sample_ns: u64 = 0,
+    frame_hud_fps_milli: u64 = 0,
+    frame_hud_callback_resolved: bool = false,
+    frame_hud_bridge_reported: bool = false,
     /// `no_presents` is a real presentation failure point, but it can be
     /// provisional during Xenia startup: the guest may create the swapchain
     /// long before it submits its first draw. Keep one bounded failure episode
@@ -2417,8 +2958,15 @@ pub const Forwarder = struct {
     texel_custody_printed: u64 = 0,
     /// What the most recently audited gamma ramp does, from `texel_custody`.
     texel_custody_last_format: u32 = 0,
+    texel_custody_last_channel_pairs_differ: ?u32 = null,
     texel_custody_last_shape: rosette_gpu.vulkan.texel_custody.Shape = .unknown_size,
-    texel_custody_last_out: [3]u16 = .{ 0, 0, 0 },
+    /// Reference gamma outputs ordered as max, 7e3-one bit pattern, midpoint;
+    /// each inner tuple is red/green/blue.
+    texel_custody_last_out_rgb: [3][3]u16 = .{
+        .{ 0, 0, 0 },
+        .{ 0, 0, 0 },
+        .{ 0, 0, 0 },
+    },
     texel_custody_default_samples: u64 = 0,
     texel_custody_programmed_samples: u64 = 0,
     /// Render-pass source edges committed to the present chain, and the
@@ -2477,10 +3025,11 @@ pub const Forwarder = struct {
     /// Synthetic shader-module handles this bridge rewrote.
     rect_expand_modules: [MAX_RECT_EXPAND_MODULES]u64 = [_]u64{0} ** MAX_RECT_EXPAND_MODULES,
     rect_expand_module_count: u32 = 0,
-    /// Synthetic pipeline handles built from a rewritten vertex shader with
-    /// the strip-plus-restart topology the rectangle fallback uses.
-    rect_expand_pipelines: [MAX_RECT_EXPAND_PIPELINES]u64 = [_]u64{0} ** MAX_RECT_EXPAND_PIPELINES,
-    rect_expand_pipeline_count: u32 = 0,
+    /// Native pipeline handles built from a rewritten vertex shader with the
+    /// strip-plus-restart topology the rectangle fallback uses. Pipelines are
+    /// removed at destruction, so this tracks live workarounds rather than
+    /// lifetime pipeline churn.
+    rect_expand_pipeline_registry: gpu_vulkan.handle_set.Set(MAX_RECT_EXPAND_PIPELINES) = .{},
     rect_expand_bound_pipeline: u64 = 0,
     /// Per command buffer: is a rewritten rectangle pipeline bound, and are
     /// the bound indices the built-in expansion buffer's. Guest threads
@@ -2500,17 +3049,53 @@ pub const Forwarder = struct {
     /// because their indices came from some other buffer - each was a
     /// guest triangle strip the old tagging rule decoded as rectangles.
     rect_expand_draws_declined_foreign_index: u64 = 0,
+    rect_expand_first_foreign_index_sample: ?RectForeignIndexSample = null,
     rect_expand_shaders_rewritten: u64 = 0,
+    rect_expand_shaders_cull_distance_stripped: u64 = 0,
     rect_expand_shaders_refused: u64 = 0,
     rect_expand_shaders_skipped_non_vertex: u64 = 0,
     rect_expand_shaders_skipped_already_expanded: u64 = 0,
     rect_expand_last_refusal: gpu_vulkan.rect_list_expand.Refusal = .none,
+    rect_expand_refusal_counts: [std.enums.values(gpu_vulkan.rect_list_expand.Refusal).len]u64 = [_]u64{0} ** std.enums.values(gpu_vulkan.rect_list_expand.Refusal).len,
+    rect_expand_last_refusal_module: u64 = 0,
+    rect_expand_last_refusal_hash: u64 = 0,
+    rect_expand_last_refusal_bytes: u32 = 0,
+    rect_expand_last_cull_distance_site: ?gpu_vulkan.rect_list_expand.CullDistanceSite = null,
+    rect_expand_allocation_failures: u64 = 0,
+    rect_expand_last_driver_rejection_result: i32 = 0,
+    rect_expand_last_driver_rejection_module: u64 = 0,
+    rect_expand_last_driver_rejection_hash: u64 = 0,
+    rect_expand_last_driver_rejection_bytes: u32 = 0,
     rect_expand_pipelines_marked: u64 = 0,
     rect_expand_draws_tagged: u64 = 0,
     rect_expand_module_overflow: u64 = 0,
     rect_expand_pipeline_overflow: u64 = 0,
     rect_expand_module_rejections: u64 = 0,
     rect_expand_pipelines_unmarked: u64 = 0,
+    /// `gpu_vulkan.robust_access`: MoltenVK reports robustBufferAccess, which
+    /// Xenia enables and relies on, but Metal bounds no shader index. Every
+    /// module is hardened before the driver sees it.
+    /// `ROSETTE_VULKAN_ROBUST_ACCESS=0` disables it (A/B diagnosis only).
+    robust_access_configured: bool = false,
+    robust_access_enabled: bool = true,
+    robust_access_stats: gpu_vulkan.robust_access.Stats = .{},
+    robust_access_modules_hardened: u64 = 0,
+    robust_access_modules_unchanged: u64 = 0,
+    robust_access_modules_refused: u64 = 0,
+    robust_access_driver_rejections: u64 = 0,
+    robust_access_allocation_failures: u64 = 0,
+    fsi_pixel_frequency_configured: bool = false,
+    fsi_pixel_frequency_enabled: bool = true,
+    fsi_pixel_frequency_changed: u64 = 0,
+    fsi_pixel_frequency_explicit: u64 = 0,
+    fsi_pixel_frequency_complex: u64 = 0,
+    fsi_pixel_frequency_allocation_failures: u64 = 0,
+    fsi_pixel_frequency_driver_rejections: u64 = 0,
+    hdr_resolve_configured: bool = false,
+    hdr_resolve_enabled: bool = true,
+    hdr_resolve_modules: u64 = 0,
+    hdr_resolve_unpacks: u64 = 0,
+    hdr_resolve_driver_rejections: u64 = 0,
     target_attribution_events: u64 = 0,
     target_offscreen_events: u64 = 0,
     target_unknown_events: u64 = 0,
@@ -2548,7 +3133,25 @@ pub const Forwarder = struct {
     vulkan_descriptor_sampled_images_recorded: u64 = 0,
     vulkan_descriptor_sampled_unknown: u64 = 0,
     pixel_probe: PixelProbeState = .{},
+    fsi_zpd_sink: FsiZpdSinkState = .{},
+    /// FSI set updates whose dead-stack sink info was replaced (see
+    /// `gpu/vulkan/fsi_descriptor_repair.zig`).
+    fsi_zpd_descriptor_repairs: u64 = 0,
+    /// Xenia's FSI render backend guard: chunked submission and GPU timing
+    /// (`gpu/vulkan/fsi`, `FsiGuard`). Allocated on first use.
+    fsi_guard: ?*FsiGuard = null,
+    /// Correct attachment-less MSAA even when watchdog chunking is disabled.
+    fsi_raster: fsi_rasterization.Registry = .{},
+    fsi_evidence_enabled: ?bool = null,
+    fsi_evidence_writer: gpu_vulkan.fsi.evidence.Writer = .{},
+    /// Vulkan queue host calls are externally synchronized even while a
+    /// dispatch-only runtime lock is yielded for FSI backpressure.
+    vulkan_queue_api_gate: queue_api_gate.Gate = .{},
+    fsi_guard_refused: bool = false,
+    /// Tests drive the timing watcher by hand instead of on its thread.
+    fsi_guard_watcher_thread: bool = !builtin.is_test,
     transport_cost: transport_timing.Ledger = .{},
+    present_ceiling: present_pacing.Ceiling = .{},
     /// Asynchronous present completion. `present_completion_confirmed` is the
     /// count of real presents the queue is known to have finished - by a
     /// blocking wait while proof is the point, then by one host fence
@@ -2579,6 +3182,8 @@ pub const Forwarder = struct {
     vulkan_async_command_worker: ?*async_vulkan_command.Worker = null,
     vulkan_async_command_worker_decided: bool = false,
     vulkan_async_command_worker_enabled: bool = false,
+    fsi_small_chunk_sync: bool = true,
+    fsi_small_chunk_sync_commands: u64 = 0,
     vulkan_async_command_barriers: u64 = 0,
     /// A full queue falls back synchronously after draining earlier work,
     /// keeping the command stream ordered without stalling on queue space.
@@ -2601,6 +3206,48 @@ pub const Forwarder = struct {
         [_]VulkanCreateLedgerEntry{.{}} ** MAX_VULKAN_CREATE_LEDGER,
     vulkan_create_ledger_count: usize = 0,
     vulkan_create_ledger_overflow: u64 = 0,
+    /// Tessellation stage visibility at the real graphics-pipeline boundary.
+    /// This distinguishes a guest shader-generator failure (no tessellation
+    /// pipeline reaches Rosette) from a Rosette marshal or native-driver fail.
+    vulkan_tessellation_pipeline_candidates: u64 = 0,
+    vulkan_tessellation_pipeline_driver_successes: u64 = 0,
+    vulkan_tessellation_pipeline_driver_failures: u64 = 0,
+    vulkan_tessellation_pipeline_marshal_refusals: u64 = 0,
+    vulkan_tessellation_pipeline_missing_state: u64 = 0,
+    vulkan_tessellation_stage_mask_or: u32 = 0,
+    /// Shader modules are created before Xenia builds tessellation pipelines.
+    /// These counters show whether their SPIR-V execution models reached the
+    /// native vkCreateShaderModule boundary at all.
+    vulkan_tess_control_shader_modules: u64 = 0,
+    vulkan_tess_control_shader_modules_native_success: u64 = 0,
+    vulkan_tess_control_shader_modules_native_failure: u64 = 0,
+    vulkan_tess_eval_shader_modules: u64 = 0,
+    vulkan_tess_eval_shader_modules_native_success: u64 = 0,
+    vulkan_tess_eval_shader_modules_native_failure: u64 = 0,
+    vulkan_shader_module_spirv_unreadable: u64 = 0,
+    /// Xenia's FSI setting is not reflected by vkCreateDevice alone: it can
+    /// request the extension even when it later picks its framebuffer path.
+    /// Count modules carrying the SPIR-V interlock capability/ops to prove
+    /// that shader generation actually selected the FSI render-target path.
+    vulkan_fsi_shader_modules: u64 = 0,
+    vulkan_fsi_shader_modules_native_success: u64 = 0,
+    vulkan_fsi_shader_modules_native_failure: u64 = 0,
+    vulkan_fsi_spirv_capability_mask: u8 = 0,
+    vulkan_fsi_spirv_begin_ops: u64 = 0,
+    vulkan_fsi_spirv_end_ops: u64 = 0,
+    /// Xenia creates this exact three-binding SSBO layout only after its
+    /// Vulkan render-target cache has selected the FSI path.
+    vulkan_fsi_descriptor_layouts: u64 = 0,
+    vulkan_fsi_shared_memory_binding_count: u32 = 0,
+    vulkan_fsi_shared_memory_binding_count_known: bool = false,
+    vulkan_fsi_host_storage_buffer_limit: u32 = 0,
+    vulkan_fsi_host_storage_buffer_limit_known: bool = false,
+    vulkan_fsi_binding_limit_would_fallback: bool = false,
+    vulkan_fsi_binding_count_matches_host_range: bool = false,
+    vulkan_fsi_binding_count_matches_host_range_known: bool = false,
+    vulkan_fsi_tracker: gpu_vulkan.fsi_diagnostics.Tracker = .{},
+    vulkan_device_loss_evidence: device_loss_diagnostics.Evidence = .{},
+    metal_backend_health: rosette_gpu.metal_backend_health.Ledger = .{},
     vulkan_guest_object_publications: u64 = 0,
     vulkan_real_objects_destroyed: u64 = 0,
     /// Handle maps are intentionally bounded because a reverse mapping is
@@ -2707,6 +3354,7 @@ pub const Forwarder = struct {
     vulkan_presenter_off_ui_calls: u64 = 0,
     vulkan_presenter_stage: VulkanPresenterStage = .none,
     native_vulkan_library_token: u64 = 0,
+    native_texture_state: ?*native_texture.State = null,
     native_vulkan_instance: ?*anyopaque = null,
     native_vulkan_surface: u64 = 0,
     native_vulkan_instance_attempts: u64 = 0,
@@ -3052,12 +3700,44 @@ pub const Forwarder = struct {
     }
 
     fn allocateGuestSymbol(self: *Forwarder, library_token: u64, symbol: []const u8) u64 {
-        const kind = guestSymbolKind(symbol);
-        for (&self.guest_symbols) |*entry| {
+        const cacheable = symbol.len <= 95;
+        const name_hash = vulkanNameHash(symbol);
+        const cache_index = if (cacheable) guestSymbolLookupCacheIndex(library_token, name_hash) else 0;
+        if (cacheable) {
+            const cached = self.guest_symbol_lookup_cache[cache_index];
+            if (cached.library_token == library_token and cached.name_hash == name_hash and cached.name_length == symbol.len) {
+                const cached_index: usize = cached.symbol_index;
+                if (cached_index < self.guest_symbols.len) {
+                    const entry = &self.guest_symbols[cached_index];
+                    if (entry.token != 0 and entry.library_token == library_token and
+                        entry.name_hash == name_hash and entry.name_length == symbol.len and
+                        std.mem.eql(u8, entry.name[0..entry.name_length], symbol))
+                    {
+                        self.guest_symbol_lookup_cache_hits +|= 1;
+                        return entry.token;
+                    }
+                }
+            }
+            self.guest_symbol_lookup_cache_misses +|= 1;
+        }
+        for (&self.guest_symbols, 0..) |*entry, index| {
             if (entry.token == 0 or entry.library_token != library_token) continue;
             if (entry.name_length != symbol.len) continue;
-            if (std.mem.eql(u8, entry.name[0..entry.name_length], symbol)) return entry.token;
+            if (std.mem.eql(u8, entry.name[0..entry.name_length], symbol)) {
+                if (cacheable) self.guest_symbol_lookup_cache[cache_index] = .{
+                    .library_token = library_token,
+                    .name_hash = name_hash,
+                    .symbol_index = @intCast(index),
+                    .name_length = @intCast(symbol.len),
+                };
+                return entry.token;
+            }
         }
+        // Classification is only needed when allocating a new thunk. Repeated
+        // lookups dominate this path (the supplied run records 8.3M repeats),
+        // so doing the long symbol-kind string match before the cache check
+        // would erase most of the cache's benefit.
+        const kind = guestSymbolKind(symbol);
         for (&self.guest_symbols, 0..) |*entry, index| {
             if (entry.token != 0) continue;
             const token = GUEST_SYMBOL_THUNK_BASE + @as(u64, @intCast(index)) * 16 + 1;
@@ -3065,6 +3745,12 @@ pub const Forwarder = struct {
             entry.* = .{ .token = token, .library_token = library_token, .kind = kind, .name_length = name_length };
             @memcpy(entry.name[0..name_length], symbol[0..name_length]);
             entry.name_hash = vulkanNameHash(entry.name[0..name_length]);
+            if (cacheable) self.guest_symbol_lookup_cache[cache_index] = .{
+                .library_token = library_token,
+                .name_hash = name_hash,
+                .symbol_index = @intCast(index),
+                .name_length = @intCast(symbol.len),
+            };
             self.guest_lookup_count +|= 1;
             return token;
         }
@@ -3089,6 +3775,22 @@ pub const Forwarder = struct {
     fn noteVulkanLoaderLookup(self: *Forwarder, library_token: u64, symbol: []const u8, token: u64) bool {
         const name_hash = vulkanNameHash(symbol);
         if (token != 0) {
+            const indexed = guestSymbolIndexFromToken(token);
+            if (indexed) |index| {
+                const entry = &self.guest_symbols[index];
+                if (entry.token == token) {
+                    if (entry.loader_lookup_logged) {
+                        entry.loader_lookup_repeats +|= 1;
+                        self.noteSuppressedVulkanLoaderLookup();
+                        return false;
+                    }
+                    entry.loader_lookup_logged = true;
+                    self.vulkan_loader_lookup_unique +|= 1;
+                    return self.shouldLogVulkanLoaderUnique();
+                }
+            }
+            // Keep the old defensive path for malformed or stale tokens. The
+            // normal token layout takes the direct indexed path above.
             for (&self.guest_symbols) |*entry| {
                 if (entry.token != token) continue;
                 if (entry.loader_lookup_logged) {
@@ -3571,7 +4273,7 @@ pub const Forwarder = struct {
             .create_instance => blk: {
                 machoCapturePrint("macho-processor: BOOTUP MILESTONE: guest invoked vkCreateInstance — Vulkan instance creation beginning\n", .{});
                 machoCapturePrint("macho-processor: vkCreateInstance dispatch: pCreateInfo=0x{x} pInstance=0x{x}\n", .{ guest_context.registers(state).rdi, guest_context.registers(state).rdx });
-                if (guest_context.registers(state).rdx == 0 or state.guestMemory(guest_context.registers(state).rdx, 8) == null) {
+                if (guest_context.registers(state).rdx == 0 or !guestRangeAvailable(state, guest_context.registers(state).rdx, 8)) {
                     guest_context.registers(state).rax = @as(u32, @bitCast(abi.ERROR_INITIALIZATION_FAILED));
                     machoCapturePrint(
                         "macho-processor: vkCreateInstance dispatch FAILED: pInstance=0x{x} is not writable\n",
@@ -3797,7 +4499,7 @@ pub const Forwarder = struct {
             // VK_SUCCESS is how an uninitialised handle reaches
             // vkDestroyDebugUtilsMessengerEXT at instance teardown.
             .create_debug_messenger => {
-                if (guest_context.registers(state).rcx == 0 or state.guestMemory(guest_context.registers(state).rcx, 8) == null) {
+                if (guest_context.registers(state).rcx == 0 or !guestRangeAvailable(state, guest_context.registers(state).rcx, 8)) {
                     guest_context.registers(state).rax = vkErrorInitializationFailed();
                 } else {
                     state.write64(guest_context.registers(state).rcx, SYNTHETIC_DEBUG_MESSENGER_HANDLE);
@@ -3888,9 +4590,7 @@ pub const Forwarder = struct {
 
     /// Write the real VkPhysicalDeviceProperties to guest memory at `output`.
     fn writeRealPhysicalDeviceProperties(self: *Forwarder, state: anytype, output: u64) void {
-        const bytes = state.guestMemory(output, VK_PHYSICAL_DEVICE_PROPERTIES_SIZE) orelse return;
-        const src: []const u8 = @as([*]const u8, @ptrCast(&self.real_vulkan.physical_device_properties))[0..VK_PHYSICAL_DEVICE_PROPERTIES_SIZE];
-        @memcpy(bytes[0..@min(bytes.len, src.len)], src[0..@min(bytes.len, src.len)]);
+        _ = writeGuestBytes(state, output, self.real_vulkan.physical_device_properties[0..VK_PHYSICAL_DEVICE_PROPERTIES_SIZE]);
     }
 
     fn writeRealPhysicalDeviceFormatProperties(self: *Forwarder, state: anytype, format: u64, output: u64) void {
@@ -4029,10 +4729,93 @@ pub const Forwarder = struct {
         return true;
     }
 
+    fn logFragmentShaderInterlockContract(
+        self: *Forwarder,
+        state: anytype,
+        guest_p_next: u64,
+        guest_extension_requested: ?bool,
+        stage: []const u8,
+    ) void {
+        const guest = fsiGuestFeatureRequest(state, guest_p_next);
+        const host_extension = if (!self.real_vulkan.host_device_extensions_known)
+            "unknown"
+        else if (self.hostDeviceExtensionAvailable("VK_EXT_fragment_shader_interlock"))
+            "yes"
+        else
+            "no";
+        const guest_extension = if (guest_extension_requested) |requested|
+            (if (requested) "yes" else "no")
+        else
+            "not_scanned";
+        const host_features_known = self.real_vulkan.feature_chain_valid[3] and
+            self.real_vulkan.feature_chain_sizes[3] >= featureChainSize(3);
+        const host_features: []const u8 = if (host_features_known)
+            self.real_vulkan.feature_chain_supported[3][0..self.real_vulkan.feature_chain_sizes[3]]
+        else
+            &.{};
+        const feature_query = if (host_features_known) "available" else "unknown";
+        const core_sample_rate_shading = coreFeatureEnabled(
+            &self.real_vulkan.physical_device_features,
+            abi.PHYSICAL_DEVICE_FEATURES_SAMPLE_RATE_SHADING_OFFSET,
+        );
+        const core_fragment_stores_and_atomics = coreFeatureEnabled(
+            &self.real_vulkan.physical_device_features,
+            abi.PHYSICAL_DEVICE_FEATURES_FRAGMENT_STORES_AND_ATOMICS_OFFSET,
+        );
+        const chain_status = switch (guest.status) {
+            .absent => "absent",
+            .present => "present",
+            .unreadable => "unreadable",
+            .too_deep => "too_deep",
+        };
+        const limits = abi.fsiPhysicalDeviceLimits(&self.real_vulkan.physical_device_properties);
+        const sample_locations: []const u8 = if (limits) |value|
+            (if (value.standard_sample_locations) "true" else "false")
+        else
+            "unknown";
+        const per_stage_storage_buffers = if (limits) |value| value.max_per_stage_storage_buffers else 0;
+        const max_storage_buffer_range = if (limits) |value| value.max_storage_buffer_range else 0;
+        const core_features_ready = core_sample_rate_shading and core_fragment_stores_and_atomics;
+        const guest_interlock_requested = guest.sample or guest.pixel;
+        const host_interlock_supported = featureChainBoolAt(host_features, 0) or featureChainBoolAt(host_features, 1);
+        const known_fsi_gate = std.mem.eql(u8, guest_extension, "yes") and std.mem.eql(u8, host_extension, "yes") and
+            guest.status == .present and guest_interlock_requested and host_interlock_supported and
+            core_features_ready and limits != null;
+        const standard_sample_locations_ready = if (limits) |value| value.standard_sample_locations else false;
+        const base_gate: []const u8 = if (limits == null or !host_features_known)
+            "unknown"
+        else if (!known_fsi_gate or !standard_sample_locations_ready)
+            "blocked"
+        else
+            "pass_shared_binding_count_unchecked";
+        machoCapturePrint(
+            "macho-processor: Vulkan FSI contract: stage={s} guest_extension={s} host_extension={s} guest_pNext={s} guest(sample/pixel/shading_rate)={}/{}/{} host_feature_query={s} host_supported(sample/pixel/shading_rate)={}/{}/{} core(sample_rate_shading/fragment_stores_and_atomics)={}/{} limits(standardSampleLocations={s} maxPerStageDescriptorStorageBuffers={d} maxStorageBufferRange={d}) base_gate={s}; Xenia can still choose FBO if its shared-memory binding count reaches the host per-stage limit\n",
+            .{
+                stage,
+                guest_extension,
+                host_extension,
+                chain_status,
+                guest.sample,
+                guest.pixel,
+                guest.shading_rate,
+                feature_query,
+                featureChainBoolAt(host_features, 0),
+                featureChainBoolAt(host_features, 1),
+                featureChainBoolAt(host_features, 2),
+                core_sample_rate_shading,
+                core_fragment_stores_and_atomics,
+                sample_locations,
+                per_stage_storage_buffers,
+                max_storage_buffer_range,
+                base_gate,
+            },
+        );
+    }
+
     /// Write the real VkPhysicalDeviceProperties2 (with pNext chain) to guest memory.
     fn writeRealPhysicalDeviceProperties2(self: *Forwarder, state: anytype, output: u64) void {
-        const header = state.guestMemory(output, 16) orelse return;
-        const next = std.mem.readInt(u64, header[8..16], .little);
+        if (!guestRangeAvailable(state, output, 16)) return;
+        const next = state.read64(output + 8);
         self.writeRealPhysicalDeviceProperties(state, output + 16);
         if (next == 0) return;
 
@@ -4095,28 +4878,25 @@ pub const Forwarder = struct {
         for (scratch.order[0..scratch.count], 0..) |kind, index| {
             const destination_address = scratch.addresses[index];
             const size = propertyChainSize(kind);
-            const destination = state.guestMemory(destination_address + 16, size - 16) orelse continue;
             const source: []const u8 = switch (kind) {
                 0 => std.mem.asBytes(&scratch.driver),
                 1 => std.mem.asBytes(&scratch.float_controls),
                 2 => std.mem.asBytes(&scratch.memory_budget),
                 else => unreachable,
             };
-            @memcpy(destination, source[16..size]);
+            _ = writeGuestBytes(state, destination_address + 16, source[16..size]);
         }
     }
 
     /// Write real VkPhysicalDeviceFeatures to guest memory.
     fn writeRealPhysicalDeviceFeatures(self: *Forwarder, state: anytype, output: u64) void {
-        const bytes = state.guestMemory(output, self.real_vulkan.physical_device_features.len) orelse return;
-        @memcpy(bytes, &self.real_vulkan.physical_device_features);
+        _ = writeGuestBytes(state, output, &self.real_vulkan.physical_device_features);
     }
 
     /// Write the real VkPhysicalDeviceFeatures2 to guest memory.
     fn writeRealPhysicalDeviceFeatures2(self: *Forwarder, state: anytype, output: u64) void {
-        const core = state.guestMemory(output + 16, self.real_vulkan.physical_device_features.len) orelse return;
-        @memcpy(core, &self.real_vulkan.physical_device_features);
-        if (state.guestMemoryConst(output, 16) == null) return;
+        if (!writeGuestBytes(state, output + 16, &self.real_vulkan.physical_device_features)) return;
+        if (!guestRangeAvailable(state, output, 16)) return;
         const guest_p_next = state.read64(output + 8);
         if (guest_p_next == 0) return;
         var scratch: FeatureChainScratch = .{};
@@ -4126,8 +4906,7 @@ pub const Forwarder = struct {
             const kind: usize = kind_value;
             const size = self.real_vulkan.feature_chain_sizes[kind];
             if (size <= 16) continue;
-            const destination = state.guestMemory(scratch.addresses[kind] + 16, @as(u64, size) - 16) orelse continue;
-            @memcpy(destination, self.real_vulkan.feature_chain_supported[kind][16..size]);
+            _ = writeGuestBytes(state, scratch.addresses[kind] + 16, self.real_vulkan.feature_chain_supported[kind][16..size]);
         }
     }
 
@@ -4364,7 +5143,25 @@ pub const Forwarder = struct {
         original_size: usize,
     };
 
-    fn expandRectangleListShader(self: *Forwarder, info: []u8) ?RectExpansion {
+    fn noteRectangleTransformRefusal(
+        self: *Forwarder,
+        refusal: gpu_vulkan.rect_list_expand.Refusal,
+        synthetic_module: u64,
+        spirv_hash: u64,
+        code_bytes: usize,
+        cull_distance_site: ?gpu_vulkan.rect_list_expand.CullDistanceSite,
+    ) void {
+        self.rect_expand_shaders_refused +|= 1;
+        self.rect_expand_last_refusal = refusal;
+        self.rect_expand_refusal_counts[@intFromEnum(refusal)] +|= 1;
+        self.rect_expand_last_refusal_module = synthetic_module;
+        self.rect_expand_last_refusal_hash = spirv_hash;
+        self.rect_expand_last_refusal_bytes = @truncate(@min(code_bytes, @as(usize, std.math.maxInt(u32))));
+        self.rect_expand_last_cull_distance_site = cull_distance_site;
+        if (refusal == .cull_distance_output) self.metal_backend_health.noteGap(.rectangle_cull_distance_output);
+    }
+
+    fn expandRectangleListShader(self: *Forwarder, info: []u8, synthetic_module: u64, spirv_hash: u64) ?RectExpansion {
         if (!self.rectExpandEnabled()) return null;
         if (info.len < @sizeOf(marshal.ShaderModuleCreateInfo)) return null;
         const root: *marshal.ShaderModuleCreateInfo = @ptrCast(@alignCast(info.ptr));
@@ -4374,7 +5171,10 @@ pub const Forwarder = struct {
         const source = words[0 .. root.code_size / 4];
 
         const result = gpu_vulkan.rect_list_expand.expand(std.heap.c_allocator, source) catch {
-            self.rect_expand_shaders_refused +|= 1;
+            self.rect_expand_allocation_failures +|= 1;
+            self.rect_expand_last_refusal_module = synthetic_module;
+            self.rect_expand_last_refusal_hash = spirv_hash;
+            self.rect_expand_last_refusal_bytes = @truncate(@min(root.code_size, @as(usize, std.math.maxInt(u32))));
             return null;
         };
         if (result.refusal != .none) {
@@ -4389,10 +5189,10 @@ pub const Forwarder = struct {
                 self.rect_expand_shaders_skipped_already_expanded +|= 1;
                 return null;
             }
-            self.rect_expand_shaders_refused +|= 1;
-            self.rect_expand_last_refusal = result.refusal;
+            self.noteRectangleTransformRefusal(result.refusal, synthetic_module, spirv_hash, root.code_size, result.cull_distance_site);
             return null;
         }
+        if (result.removed_unused_cull_distance) self.rect_expand_shaders_cull_distance_stripped +|= 1;
         const expansion = RectExpansion{
             .words = result.words,
             .original_code = root.code,
@@ -4402,10 +5202,153 @@ pub const Forwarder = struct {
         root.code_size = result.words.len * 4;
         self.rect_expand_shaders_rewritten +|= 1;
         if (self.rect_expand_shaders_rewritten <= 4) machoCapturePrint(
-            "macho-processor: RECT EXPAND: vertex shader rewritten words={d}->{d} outputs_combined={d} index_loads_repointed={d}; Xenia selects kRectangleListAsTriangleStrip on a host with no geometry shader and its SPIR-V translator never implemented it\n",
-            .{ source.len, result.words.len, result.combined_outputs, result.repointed_loads },
+            "macho-processor: RECT EXPAND: vertex shader rewritten words={d}->{d} outputs_combined={d} index_loads_repointed={d} unused_cull_distance_removed={}; Xenia selects kRectangleListAsTriangleStrip on a host with no geometry shader and its SPIR-V translator never implemented it\n",
+            .{ source.len, result.words.len, result.combined_outputs, result.repointed_loads, result.removed_unused_cull_distance },
         );
         return expansion;
+    }
+
+    fn robustAccessEnabled(self: *Forwarder) bool {
+        if (!self.robust_access_configured) {
+            self.robust_access_configured = true;
+            if (std.c.getenv("ROSETTE_VULKAN_ROBUST_ACCESS")) |raw| {
+                const value = std.mem.sliceTo(raw, 0);
+                self.robust_access_enabled = !(std.mem.eql(u8, value, "0") or
+                    std.ascii.eqlIgnoreCase(value, "false") or
+                    std.ascii.eqlIgnoreCase(value, "off"));
+            }
+        }
+        return self.robust_access_enabled;
+    }
+
+    fn correctHdrResolve(self: *Forwarder, info: []u8) !?[]u32 {
+        if (!self.fsi_raster.moltenvk) return null;
+        if (!self.hdr_resolve_configured) {
+            self.hdr_resolve_configured = true;
+            if (std.c.getenv("ROSETTE_HDR_RESOLVE")) |raw| {
+                const value = std.mem.sliceTo(raw, 0);
+                self.hdr_resolve_enabled = !(std.mem.eql(u8, value, "0") or std.ascii.eqlIgnoreCase(value, "false") or std.ascii.eqlIgnoreCase(value, "off"));
+            }
+        }
+        if (!self.hdr_resolve_enabled or info.len < @sizeOf(marshal.ShaderModuleCreateInfo)) return null;
+        const root: *marshal.ShaderModuleCreateInfo = @ptrCast(@alignCast(info.ptr));
+        const code = root.code orelse return null;
+        if (root.code_size < 20 or root.code_size % 4 != 0) return null;
+        const words: [*]const u32 = @ptrCast(@alignCast(code));
+        const corrected = try gpu_vulkan.hdr_resolve.rewrite(std.heap.c_allocator, words[0 .. root.code_size / 4]);
+        if (corrected.words.len == 0) return null;
+        root.code = @ptrCast(corrected.words.ptr);
+        root.code_size = corrected.words.len * 4;
+        self.hdr_resolve_modules +|= 1;
+        self.hdr_resolve_unpacks +|= corrected.unpacks;
+        machoCapturePrint("macho-processor: VULKAN HDR RESOLVE MODULE: name={s} unpacks={d}; exact shipped kernel; finite Xenos exponent-31 EDRAM decoded before resolve bias; destination packing unchanged\n", .{ corrected.name, corrected.unpacks });
+        return corrected.words;
+    }
+
+    /// Restore pixel-center coordinates expected by Xenia, retaining the
+    /// driver's required sample lanes, narrowed masks and atomic ordering.
+    fn normalizeFsiPixelFrequency(self: *Forwarder, info: []u8) !?[]u32 {
+        if (!self.fsi_raster.moltenvk) return null;
+        if (!self.fsi_pixel_frequency_configured) {
+            self.fsi_pixel_frequency_configured = true;
+            if (std.c.getenv("ROSETTE_FSI_PIXEL_FREQUENCY")) |raw| {
+                const value = std.mem.sliceTo(raw, 0);
+                self.fsi_pixel_frequency_enabled = !(std.mem.eql(u8, value, "0") or
+                    std.ascii.eqlIgnoreCase(value, "false") or std.ascii.eqlIgnoreCase(value, "off"));
+            }
+        }
+        if (!self.fsi_pixel_frequency_enabled or info.len < @sizeOf(marshal.ShaderModuleCreateInfo)) return null;
+        const root: *marshal.ShaderModuleCreateInfo = @ptrCast(@alignCast(info.ptr));
+        const code = root.code orelse return null;
+        if (root.code_size < 20 or root.code_size % 4 != 0) return null;
+        const words: [*]const u32 = @ptrCast(@alignCast(code));
+        const result = gpu_vulkan.fsi.pixel_frequency.centerCoordinates(std.heap.c_allocator, words[0 .. root.code_size / 4]) catch |err| {
+            self.fsi_pixel_frequency_allocation_failures +|= 1;
+            return err;
+        };
+        switch (result.reason) {
+            .changed => {
+                root.code = @ptrCast(result.words.ptr);
+                root.code_size = result.words.len * 4;
+                self.fsi_pixel_frequency_changed +|= 1;
+                if (self.fsi_pixel_frequency_changed <= 4) machoCapturePrint(
+                    "macho-processor: VULKAN FSI PIXEL FREQUENCY: centered_coordinate_loads={d}; sample-rate execution and coverage retained; explicit sample inputs unchanged\n",
+                    .{result.centered_loads},
+                );
+                return result.words;
+            },
+            .explicit_sample_input => self.fsi_pixel_frequency_explicit +|= 1,
+            .complex_decorations => self.fsi_pixel_frequency_complex +|= 1,
+            .invalid, .not_candidate => {},
+        }
+        return null;
+    }
+
+    fn printFsiPixelFrequencyReport(self: *const Forwarder) void {
+        machoCapturePrint(
+            "macho-processor: VULKAN FSI PIXEL FREQUENCY: enabled={} moltenvk={} normalized={d} explicit_sample_preserved={d} complex_preserved={d} allocation_failures={d} driver_rejections={d}; pixel-center coordinates restored; sample capability, coverage and index protection retained\n",
+            .{ self.fsi_pixel_frequency_enabled, self.fsi_raster.moltenvk, self.fsi_pixel_frequency_changed, self.fsi_pixel_frequency_explicit, self.fsi_pixel_frequency_complex, self.fsi_pixel_frequency_allocation_failures, self.fsi_pixel_frequency_driver_rejections },
+        );
+        machoCapturePrint("macho-processor: VULKAN HDR RESOLVE: enabled={} moltenvk={} corrected_modules={d} corrected_unpacks={d} driver_rejections={d}; exact full-resolve identities only; finite source decode before bias, ordinary destination packing retained; module creation is not orb attribution\n", .{ self.hdr_resolve_enabled, self.fsi_raster.moltenvk, self.hdr_resolve_modules, self.hdr_resolve_unpacks, self.hdr_resolve_driver_rejections });
+    }
+
+    const RobustHardening = struct {
+        words: []u32,
+    };
+
+    /// Clamp every dynamic array, vector and matrix index of the module about
+    /// to be created into its bound range (`robust_access.zig`). Runs after the
+    /// rectangle rewrite, on exactly the words the driver will receive.
+    fn hardenShaderModule(self: *Forwarder, info: []u8, synthetic_module: u64) error{UnsafeShader}!?RobustHardening {
+        if (!self.robustAccessEnabled()) return null;
+        if (info.len < @sizeOf(marshal.ShaderModuleCreateInfo)) return null;
+        const root: *marshal.ShaderModuleCreateInfo = @ptrCast(@alignCast(info.ptr));
+        const code = root.code orelse return null;
+        if (root.code_size < 20 or root.code_size % 4 != 0) return null;
+        const words: [*]const u32 = @ptrCast(@alignCast(code));
+        const result = gpu_vulkan.robust_access.harden(std.heap.c_allocator, words[0 .. root.code_size / 4]) catch {
+            self.robust_access_allocation_failures +|= 1;
+            return error.UnsafeShader;
+        };
+        self.robust_access_stats.add(result.stats);
+        if (result.refusal != .none) {
+            self.robust_access_modules_refused +|= 1;
+            if (self.robust_access_modules_refused <= 8) machoCapturePrint(
+                "macho-processor: VULKAN ROBUST ACCESS REFUSED: module=0x{x} reason={s}; shader creation refused before GPU use\n",
+                .{ synthetic_module, result.refusal.label() },
+            );
+            return error.UnsafeShader;
+        }
+        if (result.stats.unclamped_dynamic_indices != 0) {
+            std.heap.c_allocator.free(result.words);
+            machoCapturePrint("macho-processor: VULKAN ROBUST ACCESS UNCLAMPED: module=0x{x} dynamic_indices={d}; shader creation refused before GPU use\n", .{ synthetic_module, result.stats.unclamped_dynamic_indices });
+            return error.UnsafeShader;
+        }
+        if (!result.changed()) {
+            self.robust_access_modules_unchanged +|= 1;
+            return null;
+        }
+        const hardening = RobustHardening{ .words = result.words };
+        root.code = @ptrCast(result.words.ptr);
+        root.code_size = result.words.len * 4;
+        self.robust_access_modules_hardened +|= 1;
+        return hardening;
+    }
+
+    fn fsiUpdateShaderBoundsBudget(self: *Forwarder) void {
+        const guard = self.fsi_guard orelse return;
+        const verified = guard.protected_batching_enabled and self.robust_access_enabled and self.robust_access_modules_hardened != 0 and
+            self.robust_access_modules_refused == 0 and self.robust_access_driver_rejections == 0 and
+            self.robust_access_stats.unclamped_dynamic_indices == 0 and self.robust_access_allocation_failures == 0;
+        guard.monitor.setShaderBoundsVerified(verified);
+    }
+
+    fn printRobustAccessReport(self: *const Forwarder) void {
+        const stats = self.robust_access_stats;
+        machoCapturePrint(
+            "macho-processor: VULKAN ROBUST ACCESS: enabled={} modules(hardened/unchanged/refused/driver_rejected)={d}/{d}/{d}/{d} clamps(runtime_array/fixed_array/component)={d}/{d}/{d} hoisted_lengths={d} unclamped_dynamic_indices={d} interface_indices={d} allocation_failures={d} uniform_zero_loads={d}; buffer indices are bounded and out-of-range uniform loads return zero; failed hardening refuses shader creation\n",
+            .{ self.robust_access_enabled, self.robust_access_modules_hardened, self.robust_access_modules_unchanged, self.robust_access_modules_refused, self.robust_access_driver_rejections, stats.runtime_array_clamps, stats.fixed_array_clamps, stats.component_clamps, stats.hoisted_lengths, stats.unclamped_dynamic_indices, stats.interface_indices, self.robust_access_allocation_failures, stats.uniform_zero_loads },
+        );
     }
 
     fn noteRectangleExpandedModule(self: *Forwarder, synthetic_module: u64) void {
@@ -4425,13 +5368,15 @@ pub const Forwarder = struct {
     }
 
     fn noteRectangleExpandedPipeline(self: *Forwarder, synthetic_pipeline: u64) void {
-        if (self.rect_expand_pipeline_count == self.rect_expand_pipelines.len) {
-            self.rect_expand_pipeline_overflow +|= 1;
-            return;
+        switch (self.rect_expand_pipeline_registry.insert(synthetic_pipeline)) {
+            .inserted => self.rect_expand_pipelines_marked +|= 1,
+            .existing => {},
+            .full => self.rect_expand_pipeline_overflow +|= 1,
         }
-        self.rect_expand_pipelines[self.rect_expand_pipeline_count] = synthetic_pipeline;
-        self.rect_expand_pipeline_count += 1;
-        self.rect_expand_pipelines_marked +|= 1;
+    }
+
+    fn forgetRectangleExpandedPipeline(self: *Forwarder, synthetic_pipeline: u64) void {
+        _ = self.rect_expand_pipeline_registry.remove(synthetic_pipeline);
     }
 
     /// Prove a present's completion without waiting for it. One host fence
@@ -4498,10 +5443,7 @@ pub const Forwarder = struct {
     }
 
     fn rectangleExpandedPipeline(self: *const Forwarder, synthetic_pipeline: u64) bool {
-        for (self.rect_expand_pipelines[0..self.rect_expand_pipeline_count]) |handle| {
-            if (handle == synthetic_pipeline) return true;
-        }
-        return false;
+        return self.rect_expand_pipeline_registry.contains(synthetic_pipeline);
     }
 
     /// The topology Xenia gives the rectangle fallback: a two-triangle strip
@@ -4550,13 +5492,14 @@ pub const Forwarder = struct {
         return layout.has_vertex_rect_push_constants;
     }
 
-    fn rememberGraphicsPipeline(self: *Forwarder, real: u64, root: *const abi.GraphicsPipelineCreateInfo, repair_real: u64, guest_output_candidate: bool) void {
+    fn rememberGraphicsPipeline(self: *Forwarder, real: u64, root: *const abi.GraphicsPipelineCreateInfo, repair_real: u64, guest_output_candidate: bool, fsi: fsi_diagnostics.PipelineIdentity) void {
         if (real == 0) return;
         var metadata: TrackedGraphicsPipeline = .{
             .real = real,
             .layout = root.layout,
             .repair_real = repair_real,
             .guest_output_candidate = guest_output_candidate,
+            .fsi = fsi,
             .stage_count = root.stage_count,
         };
         if (root.input_assembly_state) |pointer| {
@@ -4592,13 +5535,32 @@ pub const Forwarder = struct {
     }
 
     fn forgetGraphicsPipeline(self: *Forwarder, real: u64) void {
+        if (self.native_texture_state) |native| native.forgetPipeline(&self.real_vulkan, real);
         if (real == 0) return;
+        _ = self.fsi_raster.pipelines.remove(real);
+        _ = self.fsi_raster.isolated_pipelines.remove(real);
+        self.vulkan_fsi_tracker.forgetPipeline(real);
         for (&self.tracked_graphics_pipelines) |*record| {
             if (record.real == real) record.* = .{};
         }
     }
 
     fn noteCommandPipelineState(self: *Forwarder, command_buffer: u64, guest_pipeline: u64, real_pipeline: u64, bind_point: u64) void {
+        if (@as(u32, @truncate(bind_point)) == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+            self.vulkan_fsi_tracker.bindPipeline(command_buffer, real_pipeline);
+            if (self.vulkan_fsi_tracker.isFsiPipelineBound(command_buffer)) {
+                if (self.commandPassTarget(command_buffer)) |target| {
+                    if (target.image != 0) {
+                        if (!self.vulkan_fsi_tracker.targetMatches(command_buffer, target.image, target.source)) {
+                            self.vulkan_fsi_tracker.setTarget(command_buffer, target.image, target.source);
+                            self.vulkan_fsi_tracker.noteTargetPropagationOnBind();
+                        }
+                    } else if (target.source == .dynamic_rendering) {
+                        self.vulkan_fsi_tracker.noteDynamicTargetUnresolved();
+                    }
+                }
+            }
+        }
         if (!self.graphicsStateTrackingEnabled()) return;
         const record = self.mutableCommandTargets(command_buffer) orelse return;
         const trace = &record.graphics_state;
@@ -4752,6 +5714,1039 @@ pub const Forwarder = struct {
         }
     }
 
+    /// The FSI guard's state, allocated on first use unless
+    /// ROSETTE_FSI_WATCHDOG_GUARD=0 turned it off.
+    fn fsiGuardInstance(self: *Forwarder) ?*FsiGuard {
+        if (self.fsi_guard) |guard| return guard;
+        if (self.fsi_guard_refused) return null;
+        if (std.c.getenv("ROSETTE_FSI_WATCHDOG_GUARD")) |raw| {
+            const value = std.mem.span(raw);
+            if (std.mem.eql(u8, value, "0") or std.ascii.eqlIgnoreCase(value, "off")) {
+                self.fsi_guard_refused = true;
+                machoCapturePrint("macho-processor: VULKAN FSI GUARD: disabled by ROSETTE_FSI_WATCHDOG_GUARD={s}; FSI command buffers go to the driver whole and untimed\n", .{value});
+                return null;
+            }
+        }
+        const guard = std.heap.page_allocator.create(FsiGuard) catch {
+            self.fsi_guard_refused = true;
+            machoCapturePrint("macho-processor: VULKAN FSI GUARD: its state could not be allocated; FSI command buffers go to the driver whole and untimed\n", .{});
+            return null;
+        };
+        guard.* = .{};
+        if (std.c.getenv("ROSETTE_FSI_SMALL_CHUNK_SYNC")) |raw| {
+            const value = std.mem.span(raw);
+            self.fsi_small_chunk_sync = !(std.mem.eql(u8, value, "0") or
+                std.ascii.eqlIgnoreCase(value, "false") or std.ascii.eqlIgnoreCase(value, "off"));
+        }
+        if (std.c.getenv("ROSETTE_FSI_ADAPTIVE_BATCHING")) |raw| {
+            const value = std.mem.span(raw);
+            guard.protected_batching_enabled = !(std.mem.eql(u8, value, "0") or
+                std.ascii.eqlIgnoreCase(value, "false") or std.ascii.eqlIgnoreCase(value, "off"));
+        }
+        self.fsi_guard = guard;
+        self.fsiUpdateShaderBoundsBudget();
+        return guard;
+    }
+
+    fn fsiArmedGuard(self: *const Forwarder) ?*FsiGuard {
+        const guard = self.fsi_guard orelse return null;
+        return if (guard.armed) guard else null;
+    }
+
+    fn fsiDirectoryEntry(guard: *FsiGuard, guest: u64) ?*FsiCommandBufferEntry {
+        if (guest == 0) return null;
+        for (&guard.directory) |*entry| {
+            if (entry.guest == guest) return entry;
+        }
+        return null;
+    }
+
+    fn fsiNoteCommandBuffersAllocated(self: *Forwarder, synthetics: []const u64, guest_pool: u64, level: u32) void {
+        self.fsi_raster.allocated(synthetics, guest_pool, level == abi.COMMAND_BUFFER_LEVEL_PRIMARY);
+        const guard = self.fsiGuardInstance() orelse return;
+        outer: for (synthetics) |guest| {
+            for (&guard.directory) |*entry| {
+                if (entry.guest == 0 or entry.guest == guest) {
+                    entry.* = .{ .guest = guest, .guest_pool = guest_pool, .primary = level == abi.COMMAND_BUFFER_LEVEL_PRIMARY };
+                    continue :outer;
+                }
+            }
+            guard.directory_overflow +|= 1;
+        }
+    }
+
+    fn fsiRecording(self: *const Forwarder, guest: u64) ?*fsi_chain.Recording {
+        const guard = self.fsi_guard orelse return null;
+        if (guest == 0) return null;
+        for (&guard.recordings) |*recording| {
+            if (recording.guest == guest) return recording;
+        }
+        return null;
+    }
+
+    fn fsiReleaseRecording(guard: *FsiGuard, recording: *fsi_chain.Recording) void {
+        for (recording.chunks[0..recording.chunk_count]) |chunk| guard.chunk_pool.release(chunk);
+        recording.* = .{};
+    }
+
+    /// vkBeginCommandBuffer succeeded on `own`. Only command buffers begun
+    /// after the guard is armed are followed, so every recorded shadow holds
+    /// all the state since the begin.
+    fn fsiBeginRecording(self: *Forwarder, guest: u64, own: abi.CommandBuffer, usage_flags: u32, has_inheritance: bool) void {
+        if (self.fsi_raster.command(guest)) |command| command.reset(has_inheritance);
+        if (self.fsi_guard) |guard| {
+            // Beginning a command buffer resets it, whether or not it is followed.
+            for (&guard.recordings) |*recording| {
+                if (recording.guest == guest) fsiReleaseRecording(guard, recording);
+            }
+        }
+        const guard = self.fsiArmedGuard() orelse return;
+        var slot: ?*fsi_chain.Recording = null;
+        for (&guard.recordings) |*recording| {
+            if (recording.guest == 0) {
+                slot = recording;
+                break;
+            }
+        }
+        const recording = slot orelse {
+            guard.recording_overflow +|= 1;
+            return;
+        };
+        const directory = fsiDirectoryEntry(guard, guest);
+        // A command buffer the bridge did not see allocated, or one begun
+        // with inheritance information, is never split.
+        const primary = !has_inheritance and directory != null and directory.?.primary;
+        recording.begin(guest, @intFromPtr(own), if (directory) |entry| entry.guest_pool else 0, usage_flags, primary);
+    }
+
+    fn fsiForgetRecording(self: *Forwarder, guest: u64) void {
+        if (self.fsi_raster.command(guest)) |command| command.reset(false);
+        const guard = self.fsi_guard orelse return;
+        if (self.fsiRecording(guest)) |recording| fsiReleaseRecording(guard, recording);
+    }
+
+    fn fsiForgetCommandBuffer(self: *Forwarder, guest: u64) void {
+        self.fsiForgetRecording(guest);
+        _ = self.fsi_raster.commands.remove(guest);
+        const guard = self.fsi_guard orelse return;
+        if (fsiDirectoryEntry(guard, guest)) |entry| entry.* = .{};
+    }
+
+    fn fsiResetCommandPool(self: *Forwarder, guest_pool: u64, destroyed: bool) void {
+        self.fsi_raster.forgetPool(guest_pool, destroyed);
+        const guard = self.fsi_guard orelse return;
+        if (guest_pool == 0) return;
+        for (&guard.recordings) |*recording| {
+            if (recording.guest != 0 and recording.guest_pool == guest_pool) fsiReleaseRecording(guard, recording);
+        }
+        if (!destroyed) return;
+        for (&guard.directory) |*entry| {
+            if (entry.guest != 0 and entry.guest_pool == guest_pool) entry.* = .{};
+        }
+    }
+
+    /// The real command buffer a command for `guest` is recorded into: the
+    /// newest chunk once the recording has been split, otherwise `own`.
+    fn fsiCommandTarget(self: *const Forwarder, guest: u64, own: abi.CommandBuffer) abi.CommandBuffer {
+        const recording = self.fsiRecording(guest) orelse return own;
+        if (recording.chunk_count == 0) return own;
+        return @ptrFromInt(recording.target());
+    }
+
+    fn fsiShadow(self: *const Forwarder, guest: u64) ?*fsi_chain.Shadow {
+        _ = self.fsiArmedGuard() orelse return null;
+        const recording = self.fsiRecording(guest) orelse return null;
+        return &recording.shadow;
+    }
+
+    fn fsiNoteShadowBlock(self: *Forwarder, guest: u64, block: fsi_chain.Block) void {
+        if (block == .none) return;
+        if (self.fsiRecording(guest)) |recording| recording.noteBlock(block);
+    }
+
+    fn fsiNoteRenderPassCreated(self: *Forwarder, real_render_pass: u64, info: []const u8) void {
+        if (self.fsi_raster.moltenvk and info.len >= @sizeOf(marshal.RenderPassCreateInfo)) {
+            var root: marshal.RenderPassCreateInfo = undefined;
+            @memcpy(std.mem.asBytes(&root), info[0..@sizeOf(marshal.RenderPassCreateInfo)]);
+            if (!self.fsi_raster.capturePass(real_render_pass, &root)) {
+                self.fsi_raster.allocation_failed = true;
+                machoCapturePrint("macho-processor: VULKAN FSI RASTERIZATION: render-pass registry exhausted; FSI pipeline creation will refuse an untracked pass\n", .{});
+            }
+        }
+        const shape = fsi_contract.RenderPassShape.fromCreateInfoBytes(info) orelse return;
+        if (!shape.canBeSplit()) return;
+        const guard = self.fsiGuardInstance() orelse return;
+        if (guard.splittable_render_pass_count < guard.splittable_render_passes.len) {
+            guard.splittable_render_passes[guard.splittable_render_pass_count] = real_render_pass;
+            guard.splittable_render_pass_count += 1;
+        } else {
+            guard.splittable_render_pass_overflow +|= 1;
+        }
+        if (!shape.isXeniaFsi()) return;
+        guard.xenia_fsi_render_passes +|= 1;
+        if (guard.armed) return;
+        guard.armed = true;
+        machoCapturePrint(
+            "macho-processor: VULKAN FSI CONTRACT: render pass recognised real=0x{x} attachments={d} subpasses={d} dependencies={d}; Xenia selected its fragment-shader-interlock backend, so the MoltenVK/Metal guard is armed: each FSI chunk has at most {d} draws and {d} sample-work units (scissor pixels times samples), with no more than {d} timed command buffers queued (ROSETTE_FSI_WATCHDOG_GUARD=0 disables this)\n",
+            .{ real_render_pass, shape.attachment_count, shape.subpass_count, shape.dependency_count, guard.monitor.capValue(), guard.monitor.sampleWorkCapValue(), fsi_timing.max_in_flight_segments },
+        );
+    }
+
+    fn fsiForgetRenderPass(self: *Forwarder, real_render_pass: u64) void {
+        if (self.fsi_raster.findPass(real_render_pass)) |pass| {
+            if (self.real_vulkan.fn_ptrs.destroy_render_pass) |destroy| {
+                for (pass.variants[1..]) |variant| {
+                    if (variant != 0) destroy(self.real_vulkan.device, variant, null);
+                }
+            }
+            pass.* = .{};
+        }
+        const guard = self.fsi_guard orelse return;
+        var index: usize = 0;
+        while (index < guard.splittable_render_pass_count) {
+            if (guard.splittable_render_passes[index] == real_render_pass) {
+                guard.splittable_render_pass_count -= 1;
+                guard.splittable_render_passes[index] = guard.splittable_render_passes[guard.splittable_render_pass_count];
+                continue;
+            }
+            index += 1;
+        }
+    }
+
+    fn fsiRenderPassSplittable(guard: *const FsiGuard, real_render_pass: u64) bool {
+        for (guard.splittable_render_passes[0..guard.splittable_render_pass_count]) |handle| {
+            if (handle == real_render_pass) return true;
+        }
+        return false;
+    }
+
+    fn fsiNoteFramebufferCreated(self: *Forwarder, info: []const u8) void {
+        const guard = self.fsi_guard orelse return;
+        const shape = fsi_contract.FramebufferShape.fromCreateInfoBytes(info) orelse return;
+        if (!shape.isXeniaFsi()) return;
+        guard.xenia_fsi_framebuffers +|= 1;
+        guard.framebuffer_width = shape.width;
+        guard.framebuffer_height = shape.height;
+        if (guard.xenia_fsi_framebuffers == 1) machoCapturePrint(
+            "macho-processor: VULKAN FSI CONTRACT: framebuffer recognised {d}x{d} attachments=0; Xenia begins every FSI pass with this whole area as its render area, so only a draw's scissor bounds how many interlocked fragments a triangle produces ({d} pixels unclipped, against 737,280 for Halo 3's 1152x640 picture)\n",
+            .{ shape.width, shape.height, shape.pixels() },
+        );
+    }
+
+    fn fsiNoteBeginRenderPass(self: *Forwarder, guest: u64, begin: *const abi.RenderPassBeginInfo, contents: u32) void {
+        const original = if (self.fsi_raster.findPass(begin.render_pass)) |pass| pass.original else begin.render_pass;
+        if (self.fsi_raster.command(guest)) |command| {
+            command.beginPass(if (self.fsi_raster.findPass(begin.render_pass) != null) original else 0, begin, contents);
+        }
+        const guard = self.fsiArmedGuard() orelse return;
+        const recording = self.fsiRecording(guest) orelse return;
+        recording.beginPass(.{
+            .render_pass = begin.render_pass,
+            .framebuffer = begin.framebuffer,
+            .render_area = begin.render_area,
+        }, fsiRenderPassSplittable(guard, original), contents);
+    }
+
+    fn fsiRasterPipelinePass(self: *Forwarder, original: u64, samples: u32) PipelineMarshalFailure!u64 {
+        if (!self.fsi_raster.moltenvk) return 0;
+        const pass = self.fsi_raster.findPass(original) orelse return error.FsiRasterizationUnavailable;
+        const slot = fsi_rasterization.sampleSlot(samples) orelse return error.FsiRasterizationUnavailable;
+        if (pass.variants[slot] != 0) return pass.variants[slot];
+        const create = self.real_vulkan.fn_ptrs.create_render_pass orelse return error.FsiRasterizationUnavailable;
+        var info = pass.createInfo();
+        var variant: u64 = 0;
+        const result = create(self.real_vulkan.device, &info, null, &variant);
+        if (result != abi.SUCCESS or variant == 0) {
+            self.fsi_raster.refusals +|= 1;
+            machoCapturePrint("macho-processor: VULKAN FSI RASTERIZATION: variant creation failed samples={d} original=0x{x} VkResult={d}\n", .{ samples, original, result });
+            return error.FsiRasterizationUnavailable;
+        }
+        pass.variants[slot] = variant;
+        self.fsi_raster.variants_created +|= 1;
+        machoCapturePrint("macho-processor: VULKAN FSI RASTERIZATION: samples={d} original=0x{x} native_variant=0x{x}; this attachment-less pass is used only by pipelines with this sample count, so MoltenVK's creation-time defaultRasterSampleCount cannot change other draws' coverage\n", .{ samples, original, variant });
+        return variant;
+    }
+
+    /// Restart the same command buffer, not a new submission. Vulkan state
+    /// bindings persist across compatible empty passes, and MoltenVK reissues
+    /// them into its new encoder. No guest shader or EDRAM buffer is changed.
+    fn fsiRasterBeforeCommand(self: *Forwarder, guest: u64, name_hash: u64, name: []const u8) bool {
+        if (!self.fsi_raster.moltenvk) return true;
+        const command = self.fsi_raster.command(guest) orelse return !self.fsi_raster.allocation_failed;
+        if (command.failed) return false;
+        if (fsiCommandClass(name_hash, name) == .draw and command.bound_pass != 0 and !command.primary and command.has_inheritance) {
+            command.failed = true;
+            self.fsi_raster.refusals +|= 1;
+            machoCapturePrint("macho-processor: VULKAN FSI RASTERIZATION: inherited secondary FSI draw refused command=0x{x}; its primary's raster sample count cannot be selected while recording a secondary buffer\n", .{guest});
+            return false;
+        }
+        if (fsiCommandClass(name_hash, name) == .draw and command.needsRestart()) {
+            const pass = self.fsi_raster.findPass(command.bound_pass);
+            if (!command.canRestart() or pass == null or pass.?.original != command.original_pass or
+                self.real_vulkan.fn_ptrs.cmd_end_render_pass == null or self.real_vulkan.fn_ptrs.cmd_begin_render_pass == null)
+            {
+                command.failed = true;
+                self.fsi_raster.refusals +|= 1;
+                machoCapturePrint("macho-processor: VULKAN FSI RASTERIZATION: incompatible sample-count transition refused command=0x{x} active_pass=0x{x} required_pass=0x{x} primary={} queries={d} conditional={}; vkEndCommandBuffer will reject this recording\n", .{ guest, command.active_pass, command.bound_pass, command.primary, command.active_queries, command.conditional });
+                return false;
+            }
+            const own = self.real_vulkan.realCommandBuffer(guest) orelse return false;
+            const target = self.fsiCommandTarget(guest, own);
+            _ = self.drainAsyncVulkanCommandsIfPending();
+            const begin = abi.RenderPassBeginInfo{ .render_pass = command.bound_pass, .framebuffer = command.framebuffer, .render_area = command.area };
+            self.real_vulkan.fn_ptrs.cmd_end_render_pass.?(target);
+            self.real_vulkan.fn_ptrs.cmd_begin_render_pass.?(target, &begin, 0);
+            command.active_pass = command.bound_pass;
+            // A later watchdog continuation must reopen the selected variant,
+            // rather than returning to the guest's default 1x pass.
+            if (self.fsiRecording(guest)) |recording| recording.pass.render_pass = command.active_pass;
+            self.fsi_raster.restarts +|= 1;
+        } else if (std.mem.eql(u8, name, "vkCmdEndRenderPass") or std.mem.startsWith(u8, name, "vkCmdEndRenderPass2")) {
+            command.endPass();
+        } else if (std.mem.eql(u8, name, "vkCmdBeginQuery") or std.mem.eql(u8, name, "vkCmdBeginQueryIndexedEXT")) {
+            command.active_queries +|= 1;
+        } else if (std.mem.eql(u8, name, "vkCmdEndQuery") or std.mem.eql(u8, name, "vkCmdEndQueryIndexedEXT")) {
+            command.active_queries -|= 1;
+        } else if (std.mem.eql(u8, name, "vkCmdBeginConditionalRenderingEXT")) {
+            command.conditional = true;
+        } else if (std.mem.eql(u8, name, "vkCmdEndConditionalRenderingEXT")) {
+            command.conditional = false;
+        }
+        return true;
+    }
+
+    fn printFsiRasterReport(self: *const Forwarder) void {
+        if (!self.fsi_raster.moltenvk or self.fsi_raster.adapted_pipelines == 0) return;
+        machoCapturePrint("macho-processor: VULKAN FSI RASTERIZATION: pipelines={d} private_passes={d} sample_count_restarts={d} refusals={d}; compatible attachment-less passes preserve EDRAM and bindings while matching the bound pipeline's raster sample count; independent of ROSETTE_FSI_WATCHDOG_GUARD\n", .{ self.fsi_raster.adapted_pipelines, self.fsi_raster.variants_created, self.fsi_raster.restarts, self.fsi_raster.refusals });
+    }
+
+    fn fsiRasterShutdown(self: *Forwarder) void {
+        self.printFsiRasterReport();
+        if (!self.real_vulkan.device_lost) {
+            if (self.real_vulkan.fn_ptrs.destroy_render_pass) |destroy| {
+                for (&self.fsi_raster.passes) |*pass| {
+                    for (pass.variants[1..]) |variant| if (variant != 0) destroy(self.real_vulkan.device, variant, null);
+                }
+            }
+        }
+        self.fsi_raster.deinit();
+    }
+
+    /// Called for every vkCmd* before its target command buffer is resolved:
+    /// follows the recording's splittability and, before an FSI draw that
+    /// would exceed the budget, moves the recording to a new chunk.
+    fn fsiNoteCommand(self: *Forwarder, guest: u64, name_hash: u64, name: []const u8) void {
+        const guard = self.fsiArmedGuard() orelse return;
+        if (guard.monitor.context_dump_requested.swap(false, .acq_rel)) self.fsiPrintEscalationContext(guard);
+        const recording = self.fsiRecording(guest) orelse return;
+        if (recording.failed) return;
+        switch (fsiCommandClass(name_hash, name)) {
+            .draw => self.fsiBeforeDraw(guard, recording, guest),
+            .blocks => recording.noteBlock(.unrecorded_command),
+            .neutral => {},
+            .recorded => {
+                if (std.mem.eql(u8, name, "vkCmdEndRenderPass") or std.mem.startsWith(u8, name, "vkCmdEndRenderPass2")) {
+                    recording.endPass();
+                } else if (std.mem.eql(u8, name, "vkCmdBeginQuery")) {
+                    recording.active_queries +|= 1;
+                } else if (std.mem.eql(u8, name, "vkCmdEndQuery")) {
+                    recording.active_queries -|= 1;
+                } else if (std.mem.eql(u8, name, "vkCmdBeginConditionalRenderingEXT")) {
+                    recording.conditional_rendering = true;
+                } else if (std.mem.eql(u8, name, "vkCmdEndConditionalRenderingEXT")) {
+                    recording.conditional_rendering = false;
+                }
+            },
+        }
+    }
+
+    fn fsiBeforeDraw(self: *Forwarder, guard: *FsiGuard, recording: *fsi_chain.Recording, guest: u64) void {
+        // The diagnostic tracker may evict identities in a long game. The
+        // correctness registry still knows every pipeline on an FSI pass.
+        if (!self.fsi_raster.pipelines.contains(recording.shadow.pipelines[fsi_chain.bind_point_graphics]) and
+            !self.vulkan_fsi_tracker.isFsiPipelineBound(guest)) return;
+        const area = recording.pass.render_area.extent;
+        const pixels = if (recording.shadow.scissor_mask & 1 != 0) blk: {
+            const scissor = recording.shadow.scissors[0];
+            break :blk fsi_contract.scissoredPixels(scissor.offset.x, scissor.offset.y, scissor.extent.width, scissor.extent.height, area.width, area.height);
+        } else blk: {
+            guard.unscissored_draws +|= 1;
+            break :blk @as(u64, area.width) * area.height;
+        };
+        const cap = guard.monitor.capValue();
+        const pixel_cap = guard.monitor.sampleWorkCapValue();
+        const bound_pipeline = recording.shadow.pipelines[fsi_chain.bind_point_graphics];
+        const diagnostic = self.vulkan_fsi_tracker.findPipeline(bound_pipeline);
+        const samples = self.fsi_raster.pipelineSampleCount(bound_pipeline) orelse
+            (if (diagnostic) |identity| @max(identity.rasterization_samples, 1) else 1);
+        const sample_work = pixels *| @as(u64, samples);
+        const segment_pixels = recording.segment_sample_work[recording.chunk_count];
+        const isolated = self.fsi_raster.isolated_pipelines.contains(bound_pipeline);
+        const isolation_boundary = recording.segment_draws != 0 and
+            (isolated or recording.segment_isolated[recording.chunk_count]);
+        if (isolation_boundary or guard.monitor.shouldSplit(recording.segment_draws, segment_pixels, sample_work)) {
+            const allowed = recording.splitAllowed();
+            if (allowed == .none) {
+                if (self.fsiSplitRecording(guard, recording)) {
+                    guard.splits +|= 1;
+                } else {
+                    guard.split_failures +|= 1;
+                    if (recording.failed) {
+                        guard.recording_aborts +|= 1;
+                        guard.aborted_fsi_draws +|= 1;
+                        machoCapturePrint(
+                            "macho-processor: VULKAN FSI GUARD: poisoned recording refused guest_command_buffer=0x{x} chunks={d} draws_in_segment={d} draw_cap={d} sample_work_in_segment={d} next_draw_sample_work={d} sample_work_cap={d} pipeline=0x{x}; the old command buffer was already ended before the continuation failed, so end/submit must reject this partial chain\n",
+                            .{ guest, recording.chunk_count, recording.segment_draws, cap, segment_pixels, sample_work, pixel_cap, recording.shadow.pipelines[fsi_chain.bind_point_graphics] },
+                        );
+                        return;
+                    }
+                    // Failures before ending the live buffer leave it intact.
+                    // Complete and submit it with normal Vulkan semantics;
+                    // the remaining tail is unsplit and may exceed budget.
+                    if (recording.block == .none) recording.noteBlock(.continuation_unavailable);
+                    guard.blocked_splits[@intFromEnum(recording.block)] +|= 1;
+                    recording.budget_block_reported = true;
+                    machoCapturePrint(
+                        "macho-processor: VULKAN FSI GUARD: split deferred guest_command_buffer=0x{x} reason={s} chunks={d} draws_in_segment={d} draw_cap={d} sample_work_in_segment={d} next_draw_sample_work={d} sample_work_cap={d} pipeline=0x{x}; the live Vulkan command buffer remains intact and this tail stays whole because splitting failed before the old buffer was ended\n",
+                        .{ guest, @tagName(recording.block), recording.chunk_count, recording.segment_draws, cap, segment_pixels, sample_work, pixel_cap, recording.shadow.pipelines[fsi_chain.bind_point_graphics] },
+                    );
+                }
+            } else if (allowed == .chunk_capacity) {
+                // This is the hard end of the per-recording continuation
+                // storage. Never forward an unbounded FSI tail to Metal.
+                guard.blocked_splits[@intFromEnum(allowed)] +|= 1;
+                recording.budget_block_reported = true;
+                machoCapturePrint(
+                    "macho-processor: VULKAN FSI GUARD: hard chain limit reached guest_command_buffer=0x{x} reason={s} chunks={d} draws_in_segment={d} draw_cap={d} sample_work_in_segment={d} next_draw_sample_work={d} sample_work_cap={d} pipeline=0x{x}; recording refused before an unbounded tail could reach Metal\n",
+                    .{ guest, @tagName(allowed), recording.chunk_count, recording.segment_draws, cap, segment_pixels, sample_work, pixel_cap, recording.shadow.pipelines[fsi_chain.bind_point_graphics] },
+                );
+                recording.fail();
+                guard.recording_aborts +|= 1;
+                guard.aborted_fsi_draws +|= 1;
+                return;
+            } else if (!recording.budget_block_reported) {
+                guard.blocked_splits[@intFromEnum(allowed)] +|= 1;
+                recording.budget_block_reported = true;
+                machoCapturePrint(
+                    "macho-processor: VULKAN FSI GUARD: split deferred guest_command_buffer=0x{x} reason={s} chunks={d} draws_in_segment={d} draw_cap={d} sample_work_in_segment={d} next_draw_sample_work={d} sample_work_cap={d} pipeline=0x{x}; preserving the guest's whole Vulkan recording because this boundary cannot be replayed exactly; this recording may exceed the Metal time budget\n",
+                    .{ guest, @tagName(allowed), recording.chunk_count, recording.segment_draws, cap, segment_pixels, sample_work, pixel_cap, recording.shadow.pipelines[fsi_chain.bind_point_graphics] },
+                );
+            } else {
+                // Report once per recording; preserve its original command
+                // stream until the hard chain limit is reached.
+            }
+        }
+        const pipeline_hash = if (self.vulkan_fsi_tracker.findPipeline(recording.shadow.pipelines[fsi_chain.bind_point_graphics])) |identity| identity.combined_hash else 0;
+        recording.noteFsiDrawSamples(pipeline_hash, pixels, samples);
+        recording.segment_isolated[recording.chunk_count] = recording.segment_isolated[recording.chunk_count] or isolated;
+        guard.fsi_draws +|= 1;
+        guard.max_scissor_pixels = @max(guard.max_scissor_pixels, pixels);
+        // Four megapixels is more than five of Halo 3's 1152x640 pictures.
+        if (pixels > 4 * 1024 * 1024) guard.oversized_scissor_draws +|= 1;
+    }
+
+    fn fsiChunkCommandPool(self: *Forwarder, guard: *FsiGuard, device: abi.Device) ?abi.CommandPool {
+        if (guard.command_pool != 0) return guard.command_pool;
+        if (guard.command_pool_failed) return null;
+        const create = self.real_vulkan.fn_ptrs.create_command_pool orelse {
+            guard.command_pool_failed = true;
+            return null;
+        };
+        const info = abi.CommandPoolCreateInfo{
+            .flags = abi.COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+            .queue_family_index = self.real_vulkan.graphics_queue_family_index,
+        };
+        var pool: abi.CommandPool = 0;
+        const result = create(device, &info, null, &pool);
+        if (result != abi.SUCCESS or pool == 0) {
+            guard.command_pool_failed = true;
+            machoCapturePrint("macho-processor: VULKAN FSI GUARD: chunk command pool creation failed VkResult={d}; FSI command buffers stay whole\n", .{result});
+            return null;
+        }
+        guard.command_pool = pool;
+        return pool;
+    }
+
+    fn fsiAcquireChunk(self: *Forwarder, guard: *FsiGuard, device: abi.Device) ?u64 {
+        if (guard.chunk_pool.acquire(guard.monitor.completedSerial())) |chunk| return chunk;
+        if (!guard.chunk_pool.canGrow()) return null;
+        const pool = self.fsiChunkCommandPool(guard, device) orelse return null;
+        const allocate = self.real_vulkan.fn_ptrs.allocate_command_buffers orelse return null;
+        const info = abi.CommandBufferAllocateInfo{ .command_pool = pool, .level = abi.COMMAND_BUFFER_LEVEL_PRIMARY, .command_buffer_count = 1 };
+        var buffers = [_]abi.CommandBuffer{null};
+        if (allocate(device, &info, &buffers) != abi.SUCCESS) return null;
+        const handle = @intFromPtr(buffers[0] orelse return null);
+        if (!guard.chunk_pool.add(handle)) return null;
+        return handle;
+    }
+
+    /// Close the recording's current real command buffer between two FSI
+    /// draws and continue in a fresh chunk (`gpu/vulkan/fsi/chain.zig`).
+    fn fsiSplitRecording(self: *Forwarder, guard: *FsiGuard, recording: *fsi_chain.Recording) bool {
+        const device = self.real_vulkan.device orelse return false;
+        const fns = &self.real_vulkan.fn_ptrs;
+        const end_pass = fns.cmd_end_render_pass orelse return false;
+        const begin_pass = fns.cmd_begin_render_pass orelse return false;
+        const end_buffer = fns.end_command_buffer orelse return false;
+        const begin_buffer = fns.begin_command_buffer orelse return false;
+        const reset_buffer = fns.reset_command_buffer orelse return false;
+        // The async worker owns admitted bind/draw calls, including calls
+        // targeting this recording. Complete them before any split operation
+        // touches the command pool or changes the active subpass. The drain
+        // has a completion-watermark fast path, so this boundary does not
+        // take a second worker stats lock when all prior commands are done.
+        // In particular, no worker draw may overlap vkCmdEndRenderPass,
+        // vkEndCommandBuffer, or the continuation's begin/replay sequence.
+        if (self.drainAsyncVulkanCommandsIfPending()) guard.split_worker_drains +|= 1;
+        guard.serialized_split_boundaries +|= 1;
+        const chunk = self.fsiAcquireChunk(guard, device) orelse return false;
+        const old: abi.CommandBuffer = @ptrFromInt(recording.target());
+        const next: abi.CommandBuffer = @ptrFromInt(chunk);
+        // Preflight the replay before touching the guest's live command
+        // buffer. If the driver entry point is absent, the original remains
+        // intact and we can safely forward it whole.
+        var ops = FsiReplayOps{ .fns = fns, .command_buffer = next };
+        if (!ops.supports(&recording.shadow)) {
+            recording.noteBlock(.replay_function_missing);
+            guard.chunk_pool.release(chunk);
+            machoCapturePrint("macho-processor: VULKAN FSI GUARD: split refused guest=0x{x} reason=replay_function_missing; the original command buffer remains open and will be forwarded whole\n", .{recording.guest});
+            return false;
+        }
+        const reset = reset_buffer(next, 0);
+        if (reset != abi.SUCCESS) {
+            recording.noteBlock(.continuation_reset_failed);
+            guard.chunk_pool.discard(chunk);
+            machoCapturePrint("macho-processor: VULKAN FSI GUARD: split refused guest=0x{x} chunk={d} reason=vkResetCommandBuffer VkResult={d}; original command buffer remains open and will be forwarded whole\n", .{ recording.guest, recording.chunk_count + 1, reset });
+            return false;
+        }
+        // Beginning the continuation first means an ordinary begin failure
+        // leaves the guest's original command buffer untouched and usable.
+        // RENDER_PASS_CONTINUE is a secondary-buffer flag; this is primary.
+        const begin_info = abi.CommandBufferBeginInfo{ .flags = recording.usage_flags & ~@as(u32, 0x2) };
+        const begun = begin_buffer(next, &begin_info);
+        if (begun != abi.SUCCESS) {
+            recording.noteBlock(.continuation_begin_failed);
+            guard.chunk_pool.discard(chunk);
+            machoCapturePrint("macho-processor: VULKAN FSI GUARD: split refused guest=0x{x} chunk={d} reason=vkBeginCommandBuffer VkResult={d}; original command buffer remains open and will be forwarded whole\n", .{ recording.guest, recording.chunk_count + 1, begun });
+            return false;
+        }
+        // Close synchronously after the drain above. MoltenVK's indexed-draw
+        // encoder assumes its subpass state remains live through encoding;
+        // queueing this close pair left that lifetime concurrent with FSI draw
+        // recording on the worker.
+        end_pass(old);
+        const ended = end_buffer(old);
+        if (ended != abi.SUCCESS) {
+            _ = end_buffer(next);
+            guard.chunk_pool.discard(chunk);
+            recording.fail();
+            machoCapturePrint("macho-processor: VULKAN FSI GUARD: split failed guest=0x{x} chunk={d} reason=vkEndCommandBuffer VkResult={d}; the recording is poisoned and will be rejected at end/submit\n", .{ recording.guest, recording.chunk_count + 1, ended });
+            return false;
+        }
+        const pass_begin = abi.RenderPassBeginInfo{
+            .render_pass = recording.pass.render_pass,
+            .framebuffer = recording.pass.framebuffer,
+            .render_area = recording.pass.render_area,
+        };
+        begin_pass(next, &pass_begin, fsi_chain.subpass_contents_inline);
+        recording.shadow.replay(&ops);
+        guard.replay_missing_functions +|= ops.missing;
+        if (ops.missing != 0) {
+            // supports() ran before the boundary and the Vulkan entry points
+            // are device-stable. Keep this as a hard failure if that contract
+            // is violated anyway; never claim a partial state replay worked.
+            end_pass(next);
+            _ = end_buffer(next);
+            guard.chunk_pool.discard(chunk);
+            recording.fail();
+            machoCapturePrint("macho-processor: VULKAN FSI GUARD: split failed guest=0x{x} reason=replay_function_missing after preflight={d}; the recording is poisoned and will be rejected at end/submit\n", .{ recording.guest, ops.missing });
+            return false;
+        }
+        recording.commitSplit(chunk);
+        return true;
+    }
+
+    fn fsiSubmitNeedsExpansion(self: *const Forwarder, synthetics: *const [8][256]u64, counts: *const [8]u32, submit_count: u32) bool {
+        _ = self.fsiArmedGuard() orelse return false;
+        for (0..submit_count) |batch| {
+            for (synthetics[batch][0..counts[batch]]) |guest| {
+                const recording = self.fsiRecording(guest) orelse continue;
+                if (recording.failed or recording.chunk_count != 0 or recording.fsi_draws != 0) return true;
+            }
+        }
+        return false;
+    }
+
+    fn fsiStartMonitor(self: *Forwarder, guard: *FsiGuard, device: abi.Device) bool {
+        if (guard.monitor_started) return true;
+        if (guard.monitor_start_failed or !self.fsi_guard_watcher_thread) return false;
+        guard.fence_context = .{ .device = device, .wait = self.real_vulkan.fn_ptrs.wait_for_fences, .reset = self.real_vulkan.fn_ptrs.reset_fences };
+        if (guard.fence_context.wait == null or guard.fence_context.reset == null or self.real_vulkan.fn_ptrs.create_fence == null) {
+            guard.monitor_start_failed = true;
+            return false;
+        }
+        guard.monitor.start(.{ .context = @ptrCast(&guard.fence_context), .wait = fsiFenceWait, .reset = fsiFenceReset, .now = fsiFenceNow }, fsiWatcherReport) catch {
+            guard.monitor_start_failed = true;
+            machoCapturePrint("macho-processor: VULKAN FSI GUARD: GPU timing watcher could not start; the bridge will refuse FSI queue submission rather than hand unbounded, untimed work to MoltenVK\n", .{});
+            return false;
+        };
+        guard.monitor_started = true;
+        machoCapturePrint("macho-processor: VULKAN FSI GUARD: GPU timing watcher started; every FSI chunk is now timed from its fence\n", .{});
+        return true;
+    }
+
+    fn fsiTimingFence(self: *Forwarder, guard: *FsiGuard, device: abi.Device) u64 {
+        if (!self.fsiStartMonitor(guard, device)) return 0;
+        if (guard.monitor.takeFence()) |fence| return fence;
+        const create = self.real_vulkan.fn_ptrs.create_fence orelse return 0;
+        const info = abi.FenceCreateInfo{};
+        var fence: abi.Fence = 0;
+        if (create(device, &info, null, &fence) != abi.SUCCESS or fence == 0) {
+            guard.timing_fence_failures +|= 1;
+            if (guard.timing_fence_failures <= 4 or (guard.timing_fence_failures & (guard.timing_fence_failures - 1)) == 0) machoCapturePrint(
+                "macho-processor: VULKAN FSI GUARD: timing fence creation failed count={d}; this segment will not be submitted without timing/queue-depth accounting\n",
+                .{guard.timing_fence_failures},
+            );
+            return 0;
+        }
+        guard.timing_fences_created +|= 1;
+        guard.monitor.noteFenceCreated();
+        return fence;
+    }
+
+    fn fsiWaitForRoom(state: anytype, monitor: *fsi_timing.Monitor, incoming_submit_infos: usize, isolated: bool) fsi_timing.RoomResult {
+        const WaitContext = struct {
+            monitor: *fsi_timing.Monitor,
+            incoming_submit_infos: usize,
+            isolated: bool,
+            result: fsi_timing.RoomResult = .available,
+
+            fn wait(context: *@This()) void {
+                context.result = context.monitor.waitForIsolatedSubmitInfos(fsi_timing.max_in_flight_segments, context.incoming_submit_infos, context.isolated);
+            }
+        };
+        var context = WaitContext{ .monitor = monitor, .incoming_submit_infos = incoming_submit_infos, .isolated = isolated };
+        if (comptime @hasDecl(@TypeOf(state.*), "tryWithWindowsRuntimeLockReleasedForVulkanQueueWait")) {
+            if (!state.tryWithWindowsRuntimeLockReleasedForVulkanQueueWait(&context, WaitContext.wait)) return .runtime_lock_pinned;
+        } else {
+            WaitContext.wait(&context);
+        }
+        return context.result;
+    }
+
+    /// Submit one or two adjacent VkSubmitInfo batches under one host queue
+    /// call. MoltenVK still builds one Metal command buffer per VkSubmitInfo;
+    /// this only avoids repeating the host entry-point/queue-lock overhead.
+    /// `guest_fence` remains a trailing empty submission so every actual
+    /// segment group retains its independent timing fence.
+    fn fsiSubmitSegmentGroup(
+        self: *Forwarder,
+        guard: *FsiGuard,
+        queue: abi.Queue,
+        submit_fn: abi.PfnQueueSubmit,
+        device: abi.Device,
+        segments: []const FsiSegment,
+        segment_buffers: []const [fsi_segment_command_capacity]abi.CommandBuffer,
+        last: bool,
+        guest_fence: u64,
+        queue_submit: u64,
+        runtime_state: anytype,
+    ) abi.Result {
+        if (segments.len == 0 or segments.len > fsi_timing.max_submit_infos_per_timing_group or segments.len != segment_buffers.len) return abi.ERROR_INITIALIZATION_FAILED;
+        if (!guard.monitor_started) return abi.ERROR_INITIALIZATION_FAILED;
+        // Keep a stable host copy across monitor backpressure. Queue submits
+        // hold the Vulkan queue gate while waiting, so no later queue call can
+        // overtake this segment; the host-only monitor wait yields the guest
+        // runtime mutex so CPU workers keep making progress.
+        var command_buffer_snapshots: [fsi_timing.max_submit_infos_per_timing_group][fsi_segment_command_capacity]abi.CommandBuffer = undefined;
+        var infos: [fsi_timing.max_submit_infos_per_timing_group]abi.SubmitInfo = undefined;
+        var combined = FsiSegment{};
+        for (segments, segment_buffers, 0..) |segment, buffers, index| {
+            combined.isolated = combined.isolated or segment.isolated;
+            command_buffer_snapshots[index] = buffers;
+            infos[index] = .{
+                .wait_semaphore_count = segment.wait_count,
+                .wait_semaphores = segment.wait_semaphores,
+                .wait_dst_stage_mask = segment.wait_stages,
+                .command_buffer_count = segment.command_count,
+                .command_buffers = if (segment.command_count == 0) null else &command_buffer_snapshots[index],
+                .signal_semaphore_count = segment.signal_count,
+                .signal_semaphores = segment.signal_semaphores,
+            };
+            combined.draws +|= segment.draws;
+            combined.scissor_pixels +|= segment.scissor_pixels;
+            combined.max_draw_scissor_pixels = @max(combined.max_draw_scissor_pixels, segment.max_draw_scissor_pixels);
+            combined.sample_work +|= segment.sample_work;
+            combined.max_draw_sample_work = @max(combined.max_draw_sample_work, segment.max_draw_sample_work);
+            if (combined.guest_command_buffer == 0 and segment.guest_command_buffer != 0) {
+                combined.guest_command_buffer = segment.guest_command_buffer;
+                combined.segment_in_guest = segment.segment_in_guest;
+                combined.guest_segments = segment.guest_segments;
+                combined.first_pipeline = segment.first_pipeline;
+            }
+            if (segment.last_pipeline != 0) combined.last_pipeline = segment.last_pipeline;
+        }
+        switch (fsiWaitForRoom(runtime_state, &guard.monitor, segments.len, combined.isolated)) {
+            .available => {},
+            .slow_chunk => {
+                guard.slow_chunk_submit_aborts +|= 1;
+                if (guard.slow_chunk_submit_aborts == 1 or (guard.slow_chunk_submit_aborts & (guard.slow_chunk_submit_aborts - 1)) == 0) {
+                    const stats = guard.monitor.stats();
+                    machoCapturePrint("macho-processor: VULKAN FSI GUARD: software_guard_device_loss=true reason=pending_without_live_watcher; refusing FSI queue submission because the monitor cannot prove outstanding completion; aborts={d} outstanding_groups={d} outstanding_metal_command_buffers={d} worst_completed_group_ms={d} worst_group_draws={d} worst_sample_work={d}; a live watcher instead parks the submitter until successful completion, actual fence failure or shutdown\n", .{ guard.slow_chunk_submit_aborts, stats.outstanding, stats.outstanding_submit_infos, stats.budget.max_chunk_ns / 1_000_000, stats.budget.max_chunk_draws, stats.budget.max_chunk_sample_work });
+                }
+                // This is a monitor failure, not ordinary slow completion:
+                // the wait could not continue because no watcher is live.
+                // Never submit unobserved work or invite a generic retry.
+                return abi.ERROR_DEVICE_LOST;
+            },
+            .runtime_lock_pinned => {
+                machoCapturePrint("macho-processor: VULKAN FSI GUARD: room wait refused because the guest runtime lock is pinned; no monitor wait or FSI submission was issued, and this is not a Vulkan device-loss report\n", .{});
+                return abi.ERROR_INITIALIZATION_FAILED;
+            },
+            .failed, .stopped => return abi.ERROR_DEVICE_LOST,
+        }
+        // Device teardown can run while the dispatch-only lock is yielded.
+        // Shutdown wakes the monitor waiter; refuse to touch a stopped guard
+        // after reacquiring the runtime lock.
+        if (!guard.monitor_started or self.real_vulkan.device != device or self.real_vulkan.device_lost) {
+            return abi.ERROR_DEVICE_LOST;
+        }
+        const timing_fence = self.fsiTimingFence(guard, device);
+        if (timing_fence == 0) return abi.ERROR_OUT_OF_HOST_MEMORY;
+        const submit_ns = transport_timing.nowNs();
+        const result = submit_fn(queue, @intCast(segments.len), &infos, timing_fence);
+        if (result != abi.SUCCESS) {
+            guard.monitor.returnFence(timing_fence);
+            machoCapturePrint(
+                "macho-processor: VULKAN FSI SUBMIT FAILED: queue_submit={d} VkResult={d} submit_infos={d} guest_command_buffer=0x{x} first_segment={d}/{d} draws={d} scissor_pixel_work={d} max_draw_pixels={d} pipelines(first/last)=0x{x}/0x{x} timing_fence=0x{x} guest_fence=0x{x}; failure happened while submitting this bounded FSI segment group, before the guest submit was accepted\n",
+                .{ queue_submit, result, segments.len, combined.guest_command_buffer, combined.segment_in_guest, combined.guest_segments, combined.draws, combined.scissor_pixels, combined.max_draw_scissor_pixels, combined.first_pipeline, combined.last_pipeline, timing_fence, guest_fence },
+            );
+            return result;
+        }
+        guard.driver_queue_submit_calls +|= 1;
+        guard.driver_submit_infos +|= segments.len;
+        if (segments.len > 1) guard.coalesced_submit_groups +|= 1;
+        guard.segments_submitted +|= segments.len;
+        const release_after = guard.monitor.track(.{
+            .isolated = combined.isolated,
+            .fence = timing_fence,
+            .submit_ns = submit_ns,
+            .draws = combined.draws,
+            .scissor_pixels = combined.scissor_pixels,
+            .max_draw_scissor_pixels = combined.max_draw_scissor_pixels,
+            .sample_work = combined.sample_work,
+            .max_draw_sample_work = combined.max_draw_sample_work,
+            .guest_command_buffer = combined.guest_command_buffer,
+            .segment = combined.segment_in_guest,
+            .segments = combined.guest_segments,
+            .queue_submit = queue_submit,
+            .submit_infos = @intCast(segments.len),
+            .first_pipeline_hash = combined.first_pipeline,
+            .last_pipeline_hash = combined.last_pipeline,
+        });
+        for (segment_buffers, 0..) |buffers, segment_index| {
+            for (buffers[0..segments[segment_index].command_count]) |buffer| {
+                if (buffer) |handle| guard.chunk_pool.noteSubmitted(@intFromPtr(handle), release_after);
+            }
+        }
+        // Preserve the guest fence's completion point. The queue-order fence
+        // follows the timed segment, while the timing fence already tracks
+        // the actual work and therefore cannot be lost on an empty-submit
+        // failure.
+        if (last and guest_fence != 0) {
+            const fence_result = submit_fn(queue, 0, null, guest_fence);
+            if (fence_result != abi.SUCCESS) {
+                machoCapturePrint("macho-processor: VULKAN FSI GUEST FENCE SUBMIT FAILED: queue_submit={d} VkResult={d} guest_fence=0x{x} after_last_segment={d}/{d}; timed FSI work was accepted, but Xenia's completion fence was not\n", .{ queue_submit, fence_result, guest_fence, combined.segment_in_guest + @as(u16, @intCast(segments.len)) - 1, combined.guest_segments });
+                return fence_result;
+            }
+            guard.driver_queue_submit_calls +|= 1;
+        }
+        return abi.SUCCESS;
+    }
+
+    /// Complete the current segment and either coalesce it with its predecessor
+    /// or submit the predecessor alone before rotating the two bounded slots.
+    fn fsiAdvanceSegmentSlots(
+        self: *Forwarder,
+        guard: *FsiGuard,
+        queue: abi.Queue,
+        submit_fn: abi.PfnQueueSubmit,
+        device: abi.Device,
+        segments: *[2]FsiSegment,
+        segment_buffers: *[2][fsi_segment_command_capacity]abi.CommandBuffer,
+        pending: *?usize,
+        current: usize,
+        queue_submit: u64,
+        runtime_state: anytype,
+    ) abi.Result {
+        if (pending.*) |older| {
+            if (fsiCanCoalesceSegments(segments[older], segments[current])) {
+                const group = [_]FsiSegment{ segments[older], segments[current] };
+                const buffers = [_][fsi_segment_command_capacity]abi.CommandBuffer{ segment_buffers[older], segment_buffers[current] };
+                const result = self.fsiSubmitSegmentGroup(guard, queue, submit_fn, device, &group, &buffers, false, 0, queue_submit, runtime_state);
+                if (result != abi.SUCCESS) return result;
+                pending.* = null;
+            } else {
+                const group = [_]FsiSegment{segments[older]};
+                const buffers = [_][fsi_segment_command_capacity]abi.CommandBuffer{segment_buffers[older]};
+                const result = self.fsiSubmitSegmentGroup(guard, queue, submit_fn, device, &group, &buffers, false, 0, queue_submit, runtime_state);
+                if (result != abi.SUCCESS) return result;
+                pending.* = current;
+            }
+        } else {
+            pending.* = current;
+        }
+        return abi.SUCCESS;
+    }
+
+    /// Submit a guest vkQueueSubmit while preserving every guest batch,
+    /// semaphore boundary, and FSI chunk as a distinct VkSubmitInfo. Adjacent
+    /// chunks from one guest command buffer are placed in the same host
+    /// vkQueueSubmit call, reducing host queue-gate/API overhead without
+    /// merging their Metal command buffers. A timing fence after each group
+    /// bounds and measures at most two such command buffers; the in-flight
+    /// group limit keeps the actual queued command-buffer limit unchanged.
+    fn fsiSubmitExpanded(
+        self: *Forwarder,
+        queue: abi.Queue,
+        submit_fn: abi.PfnQueueSubmit,
+        real_submits: *const [8]abi.SubmitInfo,
+        synthetics: *const [8][256]u64,
+        counts: *const [8]u32,
+        submit_count: u32,
+        guest_fence: u64,
+        runtime_state: anytype,
+    ) abi.Result {
+        const guard = self.fsi_guard.?;
+        const device = self.real_vulkan.device;
+        for (0..submit_count) |batch| {
+            for (synthetics[batch][0..counts[batch]]) |guest| {
+                if (self.fsiRecording(guest)) |recording| {
+                    if (recording.failed) {
+                        machoCapturePrint("macho-processor: VULKAN FSI GUARD: vkQueueSubmit refused guest_command_buffer=0x{x}; a continuation boundary failed and the recording is not executable\n", .{guest});
+                        return abi.ERROR_INITIALIZATION_FAILED;
+                    }
+                }
+            }
+        }
+        // A one-segment frame also needs a live watcher. Do not silently fall
+        // back to the unbounded Vulkan path if timing cannot be established.
+        if (!self.fsiStartMonitor(guard, device)) return abi.ERROR_INITIALIZATION_FAILED;
+        const queue_submit = self.vulkan_real_queue_submits + 1;
+        var current: usize = 0;
+        var pending: ?usize = null;
+        var produced: u64 = 0;
+        // Per-submit stack workspace keeps segment construction bounded and
+        // prevents one guest submit from reusing another submit's scratch.
+        var segments: [2]FsiSegment = .{ .{}, .{} };
+        var segment_buffers: [2][fsi_segment_command_capacity]abi.CommandBuffer = [_][fsi_segment_command_capacity]abi.CommandBuffer{[_]abi.CommandBuffer{null} ** fsi_segment_command_capacity} ** 2;
+        for (0..submit_count) |batch| {
+            const info = real_submits[batch];
+            if (batch != 0) {
+                const result = self.fsiAdvanceSegmentSlots(guard, queue, submit_fn, device, &segments, &segment_buffers, &pending, current, queue_submit, runtime_state);
+                if (result != abi.SUCCESS) return result;
+                current = 1 - current;
+                segments[current] = .{};
+                produced += 1;
+            }
+            segments[current].wait_count = info.wait_semaphore_count;
+            segments[current].wait_semaphores = info.wait_semaphores;
+            segments[current].wait_stages = info.wait_dst_stage_mask;
+            for (0..counts[batch]) |index| {
+                const guest = synthetics[batch][index];
+                const own = if (info.command_buffers) |buffers| buffers[index] else null;
+                const recording = self.fsiRecording(guest);
+                // Segments: the guest's own buffer, then each chunk.
+                const segment_total: usize = if (recording) |entry| entry.chunk_count + 1 else 1;
+                for (0..segment_total) |part| {
+                    if (part != 0) {
+                        const result = self.fsiAdvanceSegmentSlots(guard, queue, submit_fn, device, &segments, &segment_buffers, &pending, current, queue_submit, runtime_state);
+                        if (result != abi.SUCCESS) return result;
+                        current = 1 - current;
+                        segments[current] = .{};
+                        produced += 1;
+                    }
+                    const segment = &segments[current];
+                    if (segment.command_count == fsi_segment_command_capacity) return abi.ERROR_OUT_OF_HOST_MEMORY;
+                    const buffer: abi.CommandBuffer = if (part == 0) own else @ptrFromInt(recording.?.chunks[part - 1]);
+                    segment_buffers[current][segment.command_count] = buffer;
+                    segment.command_count += 1;
+                    if (recording) |entry| {
+                        segment.draws +|= entry.segment_fsi_draws[part];
+                        segment.scissor_pixels +|= entry.segment_scissor_pixels[part];
+                        segment.max_draw_scissor_pixels = @max(segment.max_draw_scissor_pixels, entry.segment_max_draw_pixels[part]);
+                        segment.sample_work +|= entry.segment_sample_work[part];
+                        segment.max_draw_sample_work = @max(segment.max_draw_sample_work, entry.segment_max_draw_sample_work[part]);
+                        segment.isolated = segment.isolated or entry.segment_isolated[part];
+                        if (entry.segment_fsi_draws[part] != 0) {
+                            if (segment.guest_command_buffer == 0) {
+                                segment.guest_command_buffer = guest;
+                                segment.segment_in_guest = @intCast(part);
+                                segment.guest_segments = @intCast(segment_total);
+                                segment.first_pipeline = entry.segment_first_pipeline[part];
+                            }
+                            segment.last_pipeline = entry.segment_last_pipeline[part];
+                        }
+                    }
+                }
+            }
+            segments[current].signal_count = info.signal_semaphore_count;
+            segments[current].signal_semaphores = info.signal_semaphores;
+        }
+        if (pending) |slot| {
+            if (fsiCanCoalesceSegments(segments[slot], segments[current])) {
+                const group = [_]FsiSegment{ segments[slot], segments[current] };
+                const buffers = [_][fsi_segment_command_capacity]abi.CommandBuffer{ segment_buffers[slot], segment_buffers[current] };
+                const result = self.fsiSubmitSegmentGroup(guard, queue, submit_fn, device, &group, &buffers, true, guest_fence, queue_submit, runtime_state);
+                if (result != abi.SUCCESS) return result;
+            } else {
+                const group = [_]FsiSegment{segments[slot]};
+                const buffers = [_][fsi_segment_command_capacity]abi.CommandBuffer{segment_buffers[slot]};
+                const result = self.fsiSubmitSegmentGroup(guard, queue, submit_fn, device, &group, &buffers, false, 0, queue_submit, runtime_state);
+                if (result != abi.SUCCESS) return result;
+                const last_group = [_]FsiSegment{segments[current]};
+                const last_buffers = [_][fsi_segment_command_capacity]abi.CommandBuffer{segment_buffers[current]};
+                const last_result = self.fsiSubmitSegmentGroup(guard, queue, submit_fn, device, &last_group, &last_buffers, true, guest_fence, queue_submit, runtime_state);
+                if (last_result != abi.SUCCESS) return last_result;
+            }
+        } else {
+            const group = [_]FsiSegment{segments[current]};
+            const buffers = [_][fsi_segment_command_capacity]abi.CommandBuffer{segment_buffers[current]};
+            const result = self.fsiSubmitSegmentGroup(guard, queue, submit_fn, device, &group, &buffers, true, guest_fence, queue_submit, runtime_state);
+            if (result != abi.SUCCESS) return result;
+        }
+        produced += 1;
+        guard.expanded_submits +|= 1;
+        guard.max_segments_per_submit = @max(guard.max_segments_per_submit, produced);
+        return abi.SUCCESS;
+    }
+
+    fn fsiEvidenceEnabled(self: *Forwarder) bool {
+        if (self.fsi_evidence_enabled) |enabled| return enabled;
+        const raw = std.c.getenv("ROSETTE_FSI_EVIDENCE");
+        const enabled = if (raw) |value| std.mem.eql(u8, std.mem.span(value), "1") else false;
+        self.fsi_evidence_enabled = enabled;
+        if (enabled) machoCapturePrint("macho-processor: VULKAN FSI EVIDENCE: exact guest/native shader modules saved under {s}/vulkan-shaders (256 MiB run limit); all FSI pipeline identities are logged\n", .{captureRunDirectory()});
+        return enabled;
+    }
+
+    fn fsiSaveShaderEvidence(self: *Forwarder, guest: u64, info: *const marshal.ShaderModuleCreateInfo, version: gpu_vulkan.fsi.evidence.Version) void {
+        if (!self.fsiEvidenceEnabled()) return;
+        const code = info.code orelse return;
+        if (info.code_size % 4 != 0 or info.code_size > gpu_vulkan.fsi.evidence.maximum_module_bytes) return;
+        const words: [*]const u32 = @ptrCast(@alignCast(code));
+        const result = self.fsi_evidence_writer.save(captureRunDirectory(), guest, words[0 .. info.code_size / 4], version);
+        if (result != .saved and self.fsi_evidence_writer.failures + self.fsi_evidence_writer.limits <= 4) machoCapturePrint("macho-processor: VULKAN FSI EVIDENCE: shader save {s} module=0x{x} version={s} bytes={d}; capture evidence is incomplete\n", .{ @tagName(result), guest, @tagName(version), info.code_size });
+    }
+
+    fn fsiPrintEscalationContext(self: *Forwarder, guard: *FsiGuard) void {
+        guard.escalation_dumps +|= 1;
+        if (guard.escalation_dumps > 8) return;
+        self.printFsiGuardReport();
+        machoCapturePrint(
+            "macho-processor: VULKAN FSI WATCHDOG CONTEXT: recent_accepted_submissions={d}; the guest command buffers the slow chunk came from, newest last\n",
+            .{self.vulkan_fsi_tracker.recent_submission_count},
+        );
+        for (0..self.vulkan_fsi_tracker.recent_submission_count) |index| {
+            self.printDeviceLossFsiSubmission("watchdog_recent_submission", self.vulkan_fsi_tracker.recentSubmission(index).?);
+        }
+    }
+
+    fn printFsiGuardReport(self: *const Forwarder) void {
+        self.printFsiRasterReport();
+        const guard = self.fsi_guard orelse return;
+        if (!guard.armed) return;
+        const stats = guard.monitor.stats();
+        const budget = stats.budget;
+        const queue_gate = self.vulkan_queue_api_gate.stats();
+        machoCapturePrint(
+            "macho-processor: VULKAN FSI GUARD: armed=true fsi_draws={d} splits={d} split_failures={d} serialized_split_boundaries={d} worker_drains={d} cap_now={d} latency_ns_per_draw={d} timing_groups_timed={d} completion_ms_per_group(mean/p50/p95/p99/max)={d}/{d}/{d}/{d}/{d} max_group_draws={d} risk_events={d} severe_events={d} emergency={} submissions_paused={} severe_recoveries={d} outstanding_groups(now/max)={d}/{d} outstanding_metal_command_buffers(now/max)={d}/{d} timing_basis=submit_to_fence_observation_upper_bound; latency includes queue wait and CPU observation delay; submit_infos remain distinct Metal command buffers\n",
+            .{
+                guard.fsi_draws,                   guard.splits,                       guard.split_failures,
+                guard.serialized_split_boundaries, guard.split_worker_drains,          guard.monitor.capValue(),
+                budget.ns_per_draw,                stats.completed,                    budget.meanChunkNs() / 1_000_000,
+                budget.percentileMs(500),          budget.percentileMs(950),           budget.percentileMs(990),
+                budget.max_chunk_ns / 1_000_000,   budget.max_chunk_draws,             budget.risk_events,
+                budget.severe_events,              budget.emergency,                   stats.submissions_paused,
+                stats.severe_recoveries,           stats.outstanding,                  stats.max_outstanding,
+                stats.outstanding_submit_infos,    stats.max_outstanding_submit_infos,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: VULKAN FSI GUARD:   submission expanded_submits={d} segments={d} driver_queue_submit_calls={d} driver_submit_infos={d} coalesced_groups={d} max_submit_infos_per_group={d} max_segments_per_submit={d} untimed_segments={d} slow_chunk_submit_aborts={d} chunk_buffers(allocated/reused/exhausted/poisoned)={d}/{d}/{d}/{d} timing_fences(created/failed)={d}/{d} watcher(started/failed)={}/{} replay_missing={d} recordings_overflow={d} fsi_render_passes={d} framebuffer={d}x{d} scissor_pixels(max/over_4M_draws/unscissored_draws)={d}/{d}/{d}; adjacent chunks share the host queue call but remain separate VkSubmitInfo batches and Metal command buffers\n",
+            .{
+                guard.expanded_submits,     guard.segments_submitted,      guard.driver_queue_submit_calls, guard.driver_submit_infos,       guard.coalesced_submit_groups, fsi_timing.max_submit_infos_per_timing_group, guard.max_segments_per_submit, guard.untimed_segments,                     guard.slow_chunk_submit_aborts,
+                guard.chunk_pool.allocated, guard.chunk_pool.reuses,       guard.chunk_pool.exhausted,      guard.chunk_pool.poisoned_count, guard.timing_fences_created,   guard.timing_fence_failures,                  guard.monitor_started,         stats.failed or guard.monitor_start_failed, guard.replay_missing_functions,
+                guard.recording_overflow,   guard.xenia_fsi_render_passes, guard.framebuffer_width,         guard.framebuffer_height,        guard.max_scissor_pixels,      guard.oversized_scissor_draws,                guard.unscissored_draws,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: METAL COMMAND BUFFER POLICY: target_ms={d} risk_ms={d} severe_ms={d} hard_draw_cap={d} adaptive_sample_work_cap={d} ns_per_sample={d} max_group_sample_work={d} max_single_draw_sample_work={d} max_in_flight_metal_command_buffers={d} max_in_flight_timing_groups={d} room_waits={d} room_wait_ms={d} room_wait_max_ms={d} shader_bounds_verified={} hard_sample_work_cap={d}; room_waits counts condition-variable sleeps, not separate queue submissions\n",
+            .{ budget.config.target_chunk_ns / 1_000_000, budget.config.risk_ns / 1_000_000, budget.config.severe_ns / 1_000_000, budget.config.max_draws, guard.monitor.sampleWorkCapValue(), budget.ns_per_sample, budget.max_chunk_sample_work, budget.max_draw_sample_work, fsi_timing.max_in_flight_segments, fsi_timing.max_in_flight_timing_groups, stats.room_waits, stats.room_wait_ns / 1_000_000, stats.max_room_wait_ns / 1_000_000, budget.shader_bounds_verified, budget.config.max_sample_work },
+        );
+        machoCapturePrint(
+            "macho-processor: VULKAN QUEUE API GATE: acquisitions={d} contended={d} waits={d} wait_ms={d} wait_max_ms={d} pinned_refusals={d}; this serializes host queue calls while a blocked submit yields the guest-runtime mutex\n",
+            .{ queue_gate.acquisitions, queue_gate.contended, queue_gate.waits, queue_gate.wait_ns / 1_000_000, queue_gate.max_wait_ns / 1_000_000, queue_gate.wait_refusals },
+        );
+        machoCapturePrint(
+            "macho-processor: VULKAN FSI CPU ROUTE: small_chunk_sync={} synchronous_commands={d} recovery_fast_groups={d} recovery_work_cap={d} recovery_growths={d}; minimum draw-cap recordings bypass worker handoffs after draining older commands; recovery work never exceeds {d}\n",
+            .{ self.fsi_small_chunk_sync, self.fsi_small_chunk_sync_commands, budget.recovery_fast_groups, budget.recovery_work_cap, budget.recovery_growths, rosette_gpu.metal.command_buffer_policy.fsi.recovery_max_sample_work },
+        );
+        machoCapturePrint(
+            "macho-processor: VULKAN FSI GUARD SAFETY: max_chain_segments={d} recording_aborts={d} withheld_over_budget_draws={d}; continuation/replay failures and the hard chain ceiling are refused; structurally unsplittable guest recordings retain whole-buffer semantics and are explicitly reported as potentially over budget\n",
+            .{ fsi_chain.max_chunks_per_command_buffer + 1, guard.recording_aborts, guard.aborted_fsi_draws },
+        );
+        var any_blocked = false;
+        for (guard.blocked_splits) |count| any_blocked = any_blocked or count != 0;
+        if (!any_blocked) return;
+        inline for (@typeInfo(fsi_chain.Block).@"enum".fields) |field| {
+            const count = guard.blocked_splits[field.value];
+            if (count != 0) machoCapturePrint(
+                "macho-processor: VULKAN FSI GUARD:   split_blocked reason={s} times={d}; an unsplittable recording retains Vulkan whole-buffer semantics and may exceed the adaptive budget; chunk_capacity is the hard chain limit and is refused before submission\n",
+                .{ field.name, count },
+            );
+        }
+    }
+
+    /// Stop the timing watcher and release every bridge-owned Vulkan object
+    /// before the device goes away.
+    fn fsiGuardShutdown(self: *Forwarder) void {
+        const guard = self.fsi_guard orelse return;
+        guard.monitor.stop();
+        const device = self.real_vulkan.device;
+        const usable = device != null and !self.real_vulkan.device_lost;
+        var fences: [fsi_timing.capacity]u64 = undefined;
+        const fence_count = guard.monitor.collectFences(&fences);
+        if (usable) {
+            if (self.real_vulkan.fn_ptrs.destroy_fence) |destroy| {
+                for (fences[0..fence_count]) |fence| destroy(device, fence, null);
+            }
+            if (guard.command_pool != 0) {
+                if (self.real_vulkan.fn_ptrs.destroy_command_pool) |destroy| destroy(device, guard.command_pool, null);
+            }
+        }
+        self.printFsiGuardReport();
+        guard.* = .{};
+    }
+
+    fn noteFsiDraw(self: *Forwarder, command_buffer: u64, kind: fsi_diagnostics.DrawKind) void {
+        self.noteFsiDrawWithParameters(command_buffer, kind, .{});
+    }
+
+    fn noteFsiDrawWithParameters(
+        self: *Forwarder,
+        command_buffer: u64,
+        kind: fsi_diagnostics.DrawKind,
+        parameters: fsi_diagnostics.DrawParameters,
+    ) void {
+        if (self.vulkan_fsi_tracker.noteDrawWithParameters(command_buffer, kind, parameters)) |draw| {
+            if (sparseVulkanSuccessLog(draw.draw_ordinal)) machoCapturePrint(
+                "macho-processor: Vulkan FSI DRAW: ordinal={d} kind={s} command_buffer=0x{x} pipeline_real=0x{x} module_id={d} shader_hash=0x{x} pipeline_hash=0x{x} stage_flags=0x{x} target_image=0x{x} target_source={s} args_valid={} elements={d} instances={d} first_element={d} vertex_offset={d} first_instance={d} command_buffer_fsi_draws={d}; identifies an interlock pipeline command actually recorded, while the accepted-submit record distinguishes recorded work from work handed to MoltenVK\n",
+                .{ draw.draw_ordinal, @tagName(draw.kind), draw.command_buffer, draw.pipeline_real, draw.module_id, draw.shader_hash, draw.pipeline_hash, draw.stage_flags, draw.target_image, @tagName(draw.target_source), draw.parameters.valid, draw.parameters.element_count, draw.parameters.instance_count, draw.parameters.first_element, draw.parameters.vertex_offset, draw.parameters.first_instance, draw.command_buffer_draw_ordinal },
+            );
+        }
+    }
+
     fn noteGraphicsDrawState(
         self: *Forwarder,
         command_buffer: u64,
@@ -4762,6 +6757,16 @@ pub const Forwarder = struct {
         auxiliary: u64,
         first_instance: u64,
     ) void {
+        const direct = std.mem.eql(u8, kind, "draw");
+        const parameters = fsi_diagnostics.DrawParameters{
+            .valid = true,
+            .element_count = vertex_count,
+            .instance_count = instance_count,
+            .first_element = first_vertex_or_index,
+            .vertex_offset = if (direct) 0 else @bitCast(@as(u32, @truncate(auxiliary))),
+            .first_instance = first_instance,
+        };
+        self.noteFsiDrawWithParameters(command_buffer, if (direct) .direct else .indexed, parameters);
         if (!self.graphicsStateTraceEnabled()) return;
         self.graphics_state_trace_draws +|= 1;
         const ordinal = self.graphics_state_trace_draws;
@@ -5012,6 +7017,17 @@ pub const Forwarder = struct {
     }
 
     fn queueAsyncVulkanCommand(self: *Forwarder, job: async_vulkan_command.Job) bool {
+        if (self.fsi_small_chunk_sync) {
+            if (self.fsiArmedGuard()) |guard| {
+                if (guard.monitor.capValue() <= rosette_gpu.metal.command_buffer_policy.fsi.min_draws) {
+                    // The ordinary synchronous call site drains all older
+                    // jobs first. Avoid a wake/drain round trip for the tiny
+                    // post-risk recordings without changing command order.
+                    self.fsi_small_chunk_sync_commands +|= 1;
+                    return false;
+                }
+            }
+        }
         const worker = self.asyncVulkanWorker() orelse return false;
         return switch (worker.trySubmit(job)) {
             .queued => blk: {
@@ -5034,12 +7050,22 @@ pub const Forwarder = struct {
     }
 
     fn drainAsyncVulkanCommands(self: *Forwarder) void {
+        _ = self.drainAsyncVulkanCommandsIfPending();
+    }
+
+    /// Complete the command-worker watermark only when it is still pending.
+    /// FSI split boundaries are frequent; after the worker has caught up, the
+    /// atomic completion check avoids re-entering its mutex just to discover
+    /// that the barrier is already satisfied.
+    fn drainAsyncVulkanCommandsIfPending(self: *Forwarder) bool {
         if (self.vulkan_async_command_worker) |worker| {
             const watermark = worker.checkpoint();
-            const before = worker.stats();
-            if (before.completed_sequence < watermark) self.vulkan_async_command_barriers +|= 1;
+            if (worker.completedThrough(watermark)) return false;
+            self.vulkan_async_command_barriers +|= 1;
             worker.drainThrough(watermark);
+            return true;
         }
+        return false;
     }
 
     fn stopAsyncVulkanCommandWorker(self: *Forwarder) void {
@@ -5187,8 +7213,8 @@ pub const Forwarder = struct {
             if (self.vulkan_async_command_worker) |worker| {
                 const stats = worker.stats();
                 machoCapturePrint(
-                    "macho-processor: PRESENT CHAIN:   hybrid_command_worker=enabled:{} submitted={d} completed={d} sequence(queued/completed)={d}/{d} batches={d} max_batch={d} max_queue_depth={d} queue_full_fallbacks={d} worker_stopped_fallbacks={d} ordering_barriers_with_work={d}; all pointer-free calls are complete at this snapshot\n",
-                    .{ self.vulkan_async_command_worker_enabled, stats.submitted, stats.completed, stats.last_submitted_sequence, stats.completed_sequence, stats.batches, stats.max_batch_size, stats.max_depth, self.vulkan_async_queue_saturated_fallbacks, self.vulkan_async_worker_stopped_fallbacks, self.vulkan_async_command_barriers },
+                    "macho-processor: PRESENT CHAIN:   hybrid_command_worker=enabled:{} submitted={d} completed={d} sequence(queued/completed)={d}/{d} batches={d} max_batch={d} max_queue_depth={d} work_signals={d} drain_broadcasts={d} queue_full_fallbacks={d} worker_stopped_fallbacks={d} ordering_barriers_with_work={d}; FSI continuation boundaries drain this worker before synchronous pass close/replay\n",
+                    .{ self.vulkan_async_command_worker_enabled, stats.submitted, stats.completed, stats.last_submitted_sequence, stats.completed_sequence, stats.batches, stats.max_batch_size, stats.max_depth, stats.work_signals, stats.drain_broadcasts, self.vulkan_async_queue_saturated_fallbacks, self.vulkan_async_worker_stopped_fallbacks, self.vulkan_async_command_barriers },
                 );
             } else {
                 machoCapturePrint(
@@ -5238,7 +7264,12 @@ pub const Forwarder = struct {
             );
             return self.noteVulkanCommandRefusal(@src().line);
         }
-        const command_buffer = self.real_vulkan.realCommandBuffer(guest_context.registers(state).rdi) orelse {
+        if (!self.fsiRasterBeforeCommand(guest_context.registers(state).rdi, name_hash, name)) return self.noteVulkanCommandRefusal(@src().line);
+        self.fsiNoteCommand(guest_context.registers(state).rdi, name_hash, name);
+        if (self.fsiRecording(guest_context.registers(state).rdi)) |recording| {
+            if (recording.failed) return self.noteVulkanCommandRefusal(@src().line);
+        }
+        const own_command_buffer = self.real_vulkan.realCommandBuffer(guest_context.registers(state).rdi) orelse {
             if (is_descriptor_bind) self.rejectDescriptorBind(
                 .command_buffer_unmapped,
                 guest_context.registers(state).rdi,
@@ -5255,15 +7286,26 @@ pub const Forwarder = struct {
             );
             return self.noteVulkanCommandRefusal(@src().line);
         };
+        if (std.mem.eql(u8, name, "vkCmdExecuteCommands") or std.mem.startsWith(u8, name, "vkCmdPushDescriptor")) {
+            if (self.native_texture_state) |native| native.resetCommand(guest_context.registers(state).rdi);
+        }
+        // Once an FSI recording has been split its commands go to the newest chunk.
+        const command_buffer = self.fsiCommandTarget(guest_context.registers(state).rdi, own_command_buffer);
         if ((name_hash == vulkanNameHash("vkCmdBindPipeline") and std.mem.eql(u8, name, "vkCmdBindPipeline"))) {
             const pipeline = self.real_vulkan.realPipeline(guest_context.registers(state).rdx) orelse return self.noteVulkanCommandRefusal(@src().line);
             self.noteCommandPipelineState(guest_context.registers(state).rdi, guest_context.registers(state).rdx, pipeline, guest_context.registers(state).rsi);
+            if (guest_context.registers(state).rsi == 1) if (self.native_texture_state) |native| {
+                if (native.command(guest_context.registers(state).rdi)) |command| command.pipeline = pipeline;
+            };
             // Compute and graphics are separate bind points: a compute bind
             // (Xenia's resolves and texture loads) leaves the graphics
             // pipeline its next draw uses in place.
             if (@as(u32, @truncate(guest_context.registers(state).rsi)) == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+                self.fsi_raster.bindPipeline(guest_context.registers(state).rdi, pipeline);
                 self.rect_expand_bound_pipeline = if (self.rectangleExpandedPipeline(pipeline)) pipeline else 0;
-                self.rectExpandCommandState(guest_context.registers(state).rdi).marked_pipeline = self.rect_expand_bound_pipeline != 0;
+                const recording = self.rectExpandCommandState(guest_context.registers(state).rdi);
+                recording.pipeline = pipeline;
+                recording.marked_pipeline = self.rect_expand_bound_pipeline != 0;
             }
             if (self.real_vulkan.fn_ptrs.cmd_bind_pipeline) |function| {
                 const bind_point: u32 = @intCast(guest_context.registers(state).rsi);
@@ -5273,15 +7315,28 @@ pub const Forwarder = struct {
                     .bind_point = bind_point,
                     .pipeline = pipeline,
                 } })) self.callNativeVulkanCommand(function, .{ command_buffer, bind_point, pipeline });
+                if (self.fsiShadow(guest_context.registers(state).rdi)) |shadow| {
+                    if (!shadow.bindPipeline(bind_point, pipeline)) self.fsiNoteShadowBlock(guest_context.registers(state).rdi, .unrecorded_command);
+                }
             }
         } else if ((name_hash == vulkanNameHash("vkCmdExecuteCommands") and std.mem.eql(u8, name, "vkCmdExecuteCommands"))) {
             const count = guest_context.registers(state).rsi;
             var secondary: [64]abi.CommandBuffer = [_]abi.CommandBuffer{null} ** 64;
             if (count > secondary.len or (count != 0 and state.guestMemoryConst(guest_context.registers(state).rdx, count * 8) == null)) return self.noteVulkanCommandRefusal(@src().line);
             if (self.real_vulkan.fn_ptrs.cmd_execute_commands) |function| {
+                const primary_target = self.commandPassTarget(guest_context.registers(state).rdi);
                 for (0..@as(usize, @intCast(count))) |index| {
                     const synthetic = state.read64(guest_context.registers(state).rdx + @as(u64, @intCast(index)) * 8);
                     secondary[index] = self.real_vulkan.realCommandBuffer(synthetic) orelse return self.noteVulkanCommandRefusal(@src().line);
+                    if (primary_target) |target| {
+                        if (target.image != 0) {
+                            self.vulkan_fsi_tracker.setTarget(synthetic, target.image, .inherited_secondary);
+                        } else {
+                            self.vulkan_fsi_tracker.noteSecondaryTargetUnresolved(synthetic);
+                        }
+                    } else {
+                        self.vulkan_fsi_tracker.noteSecondaryTargetUnresolved(synthetic);
+                    }
                     self.mergeCommandTargets(guest_context.registers(state).rdi, synthetic);
                 }
                 self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(count), &secondary });
@@ -5293,11 +7348,16 @@ pub const Forwarder = struct {
             if (count > buffers.len or !copyGuestHandleArray(self, state, guest_context.registers(state).rcx, count, @ptrCast(&buffers), .buffer)) return self.noteVulkanCommandRefusal(@src().line);
             if (!copyGuestStructs(u64, state, guest_context.registers(state).r8, count, &offsets)) return self.noteVulkanCommandRefusal(@src().line);
             if (self.real_vulkan.fn_ptrs.cmd_bind_vertex_buffers) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(guest_context.registers(state).rsi), @intCast(count), &buffers, &offsets });
+            if (self.fsiShadow(guest_context.registers(state).rdi)) |shadow| self.fsiNoteShadowBlock(guest_context.registers(state).rdi, shadow.bindVertexBuffers(@intCast(guest_context.registers(state).rsi), buffers[0..@intCast(count)], offsets[0..@intCast(count)]));
         } else if ((name_hash == vulkanNameHash("vkCmdBindIndexBuffer") and std.mem.eql(u8, name, "vkCmdBindIndexBuffer"))) {
             const buffer = self.real_vulkan.realBuffer(guest_context.registers(state).rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
             // The two-triangle strips are the built-in buffer's first
             // section, 32-bit, so an expansion binds it at offset 0.
-            self.rectExpandCommandState(guest_context.registers(state).rdi).builtin_indices = self.rect_expand_builtin_index_buffer != 0 and
+            const recording = self.rectExpandCommandState(guest_context.registers(state).rdi);
+            recording.index_buffer = buffer;
+            recording.index_offset = guest_context.registers(state).rdx;
+            recording.index_type = @truncate(guest_context.registers(state).rcx);
+            recording.builtin_indices = self.rect_expand_builtin_index_buffer != 0 and
                 buffer == self.rect_expand_builtin_index_buffer and
                 guest_context.registers(state).rdx == 0 and @as(u32, @truncate(guest_context.registers(state).rcx)) == abi.INDEX_TYPE_UINT32;
             if (self.real_vulkan.fn_ptrs.cmd_bind_index_buffer) |function| {
@@ -5309,6 +7369,7 @@ pub const Forwarder = struct {
                     .offset = guest_context.registers(state).rdx,
                     .index_type = index_type,
                 } })) self.callNativeVulkanCommand(function, .{ command_buffer, buffer, guest_context.registers(state).rdx, index_type });
+                if (self.fsiShadow(guest_context.registers(state).rdi)) |shadow| shadow.index = .{ .buffer = buffer, .offset = guest_context.registers(state).rdx, .index_type = index_type };
             }
         } else if (is_descriptor_bind) {
             const set_count = guest_context.registers(state).r8;
@@ -5359,7 +7420,11 @@ pub const Forwarder = struct {
                 if (dynamic_count == 0) null else &dynamic_offsets,
             });
             self.vulkan_descriptor_bind_admission.forwarded +|= 1;
+            if (guest_context.registers(state).rsi == 1) if (self.native_texture_state) |native| {
+                if (native.command(guest_context.registers(state).rdi)) |command| command.bind(layout, @intCast(guest_context.registers(state).rcx), sets[0..@intCast(set_count)], @intCast(dynamic_count));
+            };
             self.vulkan_descriptor_bind_calls +|= 1;
+            if (self.fsiShadow(guest_context.registers(state).rdi)) |shadow| self.fsiNoteShadowBlock(guest_context.registers(state).rdi, shadow.bindDescriptorSets(@intCast(guest_context.registers(state).rsi), layout, @intCast(guest_context.registers(state).rcx), sets[0..@intCast(set_count)], dynamic_offsets[0..@intCast(dynamic_count)]));
             // Keep the descriptor-set identities with the command. The image
             // contents of a set are persistent guest state and may be updated
             // after recording but before queue submission; resolve them at
@@ -5416,6 +7481,19 @@ pub const Forwarder = struct {
                     self.rect_expand_draws_tagged +|= 1;
                 } else {
                     self.rect_expand_draws_declined_foreign_index +|= 1;
+                    if (self.rect_expand_first_foreign_index_sample == null) {
+                        self.rect_expand_first_foreign_index_sample = .{
+                            .command_buffer = recording.command_buffer,
+                            .pipeline = recording.pipeline,
+                            .index_buffer = recording.index_buffer,
+                            .index_offset = recording.index_offset,
+                            .index_type = recording.index_type,
+                            .index_count = @truncate(index_count),
+                            .first_index = @truncate(guest_context.registers(state).rcx),
+                            .vertex_offset = vertex_offset,
+                            .instance_count = @truncate(guest_context.registers(state).rdx),
+                        };
+                    }
                 }
             }
             if (self.real_vulkan.fn_ptrs.cmd_draw_indexed) |function| {
@@ -5439,12 +7517,14 @@ pub const Forwarder = struct {
             const buffer = self.real_vulkan.realBuffer(guest_context.registers(state).rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
             if (self.real_vulkan.fn_ptrs.cmd_draw_indirect) |function| {
                 self.noteCommandTargets(guest_context.registers(state).rdi, .content);
+                self.noteFsiDraw(guest_context.registers(state).rdi, .indirect);
                 self.callNativeVulkanCommand(function, .{ command_buffer, buffer, guest_context.registers(state).rdx, @intCast(guest_context.registers(state).rcx), @intCast(guest_context.registers(state).r8) });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdDrawIndexedIndirect") and std.mem.eql(u8, name, "vkCmdDrawIndexedIndirect"))) {
             const buffer = self.real_vulkan.realBuffer(guest_context.registers(state).rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
             if (self.real_vulkan.fn_ptrs.cmd_draw_indexed_indirect) |function| {
                 self.noteCommandTargets(guest_context.registers(state).rdi, .content);
+                self.noteFsiDraw(guest_context.registers(state).rdi, .indexed_indirect);
                 self.callNativeVulkanCommand(function, .{ command_buffer, buffer, guest_context.registers(state).rdx, @intCast(guest_context.registers(state).rcx), @intCast(guest_context.registers(state).r8) });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdDrawIndirectCount") and std.mem.eql(u8, name, "vkCmdDrawIndirectCount")) or (name_hash == vulkanNameHash("vkCmdDrawIndexedIndirectCount") and std.mem.eql(u8, name, "vkCmdDrawIndexedIndirectCount"))) {
@@ -5455,16 +7535,42 @@ pub const Forwarder = struct {
             if ((name_hash == vulkanNameHash("vkCmdDrawIndirectCount") and std.mem.eql(u8, name, "vkCmdDrawIndirectCount"))) {
                 if (self.real_vulkan.fn_ptrs.cmd_draw_indirect_count) |function| {
                     self.noteCommandTargets(guest_context.registers(state).rdi, .content);
+                    self.noteFsiDraw(guest_context.registers(state).rdi, .indirect_count);
                     self.callNativeVulkanCommand(function, .{ command_buffer, buffer, guest_context.registers(state).rdx, count_buffer, guest_context.registers(state).r8, @intCast(max_draw_count), @intCast(stride) });
                 }
             } else if (self.real_vulkan.fn_ptrs.cmd_draw_indexed_indirect_count) |function| {
                 self.noteCommandTargets(guest_context.registers(state).rdi, .content);
+                self.noteFsiDraw(guest_context.registers(state).rdi, .indexed_indirect_count);
                 self.callNativeVulkanCommand(function, .{ command_buffer, buffer, guest_context.registers(state).rdx, count_buffer, guest_context.registers(state).r8, @intCast(max_draw_count), @intCast(stride) });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdDispatch") and std.mem.eql(u8, name, "vkCmdDispatch"))) {
             if (self.real_vulkan.fn_ptrs.cmd_dispatch) |function| {
                 self.noteCommandTargets(guest_context.registers(state).rdi, .content);
-                self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(guest_context.registers(state).rsi), @intCast(guest_context.registers(state).rdx), @intCast(guest_context.registers(state).rcx) });
+                const groups = [3]u32{ @intCast(guest_context.registers(state).rsi), @intCast(guest_context.registers(state).rdx), @intCast(guest_context.registers(state).rcx) };
+                var routed = false;
+                if (self.native_texture_state) |native| {
+                    if (native.canDispatch(guest_context.registers(state).rdi, groups)) {
+                        _ = self.drainAsyncVulkanCommandsIfPending();
+                        routed = native.dispatch(&self.real_vulkan, guest_context.registers(state).rdi, command_buffer, groups);
+                    } else if (native.commands.get(guest_context.registers(state).rdi)) |command_state| {
+                        if (native.pipelines.contains(command_state.pipeline)) {
+                            const reason = native.dispatchReason(guest_context.registers(state).rdi, groups).?;
+                            native.noteDecline(reason);
+                            if (native.declines <= 8) {
+                                var push: native_texture.Push = undefined;
+                                @memcpy(std.mem.asBytes(&push), &command_state.push);
+                                machoCapturePrint("macho-processor: NATIVE METAL TEXTURE DECLINE: reason={s} pipeline=0x{x} descriptor_layout=0x{x} push_layout=0x{x} push_mask=0x{x} flags={d} blocks={d}/{d}/{d} guest_pitch={d} host_pitch={d} height={d} offsets={d}/{d} groups={d}/{d}/{d}; original hardened dispatch retained\n", .{ @tagName(reason), command_state.pipeline, command_state.layout, command_state.push_layout, command_state.push_mask, push.flags, push.blocks_x, push.blocks_y, push.blocks_z, push.guest_pitch, push.host_pitch, push.height, push.guest_offset, push.host_offset, groups[0], groups[1], groups[2] });
+                            }
+                        }
+                    }
+                }
+                if (self.native_texture_state) |native| {
+                    if (native.terminal_result != abi.SUCCESS) {
+                        self.noteRealVulkanResult(native.terminal_result, "native Metal texture metadata");
+                        return self.noteVulkanCommandRefusal(@src().line);
+                    }
+                }
+                if (routed) self.vulkan_real_command_calls +|= 4 else self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(guest_context.registers(state).rsi), @intCast(guest_context.registers(state).rdx), @intCast(guest_context.registers(state).rcx) });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdDispatchIndirect") and std.mem.eql(u8, name, "vkCmdDispatchIndirect"))) {
             const buffer = self.real_vulkan.realBuffer(guest_context.registers(state).rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
@@ -5482,15 +7588,18 @@ pub const Forwarder = struct {
             if (!copyGuestStructs(abi.Viewport, state, guest_context.registers(state).rcx, guest_context.registers(state).rdx, &viewports)) return self.noteVulkanCommandRefusal(@src().line);
             self.noteCommandViewport(guest_context.registers(state).rdi, guest_context.registers(state).rsi, guest_context.registers(state).rdx, viewports[0..@as(usize, @intCast(guest_context.registers(state).rdx))]);
             if (self.real_vulkan.fn_ptrs.cmd_set_viewport) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(guest_context.registers(state).rsi), @intCast(guest_context.registers(state).rdx), &viewports });
+            if (self.fsiShadow(guest_context.registers(state).rdi)) |shadow| self.fsiNoteShadowBlock(guest_context.registers(state).rdi, shadow.setViewports(@intCast(guest_context.registers(state).rsi), viewports[0..@intCast(guest_context.registers(state).rdx)]));
         } else if ((name_hash == vulkanNameHash("vkCmdSetScissor") and std.mem.eql(u8, name, "vkCmdSetScissor"))) {
             var scissors: [16]abi.Rect2D = undefined;
             if (!copyGuestStructs(abi.Rect2D, state, guest_context.registers(state).rcx, guest_context.registers(state).rdx, &scissors)) return self.noteVulkanCommandRefusal(@src().line);
             self.noteCommandScissor(guest_context.registers(state).rdi, guest_context.registers(state).rsi, guest_context.registers(state).rdx, scissors[0..@as(usize, @intCast(guest_context.registers(state).rdx))]);
             if (self.real_vulkan.fn_ptrs.cmd_set_scissor) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(guest_context.registers(state).rsi), @intCast(guest_context.registers(state).rdx), &scissors });
+            if (self.fsiShadow(guest_context.registers(state).rdi)) |shadow| self.fsiNoteShadowBlock(guest_context.registers(state).rdi, shadow.setScissors(@intCast(guest_context.registers(state).rsi), scissors[0..@intCast(guest_context.registers(state).rdx)]));
         } else if ((name_hash == vulkanNameHash("vkCmdSetBlendConstants") and std.mem.eql(u8, name, "vkCmdSetBlendConstants"))) {
             var constants: [4]f32 = undefined;
             if (!copyGuestStructs(f32, state, guest_context.registers(state).rsi, 4, &constants)) return self.noteVulkanCommandRefusal(@src().line);
             if (self.real_vulkan.fn_ptrs.cmd_set_blend_constants) |function| self.callNativeVulkanCommand(function, .{ command_buffer, &constants });
+            if (self.fsiShadow(guest_context.registers(state).rdi)) |shadow| shadow.blend_constants = constants;
         } else if ((name_hash == vulkanNameHash("vkCmdSetDepthBias") and std.mem.eql(u8, name, "vkCmdSetDepthBias"))) {
             if (self.real_vulkan.fn_ptrs.cmd_set_depth_bias) |function| self.callNativeVulkanCommand(function, .{
                 command_buffer,
@@ -5498,8 +7607,10 @@ pub const Forwarder = struct {
                 @bitCast(guestFloatArgument(state, 1)),
                 @bitCast(guestFloatArgument(state, 2)),
             });
+            if (self.fsiShadow(guest_context.registers(state).rdi)) |shadow| shadow.depth_bias = .{ @bitCast(guestFloatArgument(state, 0)), @bitCast(guestFloatArgument(state, 1)), @bitCast(guestFloatArgument(state, 2)) };
         } else if ((name_hash == vulkanNameHash("vkCmdSetDepthBounds") and std.mem.eql(u8, name, "vkCmdSetDepthBounds"))) {
             if (self.real_vulkan.fn_ptrs.cmd_set_depth_bounds) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @bitCast(guestFloatArgument(state, 0)), @bitCast(guestFloatArgument(state, 1)) });
+            if (self.fsiShadow(guest_context.registers(state).rdi)) |shadow| shadow.depth_bounds = .{ @bitCast(guestFloatArgument(state, 0)), @bitCast(guestFloatArgument(state, 1)) };
         } else if ((name_hash == vulkanNameHash("vkCmdSetDepthTestEnable") and std.mem.eql(u8, name, "vkCmdSetDepthTestEnable"))) {
             if (self.real_vulkan.fn_ptrs.cmd_set_depth_test_enable) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(guest_context.registers(state).rsi) });
         } else if ((name_hash == vulkanNameHash("vkCmdSetDepthWriteEnable") and std.mem.eql(u8, name, "vkCmdSetDepthWriteEnable"))) {
@@ -5521,17 +7632,24 @@ pub const Forwarder = struct {
             if (self.real_vulkan.fn_ptrs.cmd_set_primitive_restart_enable) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(guest_context.registers(state).rsi) });
         } else if ((name_hash == vulkanNameHash("vkCmdSetStencilCompareMask") and std.mem.eql(u8, name, "vkCmdSetStencilCompareMask"))) {
             if (self.real_vulkan.fn_ptrs.cmd_set_stencil_compare_mask) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(guest_context.registers(state).rsi), @intCast(guest_context.registers(state).rdx) });
+            if (self.fsiShadow(guest_context.registers(state).rdi)) |shadow| fsi_chain.Shadow.setStencil(&shadow.stencil_compare_mask, @intCast(guest_context.registers(state).rsi), @intCast(guest_context.registers(state).rdx));
         } else if ((name_hash == vulkanNameHash("vkCmdSetStencilWriteMask") and std.mem.eql(u8, name, "vkCmdSetStencilWriteMask"))) {
             if (self.real_vulkan.fn_ptrs.cmd_set_stencil_write_mask) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(guest_context.registers(state).rsi), @intCast(guest_context.registers(state).rdx) });
+            if (self.fsiShadow(guest_context.registers(state).rdi)) |shadow| fsi_chain.Shadow.setStencil(&shadow.stencil_write_mask, @intCast(guest_context.registers(state).rsi), @intCast(guest_context.registers(state).rdx));
         } else if ((name_hash == vulkanNameHash("vkCmdSetStencilReference") and std.mem.eql(u8, name, "vkCmdSetStencilReference"))) {
             if (self.real_vulkan.fn_ptrs.cmd_set_stencil_reference) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(guest_context.registers(state).rsi), @intCast(guest_context.registers(state).rdx) });
+            if (self.fsiShadow(guest_context.registers(state).rdi)) |shadow| fsi_chain.Shadow.setStencil(&shadow.stencil_reference, @intCast(guest_context.registers(state).rsi), @intCast(guest_context.registers(state).rdx));
         } else if ((name_hash == vulkanNameHash("vkCmdPushConstants") and std.mem.eql(u8, name, "vkCmdPushConstants"))) {
             const size = guest_context.registers(state).r8;
             var bytes: [256]u8 = undefined;
             if (!copyGuestBytes(state, guest_context.registers(state).r9, size, &bytes)) return self.noteVulkanCommandRefusal(@src().line);
             const layout = self.real_vulkan.realPipelineLayout(guest_context.registers(state).rsi) orelse return self.noteVulkanCommandRefusal(@src().line);
             self.noteCommandPushConstants(guest_context.registers(state).rdi, guest_context.registers(state).rsi, layout, guest_context.registers(state).rdx, guest_context.registers(state).rcx, size, bytes[0..@as(usize, @intCast(size))]);
+            if (guest_context.registers(state).rdx & 0x20 != 0) if (self.native_texture_state) |native| {
+                if (native.command(guest_context.registers(state).rdi)) |command| command.constants(layout, @intCast(guest_context.registers(state).rcx), bytes[0..@intCast(size)]);
+            };
             if (self.real_vulkan.fn_ptrs.cmd_push_constants) |function| self.callNativeVulkanCommand(function, .{ command_buffer, layout, @intCast(guest_context.registers(state).rdx), @intCast(guest_context.registers(state).rcx), @intCast(size), if (size == 0) null else &bytes });
+            if (self.fsiShadow(guest_context.registers(state).rdi)) |shadow| self.fsiNoteShadowBlock(guest_context.registers(state).rdi, shadow.pushConstants(layout, @intCast(guest_context.registers(state).rdx), @intCast(guest_context.registers(state).rcx), bytes[0..@intCast(size)]));
         } else if ((name_hash == vulkanNameHash("vkCmdBeginConditionalRenderingEXT") and std.mem.eql(u8, name, "vkCmdBeginConditionalRenderingEXT"))) {
             if (self.real_vulkan.fn_ptrs.cmd_begin_conditional_rendering) |function| {
                 var info: abi.ConditionalRenderingBeginInfoEXT = undefined;
@@ -5548,6 +7666,7 @@ pub const Forwarder = struct {
                 if (!copyGuestValue(abi.RenderingInfo, state, guest_context.registers(state).rsi, &info) or info.p_next != null) return self.noteVulkanCommandRefusal(@src().line);
                 if (info.color_attachment_count > 8) return self.noteVulkanCommandRefusal(@src().line);
                 var colors: [8]abi.RenderingAttachmentInfo = undefined;
+                var guest_color_target_view: u64 = 0;
                 const colors_address = if (info.color_attachments) |pointer| @intFromPtr(pointer) else 0;
                 if (!copyGuestStructs(abi.RenderingAttachmentInfo, state, colors_address, info.color_attachment_count, &colors)) return self.noteVulkanCommandRefusal(@src().line);
                 var color_load_clear = false;
@@ -5555,6 +7674,7 @@ pub const Forwarder = struct {
                     if (attachment.p_next != null) return self.noteVulkanCommandRefusal(@src().line);
                     if (attachment.load_op == VK_ATTACHMENT_LOAD_OP_CLEAR) color_load_clear = true;
                     const guest_image_view = attachment.image_view;
+                    if (guest_color_target_view == 0 and guest_image_view != 0) guest_color_target_view = guest_image_view;
                     const guest_resolve_image_view = attachment.resolve_image_view;
                     if (guest_image_view != 0) self.addCommandImageView(guest_context.registers(state).rdi, guest_image_view);
                     if (guest_resolve_image_view != 0) self.addCommandImageView(guest_context.registers(state).rdi, guest_resolve_image_view);
@@ -5591,11 +7711,15 @@ pub const Forwarder = struct {
                     info.stencil_attachment = &stencil;
                 }
                 info.p_next = null;
+                self.noteCommandDynamicTarget(guest_context.registers(state).rdi, guest_color_target_view);
                 if (color_load_clear) self.noteLoadClearTarget(guest_context.registers(state).rdi, "vkCmdBeginRendering") else self.noteCommandTargets(guest_context.registers(state).rdi, .none);
                 self.callNativeVulkanCommand(function, .{ command_buffer, &info });
             }
         } else if ((name_hash == vulkanNameHash("vkCmdEndRendering") and std.mem.eql(u8, name, "vkCmdEndRendering")) or (name_hash == vulkanNameHash("vkCmdEndRenderingKHR") and std.mem.eql(u8, name, "vkCmdEndRenderingKHR"))) {
-            if (self.real_vulkan.fn_ptrs.cmd_end_rendering) |function| self.callNativeVulkanCommand(function, .{command_buffer});
+            if (self.real_vulkan.fn_ptrs.cmd_end_rendering) |function| {
+                self.callNativeVulkanCommand(function, .{command_buffer});
+                self.clearCommandPassTarget(guest_context.registers(state).rdi);
+            }
         } else if ((name_hash == vulkanNameHash("vkCmdBeginRenderPass") and std.mem.eql(u8, name, "vkCmdBeginRenderPass"))) {
             const guest = state.guestMemoryConst(guest_context.registers(state).rsi, @sizeOf(abi.RenderPassBeginInfo)) orelse return self.noteVulkanCommandRefusal(@src().line);
             var begin: abi.RenderPassBeginInfo = undefined;
@@ -5625,6 +7749,7 @@ pub const Forwarder = struct {
                     self.noteCommandTargets(guest_context.registers(state).rdi, .none);
                 }
                 self.callNativeVulkanCommand(function, .{ command_buffer, &begin, @intCast(guest_context.registers(state).rdx) });
+                self.fsiNoteBeginRenderPass(guest_context.registers(state).rdi, &begin, @intCast(guest_context.registers(state).rdx));
             }
         } else if ((name_hash == vulkanNameHash("vkCmdNextSubpass") and std.mem.eql(u8, name, "vkCmdNextSubpass"))) {
             if (self.real_vulkan.fn_ptrs.cmd_next_subpass) |function| self.callNativeVulkanCommand(function, .{ command_buffer, @intCast(guest_context.registers(state).rsi) });
@@ -5658,6 +7783,7 @@ pub const Forwarder = struct {
                     self.noteCommandTargets(guest_context.registers(state).rdi, .none);
                 }
                 self.callNativeVulkanCommand(function, .{ command_buffer, &begin, &subpass });
+                self.fsiNoteBeginRenderPass(guest_context.registers(state).rdi, &begin, subpass.contents);
             }
         } else if ((name_hash == vulkanNameHash("vkCmdNextSubpass2") and std.mem.eql(u8, name, "vkCmdNextSubpass2")) or (name_hash == vulkanNameHash("vkCmdNextSubpass2KHR") and std.mem.eql(u8, name, "vkCmdNextSubpass2KHR"))) {
             if (self.real_vulkan.fn_ptrs.cmd_next_subpass2) |function| {
@@ -5863,7 +7989,8 @@ pub const Forwarder = struct {
     /// first of each reason is printed with its descriptor type and binding.
     fn updateDescriptorSets(self: *Forwarder, state: anytype) void {
         self.vulkan_descriptor_update_calls +|= 1;
-        const refusal = self.updateDescriptorSetsNative(state) orelse return;
+        var failure: DescriptorUpdateFailureDetails = .{};
+        const refusal = self.updateDescriptorSetsNative(state, &failure) orelse return;
         const index = @intFromEnum(refusal);
         self.vulkan_descriptor_update_refusals[index] +|= 1;
         if (self.vulkan_descriptor_update_refusals[index] == 1) {
@@ -5871,14 +7998,20 @@ pub const Forwarder = struct {
             const readable = guest_context.registers(state).rsi != 0 and state.guestMemoryConst(guest_context.registers(state).rdx, 64) != null;
             const first_binding: u64 = if (readable) @as(u32, @truncate(state.read64(guest_context.registers(state).rdx + 24))) else 0;
             const first_type: u64 = if (readable) @as(u32, @truncate(state.read64(guest_context.registers(state).rdx + 32) >> 32)) else 0;
+            const guest_thread = if (comptime @hasField(@TypeOf(state.*), "active_guest_thread"))
+                guest_context.field(state, "active_guest_thread").*
+            else
+                0;
+            const registers = guest_context.registers(state);
+            const guest_rip = if (comptime @hasField(@TypeOf(registers.*), "rip")) registers.rip else 0;
             machoCapturePrint(
-                "macho-processor: DESCRIPTOR UPDATE REFUSED: reason={s} writes={d} copies={d} first_write(type={d} binding={d}) update_call={d}; the whole vkUpdateDescriptorSets was dropped, so every set it named keeps its previous contents and a shader bound to one reads stale or null resources\n",
-                .{ @tagName(refusal), guest_context.registers(state).rsi, guest_context.registers(state).rcx, first_type, first_binding, self.vulkan_descriptor_update_calls },
+                "macho-processor: DESCRIPTOR UPDATE REFUSED: reason={s} writes={d} copies={d} failing_write(index/type/binding/set/resource/element)={d}/{d}/{d}/0x{x}/0x{x}/{d} first_write(type={d} binding={d}) update_call={d} guest_thread=0x{x} rip=0x{x}; the whole vkUpdateDescriptorSets was dropped, so every set it named keeps its previous contents and a shader bound to one reads stale or null resources\n",
+                .{ @tagName(refusal), guest_context.registers(state).rsi, guest_context.registers(state).rcx, failure.write_index, failure.descriptor_type, failure.binding, failure.descriptor_set, failure.resource, failure.element_index, first_type, first_binding, self.vulkan_descriptor_update_calls, guest_thread, guest_rip },
             );
         }
     }
 
-    fn updateDescriptorSetsNative(self: *Forwarder, state: anytype) ?DescriptorUpdateRefusal {
+    fn updateDescriptorSetsNative(self: *Forwarder, state: anytype, failure: *DescriptorUpdateFailureDetails) ?DescriptorUpdateRefusal {
         const write_count = guest_context.registers(state).rsi;
         const copy_count = guest_context.registers(state).rcx;
         if (self.real_vulkan.device_lost or !self.real_vulkan.hasDevice() or self.real_vulkan.fn_ptrs.update_descriptor_sets == null) return .no_device;
@@ -5892,11 +8025,28 @@ pub const Forwarder = struct {
         var inline_data: [64][256]u8 = undefined;
         if (!copyGuestStructs(abi.WriteDescriptorSet, state, guest_context.registers(state).rdx, write_count, &writes)) return .guest_read;
         if (!copyGuestStructs(abi.CopyDescriptorSet, state, guest_context.registers(state).r8, copy_count, &copies)) return .guest_read;
+        const fsi_guest_set = if (copy_count == 0 and write_count == 3) writes[0].dst_set else 0;
+        const is_fsi_edram_zpd_update = copy_count == 0 and write_count == 3 and
+            gpu_vulkan.fsi_descriptor_repair.isSharedMemoryEdramZpdSetUpdate(writes[0..3], fsi_guest_set);
+        var fsi_descriptor_evidence: fsi_diagnostics.DescriptorUpdateEvidence = .{
+            .update_call = self.vulkan_descriptor_update_calls,
+            .guest_set = fsi_guest_set,
+        };
         var image_cursor: usize = 0;
         var buffer_cursor: usize = 0;
         var texel_cursor: usize = 0;
         for (writes[0..@as(usize, @intCast(write_count))], 0..) |*write, write_index| {
-            write.dst_set = self.real_vulkan.realDescriptorSet(write.dst_set) orelse return .unmapped_set;
+            const guest_set = write.dst_set;
+            const is_fsi_zpd_sink_write = is_fsi_edram_zpd_update and
+                gpu_vulkan.fsi_descriptor_repair.isZpdSinkDescriptor(write.*, fsi_guest_set);
+            failure.* = .{
+                .write_index = @intCast(write_index),
+                .descriptor_type = write.descriptor_type,
+                .binding = write.dst_binding,
+                .descriptor_set = guest_set,
+            };
+            write.dst_set = self.real_vulkan.realDescriptorSet(guest_set) orelse return .unmapped_set;
+            if (is_fsi_edram_zpd_update) fsi_descriptor_evidence.native_set = write.dst_set;
             const count: usize = @intCast(write.descriptor_count);
             if (write.descriptor_type == abi.DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
                 if (write.p_next == null or count > inline_data[write_index].len) return .inline_block;
@@ -5952,8 +8102,52 @@ pub const Forwarder = struct {
                         const address = if (write.buffer_info) |pointer| @intFromPtr(pointer) else 0;
                         if (count != 0 and address == 0) return .null_array;
                         if (!copyGuestStructs(abi.DescriptorBufferInfo, state, address, count, buffers[buffer_cursor..])) return .guest_read;
-                        for (buffers[buffer_cursor .. buffer_cursor + count]) |*buffer| {
-                            buffer.buffer = self.real_vulkan.realBuffer(buffer.buffer) orelse return .unmapped_buffer;
+                        for (buffers[buffer_cursor .. buffer_cursor + count], 0..) |*buffer, element_index| {
+                            const guest_buffer = buffer.buffer;
+                            const guest_offset = buffer.offset;
+                            const guest_range = buffer.range;
+                            var repaired = false;
+                            failure.resource = guest_buffer;
+                            failure.element_index = @intCast(element_index);
+                            const sink_bytes = gpu_vulkan.fsi_descriptor_repair.XENIA_ZPD_COUNTER_SINK_BYTES;
+                            if (is_fsi_zpd_sink_write and element_index == 0 and
+                                gpu_vulkan.fsi_descriptor_repair.zpdSinkInfoNeedsRepair(
+                                    guest_buffer != 0 and self.real_vulkan.realBuffer(guest_buffer) != null,
+                                    buffer.offset,
+                                    buffer.range,
+                                ))
+                            {
+                                buffer.buffer = self.ensureFsiZpdSink(sink_bytes) orelse return .unmapped_buffer;
+                                buffer.offset = 0;
+                                buffer.range = sink_bytes;
+                                repaired = true;
+                                self.fsi_zpd_descriptor_repairs +|= 1;
+                                machoCapturePrint(
+                                    "macho-processor: FSI ZPD descriptor repaired: update_call={d} set=0x{x} binding={d} guest_info(buffer/offset/range)=0x{x}/{d}/{d} replacement_buffer=0x{x} offset=0 range={d}; Xenia's SetupContext reads this VkDescriptorBufferInfo after its scope ends and the compiler dropped its stores, so the shared-memory and EDRAM writes in the same call are forwarded with Xenia's intended zeroed sink\n",
+                                    .{ self.vulkan_descriptor_update_calls, fsi_guest_set, write.dst_binding, guest_buffer, guest_offset, guest_range, buffer.buffer, sink_bytes },
+                                );
+                            } else {
+                                buffer.buffer = self.real_vulkan.realBuffer(guest_buffer) orelse return .unmapped_buffer;
+                            }
+                            if (is_fsi_edram_zpd_update and write.dst_binding < 3 and element_index == 0) {
+                                const binding_index: usize = @intCast(write.dst_binding);
+                                const mask = @as(u8, 1) << @intCast(binding_index);
+                                if (fsi_descriptor_evidence.binding_mask & mask == 0) {
+                                    fsi_descriptor_evidence.binding_mask |= mask;
+                                    fsi_descriptor_evidence.binding_count += 1;
+                                }
+                                fsi_descriptor_evidence.bindings[binding_index] = .{
+                                    .binding = write.dst_binding,
+                                    .descriptor_count = write.descriptor_count,
+                                    .guest_buffer = guest_buffer,
+                                    .native_buffer = buffer.buffer,
+                                    .guest_offset = guest_offset,
+                                    .guest_range = guest_range,
+                                    .offset = buffer.offset,
+                                    .range = buffer.range,
+                                    .repaired = repaired,
+                                };
+                            }
                         }
                         write.buffer_info = if (count == 0) null else buffers[buffer_cursor..].ptr;
                         write.image_info = null;
@@ -5994,6 +8188,22 @@ pub const Forwarder = struct {
             @intCast(copy_count),
             if (copy_count == 0) null else &copies,
         );
+        if (self.native_texture_state) |native| {
+            for (writes[0..@intCast(write_count)]) |write| native.noteWrite(write);
+            for (copies[0..@intCast(copy_count)]) |copy| native.noteCopy(copy);
+        }
+        if (is_fsi_edram_zpd_update) {
+            self.vulkan_fsi_tracker.noteDescriptorUpdate(fsi_descriptor_evidence);
+            if (sparseVulkanSuccessLog(self.vulkan_fsi_tracker.descriptor_updates)) {
+                const b0 = fsi_descriptor_evidence.bindings[0];
+                const b1 = fsi_descriptor_evidence.bindings[1];
+                const b2 = fsi_descriptor_evidence.bindings[2];
+                machoCapturePrint(
+                    "macho-processor: Vulkan FSI DESCRIPTOR UPDATE: call={d} guest_set=0x{x} native_set=0x{x} bindings={d}/3 mask=0x{x} b0(guest/native/offset/range/count)=0x{x}/0x{x}/{d}/{d}/{d} b1=0x{x}/0x{x}/{d}/{d}/{d} b2=0x{x}/0x{x}/{d}/{d}/{d} zpd_repaired={}; only fully admitted writes reach the driver, and this tuple identifies the EDRAM inputs consumed by later FSI draws\n",
+                    .{ fsi_descriptor_evidence.update_call, fsi_descriptor_evidence.guest_set, fsi_descriptor_evidence.native_set, fsi_descriptor_evidence.binding_count, fsi_descriptor_evidence.binding_mask, b0.guest_buffer, b0.native_buffer, b0.offset, b0.range, b0.descriptor_count, b1.guest_buffer, b1.native_buffer, b1.offset, b1.range, b1.descriptor_count, b2.guest_buffer, b2.native_buffer, b2.offset, b2.range, b2.descriptor_count, b2.repaired },
+                );
+            }
+        }
         self.vulkan_descriptor_update_forwarded +|= 1;
         self.vulkan_descriptor_native_writes +|= write_count;
         self.vulkan_descriptor_native_copies +|= copy_count;
@@ -6243,6 +8453,14 @@ pub const Forwarder = struct {
             }
         }
         function(self.real_vulkan.device.?, destination, template, if (required == 0) null else @ptrCast(host_data.ptr));
+        if (self.native_texture_state) |native| {
+            for (record.entries[0..record.entry_count]) |entry| {
+                if (entry.dst_binding != 0 or entry.dst_array_element != 0) continue;
+                var write = abi.WriteDescriptorSet{ .dst_set = destination, .descriptor_count = entry.descriptor_count, .descriptor_type = entry.descriptor_type };
+                if (entry.descriptor_type == 7 and entry.descriptor_count == 1) write.buffer_info = @ptrCast(@alignCast(host_data[@intCast(entry.offset)..].ptr));
+                native.noteWrite(write);
+            }
+        }
         self.vulkan_tiers.note(.descriptor_set, .real);
     }
 
@@ -6298,18 +8516,27 @@ pub const Forwarder = struct {
             if (self.real_vulkan.realSampler(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_sampler) |function| function(device, real, null);
             _ = self.releaseVulkanHandle(&self.real_vulkan.sampler_map, handle);
         } else if (std.mem.eql(u8, name, "vkDestroyDescriptorSetLayout")) {
-            if (self.real_vulkan.realDescriptorSetLayout(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_descriptor_set_layout) |function| function(device, real, null);
+            if (self.real_vulkan.realDescriptorSetLayout(handle)) |real| {
+                if (self.native_texture_state) |native| _ = native.set_layouts.remove(real);
+                if (self.real_vulkan.fn_ptrs.destroy_descriptor_set_layout) |function| function(device, real, null);
+            }
             _ = self.releaseVulkanHandle(&self.real_vulkan.descriptor_set_layout_map, handle);
         } else if (std.mem.eql(u8, name, "vkDestroyPipelineLayout")) {
             if (self.real_vulkan.realPipelineLayout(handle)) |real| {
                 if (self.real_vulkan.fn_ptrs.destroy_pipeline_layout) |function| function(device, real, null);
                 self.forgetPipelineLayout(real);
+                if (self.native_texture_state) |native| native.forgetLayout(&self.real_vulkan, real);
             }
             _ = self.releaseVulkanHandle(&self.real_vulkan.pipeline_layout_map, handle);
         } else if (std.mem.eql(u8, name, "vkDestroyShaderModule")) {
-            if (self.real_vulkan.realShaderModule(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_shader_module) |function| function(device, real, null);
+            if (self.real_vulkan.realShaderModule(handle)) |real| {
+                if (self.native_texture_state) |native| _ = native.shaders.remove(real);
+                if (self.real_vulkan.fn_ptrs.destroy_shader_module) |function| function(device, real, null);
+            }
+            self.vulkan_fsi_tracker.forgetShader(handle);
             _ = self.releaseVulkanHandle(&self.real_vulkan.shader_module_map, handle);
         } else if (std.mem.eql(u8, name, "vkDestroyRenderPass")) {
+            if (self.real_vulkan.realRenderPass(handle)) |real| self.fsiForgetRenderPass(real);
             if (self.real_vulkan.realRenderPass(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_render_pass) |function| function(device, real, null);
             _ = self.releaseVulkanHandle(&self.real_vulkan.render_pass_map, handle);
             self.forgetRenderPass(handle);
@@ -6326,10 +8553,12 @@ pub const Forwarder = struct {
                 }
                 if (self.real_vulkan.fn_ptrs.destroy_pipeline) |function| function(device, real, null);
                 self.forgetGraphicsPipeline(real);
+                self.forgetRectangleExpandedPipeline(real);
             }
             _ = self.releaseVulkanHandle(&self.real_vulkan.pipeline_map, handle);
         } else if (std.mem.eql(u8, name, "vkDestroyBuffer")) {
             if (self.real_vulkan.realBuffer(handle)) |real| {
+                if (self.native_texture_state) |native| native.forgetBuffer(real);
                 if (real == self.rect_expand_builtin_index_buffer) self.rect_expand_builtin_index_buffer = 0;
                 if (self.real_vulkan.fn_ptrs.destroy_buffer) |function| function(device, real, null);
             }
@@ -6361,6 +8590,7 @@ pub const Forwarder = struct {
         } else if (std.mem.eql(u8, name, "vkDestroyCommandPool")) {
             if (self.real_vulkan.realCommandPool(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_command_pool) |function| function(device, real, null);
             _ = self.releaseVulkanHandle(&self.real_vulkan.command_pool_map, handle);
+            self.fsiResetCommandPool(handle, true);
         } else if (std.mem.eql(u8, name, "vkDestroyDescriptorPool")) {
             if (self.real_vulkan.realDescriptorPool(handle)) |real| if (self.real_vulkan.fn_ptrs.destroy_descriptor_pool) |function| function(device, real, null);
             // Vulkan pool destruction implicitly frees every descriptor set
@@ -6413,6 +8643,9 @@ pub const Forwarder = struct {
             for (0..@as(usize, @intCast(count))) |index| {
                 const synthetic = state.read64(guest_context.registers(state).rcx + @as(u64, @intCast(index)) * 8);
                 _ = self.releaseVulkanHandle(&self.real_vulkan.command_buffer_map, synthetic);
+                if (self.native_texture_state) |native| native.resetCommand(synthetic);
+                self.vulkan_fsi_tracker.forgetCommandBuffer(synthetic);
+                self.fsiForgetCommandBuffer(synthetic);
                 for (&self.tracked_command_targets) |*record| {
                     if (record.synthetic == synthetic) record.* = .{};
                 }
@@ -6425,10 +8658,10 @@ pub const Forwarder = struct {
             if (self.real_vulkan.fn_ptrs.free_descriptor_sets) |function| _ = function(device, pool, @intCast(count), &sets);
             for (0..@as(usize, @intCast(count))) |index| {
                 const synthetic = state.read64(guest_context.registers(state).rcx + @as(u64, @intCast(index)) * 8);
+                self.forgetDescriptorSet(synthetic);
                 if (self.releaseVulkanHandle(&self.real_vulkan.descriptor_set_map, synthetic)) {
                     self.vulkan_descriptor_set_free_reclaims +|= 1;
                 }
-                self.forgetDescriptorSet(synthetic);
             }
         }
         return 0;
@@ -6548,6 +8781,17 @@ pub const Forwarder = struct {
     /// by older paths that predate owner tagging.
     fn reclaimDescriptorSetsForPool(self: *Forwarder, pool: u64, reason: []const u8) usize {
         if (pool == 0) return 0;
+        if (self.native_texture_state) |native| {
+            for (&self.real_vulkan.descriptor_set_map) |*entry| {
+                const mapped = HandleMap.snapshot(entry) orelse continue;
+                if (mapped.owner == pool) native.forgetSet(&self.real_vulkan, mapped.real);
+            }
+            for (self.tracked_descriptor_sets[0..self.tracked_descriptor_set_index.highWater()]) |record| {
+                if (record.synthetic != 0 and record.pool == pool) {
+                    if (self.real_vulkan.realDescriptorSet(record.synthetic)) |real| native.forgetSet(&self.real_vulkan, real);
+                }
+            }
+        }
         var reclaimed = HandleMap.removeOwned(&self.real_vulkan.descriptor_set_map, pool);
         for (self.tracked_descriptor_sets[0..self.tracked_descriptor_set_index.highWater()]) |*record| {
             if (record.synthetic == 0 or record.pool != pool) continue;
@@ -6576,11 +8820,12 @@ pub const Forwarder = struct {
     fn reclaimOrphanedDescriptorSets(self: *Forwarder) usize {
         var reclaimed: usize = 0;
         for (&self.real_vulkan.descriptor_set_map) |*entry| {
-            if (entry.synthetic == 0 or entry.owner == 0) continue;
-            if (HandleMap.findReal(&self.real_vulkan.descriptor_pool_map, entry.owner) != null) continue;
-            const synthetic = entry.synthetic;
-            entry.* = .{};
+            const mapped = HandleMap.snapshot(entry) orelse continue;
+            if (mapped.owner == 0) continue;
+            if (HandleMap.findReal(&self.real_vulkan.descriptor_pool_map, mapped.owner) != null) continue;
+            const synthetic = mapped.synthetic;
             self.forgetDescriptorSet(synthetic);
+            if (!HandleMap.remove(&self.real_vulkan.descriptor_set_map, synthetic)) continue;
             reclaimed += 1;
         }
         if (reclaimed != 0) {
@@ -6710,11 +8955,12 @@ pub const Forwarder = struct {
         };
     }
 
-    fn noteDescriptorSetImage(self: *Forwarder, set: u64, binding: u32, array_element: u32, image: u64, unknown: bool) void {
+    fn noteDescriptorSetImage(self: *Forwarder, set: u64, binding: u32, array_element: u32, image: u64, image_view: u64, unknown: bool) void {
         const record = self.mutableDescriptorSet(set) orelse return;
         for (record.images[0..@as(usize, @intCast(record.image_count))]) |*known| {
             if (known.binding != binding or known.array_element != array_element) continue;
             known.image = image;
+            known.image_view = image_view;
             if (unknown) record.unknown_image_views = true;
             return;
         }
@@ -6726,6 +8972,7 @@ pub const Forwarder = struct {
             .binding = binding,
             .array_element = array_element,
             .image = image,
+            .image_view = image_view,
         };
         record.image_count += 1;
         if (unknown) record.unknown_image_views = true;
@@ -6751,7 +8998,7 @@ pub const Forwarder = struct {
                 self.target_unknown_events +|= 1;
             }
         }
-        self.noteDescriptorSetImage(set, binding, array_element, image, unknown);
+        self.noteDescriptorSetImage(set, binding, array_element, image, info.image_view, unknown);
     }
 
     fn trackDescriptorImageWrites(self: *Forwarder, state: anytype, writes: []const abi.WriteDescriptorSet) void {
@@ -6830,8 +9077,9 @@ pub const Forwarder = struct {
                         self.texel_custody_samples +|= 1;
                         if (stats.nonzero_bytes == 0) self.texel_custody_zero +|= 1;
                         self.texel_custody_last_format = view.format;
+                        self.texel_custody_last_channel_pairs_differ = stats.channel_pairs_differ;
                         self.texel_custody_last_shape = stats.shape;
-                        self.texel_custody_last_out = .{ stats.out_max, stats.out_7e3_one, stats.out_mid };
+                        self.texel_custody_last_out_rgb = .{ stats.out_max_rgb, stats.out_7e3_one_rgb, stats.out_mid_rgb };
                         switch (stats.shape) {
                             .xenia_default_linear => self.texel_custody_default_samples +|= 1,
                             .programmed => self.texel_custody_programmed_samples +|= 1,
@@ -6839,7 +9087,7 @@ pub const Forwarder = struct {
                         }
                         if ((!view.observed or view.last_hash != stats.hash) and self.texel_custody_printed < 24) {
                             self.texel_custody_printed += 1;
-                            machoCapturePrint("macho-processor: TEXEL CUSTODY: command=0x{x} set_index={d} set=0x{x} binding={d} view=0x{x} native_view=0x{x} buffer=0x{x} native_buffer=0x{x} memory=0x{x} offset={d} format={d} bytes={d} hash=0x{x} nonzero_bytes={d} entries={d} min={d}/{d}/{d} max={d}/{d}/{d} ramp_shape={s} ramp_out(max/7e3_one/mid)={d}/{d}/{d} of 1023; native mapped lookup bytes after shadow publication, not an exposure correction. A shape of xenia_default_linear is the ramp Xenia seeds before any title write reaches DC_LUT\n", .{ command_buffer, bound.set_index, bound.synthetic, binding.binding, view.synthetic, self.real_vulkan.realBufferView(view.synthetic) orelse 0, view.buffer, self.real_vulkan.realBuffer(view.buffer) orelse 0, resource.memory, offset, view.format, view.range, stats.hash, stats.nonzero_bytes, stats.entries, stats.min[0], stats.min[1], stats.min[2], stats.max[0], stats.max[1], stats.max[2], stats.shape.label(), stats.out_max, stats.out_7e3_one, stats.out_mid });
+                            machoCapturePrint("macho-processor: TEXEL CUSTODY: command=0x{x} set_index={d} set=0x{x} binding={d} view=0x{x} native_view=0x{x} buffer=0x{x} native_buffer=0x{x} memory=0x{x} offset={d} format={d} bytes={d} hash=0x{x} nonzero_bytes={d} entries={d} min={d}/{d}/{d} max={d}/{d}/{d} ramp_shape={s} ramp_out_rgb(max/7e3_one/mid)=({d},{d},{d})/({d},{d},{d})/({d},{d},{d}) of 1023; channels are red/green/blue, native mapped lookup bytes after shadow publication, not an exposure correction. A shape of xenia_default_linear is the ramp Xenia seeds before any title write reaches DC_LUT\n", .{ command_buffer, bound.set_index, bound.synthetic, binding.binding, view.synthetic, self.real_vulkan.realBufferView(view.synthetic) orelse 0, view.buffer, self.real_vulkan.realBuffer(view.buffer) orelse 0, resource.memory, offset, view.format, view.range, stats.hash, stats.nonzero_bytes, stats.entries, stats.min[0], stats.min[1], stats.min[2], stats.max[0], stats.max[1], stats.max[2], stats.shape.label(), stats.out_max_rgb[0], stats.out_max_rgb[1], stats.out_max_rgb[2], stats.out_7e3_one_rgb[0], stats.out_7e3_one_rgb[1], stats.out_7e3_one_rgb[2], stats.out_mid_rgb[0], stats.out_mid_rgb[1], stats.out_mid_rgb[2] });
                         }
                         view.observed = true;
                         view.last_hash = stats.hash;
@@ -6894,7 +9142,7 @@ pub const Forwarder = struct {
             // Clear a destination slot before copying so a descriptor that was
             // not previously tracked cannot leave a stale sampled image in the
             // route ledger.
-            self.noteDescriptorSetImage(copy.dst_set, copy.dst_binding, dst_array_element, 0, false);
+            self.noteDescriptorSetImage(copy.dst_set, copy.dst_binding, dst_array_element, 0, 0, false);
         }
         for (source.images[0..@as(usize, @intCast(source.image_count))]) |image| {
             if (image.binding != copy.src_binding or image.array_element < copy.src_array_element) continue;
@@ -6904,7 +9152,7 @@ pub const Forwarder = struct {
                 self.noteTargetOverflow(.descriptor_address_arithmetic);
                 continue;
             };
-            self.noteDescriptorSetImage(copy.dst_set, copy.dst_binding, dst_array_element, image.image, false);
+            self.noteDescriptorSetImage(copy.dst_set, copy.dst_binding, dst_array_element, image.image, image.image_view, false);
         }
     }
 
@@ -7013,16 +9261,57 @@ pub const Forwarder = struct {
     fn noteCommandPassTarget(self: *Forwarder, command_buffer: u64, framebuffer: u64) void {
         const record = self.mutableCommandTargets(command_buffer) orelse return;
         record.current_pass_target = 0;
+        record.current_pass_target_source = .unknown;
+        self.vulkan_fsi_tracker.setTarget(command_buffer, 0, .unknown);
         const frame = self.trackedFramebuffer(framebuffer) orelse return;
         if (frame.attachment_count == 0) return;
         const view = self.trackedImageView(frame.attachments[0]) orelse return;
         record.current_pass_target = view.image;
+        record.current_pass_target_source = .render_pass;
+        self.vulkan_fsi_tracker.setTarget(command_buffer, view.image, .render_pass);
+    }
+
+    const CommandPassTarget = struct {
+        image: u64,
+        source: fsi_diagnostics.TargetSource,
+    };
+
+    fn commandPassTarget(self: *const Forwarder, command_buffer: u64) ?CommandPassTarget {
+        for (self.tracked_command_targets) |record| {
+            if (record.synthetic != command_buffer) continue;
+            return .{ .image = record.current_pass_target, .source = record.current_pass_target_source };
+        }
+        return null;
+    }
+
+    fn noteCommandDynamicTarget(self: *Forwarder, command_buffer: u64, guest_image_view: u64) void {
+        const target_image = if (guest_image_view != 0)
+            (if (self.trackedImageView(guest_image_view)) |view| view.image else 0)
+        else
+            0;
+        if (self.mutableCommandTargets(command_buffer)) |record| {
+            record.current_pass_target = target_image;
+            record.current_pass_target_source = .dynamic_rendering;
+        }
+        if (target_image == 0) {
+            if (self.vulkan_fsi_tracker.isFsiPipelineBound(command_buffer)) {
+                self.vulkan_fsi_tracker.noteDynamicTargetUnresolved();
+                if (self.vulkan_fsi_tracker.dynamic_targets_unresolved <= 4) machoCapturePrint(
+                    "macho-processor: Vulkan FSI target unresolved: source=dynamic_rendering command_buffer=0x{x} guest_image_view=0x{x}; the draw can still be forwarded, but image attribution is unavailable\n",
+                    .{ command_buffer, guest_image_view },
+                );
+            }
+            return;
+        }
+        self.vulkan_fsi_tracker.setTarget(command_buffer, target_image, .dynamic_rendering);
     }
 
     fn clearCommandPassTarget(self: *Forwarder, command_buffer: u64) void {
+        self.vulkan_fsi_tracker.setTarget(command_buffer, 0, .unknown);
         for (&self.tracked_command_targets) |*record| {
             if (record.synthetic == command_buffer) {
                 record.current_pass_target = 0;
+                record.current_pass_target_source = .unknown;
                 return;
             }
         }
@@ -7059,7 +9348,16 @@ pub const Forwarder = struct {
             for (set.images[0..@as(usize, @intCast(set.image_count))]) |image| {
                 if (image.image == 0) continue;
                 const real_sampled = self.real_vulkan.realImage(image.image) orelse continue;
-                self.present_chain.noteRenderPassSource(real_target, real_sampled);
+                var sampling: rosette_gpu.PresentPassSourceView = .{ .image = real_sampled, .view = image.image_view };
+                if (self.trackedImageView(image.image_view)) |view| {
+                    sampling.format = view.format;
+                    sampling.components = view.components;
+                    sampling.base_mip = view.base_mip;
+                    sampling.base_layer = view.base_layer;
+                    sampling.view_type = view.view_type;
+                    sampling.known = view.format != 0;
+                }
+                self.present_chain.noteRenderPassSourceView(real_target, sampling);
                 self.vulkan_pass_source_edges +|= 1;
             }
         }
@@ -7207,6 +9505,17 @@ pub const Forwarder = struct {
     }
 
     fn resetCommandTargets(self: *Forwarder, synthetic: u64) void {
+        // Pipeline and index bindings are command-buffer recording state. A
+        // recycled buffer must not inherit the rectangle expansion decision
+        // from its previous recording, even if its first draw precedes a new
+        // graphics pipeline or index bind.
+        for (&self.rect_expand_command_states) |*entry| {
+            if (entry.command_buffer == synthetic) {
+                entry.* = .{ .command_buffer = synthetic };
+                break;
+            }
+        }
+        self.vulkan_fsi_tracker.resetCommandBuffer(synthetic);
         const record = self.mutableCommandTargets(synthetic) orelse return;
         record.* = .{ .synthetic = synthetic };
     }
@@ -7294,6 +9603,13 @@ pub const Forwarder = struct {
             return;
         }
         if (!self.recordImageView(synthetic, info.image)) self.noteTargetOverflow(.image_view_table);
+        if (self.tracked_image_view_index.find(synthetic)) |slot| {
+            self.tracked_image_views[slot].format = info.format;
+            self.tracked_image_views[slot].components = info.components;
+            self.tracked_image_views[slot].base_mip = info.subresource_range[1];
+            self.tracked_image_views[slot].base_layer = info.subresource_range[3];
+            self.tracked_image_views[slot].view_type = info.view_type;
+        }
     }
 
     fn trackFramebuffer(self: *Forwarder, state: anytype, synthetic: u64, create_info: u64) void {
@@ -7460,6 +9776,7 @@ pub const Forwarder = struct {
 
     fn mergeCommandTargets(self: *Forwarder, destination: u64, source: u64) void {
         if (destination == source) return;
+        self.vulkan_fsi_tracker.mergeCommandBuffer(destination, source);
         var images: [MAX_TRACKED_TARGET_ATTACHMENTS]u64 = [_]u64{0} ** MAX_TRACKED_TARGET_ATTACHMENTS;
         var sampled_images: [MAX_TRACKED_DESCRIPTOR_IMAGES]u64 = [_]u64{0} ** MAX_TRACKED_DESCRIPTOR_IMAGES;
         var transfers: [MAX_TRACKED_RESOURCE_TRANSFERS]TrackedImageTransfer = [_]TrackedImageTransfer{.{}} ** MAX_TRACKED_RESOURCE_TRANSFERS;
@@ -7517,6 +9834,15 @@ pub const Forwarder = struct {
                 }
                 record.current_pass_target = saved_target;
             }
+        }
+    }
+
+    fn noteFsiSubmittedCommandBuffer(self: *Forwarder, command_buffer: u64, queue_submit_ordinal: u64, batch_index: u32) void {
+        if (self.vulkan_fsi_tracker.noteSubmitted(command_buffer, queue_submit_ordinal, batch_index)) |submitted| {
+            if (sparseVulkanSuccessLog(self.vulkan_fsi_tracker.submitted_command_buffers)) machoCapturePrint(
+                "macho-processor: Vulkan FSI SUBMIT: ordinal={d} queue_submit={d} batch={d} command_buffer=0x{x} fsi_commands={d} last(kind/pipeline_hash/shader_hash/module/target/source/draw_ordinal)={s}/0x{x}/0x{x}/{d}/0x{x}/{s}/{d}; host success proves MoltenVK accepted this recorded interlock draw sequence\n",
+                .{ self.vulkan_fsi_tracker.submitted_command_buffers, submitted.queue_submit_ordinal, submitted.batch_index, submitted.draw.command_buffer, submitted.fsi_draws_in_command_buffer, @tagName(submitted.draw.kind), submitted.draw.pipeline_hash, submitted.draw.shader_hash, submitted.draw.module_id, submitted.draw.target_image, @tagName(submitted.draw.target_source), submitted.draw.draw_ordinal },
+            );
         }
     }
 
@@ -7651,6 +9977,7 @@ pub const Forwarder = struct {
     }
 
     fn forgetDescriptorSet(self: *Forwarder, synthetic: u64) void {
+        if (self.native_texture_state) |native| if (self.real_vulkan.realDescriptorSet(synthetic)) |real| native.forgetSet(&self.real_vulkan, real);
         if (self.tracked_descriptor_set_index.remove(synthetic)) |slot| self.tracked_descriptor_sets[slot] = .{};
     }
 
@@ -7725,6 +10052,71 @@ pub const Forwarder = struct {
             "macho-processor:   marshal_scratch: capacity={d} used={d} spill_reserves={d} peak_bytes={d} spill_failures={d} refusals={d}\n",
             .{ self.vulkan_scratch.capacity(), self.vulkan_scratch.used, self.vulkan_marshal_spill_reserves, self.vulkan_marshal_spill_peak_bytes, self.vulkan_marshal_spill_failures, self.vulkan_marshal_refusals },
         );
+        machoCapturePrint(
+            "macho-processor:   tessellation_pipeline: candidates={d} native_success={d} native_failure={d} bridge_refusal={d} missing_tessellation_state={d} stage_mask_or=0x{x}; mask bit 0=tessellation_control, bit 1=tessellation_evaluation; no candidates means the guest shader/pipeline generator did not submit a tessellation pipeline to Rosetta\n",
+            .{ self.vulkan_tessellation_pipeline_candidates, self.vulkan_tessellation_pipeline_driver_successes, self.vulkan_tessellation_pipeline_driver_failures, self.vulkan_tessellation_pipeline_marshal_refusals, self.vulkan_tessellation_pipeline_missing_state, self.vulkan_tessellation_stage_mask_or },
+        );
+        machoCapturePrint(
+            "macho-processor:   tessellation_shader_modules: control(candidate/native_success/native_failure)={d}/{d}/{d} evaluation={d}/{d}/{d} spirv_unreadable={d}; candidates come from SPIR-V OpEntryPoint before native creation and diagnose the earlier module-creation warning\n",
+            .{ self.vulkan_tess_control_shader_modules, self.vulkan_tess_control_shader_modules_native_success, self.vulkan_tess_control_shader_modules_native_failure, self.vulkan_tess_eval_shader_modules, self.vulkan_tess_eval_shader_modules_native_success, self.vulkan_tess_eval_shader_modules_native_failure, self.vulkan_shader_module_spirv_unreadable },
+        );
+        machoCapturePrint(
+            "macho-processor:   fsi_shader_modules: candidates/native_success/native_failure={d}/{d}/{d} capability_mask=0x{x} begin_ops/end_ops={d}/{d}; a nonzero SPIR-V interlock module proves Xenia generated an FSI shader, while zero means device extension negotiation alone did not select the FSI rendering path\n",
+            .{ self.vulkan_fsi_shader_modules, self.vulkan_fsi_shader_modules_native_success, self.vulkan_fsi_shader_modules_native_failure, self.vulkan_fsi_spirv_capability_mask, self.vulkan_fsi_spirv_begin_ops, self.vulkan_fsi_spirv_end_ops },
+        );
+        machoCapturePrint(
+            "macho-processor:   fsi_render_target_path: matching_edram_layouts={d} shared_memory_binding_count={s}:{d} host_maxPerStageDescriptorStorageBuffers={d} would_fallback_at_limit={s} count_matches_host_range={s}; the exact three-binding Xenia EDRAM/ZPD layout is emitted only after FSI path selection, while zero means Xenia stayed on host render targets or failed earlier\n",
+            .{
+                self.vulkan_fsi_descriptor_layouts,
+                if (self.vulkan_fsi_shared_memory_binding_count_known) "observed" else "unknown",
+                self.vulkan_fsi_shared_memory_binding_count,
+                self.vulkan_fsi_host_storage_buffer_limit,
+                if (!self.vulkan_fsi_host_storage_buffer_limit_known) "unknown" else if (self.vulkan_fsi_binding_limit_would_fallback) "yes" else "no",
+                if (!self.vulkan_fsi_binding_count_matches_host_range_known) "unknown" else if (self.vulkan_fsi_binding_count_matches_host_range) "yes" else "no",
+            },
+        );
+        const fsi = &self.vulkan_fsi_tracker;
+        machoCapturePrint(
+            "macho-processor:   fsi_flow: shaders(live/overflow/issued)={d}/{d}/{d} pipelines(candidate/native_success/native_failure/live/overflow)={d}/{d}/{d}/{d}/{d} binds={d} recorded_draws={d} accepted_command_buffers/draws={d}/{d} descriptor_updates={d} command_state_collisions={d}; this links shader identity through pipeline, target, draw and accepted queue submission without changing guest work\n",
+            .{ fsi.shader_count, fsi.shader_identity_overflow, fsi.shader_ids_issued, fsi.pipeline_candidates, fsi.pipeline_native_successes, fsi.pipeline_native_failures, fsi.pipeline_count, fsi.pipeline_identity_overflow, fsi.pipeline_binds, fsi.draws, fsi.submitted_command_buffers, fsi.submitted_draws, fsi.descriptor_updates, fsi.command_state_collisions },
+        );
+        machoCapturePrint(
+            "macho-processor:   fsi_target_routing: target_updates_before_fsi_bind={d} propagated_on_bind={d} dynamic_resolved={d} dynamic_unresolved={d} secondary_inherited={d} secondary_unresolved={d}; source identifies the forwarder's attachment provenance, not a framebuffer rewrite\n",
+            .{ fsi.target_updates_before_fsi_pipeline, fsi.target_propagations_on_bind, fsi.dynamic_targets_resolved, fsi.dynamic_targets_unresolved, fsi.secondary_targets_inherited, fsi.secondary_targets_unresolved },
+        );
+        if (fsi.pipeline_candidates != 0) {
+            machoCapturePrint(
+                "macho-processor:   fsi_last_pipeline: native_success={} real=0x{x} module_id={d} shader_hash=0x{x} pipeline_hash=0x{x} stage_flags=0x{x} modules={d} capabilities=0x{x} begin/end={d}/{d}\n",
+                .{ fsi.last_pipeline_native_success, fsi.last_pipeline_real, fsi.last_pipeline.module_id, fsi.last_pipeline.shader_hash, fsi.last_pipeline.combined_hash, fsi.last_pipeline.stage_flags_or, fsi.last_pipeline.shader_count, fsi.last_pipeline.capability_mask, fsi.last_pipeline.begin_ops, fsi.last_pipeline.end_ops },
+            );
+        }
+        if (fsi.draws != 0) {
+            const draw = fsi.last_draw;
+            machoCapturePrint(
+                "macho-processor:   fsi_last_draw: ordinal={d} kind={s} command_buffer=0x{x} pipeline=0x{x} shader_hash=0x{x} pipeline_hash=0x{x} target_image=0x{x} target_source={s}\n",
+                .{ draw.draw_ordinal, @tagName(draw.kind), draw.command_buffer, draw.pipeline_real, draw.shader_hash, draw.pipeline_hash, draw.target_image, @tagName(draw.target_source) },
+            );
+        }
+        if (fsi.submitted_command_buffers != 0) {
+            const submitted = fsi.last_submission;
+            machoCapturePrint(
+                "macho-processor:   fsi_last_submit: queue_submit={d} batch={d} command_buffer=0x{x} fsi_draws={d} draw_ordinal={d} kind={s} target_image=0x{x} target_source={s}\n",
+                .{ submitted.queue_submit_ordinal, submitted.batch_index, submitted.draw.command_buffer, submitted.fsi_draws_in_command_buffer, submitted.draw.draw_ordinal, @tagName(submitted.draw.kind), submitted.draw.target_image, @tagName(submitted.draw.target_source) },
+            );
+        }
+        if (fsi.descriptor_updates != 0) {
+            const update = fsi.last_descriptor_update;
+            machoCapturePrint(
+                "macho-processor:   fsi_last_descriptors: call={d} set(guest/native)=0x{x}/0x{x} bindings={d}/3 mask=0x{x}\n",
+                .{ update.update_call, update.guest_set, update.native_set, update.binding_count, update.binding_mask },
+            );
+            for (update.bindings, 0..) |binding, index| {
+                machoCapturePrint(
+                    "macho-processor:     fsi_descriptor_binding: slot={d} present={} binding={d} descriptors={d} buffer(guest/native)=0x{x}/0x{x} offset(guest/native)={d}/{d} range(guest/native)={d}/{d} zpd_repaired={}\n",
+                    .{ index, update.binding_mask & (@as(u8, 1) << @intCast(index)) != 0, binding.binding, binding.descriptor_count, binding.guest_buffer, binding.native_buffer, binding.guest_offset, binding.offset, binding.guest_range, binding.range, binding.repaired },
+                );
+            }
+        }
         for (self.vulkan_create_ledger[0..self.vulkan_create_ledger_count]) |entry| {
             const lost = entry.attempts -| entry.published;
             machoCapturePrint(
@@ -8278,6 +10670,7 @@ pub const Forwarder = struct {
             var real_buffer: abi.Buffer = 0;
             const result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_buffer);
             if (result == 0 and real_buffer != 0) {
+                if (self.native_texture_state) |native| native.noteBuffer(real_buffer, state.read64(create_info + VK_BUFFER_CREATE_INFO_SIZE_OFFSET));
                 _ = self.mapVulkanHandle(&self.real_vulkan.buffer_map, synthetic_handle, real_buffer, "vkCreateBuffer");
                 // VkBufferCreateInfo: size at +24, usage at +32.
                 if (rectExpansionBuiltinIndexBuffer(state.read64(create_info + 24), state.read32(create_info + 32))) {
@@ -8319,23 +10712,93 @@ pub const Forwarder = struct {
             // handing the driver a guest address.
 
             const info = self.marshalCreateInfo(state, create_info, name) orelse return error.InvalidInfo;
+            const module_info: *marshal.ShaderModuleCreateInfo = @ptrCast(@alignCast(info.ptr));
+            const ModuleInspection = struct {
+                stages: gpu_vulkan.spirv_stage.ModuleStages,
+                fingerprint: u64,
+            };
+            const module_inspection: ModuleInspection = blk: {
+                if (module_info.code_size < 20 or module_info.code_size % 4 != 0) break :blk .{
+                    .stages = gpu_vulkan.spirv_stage.inspect(&.{}),
+                    .fingerprint = @as(u64, 0),
+                };
+                const code = module_info.code orelse break :blk .{
+                    .stages = gpu_vulkan.spirv_stage.inspect(&.{}),
+                    .fingerprint = @as(u64, 0),
+                };
+                const words: [*]const u32 = @ptrCast(@alignCast(code));
+                const word_slice = words[0 .. module_info.code_size / 4];
+                break :blk .{
+                    .stages = gpu_vulkan.spirv_stage.inspect(word_slice),
+                    .fingerprint = fsi_diagnostics.spirvFingerprint(word_slice),
+                };
+            };
+            const module_stages = module_inspection.stages;
+            if (!module_stages.valid or !module_stages.has_entry_point) {
+                self.vulkan_shader_module_spirv_unreadable +|= 1;
+            }
+            const native_format = if (self.native_texture_state != null and module_info.code != null and module_stages.valid)
+                native_texture.identify(@as([*]const u8, @ptrCast(module_info.code.?))[0..module_info.code_size])
+            else
+                null;
+            const has_fsi_interlock = module_stages.usesFragmentShaderInterlock();
+            if (has_fsi_interlock) {
+                self.vulkan_fsi_shader_modules +|= 1;
+                self.vulkan_fsi_spirv_capability_mask |= module_stages.fragment_interlock_capabilities;
+                self.vulkan_fsi_spirv_begin_ops +|= module_stages.begin_interlock_ops;
+                self.vulkan_fsi_spirv_end_ops +|= module_stages.end_interlock_ops;
+            }
+            const tessellation_stage_mask = module_stages.tessellationMask();
+            if ((tessellation_stage_mask & 1) != 0) self.vulkan_tess_control_shader_modules +|= 1;
+            if ((tessellation_stage_mask & 2) != 0) self.vulkan_tess_eval_shader_modules +|= 1;
             const create_fn = self.real_vulkan.fn_ptrs.create_shader_module orelse return error.MissingFn;
+            self.fsiSaveShaderEvidence(synthetic_handle, @ptrCast(@alignCast(info.ptr)), .guest);
+            const hdr_resolve = self.correctHdrResolve(info) catch {
+                self.real_create_result = abi.ERROR_OUT_OF_HOST_MEMORY;
+                return;
+            };
+            defer if (hdr_resolve) |words| std.heap.c_allocator.free(words);
             // Give a vertex shader the ability to expand a Xenos rectangle
             // list itself. Xenia's SPIR-V translator never implemented the
             // `kRectangleListAsTriangleStrip` fallback it selects on a host
             // with no geometry shader, so without this the fourth corner of
             // every rectangle is never shaded. See `rect_list_expand`.
-            const expanded = self.expandRectangleListShader(info);
+            const expanded = self.expandRectangleListShader(info, synthetic_handle, module_inspection.fingerprint);
             defer if (expanded) |expansion| std.heap.c_allocator.free(expansion.words);
+            const pixel_frequency = self.normalizeFsiPixelFrequency(info) catch {
+                self.real_create_result = abi.ERROR_OUT_OF_HOST_MEMORY;
+                return;
+            };
+            defer if (pixel_frequency) |words| std.heap.c_allocator.free(words);
+            // Then bound every dynamic index: Metal has no robustBufferAccess.
+            const hardened = self.hardenShaderModule(info, synthetic_handle) catch {
+                self.fsiUpdateShaderBoundsBudget();
+                self.real_create_result = abi.ERROR_INITIALIZATION_FAILED;
+                return;
+            };
+            defer if (hardened) |hardening| std.heap.c_allocator.free(hardening.words);
             var real_module: u64 = 0;
             var result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_module);
+            if (result != 0 and hdr_resolve != null) self.hdr_resolve_driver_rejections +|= 1;
+            if (result != 0 and pixel_frequency != null) self.fsi_pixel_frequency_driver_rejections +|= 1;
+            if (result != 0 and hardened != null) {
+                // A failed safety transform must never fall back to the
+                // original shader that can fault the GPU.
+                self.robust_access_driver_rejections +|= 1;
+                machoCapturePrint("macho-processor: VULKAN ROBUST ACCESS: the driver refused a hardened module (VkResult={d}); module=0x{x} refused before GPU use\n", .{ result, synthetic_handle });
+            }
             var expansion_used = expanded != null;
-            if (result != 0 and expanded != null) {
+            if (result != 0 and expanded != null and !self.robust_access_enabled) {
                 // The driver would not take the rewritten module. Put the
                 // guest's own SPIR-V back and create that instead: a rectangle
                 // with a missing fourth corner is a far better outcome than a
                 // pipeline this title cannot create at all.
                 const root: *marshal.ShaderModuleCreateInfo = @ptrCast(@alignCast(info.ptr));
+                self.rect_expand_last_driver_rejection_result = result;
+                self.rect_expand_last_driver_rejection_module = synthetic_handle;
+                self.rect_expand_last_driver_rejection_hash = module_inspection.fingerprint;
+                self.rect_expand_last_driver_rejection_bytes = @truncate(@min(expanded.?.original_size, @as(usize, std.math.maxInt(u32))));
+                self.metal_backend_health.noteGap(.rectangle_shader_driver_rejection);
                 root.code = expanded.?.original_code;
                 root.code_size = expanded.?.original_size;
                 expansion_used = false;
@@ -8346,12 +10809,33 @@ pub const Forwarder = struct {
                 );
                 result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_module);
             }
+            self.fsiUpdateShaderBoundsBudget();
             if (result == 0 and real_module != 0) {
+                self.fsiSaveShaderEvidence(synthetic_handle, @ptrCast(@alignCast(info.ptr)), .native);
+                self.metal_backend_health.noteSpirvModule();
+                if (native_format) |format| if (self.native_texture_state) |native| {
+                    native.noteShader(real_module, format);
+                    machoCapturePrint("macho-processor: NATIVE METAL TEXTURES: matched_exact_loader={s} guest_module=0x{x} native_module=0x{x}\n", .{ @tagName(format), synthetic_handle, real_module });
+                };
+                if (has_fsi_interlock) self.vulkan_fsi_shader_modules_native_success +|= 1;
+                if ((tessellation_stage_mask & 1) != 0) self.vulkan_tess_control_shader_modules_native_success +|= 1;
+                if ((tessellation_stage_mask & 2) != 0) self.vulkan_tess_eval_shader_modules_native_success +|= 1;
                 _ = self.mapVulkanHandle(&self.real_vulkan.shader_module_map, synthetic_handle, real_module, "vkCreateShaderModule");
+                if (has_fsi_interlock) {
+                    if (self.vulkan_fsi_tracker.rememberShader(synthetic_handle, module_inspection.fingerprint, @truncate(module_info.code_size), module_stages)) |identity| {
+                        machoCapturePrint(
+                            "macho-processor: Vulkan FSI SHADER: module_id={d} guest=0x{x} native=0x{x} spirv_hash=0x{x} bytes={d} execution_models=0x{x} capabilities=0x{x} begin/end={d}/{d}; stable content identity links this SPIR-V module to later pipeline, draw and submit records\n",
+                            .{ identity.id, synthetic_handle, real_module, identity.spirv_hash, identity.code_bytes, identity.execution_model_mask, identity.capability_mask, identity.begin_ops, identity.end_ops },
+                        );
+                    }
+                }
                 if (expansion_used) self.noteRectangleExpandedModule(real_module);
                 self.vulkan_real_objects_created +|= 1;
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreateShaderModule synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_module });
             } else {
+                if (has_fsi_interlock) self.vulkan_fsi_shader_modules_native_failure +|= 1;
+                if ((tessellation_stage_mask & 1) != 0) self.vulkan_tess_control_shader_modules_native_failure +|= 1;
+                if ((tessellation_stage_mask & 2) != 0) self.vulkan_tess_eval_shader_modules_native_failure +|= 1;
                 machoCapturePrint("macho-processor: vkCreateShaderModule FAILED: VkResult={d} info=0x{x}\n", .{ result, create_info });
                 self.real_create_result = if (result != abi.SUCCESS) result else abi.ERROR_INITIALIZATION_FAILED;
             }
@@ -8368,6 +10852,7 @@ pub const Forwarder = struct {
             const result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_rp);
             if (result == 0 and real_rp != 0) {
                 _ = self.mapVulkanHandle(&self.real_vulkan.render_pass_map, synthetic_handle, real_rp, "vkCreateRenderPass");
+                self.fsiNoteRenderPassCreated(real_rp, info);
                 self.vulkan_real_objects_created +|= 1;
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreateRenderPass synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_rp });
             } else {
@@ -8387,6 +10872,7 @@ pub const Forwarder = struct {
             const result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_fb);
             if (result == 0 and real_fb != 0) {
                 _ = self.mapVulkanHandle(&self.real_vulkan.framebuffer_map, synthetic_handle, real_fb, "vkCreateFramebuffer");
+                self.fsiNoteFramebufferCreated(info);
                 self.vulkan_real_objects_created +|= 1;
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreateFramebuffer synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_fb });
             } else {
@@ -8400,12 +10886,14 @@ pub const Forwarder = struct {
 
             // handing the driver a guest address.
 
+            self.observeFsiDescriptorSetLayout(state, create_info);
             const info = self.marshalCreateInfo(state, create_info, name) orelse return error.InvalidInfo;
             const create_fn = self.real_vulkan.fn_ptrs.create_descriptor_set_layout orelse return error.MissingFn;
             var real_layout: u64 = 0;
             const result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_layout);
             if (result == 0 and real_layout != 0) {
                 _ = self.mapVulkanHandle(&self.real_vulkan.descriptor_set_layout_map, synthetic_handle, real_layout, "vkCreateDescriptorSetLayout");
+                if (self.native_texture_state) |native| native.noteSetLayout(real_layout, @ptrCast(@alignCast(info.ptr)));
                 self.vulkan_real_objects_created +|= 1;
                 self.vulkan_tiers.note(.descriptor_set_layout, .real);
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreateDescriptorSetLayout synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_layout });
@@ -8427,6 +10915,7 @@ pub const Forwarder = struct {
             if (result == 0 and real_pl != 0) {
                 _ = self.mapVulkanHandle(&self.real_vulkan.pipeline_layout_map, synthetic_handle, real_pl, "vkCreatePipelineLayout");
                 self.rememberPipelineLayout(real_pl, info);
+                if (self.native_texture_state) |native| native.noteLayout(real_pl, @ptrCast(@alignCast(info.ptr)));
                 self.vulkan_real_objects_created +|= 1;
                 self.vulkan_tiers.note(.pipeline_layout, .real);
                 if (sparseVulkanSuccessLog(self.vulkan_real_objects_created)) machoCapturePrint("macho-processor: REAL Vulkan object sample: count={d} name=vkCreatePipelineLayout synthetic=0x{x} real=0x{x}\n", .{ self.vulkan_real_objects_created, synthetic_handle, real_pl });
@@ -9014,6 +11503,34 @@ pub const Forwarder = struct {
             "macho-processor:   counters: device_void={d} opaque={d} memory_allocs={d} memory_maps={d} queue_submits={d} fence_only_submits={d} real_queue_submits={d} presents={d} real_presents={d} real_present_completions={d} command_calls={d} real_command_calls={d} real_objects_created={d} real_objects_destroyed={d} shadow_uploads={d} shadow_upload_failures={d} fence_completions={d} device_lost_events={d} pipeline_cache_loads={d} pipeline_cache_saves={d}\n",
             .{ self.vulkan_device_void_calls, self.guest_opaque_calls, self.vulkan_memory_allocations, self.vulkan_memory_maps, self.vulkan_queue_submits, self.vulkan_fence_only_queue_submits, self.vulkan_real_queue_submits, self.vulkan_presents, self.vulkan_real_presents, self.vulkan_real_present_completions, self.vulkan_modeled_command_calls, self.vulkan_real_command_calls, self.vulkan_real_objects_created, self.vulkan_real_objects_destroyed, self.vulkan_shadow_uploads, self.vulkan_shadow_upload_failures, self.vulkan_fence_completions, self.vulkan_device_lost_events, self.vulkan_pipeline_cache_loads, self.vulkan_pipeline_cache_saves },
         );
+        if (self.vulkan_device_loss_evidence.first_api_detection) {
+            const loss = &self.vulkan_device_loss_evidence;
+            machoCapturePrint(
+                "macho-processor:   first_device_loss: operation={s} result={d} later_observations={d} guest_submits={d} native_submits_accepted={d} native_presents_accepted={d} present_completions={d} fence_completions={d} fsi_draws(recorded/submitted)={d}/{d} last_fsi_submit(queue/target)={d}/0x{x}; first Vulkan API detection retained across device recreation\n",
+                .{ loss.operationName(), loss.result, loss.occurrences, loss.guest_queue_submit_calls, loss.native_queue_submits_accepted, loss.native_presents_accepted, loss.native_present_completions, loss.fence_completions, loss.fsi_recorded_draws, loss.fsi_submitted_draws, loss.last_fsi_queue_submit, loss.last_fsi_target_image },
+            );
+            self.printDeviceLossFsiSubmission("device_loss_last_fsi_submission", loss.last_fsi_submission);
+        }
+        if (self.vulkan_device_loss_evidence.first_unexpected_error.first_observed) {
+            const failure = &self.vulkan_device_loss_evidence.first_unexpected_error;
+            machoCapturePrint(
+                "macho-processor:   first_unexpected_vulkan_error: operation={s} result={d} occurrences={d} guest_submits={d} native_submits_accepted={d} native_presents_accepted={d} present_completions={d} fence_completions={d} fsi_draws(recorded/submitted)={d}/{d} last_fsi_submit(queue/target)={d}/0x{x}; OUT_OF_DATE swapchain results are excluded; this is the earliest unexpected API error, not proof of the underlying driver fault\n",
+                .{ failure.operationName(), failure.result, failure.occurrences, failure.guest_queue_submit_calls, failure.native_queue_submits_accepted, failure.native_presents_accepted, failure.native_present_completions, failure.fence_completions, failure.fsi_recorded_draws, failure.fsi_submitted_draws, failure.last_fsi_queue_submit, failure.last_fsi_target_image },
+            );
+            self.printDeviceLossFsiSubmission("first_unexpected_error_last_fsi_submission", failure.last_fsi_submission);
+        }
+        machoCapturePrint(
+            "macho-processor: METAL BACKEND HEALTH: live_translation_path={s} Vulkan_SPIR-V_modules_forwarded={d} Rosette_native_MSL_modules={d}; Xenia's live shaders use the Vulkan driver's SPIR-V-to-MSL route unless a Rosette native-MSL dispatch is explicitly recorded, so offline AIR/metallib cache state is not evidence of live shader use\n",
+            .{ @tagName(self.metal_backend_health.live_translation_path), self.metal_backend_health.spirv_modules_forwarded, self.metal_backend_health.native_msl_modules },
+        );
+        for (std.enums.values(rosette_gpu.metal_backend_health.CapabilityGap)) |gap| {
+            const count = self.metal_backend_health.gapCount(gap);
+            if (count == 0) continue;
+            machoCapturePrint(
+                "macho-processor: METAL BACKEND GAP OBSERVED: kind={s} count={d}; this records an encountered refusal/rejection, not a guessed unsupported capability set\n",
+                .{ @tagName(gap), count },
+            );
+        }
         machoCapturePrint(
             "macho-processor:   marshal_scratch: capacity={d} used={d} spill_reserves={d} peak_bytes={d} spill_failures={d} refusals={d}; shader/module arrays are kept intact or refused, never truncated\n",
             .{ self.vulkan_scratch.capacity(), self.vulkan_scratch.used, self.vulkan_marshal_spill_reserves, self.vulkan_marshal_spill_peak_bytes, self.vulkan_marshal_spill_failures, self.vulkan_marshal_refusals },
@@ -9128,8 +11645,9 @@ pub const Forwarder = struct {
             native_queue = @intFromPtr(real_queue.?);
             queue = native_queue;
             _ = self.mapVulkanHandle(&self.real_vulkan.queue_map, queue, queue, "vkGetDeviceQueue");
-            for (self.real_vulkan.queue_map, 0..) |mapping, index| {
-                if (mapping.real == queue and mapping.synthetic != 0) {
+            for (&self.real_vulkan.queue_map, 0..) |*entry, index| {
+                const mapping = HandleMap.snapshot(entry) orelse continue;
+                if (mapping.real == queue) {
                     self.real_vulkan.queue_family_indices[index] = family_index;
                     break;
                 }
@@ -9401,6 +11919,8 @@ pub const Forwarder = struct {
         self.noteRealVulkanResult(result, "vkBeginCommandBuffer");
         if (result == abi.SUCCESS) {
             self.resetCommandTargets(guest_context.registers(state).rdi);
+            if (self.native_texture_state) |native| native.resetCommand(guest_context.registers(state).rdi);
+            self.fsiBeginRecording(guest_context.registers(state).rdi, real, info.flags, info.inheritance_info != null);
             self.vulkan_tiers.note(.command_recording, .real);
         }
         return @as(u32, @bitCast(result));
@@ -9408,9 +11928,24 @@ pub const Forwarder = struct {
 
     fn endCommandBuffer(self: *Forwarder, state: anytype) u64 {
         if (self.realDeviceLostResult()) |result| return result;
-        const real = self.real_vulkan.realCommandBuffer(guest_context.registers(state).rdi) orelse return 0;
+        const guest = guest_context.registers(state).rdi;
+        if (self.fsi_raster.moltenvk and self.fsi_raster.allocation_failed) return vkErrorOutOfHostMemory();
+        if (self.fsi_raster.command(guest)) |command| {
+            if (command.failed) return @as(u32, @bitCast(abi.ERROR_INITIALIZATION_FAILED));
+        }
+        if (self.fsiRecording(guest)) |recording| {
+            if (recording.failed) {
+                if (!recording.failure_reported) {
+                    recording.failure_reported = true;
+                    machoCapturePrint("macho-processor: VULKAN FSI GUARD: vkEndCommandBuffer refused guest=0x{x}; a required continuation boundary failed, so submitting a partially replayed FSI recording is unsafe\n", .{guest});
+                }
+                return @as(u32, @bitCast(abi.ERROR_INITIALIZATION_FAILED));
+            }
+        }
+        const real = self.real_vulkan.realCommandBuffer(guest) orelse return 0;
         const end = self.real_vulkan.fn_ptrs.end_command_buffer orelse return 0;
-        const result = end(real);
+        // A split FSI recording ends in its newest chunk.
+        const result = end(self.fsiCommandTarget(guest, real));
         self.noteRealVulkanResult(result, "vkEndCommandBuffer");
         if (result == abi.SUCCESS) self.vulkan_tiers.note(.command_recording, .real);
         return @as(u32, @bitCast(result));
@@ -9424,6 +11959,8 @@ pub const Forwarder = struct {
         self.noteRealVulkanResult(result, "vkResetCommandBuffer");
         if (result == abi.SUCCESS) {
             self.resetCommandTargets(guest_context.registers(state).rdi);
+            if (self.native_texture_state) |native| native.resetCommand(guest_context.registers(state).rdi);
+            self.fsiForgetRecording(guest_context.registers(state).rdi);
             self.vulkan_tiers.note(.command_recording, .real);
         }
         return @as(u32, @bitCast(result));
@@ -9435,7 +11972,10 @@ pub const Forwarder = struct {
         const reset = self.real_vulkan.fn_ptrs.reset_command_pool orelse return 0;
         const result = reset(self.real_vulkan.device.?, pool, @truncate(guest_context.registers(state).rdx));
         self.noteRealVulkanResult(result, "vkResetCommandPool");
-        if (result == abi.SUCCESS) self.vulkan_tiers.note(.command_recording, .real);
+        if (result == abi.SUCCESS) {
+            self.fsiResetCommandPool(guest_context.registers(state).rsi, false);
+            self.vulkan_tiers.note(.command_recording, .real);
+        }
         return @as(u32, @bitCast(result));
     }
 
@@ -9463,17 +12003,42 @@ pub const Forwarder = struct {
         if (state.guestMemoryConst(guest_context.registers(state).rdx, @as(u64, count) * 8) == null) return vkErrorInitializationFailed();
         const wait = self.real_vulkan.fn_ptrs.wait_for_fences orelse return abi.SUCCESS;
         var fences: [256]abi.Fence = [_]abi.Fence{0} ** 256;
+        var synthetic_fences: [256]u64 = [_]u64{0} ** 256;
         for (0..count) |index| {
             const synthetic = state.read64(guest_context.registers(state).rdx + @as(u64, @intCast(index)) * 8);
+            synthetic_fences[index] = synthetic;
             self.vulkan_fence_watch.notePoll(synthetic);
             fences[index] = self.real_vulkan.realFence(synthetic) orelse return vkErrorInitializationFailed();
         }
         self.reportStarvedFence();
-        const result = wait(self.real_vulkan.device.?, count, &fences, @truncate(guest_context.registers(state).rcx), guest_context.registers(state).r8);
+        const NativeFenceWait = struct {
+            function: abi.PfnWaitForFences,
+            device: abi.Device,
+            count: u32,
+            fences: *const [256]abi.Fence,
+            wait_all: u32,
+            timeout: u64,
+
+            fn invoke(call: @This()) abi.Result {
+                return call.function(call.device, call.count, @ptrCast(call.fences), call.wait_all, call.timeout);
+            }
+        };
+        const call = NativeFenceWait{
+            .function = wait,
+            .device = self.real_vulkan.device.?,
+            .count = count,
+            .fences = &fences,
+            .wait_all = @truncate(guest_context.registers(state).rcx),
+            .timeout = guest_context.registers(state).r8,
+        };
+        const result = if (comptime @hasDecl(@TypeOf(state.*), "withWindowsRuntimeLockReleasedForGpuFenceWait"))
+            state.withWindowsRuntimeLockReleasedForGpuFenceWait(call, NativeFenceWait.invoke)
+        else
+            NativeFenceWait.invoke(call);
         self.noteRealVulkanResult(result, "vkWaitForFences");
         if (result == abi.SUCCESS) {
             for (0..count) |index| {
-                const synthetic = state.read64(guest_context.registers(state).rdx + @as(u64, @intCast(index)) * 8);
+                const synthetic = synthetic_fences[index];
                 self.vulkan_fence_watch.noteSignalled(synthetic);
                 self.noteNativeFenceComplete(state, synthetic);
             }
@@ -9541,9 +12106,35 @@ pub const Forwarder = struct {
         return abi.SUCCESS;
     }
 
+    const QueueApiWait = struct {
+        gate: *queue_api_gate.Gate,
+        lease: ?queue_api_gate.Gate.Lease = null,
+
+        fn acquire(context: *@This()) void {
+            context.lease = context.gate.waitAcquire();
+        }
+    };
+
+    fn lockVulkanQueueApi(self: *Forwarder, state: anytype) ?queue_api_gate.Gate.Lease {
+        if (self.vulkan_queue_api_gate.tryAcquire()) |lease| return lease;
+        var context = QueueApiWait{ .gate = &self.vulkan_queue_api_gate };
+        if (comptime @hasDecl(@TypeOf(state.*), "tryWithWindowsRuntimeLockReleasedForVulkanQueueWait")) {
+            if (!state.tryWithWindowsRuntimeLockReleasedForVulkanQueueWait(&context, QueueApiWait.acquire)) {
+                self.vulkan_queue_api_gate.noteWaitRefusal();
+                machoCapturePrint("macho-processor: VULKAN QUEUE API GATE refused contended queue call because its runtime lock is pinned; no native queue operation was issued\n", .{});
+                return null;
+            }
+        } else {
+            QueueApiWait.acquire(&context);
+        }
+        return context.lease;
+    }
+
     fn deviceWaitIdle(self: *Forwarder, state: anytype) u64 {
         if (self.realDeviceLostResult()) |result| return result;
         const wait = self.real_vulkan.fn_ptrs.device_wait_idle orelse return 0;
+        var queue_lease = self.lockVulkanQueueApi(state) orelse return @as(u32, @bitCast(abi.ERROR_INITIALIZATION_FAILED));
+        defer queue_lease.release();
         const result = wait(self.real_vulkan.device orelse return 0);
         self.noteRealVulkanResult(result, "vkDeviceWaitIdle");
         if (result == abi.SUCCESS) self.downloadCoherentShadowsAfterCompletion(state);
@@ -9554,6 +12145,8 @@ pub const Forwarder = struct {
         if (self.realDeviceLostResult()) |result| return result;
         const wait = self.real_vulkan.fn_ptrs.queue_wait_idle orelse return 0;
         const queue = self.real_vulkan.realQueue(guest_context.registers(state).rdi) orelse return @as(u32, @bitCast(abi.ERROR_INITIALIZATION_FAILED));
+        var queue_lease = self.lockVulkanQueueApi(state) orelse return @as(u32, @bitCast(abi.ERROR_INITIALIZATION_FAILED));
+        defer queue_lease.release();
         const result = wait(queue);
         self.noteRealVulkanResult(result, "vkQueueWaitIdle");
         // Another queue may still own writes to an unrelated shadow. Native
@@ -9668,7 +12261,37 @@ pub const Forwarder = struct {
             }
             self.vulkan_shadow_uploads +|= 1;
         }
+        if (vulkan_capture.active) self.flushMappingsForCapture();
         return true;
+    }
+
+    /// GFXReconstruct's assisted tracking records mapped memory only at
+    /// vkFlushMappedMemoryRanges. Xenia maps coherent memory and never flushes
+    /// it, and neither Rosette's shadow publication nor a natively aliased
+    /// mapping the guest writes directly is visible to the layer, so while a
+    /// capture is armed every live mapping is flushed before each submit. On
+    /// Apple's unified memory a coherent flush costs the driver nothing.
+    fn flushMappingsForCapture(self: *Forwarder) void {
+        const flush = self.real_vulkan.fn_ptrs.flush_mapped_memory_ranges orelse return;
+        const device = self.real_vulkan.device orelse return;
+        var ranges: [32]abi.MappedMemoryRange = undefined;
+        var count: usize = 0;
+        for (&self.vulkan_memory_records) |*record| {
+            if (record.handle == 0 or record.host_mapped_ptr == null) continue;
+            const real = self.real_vulkan.realMemory(record.handle) orelse continue;
+            ranges[count] = .{ .memory = real, .offset = record.mapped_offset, .size = abi.WHOLE_SIZE };
+            count += 1;
+            if (count == ranges.len) {
+                recordCaptureFlush(flush(device, @intCast(count), &ranges));
+                count = 0;
+            }
+        }
+        if (count != 0) recordCaptureFlush(flush(device, @intCast(count), &ranges));
+    }
+
+    fn recordCaptureFlush(result: anytype) void {
+        vulkan_capture.flush_calls +|= 1;
+        if (result != abi.SUCCESS) vulkan_capture.flush_failures +|= 1;
     }
 
     fn flushMappedMemoryRanges(self: *Forwarder, state: anytype) u64 {
@@ -10045,6 +12668,50 @@ pub const Forwarder = struct {
     /// Called the first time the guest invokes vkCreateInstance. The instance
     /// is created with the extensions the guest requested plus any we need
     /// internally.
+    /// Name the driver that will render every guest frame. The adapter name
+    /// is the GPU's for every Metal-backed driver, and which driver the loader
+    /// picks depends on the launching shell (VULKAN_SDK, VK_ICD_FILENAMES,
+    /// VK_DRIVER_FILES), so without this line two runs could differ silently.
+    fn logRealDriverIdentity(self: *Forwarder, instance: abi.Instance, physical_device: abi.PhysicalDevice) void {
+        const get_proc = self.real_vulkan.get_instance_proc_addr orelse return;
+        const address = get_proc(instance, "vkGetPhysicalDeviceProperties2") orelse
+            get_proc(instance, "vkGetPhysicalDeviceProperties2KHR") orelse {
+            machoCapturePrint("macho-processor: VULKAN DRIVER: vkGetPhysicalDeviceProperties2 is unavailable; the driver cannot be named\n", .{});
+            return;
+        };
+        const get_properties: abi.PfnGetPhysicalDeviceProperties2 = @ptrCast(@alignCast(address));
+        var driver = abi.PhysicalDeviceDriverProperties{};
+        var properties = abi.PhysicalDeviceProperties2{ .p_next = @ptrCast(&driver) };
+        get_properties(physical_device, &properties);
+        const api_version = std.mem.readInt(u32, properties.properties[0..4], .little);
+        const identity = driver_identity.Identity.fromProperties(&driver, api_version);
+        const driver_version = std.mem.readInt(u32, properties.properties[4..8], .little);
+        const uniform_alignment = std.mem.readInt(u64, properties.properties[616..624], .little);
+        if (self.native_texture_state == null) {
+            if (native_texture.resolveControl(instance, identity.driver_id, driver_version, uniform_alignment)) |control| {
+                const native = std.heap.c_allocator.create(native_texture.State) catch null;
+                if (native) |owned| {
+                    owned.* = .{ .control = control, .bounds_stride = @intCast(@max(uniform_alignment, 16)) };
+                    self.native_texture_state = owned;
+                    machoCapturePrint("macho-processor: NATIVE METAL TEXTURES: enabled=true profile=MoltenVK-1.2.7-discrete route=MSL-in-Vulkan-command-stream formats=CTX1/DXT1/DXT3/DXT5 bounds=explicit-descriptor-ranges; ROSETTE_NATIVE_METAL_TEXTURES=0 retains the hardened SPIR-V route\n", .{});
+                }
+            } else machoCapturePrint("macho-processor: NATIVE METAL TEXTURES: enabled=false; profile/control/configuration unavailable or opted out; hardened SPIR-V route retained\n", .{});
+        }
+        self.fsi_raster.moltenvk = identity.isMoltenVK();
+        machoCapturePrint(
+            "macho-processor: VULKAN DRIVER: name={s} info={s} id={d}({s}) api={d}.{d}.{d} conformance={d}.{d}.{d}.{d} VULKAN_SDK={s} VK_ICD_FILENAMES={s} VK_DRIVER_FILES={s}; every Metal-backed driver reports the GPU as its adapter name, so this line is the record of which driver rendered\n",
+            .{
+                identity.name(),                    identity.info(),
+                identity.driver_id,                 driver_identity.driverIdName(identity.driver_id) orelse "unnamed",
+                identity.api.major,                 identity.api.minor,
+                identity.api.patch,                 identity.conformance.major,
+                identity.conformance.minor,         identity.conformance.subminor,
+                identity.conformance.patch,         exportedOrNone("VULKAN_SDK"),
+                exportedOrNone("VK_ICD_FILENAMES"), exportedOrNone("VK_DRIVER_FILES"),
+            },
+        );
+    }
+
     fn ensureRealInstance(self: *Forwarder, state: anytype, library_token: u64, create_info: u64) i32 {
         if (self.real_vulkan.hasInstance()) {
             machoCapturePrint("macho-processor: ensureRealInstance: instance already exists, skipping\n", .{});
@@ -10230,14 +12897,56 @@ pub const Forwarder = struct {
             0;
         instance_create_info.enabled_extension_count = @intCast(extension_count);
         instance_create_info.enabled_extension_names = if (extension_count == 0) null else &host_extension_names;
-        machoCapturePrint("macho-processor: ensureRealInstance: calling vkCreateInstance: extensions={d} host_extensions_known={s}\n", .{ extension_count, if (self.real_vulkan.host_instance_extensions_known) "YES" else "NO" });
+        // GFXReconstruct sits between this instance and the driver, so it
+        // records exactly the stream Rosette hands MoltenVK.
+        const capture_layers = [_][*:0]const u8{capture_plan.layer_name};
+        var capture_layer_enabled = false;
+        if (vulkan_capture.prepared) {
+            vulkan_capture.loader_layer_listed = hostLoaderListsCaptureLayer(library);
+            if (vulkan_capture.loader_layer_listed) {
+                instance_create_info.enabled_layer_count = capture_layers.len;
+                instance_create_info.enabled_layer_names = &capture_layers;
+                capture_layer_enabled = true;
+                vulkan_capture.instance_layer_requested = true;
+            } else {
+                vulkan_capture.state = .loader_layer_missing;
+                machoCapturePrint("macho-processor: VULKAN CAPTURE: the native loader does not list {s} (VK_LAYER_PATH={s}; VK_ADD_LAYER_PATH={s}); capture disabled\n", .{ capture_plan.layer_name, exportedOrNone("VK_LAYER_PATH"), exportedOrNone("VK_ADD_LAYER_PATH") });
+            }
+        }
+        machoCapturePrint("macho-processor: ensureRealInstance: calling vkCreateInstance: extensions={d} host_extensions_known={s} layers={d}\n", .{ extension_count, if (self.real_vulkan.host_instance_extensions_known) "YES" else "NO", instance_create_info.enabled_layer_count });
         // Call the real vkCreateInstance.
         const create_fn: abi.PfnCreateInstance = @ptrCast(@alignCast(dlsym(library, "vkCreateInstance") orelse {
             machoCapturePrint("macho-processor: ensureRealInstance: FAILED to find vkCreateInstance\n", .{});
             return vkErrorInitializationFailedSigned();
         }));
         var real_instance: abi.Instance = null;
-        const result = create_fn(&instance_create_info, null, &real_instance);
+        var result = create_fn(&instance_create_info, null, &real_instance);
+        if (capture_layer_enabled and (result != 0 or real_instance == null)) {
+            // A capture must never cost the run its device.
+            vulkan_capture.instance_create_failures +|= 1;
+            vulkan_capture.state = .instance_create_failed;
+            machoCapturePrint("macho-processor: VULKAN CAPTURE: vkCreateInstance with {s} failed (VkResult={d}); retrying without it\n", .{ capture_plan.layer_name, result });
+            capture_layer_enabled = false;
+            instance_create_info.enabled_layer_count = 0;
+            instance_create_info.enabled_layer_names = null;
+            real_instance = null;
+            result = create_fn(&instance_create_info, null, &real_instance);
+        }
+        if (capture_layer_enabled and result == 0 and real_instance != null) {
+            vulkan_capture.active = true;
+            vulkan_capture.state = .active;
+            machoCapturePrint(
+                "macho-processor: VULKAN CAPTURE: {s} enabled on the real instance; {s}. Every mapping is flushed before each submit for assisted tracking. Replay: gfxrecon-replay <file>; dump passes: tools/vulkan/capture_replay.py\n",
+                .{
+                    capture_plan.layer_name,
+                    switch (vulkan_capture.plan.mode) {
+                        .hotkey => "press the trigger key in game to capture one frame",
+                        .frames => "the listed present frames are captured",
+                        .off => "no capture",
+                    },
+                },
+            );
+        }
         if (result != 0 or real_instance == null) {
             self.real_vulkan.instance = null;
             machoCapturePrint(
@@ -10279,6 +12988,7 @@ pub const Forwarder = struct {
         // Select the first physical device (MoltenVK will only report one).
         self.real_vulkan.physical_device = phys_devices[0];
         machoCapturePrint("macho-processor: ensureRealInstance: selected physical_device=0x{x}\n", .{@intFromPtr(phys_devices[0].?)});
+        self.logRealDriverIdentity(real_instance, phys_devices[0]);
         // Query queue family properties.
         const get_queue_families: abi.PfnGetPhysicalDeviceQueueFamilyProperties = @ptrCast(@alignCast(self.real_vulkan.get_instance_proc_addr.?(real_instance, "vkGetPhysicalDeviceQueueFamilyProperties") orelse {
             machoCapturePrint("macho-processor: ensureRealInstance: FAILED to resolve vkGetPhysicalDeviceQueueFamilyProperties\n", .{});
@@ -10501,6 +13211,11 @@ pub const Forwarder = struct {
                 host_supported_feature_count += 1;
             }
         }
+        const host_tessellation_shader = coreFeatureEnabled(
+            &self.real_vulkan.physical_device_features,
+            abi.PHYSICAL_DEVICE_FEATURES_TESSELLATION_SHADER_OFFSET,
+        );
+        var guest_tessellation_shader_enabled = false;
         const guest_features_addr = state.read64(device_create_info_addr + device_create_info_features_offset);
         if (guest_features_addr != 0) {
             const guest_features = state.guestMemoryConst(guest_features_addr, requested_features.len) orelse {
@@ -10511,6 +13226,10 @@ pub const Forwarder = struct {
                 return vkErrorInitializationFailedSigned();
             };
             @memcpy(&requested_features, guest_features);
+            guest_tessellation_shader_enabled = coreFeatureEnabled(
+                &requested_features,
+                abi.PHYSICAL_DEVICE_FEATURES_TESSELLATION_SHADER_OFFSET,
+            );
             var feature_offset: usize = 0;
             while (feature_offset + 4 <= requested_features.len) : (feature_offset += 4) {
                 const requested = std.mem.readInt(u32, requested_features[feature_offset..][0..4], .little);
@@ -10539,14 +13258,16 @@ pub const Forwarder = struct {
         var feature_chain: FeatureChainScratch = .{};
         if (guest_device_p_next != 0) {
             if (!self.prepareDeviceFeatureChain(state, guest_device_p_next, &feature_chain)) {
+                _ = self.queryHostDeviceExtensions();
+                self.logFragmentShaderInterlockContract(state, guest_device_p_next, null, "feature_chain_refused");
                 machoCapturePrint("macho-processor: ensureRealDevice: unsupported or unreadable device feature pNext chain at 0x{x}\n", .{guest_device_p_next});
                 return abi.ERROR_FEATURE_NOT_PRESENT;
             }
             if (feature_chain.count != 0) real_device_info.p_next = @ptrCast(&feature_chain.nodes[feature_chain.order[0]]);
         }
         machoCapturePrint(
-            "macho-processor: Vulkan feature contract: core_host_supported={d}/{d} guest_core_enabled={d} pNext_nodes={d} verified=YES unsupported_requested=NO; every enabled guest bit was checked against the native physical-device feature set before vkCreateDevice\n",
-            .{ host_supported_feature_count, requested_features.len / 4, guest_enabled_feature_count, feature_chain.count },
+            "macho-processor: Vulkan feature contract: core_host_supported={d}/{d} guest_core_enabled={d} tessellation_shader(host/guest)={}/{} pNext_nodes={d} verified=YES unsupported_requested=NO; tessellationShader is VkPhysicalDeviceFeatures byte offset 20 and every enabled guest bit was checked against the native physical-device feature set before vkCreateDevice\n",
+            .{ host_supported_feature_count, requested_features.len / 4, guest_enabled_feature_count, host_tessellation_shader, guest_tessellation_shader_enabled, feature_chain.count },
         );
         // Request only extensions the host actually exposes.  Passing a guest
         // extension-name pointer through is unsafe for the same reason as a
@@ -10615,6 +13336,7 @@ pub const Forwarder = struct {
             );
             return vkErrorInitializationFailedSigned();
         }
+        var guest_fsi_extension_requested = false;
         for (0..@as(usize, @intCast(requested_extension_count))) |index| {
             const string_address = state.read64(guest_extension_array + @as(u64, @intCast(index)) * 8);
             const string = state.guestCString(string_address, 255) orelse {
@@ -10624,7 +13346,13 @@ pub const Forwarder = struct {
                 );
                 return vkErrorInitializationFailedSigned();
             };
+            if (std.mem.eql(u8, string, "VK_EXT_fragment_shader_interlock")) {
+                guest_fsi_extension_requested = true;
+            }
             if (host_extensions_known and !self.hostDeviceExtensionAvailable(string)) {
+                if (std.mem.eql(u8, string, "VK_EXT_fragment_shader_interlock")) {
+                    self.logFragmentShaderInterlockContract(state, guest_device_p_next, true, "guest_extension_unavailable");
+                }
                 machoCapturePrint("macho-processor: ensureRealDevice: guest device extension unavailable on host, refusing {s}\n", .{string});
                 return abi.ERROR_EXTENSION_NOT_PRESENT;
             }
@@ -10636,6 +13364,7 @@ pub const Forwarder = struct {
                 return vkErrorOutOfHostMemorySigned();
             }
         }
+        self.logFragmentShaderInterlockContract(state, guest_device_p_next, guest_fsi_extension_requested, "device_create");
         // Everything up to here is the guest's own device. What follows is
         // the bridge's: extensions Rosette needs so the entry points it
         // forwards through exist, negotiated against the host and enabled
@@ -11528,7 +14257,7 @@ pub const Forwarder = struct {
             const ladder = &self.brightness_ladder;
             machoCapturePrint("macho-processor: IMAGE SIGNAL VERDICT: near_black={} raw_pixel_variation={} recognizable_title=unverified exposure_comparison={} preview_interval_ms={d} brightness_loss_stage={s}; healthy transport does not prove image brightness or shader correctness\n", .{ stats.pixel_count != 0 and stats.visible_pixels == 0, stats.rgb_different_pixels != 0, probe.exposure_enabled, probe.preview_interval_ns / 1_000_000, ladder.last_verdict.label() });
             if (ladder.samples != 0 or self.vulkan_image_usage_augmented != 0) {
-                machoCapturePrint("macho-processor: BRIGHTNESS LADDER SUMMARY: samples={d} readbacks={d} readback_failures={d} verdicts(unknown/before_gamma_pass/gamma_pass/present_paint/none)={d}/{d}/{d}/{d}/{d} last_frame={d} last_peaks(swap_texture/guest_output/swapchain)={d}/{d}/{d} pass_source_edges={d} host_images_given_transfer_src={d}; {s}\n", .{ ladder.samples, ladder.readbacks, ladder.readback_failures, ladder.verdict_counts[0], ladder.verdict_counts[1], ladder.verdict_counts[2], ladder.verdict_counts[3], ladder.verdict_counts[4], ladder.last_frame, ladder.last_peaks[0], ladder.last_peaks[1], ladder.last_peaks[2], self.vulkan_pass_source_edges, self.vulkan_image_usage_augmented, ladder.last_verdict.meaning() });
+                machoCapturePrint("macho-processor: BRIGHTNESS LADDER SUMMARY: samples={d} readbacks={d} readback_failures={d} verdicts(unknown/before_gamma_pass/gamma_pass/present_paint/swapchain_signal_present)={d}/{d}/{d}/{d}/{d} white_transitions={d} last_frame={d} last_peaks(swap_texture/guest_output/swapchain)={d}/{d}/{d} pass_source_edges={d} host_images_given_transfer_src={d}; {s}\n", .{ ladder.samples, ladder.readbacks, ladder.readback_failures, ladder.verdict_counts[0], ladder.verdict_counts[1], ladder.verdict_counts[2], ladder.verdict_counts[3], ladder.verdict_counts[4], ladder.white_transitions, ladder.last_frame, ladder.last_peaks[0], ladder.last_peaks[1], ladder.last_peaks[2], self.vulkan_pass_source_edges, self.vulkan_image_usage_augmented, ladder.last_verdict.meaning() });
             }
         }
         self.printScreenValidity();
@@ -11652,6 +14381,7 @@ pub const Forwarder = struct {
         const now = transport_timing.nowNs();
         self.printFrameRates(now);
         self.printGraphicsPacing(now);
+        machoCapturePrint("macho-processor: PRESENT CEILING: max_fps={d} interval_ns={d} waits={d} waited_ms={d} refused={d}; host sleeps release the runtime mutex; slow frames receive no additional delay or catch-up credit\n", .{ present_pacing.Ceiling.fps, present_pacing.Ceiling.interval_ns, self.present_ceiling.waits, self.present_ceiling.waited_ns / 1_000_000, self.present_ceiling.refused });
         machoCapturePrint("macho-processor: FRAME HOST COST: present_intervals={d} total_ms={d} mean_ms={d} max_ms={d}; ingress-to-ingress includes guest execution, waits, and delivery, not just Vulkan\n", .{ timing.intervals.calls, timing.intervals.total_ns / 1_000_000, if (timing.intervals.calls == 0) 0 else timing.intervals.total_ns / timing.intervals.calls / 1_000_000, timing.intervals.max_ns / 1_000_000 });
         inline for (std.enums.values(transport_timing.Stage)) |stage| {
             const cost = timing.costs[@intFromEnum(stage)];
@@ -11660,15 +14390,33 @@ pub const Forwarder = struct {
         machoCapturePrint("macho-processor: PRESENT COMPLETION: blocking_waits={d} async={d} fence_signals={d} confirmed={d} requests={d} fence_pending={} failures={d}; a present is waited on only until the first picture opens and when the pixel probe reads it back, then proven by a polled fence so the guest never idles for a GPU frame\n", .{ self.present_completion_blocking, self.present_completion_async, self.present_completion_fence_signals, self.present_completion_confirmed, self.vulkan_real_presents, self.present_completion_fence_pending, self.present_completion_failures });
         machoCapturePrint("macho-processor: SHADOW MEMORY CUSTODY: uploads={d} bytes={d} unchanged_skips={d} unmap_publications={d} failures={d}; coherent CPU changes are published without erasing unchanged GPU bytes; noncoherent ranges still require explicit flush\n", .{ self.vulkan_shadow_uploads, self.vulkan_shadow_upload_bytes, self.vulkan_shadow_unchanged, self.vulkan_shadow_unmap_uploads, self.vulkan_shadow_upload_failures });
         machoCapturePrint("macho-processor: NATIVE MEMORY IDENTITY: mappings={d}; PE driver-owned aliases retain exact CPU/GPU byte identity, including same-value stores; flush/invalidate and synchronization remain native Vulkan obligations\n", .{self.vulkan_native_memory_aliases});
-        machoCapturePrint("macho-processor: TEXEL CUSTODY SUMMARY: samples={d} zero_tables={d} unreadable_native_ranges={d} printed={d} xenia_default_ramps={d} programmed_ramps={d} last(format/shape/out_max/out_7e3_one/out_mid)={d}/{s}/{d}/{d}/{d}; lookup bytes are checked only for bounded mapped A2B10G10R10 and R16G16_UINT uniform texel views, and a default shape means no title DC_LUT programming reached the ramp\n", .{ self.texel_custody_samples, self.texel_custody_zero, self.texel_custody_missing, self.texel_custody_printed, self.texel_custody_default_samples, self.texel_custody_programmed_samples, self.texel_custody_last_format, self.texel_custody_last_shape.label(), self.texel_custody_last_out[0], self.texel_custody_last_out[1], self.texel_custody_last_out[2] });
+        if (vulkan_capture.active) {
+            machoCapturePrint("macho-processor: VULKAN CAPTURE: active mode={s} flush_calls={d} flush_failures={d} file={s}; GFXReconstruct writes only the triggered frames, its own log says when\n", .{ @tagName(vulkan_capture.plan.mode), vulkan_capture.flush_calls, vulkan_capture.flush_failures, exportedOrNone("GFXRECON_CAPTURE_FILE") });
+        }
+        const capture_layer_directory: []const u8 = if (vulkan_capture.layer_directory[0] == 0)
+            "<none>"
+        else
+            std.mem.sliceTo(vulkan_capture.layer_directory[0..], 0);
+        machoCapturePrint(
+            "macho-processor: VULKAN CAPTURE STATUS: requested={} raw_setting={s} mode={s} state={s} prepared={} active={} layer_directory={s} loader_layer_listed={} loader_paths(VK_LAYER_PATH/VK_ADD_LAYER_PATH)={s}/{s} instance_layer_requested={} instance_create_failures={d} assisted_flush(calls/failures)={d}/{d} capture_file={s} capture_log={s}; FRAME CAPTURE SUMMARY is only a swap-image probe and is not a GFXReconstruct render-pass capture, so fog/exposure attribution remains unverified unless the .gfxr artifact exists\n",
+            .{ vulkan_capture.requested, exportedOrNone(capture_plan.environment), @tagName(vulkan_capture.plan.mode), @tagName(vulkan_capture.state), vulkan_capture.prepared, vulkan_capture.active, capture_layer_directory, vulkan_capture.loader_layer_listed, exportedOrNone("VK_LAYER_PATH"), exportedOrNone("VK_ADD_LAYER_PATH"), vulkan_capture.instance_layer_requested, vulkan_capture.instance_create_failures, vulkan_capture.flush_calls, vulkan_capture.flush_failures, exportedOrNone("GFXRECON_CAPTURE_FILE"), exportedOrNone("GFXRECON_LOG_FILE") },
+        );
+        machoCapturePrint("macho-processor: TEXEL CUSTODY SUMMARY: samples={d} zero_tables={d} unreadable_native_ranges={d} printed={d} xenia_default_ramps={d} programmed_ramps={d} last(format/shape/out_max_rgb/out_7e3_one_rgb/out_mid_rgb)={d}/{s}/({d},{d},{d})/({d},{d},{d})/({d},{d},{d}); RGB tuples are red/green/blue; lookup bytes are checked only for bounded mapped A2B10G10R10 and R16G16_UINT uniform texel views, and a default shape means no title DC_LUT programming reached the ramp\n", .{ self.texel_custody_samples, self.texel_custody_zero, self.texel_custody_missing, self.texel_custody_printed, self.texel_custody_default_samples, self.texel_custody_programmed_samples, self.texel_custody_last_format, self.texel_custody_last_shape.label(), self.texel_custody_last_out_rgb[0][0], self.texel_custody_last_out_rgb[0][1], self.texel_custody_last_out_rgb[0][2], self.texel_custody_last_out_rgb[1][0], self.texel_custody_last_out_rgb[1][1], self.texel_custody_last_out_rgb[1][2], self.texel_custody_last_out_rgb[2][0], self.texel_custody_last_out_rgb[2][1], self.texel_custody_last_out_rgb[2][2] });
     }
 
     fn printFrameRates(self: *const Forwarder, now: u64) void {
         const timing = &self.transport_cost;
         const picture = &self.picture_sequence;
         const recent_fps = timing.recent.activeFpsMilli(timing.last_present_ns, now);
+        const accepted_fps = timing.accepted_present_recent.activeFpsMilli(timing.last_accepted_present_ns, now);
         machoCapturePrint("macho-processor: RAW PRESENT TRAFFIC: presents={d} ingress_per_second={d}.{d:0>3} accepted_content_presents={d}; transport counters, NOT picture frames or game FPS\n", .{
             self.vulkan_presents, recent_fps / 1000, recent_fps % 1000, timing.content_frames,
+        });
+        machoCapturePrint("macho-processor: FRAME HUD RATE: bridge={s} accepted_presents={d} presented_fps={d}.{d:0>3}; successful native WSI cadence, not Xbox simulation FPS\n", .{
+            if (self.frame_hud_callback_resolved) "resolved" else "unresolved",
+            timing.accepted_presents,
+            accepted_fps / 1000,
+            accepted_fps % 1000,
         });
         if (picture.frames == 0) {
             machoCapturePrint("macho-processor: CONTENT FRAME: frame=0 state=waiting_for_picture completed_content_without_fresh_detail={d}; frame 1 requires fresh acquired-image RGB detail, accepted native present and queue completion; offscreen writes/clears do not open the epoch\n", .{picture.waiting_content});
@@ -11678,6 +14426,19 @@ pub const Forwarder = struct {
         machoCapturePrint("macho-processor: FRAME GENERATION RATE: picture_frame={d} picture_fps={d}.{d:0>3} first_observed_picture_raw_present={d} first_observed_image=0x{x} initial_to_picture_ms={d}; counts completed content presents since first OBSERVED RGB detail, not distinct scenes or Xbox simulation FPS; UI fills excluded, black content fades retained\n", .{
             picture.frames,                                                                              picture_fps / 1000, picture_fps % 1000, picture.first_present, picture.first_image,
             if (picture.first_ns == 0) 0 else (picture.first_ns -| timing.first_present_ns) / 1_000_000,
+        });
+        const cadence = &picture.recent;
+        const mean_interval_ns = if (cadence.count == 0) 0 else cadence.total_ns / cadence.count;
+        const p95_interval_ns = cadence.p95Ns();
+        const max_interval_ns = cadence.maxSampleNs();
+        machoCapturePrint("macho-processor: FRAME CADENCE JITTER: completed_content_intervals={d} mean_ms={d}.{d:0>3} p95_ms={d}.{d:0>3} max_ms={d}.{d:0>3}; recent accepted/completed picture gaps; this snapshot does not identify camera-motion timing\n", .{
+            cadence.count,
+            mean_interval_ns / 1_000_000,
+            (mean_interval_ns / 1_000) % 1_000,
+            p95_interval_ns / 1_000_000,
+            (p95_interval_ns / 1_000) % 1_000,
+            max_interval_ns / 1_000_000,
+            (max_interval_ns / 1_000) % 1_000,
         });
         machoCapturePrint("macho-processor: FRAME PIXEL PROGRESS: samples={d} byte_hash_changes={d} consecutive_unchanged_samples={d} last_change_age_ms={d}; repeated presents are not proof of scene advancement; sparse readback can miss changes\n", .{
             timing.pixel_samples,                                                                          timing.pixel_changes, timing.pixel_unchanged_run,
@@ -12210,12 +14971,17 @@ pub const Forwarder = struct {
                 .{ self.guest_output_topology_repair_enabled, self.graphics_topology_repair_candidates, self.graphics_topology_repair_pipeline_creations, self.graphics_topology_repair_create_failures, self.graphics_topology_repairs, self.graphics_topology_repair_bind_failures },
             );
         }
+        self.printFsiGuardReport();
+        self.printRobustAccessReport();
+        self.printFsiPixelFrequencyReport();
+        self.printNativeTextureReport();
         if (self.rect_expand_configured or self.rect_expand_shaders_rewritten != 0) {
             machoCapturePrint(
-                "macho-processor: RECT EXPAND: enabled={} shaders(rewritten/transform_refused/non_vertex_skipped/already_expanded_skipped)={d}/{d}/{d}/{d} last_transform_refusal={s} pipelines(marked/unmarked)={d}/{d} draws_tagged={d} declined_foreign_index={d} builtin_index_buffer=0x{x} overflow(modules/pipelines)={d}/{d} driver_rejections={d}; a Xenos rectangle list is three vertices with the fourth corner derived, and Xenia's Vulkan backend selects a vertex-shader fallback its SPIR-V translator never implemented. draws_tagged counts the draws whose fourth corner this bridge shaded, and declined_foreign_index the rectangle-shaped draws on a rewritten pipeline whose indices were a guest strip's, not the built-in expansion buffer's; zero tagged with rewritten shaders means the rectangle pipelines were never recognised, not that the title drew no rectangles\n",
+                "macho-processor: RECT EXPAND: enabled={} shaders(rewritten/unused_cull_distance_removed/transform_refused/non_vertex_skipped/already_expanded_skipped)={d}/{d}/{d}/{d}/{d} last_transform_refusal={s} pipelines(marked/unmarked)={d}/{d} draws_tagged={d} declined_foreign_index={d} builtin_index_buffer=0x{x} overflow(modules/pipelines)={d}/{d} driver_rejections={d}; a Xenos rectangle list is three vertices with the fourth corner derived, and Xenia's Vulkan backend selects a vertex-shader fallback its SPIR-V translator never implemented. draws_tagged counts the draws whose fourth corner this bridge shaded, and declined_foreign_index the rectangle-shaped draws on a rewritten pipeline whose indices were a guest strip's, not the built-in expansion buffer's; zero tagged with rewritten shaders means the rectangle pipelines were never recognised, not that the title drew no rectangles\n",
                 .{
                     self.rect_expand_enabled,
                     self.rect_expand_shaders_rewritten,
+                    self.rect_expand_shaders_cull_distance_stripped,
                     self.rect_expand_shaders_refused,
                     self.rect_expand_shaders_skipped_non_vertex,
                     self.rect_expand_shaders_skipped_already_expanded,
@@ -12230,6 +14996,59 @@ pub const Forwarder = struct {
                     self.rect_expand_module_rejections,
                 },
             );
+            if (self.rect_expand_first_foreign_index_sample) |sample| {
+                machoCapturePrint(
+                    "macho-processor: RECT EXPAND FOREIGN INDEX SAMPLE: command_buffer=0x{x} pipeline=0x{x} index_buffer=0x{x} offset={d} index_type={d} index_count={d} first_index={d} vertex_offset={d} instances={d}; one rectangle-shaped draw declined because its index binding was not Xenia's built-in expansion buffer at offset zero with UINT32 indices\n",
+                    .{
+                        sample.command_buffer,
+                        sample.pipeline,
+                        sample.index_buffer,
+                        sample.index_offset,
+                        sample.index_type,
+                        sample.index_count,
+                        sample.first_index,
+                        sample.vertex_offset,
+                        sample.instance_count,
+                    },
+                );
+            }
+            if (self.rect_expand_shaders_refused != 0) {
+                const cull_site = self.rect_expand_last_cull_distance_site orelse gpu_vulkan.rect_list_expand.CullDistanceSite{};
+                machoCapturePrint(
+                    "macho-processor: RECT EXPAND REFUSAL DETAIL: last_reason={s} module=0x{x} spirv_hash=0x{x} source_bytes={d} allocation_failures={d} cull_site_present={} output_variable=0x{x} interface_type=0x{x} member_index={d}; member_index=4294967295 means BuiltIn was attached directly to the output variable; refusals preserve the guest shader unchanged\n",
+                    .{
+                        self.rect_expand_last_refusal.label(),
+                        self.rect_expand_last_refusal_module,
+                        self.rect_expand_last_refusal_hash,
+                        self.rect_expand_last_refusal_bytes,
+                        self.rect_expand_allocation_failures,
+                        self.rect_expand_last_cull_distance_site != null,
+                        cull_site.variable,
+                        cull_site.interface_type,
+                        cull_site.member_index orelse std.math.maxInt(u32),
+                    },
+                );
+                for (std.enums.values(gpu_vulkan.rect_list_expand.Refusal), 0..) |reason, index| {
+                    const count = self.rect_expand_refusal_counts[index];
+                    if (count == 0) continue;
+                    machoCapturePrint(
+                        "macho-processor: RECT EXPAND REFUSAL REASON: reason={s} count={d}\n",
+                        .{ reason.label(), count },
+                    );
+                }
+            }
+            if (self.rect_expand_allocation_failures != 0) {
+                machoCapturePrint(
+                    "macho-processor: RECT EXPAND ALLOCATION FAILURE: count={d}; last module=0x{x} spirv_hash=0x{x} bytes={d}\n",
+                    .{ self.rect_expand_allocation_failures, self.rect_expand_last_refusal_module, self.rect_expand_last_refusal_hash, self.rect_expand_last_refusal_bytes },
+                );
+            }
+            if (self.rect_expand_module_rejections != 0) {
+                machoCapturePrint(
+                    "macho-processor: RECT EXPAND DRIVER REJECTION: result={d} module=0x{x} spirv_hash=0x{x} source_bytes={d}; the unchanged guest module was retried\n",
+                    .{ self.rect_expand_last_driver_rejection_result, self.rect_expand_last_driver_rejection_module, self.rect_expand_last_driver_rejection_hash, self.rect_expand_last_driver_rejection_bytes },
+                );
+            }
         }
         self.printVulkanCommandAdmission();
         if (self.vulkan_descriptor_update_calls != 0 or
@@ -12375,8 +15194,8 @@ pub const Forwarder = struct {
         }
         if (self.pixel_probe.attempts != 0 or self.pixel_probe.failures != 0) {
             machoCapturePrint(
-                "macho-processor: PRESENT CHAIN:   pixel_probe=attempts={d} successes={d} failures={d} content_attempts={d} detail_observed={} last_result={d} sample_policy=first_{d}+up_to_{d}_pre_detail_content_retries+first_8_picture_frames; steady_fills=1Hz steady_content=4Hz preview_interval_ms={d} clock_failure_fallback=8192_checks; readback discovery never waits for the picture epoch\n",
-                .{ self.pixel_probe.attempts, self.pixel_probe.successes, self.pixel_probe.failures, self.pixel_probe.content_probe_attempts, self.pixel_probe.detail_observed, self.pixel_probe.last_result, PIXEL_PROBE_INITIAL_SAMPLES, PIXEL_PROBE_CONTENT_SAMPLES, self.pixel_probe.preview_interval_ns / 1_000_000 },
+                "macho-processor: PRESENT CHAIN:   pixel_probe=attempts={d} successes={d} failures={d} content_attempts={d} detail_observed={} last_result={d} sample_policy=first_{d}+up_to_{d}_pre_detail_content_retries+first_8_picture_frames+{d}_render_checkpoints; steady_fills=1Hz steady_content=4Hz preview_interval_ms={d} clock_failure_fallback=8192_checks; readback discovery never waits for the picture epoch\n",
+                .{ self.pixel_probe.attempts, self.pixel_probe.successes, self.pixel_probe.failures, self.pixel_probe.content_probe_attempts, self.pixel_probe.detail_observed, self.pixel_probe.last_result, PIXEL_PROBE_INITIAL_SAMPLES, PIXEL_PROBE_CONTENT_SAMPLES, render_diagnostic_frames.len, self.pixel_probe.preview_interval_ns / 1_000_000 },
             );
         }
         if (chain.contestedLayer()) |layer| {
@@ -12495,17 +15314,75 @@ pub const Forwarder = struct {
     }
 
     fn noteRealVulkanResult(self: *Forwarder, result: abi.Result, operation: []const u8) void {
+        const last_fsi_submit = self.vulkan_fsi_tracker.last_submission;
+        const observation: device_loss_diagnostics.Evidence.Snapshot = .{
+            .operation = operation,
+            .result = result,
+            .guest_queue_submit_calls = self.vulkan_queue_submits,
+            .native_queue_submits_accepted = self.vulkan_real_queue_submits,
+            .native_presents_accepted = self.vulkan_real_presents,
+            .native_present_completions = self.vulkan_real_present_completions,
+            .fence_completions = self.vulkan_fence_completions,
+            .fsi_recorded_draws = self.vulkan_fsi_tracker.draws,
+            .fsi_submitted_draws = self.vulkan_fsi_tracker.submitted_draws,
+            .last_fsi_queue_submit = last_fsi_submit.queue_submit_ordinal,
+            .last_fsi_target_image = last_fsi_submit.draw.target_image,
+            .last_fsi_submission = last_fsi_submit,
+        };
+        if (device_loss_diagnostics.isUnexpectedApiError(result)) {
+            const first_unexpected_error = self.vulkan_device_loss_evidence.first_unexpected_error.observe(observation);
+            if (first_unexpected_error) {
+                machoCapturePrint(
+                    "macho-processor: Vulkan first unexpected API error: operation={s} result={d} guest_submits={d} native_submits_accepted={d} native_presents_accepted={d} present_completions={d} fence_completions={d} fsi_draws(recorded/submitted)={d}/{d} last_fsi_submit(queue/target)={d}/0x{x}; swapchain OUT_OF_DATE is excluded, and this earliest API error is diagnostic evidence rather than a claimed root cause\n",
+                    .{ operation, result, observation.guest_queue_submit_calls, observation.native_queue_submits_accepted, observation.native_presents_accepted, observation.native_present_completions, observation.fence_completions, observation.fsi_recorded_draws, observation.fsi_submitted_draws, observation.last_fsi_queue_submit, observation.last_fsi_target_image },
+                );
+            }
+        }
         if (result != abi.ERROR_DEVICE_LOST) return;
-        const first = !self.real_vulkan.device_lost;
         self.real_vulkan.device_lost = true;
         self.real_vulkan.device_loss_result = result;
         self.vulkan_device_lost_events +|= 1;
-        if (first) {
+        const first_run_observation = self.vulkan_device_loss_evidence.observe(observation);
+        if (first_run_observation) {
             machoCapturePrint(
-                "macho-processor: Vulkan device lost: operation={s} result={d}; native guest work is quarantined until the guest tears down and recreates its VkDevice\n",
-                .{ operation, result },
+                "macho-processor: Vulkan device lost: observation=first_api_detection operation={s} result={d} guest_submits={d} native_submits_accepted={d} native_presents_accepted={d} present_completions={d} fence_completions={d} fsi_draws(recorded/submitted)={d}/{d} fsi_last_submit(queue/target)={d}/0x{x}; Metal/MoltenVK may have reported the underlying GPU fault earlier, so this API return is the detection point, not proof of fault origin\n",
+                .{ operation, result, self.vulkan_device_loss_evidence.guest_queue_submit_calls, self.vulkan_device_loss_evidence.native_queue_submits_accepted, self.vulkan_device_loss_evidence.native_presents_accepted, self.vulkan_device_loss_evidence.native_present_completions, self.vulkan_device_loss_evidence.fence_completions, self.vulkan_device_loss_evidence.fsi_recorded_draws, self.vulkan_device_loss_evidence.fsi_submitted_draws, self.vulkan_device_loss_evidence.last_fsi_queue_submit, self.vulkan_device_loss_evidence.last_fsi_target_image },
             );
+            self.printDeviceLossFsiSubmission("device_loss_last_fsi_submission", self.vulkan_device_loss_evidence.last_fsi_submission);
+            machoCapturePrint(
+                "macho-processor: VULKAN FSI RECENT ACCEPTED SUBMISSIONS: count={d}; chronological candidates preceding asynchronous Metal fault, not individually proven faulty\n",
+                .{self.vulkan_fsi_tracker.recent_submission_count},
+            );
+            for (0..self.vulkan_fsi_tracker.recent_submission_count) |index| {
+                self.printDeviceLossFsiSubmission("recent_accepted_candidate", self.vulkan_fsi_tracker.recentSubmission(index).?);
+            }
+            self.printFsiGuardReport();
+            self.dumpVulkanCallTrace();
         }
+    }
+
+    fn printDeviceLossFsiSubmission(self: *Forwarder, label: []const u8, submission: fsi_diagnostics.SubmissionEvidence) void {
+        _ = self;
+        const draw = submission.draw;
+        machoCapturePrint(
+            "macho-processor: VULKAN FSI FAILURE CONTEXT: {s} submit={d} batch={d} command_buffer=0x{x} draw={d} command_draw={d} kind={s} target=0x{x} target_source={s} pipeline=0x{x} module_id={d} shader_hash=0x{x} pipeline_hash=0x{x} draws_in_command_buffer={d}\n",
+            .{
+                label,
+                submission.queue_submit_ordinal,
+                submission.batch_index,
+                draw.command_buffer,
+                draw.draw_ordinal,
+                draw.command_buffer_draw_ordinal,
+                @tagName(draw.kind),
+                draw.target_image,
+                @tagName(draw.target_source),
+                draw.pipeline_real,
+                draw.module_id,
+                draw.shader_hash,
+                draw.pipeline_hash,
+                submission.fsi_draws_in_command_buffer,
+            },
+        );
     }
 
     fn realDeviceLostResult(self: *const Forwarder) ?u64 {
@@ -12525,31 +15402,31 @@ pub const Forwarder = struct {
 
     fn clearRealVulkanObjectMaps(self: *Forwarder) void {
         for (&self.vulkan_memory_records) |*record| record.releaseBaseline();
-        @memset(&self.real_vulkan.memory_map, .{});
-        @memset(&self.real_vulkan.buffer_map, .{});
-        @memset(&self.real_vulkan.image_map, .{});
-        @memset(&self.real_vulkan.sampler_map, .{});
-        @memset(&self.real_vulkan.fence_map, .{});
-        @memset(&self.real_vulkan.semaphore_map, .{});
-        @memset(&self.real_vulkan.render_pass_map, .{});
-        @memset(&self.real_vulkan.framebuffer_map, .{});
-        @memset(&self.real_vulkan.pipeline_map, .{});
-        @memset(&self.real_vulkan.shader_module_map, .{});
-        @memset(&self.real_vulkan.descriptor_set_layout_map, .{});
-        @memset(&self.real_vulkan.pipeline_layout_map, .{});
-        @memset(&self.real_vulkan.descriptor_pool_map, .{});
-        @memset(&self.real_vulkan.descriptor_set_map, .{});
-        @memset(&self.real_vulkan.command_pool_map, .{});
-        @memset(&self.real_vulkan.command_buffer_map, .{});
-        @memset(&self.real_vulkan.swapchain_map, .{});
+        HandleMap.clear(&self.real_vulkan.memory_map);
+        HandleMap.clear(&self.real_vulkan.buffer_map);
+        HandleMap.clear(&self.real_vulkan.image_map);
+        HandleMap.clear(&self.real_vulkan.sampler_map);
+        HandleMap.clear(&self.real_vulkan.fence_map);
+        HandleMap.clear(&self.real_vulkan.semaphore_map);
+        HandleMap.clear(&self.real_vulkan.render_pass_map);
+        HandleMap.clear(&self.real_vulkan.framebuffer_map);
+        HandleMap.clear(&self.real_vulkan.pipeline_map);
+        HandleMap.clear(&self.real_vulkan.shader_module_map);
+        HandleMap.clear(&self.real_vulkan.descriptor_set_layout_map);
+        HandleMap.clear(&self.real_vulkan.pipeline_layout_map);
+        HandleMap.clear(&self.real_vulkan.descriptor_pool_map);
+        HandleMap.clear(&self.real_vulkan.descriptor_set_map);
+        HandleMap.clear(&self.real_vulkan.command_pool_map);
+        HandleMap.clear(&self.real_vulkan.command_buffer_map);
+        HandleMap.clear(&self.real_vulkan.swapchain_map);
         @memset(&self.real_vulkan.swapchain_records, .{});
-        @memset(&self.real_vulkan.buffer_view_map, .{});
-        @memset(&self.real_vulkan.image_view_map, .{});
-        @memset(&self.real_vulkan.query_pool_map, .{});
-        @memset(&self.real_vulkan.pipeline_cache_map, .{});
-        @memset(&self.real_vulkan.descriptor_update_template_map, .{});
+        HandleMap.clear(&self.real_vulkan.buffer_view_map);
+        HandleMap.clear(&self.real_vulkan.image_view_map);
+        HandleMap.clear(&self.real_vulkan.query_pool_map);
+        HandleMap.clear(&self.real_vulkan.pipeline_cache_map);
+        HandleMap.clear(&self.real_vulkan.descriptor_update_template_map);
         @memset(&self.real_vulkan.descriptor_update_template_records, .{});
-        @memset(&self.real_vulkan.queue_map, .{});
+        HandleMap.clear(&self.real_vulkan.queue_map);
         @memset(&self.real_vulkan.queue_family_indices, abi.QUEUE_FAMILY_IGNORED);
         @memset(&self.vulkan_memory_records, .{});
         @memset(&self.vulkan_resources, .{});
@@ -12576,8 +15453,13 @@ pub const Forwarder = struct {
 
     /// Destroy the guest's real Vulkan device and all its children.
     fn destroyRealDevice(self: *Forwarder) void {
+        if (self.native_texture_state) |native| {
+            if (native.terminal_result != abi.SUCCESS) self.noteRealVulkanResult(native.terminal_result, "native Metal texture resources during teardown");
+        }
         if (!self.real_vulkan.hasDevice()) return;
         for (&self.vulkan_memory_records) |*record| record.releaseBaseline();
+        // The FSI timing watcher waits on this device's fences: stop it first.
+        self.fsiGuardShutdown();
         const device = self.real_vulkan.device.?;
         // The pixel probe owns host Vulkan children outside the guest handle
         // maps.  Release them while the device function table is still live.
@@ -12600,6 +15482,9 @@ pub const Forwarder = struct {
             // Drop the bridge's mappings, then perform the one Vulkan teardown
             // operation that remains meaningful so a later guest recreation
             // starts from a clean provenance ledger.
+            self.fsiRasterShutdown();
+            self.destroyFsiZpdSinkResources();
+            self.shutdownNativeTextures(false);
             self.clearRealVulkanObjectMaps();
             self.real_vulkan.swapchain = 0;
             self.vulkan_swapchain_image_count = 0;
@@ -12635,153 +15520,175 @@ pub const Forwarder = struct {
                 return;
             }
         }
+        self.fsiRasterShutdown();
+        self.destroyFsiZpdSinkResources();
+        self.shutdownNativeTextures(true);
         // Destroy tracked objects in reverse dependency order.
-        for (self.real_vulkan.image_view_map) |entry| {
-            if (entry.real == 0) continue;
+        for (&self.real_vulkan.image_view_map) |*entry| {
+            const mapped = HandleMap.snapshot(entry) orelse continue;
+            if (mapped.real == 0) continue;
             if (self.real_vulkan.fn_ptrs.destroy_image_view) |fn_ptr| {
-                fn_ptr(device, entry.real, null);
+                fn_ptr(device, mapped.real, null);
             }
         }
-        for (self.real_vulkan.query_pool_map) |entry| {
-            if (entry.real == 0) continue;
+        for (&self.real_vulkan.query_pool_map) |*entry| {
+            const mapped = HandleMap.snapshot(entry) orelse continue;
+            if (mapped.real == 0) continue;
             if (self.real_vulkan.fn_ptrs.destroy_query_pool) |fn_ptr| {
-                fn_ptr(device, entry.real, null);
+                fn_ptr(device, mapped.real, null);
             }
         }
-        for (self.real_vulkan.pipeline_cache_map) |entry| {
-            if (entry.real == 0) continue;
-            self.persistPipelineCache(entry.real);
+        for (&self.real_vulkan.pipeline_cache_map) |*entry| {
+            const mapped = HandleMap.snapshot(entry) orelse continue;
+            if (mapped.real == 0) continue;
+            self.persistPipelineCache(mapped.real);
             if (self.real_vulkan.fn_ptrs.destroy_pipeline_cache) |fn_ptr| {
-                fn_ptr(device, entry.real, null);
+                fn_ptr(device, mapped.real, null);
             }
         }
-        for (self.real_vulkan.descriptor_update_template_map) |entry| {
-            if (entry.real == 0) continue;
+        for (&self.real_vulkan.descriptor_update_template_map) |*entry| {
+            const mapped = HandleMap.snapshot(entry) orelse continue;
+            if (mapped.real == 0) continue;
             if (self.real_vulkan.fn_ptrs.destroy_descriptor_update_template) |fn_ptr| {
-                fn_ptr(device, entry.real, null);
+                fn_ptr(device, mapped.real, null);
             }
         }
-        for (self.real_vulkan.buffer_view_map) |entry| {
-            if (entry.real == 0) continue;
+        for (&self.real_vulkan.buffer_view_map) |*entry| {
+            const mapped = HandleMap.snapshot(entry) orelse continue;
+            if (mapped.real == 0) continue;
             if (self.real_vulkan.fn_ptrs.destroy_buffer_view) |fn_ptr| {
-                fn_ptr(device, entry.real, null);
+                fn_ptr(device, mapped.real, null);
             }
         }
-        for (self.real_vulkan.framebuffer_map) |entry| {
-            if (entry.real == 0) continue;
+        for (&self.real_vulkan.framebuffer_map) |*entry| {
+            const mapped = HandleMap.snapshot(entry) orelse continue;
+            if (mapped.real == 0) continue;
             if (self.real_vulkan.fn_ptrs.destroy_framebuffer) |fn_ptr| {
-                fn_ptr(device, entry.real, null);
+                fn_ptr(device, mapped.real, null);
             }
         }
-        for (self.real_vulkan.pipeline_map) |entry| {
-            if (entry.real == 0) continue;
-            if (self.trackedGraphicsPipeline(entry.real)) |metadata| {
-                if (metadata.repair_real != 0 and metadata.repair_real != entry.real) {
+        for (&self.real_vulkan.pipeline_map) |*entry| {
+            const mapped = HandleMap.snapshot(entry) orelse continue;
+            if (mapped.real == 0) continue;
+            if (self.trackedGraphicsPipeline(mapped.real)) |metadata| {
+                if (metadata.repair_real != 0 and metadata.repair_real != mapped.real) {
                     if (self.real_vulkan.fn_ptrs.destroy_pipeline) |fn_ptr| {
                         fn_ptr(device, metadata.repair_real, null);
                     }
                 }
             }
             if (self.real_vulkan.fn_ptrs.destroy_pipeline) |fn_ptr| {
-                fn_ptr(device, entry.real, null);
+                fn_ptr(device, mapped.real, null);
             }
         }
-        for (self.real_vulkan.render_pass_map) |entry| {
-            if (entry.real == 0) continue;
+        for (&self.real_vulkan.render_pass_map) |*entry| {
+            const mapped = HandleMap.snapshot(entry) orelse continue;
+            if (mapped.real == 0) continue;
             if (self.real_vulkan.fn_ptrs.destroy_render_pass) |fn_ptr| {
-                fn_ptr(device, entry.real, null);
+                fn_ptr(device, mapped.real, null);
             }
         }
-        for (self.real_vulkan.descriptor_set_layout_map) |entry| {
-            if (entry.real == 0) continue;
+        for (&self.real_vulkan.descriptor_set_layout_map) |*entry| {
+            const mapped = HandleMap.snapshot(entry) orelse continue;
+            if (mapped.real == 0) continue;
             if (self.real_vulkan.fn_ptrs.destroy_descriptor_set_layout) |fn_ptr| {
-                fn_ptr(device, entry.real, null);
+                fn_ptr(device, mapped.real, null);
             }
         }
-        for (self.real_vulkan.pipeline_layout_map) |entry| {
-            if (entry.real == 0) continue;
+        for (&self.real_vulkan.pipeline_layout_map) |*entry| {
+            const mapped = HandleMap.snapshot(entry) orelse continue;
+            if (mapped.real == 0) continue;
             if (self.real_vulkan.fn_ptrs.destroy_pipeline_layout) |fn_ptr| {
-                fn_ptr(device, entry.real, null);
+                fn_ptr(device, mapped.real, null);
             }
         }
-        for (self.real_vulkan.shader_module_map) |entry| {
-            if (entry.real == 0) continue;
+        for (&self.real_vulkan.shader_module_map) |*entry| {
+            const mapped = HandleMap.snapshot(entry) orelse continue;
+            if (mapped.real == 0) continue;
             if (self.real_vulkan.fn_ptrs.destroy_shader_module) |fn_ptr| {
-                fn_ptr(device, entry.real, null);
+                fn_ptr(device, mapped.real, null);
             }
         }
-        for (self.real_vulkan.sampler_map) |entry| {
-            if (entry.real == 0) continue;
+        for (&self.real_vulkan.sampler_map) |*entry| {
+            const mapped = HandleMap.snapshot(entry) orelse continue;
+            if (mapped.real == 0) continue;
             if (self.real_vulkan.fn_ptrs.destroy_sampler) |fn_ptr| {
-                fn_ptr(device, entry.real, null);
+                fn_ptr(device, mapped.real, null);
             }
         }
-        for (self.real_vulkan.descriptor_pool_map) |entry| {
-            if (entry.real == 0) continue;
+        for (&self.real_vulkan.descriptor_pool_map) |*entry| {
+            const mapped = HandleMap.snapshot(entry) orelse continue;
+            if (mapped.real == 0) continue;
             if (self.real_vulkan.fn_ptrs.destroy_descriptor_pool) |fn_ptr| {
-                fn_ptr(device, entry.real, null);
+                fn_ptr(device, mapped.real, null);
             }
         }
-        for (self.real_vulkan.image_map) |entry| {
-            if (entry.real == 0) continue;
+        for (&self.real_vulkan.image_map) |*entry| {
+            const mapped = HandleMap.snapshot(entry) orelse continue;
+            if (mapped.real == 0) continue;
             if (self.real_vulkan.fn_ptrs.destroy_image) |fn_ptr| {
-                fn_ptr(device, entry.real, null);
+                fn_ptr(device, mapped.real, null);
             }
         }
-        for (self.real_vulkan.buffer_map) |entry| {
-            if (entry.real == 0) continue;
+        for (&self.real_vulkan.buffer_map) |*entry| {
+            const mapped = HandleMap.snapshot(entry) orelse continue;
+            if (mapped.real == 0) continue;
             if (self.real_vulkan.fn_ptrs.destroy_buffer) |fn_ptr| {
-                fn_ptr(device, entry.real, null);
+                fn_ptr(device, mapped.real, null);
             }
         }
-        for (self.real_vulkan.fence_map) |entry| {
-            if (entry.real == 0) continue;
+        for (&self.real_vulkan.fence_map) |*entry| {
+            const mapped = HandleMap.snapshot(entry) orelse continue;
+            if (mapped.real == 0) continue;
             if (self.real_vulkan.fn_ptrs.destroy_fence) |fn_ptr| {
-                fn_ptr(device, entry.real, null);
+                fn_ptr(device, mapped.real, null);
             }
         }
-        for (self.real_vulkan.semaphore_map) |entry| {
-            if (entry.real == 0) continue;
+        for (&self.real_vulkan.semaphore_map) |*entry| {
+            const mapped = HandleMap.snapshot(entry) orelse continue;
+            if (mapped.real == 0) continue;
             if (self.real_vulkan.fn_ptrs.destroy_semaphore) |fn_ptr| {
-                fn_ptr(device, entry.real, null);
+                fn_ptr(device, mapped.real, null);
             }
         }
-        for (self.real_vulkan.memory_map) |entry| {
-            if (entry.real == 0) continue;
+        for (&self.real_vulkan.memory_map) |*entry| {
+            const mapped = HandleMap.snapshot(entry) orelse continue;
+            if (mapped.real == 0) continue;
             if (self.real_vulkan.fn_ptrs.free_memory) |fn_ptr| {
-                fn_ptr(device, entry.real, null);
+                fn_ptr(device, mapped.real, null);
             }
         }
-        for (self.real_vulkan.command_pool_map) |entry| {
-            if (entry.real == 0) continue;
+        for (&self.real_vulkan.command_pool_map) |*entry| {
+            const mapped = HandleMap.snapshot(entry) orelse continue;
+            if (mapped.real == 0) continue;
             if (self.real_vulkan.fn_ptrs.destroy_command_pool) |fn_ptr| {
-                fn_ptr(device, entry.real, null);
+                fn_ptr(device, mapped.real, null);
             }
         }
         // Clear all maps.
-        @memset(&self.real_vulkan.memory_map, .{});
-        @memset(&self.real_vulkan.buffer_map, .{});
-        @memset(&self.real_vulkan.image_map, .{});
-        @memset(&self.real_vulkan.sampler_map, .{});
-        @memset(&self.real_vulkan.fence_map, .{});
-        @memset(&self.real_vulkan.semaphore_map, .{});
-        @memset(&self.real_vulkan.render_pass_map, .{});
-        @memset(&self.real_vulkan.framebuffer_map, .{});
-        @memset(&self.real_vulkan.pipeline_map, .{});
-        @memset(&self.real_vulkan.shader_module_map, .{});
-        @memset(&self.real_vulkan.descriptor_set_layout_map, .{});
-        @memset(&self.real_vulkan.pipeline_layout_map, .{});
-        @memset(&self.real_vulkan.descriptor_pool_map, .{});
-        @memset(&self.real_vulkan.descriptor_set_map, .{});
-        @memset(&self.real_vulkan.command_pool_map, .{});
-        @memset(&self.real_vulkan.command_buffer_map, .{});
-        @memset(&self.real_vulkan.buffer_view_map, .{});
-        @memset(&self.real_vulkan.image_view_map, .{});
-        @memset(&self.real_vulkan.query_pool_map, .{});
-        @memset(&self.real_vulkan.pipeline_cache_map, .{});
-        @memset(&self.real_vulkan.descriptor_update_template_map, .{});
+        HandleMap.clear(&self.real_vulkan.memory_map);
+        HandleMap.clear(&self.real_vulkan.buffer_map);
+        HandleMap.clear(&self.real_vulkan.image_map);
+        HandleMap.clear(&self.real_vulkan.sampler_map);
+        HandleMap.clear(&self.real_vulkan.fence_map);
+        HandleMap.clear(&self.real_vulkan.semaphore_map);
+        HandleMap.clear(&self.real_vulkan.render_pass_map);
+        HandleMap.clear(&self.real_vulkan.framebuffer_map);
+        HandleMap.clear(&self.real_vulkan.pipeline_map);
+        HandleMap.clear(&self.real_vulkan.shader_module_map);
+        HandleMap.clear(&self.real_vulkan.descriptor_set_layout_map);
+        HandleMap.clear(&self.real_vulkan.pipeline_layout_map);
+        HandleMap.clear(&self.real_vulkan.descriptor_pool_map);
+        HandleMap.clear(&self.real_vulkan.descriptor_set_map);
+        HandleMap.clear(&self.real_vulkan.command_pool_map);
+        HandleMap.clear(&self.real_vulkan.command_buffer_map);
+        HandleMap.clear(&self.real_vulkan.buffer_view_map);
+        HandleMap.clear(&self.real_vulkan.image_view_map);
+        HandleMap.clear(&self.real_vulkan.query_pool_map);
+        HandleMap.clear(&self.real_vulkan.pipeline_cache_map);
+        HandleMap.clear(&self.real_vulkan.descriptor_update_template_map);
         @memset(&self.real_vulkan.descriptor_update_template_records, .{});
-        @memset(&self.real_vulkan.queue_map, .{});
+        HandleMap.clear(&self.real_vulkan.queue_map);
         @memset(&self.real_vulkan.queue_family_indices, abi.QUEUE_FAMILY_IGNORED);
         @memset(&self.vulkan_memory_records, .{});
         @memset(&self.vulkan_resources, .{});
@@ -12842,7 +15749,7 @@ pub const Forwarder = struct {
                 self.forgetSwapchainResourceImages(&record);
                 self.real_vulkan.releaseSwapchainImageHandles(&record);
             }
-            @memset(&self.real_vulkan.swapchain_map, .{});
+            HandleMap.clear(&self.real_vulkan.swapchain_map);
             @memset(&self.real_vulkan.swapchain_records, .{});
         }
         self.real_vulkan.swapchain = 0;
@@ -12886,6 +15793,23 @@ pub const Forwarder = struct {
         self.real_vulkan.physical_device_memory = .{};
         self.real_vulkan.queue_family_count = 0;
         machoCapturePrint("macho-processor: REAL VkInstance destroyed\n", .{});
+    }
+
+    fn printNativeTextureReport(self: *const Forwarder) void {
+        const native = self.native_texture_state orelse return;
+        machoCapturePrint("macho-processor: NATIVE METAL TEXTURES: pipelines={d} modules_matched={d} dispatches(ctx1/dxt1/dxt3/dxt5)={d}/{d}/{d}/{d} declined={d} pipeline_failures={d} metadata_failures={d}; no separate submissions or CPU texture readbacks; runtime visual correctness unverified\n", .{ native.pipelines.count(), native.shaders.count(), native.dispatches[0], native.dispatches[1], native.dispatches[2], native.dispatches[3], native.declines, native.pipeline_failures, native.metadata_failures });
+        inline for (std.meta.fields(native_texture.Decline)) |field| {
+            const count = native.decline_reasons[field.value];
+            if (count != 0) machoCapturePrint("macho-processor: NATIVE METAL TEXTURE DECLINE TOTAL: reason={s} count={d}; admission refusals are not texture decoding failures\n", .{ field.name, count });
+        }
+    }
+
+    fn shutdownNativeTextures(self: *Forwarder, destroy_native: bool) void {
+        const native = self.native_texture_state orelse return;
+        self.printNativeTextureReport();
+        if (destroy_native) native.deinit(&self.real_vulkan) else native.releaseCpu();
+        std.heap.c_allocator.destroy(native);
+        self.native_texture_state = null;
     }
 
     fn destroyNativeVulkanObjects(self: *Forwarder) void {
@@ -14664,6 +17588,9 @@ pub const Forwarder = struct {
     }
 
     fn queueSubmit(self: *Forwarder, state: anytype) u64 {
+        if (self.native_texture_state) |native| {
+            if (native.terminal_result != abi.SUCCESS) self.noteRealVulkanResult(native.terminal_result, "native Metal texture resources");
+        }
         self.vulkan_queue_submits +|= 1;
         self.frame_provenance.noteGuestVulkanCall();
         if (self.realDeviceLostResult()) |result| return result;
@@ -14675,6 +17602,8 @@ pub const Forwarder = struct {
         //   rcx = fence handle (synthetic, may be 0)
         if (self.real_vulkan.hasDevice()) {
             const real_queue = self.real_vulkan.realQueue(guest_context.registers(state).rdi) orelse return @as(u32, @bitCast(abi.ERROR_INITIALIZATION_FAILED));
+            var queue_lease = self.lockVulkanQueueApi(state) orelse return @as(u32, @bitCast(abi.ERROR_INITIALIZATION_FAILED));
+            defer queue_lease.release();
             if (self.real_vulkan.fn_ptrs.queue_submit) |submit_fn| {
                 const requested_count: u32 = @truncate(guest_context.registers(state).rsi);
                 const submits_addr = guest_context.registers(state).rdx;
@@ -14798,6 +17727,10 @@ pub const Forwarder = struct {
                     }
                     for (0..command_count) |index| {
                         const synthetic = state.read64(command_address + @as(u64, @intCast(index)) * 8);
+                        if (self.fsi_raster.command(synthetic)) |command| {
+                            if (command.failed) return self.refuseVulkanCall("vkQueueSubmit", "an FSI sample-count transition invalidated this recording", abi.ERROR_INITIALIZATION_FAILED, .{ synthetic, i, index });
+                        }
+                        if (self.fsi_raster.moltenvk and self.fsi_raster.allocation_failed) return vkErrorOutOfHostMemory();
                         command_synthetics[i][index] = synthetic;
                         command_buffers[i][index] = self.real_vulkan.realCommandBuffer(synthetic) orelse
                             return self.refuseVulkanCall(
@@ -14836,7 +17769,12 @@ pub const Forwarder = struct {
                         .{ fence_synthetic, submit_count, 0 },
                     );
                 const submit_started = transport_timing.nowNs();
-                const result = submit_fn(real_queue, submit_count, &real_submits, fence_real);
+                // FSI work goes out in bounded chunks, each its own Metal
+                // command buffer, and is timed (`gpu/vulkan/fsi`).
+                const result = if (self.fsiSubmitNeedsExpansion(&command_synthetics, &command_counts, submit_count))
+                    self.fsiSubmitExpanded(real_queue, submit_fn, &real_submits, &command_synthetics, &command_counts, submit_count, fence_real, state)
+                else
+                    submit_fn(real_queue, submit_count, &real_submits, fence_real);
                 self.transport_cost.finish(.queue_submit, submit_started);
                 self.noteRealVulkanResult(result, "vkQueueSubmit");
                 if (result != abi.SUCCESS) {
@@ -14846,7 +17784,9 @@ pub const Forwarder = struct {
                 self.vulkan_fence_watch.noteSubmission(fence_synthetic);
                 for (0..@as(usize, @intCast(submit_count))) |batch| {
                     for (0..@as(usize, @intCast(command_counts[batch]))) |index| {
-                        self.noteSubmittedCommandTargets(command_synthetics[batch][index]);
+                        const command_buffer = command_synthetics[batch][index];
+                        self.noteFsiSubmittedCommandBuffer(command_buffer, self.vulkan_real_queue_submits + 1, @intCast(batch));
+                        self.noteSubmittedCommandTargets(command_buffer);
                     }
                 }
                 self.frame_provenance.noteNativeSubmission();
@@ -14867,11 +17807,16 @@ pub const Forwarder = struct {
     }
 
     fn queueSubmit2(self: *Forwarder, state: anytype) u64 {
+        if (self.native_texture_state) |native| {
+            if (native.terminal_result != abi.SUCCESS) self.noteRealVulkanResult(native.terminal_result, "native Metal texture resources");
+        }
         self.vulkan_queue_submits +|= 1;
         self.frame_provenance.noteGuestVulkanCall();
         if (self.realDeviceLostResult()) |result| return result;
         const submit = self.real_vulkan.fn_ptrs.queue_submit2 orelse return @as(u32, @bitCast(abi.ERROR_FEATURE_NOT_PRESENT));
         const queue = self.real_vulkan.realQueue(guest_context.registers(state).rdi) orelse return @as(u32, @bitCast(abi.ERROR_INITIALIZATION_FAILED));
+        var queue_lease = self.lockVulkanQueueApi(state) orelse return @as(u32, @bitCast(abi.ERROR_INITIALIZATION_FAILED));
+        defer queue_lease.release();
         const requested_count: u32 = @truncate(guest_context.registers(state).rsi);
         // The same fence-only submission the 1.0 path handles, spelled in the
         // synchronization2 form. Returning SUCCESS without forwarding it is
@@ -14945,6 +17890,10 @@ pub const Forwarder = struct {
             }
             for (commands[index][0..@as(usize, @intCast(submits[index].command_buffer_info_count))]) |*info| {
                 if (info.p_next != null) return @as(u32, @bitCast(abi.ERROR_FEATURE_NOT_PRESENT));
+                if (self.fsi_raster.command(@intFromPtr(info.command_buffer))) |command| {
+                    if (command.failed) return vkErrorInitializationFailed();
+                }
+                if (self.fsi_raster.moltenvk and self.fsi_raster.allocation_failed) return vkErrorOutOfHostMemory();
                 command_synthetics[index][command_counts[index]] = @intFromPtr(info.command_buffer);
                 command_counts[index] += 1;
                 info.command_buffer = self.real_vulkan.realCommandBuffer(@intFromPtr(info.command_buffer)) orelse return vkErrorInitializationFailed();
@@ -14965,7 +17914,9 @@ pub const Forwarder = struct {
         if (result == abi.SUCCESS) {
             for (0..@as(usize, @intCast(count))) |batch| {
                 for (0..@as(usize, @intCast(command_counts[batch]))) |index| {
-                    self.noteSubmittedCommandTargets(command_synthetics[batch][index]);
+                    const command_buffer = command_synthetics[batch][index];
+                    self.noteFsiSubmittedCommandBuffer(command_buffer, self.vulkan_real_queue_submits + 1, @intCast(batch));
+                    self.noteSubmittedCommandTargets(command_buffer);
                 }
             }
             self.frame_provenance.noteNativeSubmission();
@@ -14982,6 +17933,8 @@ pub const Forwarder = struct {
         const queue = self.real_vulkan.realQueue(guest_context.registers(state).rdi) orelse return @as(u32, @bitCast(abi.ERROR_INITIALIZATION_FAILED));
         const count: u32 = @min(@as(u32, @truncate(guest_context.registers(state).rsi)), 4);
         if (count == 0) return abi.SUCCESS;
+        var queue_lease = self.lockVulkanQueueApi(state) orelse return @as(u32, @bitCast(abi.ERROR_INITIALIZATION_FAILED));
+        defer queue_lease.release();
         const address = guest_context.registers(state).rdx;
         if (address == 0 or state.guestMemoryConst(address, @as(u64, count) * @sizeOf(abi.BindSparseInfo)) == null) return vkErrorInitializationFailed();
         var infos: [4]abi.BindSparseInfo = [_]abi.BindSparseInfo{.{}} ** 4;
@@ -15099,6 +18052,131 @@ pub const Forwarder = struct {
                 .{ swapchain, frame, image, write_kind.label(), result, reason },
             );
         }
+    }
+
+    fn destroyFsiZpdSinkResources(self: *Forwarder) void {
+        const device = self.real_vulkan.device;
+        if (device != null and !self.real_vulkan.device_lost) {
+            if (self.fsi_zpd_sink.buffer != 0) {
+                if (self.real_vulkan.fn_ptrs.destroy_buffer) |destroy| {
+                    destroy(device.?, self.fsi_zpd_sink.buffer, null);
+                }
+            }
+            if (self.fsi_zpd_sink.memory != 0) {
+                if (self.real_vulkan.fn_ptrs.free_memory) |free| {
+                    free(device.?, self.fsi_zpd_sink.memory, null);
+                }
+            }
+        }
+        // A lost device owns and releases its remaining allocations as part
+        // of vkDestroyDevice; do not call child destructors on that device.
+        self.fsi_zpd_sink = .{};
+    }
+
+    fn ensureFsiZpdSink(self: *Forwarder, range: u64) ?abi.Buffer {
+        if (!gpu_vulkan.fsi_descriptor_repair.isExpectedZpdSinkRange(0, range)) return null;
+        if (self.fsi_zpd_sink.buffer != 0 and self.fsi_zpd_sink.range == range) {
+            return self.fsi_zpd_sink.buffer;
+        }
+        if (self.fsi_zpd_sink.buffer != 0 or self.real_vulkan.device_lost) return null;
+
+        const device = self.real_vulkan.device orelse return null;
+        const create_buffer = self.real_vulkan.fn_ptrs.create_buffer orelse return null;
+        const get_requirements = self.real_vulkan.fn_ptrs.get_buffer_memory_requirements orelse return null;
+        const allocate_memory = self.real_vulkan.fn_ptrs.allocate_memory orelse return null;
+        const bind_memory = self.real_vulkan.fn_ptrs.bind_buffer_memory orelse return null;
+        const map_memory = self.real_vulkan.fn_ptrs.map_memory orelse return null;
+        const unmap_memory = self.real_vulkan.fn_ptrs.unmap_memory orelse return null;
+
+        var complete = false;
+        defer if (!complete) self.destroyFsiZpdSinkResources();
+
+        const buffer_info = abi.BufferCreateInfo{
+            .size = range,
+            .usage = abi.BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        };
+        var buffer: abi.Buffer = 0;
+        var result = create_buffer(device, &buffer_info, null, &buffer);
+        if (result != abi.SUCCESS or buffer == 0) {
+            machoCapturePrint("macho-processor: FSI ZPD sink create failed: VkResult={d} buffer=0x{x} range={d}\n", .{ result, buffer, range });
+            return null;
+        }
+        self.fsi_zpd_sink.buffer = buffer;
+        self.fsi_zpd_sink.range = range;
+
+        var requirements: abi.MemoryRequirements = .{};
+        get_requirements(device, buffer, &requirements);
+        if (requirements.size < range or requirements.memory_type_bits == 0) {
+            machoCapturePrint("macho-processor: FSI ZPD sink requirements invalid: size={d} alignment={d} memory_type_bits=0x{x} range={d}\n", .{ requirements.size, requirements.alignment, requirements.memory_type_bits, range });
+            return null;
+        }
+
+        const memory_type_count = @min(self.real_vulkan.physical_device_memory.memory_type_count, @as(u32, abi.MAX_MEMORY_TYPES));
+        var selected_type: ?u32 = null;
+        var selected_coherent = false;
+        // A host-visible type lets us initialize the sink to zero before any
+        // FSI shader can consume it. Prefer coherent unified memory, then a
+        // non-coherent host-visible type that we explicitly flush.
+        for (0..@as(usize, @intCast(memory_type_count))) |index| {
+            const bit = @as(u32, 1) << @as(u5, @intCast(index));
+            if ((requirements.memory_type_bits & bit) == 0) continue;
+            const flags = self.real_vulkan.physical_device_memory.memory_types[index].property_flags;
+            if ((flags & abi.MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) continue;
+            if ((flags & abi.MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0) {
+                selected_type = @intCast(index);
+                selected_coherent = true;
+                break;
+            }
+            if (selected_type == null) selected_type = @intCast(index);
+        }
+        const memory_type_index = selected_type orelse {
+            machoCapturePrint("macho-processor: FSI ZPD sink refused: no host-visible compatible memory type; range={d} type_bits=0x{x}\n", .{ range, requirements.memory_type_bits });
+            return null;
+        };
+        const allocate_info = abi.MemoryAllocateInfo{
+            .allocation_size = requirements.size,
+            .memory_type_index = memory_type_index,
+        };
+        var memory: abi.DeviceMemory = 0;
+        result = allocate_memory(device, &allocate_info, null, &memory);
+        if (result != abi.SUCCESS or memory == 0) {
+            machoCapturePrint("macho-processor: FSI ZPD sink allocation failed: VkResult={d} memory=0x{x} bytes={d} type={d}\n", .{ result, memory, requirements.size, memory_type_index });
+            return null;
+        }
+        self.fsi_zpd_sink.memory = memory;
+        result = bind_memory(device, buffer, memory, 0);
+        if (result != abi.SUCCESS) {
+            machoCapturePrint("macho-processor: FSI ZPD sink bind failed: VkResult={d} buffer=0x{x} memory=0x{x}\n", .{ result, buffer, memory });
+            return null;
+        }
+
+        var mapped: ?*anyopaque = null;
+        result = map_memory(device, memory, 0, abi.WHOLE_SIZE, 0, &mapped);
+        if (result != abi.SUCCESS or mapped == null) {
+            machoCapturePrint("macho-processor: FSI ZPD sink map failed: VkResult={d} memory=0x{x}\n", .{ result, memory });
+            return null;
+        }
+        defer unmap_memory(device, memory);
+        @memset(@as([*]u8, @ptrCast(mapped.?))[0..@intCast(range)], 0);
+        if (!selected_coherent) {
+            const flush = self.real_vulkan.fn_ptrs.flush_mapped_memory_ranges orelse {
+                machoCapturePrint("macho-processor: FSI ZPD sink refused: non-coherent host memory requires vkFlushMappedMemoryRanges\n", .{});
+                return null;
+            };
+            const mapped_range = abi.MappedMemoryRange{
+                .memory = memory,
+                .offset = 0,
+                .size = abi.WHOLE_SIZE,
+            };
+            result = flush(device, 1, @ptrCast(&mapped_range));
+            if (result != abi.SUCCESS) {
+                machoCapturePrint("macho-processor: FSI ZPD sink flush failed: VkResult={d} memory=0x{x}\n", .{ result, memory });
+                return null;
+            }
+        }
+        complete = true;
+        machoCapturePrint("macho-processor: FSI ZPD sink ready: buffer=0x{x} memory=0x{x} range={d} memory_type={d} coherent={} initialized=zero\n", .{ buffer, memory, range, memory_type_index, selected_coherent });
+        return buffer;
     }
 
     fn destroyPixelProbeResources(self: *Forwarder) void {
@@ -15231,15 +18309,33 @@ pub const Forwarder = struct {
         return true;
     }
 
-    /// Hand every presented frame count to the window bridge. The bridge
-    /// uses it twice: as the frame clock that keeps a short key press
-    /// visible until the guest has had a whole frame to poll it, and, at
-    /// most four times a second, as the main window's title. The title is
-    /// applied asynchronously so a repaint can never stall the thread every
-    /// guest thread runs on, which is why the throttle lives on that side.
-    fn noteFrameCounterTitle(self: *Forwarder) void {
-        const callback = HostFrameCounterResolver.resolve() orelse return;
-        callback(self.vulkan_real_presents);
+    /// Hand presentation progress to the window bridge. Accepted native WSI
+    /// presents keep the input latch clock moving and provide the HUD rate;
+    /// strict RGB/completion qualification remains a separate diagnostic.
+    /// The bridge updates UI at most four times a second and never
+    /// synchronously hops to AppKit.
+    fn notePresentationProgress(self: *Forwarder, now_ns: u64) void {
+        if (self.frame_hud_last_sample_ns == 0 or
+            (now_ns >= self.frame_hud_last_sample_ns and
+                now_ns - self.frame_hud_last_sample_ns >= 250_000_000))
+        {
+            self.frame_hud_fps_milli = self.transport_cost.accepted_present_recent.activeFpsMilli(self.transport_cost.last_accepted_present_ns, now_ns);
+            self.frame_hud_last_sample_ns = now_ns;
+        }
+        const callback = HostFrameCounterResolver.resolve() orelse {
+            if (!self.frame_hud_bridge_reported) {
+                self.frame_hud_bridge_reported = true;
+                machoCapturePrint("macho-processor: FRAME HUD BRIDGE: callback=unavailable accepted_presents={d}; native overlay cannot receive its numeric rate until the bridge symbol resolves\n", .{self.vulkan_real_presents});
+            }
+            return;
+        };
+        if (!self.frame_hud_bridge_reported) {
+            self.frame_hud_bridge_reported = true;
+            self.frame_hud_callback_resolved = true;
+            machoCapturePrint("macho-processor: FRAME HUD BRIDGE: callback=resolved source=successful_native_presents accepted_presents={d} fps_milli={d}; the overlay reports accepted Vulkan WSI cadence, not Xbox simulation FPS\n", .{ self.vulkan_real_presents, self.frame_hud_fps_milli });
+        }
+        self.frame_hud_callback_resolved = true;
+        callback(self.vulkan_real_presents, self.frame_hud_fps_milli);
     }
 
     fn configureFrameCapture(self: *Forwarder) void {
@@ -15330,7 +18426,8 @@ pub const Forwarder = struct {
         // time cadence: 1 Hz for fills, 4 Hz for content (not every 60 clears).
         const first_picture_probes = write_kind == .content and self.picture_sequence.frames != 0 and self.picture_sequence.frames < 8;
         const probe_interval_ns: u64 = if (write_kind == .content) 250_000_000 else 1_000_000_000;
-        const discovery = frame <= PIXEL_PROBE_INITIAL_SAMPLES or force_content_probe or first_picture_probes or preview_due;
+        const campaign_probe = write_kind == .content and campaignDiagnosticFrame(frame);
+        const discovery = frame <= PIXEL_PROBE_INITIAL_SAMPLES or force_content_probe or first_picture_probes or preview_due or campaign_probe;
         // The steady cadence exists to feed the capture files and the preview
         // window. With neither enabled it bought nothing and cost 9.5% of the
         // run: on 2026-09-20 2,526 readbacks took 114.5 s, because each one
@@ -15390,8 +18487,9 @@ pub const Forwarder = struct {
         // first graphics queue can violate exclusive queue-family ownership.
         // Use the actual present queue and a pool created for that family.
         var queue_family: u32 = abi.QUEUE_FAMILY_IGNORED;
-        for (self.real_vulkan.queue_map, 0..) |mapping, index| {
-            if (mapping.real == @intFromPtr(present_queue) and mapping.synthetic != 0) {
+        for (&self.real_vulkan.queue_map, 0..) |*entry, index| {
+            const mapping = HandleMap.snapshot(entry) orelse continue;
+            if (mapping.real == @intFromPtr(present_queue)) {
                 queue_family = self.real_vulkan.queue_family_indices[index];
                 break;
             }
@@ -15611,7 +18709,7 @@ pub const Forwarder = struct {
                 if (self.pixel_probe.capture_failures == 1) machoCapturePrint("macho-processor: FRAME CAPTURE: deferred copy unavailable or batch exceeds 64 MiB; pixel evidence retained, no unsafe staging pointer delivered\n", .{});
             }
         }
-        if (self.pixel_probe.successes <= 4 or force_content_probe or self.graphics_report_verbose) {
+        if (self.pixel_probe.successes <= 4 or force_content_probe or campaign_probe or self.graphics_report_verbose) {
             machoCapturePrint(
                 "macho-processor: PIXEL PROBE: frame={d} swapchain=0x{x} image_index={d} image=0x{x} write_kind={s} forced_content={} bytes={d} evidence={s} hash=0x{x} uniform_value=0x{x} shows_detail={}\n",
                 .{ frame, real_swapchain, image_index, synthetic_image, write_kind.label(), force_content_probe, size, evidence.label(), hash, uniform_value, evidence.showsDetail() },
@@ -15631,8 +18729,9 @@ pub const Forwarder = struct {
     /// record on the same family the image was released to.
     fn presentQueueFamily(self: *const Forwarder, present_queue: abi.Queue) ?u32 {
         var queue_family: u32 = abi.QUEUE_FAMILY_IGNORED;
-        for (self.real_vulkan.queue_map, 0..) |mapping, index| {
-            if (mapping.real == @intFromPtr(present_queue) and mapping.synthetic != 0) {
+        for (&self.real_vulkan.queue_map, 0..) |*entry, index| {
+            const mapping = HandleMap.snapshot(entry) orelse continue;
+            if (mapping.real == @intFromPtr(present_queue)) {
                 queue_family = self.real_vulkan.queue_family_indices[index];
                 break;
             }
@@ -15653,10 +18752,7 @@ pub const Forwarder = struct {
     /// (which is kept by guest handle).
     fn syntheticImageForReal(self: *const Forwarder, real: u64) ?u64 {
         if (real == 0) return null;
-        for (self.real_vulkan.image_map) |entry| {
-            if (entry.synthetic != 0 and entry.real == real) return entry.synthetic;
-        }
-        return null;
+        return HandleMap.findSynthetic(&self.real_vulkan.image_map, real);
     }
 
     /// Copy one colour image, mip 0 layer 0, into the probe's staging buffer
@@ -15739,7 +18835,14 @@ pub const Forwarder = struct {
     /// record, read it back and measure it. Every failure is named in
     /// `status` rather than dropped, because a stage that could not be read
     /// is different from a stage that read dark.
-    fn readLadderStage(self: *Forwarder, stage: *LadderStage, real_image: u64, queue: abi.Queue, queue_family: u32) void {
+    fn readLadderStage(
+        self: *Forwarder,
+        stage: *LadderStage,
+        real_image: u64,
+        queue: abi.Queue,
+        queue_family: u32,
+        decode_as_xenos_7e3: bool,
+    ) void {
         stage.real_image = real_image;
         if (real_image == 0) {
             stage.status = "no_source_edge";
@@ -15786,13 +18889,58 @@ pub const Forwarder = struct {
             stage.status = "analysis_refused";
             return;
         };
-        stage.seven_e3 = frame_capture.analyzeSevenE3(bytes, resource.width, resource.height, resource.format);
+        if (decode_as_xenos_7e3) {
+            stage.seven_e3 = frame_capture.analyzeSevenE3(bytes, resource.width, resource.height, resource.format);
+        }
         stage.status = "read";
+    }
+
+    /// Snapshot the most recent accepted FSI command buffers at the first
+    /// observed transition to a near-white swapchain image. These are
+    /// temporally adjacent candidates, not pass-level causality; GFXR remains
+    /// necessary to identify the draw that first wrote the bad values.
+    fn printFsiImageTransitionCandidates(self: *Forwarder, frame: u64) void {
+        const available = self.vulkan_fsi_tracker.recent_submission_count;
+        const count = @min(available, 4);
+        const first = available - count;
+        machoCapturePrint(
+            "macho-processor: VULKAN FSI IMAGE CANDIDATES: frame={d} recent_accepted={d} printed={d}; newest accepted submissions near the first measured white transition, not proof any candidate caused the pixels\n",
+            .{ frame, available, count },
+        );
+        for (first..available) |index| {
+            const submission = self.vulkan_fsi_tracker.recentSubmission(index) orelse continue;
+            const draw = submission.draw;
+            machoCapturePrint(
+                "macho-processor: VULKAN FSI IMAGE CANDIDATE: frame={d} submit={d} batch={d} command_buffer=0x{x} command_draw={d} global_draw={d} kind={s} target=0x{x} target_source={s} pipeline=0x{x} module_id={d} shader_hash=0x{x} pipeline_hash=0x{x} draws_in_command_buffer={d} args_valid={} elements={d} instances={d} first_element={d} vertex_offset={d} first_instance={d}\n",
+                .{
+                    frame,
+                    submission.queue_submit_ordinal,
+                    submission.batch_index,
+                    draw.command_buffer,
+                    draw.command_buffer_draw_ordinal,
+                    draw.draw_ordinal,
+                    @tagName(draw.kind),
+                    draw.target_image,
+                    @tagName(draw.target_source),
+                    draw.pipeline_real,
+                    draw.module_id,
+                    draw.shader_hash,
+                    draw.pipeline_hash,
+                    submission.fsi_draws_in_command_buffer,
+                    draw.parameters.valid,
+                    draw.parameters.element_count,
+                    draw.parameters.instance_count,
+                    draw.parameters.first_element,
+                    draw.parameters.vertex_offset,
+                    draw.parameters.first_instance,
+                },
+            );
+        }
     }
 
     /// Read the two images upstream of a just-probed swapchain image and say
     /// where the brightness went. Bounded like the swapchain probe: the first
-    /// eight content frames, then every sixtieth present.
+    /// eight content frames and the sparse render checkpoints.
     fn probeBrightnessLadder(self: *Forwarder, real_swapchain: abi.SwapchainKHR, frame: u64, queue: abi.Queue, swapchain_stats: frame_capture.Stats, format: u32) void {
         const ladder = &self.brightness_ladder;
         const started = transport_timing.nowNs();
@@ -15800,7 +18948,8 @@ pub const Forwarder = struct {
         // stop observing gamma/source changes. Keep the first eight proofs,
         // then one ladder per host second per swapchain, independently of
         // raw presentation rate and batch order.
-        if (!ladder.probe_schedule.choose(real_swapchain, started, 1_000_000_000, ladder.samples < 8)) return;
+        const campaign_probe = campaignDiagnosticFrame(frame);
+        if (!ladder.probe_schedule.choose(real_swapchain, started, 1_000_000_000, ladder.samples < 8 or campaign_probe)) return;
         const pending = self.present_chain.pendingFrame(real_swapchain) orelse return;
         if (pending.write_kind != .content) return;
         const queue_family = self.presentQueueFamily(queue) orelse return;
@@ -15811,19 +18960,58 @@ pub const Forwarder = struct {
         var swapchain_stage = LadderStage{ .label = "swapchain", .format = format, .stats = swapchain_stats, .status = "read" };
         var output_stage = LadderStage{ .label = "guest_output" };
         var source_stage = LadderStage{ .label = "swap_texture" };
-        self.readLadderStage(&output_stage, pending.sampled_image, queue, queue_family);
+        self.readLadderStage(&output_stage, pending.sampled_image, queue, queue_family, false);
         const sources = self.present_chain.passSourcesOf(pending.sampled_image);
-        self.readLadderStage(&source_stage, sources[0], queue, queue_family);
+        self.readLadderStage(
+            &source_stage,
+            sources[0],
+            queue,
+            queue_family,
+            self.guest_frontbuffer_format.uses7e3Color(),
+        );
 
         const swapchain_peak: u16 = swapchain_stage.stats.?.peak();
         const output_peak: u16 = if (output_stage.stats) |stats| stats.peak() else 256;
         const source_peak: u16 = if (source_stage.stats) |stats| stats.peak() else 256;
         ladder.last_peaks = .{ source_peak, output_peak, swapchain_peak };
+        const swapchain_near_white = swapchain_stats.nearWhite();
+        const white_transition = swapchain_near_white and !ladder.last_swapchain_near_white;
+        ladder.last_swapchain_near_white = swapchain_near_white;
+        if (white_transition) {
+            ladder.white_transitions +|= 1;
+            machoCapturePrint(
+                "macho-processor: FSI WHITE FRAME: transition={d} frame={d} swapchain_white={d}/{d} guest_output={s} white={d}/{d} swap_texture={s} white={d}/{d}; this locates the first sampled white image in the FSI/gamma/present chain, not the cause of its pixels\n",
+                .{
+                    ladder.white_transitions,
+                    frame,
+                    swapchain_stats.white_pixels,
+                    swapchain_stats.pixel_count,
+                    if (output_stage.stats) |stats| (if (stats.nearWhite()) "near_white" else "not_near_white") else output_stage.status,
+                    if (output_stage.stats) |stats| stats.white_pixels else 0,
+                    if (output_stage.stats) |stats| stats.pixel_count else 0,
+                    if (source_stage.stats) |stats| (if (stats.nearWhite()) "near_white" else "not_near_white") else source_stage.status,
+                    if (source_stage.stats) |stats| stats.white_pixels else 0,
+                    if (source_stage.stats) |stats| stats.pixel_count else 0,
+                },
+            );
+            if (source_stage.seven_e3) |seven| {
+                machoCapturePrint(
+                    "macho-processor: FSI WHITE SOURCE ENCODING: frame={d} stage=pre_gamma_swap_texture encoding=xenos_7e3 max_milli={d}/{d}/{d} mean_milli={d}/{d}/{d} over_one_pixels={d}/{d}; this interpretation is intentionally not applied to normalized guest_output\n",
+                    .{ frame, seven.max_milli[0], seven.max_milli[1], seven.max_milli[2], seven.mean(0), seven.mean(1), seven.mean(2), seven.over_one_pixels, seven.pixel_count },
+                );
+            } else {
+                machoCapturePrint(
+                    "macho-processor: FSI WHITE SOURCE ENCODING: frame={d} stage=pre_gamma_swap_texture encoding={s} guest_frontbuffer_format={s}({d}) host_vk_format={d} status={s}; normalized channel bytes are measured by the UNORM ladder above and are not reinterpreted as 7e3\n",
+                    .{ frame, self.guest_frontbuffer_format.encodingLabel(), self.guest_frontbuffer_format.label(), @intFromEnum(self.guest_frontbuffer_format), source_stage.format, source_stage.status },
+                );
+            }
+            self.printFsiImageTransitionCandidates(frame);
+        }
         // "Dark" is the swapchain probe's own threshold, 64/255, at every
         // stage. The 2026-09-17 run read a dim swap texture (peak 36) and
         // called it unknown because the first rule wanted 16.
         const verdict: BrightnessLoss = if (swapchain_peak > 64)
-            .none
+            .swapchain_signal_present
         else if (source_peak != 256 and source_peak <= 64)
             .before_gamma_pass
         else if (source_peak != 256 and source_peak > 64 and output_peak != 256 and output_peak <= 64)
@@ -15839,14 +19027,17 @@ pub const Forwarder = struct {
         ladder.verdict_counts[@intFromEnum(verdict)] +|= 1;
         const changed = verdict != ladder.last_verdict;
         ladder.last_verdict = verdict;
-        if (ladder.printed < 8 or changed) {
+        if (ladder.printed < 8 or changed or campaignDiagnosticFrame(frame)) {
             ladder.printed +|= 1;
             self.printLadderStage(frame, &source_stage);
             self.printLadderStage(frame, &output_stage);
             self.printLadderStage(frame, &swapchain_stage);
+            self.printLadderSampling(frame, pending.sampled_image, &source_stage);
+            self.printLadderSampling(frame, self.present_chain.pendingFrame(real_swapchain).?.acquired_image, &output_stage);
+            machoCapturePrint("macho-processor: GAMMA CHANNEL CONTRACT: frame={d} ramp_format={d} full_table_channel_pairs_differ={?d}; latest observed ramp; zero means every R/G/B table value or PWL base/delta pair agrees, not only the reported landmarks\n", .{ frame, self.texel_custody_last_format, self.texel_custody_last_channel_pairs_differ });
             machoCapturePrint(
-                "macho-processor: BRIGHTNESS LADDER: frame={d} peaks(swap_texture/guest_output/swapchain)={d}/{d}/{d} (256=unread) ramp_format={d} ramp_shape={s} ramp_out(max/7e3_one/mid)={d}/{d}/{d} verdict={s}: {s}\n",
-                .{ frame, source_peak, output_peak, swapchain_peak, self.texel_custody_last_format, self.texel_custody_last_shape.label(), self.texel_custody_last_out[0], self.texel_custody_last_out[1], self.texel_custody_last_out[2], verdict.label(), verdict.meaning() },
+                "macho-processor: BRIGHTNESS LADDER: frame={d} peaks(swap_texture/guest_output/swapchain)={d}/{d}/{d} (256=unread) ramp_format={d} ramp_shape={s} ramp_out_rgb(max/7e3_one/mid)=({d},{d},{d})/({d},{d},{d})/({d},{d},{d}) verdict={s}: {s}\n",
+                .{ frame, source_peak, output_peak, swapchain_peak, self.texel_custody_last_format, self.texel_custody_last_shape.label(), self.texel_custody_last_out_rgb[0][0], self.texel_custody_last_out_rgb[0][1], self.texel_custody_last_out_rgb[0][2], self.texel_custody_last_out_rgb[1][0], self.texel_custody_last_out_rgb[1][1], self.texel_custody_last_out_rgb[1][2], self.texel_custody_last_out_rgb[2][0], self.texel_custody_last_out_rgb[2][1], self.texel_custody_last_out_rgb[2][2], verdict.label(), verdict.meaning() },
             );
             if (verdict == .before_gamma_pass and self.texel_custody_last_shape == .xenia_default_linear and self.texel_custody_last_format == 81) {
                 machoCapturePrint(
@@ -15857,16 +19048,29 @@ pub const Forwarder = struct {
         }
     }
 
+    fn printLadderSampling(self: *const Forwarder, frame: u64, target: u64, source: *const LadderStage) void {
+        for (self.present_chain.passSourceViewsOf(target)) |view| {
+            if (view.image == 0 or view.image != source.real_image) continue;
+            machoCapturePrint("macho-processor: BRIGHTNESS SAMPLE VIEW: frame={d} stage={s} target=0x{x} image=0x{x} guest_view=0x{x} known={} view_format={d} storage_format={d} components={d}/{d}/{d}/{d} view_type={d} base_mip={d} base_layer={d}; latest descriptor source in this pass, not proof which binding the shader fetched; components 0=identity 1=zero 2=one 3=R 4=G 5=B 6=A; submission metadata, raw transfer bytes do not apply this mapping\n", .{ frame, source.label, target, view.image, view.view, view.known, view.format, source.format, view.components[0], view.components[1], view.components[2], view.components[3], view.view_type, view.base_mip, view.base_layer });
+            if (!view.known or view.format != source.format or view.view_type != 1 or view.base_mip != 0 or view.base_layer != 0 or
+                (view.format != 37 and view.format != 44 and view.format != 51 and view.format != 64)) return;
+            const stats = source.stats orelse return;
+            const permutation = frame_capture.sampledRgbPermutation(view.components) orelse return;
+            machoCapturePrint("macho-processor: BRIGHTNESS SAMPLED RGB: frame={d} stage={s} mean_rgb={d}/{d}/{d} max_rgb={d}/{d}/{d}; RGB permutation of the raw readback for this submitted view, without another GPU readback; constants, alpha, replication, sRGB conversion, differing formats and subresources are not inferred\n", .{ frame, source.label, stats.mean(permutation[0]), stats.mean(permutation[1]), stats.mean(permutation[2]), stats.max_rgb[permutation[0]], stats.max_rgb[permutation[1]], stats.max_rgb[permutation[2]] });
+            return;
+        }
+    }
+
     fn printLadderStage(self: *const Forwarder, frame: u64, stage: *const LadderStage) void {
         _ = self;
         if (stage.stats) |stats| {
             machoCapturePrint(
-                "macho-processor: BRIGHTNESS LADDER:   stage={s} image=0x{x} guest=0x{x} format={d} extent={d}x{d} mean_rgb={d}/{d}/{d} max_rgb={d}/{d}/{d} visible_gt16={d} bright_gt64={d} rgb_different={d} frame={d}\n",
-                .{ stage.label, stage.real_image, stage.synthetic_image, stage.format, stage.width, stage.height, stats.mean(0), stats.mean(1), stats.mean(2), stats.max_rgb[0], stats.max_rgb[1], stats.max_rgb[2], stats.visible_pixels, stats.bright_pixels, stats.rgb_different_pixels, frame },
+                "macho-processor: BRIGHTNESS LADDER:   stage={s} image=0x{x} guest=0x{x} format={d} extent={d}x{d} channels=raw_storage mean_rgb={d}/{d}/{d} max_rgb={d}/{d}/{d} visible_gt16={d} bright_gt64={d} white_rgb_ge240={d}/{d} rgb_different={d} frame={d}\n",
+                .{ stage.label, stage.real_image, stage.synthetic_image, stage.format, stage.width, stage.height, stats.mean(0), stats.mean(1), stats.mean(2), stats.max_rgb[0], stats.max_rgb[1], stats.max_rgb[2], stats.visible_pixels, stats.bright_pixels, stats.white_pixels, stats.pixel_count, stats.rgb_different_pixels, frame },
             );
             if (stage.seven_e3) |seven| {
                 machoCapturePrint(
-                    "macho-processor: BRIGHTNESS LADDER:   stage={s} as_7e3(max_milli/mean_milli)={d}/{d}/{d} / {d}/{d}/{d} over_one_pixels={d}; 1000 is 1.0 (white before tonemapping), so a UNORM max_rgb near 96 with as_7e3 near 1000 is a bright 7e3 front buffer, not a dark one\n",
+                    "macho-processor: BRIGHTNESS LADDER:   stage={s} encoding=xenos_7e3_pre_gamma(max_milli/mean_milli)={d}/{d}/{d} / {d}/{d}/{d} over_one_pixels={d}; 1000 is 1.0; this is the pre-gamma Xenos front-buffer interpretation, not a second interpretation of normalized guest_output\n",
                     .{ stage.label, seven.max_milli[0], seven.max_milli[1], seven.max_milli[2], seven.mean(0), seven.mean(1), seven.mean(2), seven.over_one_pixels },
                 );
             }
@@ -15878,6 +19082,31 @@ pub const Forwarder = struct {
         }
     }
 
+    /// Called with queue admission held, before any present-side semaphore
+    /// consumption. Other guest CPU workers can acquire the runtime mutex while
+    /// this queue's presenter sleeps. A pinned runtime lock refuses the wait.
+    fn pacePresent(self: *Forwarder, state: anytype) bool {
+        const now = transport_timing.nowNs();
+        const deadline = self.present_ceiling.deadline(now) orelse {
+            self.present_ceiling.refused +|= 1;
+            return false;
+        };
+        if (deadline == now) return true;
+        var wait: present_pacing.Wait = .{ .deadline_ns = deadline };
+        if (comptime @hasDecl(@TypeOf(state.*), "tryWithWindowsRuntimeLockReleasedForVulkanQueueWait")) {
+            if (!state.tryWithWindowsRuntimeLockReleasedForVulkanQueueWait(&wait, present_pacing.Wait.run)) {
+                self.present_ceiling.refused +|= 1;
+                return false;
+            }
+        } else {
+            present_pacing.Wait.run(&wait);
+        }
+        self.present_ceiling.waits +|= 1;
+        self.present_ceiling.waited_ns +|= wait.elapsed_ns;
+        if (!wait.succeeded) self.present_ceiling.refused +|= 1;
+        return wait.succeeded;
+    }
+
     fn queuePresent(self: *Forwarder, state: anytype) u64 {
         const ingress_ns = transport_timing.nowNs();
         self.transport_cost.ingress(ingress_ns);
@@ -15886,6 +19115,9 @@ pub const Forwarder = struct {
         if (self.realDeviceLostResult()) |result| return result;
         const present_info = guest_context.registers(state).rsi;
         if (self.real_vulkan.hasDevice() and self.real_vulkan.fn_ptrs.queue_present != null and present_info != 0 and state.guestMemoryConst(present_info, @sizeOf(abi.PresentInfoKHR)) != null) {
+            const real_queue = self.real_vulkan.realQueue(guest_context.registers(state).rdi) orelse return vkErrorInitializationFailed();
+            var queue_lease = self.lockVulkanQueueApi(state) orelse return @as(u32, @bitCast(abi.ERROR_INITIALIZATION_FAILED));
+            defer queue_lease.release();
             if (state.read64(present_info + 8) != 0) return @as(u32, @bitCast(abi.ERROR_FEATURE_NOT_PRESENT));
             const swapchain_count = @min(state.read32(present_info + 32), 8);
             const wait_count = @min(state.read32(present_info + 16), 16);
@@ -15928,7 +19160,7 @@ pub const Forwarder = struct {
                 .image_indices = if (swapchain_count == 0) null else &indices,
                 .results = if (swapchain_count == 0) null else &results,
             };
-            const real_queue = self.real_vulkan.realQueue(guest_context.registers(state).rdi) orelse return vkErrorInitializationFailed();
+            if (!self.pacePresent(state)) return @as(u32, @bitCast(abi.ERROR_INITIALIZATION_FAILED));
             // The probe is inserted after the guest's queued rendering and
             // before WSI consumes the image. Its second layout transition
             // restores PRESENT_SRC_KHR, so the guest present remains the
@@ -16046,10 +19278,16 @@ pub const Forwarder = struct {
             self.vulkan_tiers.note(.presentation, .real);
             if (result == abi.SUCCESS or result == abi.SUBOPTIMAL_KHR) {
                 self.vulkan_real_presents +|= 1;
-                self.noteFrameCounterTitle();
             }
             if (hardware_completed) self.vulkan_real_present_completions +|= 1;
             const completed_ns = transport_timing.nowNs();
+            // Include synchronous completion/probe delays in the pacing edge
+            // so accepted timestamps cannot bunch up after a slow first call.
+            // Failed attempts are also paced rather than retried in a burst.
+            self.present_ceiling.attempted(completed_ns);
+            if (result == abi.SUCCESS or result == abi.SUBOPTIMAL_KHR) {
+                self.transport_cost.acceptedPresent(completed_ns);
+            }
             for (0..swapchain_count) |index| {
                 const per_swapchain = resolvedPresentResult(result, results[index]);
                 const accepted = per_swapchain == abi.SUCCESS or per_swapchain == abi.SUBOPTIMAL_KHR;
@@ -16063,6 +19301,9 @@ pub const Forwarder = struct {
                     .sample = if (samples[index]) |sample| sample.pictureEvidence() else null,
                 }, completed_ns);
                 if (opened) machoCapturePrint("macho-processor: CONTENT FRAME BEGIN: frame=1 raw_present={d} swapchain=0x{x} image=0x{x} custody=fresh_RGB_detail+native_accepted+queue_completed; first observed picture, not a game-loop or scanout claim\n", .{ self.vulkan_presents, swapchains[index], acquired_images[index] });
+            }
+            if (result == abi.SUCCESS or result == abi.SUBOPTIMAL_KHR) {
+                self.notePresentationProgress(completed_ns);
             }
             // Independent CPU preview is still not WSI/scanout evidence. A
             // rejected or incomplete native request never receives an epoch
@@ -16451,6 +19692,7 @@ pub const Forwarder = struct {
                 state.write64(output + @as(u64, @intCast(index)) * 8, synthetic);
                 registerOpaqueHandle(state, synthetic, name);
             }
+            self.fsiNoteCommandBuffersAllocated(synthetic_buffers[0..mapped_count], pool_synthetic, real_info.level);
             self.vulkan_tiers.note(.command_buffer, .real);
             self.vulkan_command_buffer_allocations +|= 1;
             if (sparseVulkanSuccessLog(self.vulkan_command_buffer_allocations)) {
@@ -16531,6 +19773,43 @@ pub const Forwarder = struct {
         return 0;
     }
 
+    fn observeFsiDescriptorSetLayout(self: *Forwarder, state: anytype, create_info: u64) void {
+        var root: marshal.DescriptorSetLayoutCreateInfo = undefined;
+        if (!copyGuestValue(marshal.DescriptorSetLayoutCreateInfo, state, create_info, &root) or root.binding_count != 3) return;
+        const bindings_address = if (root.bindings) |pointer| @intFromPtr(pointer) else return;
+        const binding_bytes_len = 3 * @sizeOf(marshal.DescriptorSetLayoutBinding);
+        const bytes = state.guestMemoryConst(bindings_address, binding_bytes_len) orelse return;
+        var guest_bindings: [3]marshal.DescriptorSetLayoutBinding = undefined;
+        @memcpy(std.mem.sliceAsBytes(guest_bindings[0..]), bytes);
+        var bindings: [3]fsi_diagnostics.DescriptorBinding = undefined;
+        for (guest_bindings, 0..) |binding, index| {
+            bindings[index] = .{
+                .binding = binding.binding,
+                .descriptor_type = binding.descriptor_type,
+                .descriptor_count = binding.descriptor_count,
+                .stage_flags = binding.stage_flags,
+                .immutable_samplers = if (binding.immutable_samplers) |pointer| @intFromPtr(pointer) else 0,
+            };
+        }
+        const shared_count = fsi_diagnostics.sharedMemoryBindingCount(&bindings) orelse return;
+        self.vulkan_fsi_descriptor_layouts +|= 1;
+        self.vulkan_fsi_shared_memory_binding_count = shared_count;
+        self.vulkan_fsi_shared_memory_binding_count_known = true;
+        const limits = abi.fsiPhysicalDeviceLimits(&self.real_vulkan.physical_device_properties) orelse return;
+        self.vulkan_fsi_host_storage_buffer_limit = limits.max_per_stage_storage_buffers;
+        self.vulkan_fsi_host_storage_buffer_limit_known = true;
+        self.vulkan_fsi_binding_limit_would_fallback = shared_count >= limits.max_per_stage_storage_buffers;
+        if (limits.max_storage_buffer_range != 0) {
+            self.vulkan_fsi_binding_count_matches_host_range_known = true;
+            self.vulkan_fsi_binding_count_matches_host_range = shared_count ==
+                fsi_diagnostics.sharedMemoryBindingCountForRange(limits.max_storage_buffer_range);
+        }
+        if (self.vulkan_fsi_descriptor_layouts <= 3) machoCapturePrint(
+            "macho-processor: Vulkan FSI path selection: Xenia EDRAM/ZPD descriptor layout observed shared_memory_bindings={d} host_maxPerStageDescriptorStorageBuffers={d} would_fallback={s} maxStorageBufferRange={d}\n",
+            .{ shared_count, limits.max_per_stage_storage_buffers, if (self.vulkan_fsi_binding_limit_would_fallback) "yes" else "no", limits.max_storage_buffer_range },
+        );
+    }
+
     fn copyGuestValue(comptime T: type, state: anytype, address: u64, value: *T) bool {
         const bytes = state.guestMemoryConst(address, @sizeOf(T)) orelse return false;
         @memcpy(std.mem.asBytes(value), bytes);
@@ -16580,12 +19859,17 @@ pub const Forwarder = struct {
         VertexDivisorsUnreadable,
         InputAssemblyUnreadable,
         TessellationUnreadable,
+        TessellationStructureTypeInvalid,
+        TessellationChainUnreadable,
+        TessellationChainUnsupported,
+        TessellationDomainOriginInvalid,
         ViewportStateUnreadable,
         ViewportCountsOutOfRange,
         ViewportsUnreadable,
         ScissorsUnreadable,
         RasterizationUnreadable,
         MultisampleUnreadable,
+        FsiRasterizationUnavailable,
         SampleMaskUnreadable,
         DepthStencilUnreadable,
         ColorBlendUnreadable,
@@ -16652,6 +19936,72 @@ pub const Forwarder = struct {
         return &scratch.info;
     }
 
+    const NativeGraphicsPipelineCall = struct {
+        function: abi.PfnCreateGraphicsPipelines,
+        device: abi.Device,
+        cache: abi.PipelineCache,
+        info: *const abi.GraphicsPipelineCreateInfo,
+        output: *u64,
+
+        fn invoke(call: @This()) abi.Result {
+            return call.function(call.device, call.cache, 1, @ptrCast(call.info), null, @ptrCast(call.output));
+        }
+    };
+
+    const NativeComputePipelineCall = struct {
+        function: abi.PfnCreateComputePipelines,
+        device: abi.Device,
+        cache: abi.PipelineCache,
+        info: *const abi.ComputePipelineCreateInfo,
+        output: *u64,
+
+        fn invoke(call: @This()) abi.Result {
+            return call.function(call.device, call.cache, 1, @ptrCast(call.info), null, @ptrCast(call.output));
+        }
+    };
+
+    fn callNativeGraphicsPipeline(
+        state: anytype,
+        function: abi.PfnCreateGraphicsPipelines,
+        device: abi.Device,
+        cache: abi.PipelineCache,
+        info: *const abi.GraphicsPipelineCreateInfo,
+        output: *u64,
+    ) abi.Result {
+        const call = NativeGraphicsPipelineCall{
+            .function = function,
+            .device = device,
+            .cache = cache,
+            .info = info,
+            .output = output,
+        };
+        if (comptime @hasDecl(@TypeOf(state.*), "withWindowsRuntimeLockReleased")) {
+            return state.withWindowsRuntimeLockReleased(call, NativeGraphicsPipelineCall.invoke);
+        }
+        return NativeGraphicsPipelineCall.invoke(call);
+    }
+
+    fn callNativeComputePipeline(
+        state: anytype,
+        function: abi.PfnCreateComputePipelines,
+        device: abi.Device,
+        cache: abi.PipelineCache,
+        info: *const abi.ComputePipelineCreateInfo,
+        output: *u64,
+    ) abi.Result {
+        const call = NativeComputePipelineCall{
+            .function = function,
+            .device = device,
+            .cache = cache,
+            .info = info,
+            .output = output,
+        };
+        if (comptime @hasDecl(@TypeOf(state.*), "withWindowsRuntimeLockReleased")) {
+            return state.withWindowsRuntimeLockReleased(call, NativeComputePipelineCall.invoke);
+        }
+        return NativeComputePipelineCall.invoke(call);
+    }
+
     fn createRealGraphicsPipeline(
         self: *Forwarder,
         state: anytype,
@@ -16659,9 +20009,12 @@ pub const Forwarder = struct {
         guest_address: u64,
         real_output: *u64,
         result_output: *i32,
+        tessellation_pipeline: *bool,
         reason: *[]const u8,
     ) bool {
-        self.marshalRealGraphicsPipeline(state, cache, guest_address, real_output, result_output) catch |failure| {
+        tessellation_pipeline.* = false;
+        self.marshalRealGraphicsPipeline(state, cache, guest_address, real_output, result_output, tessellation_pipeline) catch |failure| {
+            if (tessellation_pipeline.*) self.vulkan_tessellation_pipeline_marshal_refusals +|= 1;
             reason.* = @errorName(failure);
             return false;
         };
@@ -16675,6 +20028,7 @@ pub const Forwarder = struct {
         guest_address: u64,
         real_output: *u64,
         result_output: *i32,
+        tessellation_pipeline: *bool,
     ) PipelineMarshalFailure!void {
         const function = self.real_vulkan.fn_ptrs.create_graphics_pipelines orelse return error.DeviceEntryPointUnavailable;
         const real_cache = if (cache == 0) 0 else self.real_vulkan.realPipelineCache(cache) orelse return error.UnknownPipelineCache;
@@ -16713,6 +20067,21 @@ pub const Forwarder = struct {
         if (root.stage_count == 0 or root.stage_count > stages.len) return error.StageCountOutOfRange;
         const stage_address = guestPointerValue(abi.PipelineShaderStageCreateInfo, root.stages);
         if (!copyGuestStructs(abi.PipelineShaderStageCreateInfo, state, stage_address, root.stage_count, &stages)) return error.StageArrayUnreadable;
+        var tessellation_stage_mask: u32 = 0;
+        var fsi_identity: fsi_diagnostics.PipelineIdentity = .{};
+        for (stages[0..@as(usize, @intCast(root.stage_count))]) |stage| {
+            if (stage.stage == VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT) tessellation_stage_mask |= 1;
+            if (stage.stage == VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT) tessellation_stage_mask |= 2;
+            if (self.vulkan_fsi_tracker.findShader(stage.module)) |shader| {
+                fsi_identity.include(stage.stage, shader);
+            }
+        }
+        tessellation_pipeline.* = tessellation_stage_mask != 0;
+        if (tessellation_pipeline.*) {
+            self.vulkan_tessellation_pipeline_candidates +|= 1;
+            self.vulkan_tessellation_stage_mask_or |= tessellation_stage_mask;
+            if (root.tessellation_state == null) self.vulkan_tessellation_pipeline_missing_state +|= 1;
+        }
         var stage_names: [8][64]u8 = undefined;
         var specializations: [8]SpecializationScratch = undefined;
         for (stages[0..@as(usize, @intCast(root.stage_count))], 0..) |*stage, index| {
@@ -16782,9 +20151,14 @@ pub const Forwarder = struct {
             root.input_assembly_state = &input_assembly;
         }
         var tessellation: abi.PipelineTessellationStateCreateInfo = undefined;
+        var tessellation_domain_origin: abi.PipelineTessellationDomainOriginStateCreateInfo = .{};
         if (root.tessellation_state) |pointer| {
-            if (!copyGuestValue(abi.PipelineTessellationStateCreateInfo, state, @intFromPtr(pointer), &tessellation) or tessellation.p_next != null) return error.TessellationUnreadable;
-            tessellation.p_next = null;
+            try marshalPipelineTessellationState(
+                state,
+                @intFromPtr(pointer),
+                &tessellation,
+                &tessellation_domain_origin,
+            );
             root.tessellation_state = &tessellation;
         }
 
@@ -16857,8 +20231,42 @@ pub const Forwarder = struct {
             root.dynamic_state = &dynamic;
         }
 
+        if (self.fsi_raster.moltenvk and (self.fsi_raster.findPass(root.render_pass) != null or fsi_identity.uses_fsi)) {
+            const samples = if (root.multisample_state) |pointer| pointer.rasterization_samples else 0;
+            fsi_identity.rasterization_samples = samples;
+            fsi_identity.raster_pass = try self.fsiRasterPipelinePass(root.render_pass, samples);
+            root.render_pass = fsi_identity.raster_pass;
+        }
         var real_pipeline: u64 = 0;
-        const result = function(self.real_vulkan.device.?, real_cache, 1, @ptrCast(&root), null, @ptrCast(&real_pipeline));
+        const result = callNativeGraphicsPipeline(state, function, self.real_vulkan.device.?, real_cache, &root, &real_pipeline);
+        if (result == abi.SUCCESS) {
+            self.fsi_raster.pipelineCreated(real_pipeline, fsi_identity.raster_pass) catch {
+                if (self.real_vulkan.fn_ptrs.destroy_pipeline) |destroy| destroy(self.real_vulkan.device, real_pipeline, null);
+                self.fsi_raster.refusals +|= 1;
+                return error.FsiRasterizationUnavailable;
+            };
+            // The adapted pass is correctness state; shader diagnostic IDs
+            // may have been evicted before this pipeline was created.
+            if (fsi_identity.raster_pass != 0 and self.fsi_raster.moltenvk and root.tessellation_state != null) {
+                self.fsi_raster.isolatePipeline(real_pipeline) catch {
+                    _ = self.fsi_raster.pipelines.remove(real_pipeline);
+                    if (self.real_vulkan.fn_ptrs.destroy_pipeline) |destroy| destroy(self.real_vulkan.device, real_pipeline, null);
+                    return error.FsiRasterizationUnavailable;
+                };
+                machoCapturePrint("macho-processor: VULKAN FSI ISOLATION: pipeline=0x{x} shader_hash=0x{x} reason=tessellation_interlock; splittable recordings isolate each draw and do not coalesce its timing group; a single draw can still fail\n", .{ real_pipeline, fsi_identity.shader_hash });
+            }
+        }
+        self.vulkan_fsi_tracker.notePipelineCreated(real_pipeline, fsi_identity, result == abi.SUCCESS);
+        // Always retain every FSI identity in logs: sparse creation logging
+        // omitted the recurrent failed-group candidate in the Oct 7 runs.
+        if (fsi_identity.uses_fsi or self.fsi_raster.findPass(root.render_pass) != null) {
+            const topology = if (root.input_assembly_state) |pointer| pointer.topology else std.math.maxInt(u32);
+            const samples = if (root.multisample_state) |pointer| pointer.rasterization_samples else 0;
+            machoCapturePrint(
+                "macho-processor: Vulkan FSI PIPELINE: ordinal={d} result={d} real=0x{x} module_id={d} shader_hash=0x{x} pipeline_hash=0x{x} stage_flags=0x{x} fsi_modules={d} interlock_caps=0x{x} begin/end={d}/{d} stages={d} topology={d} samples={d} render_pass=0x{x} layout=0x{x} fragment_identity_known={}; ties Xenia's interlock SPIR-V to the exact native pipeline outcome and render-pass compatibility inputs\n",
+                .{ self.vulkan_fsi_tracker.pipeline_candidates, result, real_pipeline, fsi_identity.module_id, fsi_identity.shader_hash, fsi_identity.combined_hash, fsi_identity.stage_flags_or, fsi_identity.shader_count, fsi_identity.capability_mask, fsi_identity.begin_ops, fsi_identity.end_ops, root.stage_count, topology, samples, root.render_pass, root.layout, fsi_identity.uses_fsi },
+            );
+        }
         var repair_pipeline: u64 = 0;
         const guest_output_candidate = result == abi.SUCCESS and self.isGuestOutputPaintPipeline(&root);
         if (guest_output_candidate) {
@@ -16866,7 +20274,7 @@ pub const Forwarder = struct {
             const original_topology = input_assembly.topology;
             input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
             var repair_result: i32 = abi.ERROR_INITIALIZATION_FAILED;
-            repair_result = function(self.real_vulkan.device.?, real_cache, 1, @ptrCast(&root), null, @ptrCast(&repair_pipeline));
+            repair_result = callNativeGraphicsPipeline(state, function, self.real_vulkan.device.?, real_cache, &root, &repair_pipeline);
             input_assembly.topology = original_topology;
             if (repair_result == abi.SUCCESS and repair_pipeline != 0) {
                 self.graphics_topology_repair_pipeline_creations +|= 1;
@@ -16907,7 +20315,7 @@ pub const Forwarder = struct {
             // is the counter that says its rectangles took this path instead.
             if (!marked) self.rect_expand_pipelines_unmarked +|= 1;
         }
-        if (result == abi.SUCCESS) self.rememberGraphicsPipeline(real_pipeline, &root, repair_pipeline, guest_output_candidate);
+        if (result == abi.SUCCESS) self.rememberGraphicsPipeline(real_pipeline, &root, repair_pipeline, guest_output_candidate, fsi_identity);
     }
 
     fn createRealComputePipeline(
@@ -16924,6 +20332,34 @@ pub const Forwarder = struct {
             return false;
         };
         return true;
+    }
+
+    /// Copy the tessellation state and its one Vulkan-defined pNext node into
+    /// host-owned scratch. Forwarding the guest's nested pointer would hand a
+    /// guest address to the native Vulkan driver; rejecting every non-null
+    /// pNext silently disabled the legal lower-left domain-origin setting.
+    fn marshalPipelineTessellationState(
+        state: anytype,
+        guest_address: u64,
+        tessellation: *abi.PipelineTessellationStateCreateInfo,
+        domain_origin: *abi.PipelineTessellationDomainOriginStateCreateInfo,
+    ) PipelineMarshalFailure!void {
+        if (!copyGuestValue(abi.PipelineTessellationStateCreateInfo, state, guest_address, tessellation)) return error.TessellationUnreadable;
+        if (tessellation.s_type != abi.STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO) return error.TessellationStructureTypeInvalid;
+        const domain_origin_address = if (tessellation.p_next) |pointer| @intFromPtr(pointer) else 0;
+        if (domain_origin_address == 0) {
+            tessellation.p_next = null;
+            return;
+        }
+        if (!copyGuestValue(abi.PipelineTessellationDomainOriginStateCreateInfo, state, domain_origin_address, domain_origin)) {
+            return error.TessellationChainUnreadable;
+        }
+        if (domain_origin.s_type != abi.STRUCTURE_TYPE_PIPELINE_TESSELLATION_DOMAIN_ORIGIN_STATE_CREATE_INFO or domain_origin.p_next != null) {
+            return error.TessellationChainUnsupported;
+        }
+        if (domain_origin.domain_origin > 1) return error.TessellationDomainOriginInvalid;
+        domain_origin.p_next = null;
+        tessellation.p_next = domain_origin;
     }
 
     fn marshalRealComputePipeline(
@@ -16953,9 +20389,18 @@ pub const Forwarder = struct {
         }
         if (root.base_pipeline_handle != 0) root.base_pipeline_handle = self.real_vulkan.realPipeline(root.base_pipeline_handle) orelse return error.UnknownBasePipeline;
         var real_pipeline: u64 = 0;
-        const result = function(self.real_vulkan.device.?, real_cache, 1, @ptrCast(&root), null, @ptrCast(&real_pipeline));
+        const result = callNativeComputePipeline(state, function, self.real_vulkan.device.?, real_cache, &root, &real_pipeline);
         result_output.* = result;
         real_output.* = real_pipeline;
+        if (result == abi.SUCCESS and real_pipeline != 0) {
+            if (self.native_texture_state) |native| {
+                native.addPipeline(&self.real_vulkan, real_pipeline, root);
+                if (native.terminal_result != abi.SUCCESS) {
+                    self.noteRealVulkanResult(native.terminal_result, "native Metal texture pipeline");
+                    result_output.* = native.terminal_result;
+                }
+            }
+        }
     }
 
     /// A vkCreate*Pipelines call is atomic from the guest's perspective even
@@ -16971,6 +20416,8 @@ pub const Forwarder = struct {
             if (synthetic == 0) continue;
             if (self.real_vulkan.realPipeline(synthetic)) |real| {
                 if (self.real_vulkan.fn_ptrs.destroy_pipeline) |destroy| destroy(device, real, null);
+                self.forgetGraphicsPipeline(real);
+                self.forgetRectangleExpandedPipeline(real);
                 self.vulkan_real_objects_destroyed +|= 1;
             }
             _ = self.releaseVulkanHandle(&self.real_vulkan.pipeline_map, synthetic);
@@ -16995,13 +20442,21 @@ pub const Forwarder = struct {
                 const guest_info = guest_context.registers(state).rcx + @as(u64, @intCast(index)) * info_size;
                 var real_pipeline: u64 = 0;
                 var result: i32 = 0;
+                var tessellation_pipeline = false;
                 var reason: []const u8 = "unknown";
                 const forwarded = if (std.mem.eql(u8, name, "vkCreateGraphicsPipelines"))
-                    self.createRealGraphicsPipeline(state, guest_context.registers(state).rsi, guest_info, &real_pipeline, &result, &reason)
+                    self.createRealGraphicsPipeline(state, guest_context.registers(state).rsi, guest_info, &real_pipeline, &result, &tessellation_pipeline, &reason)
                 else
                     self.createRealComputePipeline(state, guest_context.registers(state).rsi, guest_info, &real_pipeline, &result, &reason);
                 if (forwarded) {
                     self.noteRealVulkanResult(result, name);
+                    if (tessellation_pipeline) {
+                        if (result == abi.SUCCESS) {
+                            self.vulkan_tessellation_pipeline_driver_successes +|= 1;
+                        } else {
+                            self.vulkan_tessellation_pipeline_driver_failures +|= 1;
+                        }
+                    }
                     if (result != abi.SUCCESS) {
                         if (real_pipeline != 0) {
                             if (self.real_vulkan.fn_ptrs.destroy_pipeline) |destroy| destroy(self.real_vulkan.device.?, real_pipeline, null);
@@ -17014,6 +20469,8 @@ pub const Forwarder = struct {
                     if (!self.mapVulkanHandle(&self.real_vulkan.pipeline_map, synthetic, real_pipeline, name)) {
                         if (real_pipeline != 0) {
                             if (self.real_vulkan.fn_ptrs.destroy_pipeline) |destroy| destroy(self.real_vulkan.device.?, real_pipeline, null);
+                            self.forgetGraphicsPipeline(real_pipeline);
+                            self.forgetRectangleExpandedPipeline(real_pipeline);
                             self.vulkan_real_objects_destroyed +|= 1;
                         }
                         self.rollbackCreatedVulkanPipelines(created_synthetic[0..created_count]);
@@ -17097,6 +20554,9 @@ pub const Forwarder = struct {
             entry.* = .{};
             for (&self.guest_symbols) |*symbol| {
                 if (symbol.library_token == token) symbol.* = .{};
+            }
+            for (&self.guest_symbol_lookup_cache) |*cached| {
+                if (cached.library_token == token) cached.* = .{};
             }
             if (result == 0) self.guest_close_count +|= 1;
             return result;
@@ -17778,6 +21238,12 @@ pub const Forwarder = struct {
             machoCapturePrint(
                 "macho-processor: Vulkan loader lookup summary: unique={d} repeats_suppressed={d} cache_overflows={d}\n",
                 .{ self.vulkan_loader_lookup_unique, self.vulkan_loader_lookup_repeats, self.vulkan_loader_lookup_cache_overflows },
+            );
+        }
+        if (self.guest_symbol_lookup_cache_hits != 0 or self.guest_symbol_lookup_cache_misses != 0) {
+            machoCapturePrint(
+                "macho-processor: Vulkan guest-symbol lookup cache: hits={d} misses={d}; hits validate library, hash, length and exact symbol bytes before returning the cached thunk\n",
+                .{ self.guest_symbol_lookup_cache_hits, self.guest_symbol_lookup_cache_misses },
             );
         }
         if (self.gpu_handshake_updates != 0) {
@@ -18578,14 +22044,20 @@ fn forwardedVulkanCommandIndex(name: []const u8) ?usize {
     return indices.get(name);
 }
 
+fn guestSymbolIndexFromToken(token: u64) ?usize {
+    if (token < GUEST_SYMBOL_THUNK_BASE) return null;
+    const offset = token - GUEST_SYMBOL_THUNK_BASE;
+    if (offset == 0 or offset % 16 != 1) return null;
+    const index: usize = @intCast((offset - 1) / 16);
+    if (index >= MAX_GUEST_SYMBOLS) return null;
+    return index;
+}
+
 pub fn isForwardableVulkanSymbol(symbol: []const u8) bool {
     if (!std.mem.startsWith(u8, symbol, "vk")) return false;
     if (std.mem.startsWith(u8, symbol, "vkCmd")) {
         const canonical = canonicalVulkanCommand(symbol);
-        for (forwarded_vulkan_commands) |name| {
-            if (std.mem.eql(u8, canonical, name)) return true;
-        }
-        return false;
+        return forwardedVulkanCommandIndex(canonical) != null;
     }
     return guestSymbolKind(symbol) != .@"opaque";
 }
@@ -18635,20 +22107,53 @@ fn enumerateInstanceExtensionsSynthetic(state: anytype) u64 {
     return instance_extensions.enumerateSyntheticInstance(state);
 }
 
+/// Whether a Vulkan output parameter names reachable guest memory, asked
+/// through the read-only resolver so the answer never depends on a mutable
+/// view being handed out.
+fn guestRangeAvailable(state: anytype, address: u64, length: u64) bool {
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "guestMemoryConst")) {
+        return state.guestMemoryConst(address, length) != null;
+    }
+    return state.guestMemory(address, length) != null;
+}
+
+/// Copy a whole output structure into guest memory through the state's
+/// ordered writer when it has one: that is how `ElfState` publishes bytes
+/// while guest threads run in parallel, and it moves an executable range's
+/// generation after the bytes. A state without it takes a raw view.
+///
+/// The physical-device properties and features go through here. On
+/// 2026-09-30 their raw views were refused in parallel mode, so Xenia read
+/// an empty adapter name and no independentBlend, rejected the only GPU,
+/// and faulted on a null device in `VulkanCommandProcessor::SetupContext`.
+fn writeGuestBytes(state: anytype, address: u64, bytes: []const u8) bool {
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "copyToGuest")) return state.copyToGuest(address, bytes);
+    const destination = state.guestMemory(address, bytes.len) orelse return false;
+    @memcpy(destination, bytes);
+    return true;
+}
+
 fn enumerateEmpty(state: anytype, count_address: u64) u64 {
-    if (state.guestMemory(count_address, 4) == null) return vkErrorInitializationFailed();
+    if (count_address == 0 or !guestRangeAvailable(state, count_address, 4)) return vkErrorInitializationFailed();
     state.write32(count_address, 0);
     return 0;
 }
 
 fn writeApiVersion(state: anytype, output: u64) u64 {
-    if (state.guestMemory(output, 4) == null) return vkErrorInitializationFailed();
+    if (output == 0 or !guestRangeAvailable(state, output, 4)) return vkErrorInitializationFailed();
     state.write32(output, 0x0040_2000); // Vulkan 1.2.0
     return 0;
 }
 
 fn enumerateDeviceExtensions(state: anytype) u64 {
     return instance_extensions.enumerateSyntheticDevice(state);
+}
+
+fn coreFeatureEnabled(features: []const u8, offset: usize) bool {
+    if (offset > features.len or features.len - offset < 4) return false;
+    return std.mem.readInt(u32, features[offset..][0..4], .little) != 0;
 }
 
 fn writePhysicalDeviceFeatures(state: anytype, output: u64) void {
@@ -18987,7 +22492,7 @@ fn writeMemoryRequirements(state: anytype, output: u64, requested_size: u64) u64
 }
 
 fn createHandle(state: anytype, output: u64, handle: u64, owner: []const u8) u64 {
-    if (output == 0 or state.guestMemory(output, 8) == null) return vkErrorInitializationFailed();
+    if (output == 0 or !guestRangeAvailable(state, output, 8)) return vkErrorInitializationFailed();
     state.write64(output, handle);
     registerOpaqueHandle(state, handle, owner);
     return 0;
@@ -19001,12 +22506,12 @@ fn enumerateHandle(
     owner: []const u8,
     register_opaque: bool,
 ) u64 {
-    if (count_address == 0 or state.guestMemory(count_address, 4) == null) return vkErrorInitializationFailed();
+    if (count_address == 0 or !guestRangeAvailable(state, count_address, 4)) return vkErrorInitializationFailed();
     if (output == 0) {
         state.write32(count_address, 1);
         return 0;
     }
-    if (state.read32(count_address) == 0 or state.guestMemory(output, 8) == null) return 5;
+    if (state.read32(count_address) == 0 or !guestRangeAvailable(state, output, 8)) return 5;
     state.write64(output, handle);
     if (register_opaque) registerOpaqueHandle(state, handle, owner);
     state.write32(count_address, 1);
@@ -19020,7 +22525,7 @@ const PhysicalDeviceGuestHandle = struct {
 
 fn publishVulkanDispatchableHandle(state: anytype, output: u64, handle: abi.Device) bool {
     if (output == 0 or handle == null) return false;
-    if (state.guestMemory(output, 8) == null) return false;
+    if (!guestRangeAvailable(state, output, 8)) return false;
     state.write64(output, @intFromPtr(handle.?));
     return true;
 }
@@ -19140,6 +22645,44 @@ test "guest symbol name hash separates the command chain's literals" {
     try std.testing.expect(vulkanNameHash("vkCmdPipelineBarrier2") != vulkanNameHash("vkCmdPipelineBarrier2KHR"));
 }
 
+test "guest Vulkan symbol lookup caches exact names and recovers from direct-map collisions" {
+    var forwarder = Forwarder{};
+    const library_token: u64 = GUEST_LIBRARY_HANDLE_BASE + 17;
+    const first_name = "vkCmdDrawIndexed";
+    const first_hash = vulkanNameHash(first_name);
+    const target_slot = guestSymbolLookupCacheIndex(library_token, first_hash);
+    var collision_buffer: [48]u8 = undefined;
+    var collision_name: ?[]const u8 = null;
+    for (0..100_000) |candidate| {
+        const formatted = try std.fmt.bufPrint(&collision_buffer, "vkCmdCacheCollision{d}", .{candidate});
+        if (!std.mem.eql(u8, formatted, first_name) and
+            guestSymbolLookupCacheIndex(library_token, vulkanNameHash(formatted)) == target_slot)
+        {
+            collision_name = formatted;
+            break;
+        }
+    }
+    const colliding_name = collision_name orelse return error.TestUnexpectedResult;
+
+    const first = forwarder.allocateGuestSymbol(library_token, first_name);
+    try std.testing.expect(first != 0);
+    try std.testing.expectEqual(first, forwarder.allocateGuestSymbol(library_token, first_name));
+    const colliding = forwarder.allocateGuestSymbol(library_token, colliding_name);
+    try std.testing.expect(colliding != 0 and colliding != first);
+    try std.testing.expectEqual(first, forwarder.allocateGuestSymbol(library_token, first_name));
+    try std.testing.expectEqual(first, forwarder.allocateGuestSymbol(library_token, first_name));
+    try std.testing.expectEqual(@as(u64, 2), forwarder.guest_lookup_count);
+    try std.testing.expectEqual(@as(u64, 2), forwarder.guest_symbol_lookup_cache_hits);
+    try std.testing.expectEqual(@as(u64, 3), forwarder.guest_symbol_lookup_cache_misses);
+
+    // The repeated loader-evidence lookup is now a direct token-slot access;
+    // its first/repeated logging semantics are unchanged.
+    try std.testing.expect(forwarder.noteVulkanLoaderLookup(library_token, first_name, first));
+    try std.testing.expect(!forwarder.noteVulkanLoaderLookup(library_token, first_name, first));
+    try std.testing.expectEqual(@as(u64, 1), forwarder.vulkan_loader_lookup_unique);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.vulkan_loader_lookup_repeats);
+}
+
 test "Vulkan guest symbol classification covers surface bootstrap" {
     try std.testing.expectEqual(GuestSymbolKind.enumerate_instance_extensions, guestSymbolKind("vkEnumerateInstanceExtensionProperties"));
     try std.testing.expectEqual(GuestSymbolKind.create_metal_surface, guestSymbolKind("vkCreateMetalSurfaceEXT"));
@@ -19256,6 +22799,41 @@ test "Vulkan feature pNext sizes include every advertised VkBool32" {
     try std.testing.expectEqual(@as(usize, 1), featureChainBoolCount(6));
 }
 
+test "Vulkan FSI features are forwarded and unsupported interlock bits are refused" {
+    try std.testing.expectEqual(@as(?usize, 3), featureChainKind(abi.STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT));
+    try std.testing.expectEqual(abi.STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT, featureChainSType(3));
+
+    var forwarder = Forwarder{};
+    var state = TestState{};
+    const node: u64 = 64;
+    state.write32(node, abi.STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT);
+    state.write64(node + 8, 0);
+    state.write32(node + 16, 1); // fragmentShaderSampleInterlock
+    state.write32(node + 20, 1); // fragmentShaderPixelInterlock
+    state.write32(node + 24, 0); // fragmentShaderShadingRateInterlock
+
+    forwarder.real_vulkan.feature_chain_valid[3] = true;
+    forwarder.real_vulkan.feature_chain_sizes[3] = featureChainSize(3);
+    const host = &forwarder.real_vulkan.feature_chain_supported[3];
+    std.mem.writeInt(u32, host[0..4], abi.STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT, .little);
+    std.mem.writeInt(u32, host[16..20], 1, .little);
+    std.mem.writeInt(u32, host[20..24], 1, .little);
+    std.mem.writeInt(u32, host[24..28], 0, .little);
+
+    const request = fsiGuestFeatureRequest(&state, node);
+    try std.testing.expectEqual(FsiGuestChainStatus.present, request.status);
+    try std.testing.expect(request.sample and request.pixel and !request.shading_rate);
+
+    var scratch: FeatureChainScratch = .{};
+    try std.testing.expect(forwarder.prepareDeviceFeatureChain(&state, node, &scratch));
+    try std.testing.expect(featureChainBoolAt(&scratch.nodes[3], 0));
+    try std.testing.expect(featureChainBoolAt(&scratch.nodes[3], 1));
+    try std.testing.expect(!featureChainBoolAt(&scratch.nodes[3], 2));
+
+    state.write32(node + 24, 1);
+    try std.testing.expect(!forwarder.prepareDeviceFeatureChain(&state, node, &scratch));
+}
+
 test "native Vulkan device handles are published to guest output memory" {
     var state = TestState{};
     const device: abi.Device = @ptrFromInt(0x1234);
@@ -19263,6 +22841,110 @@ test "native Vulkan device handles are published to guest output memory" {
     try std.testing.expectEqual(@as(u64, 0x1234), state.read64(8));
     try std.testing.expect(!publishVulkanDispatchableHandle(&state, 0, device));
     try std.testing.expect(!publishVulkanDispatchableHandle(&state, 8, null));
+}
+
+test "Vulkan bootstrap output parameters use address-based writes in parallel mode" {
+    var state = TestState{ .parallel_guest_execution = true };
+    const count_address: u64 = 8;
+    const version_address: u64 = 16;
+    const handle_address: u64 = 24;
+    const array_address: u64 = 32;
+
+    try std.testing.expect(state.guestMemory(count_address, 4) == null);
+    try std.testing.expect(guestRangeAvailable(&state, count_address, 4));
+    try std.testing.expectEqual(@as(u64, 0), writeApiVersion(&state, version_address));
+    try std.testing.expectEqual(@as(u32, 0x0040_2000), state.read32(version_address));
+    try std.testing.expectEqual(@as(u64, 0), enumerateEmpty(&state, count_address));
+    try std.testing.expectEqual(@as(u32, 0), state.read32(count_address));
+
+    state.write32(count_address, 1);
+    try std.testing.expectEqual(@as(u64, 0), enumerateHandle(&state, count_address, array_address, 0x1234, "VkPhysicalDevice", false));
+    try std.testing.expectEqual(@as(u64, 0x1234), state.read64(array_address));
+    try std.testing.expectEqual(@as(u32, 1), state.read32(count_address));
+
+    const device: abi.Device = @ptrFromInt(0x5678);
+    try std.testing.expect(publishVulkanDispatchableHandle(&state, handle_address, device));
+    try std.testing.expectEqual(@as(u64, 0x5678), state.read64(handle_address));
+}
+
+test "physical-device properties and features reach the guest without a raw view" {
+    // The 2026-09-30 crash: with raw views refused, both writes were
+    // dropped, Xenia saw Vulkan device '' without independentBlend and
+    // rejected the only GPU.
+    var forwarder = Forwarder{};
+    const name = "Apple M2 Max";
+    const device_name_offset = 20;
+    const independent_blend_offset = 12;
+    const tessellation_shader_offset = abi.PHYSICAL_DEVICE_FEATURES_TESSELLATION_SHADER_OFFSET;
+    @memcpy(forwarder.real_vulkan.physical_device_properties[device_name_offset..][0..name.len], name);
+    std.mem.writeInt(u32, forwarder.real_vulkan.physical_device_features[independent_blend_offset..][0..4], 1, .little);
+    std.mem.writeInt(u32, forwarder.real_vulkan.physical_device_features[tessellation_shader_offset..][0..4], 1, .little);
+
+    var state = TestState{ .parallel_guest_execution = true };
+    const properties_output: u64 = 0x1000;
+    const features_output: u64 = 0x2000;
+    const properties2_output: u64 = 0x3000;
+    try std.testing.expect(state.guestMemory(properties_output, 8) == null);
+
+    forwarder.writeRealPhysicalDeviceProperties(&state, properties_output);
+    forwarder.writeRealPhysicalDeviceFeatures(&state, features_output);
+    try std.testing.expectEqualStrings(name, std.mem.sliceTo(state.mem[properties_output + device_name_offset ..][0..256], 0));
+    try std.testing.expectEqual(@as(u32, 1), state.read32(features_output + independent_blend_offset));
+    try std.testing.expectEqual(@as(u32, 1), state.read32(features_output + tessellation_shader_offset));
+    try std.testing.expect(coreFeatureEnabled(&forwarder.real_vulkan.physical_device_features, tessellation_shader_offset));
+
+    // The *2 forms carry the same core structure after sType and pNext.
+    forwarder.writeRealPhysicalDeviceProperties2(&state, properties2_output);
+    try std.testing.expectEqualStrings(name, std.mem.sliceTo(state.mem[properties2_output + 16 + device_name_offset ..][0..256], 0));
+}
+
+test "native tessellation pipeline state forwards the legal domain-origin pNext" {
+    var state = TestState{};
+    const tessellation_address: u64 = 0x1000;
+    const domain_origin_address: u64 = 0x1040;
+    state.write32(tessellation_address, abi.STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO);
+    state.write64(tessellation_address + 8, domain_origin_address);
+    state.write32(tessellation_address + 16, 0);
+    state.write32(tessellation_address + 20, 3);
+    state.write32(domain_origin_address, abi.STRUCTURE_TYPE_PIPELINE_TESSELLATION_DOMAIN_ORIGIN_STATE_CREATE_INFO);
+    state.write64(domain_origin_address + 8, 0);
+    state.write32(domain_origin_address + 16, 1); // VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT
+
+    var tessellation: abi.PipelineTessellationStateCreateInfo = .{};
+    var domain_origin: abi.PipelineTessellationDomainOriginStateCreateInfo = .{};
+    try Forwarder.marshalPipelineTessellationState(&state, tessellation_address, &tessellation, &domain_origin);
+
+    try std.testing.expectEqual(@as(u32, 3), tessellation.patch_control_points);
+    try std.testing.expectEqual(@as(u32, 1), domain_origin.domain_origin);
+    try std.testing.expectEqual(@intFromPtr(&domain_origin), @intFromPtr(tessellation.p_next.?));
+}
+
+test "tessellation feature offset and pNext validation are explicit" {
+    var features = [_]u8{0} ** 220;
+    try std.testing.expect(!coreFeatureEnabled(&features, abi.PHYSICAL_DEVICE_FEATURES_TESSELLATION_SHADER_OFFSET));
+    std.mem.writeInt(u32, features[abi.PHYSICAL_DEVICE_FEATURES_TESSELLATION_SHADER_OFFSET..][0..4], 1, .little);
+    try std.testing.expect(coreFeatureEnabled(&features, abi.PHYSICAL_DEVICE_FEATURES_TESSELLATION_SHADER_OFFSET));
+    try std.testing.expect(!coreFeatureEnabled(&features, features.len - 2));
+    try std.testing.expectEqual(@as(usize, 24), abi.PHYSICAL_DEVICE_FEATURES_SAMPLE_RATE_SHADING_OFFSET);
+    try std.testing.expectEqual(@as(usize, 104), abi.PHYSICAL_DEVICE_FEATURES_FRAGMENT_STORES_AND_ATOMICS_OFFSET);
+    std.mem.writeInt(u32, features[abi.PHYSICAL_DEVICE_FEATURES_SAMPLE_RATE_SHADING_OFFSET..][0..4], 1, .little);
+    std.mem.writeInt(u32, features[abi.PHYSICAL_DEVICE_FEATURES_FRAGMENT_STORES_AND_ATOMICS_OFFSET..][0..4], 1, .little);
+    try std.testing.expect(coreFeatureEnabled(&features, abi.PHYSICAL_DEVICE_FEATURES_SAMPLE_RATE_SHADING_OFFSET));
+    try std.testing.expect(coreFeatureEnabled(&features, abi.PHYSICAL_DEVICE_FEATURES_FRAGMENT_STORES_AND_ATOMICS_OFFSET));
+
+    var state = TestState{};
+    const tessellation_address: u64 = 0x1000;
+    const unknown_node_address: u64 = 0x1040;
+    state.write32(tessellation_address, abi.STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO);
+    state.write64(tessellation_address + 8, unknown_node_address);
+    state.write32(unknown_node_address, 0xDEAD);
+    state.write64(unknown_node_address + 8, 0);
+    var tessellation: abi.PipelineTessellationStateCreateInfo = .{};
+    var domain_origin: abi.PipelineTessellationDomainOriginStateCreateInfo = .{};
+    try std.testing.expectError(
+        error.TessellationChainUnsupported,
+        Forwarder.marshalPipelineTessellationState(&state, tessellation_address, &tessellation, &domain_origin),
+    );
 }
 
 test "Vulkan physical device enumeration exposes native handles when available" {
@@ -19395,6 +23077,7 @@ fn nulTerminate(buffer: []u8, value: []const u8) ?[*:0]const u8 {
 const TestState = struct {
     xmm: [16][16]u8 = @splat(@splat(0)),
     mem: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024),
+    parallel_guest_execution: bool = false,
     regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0, r8: u64 = 0, r9: u64 = 0, rsp: u64 = 0, rax: u64 = 0 } = .{},
     executed_steps: u64 = 10,
     active_guest_thread: u64 = 0x7FFF_2020,
@@ -19408,6 +23091,7 @@ const TestState = struct {
     heap_next: u64 = 1024,
 
     pub fn guestMemory(self: *@This(), address: u64, length: u64) ?[]u8 {
+        if (self.parallel_guest_execution) return null;
         if (address + length > self.mem.len) return null;
         return self.mem[@intCast(address)..@intCast(address + length)];
     }
@@ -19415,6 +23099,15 @@ const TestState = struct {
     fn guestMemoryConst(self: *@This(), address: u64, length: u64) ?[]const u8 {
         if (address + length > self.mem.len) return null;
         return self.mem[@intCast(address)..@intCast(address + length)];
+    }
+
+    /// The ordered writer, which stays available when `parallel_guest_execution`
+    /// refuses raw views - the case these tests use to prove a path does not
+    /// depend on one.
+    fn copyToGuest(self: *@This(), address: u64, source: []const u8) bool {
+        if (address + source.len > self.mem.len) return false;
+        @memcpy(self.mem[@intCast(address)..][0..source.len], source);
+        return true;
     }
 
     pub fn guestCString(self: *@This(), address: u64, maximum: usize) ?[]const u8 {
@@ -19643,6 +23336,961 @@ test "mapped guest shadow is uploaded before native submission" {
     try std.testing.expectEqualSlices(u8, &expected, &host_bytes);
     try std.testing.expectEqual(@as(u64, 1), forwarder.vulkan_shadow_uploads);
     try std.testing.expectEqual(@as(u64, 0), forwarder.vulkan_shadow_upload_failures);
+}
+
+const FsiRasterTestDriver = struct {
+    var creates: usize = 0;
+    var destroys: usize = 0;
+    var ends: usize = 0;
+    var begins: usize = 0;
+    var last_pass: u64 = 0;
+    var last_buffer: usize = 0;
+    var create_result: abi.Result = abi.SUCCESS;
+
+    fn reset() void {
+        creates = 0;
+        destroys = 0;
+        ends = 0;
+        begins = 0;
+        last_pass = 0;
+        last_buffer = 0;
+        create_result = abi.SUCCESS;
+    }
+    fn create(_: abi.Device, pointer: *const anyopaque, _: ?*const anyopaque, output: *u64) callconv(.c) abi.Result {
+        const info: *const marshal.RenderPassCreateInfo = @ptrCast(@alignCast(pointer));
+        std.debug.assert(info.attachment_count == 0 and info.subpass_count == 1 and info.dependency_count == 2);
+        creates += 1;
+        output.* = if (create_result == abi.SUCCESS) 0x7100 + creates else 0;
+        return create_result;
+    }
+    fn destroy(_: abi.Device, pass: u64, _: ?*const anyopaque) callconv(.c) void {
+        std.debug.assert(pass > 0x7100);
+        destroys += 1;
+    }
+    fn createPipeline(_: abi.Device, _: abi.PipelineCache, count: u32, info: [*]const abi.GraphicsPipelineCreateInfo, _: ?*const anyopaque, output: [*]u64) callconv(.c) abi.Result {
+        std.debug.assert(count == 1 and info[0].render_pass == 0x7101 and info[0].multisample_state.?.rasterization_samples == 4);
+        output[0] = 0x7004;
+        return abi.SUCCESS;
+    }
+    fn end(buffer: abi.CommandBuffer) callconv(.c) void {
+        last_buffer = @intFromPtr(buffer);
+        ends += 1;
+    }
+    fn begin(buffer: abi.CommandBuffer, info: *const abi.RenderPassBeginInfo, contents: u32) callconv(.c) void {
+        std.debug.assert(info.framebuffer == 0x7200 and info.render_area.extent.width == 8192 and contents == 0 and info.clear_value_count == 0);
+        last_buffer = @intFromPtr(buffer);
+        last_pass = info.render_pass;
+        begins += 1;
+    }
+};
+
+fn fsiRasterTestPass(forwarder: *Forwarder) !void {
+    FsiRasterTestDriver.reset();
+    forwarder.fsi_raster.moltenvk = true;
+    const subpass = marshal.SubpassDescription{};
+    const dependencies = [_]marshal.SubpassDependency{
+        .{ .src_subpass = 0xffff_ffff, .src_stage_mask = 0x80, .dst_stage_mask = 0x80, .src_access_mask = 0x60, .dst_access_mask = 0x60, .dependency_flags = 1 },
+        .{ .dst_subpass = 0xffff_ffff, .src_stage_mask = 0x80, .dst_stage_mask = 0x80, .src_access_mask = 0x60, .dst_access_mask = 0x60, .dependency_flags = 1 },
+    };
+    const info = marshal.RenderPassCreateInfo{ .s_type = 38, .subpass_count = 1, .subpasses = &subpass, .dependency_count = 2, .dependencies = &dependencies };
+    try std.testing.expect(forwarder.fsi_raster.capturePass(0x7100, &info));
+    forwarder.real_vulkan.device = @ptrFromInt(0x1234);
+    forwarder.real_vulkan.fn_ptrs.create_render_pass = FsiRasterTestDriver.create;
+    forwarder.real_vulkan.fn_ptrs.destroy_render_pass = FsiRasterTestDriver.destroy;
+    forwarder.real_vulkan.fn_ptrs.cmd_begin_render_pass = FsiRasterTestDriver.begin;
+    forwarder.real_vulkan.fn_ptrs.cmd_end_render_pass = FsiRasterTestDriver.end;
+    forwarder.fsi_raster.allocated(&.{0x501}, 0x601, true);
+    try std.testing.expect(forwarder.mapVulkanHandle(&forwarder.real_vulkan.command_buffer_map, 0x501, 0x5010, "test"));
+}
+
+test "FSI raster sample count reaches native pipeline creation even without shader diagnostic identity" {
+    var forwarder = Forwarder{};
+    try fsiRasterTestPass(&forwarder);
+    defer forwarder.fsiRasterShutdown();
+    forwarder.real_vulkan.fn_ptrs.create_graphics_pipelines = FsiRasterTestDriver.createPipeline;
+    try std.testing.expect(forwarder.mapVulkanHandle(&forwarder.real_vulkan.render_pass_map, 2, 0x7100, "test"));
+    try std.testing.expect(forwarder.mapVulkanHandle(&forwarder.real_vulkan.pipeline_layout_map, 1, 0x7300, "test"));
+    try std.testing.expect(forwarder.mapVulkanHandle(&forwarder.real_vulkan.shader_module_map, 3, 0x7500, "test"));
+    var state = TestState{};
+    const root = abi.GraphicsPipelineCreateInfo{ .stage_count = 1, .stages = @ptrFromInt(0x1100), .multisample_state = @ptrFromInt(0x1200), .layout = 1, .render_pass = 2 };
+    const stage = abi.PipelineShaderStageCreateInfo{ .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = 3, .name = @ptrFromInt(0x1300) };
+    const multisample = abi.PipelineMultisampleStateCreateInfo{ .rasterization_samples = 4 };
+    try std.testing.expect(state.copyToGuest(0x1000, std.mem.asBytes(&root)));
+    try std.testing.expect(state.copyToGuest(0x1100, std.mem.asBytes(&stage)));
+    try std.testing.expect(state.copyToGuest(0x1200, std.mem.asBytes(&multisample)));
+    try std.testing.expect(state.copyToGuest(0x1300, "main\x00"));
+    var real: u64 = 0;
+    var result: i32 = abi.ERROR_INITIALIZATION_FAILED;
+    var tessellation = false;
+    try forwarder.marshalRealGraphicsPipeline(&state, 0, 0x1000, &real, &result, &tessellation);
+    try std.testing.expectEqual(abi.SUCCESS, result);
+    try std.testing.expectEqual(@as(u64, 0x7101), forwarder.fsi_raster.pipelines.get(real).?);
+    // The same forget path is used for guest destruction and creation-batch
+    // rollback, so a retried batch cannot leave stale native-handle bindings.
+    forwarder.forgetGraphicsPipeline(real);
+    try std.testing.expect(forwarder.fsi_raster.pipelines.get(real) == null);
+}
+
+test "FSI pixel frequency reaches native module creation while preserving explicit sample inputs and refusal ordering" {
+    const Driver = struct {
+        var calls: usize = 0;
+        var rate_caps: usize = 0;
+        var refuse: bool = false;
+        fn create(_: abi.Device, raw: *const anyopaque, _: ?*const anyopaque, out: *u64) callconv(.c) i32 {
+            calls += 1;
+            const info: *const marshal.ShaderModuleCreateInfo = @ptrCast(@alignCast(raw));
+            const words: [*]const u32 = @ptrCast(@alignCast(info.code.?));
+            var cursor: usize = 5;
+            rate_caps = 0;
+            while (cursor < info.code_size / 4) {
+                const count = words[cursor] >> 16;
+                if (@as(u16, @truncate(words[cursor])) == 17 and words[cursor + 1] == 35) rate_caps += 1;
+                cursor += count;
+            }
+            if (refuse) return abi.ERROR_INITIALIZATION_FAILED;
+            out.* = 0x4567;
+            return abi.SUCCESS;
+        }
+    };
+    // A small fragment module with a typed input mask and ordered interlock.
+    const words = [_]u32{
+        0x07230203,        0x00010500,        0,          32,         0,
+        0x00020011,        1,                 0x00020011, 35,         0x00020011,
+        5363,              0x0006000b,        17,         0x4c534c47, 0x6474732e,
+        0x3035342e,        0,                 0x0003000e, 0,          1,
+        0x0007000f,        4,                 10,         0x6e69616d, 0,
+        6,                 16,                0x00030010, 10,         7,
+        0x00030010,        10,                5367,       0x00040047, 6,
+        11,                20,                0x00040047, 16,         11,
+        15,                0x00020013,        1,          0x00030021, 2,
+        1,                 0x00040015,        3,          32,         1,
+        0x00040015,        4,                 32,         0,          0x0004002b,
+        4,                 5,                 1,          0x0004001c, 7,
+        3,                 5,                 0x00040020, 8,          1,
+        7,                 0x0004003b,        8,          6,          1,
+        0x00030016,        13,                32,         0x00040017, 14,
+        13,                4,                 0x00040020, 15,         1,
+        14,                0x0004003b,        15,         16,         1,
+        0x00050036,        1,                 10,         0,          2,
+        0x000200f8,        11,                0x0004003d, 7,          12,
+        6,                 0x0004003d,        14,         18,         16,
+        0x00010000 | 5364, 0x00010000 | 5365, 0x000100fd, 0x00010038,
+    };
+    for ([_]u8{ 0, 1, 2, 3 }) |mode| {
+        var forwarder = Forwarder{};
+        var state = TestState{};
+        forwarder.fsi_raster.moltenvk = mode != 1;
+        forwarder.fsi_pixel_frequency_configured = true;
+        forwarder.robust_access_configured = true;
+        forwarder.real_vulkan.device = @ptrFromInt(0x1234);
+        forwarder.real_vulkan.fn_ptrs.create_shader_module = Driver.create;
+        defer forwarder.vulkan_scratch.deinit();
+        const sample = [_]u32{ 0x00030047, 6, 17 };
+        const size = @sizeOf(@TypeOf(words)) + (if (mode == 2) @sizeOf(@TypeOf(sample)) else @as(usize, 0));
+        const root = marshal.ShaderModuleCreateInfo{ .s_type = 16, .code_size = size, .code = @ptrFromInt(2048) };
+        try std.testing.expect(state.copyToGuest(1024, std.mem.asBytes(&root)));
+        if (mode == 2) {
+            var types: usize = 5;
+            while (@as(u16, @truncate(words[types])) != 19) types += words[types] >> 16;
+            try std.testing.expect(state.copyToGuest(2048, std.mem.sliceAsBytes(words[0..types])));
+            try std.testing.expect(state.copyToGuest(2048 + types * 4, std.mem.sliceAsBytes(&sample)));
+            try std.testing.expect(state.copyToGuest(2048 + (types + 3) * 4, std.mem.sliceAsBytes(words[types..])));
+        } else try std.testing.expect(state.copyToGuest(2048, std.mem.sliceAsBytes(&words)));
+        Driver.calls = 0;
+        Driver.refuse = mode == 3;
+        try forwarder.createRealVulkanObject(&state, 0x321, 1024, "vkCreateShaderModule");
+        try std.testing.expectEqual(@as(usize, 1), Driver.calls);
+        try std.testing.expectEqual(@as(usize, 1), Driver.rate_caps);
+        try std.testing.expectEqual(@as(u64, if (mode == 0 or mode == 3) 1 else 0), forwarder.fsi_pixel_frequency_changed);
+        try std.testing.expectEqual(@as(u64, if (mode == 2) 1 else 0), forwarder.fsi_pixel_frequency_explicit);
+        try std.testing.expectEqual(@as(u64, if (mode == 3) 1 else 0), forwarder.fsi_pixel_frequency_driver_rejections);
+        try std.testing.expectEqual(mode != 3, forwarder.realVulkanObjectMapped(0x321, "vkCreateShaderModule"));
+    }
+}
+
+test "FSI shader hardening failures never create the unsafe original module" {
+    const Driver = struct {
+        var calls: usize = 0;
+        fn create(_: abi.Device, _: *const anyopaque, _: ?*const anyopaque, out: *u64) callconv(.c) i32 {
+            calls += 1;
+            // An unsafe retry would succeed and conceal the safety failure.
+            if (calls == 1) return abi.ERROR_INITIALIZATION_FAILED;
+            out.* = 0x4567;
+            return abi.SUCCESS;
+        }
+    };
+    // Minimal uniform-array load through a computed index. The stub needs no
+    // actual GPU, and a successful retry would be an observable regression.
+    const words = [_]u32{
+        0x07230203, 0x00010000, 0,          20,         0,
+        0x0003000e, 0,          1,          0x0005000f, 5,
+        12,         0x6e69616d, 0,          0x00030047, 4,
+        2,          0x00020013, 9,          0x00030021, 10,
+        9,          0x00040015, 1,          32,         0,
+        0x0004002b, 1,          2,          4,          0x0004001c,
+        3,          1,          2,          0x0003001e, 4,
+        3,          0x00040020, 5,          2,          4,
+        0x00040020, 6,          2,          1,          0x0004003b,
+        5,          7,          2,          0x0004002b, 1,
+        8,          0,          0x00050036, 9,          12,
+        0,          10,         0x000200f8, 13,         0x00050080,
+        1,          11,         8,          8,          0x00060041,
+        6,          14,         7,          8,          11,
+        0x0004003d, 1,          15,         14,         0x000100fd,
+        0x00010038,
+    };
+    var forwarder = Forwarder{};
+    var state = TestState{};
+    forwarder.robust_access_configured = true;
+    forwarder.robust_access_enabled = true;
+    forwarder.real_vulkan.device = @ptrFromInt(0x1234);
+    forwarder.real_vulkan.fn_ptrs.create_shader_module = Driver.create;
+    defer forwarder.vulkan_scratch.deinit();
+    const root = marshal.ShaderModuleCreateInfo{ .s_type = 16, .code_size = @sizeOf(@TypeOf(words)), .code = @ptrFromInt(2048) };
+    try std.testing.expect(state.copyToGuest(1024, std.mem.asBytes(&root)));
+    try std.testing.expect(state.copyToGuest(2048, std.mem.sliceAsBytes(&words)));
+    Driver.calls = 0;
+    try forwarder.createRealVulkanObject(&state, 0x321, 1024, "vkCreateShaderModule");
+    try std.testing.expectEqual(@as(usize, 1), Driver.calls);
+    try std.testing.expectEqual(abi.ERROR_INITIALIZATION_FAILED, forwarder.real_create_result);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.robust_access_driver_rejections);
+    try std.testing.expectEqual(@as(u32, 1), forwarder.robust_access_stats.uniform_zero_loads);
+    try std.testing.expect(!forwarder.realVulkanObjectMapped(0x321, "vkCreateShaderModule"));
+
+    // An unreadable module is refused before even calling the driver.
+    Driver.calls = 0;
+    @memset(state.mem[2048..][0..@sizeOf(@TypeOf(words))], 0);
+    forwarder.real_create_result = abi.SUCCESS;
+    try forwarder.createRealVulkanObject(&state, 0x322, 1024, "vkCreateShaderModule");
+    try std.testing.expectEqual(@as(usize, 0), Driver.calls);
+    try std.testing.expectEqual(abi.ERROR_INITIALIZATION_FAILED, forwarder.real_create_result);
+}
+
+test "FSI raster sample-count variants restart the live buffer without the watchdog" {
+    var forwarder = Forwarder{};
+    try fsiRasterTestPass(&forwarder);
+    defer forwarder.fsiRasterShutdown();
+    try std.testing.expect(forwarder.fsi_guard == null);
+    try std.testing.expectEqual(@as(u64, 0x7100), try forwarder.fsiRasterPipelinePass(0x7100, 1));
+    const four = try forwarder.fsiRasterPipelinePass(0x7100, 4);
+    try std.testing.expectEqual(four, try forwarder.fsiRasterPipelinePass(0x7100, 4));
+    try std.testing.expectEqual(@as(usize, 1), FsiRasterTestDriver.creates);
+    try forwarder.fsi_raster.pipelineCreated(0x7004, four);
+    forwarder.fsiBeginRecording(0x501, @ptrFromInt(0x5010), 1, false);
+    forwarder.fsi_raster.bindPipeline(0x501, 0x7004);
+    const begin = abi.RenderPassBeginInfo{ .render_pass = 0x7100, .framebuffer = 0x7200, .render_area = .{ .extent = .{ .width = 8192, .height = 8192 } } };
+    forwarder.fsiNoteBeginRenderPass(0x501, &begin, 0);
+    try std.testing.expect(forwarder.fsiRasterBeforeCommand(0x501, vulkanNameHash("vkCmdDrawIndexed"), "vkCmdDrawIndexed"));
+    try std.testing.expectEqual(four, FsiRasterTestDriver.last_pass);
+    try std.testing.expectEqual(@as(usize, 0x5010), FsiRasterTestDriver.last_buffer);
+    try std.testing.expectEqual(@as(usize, 1), FsiRasterTestDriver.begins);
+    try std.testing.expect(forwarder.fsiRasterBeforeCommand(0x501, vulkanNameHash("vkCmdDraw"), "vkCmdDraw"));
+    try std.testing.expectEqual(@as(usize, 1), FsiRasterTestDriver.begins);
+    try forwarder.fsi_raster.pipelineCreated(0x7001, 0x7100);
+    forwarder.fsi_raster.bindPipeline(0x501, 0x7001);
+    try std.testing.expect(forwarder.fsiRasterBeforeCommand(0x501, vulkanNameHash("vkCmdDraw"), "vkCmdDraw"));
+    try std.testing.expectEqual(@as(u64, 0x7100), FsiRasterTestDriver.last_pass);
+    forwarder.fsiForgetRenderPass(0x7100);
+    try std.testing.expectEqual(@as(usize, 1), FsiRasterTestDriver.destroys);
+    try std.testing.expect(forwarder.fsi_raster.findPass(four) == null);
+}
+
+test "FSI raster sample-count adaptation refuses unsafe queries, inheritance and failed variant creation" {
+    var forwarder = Forwarder{};
+    try fsiRasterTestPass(&forwarder);
+    defer forwarder.fsiRasterShutdown();
+    FsiRasterTestDriver.create_result = abi.ERROR_OUT_OF_HOST_MEMORY;
+    try std.testing.expectError(error.FsiRasterizationUnavailable, forwarder.fsiRasterPipelinePass(0x7100, 4));
+    try std.testing.expectError(error.FsiRasterizationUnavailable, forwarder.fsiRasterPipelinePass(0xBAD, 4));
+    FsiRasterTestDriver.create_result = abi.SUCCESS;
+    const four = try forwarder.fsiRasterPipelinePass(0x7100, 4);
+    try forwarder.fsi_raster.pipelineCreated(0x7004, four);
+    forwarder.fsi_raster.bindPipeline(0x501, 0x7004);
+    const begin = abi.RenderPassBeginInfo{ .render_pass = 0x7100, .framebuffer = 0x7200, .render_area = .{ .extent = .{ .width = 8192, .height = 8192 } } };
+    forwarder.fsiNoteBeginRenderPass(0x501, &begin, 0);
+    try std.testing.expect(forwarder.fsiRasterBeforeCommand(0x501, vulkanNameHash("vkCmdBeginQuery"), "vkCmdBeginQuery"));
+    try std.testing.expect(!forwarder.fsiRasterBeforeCommand(0x501, vulkanNameHash("vkCmdDraw"), "vkCmdDraw"));
+    try std.testing.expect(forwarder.fsi_raster.command(0x501).?.failed);
+    try std.testing.expectEqual(@as(usize, 0), FsiRasterTestDriver.begins);
+    forwarder.fsiBeginRecording(0x501, @ptrFromInt(0x5010), 1, false);
+    try std.testing.expect(!forwarder.fsi_raster.command(0x501).?.failed);
+    forwarder.fsi_raster.command(0x501).?.primary = false;
+    forwarder.fsiBeginRecording(0x501, @ptrFromInt(0x5010), 1, true);
+    forwarder.fsi_raster.bindPipeline(0x501, 0x7004);
+    try std.testing.expect(!forwarder.fsiRasterBeforeCommand(0x501, vulkanNameHash("vkCmdDraw"), "vkCmdDraw"));
+    try std.testing.expect(forwarder.fsi_raster.command(0x501).?.failed);
+    try std.testing.expectEqual(@as(usize, 0), FsiRasterTestDriver.begins);
+}
+
+test "FSI raster sample-count selection is replayed into watchdog continuations" {
+    var forwarder = Forwarder{};
+    try fsiTestForwarder(&forwarder);
+    try fsiRasterTestPass(&forwarder);
+    defer forwarder.fsiRasterShutdown();
+    fsiTestRecordPassState(&forwarder);
+    const four = try forwarder.fsiRasterPipelinePass(0x7100, 4);
+    try forwarder.fsi_raster.pipelineCreated(0x7001, four);
+    forwarder.fsi_raster.bindPipeline(0x501, 0x7001);
+    try std.testing.expect(forwarder.fsiRasterBeforeCommand(0x501, vulkanNameHash("vkCmdDrawIndexed"), "vkCmdDrawIndexed"));
+    // Splitting must continue even when all diagnostic pipeline identities
+    // have been evicted. The mandatory registry is the authority here.
+    forwarder.vulkan_fsi_tracker = .{};
+    for (0..20) |_| fsiTestDraw(&forwarder);
+    try std.testing.expectEqual(@as(usize, 3), forwarder.fsiRecording(0x501).?.chunk_count);
+    try std.testing.expectEqualSlices(u32, &.{ 6, 6, 6, 2 }, forwarder.fsiRecording(0x501).?.segment_fsi_draws[0..4]);
+    try std.testing.expectEqual(@as(u64, 6 * 320 * 240 * 4), forwarder.fsiRecording(0x501).?.segment_sample_work[0]);
+    try std.testing.expectEqual(four, FsiRasterTestDriver.last_pass);
+    try std.testing.expectEqual(@as(usize, 0x9030), FsiRasterTestDriver.last_buffer);
+    // A return to 1x after a split restarts the chunk, not the guest's old buffer.
+    try forwarder.fsi_raster.pipelineCreated(0x7002, 0x7100);
+    forwarder.fsi_raster.bindPipeline(0x501, 0x7002);
+    try std.testing.expect(forwarder.fsiRasterBeforeCommand(0x501, vulkanNameHash("vkCmdDraw"), "vkCmdDraw"));
+    try std.testing.expectEqual(@as(usize, 0x9030), FsiRasterTestDriver.last_buffer);
+    try std.testing.expectEqual(@as(u64, 0x7100), FsiRasterTestDriver.last_pass);
+}
+
+const FsiTestDriver = struct {
+    var calls: [512][]const u8 = undefined;
+    var call_buffers: [512]usize = undefined;
+    var call_count: usize = 0;
+    var next_chunk: usize = 0x9000;
+    var next_fence: u64 = 0xA000;
+    var reset_result: abi.Result = abi.SUCCESS;
+    var begin_result: abi.Result = abi.SUCCESS;
+    var end_result: abi.Result = abi.SUCCESS;
+    var submit_info_counts: [16]u32 = undefined;
+    var submit_buffers: [16][2][4]usize = undefined;
+    var submit_buffer_counts: [16][2]u32 = undefined;
+    var submit_waits: [16][2]u32 = undefined;
+    var submit_signals: [16][2]u32 = undefined;
+    var submit_fences: [16]u64 = undefined;
+    var submit_count: usize = 0;
+
+    fn reset() void {
+        call_count = 0;
+        next_chunk = 0x9000;
+        next_fence = 0xA000;
+        reset_result = abi.SUCCESS;
+        begin_result = abi.SUCCESS;
+        end_result = abi.SUCCESS;
+        submit_count = 0;
+        submit_info_counts = [_]u32{0} ** submit_info_counts.len;
+        submit_buffer_counts = [_][2]u32{.{ 0, 0 }} ** submit_buffer_counts.len;
+        submit_waits = [_][2]u32{.{ 0, 0 }} ** submit_waits.len;
+        submit_signals = [_][2]u32{.{ 0, 0 }} ** submit_signals.len;
+        submit_fences = [_]u64{0} ** submit_fences.len;
+    }
+    fn note(name: []const u8, buffer: abi.CommandBuffer) void {
+        calls[call_count] = name;
+        call_buffers[call_count] = @intFromPtr(buffer);
+        call_count += 1;
+    }
+    fn endPass(buffer: abi.CommandBuffer) callconv(.c) void {
+        note("end_render_pass", buffer);
+    }
+    fn beginPass(buffer: abi.CommandBuffer, info: *const abi.RenderPassBeginInfo, contents: u32) callconv(.c) void {
+        std.debug.assert(info.render_pass == 0x7100 and info.framebuffer == 0x7200 and info.render_area.extent.width == 8192 and contents == 0);
+        note("begin_render_pass", buffer);
+    }
+    fn endBuffer(buffer: abi.CommandBuffer) callconv(.c) abi.Result {
+        note("end_command_buffer", buffer);
+        return end_result;
+    }
+    fn beginBuffer(buffer: abi.CommandBuffer, info: *const abi.CommandBufferBeginInfo) callconv(.c) abi.Result {
+        std.debug.assert(info.flags == 1 and info.inheritance_info == null);
+        note("begin_command_buffer", buffer);
+        return begin_result;
+    }
+    fn bindPipeline(buffer: abi.CommandBuffer, bind_point: u32, pipeline: u64) callconv(.c) void {
+        std.debug.assert(bind_point == 0 and pipeline == 0x7001);
+        note("bind_pipeline", buffer);
+    }
+    fn bindSets(buffer: abi.CommandBuffer, bind_point: u32, layout: u64, first: u32, count: u32, sets: [*]const u64, dynamic_count: u32, dynamic: ?[*]const u32) callconv(.c) void {
+        _ = dynamic;
+        std.debug.assert(bind_point == 0 and layout == 0x7300 and first == 0 and count == 1 and sets[0] == 0x7400 and dynamic_count == 0);
+        note("bind_descriptor_sets", buffer);
+    }
+    fn setScissor(buffer: abi.CommandBuffer, first: u32, count: u32, scissors: [*]const abi.Rect2D) callconv(.c) void {
+        std.debug.assert(first == 0 and count == 1 and scissors[0].extent.width == 320 and scissors[0].extent.height == 240);
+        note("set_scissor", buffer);
+    }
+    fn resetCommandBuffer(buffer: abi.CommandBuffer, flags: u32) callconv(.c) abi.Result {
+        std.debug.assert(flags == 0);
+        note("reset_chunk", buffer);
+        return reset_result;
+    }
+    fn createFence(_: abi.Device, _: *const abi.FenceCreateInfo, _: ?*const anyopaque, fence: *abi.Fence) callconv(.c) abi.Result {
+        next_fence += 1;
+        fence.* = next_fence;
+        return abi.SUCCESS;
+    }
+    fn createPool(device: abi.Device, info: *const abi.CommandPoolCreateInfo, allocator: ?*const anyopaque, pool: *abi.CommandPool) callconv(.c) abi.Result {
+        _ = device;
+        _ = allocator;
+        std.debug.assert(info.flags == abi.COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT);
+        pool.* = 0x7500;
+        return abi.SUCCESS;
+    }
+    fn allocate(device: abi.Device, info: *const abi.CommandBufferAllocateInfo, buffers: [*]abi.CommandBuffer) callconv(.c) abi.Result {
+        _ = device;
+        std.debug.assert(info.command_pool == 0x7500 and info.command_buffer_count == 1 and info.level == abi.COMMAND_BUFFER_LEVEL_PRIMARY);
+        next_chunk += 0x10;
+        buffers[0] = @ptrFromInt(next_chunk);
+        return abi.SUCCESS;
+    }
+    fn submit(queue: abi.Queue, count: u32, infos: ?[*]const abi.SubmitInfo, fence: abi.Fence) callconv(.c) abi.Result {
+        _ = queue;
+        std.debug.assert(count <= fsi_timing.max_submit_infos_per_timing_group);
+        submit_info_counts[submit_count] = count;
+        submit_buffer_counts[submit_count] = .{ 0, 0 };
+        submit_waits[submit_count] = .{ 0, 0 };
+        submit_signals[submit_count] = .{ 0, 0 };
+        for (0..count) |info_index| {
+            const info = infos.?[info_index];
+            submit_buffer_counts[submit_count][info_index] = info.command_buffer_count;
+            for (0..info.command_buffer_count) |index| submit_buffers[submit_count][info_index][index] = @intFromPtr(info.command_buffers.?[index]);
+            submit_waits[submit_count][info_index] = info.wait_semaphore_count;
+            submit_signals[submit_count][info_index] = info.signal_semaphore_count;
+        }
+        submit_fences[submit_count] = fence;
+        submit_count += 1;
+        return abi.SUCCESS;
+    }
+};
+
+fn fsiTestForwarder(forwarder: *Forwarder) !void {
+    FsiTestDriver.reset();
+    forwarder.real_vulkan.device = @ptrFromInt(0x1234);
+    const fns = &forwarder.real_vulkan.fn_ptrs;
+    fns.cmd_end_render_pass = FsiTestDriver.endPass;
+    fns.cmd_begin_render_pass = FsiTestDriver.beginPass;
+    fns.end_command_buffer = FsiTestDriver.endBuffer;
+    fns.begin_command_buffer = FsiTestDriver.beginBuffer;
+    fns.cmd_bind_pipeline = FsiTestDriver.bindPipeline;
+    fns.cmd_bind_descriptor_sets = FsiTestDriver.bindSets;
+    fns.cmd_set_scissor = FsiTestDriver.setScissor;
+    fns.reset_command_buffer = FsiTestDriver.resetCommandBuffer;
+    fns.create_command_pool = FsiTestDriver.createPool;
+    fns.allocate_command_buffers = FsiTestDriver.allocate;
+    fns.create_fence = FsiTestDriver.createFence;
+    // Xenia's FSI render pass: no attachments, one subpass, two dependencies.
+    var render_pass = [_]u8{0} ** 64;
+    std.mem.writeInt(u32, render_pass[32..36], 1, .little);
+    std.mem.writeInt(u32, render_pass[48..52], 2, .little);
+    forwarder.fsiNoteCommandBuffersAllocated(&.{0x501}, 0x601, abi.COMMAND_BUFFER_LEVEL_PRIMARY);
+    forwarder.fsiNoteRenderPassCreated(0x7100, &render_pass);
+    try std.testing.expect(forwarder.fsiArmedGuard() != null);
+    forwarder.fsiBeginRecording(0x501, @ptrFromInt(0x5010), 1, false);
+    forwarder.vulkan_fsi_tracker.notePipelineCreated(0x7001, .{ .uses_fsi = true, .module_id = 1, .combined_hash = 0xABC }, true);
+}
+
+fn fsiTestRecordPassState(forwarder: *Forwarder) void {
+    forwarder.vulkan_fsi_tracker.bindPipeline(0x501, 0x7001);
+    const shadow = forwarder.fsiShadow(0x501).?;
+    _ = shadow.bindPipeline(0, 0x7001);
+    _ = shadow.bindDescriptorSets(0, 0x7300, 0, &.{0x7400}, &.{});
+    _ = shadow.setScissors(0, &.{.{ .extent = .{ .width = 320, .height = 240 } }});
+    const begin = abi.RenderPassBeginInfo{ .render_pass = 0x7100, .framebuffer = 0x7200, .render_area = .{ .extent = .{ .width = 8192, .height = 8192 } } };
+    forwarder.fsiNoteBeginRenderPass(0x501, &begin, 0);
+}
+
+fn fsiTestDraw(forwarder: *Forwarder) void {
+    forwarder.fsiNoteCommand(0x501, vulkanNameHash("vkCmdDrawIndexed"), "vkCmdDrawIndexed");
+}
+
+test "FSI tessellation isolation splits before and after each draw" {
+    var forwarder = Forwarder{};
+    try fsiTestForwarder(&forwarder);
+    defer std.heap.page_allocator.destroy(forwarder.fsi_guard.?);
+    defer forwarder.fsi_raster.deinit();
+    fsiTestRecordPassState(&forwarder);
+    try forwarder.fsi_raster.isolatePipeline(0x7001);
+    for (0..3) |_| fsiTestDraw(&forwarder);
+    const recording = forwarder.fsiRecording(0x501).?;
+    try std.testing.expectEqual(@as(usize, 2), recording.chunk_count);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 1, 1 }, recording.segment_fsi_draws[0..3]);
+    try std.testing.expectEqualSlices(bool, &.{ true, true, true }, recording.segment_isolated[0..3]);
+    _ = forwarder.fsi_raster.isolated_pipelines.remove(0x7001);
+    fsiTestDraw(&forwarder);
+    try std.testing.expectEqual(@as(usize, 3), recording.chunk_count);
+    try std.testing.expect(!recording.segment_isolated[3]);
+    fsiTestDraw(&forwarder);
+    try std.testing.expectEqual(@as(u32, 2), recording.segment_fsi_draws[3]);
+}
+
+const FsiCpuRouteTestDriver = struct {
+    var events = std.atomic.Value(u32).init(0);
+    var errors = std.atomic.Value(u32).init(0);
+    var require_pairs: bool = true;
+
+    fn reset(pairs: bool) void {
+        events.store(0, .monotonic);
+        errors.store(0, .monotonic);
+        require_pairs = pairs;
+    }
+
+    fn draw(command_buffer: abi.CommandBuffer, vertices: u32, instances: u32, first: u32, first_instance: u32) callconv(.c) void {
+        const event = events.fetchAdd(1, .monotonic);
+        if (@intFromPtr(command_buffer.?) != 0x5010 or vertices != 3 or instances != 2 or first != event or first_instance != 5) {
+            _ = errors.fetchAdd(1, .monotonic);
+        }
+    }
+
+    fn endPass(command_buffer: abi.CommandBuffer) callconv(.c) void {
+        const event = events.fetchAdd(1, .monotonic);
+        if (@intFromPtr(command_buffer.?) != 0x5010 or (require_pairs and event % 2 != 1)) {
+            _ = errors.fetchAdd(1, .monotonic);
+        }
+    }
+
+    fn job(first: u32) async_vulkan_command.Job {
+        return .{ .draw = .{
+            .function = draw,
+            .command_buffer = @ptrFromInt(0x5010),
+            .vertex_count = 3,
+            .instance_count = 2,
+            .first_vertex = first,
+            .first_instance = 5,
+        } };
+    }
+
+    fn issue(forwarder: *Forwarder, first: u32) void {
+        if (!forwarder.queueAsyncVulkanCommand(job(first))) {
+            forwarder.callNativeVulkanCommand(@as(abi.PfnCmdDraw, draw), .{ @ptrFromInt(0x5010), 3, 2, first, 5 });
+        }
+    }
+};
+
+test "FSI small-chunk CPU route drains older jobs and retains command payloads and order" {
+    var forwarder = Forwarder{};
+    try fsiTestForwarder(&forwarder);
+    defer std.heap.page_allocator.destroy(forwarder.fsi_guard.?);
+    forwarder.vulkan_async_command_worker_decided = true;
+    forwarder.vulkan_async_command_worker_enabled = true;
+    defer forwarder.stopAsyncVulkanCommandWorker();
+    FsiCpuRouteTestDriver.reset(false);
+    // Queue an older draw before the budget switches to tiny recordings.
+    try std.testing.expect(forwarder.queueAsyncVulkanCommand(FsiCpuRouteTestDriver.job(0)));
+    forwarder.fsi_guard.?.monitor.cap.store(4, .monotonic);
+    FsiCpuRouteTestDriver.issue(&forwarder, 1);
+    // The direct draw must first drain the older job, even without an
+    // intervening end-pass barrier. Its first-vertex payload checks ordering.
+    try std.testing.expectEqual(@as(u32, 2), FsiCpuRouteTestDriver.events.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), FsiCpuRouteTestDriver.errors.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), forwarder.fsi_small_chunk_sync_commands);
+    // Retain the old route when requested, and ordinary larger recordings
+    // still use the worker. Drain before reading callback results.
+    forwarder.fsi_small_chunk_sync = false;
+    try std.testing.expect(forwarder.queueAsyncVulkanCommand(FsiCpuRouteTestDriver.job(2)));
+    forwarder.drainAsyncVulkanCommands();
+    forwarder.fsi_small_chunk_sync = true;
+    forwarder.fsi_guard.?.monitor.cap.store(16, .monotonic);
+    try std.testing.expect(forwarder.queueAsyncVulkanCommand(FsiCpuRouteTestDriver.job(3)));
+    forwarder.drainAsyncVulkanCommands();
+    try std.testing.expectEqual(@as(u32, 4), FsiCpuRouteTestDriver.events.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), FsiCpuRouteTestDriver.errors.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 4), forwarder.vulkan_real_command_calls);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.fsi_small_chunk_sync_commands);
+}
+
+test "FSI CPU benchmark measures production worker and synchronous tiny-chunk routes without a GPU" {
+    const benchmark = if (std.c.getenv("ROSETTE_FSI_CPU_BENCH")) |value| std.mem.eql(u8, std.mem.span(value), "1") else false;
+    const iterations: u32 = if (benchmark) 20000 else 32;
+    var elapsed: [2]u64 = undefined;
+    var queued: [2]u64 = undefined;
+    for (0..2) |mode| {
+        var forwarder = Forwarder{};
+        try fsiTestForwarder(&forwarder);
+        defer std.heap.page_allocator.destroy(forwarder.fsi_guard.?);
+        forwarder.fsi_guard.?.monitor.cap.store(4, .monotonic);
+        forwarder.fsi_small_chunk_sync = mode == 1;
+        forwarder.vulkan_async_command_worker_decided = true;
+        forwarder.vulkan_async_command_worker_enabled = true;
+        // Exclude worker creation from the measured baseline.
+        _ = forwarder.asyncVulkanWorker() orelse return error.WorkerUnavailable;
+        defer forwarder.stopAsyncVulkanCommandWorker();
+        FsiCpuRouteTestDriver.reset(true);
+        const started = transport_timing.nowNs();
+        for (0..iterations) |index| {
+            FsiCpuRouteTestDriver.issue(&forwarder, @intCast(index * 2));
+            forwarder.callNativeVulkanCommand(@as(abi.PfnCmdEndRenderPass, FsiCpuRouteTestDriver.endPass), .{@ptrFromInt(0x5010)});
+        }
+        elapsed[mode] = transport_timing.nowNs() -| started;
+        queued[mode] = forwarder.vulkan_async_command_worker.?.stats().submitted;
+        try std.testing.expectEqual(iterations * 2, FsiCpuRouteTestDriver.events.load(.monotonic));
+        try std.testing.expectEqual(@as(u32, 0), FsiCpuRouteTestDriver.errors.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, iterations) * 2, forwarder.vulkan_real_command_calls);
+        try std.testing.expectEqual(@as(u64, if (mode == 1) iterations else 0), forwarder.fsi_small_chunk_sync_commands);
+    }
+    try std.testing.expectEqual(@as(u64, iterations), queued[0]);
+    try std.testing.expectEqual(@as(u64, 0), queued[1]);
+    if (benchmark) std.debug.print(
+        "FSI CPU route benchmark: {d} draw/barrier pairs worker_ns={d} sync_ns={d} queued(old/new)={d}/{d}; stub native callbacks, production forwarding and FIFO barriers, not gameplay FPS\n",
+        .{ iterations, elapsed[0], elapsed[1], queued[0], queued[1] },
+    );
+}
+
+test "an FSI command buffer is split into bounded chunks that each resume the guest's bound state" {
+    var forwarder = Forwarder{};
+    try fsiTestForwarder(&forwarder);
+    fsiTestRecordPassState(&forwarder);
+    // The initial draw cap is 16. With a small test scissor, forty draws
+    // become three bounded chunks without triggering the pixel-work ceiling.
+    for (0..40) |_| fsiTestDraw(&forwarder);
+    const recording = forwarder.fsiRecording(0x501).?;
+    try std.testing.expectEqual(@as(usize, 2), recording.chunk_count);
+    try std.testing.expectEqualSlices(u32, &.{ 16, 16, 8 }, recording.segment_fsi_draws[0..3]);
+    try std.testing.expectEqual(@as(u64, 0xABC), recording.segment_first_pipeline[1]);
+    // Later commands go to the newest chunk.
+    try std.testing.expectEqual(@as(usize, 0x9020), @intFromPtr(forwarder.fsiCommandTarget(0x501, @ptrFromInt(0x5010))));
+    // Each split closes the old buffer and replays pipeline, descriptor sets
+    // and scissor into the new one inside the same render pass.
+    const expected = [_][]const u8{ "reset_chunk", "begin_command_buffer", "end_render_pass", "end_command_buffer", "begin_render_pass", "bind_pipeline", "bind_descriptor_sets", "set_scissor" };
+    try std.testing.expectEqual(expected.len * 2, FsiTestDriver.call_count);
+    for (expected, 0..) |name, index| {
+        try std.testing.expectEqualStrings(name, FsiTestDriver.calls[index]);
+        try std.testing.expectEqualStrings(name, FsiTestDriver.calls[expected.len + index]);
+    }
+    try std.testing.expectEqual(@as(usize, 0x9010), FsiTestDriver.call_buffers[0]);
+    try std.testing.expectEqual(@as(usize, 0x9010), FsiTestDriver.call_buffers[1]);
+    try std.testing.expectEqual(@as(usize, 0x5010), FsiTestDriver.call_buffers[2]);
+    try std.testing.expectEqual(@as(usize, 0x9010), FsiTestDriver.call_buffers[4]);
+    try std.testing.expectEqual(@as(usize, 0x9020), FsiTestDriver.call_buffers[8]);
+    try std.testing.expectEqual(@as(u64, 2), forwarder.fsi_guard.?.splits);
+
+    // The guest submits its one command buffer in one batch with a wait and
+    // a signal semaphore. The first two adjacent chunks are preserved as two
+    // VkSubmitInfo batches in one timed queue call; the final chunk retains
+    // the signal, followed by an empty submit that preserves the guest fence.
+    var real_submits: [8]abi.SubmitInfo = [_]abi.SubmitInfo{.{}} ** 8;
+    const waits = [_]abi.Semaphore{0x801};
+    const stages = [_]u32{0x400};
+    const signals = [_]abi.Semaphore{0x802};
+    const own = [_]abi.CommandBuffer{@ptrFromInt(0x5010)};
+    real_submits[0] = .{ .wait_semaphore_count = 1, .wait_semaphores = &waits, .wait_dst_stage_mask = &stages, .command_buffer_count = 1, .command_buffers = &own, .signal_semaphore_count = 1, .signal_semaphores = &signals };
+    var synthetics: [8][256]u64 = [_][256]u64{[_]u64{0} ** 256} ** 8;
+    synthetics[0][0] = 0x501;
+    var counts: [8]u32 = [_]u32{0} ** 8;
+    counts[0] = 1;
+    try std.testing.expect(forwarder.fsiSubmitNeedsExpansion(&synthetics, &counts, 1));
+    // The first two adjacent chunks share one host vkQueueSubmit call while
+    // remaining distinct VkSubmitInfo batches; the final chunk carries the
+    // guest signal and has its own timing fence. An empty submission then
+    // preserves the guest fence after the last segment.
+    forwarder.fsi_guard.?.monitor_started = true;
+    try std.testing.expectEqual(abi.SUCCESS, forwarder.fsiSubmitExpanded(@ptrFromInt(0x99), FsiTestDriver.submit, &real_submits, &synthetics, &counts, 1, 0x803, &forwarder));
+    try std.testing.expectEqual(@as(usize, 3), FsiTestDriver.submit_count);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 1, 0 }, FsiTestDriver.submit_info_counts[0..3]);
+    try std.testing.expectEqual(@as(u32, 1), FsiTestDriver.submit_buffer_counts[0][0]);
+    try std.testing.expectEqual(@as(u32, 1), FsiTestDriver.submit_buffer_counts[0][1]);
+    try std.testing.expectEqual(@as(usize, 0x5010), FsiTestDriver.submit_buffers[0][0][0]);
+    try std.testing.expectEqual(@as(usize, 0x9010), FsiTestDriver.submit_buffers[0][1][0]);
+    try std.testing.expectEqual(@as(u32, 1), FsiTestDriver.submit_buffer_counts[1][0]);
+    try std.testing.expectEqual(@as(usize, 0x9020), FsiTestDriver.submit_buffers[1][0][0]);
+    try std.testing.expectEqual(@as(u32, 0), FsiTestDriver.submit_buffer_counts[2][0]);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 0 }, FsiTestDriver.submit_waits[0][0..]);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0 }, FsiTestDriver.submit_signals[0][0..]);
+    try std.testing.expectEqual(@as(u32, 0), FsiTestDriver.submit_signals[0][1]);
+    try std.testing.expectEqual(@as(u32, 1), FsiTestDriver.submit_signals[1][0]);
+    try std.testing.expect(FsiTestDriver.submit_fences[0] != 0 and FsiTestDriver.submit_fences[1] != 0 and FsiTestDriver.submit_fences[2] != 0);
+    try std.testing.expectEqual(@as(u64, 0x803), FsiTestDriver.submit_fences[2]);
+    try std.testing.expectEqual(@as(u64, 3), forwarder.fsi_guard.?.segments_submitted);
+    try std.testing.expectEqual(@as(u64, 3), forwarder.fsi_guard.?.driver_queue_submit_calls);
+    try std.testing.expectEqual(@as(u64, 3), forwarder.fsi_guard.?.driver_submit_infos);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.fsi_guard.?.coalesced_submit_groups);
+
+    // Beginning the guest buffer again returns both chunks to the pool and
+    // the next split reuses one instead of allocating.
+    forwarder.fsi_guard.?.monitor.completed_serial = 3;
+    var discarded_fences: [8]u64 = undefined;
+    _ = forwarder.fsi_guard.?.monitor.collectFences(&discarded_fences);
+    forwarder.fsiBeginRecording(0x501, @ptrFromInt(0x5010), 1, false);
+    fsiTestRecordPassState(&forwarder);
+    for (0..17) |_| fsiTestDraw(&forwarder);
+    try std.testing.expectEqual(@as(u64, 2), forwarder.fsi_guard.?.chunk_pool.allocated);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.fsi_guard.?.chunk_pool.reuses);
+}
+
+test "FSI submit is refused before driver work when the watchdog cannot start" {
+    var forwarder = Forwarder{};
+    try fsiTestForwarder(&forwarder);
+    forwarder.fsi_guard_watcher_thread = true;
+    fsiTestRecordPassState(&forwarder);
+    fsiTestDraw(&forwarder);
+    var real_submits: [8]abi.SubmitInfo = [_]abi.SubmitInfo{.{}} ** 8;
+    const own = [_]abi.CommandBuffer{@ptrFromInt(0x5010)};
+    real_submits[0] = .{ .command_buffer_count = 1, .command_buffers = &own };
+    var synthetics: [8][256]u64 = [_][256]u64{[_]u64{0} ** 256} ** 8;
+    synthetics[0][0] = 0x501;
+    var counts: [8]u32 = [_]u32{0} ** 8;
+    counts[0] = 1;
+
+    try std.testing.expectEqual(
+        abi.ERROR_INITIALIZATION_FAILED,
+        forwarder.fsiSubmitExpanded(@ptrFromInt(0x99), FsiTestDriver.submit, &real_submits, &synthetics, &counts, 1, 0, &forwarder),
+    );
+    try std.testing.expectEqual(@as(usize, 0), FsiTestDriver.submit_count);
+    try std.testing.expect(forwarder.fsi_guard.?.monitor_start_failed);
+}
+
+test "FSI paused monitor without a watcher and failed timing fences stop before additional GPU work" {
+    for (0..2) |case| {
+        var forwarder = Forwarder{};
+        try fsiTestForwarder(&forwarder);
+        fsiTestRecordPassState(&forwarder);
+        fsiTestDraw(&forwarder);
+        const guard = forwarder.fsi_guard.?;
+        guard.monitor_started = true;
+        guard.monitor.submissions_paused = case == 0;
+        guard.monitor.failed = case == 1;
+        var real_submits: [8]abi.SubmitInfo = [_]abi.SubmitInfo{.{}} ** 8;
+        const own = [_]abi.CommandBuffer{@ptrFromInt(0x5010)};
+        real_submits[0] = .{ .command_buffer_count = 1, .command_buffers = &own };
+        var synthetics: [8][256]u64 = [_][256]u64{[_]u64{0} ** 256} ** 8;
+        synthetics[0][0] = 0x501;
+        var counts: [8]u32 = [_]u32{0} ** 8;
+        counts[0] = 1;
+        const result = forwarder.fsiSubmitExpanded(@ptrFromInt(0x99), FsiTestDriver.submit, &real_submits, &synthetics, &counts, 1, 0, &forwarder);
+        try std.testing.expectEqual(abi.ERROR_DEVICE_LOST, result);
+        try std.testing.expectEqual(@as(usize, 0), FsiTestDriver.submit_count);
+        forwarder.noteRealVulkanResult(result, "FSI test submit");
+        try std.testing.expect(forwarder.real_vulkan.device_lost);
+        try std.testing.expectEqual(@as(u64, if (case == 0) 1 else 0), guard.slow_chunk_submit_aborts);
+    }
+}
+
+test "FSI campaign severe completion permits the next native submit without synthetic device loss" {
+    const CompletedFence = struct {
+        fn wait(context: *anyopaque, fence: u64, timeout_ns: u64) fsi_timing.WaitResult {
+            _ = context;
+            _ = fence;
+            _ = timeout_ns;
+            return .signaled;
+        }
+        fn reset(context: *anyopaque, fence: u64) bool {
+            _ = context;
+            _ = fence;
+            return true;
+        }
+        fn now(context: *anyopaque) u64 {
+            _ = context;
+            return 466 * 1_000_000;
+        }
+    };
+    var forwarder = Forwarder{};
+    try fsiTestForwarder(&forwarder);
+    fsiTestRecordPassState(&forwarder);
+    fsiTestDraw(&forwarder);
+    const guard = forwarder.fsi_guard.?;
+    guard.monitor_started = true;
+    guard.monitor.ops = .{ .context = guard, .wait = CompletedFence.wait, .reset = CompletedFence.reset, .now = CompletedFence.now };
+    _ = guard.monitor.track(.{ .fence = 0x999, .draws = 16, .submit_infos = 2 });
+    _ = guard.monitor.budget.noteOutstanding(356 * 1_000_000, .none);
+    guard.monitor.submissions_paused = true;
+    try std.testing.expect(guard.monitor.pollOnce());
+    try std.testing.expectEqual(@as(u64, 1), guard.monitor.stats().severe_recoveries);
+    try std.testing.expectEqual(@as(u32, 4), guard.monitor.capValue());
+    try std.testing.expectEqual(@as(usize, 0), FsiTestDriver.submit_count);
+
+    var real_submits: [8]abi.SubmitInfo = [_]abi.SubmitInfo{.{}} ** 8;
+    const own = [_]abi.CommandBuffer{@ptrFromInt(0x5010)};
+    real_submits[0] = .{ .command_buffer_count = 1, .command_buffers = &own };
+    var synthetics: [8][256]u64 = [_][256]u64{[_]u64{0} ** 256} ** 8;
+    synthetics[0][0] = 0x501;
+    var counts: [8]u32 = [_]u32{0} ** 8;
+    counts[0] = 1;
+    const result = forwarder.fsiSubmitExpanded(@ptrFromInt(0x99), FsiTestDriver.submit, &real_submits, &synthetics, &counts, 1, 0, &forwarder);
+    try std.testing.expectEqual(abi.SUCCESS, result);
+    try std.testing.expectEqual(@as(usize, 1), FsiTestDriver.submit_count);
+    forwarder.noteRealVulkanResult(result, "FSI recovery test submit");
+    try std.testing.expect(!forwarder.real_vulkan.device_lost);
+    try std.testing.expectEqual(@as(u64, 0), guard.slow_chunk_submit_aborts);
+    try std.testing.expect(guard.monitor.stats().budget.emergency);
+}
+
+test "FSI continuation boundary failures never commit a partial command buffer" {
+    var begin_forwarder = Forwarder{};
+    try fsiTestForwarder(&begin_forwarder);
+    fsiTestRecordPassState(&begin_forwarder);
+    FsiTestDriver.begin_result = abi.ERROR_INITIALIZATION_FAILED;
+    for (0..20) |_| fsiTestDraw(&begin_forwarder);
+    const begin_recording = begin_forwarder.fsiRecording(0x501).?;
+    try std.testing.expectEqual(@as(usize, 0), begin_recording.chunk_count);
+    try std.testing.expectEqual(@as(u64, 0x5010), begin_recording.target());
+    try std.testing.expectEqual(@as(u64, 1), begin_forwarder.fsi_guard.?.blocked_splits[@intFromEnum(fsi_chain.Block.continuation_begin_failed)]);
+    try std.testing.expectEqual(@as(usize, 2), FsiTestDriver.call_count);
+    try std.testing.expectEqualStrings("reset_chunk", FsiTestDriver.calls[0]);
+    try std.testing.expectEqualStrings("begin_command_buffer", FsiTestDriver.calls[1]);
+
+    var end_forwarder = Forwarder{};
+    try fsiTestForwarder(&end_forwarder);
+    fsiTestRecordPassState(&end_forwarder);
+    FsiTestDriver.end_result = abi.ERROR_INITIALIZATION_FAILED;
+    for (0..17) |_| fsiTestDraw(&end_forwarder);
+    const end_recording = end_forwarder.fsiRecording(0x501).?;
+    try std.testing.expect(end_recording.failed);
+    try std.testing.expectEqual(@as(usize, 0), end_recording.chunk_count);
+    try std.testing.expectEqual(@as(u64, 0), end_forwarder.fsi_guard.?.chunk_pool.reuses);
+    var real_submits: [8]abi.SubmitInfo = [_]abi.SubmitInfo{.{}} ** 8;
+    const own = [_]abi.CommandBuffer{@ptrFromInt(0x5010)};
+    real_submits[0] = .{ .command_buffer_count = 1, .command_buffers = &own };
+    var synthetics: [8][256]u64 = [_][256]u64{[_]u64{0} ** 256} ** 8;
+    synthetics[0][0] = 0x501;
+    var counts: [8]u32 = [_]u32{0} ** 8;
+    counts[0] = 1;
+    try std.testing.expectEqual(abi.ERROR_INITIALIZATION_FAILED, end_forwarder.fsiSubmitExpanded(@ptrFromInt(0x99), FsiTestDriver.submit, &real_submits, &synthetics, &counts, 1, 0, &end_forwarder));
+    try std.testing.expectEqual(@as(usize, 0), FsiTestDriver.submit_count);
+}
+
+test "an FSI recording with state the bridge cannot replay keeps Vulkan's whole-buffer semantics" {
+    var forwarder = Forwarder{};
+    try fsiTestForwarder(&forwarder);
+    fsiTestRecordPassState(&forwarder);
+    // Extended dynamic state is not part of the shadow: once recorded, the
+    // buffer is never split, but its original Vulkan command stream survives.
+    forwarder.fsiNoteCommand(0x501, vulkanNameHash("vkCmdSetDepthTestEnable"), "vkCmdSetDepthTestEnable");
+    for (0..100) |_| fsiTestDraw(&forwarder);
+    try std.testing.expectEqual(@as(usize, 0), forwarder.fsiRecording(0x501).?.chunk_count);
+    try std.testing.expect(!forwarder.fsiRecording(0x501).?.failed);
+    try std.testing.expectEqual(@as(u64, 100), forwarder.fsiRecording(0x501).?.fsi_draws);
+    try std.testing.expectEqual(@as(usize, 0), FsiTestDriver.call_count);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.fsi_guard.?.blocked_splits[@intFromEnum(fsi_chain.Block.unrecorded_command)]);
+}
+
+test "a render pass with attachments is never split, and an FSI-free buffer is never expanded" {
+    var forwarder = Forwarder{};
+    try fsiTestForwarder(&forwarder);
+    forwarder.vulkan_fsi_tracker.bindPipeline(0x501, 0x7001);
+    _ = forwarder.fsiShadow(0x501).?.bindPipeline(0, 0x7001);
+    // A host render target pass: its attachments would have to be loaded
+    // again by a new instance, so it is not in the splittable set.
+    const begin = abi.RenderPassBeginInfo{ .render_pass = 0x7666, .framebuffer = 0x7200 };
+    forwarder.fsiNoteBeginRenderPass(0x501, &begin, 0);
+    for (0..100) |_| fsiTestDraw(&forwarder);
+    try std.testing.expectEqual(@as(usize, 0), forwarder.fsiRecording(0x501).?.chunk_count);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.fsi_guard.?.blocked_splits[@intFromEnum(fsi_chain.Block.render_pass_not_splittable)]);
+
+    var synthetics: [8][256]u64 = [_][256]u64{[_]u64{0} ** 256} ** 8;
+    var counts: [8]u32 = [_]u32{0} ** 8;
+    synthetics[0][0] = 0x777;
+    counts[0] = 1;
+    try std.testing.expect(!forwarder.fsiSubmitNeedsExpansion(&synthetics, &counts, 1));
+}
+
+test "every command Xenia records in an FSI pass is either replayed, neutral, or blocks a split" {
+    try std.testing.expectEqual(FsiCommandClass.draw, fsiCommandClass(vulkanNameHash("vkCmdDrawIndexed"), "vkCmdDrawIndexed"));
+    try std.testing.expectEqual(FsiCommandClass.recorded, fsiCommandClass(vulkanNameHash("vkCmdBindDescriptorSets"), "vkCmdBindDescriptorSets"));
+    try std.testing.expectEqual(FsiCommandClass.recorded, fsiCommandClass(vulkanNameHash("vkCmdSetStencilReference"), "vkCmdSetStencilReference"));
+    try std.testing.expectEqual(FsiCommandClass.neutral, fsiCommandClass(vulkanNameHash("vkCmdPipelineBarrier"), "vkCmdPipelineBarrier"));
+    try std.testing.expectEqual(FsiCommandClass.blocks, fsiCommandClass(vulkanNameHash("vkCmdPushDescriptorSetKHR"), "vkCmdPushDescriptorSetKHR"));
+    try std.testing.expectEqual(FsiCommandClass.blocks, fsiCommandClass(vulkanNameHash("vkCmdNextSubpass"), "vkCmdNextSubpass"));
+    try std.testing.expectEqual(FsiCommandClass.blocks, fsiCommandClass(vulkanNameHash("vkCmdBeginRendering"), "vkCmdBeginRendering"));
+}
+
+test "Xenia's FSI set update reaches the driver whole when its dead-stack sink info is garbage" {
+    // The guest bytes the shipped xenia_canary.exe produces at
+    // VulkanCommandProcessor::SetupContext+0xb08 (0x140a321ce): three storage
+    // writes to one set, where write 2's VkDescriptorBufferInfo lives in a
+    // stack slot the compiler never stored (see fsi_descriptor_repair.zig).
+    const Driver = struct {
+        var forwarded: [3]abi.WriteDescriptorSet = undefined;
+        var forwarded_buffers: [3]abi.DescriptorBufferInfo = undefined;
+        var forwarded_count: u32 = 0;
+        var host_sink: [gpu_vulkan.fsi_descriptor_repair.XENIA_ZPD_COUNTER_SINK_BYTES]u8 = undefined;
+        fn update(_: abi.Device, count: u32, writes: ?[*]const abi.WriteDescriptorSet, _: u32, _: ?[*]const abi.CopyDescriptorSet) callconv(.c) void {
+            forwarded_count = count;
+            for (0..count) |index| {
+                forwarded[index] = writes.?[index];
+                forwarded_buffers[index] = writes.?[index].buffer_info.?[0];
+            }
+        }
+        fn createBuffer(_: abi.Device, info: *const abi.BufferCreateInfo, _: ?*const anyopaque, buffer: *abi.Buffer) callconv(.c) abi.Result {
+            std.debug.assert(info.size == gpu_vulkan.fsi_descriptor_repair.XENIA_ZPD_COUNTER_SINK_BYTES);
+            buffer.* = 0x5150;
+            return abi.SUCCESS;
+        }
+        fn requirements(_: abi.Device, _: abi.Buffer, out: *abi.MemoryRequirements) callconv(.c) void {
+            out.* = .{ .size = gpu_vulkan.fsi_descriptor_repair.XENIA_ZPD_COUNTER_SINK_BYTES, .alignment = 256, .memory_type_bits = 1 };
+        }
+        fn allocate(_: abi.Device, _: *const abi.MemoryAllocateInfo, _: ?*const anyopaque, memory: *abi.DeviceMemory) callconv(.c) abi.Result {
+            memory.* = 0x5160;
+            return abi.SUCCESS;
+        }
+        fn bind(_: abi.Device, _: abi.Buffer, _: abi.DeviceMemory, _: u64) callconv(.c) abi.Result {
+            return abi.SUCCESS;
+        }
+        fn map(_: abi.Device, _: abi.DeviceMemory, _: u64, _: u64, _: u32, out: *?*anyopaque) callconv(.c) abi.Result {
+            out.* = @ptrCast(&host_sink);
+            return abi.SUCCESS;
+        }
+        fn unmap(_: abi.Device, _: abi.DeviceMemory) callconv(.c) void {}
+    };
+    const sink_bytes = gpu_vulkan.fsi_descriptor_repair.XENIA_ZPD_COUNTER_SINK_BYTES;
+    // Whatever the stack slot held: a null buffer with an arbitrary range,
+    // and stale bytes that happen to name the EDRAM buffer.
+    const dead_slots = [_]abi.DescriptorBufferInfo{
+        .{ .buffer = 0, .offset = 0, .range = 0 },
+        .{ .buffer = 0, .offset = 0x7ff6_0000, .range = 0x1_0000_0000 },
+        .{ .buffer = 0x9c1, .offset = 0, .range = abi.WHOLE_SIZE },
+    };
+    for (dead_slots) |dead_slot| {
+        var forwarder = Forwarder{};
+        var state = TestState{};
+        forwarder.real_vulkan.device = @ptrFromInt(0x1234);
+        forwarder.real_vulkan.fn_ptrs.update_descriptor_sets = Driver.update;
+        forwarder.real_vulkan.fn_ptrs.create_buffer = Driver.createBuffer;
+        forwarder.real_vulkan.fn_ptrs.get_buffer_memory_requirements = Driver.requirements;
+        forwarder.real_vulkan.fn_ptrs.allocate_memory = Driver.allocate;
+        forwarder.real_vulkan.fn_ptrs.bind_buffer_memory = Driver.bind;
+        forwarder.real_vulkan.fn_ptrs.map_memory = Driver.map;
+        forwarder.real_vulkan.fn_ptrs.unmap_memory = Driver.unmap;
+        forwarder.real_vulkan.physical_device_memory.memory_type_count = 1;
+        forwarder.real_vulkan.physical_device_memory.memory_types[0].property_flags = abi.MEMORY_PROPERTY_HOST_VISIBLE_BIT | abi.MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        forwarder.real_vulkan.descriptor_set_map[0] = .{ .synthetic = 0x9b1, .real = 0xA9B1 };
+        forwarder.real_vulkan.buffer_map[0] = .{ .synthetic = 0x2e1, .real = 0xB2E1 }; // shared memory
+        forwarder.real_vulkan.buffer_map[1] = .{ .synthetic = 0x9c1, .real = 0xB9C1 }; // EDRAM
+        @memset(&Driver.host_sink, 0xAB);
+        Driver.forwarded_count = 0;
+
+        const infos = [_]abi.DescriptorBufferInfo{
+            .{ .buffer = 0x2e1, .offset = 0, .range = 512 << 20 },
+            .{ .buffer = 0x9c1, .offset = 0, .range = abi.WHOLE_SIZE },
+            dead_slot,
+        };
+        try std.testing.expect(state.copyToGuest(2048, std.mem.asBytes(&infos)));
+        var writes: [3]abi.WriteDescriptorSet = undefined;
+        for (&writes, 0..) |*write, binding| write.* = .{
+            .dst_set = 0x9b1,
+            .dst_binding = @intCast(binding),
+            .descriptor_count = 1,
+            .descriptor_type = abi.DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .buffer_info = @ptrFromInt(2048 + binding * @sizeOf(abi.DescriptorBufferInfo)),
+        };
+        try std.testing.expect(state.copyToGuest(1024, std.mem.asBytes(&writes)));
+        state.regs.rsi = 3;
+        state.regs.rdx = 1024;
+        state.regs.rcx = 0;
+        state.regs.r8 = 0;
+
+        forwarder.updateDescriptorSets(&state);
+
+        // All three writes reach the driver: the FSI shaders get their shared
+        // memory and EDRAM, and binding 2 gets a zeroed sink of Xenia's size.
+        try std.testing.expectEqual(@as(u32, 3), Driver.forwarded_count);
+        for (Driver.forwarded, 0..) |write, binding| {
+            try std.testing.expectEqual(@as(u64, 0xA9B1), write.dst_set);
+            try std.testing.expectEqual(@as(u32, @intCast(binding)), write.dst_binding);
+        }
+        try std.testing.expectEqual(@as(u64, 0xB2E1), Driver.forwarded_buffers[0].buffer);
+        try std.testing.expectEqual(@as(u64, 0xB9C1), Driver.forwarded_buffers[1].buffer);
+        try std.testing.expectEqual(abi.WHOLE_SIZE, Driver.forwarded_buffers[1].range);
+        try std.testing.expectEqual(@as(u64, 0x5150), Driver.forwarded_buffers[2].buffer);
+        try std.testing.expectEqual(@as(u64, 0), Driver.forwarded_buffers[2].offset);
+        try std.testing.expectEqual(sink_bytes, Driver.forwarded_buffers[2].range);
+        try std.testing.expect(std.mem.allEqual(u8, &Driver.host_sink, 0));
+        try std.testing.expectEqual(@as(u64, 1), forwarder.fsi_zpd_descriptor_repairs);
+        for (forwarder.vulkan_descriptor_update_refusals) |count| try std.testing.expectEqual(@as(u64, 0), count);
+    }
 }
 
 test "lookup custody follows descriptor copies to bound native gamma bytes" {
@@ -20780,6 +25428,42 @@ test "content pixel probing retries until detail or its bounded budget" {
     try std.testing.expect(!shouldForceContentPixelProbe(&probe, .content));
 }
 
+test "render colour probes reach the campaign transition before the observed Metal hang" {
+    var count: u32 = 0;
+    for (1..5810) |frame| {
+        if (campaignDiagnosticFrame(frame)) count += 1;
+    }
+    try std.testing.expectEqual(@as(u32, render_diagnostic_frames.len), count);
+    try std.testing.expect(campaignDiagnosticFrame(1024));
+    try std.testing.expect(campaignDiagnosticFrame(1280));
+    try std.testing.expect(campaignDiagnosticFrame(4608));
+    try std.testing.expect(!campaignDiagnosticFrame(4609));
+}
+
+test "restarting a command buffer clears its rectangle shader and index bindings" {
+    var forwarder = Forwarder{};
+    const first = forwarder.rectExpandCommandState(0x101);
+    first.marked_pipeline = true;
+    first.builtin_indices = true;
+    first.pipeline = 0x301;
+    first.index_buffer = 0x401;
+    first.index_offset = 16;
+    first.index_type = abi.INDEX_TYPE_UINT32;
+    const second = forwarder.rectExpandCommandState(0x202);
+    second.marked_pipeline = true;
+    second.builtin_indices = true;
+
+    forwarder.resetCommandTargets(0x101);
+    const restarted = forwarder.rectExpandCommandState(0x101);
+    try std.testing.expect(!restarted.marked_pipeline and !restarted.builtin_indices);
+    try std.testing.expectEqual(@as(u64, 0), restarted.pipeline);
+    try std.testing.expectEqual(@as(u64, 0), restarted.index_buffer);
+    try std.testing.expectEqual(@as(u64, 0), restarted.index_offset);
+    try std.testing.expectEqual(@as(u32, 0), restarted.index_type);
+    const other = forwarder.rectExpandCommandState(0x202);
+    try std.testing.expect(other.marked_pipeline and other.builtin_indices);
+}
+
 test "Vulkan handle maps turn capacity pressure into a recoverable result" {
     var map: [2]HandleMap = [_]HandleMap{.{}} ** 2;
     try std.testing.expectEqual(HandleMap.InsertResult.inserted, HandleMap.allocOrFind(&map, 0x11, 0x21));
@@ -20828,7 +25512,7 @@ test "render pass sources are attributed to the pass target and committed at sub
     try std.testing.expect(forwarder.recordImageView(0x802, 0x902));
     forwarder.tracked_framebuffers[0] = .{ .synthetic = 0x701, .attachment_count = 1 };
     forwarder.tracked_framebuffers[0].attachments[0] = 0x801;
-    forwarder.noteDescriptorSetImage(0xB001, 0, 0, 0x902, false);
+    forwarder.noteDescriptorSetImage(0xB001, 0, 0, 0x902, 0x802, false);
     const command: u64 = 0x501;
     forwarder.noteCommandPassTarget(command, 0x701);
     forwarder.noteCommandBoundDescriptorSet(command, 1, 0xB001);
@@ -21057,4 +25741,297 @@ test "picture capture follows native completion and owns pixels across staging r
     try std.testing.expectEqual(@as(u64, 1), forwarder.picture_sequence.frames);
     try std.testing.expectEqual(@as(u64, 1), forwarder.pixel_probe.capture_policy.picture_saved);
     try std.testing.expectEqual(@as(u64, 1), forwarder.pixel_probe.capture_previewed);
+}
+
+test "presentation ceiling sleeps through the runtime release callback and refuses pinned waits" {
+    const State = struct {
+        pinned: bool = false,
+        releases: u32 = 0,
+        pub fn tryWithWindowsRuntimeLockReleasedForVulkanQueueWait(self: *@This(), context: anytype, comptime callback: anytype) bool {
+            if (self.pinned) return false;
+            self.releases += 1;
+            callback(context);
+            return true;
+        }
+    };
+    const forwarder = try std.testing.allocator.create(Forwarder);
+    defer std.testing.allocator.destroy(forwarder);
+    forwarder.* = .{};
+    defer forwarder.deinit();
+    var state: State = .{};
+    const now = transport_timing.nowNs();
+    if (now == 0) return error.SkipZigTest;
+    // First and already-slow frames never invoke a sleep callback.
+    try std.testing.expect(forwarder.pacePresent(&state));
+    try std.testing.expectEqual(@as(u32, 0), state.releases);
+    forwarder.present_ceiling.attempted(now);
+    try std.testing.expect(forwarder.pacePresent(&state));
+    try std.testing.expectEqual(@as(u32, 1), state.releases);
+    try std.testing.expect(transport_timing.nowNs() >= now + present_pacing.Ceiling.interval_ns);
+    forwarder.present_ceiling.attempted(transport_timing.nowNs());
+    state.pinned = true;
+    try std.testing.expect(!forwarder.pacePresent(&state));
+    try std.testing.expectEqual(@as(u32, 1), state.releases);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.present_ceiling.refused);
+}
+
+test "FSI sample view follows descriptor copies and freezes late updates at submission" {
+    var forwarder: Forwarder = .{};
+    defer forwarder.deinit();
+    _ = HandleMap.alloc(&forwarder.real_vulkan.image_map, 0x901, 0x1901);
+    _ = HandleMap.alloc(&forwarder.real_vulkan.image_map, 0x902, 0x1902);
+    try std.testing.expect(forwarder.recordImageView(0x802, 0x902));
+    const slot = forwarder.tracked_image_view_index.find(0x802).?;
+    forwarder.tracked_image_views[slot].format = 64;
+    forwarder.tracked_image_views[slot].view_type = 1;
+    forwarder.tracked_image_views[slot].components = .{ 5, 4, 3, 0 };
+    forwarder.noteDescriptorImageInfo(0xB001, 0, 0, .{ .image_view = 0x802 });
+    const command = forwarder.mutableCommandTargets(0x501).?;
+    command.current_pass_target = 0x901;
+    forwarder.noteCommandBoundDescriptorSet(0x501, 1, 0xB002);
+    // Recording before the descriptor update is legal and remains observable.
+    forwarder.copyDescriptorSetImages(.{ .src_set = 0xB001, .dst_set = 0xB002, .descriptor_count = 1 });
+    forwarder.commitCommandPassSources(0x501);
+    const submitted = forwarder.present_chain.passSourceViewsOf(0x1901)[0];
+    try std.testing.expectEqual(@as(u64, 0x802), submitted.view);
+    try std.testing.expectEqualDeep([4]u32{ 5, 4, 3, 0 }, submitted.components);
+    try std.testing.expect(submitted.known);
+    forwarder.tracked_image_views[slot].components = @splat(0);
+    try std.testing.expectEqualDeep(submitted, forwarder.present_chain.passSourceViewsOf(0x1901)[0]);
+    forwarder.commitCommandPassSources(0x501);
+    try std.testing.expectEqualDeep([4]u32{ 0, 0, 0, 0 }, forwarder.present_chain.passSourceViewsOf(0x1901)[0].components);
+    // Replacing with a null view clears the previously known source.
+    forwarder.noteDescriptorImageInfo(0xB001, 0, 0, .{});
+    forwarder.copyDescriptorSetImages(.{ .src_set = 0xB001, .dst_set = 0xB002, .descriptor_count = 1 });
+    try std.testing.expectEqual(@as(u64, 0), forwarder.trackedDescriptorSet(0xB002).?.images[0].image_view);
+}
+
+const LiveTextureTestDriver = struct {
+    var events: [32]u64 = @splat(0);
+    var count: usize = 0;
+    var result: abi.Result = abi.SUCCESS;
+    var next_layout: u64 = 900;
+    var destroyed: u32 = 0;
+    var frees: u32 = 0;
+    var original_always_succeeds: bool = false;
+    fn control(_: u64, _: u32, _: u32, _: u32) callconv(.c) void {}
+    fn event(value: u64) void {
+        events[count] = value;
+        count += 1;
+    }
+    fn bind(_: abi.CommandBuffer, _: u32, selected: u64) callconv(.c) void {
+        event(selected);
+    }
+    fn sets(_: abi.CommandBuffer, _: u32, selected: u64, first: u32, n: u32, _: [*]const u64, _: u32, _: ?[*]const u32) callconv(.c) void {
+        std.debug.assert(first == 2 and n == 2);
+        event(selected);
+    }
+    fn dispatch(_: abi.CommandBuffer, _: u32, _: u32, _: u32) callconv(.c) void {
+        event(777);
+    }
+    fn create(_: abi.Device, _: *const anyopaque, _: ?*const anyopaque, out: *u64) callconv(.c) i32 {
+        out.* = 100;
+        return result;
+    }
+    fn layout(_: abi.Device, _: *const anyopaque, _: ?*const anyopaque, out: *u64) callconv(.c) i32 {
+        out.* = next_layout;
+        next_layout += 1;
+        return abi.SUCCESS;
+    }
+    fn pipeline(_: abi.Device, _: u64, _: u32, infos: [*]const abi.ComputePipelineCreateInfo, _: ?*const anyopaque, out: [*]u64) callconv(.c) i32 {
+        if (original_always_succeeds and infos[0].stage.module == 200) {
+            out[0] = 750;
+            return abi.SUCCESS;
+        }
+        out[0] = if (result == abi.SUCCESS) 800 else 0;
+        return result;
+    }
+    fn destroy(_: abi.Device, _: u64, _: ?*const anyopaque) callconv(.c) void {
+        destroyed += 1;
+    }
+    fn allocate(_: abi.Device, _: *const abi.DescriptorSetAllocateInfo, out: [*]u64) callconv(.c) i32 {
+        out[0] = 600;
+        return result;
+    }
+    fn free(_: abi.Device, _: u64, _: u32, _: [*]const u64) callconv(.c) i32 {
+        frees += 1;
+        return result;
+    }
+    fn update(_: abi.Device, _: u32, _: ?[*]const abi.WriteDescriptorSet, _: u32, _: ?[*]const abi.CopyDescriptorSet) callconv(.c) void {}
+};
+
+fn liveTextureFixture(forwarder: *Forwarder, native: *native_texture.State, memory: []u8) !void {
+    LiveTextureTestDriver.count = 0;
+    LiveTextureTestDriver.result = abi.SUCCESS;
+    LiveTextureTestDriver.next_layout = 900;
+    LiveTextureTestDriver.destroyed = 0;
+    LiveTextureTestDriver.frees = 0;
+    LiveTextureTestDriver.original_always_succeeds = false;
+    native.* = .{ .control = LiveTextureTestDriver.control, .module = 100, .bounds_layout = 101, .bounds_pool = 102, .bounds_buffer = 103, .mapped = memory.ptr };
+    forwarder.native_texture_state = native;
+    forwarder.real_vulkan.device = @ptrFromInt(0x1234);
+    forwarder.real_vulkan.fn_ptrs.cmd_bind_pipeline = LiveTextureTestDriver.bind;
+    forwarder.real_vulkan.fn_ptrs.cmd_bind_descriptor_sets = LiveTextureTestDriver.sets;
+    forwarder.real_vulkan.fn_ptrs.cmd_dispatch = LiveTextureTestDriver.dispatch;
+    forwarder.real_vulkan.fn_ptrs.create_shader_module = LiveTextureTestDriver.create;
+    forwarder.real_vulkan.fn_ptrs.create_pipeline_layout = LiveTextureTestDriver.layout;
+    forwarder.real_vulkan.fn_ptrs.create_compute_pipelines = LiveTextureTestDriver.pipeline;
+    forwarder.real_vulkan.fn_ptrs.destroy_shader_module = LiveTextureTestDriver.destroy;
+    forwarder.real_vulkan.fn_ptrs.destroy_pipeline_layout = LiveTextureTestDriver.destroy;
+    forwarder.real_vulkan.fn_ptrs.destroy_pipeline = LiveTextureTestDriver.destroy;
+    forwarder.real_vulkan.fn_ptrs.allocate_descriptor_sets = LiveTextureTestDriver.allocate;
+    forwarder.real_vulkan.fn_ptrs.free_descriptor_sets = LiveTextureTestDriver.free;
+    forwarder.real_vulkan.fn_ptrs.update_descriptor_sets = LiveTextureTestDriver.update;
+    try native.layouts.put(std.heap.c_allocator, 500, .{ .sets = .{ 10, 11 } });
+    native.noteShader(200, .dxt5);
+    native.addPipeline(&forwarder.real_vulkan, 700, .{ .stage = .{ .module = 200, .name = "main" }, .layout = 500 });
+    try std.testing.expectEqual(@as(u32, 1), native.pipelines.count());
+    native.noteBuffer(300, 4096);
+    native.noteBuffer(301, 4096);
+    const buffers = [_]abi.DescriptorBufferInfo{ .{ .buffer = 300, .offset = 32, .range = 2048 }, .{ .buffer = 301, .offset = 64, .range = 1024 } };
+    for (&buffers, 0..) |*buffer, i| native.noteWrite(.{ .dst_set = 400 + i, .descriptor_type = 7, .descriptor_count = 1, .buffer_info = @ptrCast(buffer) });
+    const c = native.command(0x111).?;
+    c.pipeline = 700;
+    c.bind(500, 0, &.{ 400, 401 }, 0);
+    const p = native_texture.Push{ .flags = 0x91, .guest_offset = 32, .guest_pitch = 32, .guest_z_rows = 32, .blocks_x = 5, .blocks_y = 3, .blocks_z = 1, .host_offset = 16, .host_pitch = 128, .height = 11 };
+    c.constants(500, 0, std.mem.asBytes(&p));
+    _ = HandleMap.alloc(&forwarder.real_vulkan.command_buffer_map, 0x111, 0x222);
+}
+
+test "native Metal live texture production dispatch restores original state and declines incompatible work" {
+    var forwarder = Forwarder{};
+    var native: native_texture.State = undefined;
+    var memory: [65536]u8 = @splat(0);
+    try liveTextureFixture(&forwarder, &native, &memory);
+    defer native.releaseCpu();
+    var state = TestState{};
+    state.regs.rdi = 0x111;
+    state.regs.rsi = 1;
+    state.regs.rdx = 1;
+    state.regs.rcx = 1;
+    forwarder.forwardVulkanCommand(&state, vulkanNameHash("vkCmdDispatch"), "vkCmdDispatch");
+    try std.testing.expectEqualSlices(u64, &.{ 800, 900, 777, 700 }, LiveTextureTestDriver.events[0..LiveTextureTestDriver.count]);
+    try std.testing.expectEqual(@as(u64, 1), native.dispatches[3]);
+    // Group mismatch must leave the original path and encode no private bind.
+    state.regs.rsi = 2;
+    forwarder.forwardVulkanCommand(&state, vulkanNameHash("vkCmdDispatch"), "vkCmdDispatch");
+    try std.testing.expectEqual(@as(usize, 5), LiveTextureTestDriver.count);
+    try std.testing.expectEqual(@as(u64, 777), LiveTextureTestDriver.events[4]);
+    try std.testing.expectEqual(@as(u64, 1), native.dispatches[3]);
+}
+
+test "native Metal live texture bounds follow writes copies buffer destruction and pool lifetime" {
+    var forwarder = Forwarder{};
+    var native: native_texture.State = undefined;
+    var memory: [65536]u8 = @splat(0);
+    try liveTextureFixture(&forwarder, &native, &memory);
+    defer native.releaseCpu();
+    try std.testing.expect(native.dispatch(&forwarder.real_vulkan, 0x111, @ptrFromInt(0x222), .{ 1, 1, 1 }));
+    const slot = native.bounds.get(400).?.slot.?;
+    const buffer = abi.DescriptorBufferInfo{ .buffer = 300, .offset = 4000, .range = 64 };
+    native.noteWrite(.{ .dst_set = 400, .descriptor_type = 7, .descriptor_count = 1, .buffer_info = @ptrCast(&buffer) });
+    try std.testing.expectEqual(@as(u32, 64), std.mem.readInt(u32, memory[@as(usize, slot) * 16 ..][0..4], .little));
+    native.noteCopy(.{ .src_set = 400, .dst_set = 401, .descriptor_count = 1 });
+    try std.testing.expectEqual(@as(u32, 64), native.bounds.get(401).?.bytes);
+    native.forgetBuffer(300);
+    try std.testing.expectEqual(@as(u32, 0), native.bounds.get(401).?.bytes);
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, memory[@as(usize, slot) * 16 ..][0..4], .little));
+    _ = HandleMap.allocOrFindOwned(&forwarder.real_vulkan.descriptor_set_map, 60, 400, 70);
+    _ = HandleMap.allocOrFindOwned(&forwarder.real_vulkan.descriptor_set_map, 61, 401, 70);
+    _ = forwarder.reclaimDescriptorSetsForPool(70, "reset");
+    try std.testing.expectEqual(@as(u32, 0), native.bounds.count());
+    try std.testing.expectEqual(@as(u32, 2), LiveTextureTestDriver.frees);
+    try std.testing.expect(!native.slots[slot]);
+}
+
+test "native Metal live texture rejects compiler failures but never hides real device loss" {
+    var forwarder = Forwarder{};
+    var native: native_texture.State = undefined;
+    var memory: [65536]u8 = @splat(0);
+    try liveTextureFixture(&forwarder, &native, &memory);
+    defer native.releaseCpu();
+    LiveTextureTestDriver.result = abi.ERROR_INITIALIZATION_FAILED;
+    const info = abi.ComputePipelineCreateInfo{ .stage = .{ .module = 200, .name = "main" }, .layout = 500 };
+    native.addPipeline(&forwarder.real_vulkan, 701, info);
+    try std.testing.expect(native.pipelines.get(701) == null);
+    try std.testing.expectEqual(abi.SUCCESS, native.terminal_result);
+    LiveTextureTestDriver.result = abi.ERROR_DEVICE_LOST;
+    native.addPipeline(&forwarder.real_vulkan, 702, info);
+    try std.testing.expectEqual(abi.ERROR_DEVICE_LOST, native.terminal_result);
+    try std.testing.expect(!native.dispatch(&forwarder.real_vulkan, 0x111, @ptrFromInt(0x222), .{ 1, 1, 1 }));
+    try std.testing.expectEqual(@as(usize, 0), LiveTextureTestDriver.count);
+}
+
+test "native Metal live texture destroyed layout handle reuse keeps existing private layout" {
+    var forwarder = Forwarder{};
+    var native: native_texture.State = undefined;
+    var memory: [65536]u8 = @splat(0);
+    try liveTextureFixture(&forwarder, &native, &memory);
+    defer native.releaseCpu();
+    native.forgetLayout(&forwarder.real_vulkan, 500);
+    try native.layouts.put(std.heap.c_allocator, 500, .{ .sets = .{ 12, 13 } });
+    native.addPipeline(&forwarder.real_vulkan, 701, .{ .stage = .{ .module = 200, .name = "main" }, .layout = 500 });
+    try std.testing.expectEqual(@as(u64, 900), native.pipelines.get(700).?.native_layout);
+    try std.testing.expectEqual(@as(u64, 901), native.pipelines.get(701).?.native_layout);
+    try std.testing.expectEqualSlices(u64, &.{ 900, 901 }, native.owned_layouts.items);
+    try std.testing.expect(native.dispatch(&forwarder.real_vulkan, 0x111, @ptrFromInt(0x222), .{ 1, 1, 1 }));
+    try std.testing.expectEqual(@as(u64, 900), LiveTextureTestDriver.events[1]);
+    native.forgetPipeline(&forwarder.real_vulkan, 700);
+    try std.testing.expectEqual(@as(u32, 1), LiveTextureTestDriver.destroyed);
+}
+
+test "native Metal live texture allocation refusal keeps baseline and failed free quarantines cell" {
+    var forwarder = Forwarder{};
+    var native: native_texture.State = undefined;
+    var memory: [65536]u8 = @splat(0);
+    try liveTextureFixture(&forwarder, &native, &memory);
+    defer native.releaseCpu();
+    LiveTextureTestDriver.result = abi.ERROR_INITIALIZATION_FAILED;
+    var state = TestState{};
+    state.regs.rdi = 0x111;
+    state.regs.rsi = 1;
+    state.regs.rdx = 1;
+    state.regs.rcx = 1;
+    forwarder.forwardVulkanCommand(&state, vulkanNameHash("vkCmdDispatch"), "vkCmdDispatch");
+    try std.testing.expectEqualSlices(u64, &.{777}, LiveTextureTestDriver.events[0..LiveTextureTestDriver.count]);
+    try std.testing.expectEqual(@as(u64, 0), native.bounds.get(400).?.meta);
+    LiveTextureTestDriver.result = abi.SUCCESS;
+    try std.testing.expect(native.dispatch(&forwarder.real_vulkan, 0x111, @ptrFromInt(0x222), .{ 1, 1, 1 }));
+    const slot = native.bounds.get(400).?.slot.?;
+    LiveTextureTestDriver.result = abi.ERROR_INITIALIZATION_FAILED;
+    native.forgetSet(&forwarder.real_vulkan, 400);
+    try std.testing.expect(native.slots[slot]);
+    try std.testing.expect(native.bounds.get(400) == null);
+    try std.testing.expectEqual(abi.SUCCESS, native.terminal_result);
+}
+
+test "native Metal live texture production pipeline marshalling preserves accepted baseline on native refusal" {
+    var forwarder = Forwarder{};
+    var native: native_texture.State = undefined;
+    var memory: [65536]u8 = @splat(0);
+    try liveTextureFixture(&forwarder, &native, &memory);
+    defer native.releaseCpu();
+    var state = TestState{};
+    _ = HandleMap.alloc(&forwarder.real_vulkan.shader_module_map, 3, 200);
+    _ = HandleMap.alloc(&forwarder.real_vulkan.pipeline_layout_map, 1, 500);
+    const info = abi.ComputePipelineCreateInfo{ .stage = .{ .module = 3, .stage = 0x20, .name = @ptrFromInt(512) }, .layout = 1 };
+    @memcpy(state.mem[64..][0..@sizeOf(@TypeOf(info))], std.mem.asBytes(&info));
+    @memcpy(state.mem[512..517], "main\x00");
+    LiveTextureTestDriver.original_always_succeeds = true;
+    LiveTextureTestDriver.result = abi.ERROR_INITIALIZATION_FAILED;
+    var output: u64 = 0;
+    var result: i32 = 0;
+    try forwarder.marshalRealComputePipeline(&state, 0, 64, &output, &result);
+    try std.testing.expectEqual(abi.SUCCESS, result);
+    try std.testing.expectEqual(@as(u64, 750), output);
+    try std.testing.expect(native.pipelines.get(750) == null);
+    LiveTextureTestDriver.result = abi.SUCCESS;
+    try forwarder.marshalRealComputePipeline(&state, 0, 64, &output, &result);
+    try std.testing.expectEqual(abi.SUCCESS, result);
+    try std.testing.expectEqual(@as(u64, 800), native.pipelines.get(750).?.native);
+    native.forgetPipeline(&forwarder.real_vulkan, 750);
+    LiveTextureTestDriver.result = abi.ERROR_DEVICE_LOST;
+    try forwarder.marshalRealComputePipeline(&state, 0, 64, &output, &result);
+    try std.testing.expectEqual(abi.ERROR_DEVICE_LOST, result);
+    try std.testing.expect(forwarder.real_vulkan.device_lost);
 }

@@ -51,6 +51,25 @@ fn resultValue(result: abi.Result) u64 {
     return @as(u32, @bitCast(result));
 }
 
+/// Parallel guest execution forbids raw mutable borrows: guest writes must go
+/// through the process' coordinated memory API. Address validation and scalar
+/// reads use the const resolver, which remains available to every executor.
+fn guestRangeAvailable(state: anytype, address: u64, length: u64) bool {
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "guestMemoryConst")) {
+        return state.guestMemoryConst(address, length) != null;
+    }
+    return state.guestMemory(address, length) != null;
+}
+
+fn copyToGuest(state: anytype, address: u64, source: []const u8) bool {
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "copyToGuest")) return state.copyToGuest(address, source);
+    const output = state.guestMemory(address, @intCast(source.len)) orelse return false;
+    @memcpy(output, source);
+    return true;
+}
+
 pub fn queryHost(cache: anytype, library: *anyopaque) bool {
     if (cache.host_instance_extensions_known) return true;
     const address = dlsym(library, "vkEnumerateInstanceExtensionProperties") orelse {
@@ -174,7 +193,7 @@ pub fn writeProperties(
     output_address: u64,
     available: []const abi.ExtensionProperties,
 ) u64 {
-    if (count_address == 0 or state.guestMemory(count_address, 4) == null) return initializationFailed();
+    if (count_address == 0 or !guestRangeAvailable(state, count_address, 4)) return initializationFailed();
     const total: u32 = @intCast(available.len);
     if (output_address == 0) {
         state.write32(count_address, total);
@@ -183,16 +202,17 @@ pub fn writeProperties(
     const capacity = state.read32(count_address);
     const written: u32 = @min(capacity, total);
     if (written != 0) {
-        const span = @as(u64, written) * @sizeOf(abi.ExtensionProperties);
-        const bytes = state.guestMemory(output_address, span) orelse return initializationFailed();
-        @memcpy(bytes[0..@intCast(span)], std.mem.sliceAsBytes(available[0..written]));
+        const bytes = std.mem.sliceAsBytes(available[0..written]);
+        if (!copyToGuest(state, output_address, bytes)) {
+            return initializationFailed();
+        }
     }
     state.write32(count_address, written);
     return resultValue(if (written < total) abi.INCOMPLETE else abi.SUCCESS);
 }
 
 pub fn enumerateNoLayer(state: anytype, count_address: u64) u64 {
-    if (count_address != 0 and state.guestMemory(count_address, 4) != null) state.write32(count_address, 0);
+    if (count_address != 0 and guestRangeAvailable(state, count_address, 4)) state.write32(count_address, 0);
     return resultValue(abi.ERROR_LAYER_NOT_PRESENT);
 }
 
@@ -206,7 +226,7 @@ pub fn syntheticProperties(comptime names: []const []const u8) [names.len]abi.Ex
 }
 
 fn readableCount(state: anytype, address: u64) ?u32 {
-    if (address == 0 or state.guestMemory(address, 4) == null) return null;
+    if (address == 0 or !guestRangeAvailable(state, address, 4)) return null;
     return state.read32(address);
 }
 
@@ -242,11 +262,28 @@ fn logEnumeration(
 const TestState = struct {
     mem: [131_072]u8 = @splat(0),
     regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0 } = .{},
+    parallel_guest_execution: bool = false,
 
     fn guestMemory(self: *@This(), address: u64, length: u64) ?[]u8 {
+        if (self.parallel_guest_execution) return null;
         const capacity: u64 = @intCast(self.mem.len);
         if (address > capacity or length > capacity - address) return null;
         return self.mem[@intCast(address)..][0..@intCast(length)];
+    }
+
+    fn guestMemoryConst(self: *const @This(), address: u64, length: u64) ?[]const u8 {
+        const capacity: u64 = @intCast(self.mem.len);
+        if (address > capacity or length > capacity - address) return null;
+        return self.mem[@intCast(address)..][0..@intCast(length)];
+    }
+
+    fn copyToGuest(self: *@This(), address: u64, source: []const u8) bool {
+        const capacity: u64 = @intCast(self.mem.len);
+        const length: u64 = @intCast(source.len);
+        if (address > capacity or length > capacity - address) return false;
+        const start: usize = @intCast(address);
+        @memcpy(self.mem[start..][0..source.len], source);
+        return true;
     }
 
     fn read32(self: *@This(), address: u64) u32 {
@@ -258,7 +295,7 @@ const TestState = struct {
     }
 
     fn guestCString(self: *@This(), address: u64, maximum: usize) ?[]const u8 {
-        const bytes = self.guestMemory(address, @intCast(@min(maximum, self.mem.len) + 1)) orelse return null;
+        const bytes = self.guestMemoryConst(address, @intCast(@min(maximum, self.mem.len) + 1)) orelse return null;
         const end = std.mem.indexOfScalar(u8, bytes, 0) orelse return null;
         return bytes[0..end];
     }
@@ -299,6 +336,28 @@ test "instance extension enumeration uses the two-call guest protocol and adds o
     state.regs.rdx = array_address;
     try std.testing.expectEqual(@as(u64, 0), enumerateGuest(&cache, &state, 2));
     try std.testing.expectEqual(@as(u32, 3), state.read32(count_address));
+    const first = @as(usize, @intCast(array_address));
+    try std.testing.expectEqualStrings("VK_KHR_surface", std.mem.sliceTo(state.mem[first..][0..abi.MAX_EXTENSION_NAME_SIZE], 0));
+    const alias_offset = first + 2 * @sizeOf(abi.ExtensionProperties);
+    try std.testing.expectEqualStrings("VK_KHR_win32_surface", std.mem.sliceTo(state.mem[alias_offset..][0..abi.MAX_EXTENSION_NAME_SIZE], 0));
+}
+
+test "instance extension enumeration works without parallel mutable borrows" {
+    var cache = TestCache{};
+    cache.host_instance_extensions_known = true;
+    cache.append("VK_KHR_surface", 25);
+    cache.append("VK_EXT_metal_surface", 1);
+    var state = TestState{ .parallel_guest_execution = true };
+    const count_address: u64 = 8;
+    const array_address: u64 = 64;
+    state.regs = .{ .rdi = 0, .rsi = count_address, .rdx = 0 };
+
+    try std.testing.expect(state.guestMemory(count_address, 4) == null);
+    try std.testing.expectEqual(resultValue(abi.SUCCESS), enumerateGuest(&cache, &state, 1));
+    try std.testing.expectEqual(@as(u32, 3), state.read32(count_address));
+
+    state.regs.rdx = array_address;
+    try std.testing.expectEqual(resultValue(abi.SUCCESS), enumerateGuest(&cache, &state, 2));
     const first = @as(usize, @intCast(array_address));
     try std.testing.expectEqualStrings("VK_KHR_surface", std.mem.sliceTo(state.mem[first..][0..abi.MAX_EXTENSION_NAME_SIZE], 0));
     const alias_offset = first + 2 * @sizeOf(abi.ExtensionProperties);
