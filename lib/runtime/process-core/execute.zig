@@ -50,8 +50,6 @@ const vexArithmeticForOp = decoder.vexArithmeticForOp;
 const vexBitwiseForOp = decoder.vexBitwiseForOp;
 const shuffleBytes = decoder.shuffleBytes;
 const unpackLowDwords = decoder.unpackLowDwords;
-const bitwiseAndAllZero = decoder.bitwiseAndAllZero;
-const bitwiseAndNotAllZero = decoder.bitwiseAndNotAllZero;
 const roundVexFloat = decoder.roundVexFloat;
 const roundVexPackedF32 = decoder.roundVexPackedF32;
 const roundVexPackedF64 = decoder.roundVexPackedF64;
@@ -545,6 +543,12 @@ fn executeX87Memory(self: anytype, d: DecodedInsn) void {
 }
 
 pub fn execute(self: anytype, initial_d: DecodedInsn) void {
+    // Every `inline fn` call counts toward the eval branch quota, and this
+    // switch makes over a thousand of them (regVal/setReg and the high-byte
+    // regOperandVal/setRegOperand pair, which nests two more). Only the
+    // macho_processor executable instantiates it, so `zig build check` never
+    // analyses it: the 2026-10-03 shell-update failed here, not the tests.
+    @setEvalBranchQuota(20_000);
     // EVEX uses a distinct 32-register vector file and mask semantics. Route
     // it before CLEO and the legacy VEX switch so high ZMM operands cannot be
     // truncated to the old 16-register XMM/YMM representation.
@@ -1474,9 +1478,9 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         },
         .inc_reg8, .inc_reg16, .inc_reg32, .inc_reg64 => {
             const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.inc_reg8) + @intFromEnum(Size.bits8));
-            const a = self.regVal(d.dst_reg, sz);
+            const a = self.regOperandVal(d.dst_reg, sz, d.dst_high8);
             const r = a +% 1;
-            self.setReg(d.dst_reg, sz, r);
+            self.setRegOperand(d.dst_reg, sz, d.dst_high8, r);
             self.setFlagsIncDec(a, r, sz, true);
         },
         .dec_mem8, .dec_mem16, .dec_mem32, .dec_mem64 => {
@@ -1488,17 +1492,17 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         },
         .dec_reg8, .dec_reg16, .dec_reg32, .dec_reg64 => {
             const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.dec_reg8) + @intFromEnum(Size.bits8));
-            const a = self.regVal(d.dst_reg, sz);
+            const a = self.regOperandVal(d.dst_reg, sz, d.dst_high8);
             const r = a -% 1;
-            self.setReg(d.dst_reg, sz, r);
+            self.setRegOperand(d.dst_reg, sz, d.dst_high8, r);
             self.setFlagsIncDec(a, r, sz, false);
         },
 
         .neg_reg8, .neg_reg16, .neg_reg32, .neg_reg64 => {
             const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.neg_reg8) + @intFromEnum(Size.bits8));
-            const a = self.regVal(d.dst_reg, sz);
+            const a = self.regOperandVal(d.dst_reg, sz, d.dst_high8);
             const r = (~a +% 1) & maskForSize(sz);
-            self.setReg(d.dst_reg, sz, r);
+            self.setRegOperand(d.dst_reg, sz, d.dst_high8, r);
             self.setFlagsSub(0, a, r, sz);
         },
         .neg_mem8, .neg_mem16, .neg_mem32, .neg_mem64 => {
@@ -1509,7 +1513,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             self.setFlagsSub(0, a, r, sz);
         },
         .not_reg8, .not_reg16, .not_reg32, .not_reg64 => {
-            self.setReg(d.dst_reg, d.size, ~self.regVal(d.dst_reg, d.size));
+            self.setRegOperand(d.dst_reg, d.size, d.dst_high8, ~self.regOperandVal(d.dst_reg, d.size, d.dst_high8));
         },
         .not_mem8, .not_mem16, .not_mem32, .not_mem64 => {
             self.writeMemVal(d.addr, d.size, ~self.readMemVal(d.addr, d.size));
@@ -2049,54 +2053,54 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             const sz = d.size;
             const is_mem = d.op == .shl_mem_cl;
             const count = self.regVal(.cl_cx_ecx_rcx, .bits8) & @as(u64, if (sz == .bits64) 0x3F else 0x1F);
-            const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regVal(d.dst_reg, sz);
+            const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regOperandVal(d.dst_reg, sz, d.dst_high8);
             const r = (a & maskForSize(sz)) << @as(u6, @intCast(count));
-            if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setReg(d.dst_reg, sz, r);
+            if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setRegOperand(d.dst_reg, sz, d.dst_high8, r);
         },
         .shr_reg_cl, .shr_mem_cl => {
             const sz = d.size;
             const is_mem = d.op == .shr_mem_cl;
             const count = self.regVal(.cl_cx_ecx_rcx, .bits8) & @as(u64, if (sz == .bits64) 0x3F else 0x1F);
-            const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regVal(d.dst_reg, sz);
+            const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regOperandVal(d.dst_reg, sz, d.dst_high8);
             const r = (a & maskForSize(sz)) >> @as(u6, @intCast(count));
-            if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setReg(d.dst_reg, sz, r);
+            if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setRegOperand(d.dst_reg, sz, d.dst_high8, r);
         },
         .sar_reg_cl, .sar_mem_cl => {
             const sz = d.size;
             const is_mem = d.op == .sar_mem_cl;
             const count = self.regVal(.cl_cx_ecx_rcx, .bits8) & @as(u64, if (sz == .bits64) 0x3F else 0x1F);
-            const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regVal(d.dst_reg, sz);
+            const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regOperandVal(d.dst_reg, sz, d.dst_high8);
             const r = arithmeticShiftRight(a, sz, @intCast(count));
-            if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setReg(d.dst_reg, sz, r);
+            if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setRegOperand(d.dst_reg, sz, d.dst_high8, r);
         },
         .shr_reg_imm, .shr_mem_imm => {
             const sz = d.size;
             const is_mem = d.op == .shr_mem_imm;
             const count = d.imm & @as(u64, if (sz == .bits64) 0x3F else 0x1F);
-            const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regVal(d.dst_reg, sz);
+            const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regOperandVal(d.dst_reg, sz, d.dst_high8);
             const r = (a & maskForSize(sz)) >> @as(u6, @intCast(count));
-            if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setReg(d.dst_reg, sz, r);
+            if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setRegOperand(d.dst_reg, sz, d.dst_high8, r);
         },
         .shl_reg_imm, .shl_mem_imm => {
             const sz = d.size;
             const is_mem = d.op == .shl_mem_imm;
             const count = d.imm & @as(u64, if (sz == .bits64) 0x3F else 0x1F);
-            const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regVal(d.dst_reg, sz);
+            const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regOperandVal(d.dst_reg, sz, d.dst_high8);
             const r = (a & maskForSize(sz)) << @as(u6, @intCast(count));
-            if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setReg(d.dst_reg, sz, r);
+            if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setRegOperand(d.dst_reg, sz, d.dst_high8, r);
         },
         .sar_reg_imm, .sar_mem_imm => {
             const sz = d.size;
             const is_mem = d.op == .sar_mem_imm;
             const count = d.imm & @as(u64, if (sz == .bits64) 0x3F else 0x1F);
-            const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regVal(d.dst_reg, sz);
+            const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regOperandVal(d.dst_reg, sz, d.dst_high8);
             const r = arithmeticShiftRight(a, sz, @intCast(count));
-            if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setReg(d.dst_reg, sz, r);
+            if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setRegOperand(d.dst_reg, sz, d.dst_high8, r);
         },
 
         .mul_reg8 => {
             const a = self.regVal(.al_ax_eax_rax, .bits8);
-            const b = self.regVal(d.dst_reg, .bits8);
+            const b = self.regOperandVal(d.dst_reg, .bits8, d.dst_high8);
             const r = a * b;
             self.setReg(.al_ax_eax_rax, .bits16, r);
             self.setFlag(RFL_CF, r >> 8 != 0);
@@ -2115,7 +2119,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         },
         .imul_reg8, .imul_mem8 => {
             const a: i8 = @bitCast(@as(u8, @truncate(self.regVal(.al_ax_eax_rax, .bits8))));
-            const raw = if (d.op == .imul_mem8) self.readMemVal(d.addr, .bits8) else self.regVal(d.dst_reg, .bits8);
+            const raw = if (d.op == .imul_mem8) self.readMemVal(d.addr, .bits8) else self.regOperandVal(d.dst_reg, .bits8, d.dst_high8);
             const b: i8 = @bitCast(@as(u8, @truncate(raw)));
             const r: i16 = @as(i16, a) * @as(i16, b);
             self.setReg(.al_ax_eax_rax, .bits16, @as(u16, @bitCast(r)));
@@ -2126,7 +2130,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             self.setFlag(RFL_OF, truncated != r);
         },
         .div_reg8, .div_mem8 => {
-            const raw = if (d.op == .div_mem8) self.readMemVal(d.addr, .bits8) else self.regVal(d.dst_reg, .bits8);
+            const raw = if (d.op == .div_mem8) self.readMemVal(d.addr, .bits8) else self.regOperandVal(d.dst_reg, .bits8, d.dst_high8);
             const divisor: u8 = @truncate(raw);
             if (divisor == 0) return self.raiseDivideError();
             const dividend: u16 = @truncate(self.regVal(.al_ax_eax_rax, .bits16));
@@ -2138,7 +2142,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             self.setReg(.al_ax_eax_rax, .bits16, (@as(u16, remainder) << 8) | @as(u8, @truncate(quotient)));
         },
         .idiv_reg8, .idiv_mem8 => {
-            const raw = if (d.op == .idiv_mem8) self.readMemVal(d.addr, .bits8) else self.regVal(d.dst_reg, .bits8);
+            const raw = if (d.op == .idiv_mem8) self.readMemVal(d.addr, .bits8) else self.regOperandVal(d.dst_reg, .bits8, d.dst_high8);
             const divisor: i8 = @bitCast(@as(u8, @truncate(raw)));
             if (divisor == 0) return self.raiseDivideError();
             const dividend: i16 = @bitCast(@as(u16, @truncate(self.regVal(.al_ax_eax_rax, .bits16))));
@@ -2254,6 +2258,12 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             const b = self.readMemVal(d.addr, sz);
             const r = a *% b;
             self.setReg(d.dst_reg, sz, r);
+        },
+        // IMUL r16, r/m16 (66 0F AF) writes only the low word.
+        .imul_reg16_reg16, .imul_reg16_mem16 => {
+            const a = self.regVal(d.dst_reg, .bits16);
+            const b = if (d.op == .imul_reg16_mem16) self.readMemVal(d.addr, .bits16) else self.regVal(d.src_reg, .bits16);
+            self.setReg(d.dst_reg, .bits16, (a *% b) & 0xFFFF);
         },
         .imul_reg16_reg16_imm8,
         .imul_reg16_reg16_imm16,
@@ -2386,10 +2396,10 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             const size = d.size;
             const expected = self.regVal(.al_ax_eax_rax, size);
             const actual = if (d.is_reg_form)
-                self.regVal(d.dst_reg, size)
+                self.regOperandVal(d.dst_reg, size, d.dst_high8)
             else
                 self.readMemVal(d.addr, size);
-            const replacement = self.regVal(d.src_reg, size);
+            const replacement = self.regOperandVal(d.src_reg, size, d.src_high8);
             const rax_before = self.regs.rax;
             const rflags_before = self.regs.rflags;
             const outcome = atomic_compare_exchange.evaluate(expected, actual, replacement);
@@ -2399,7 +2409,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             self.setFlagsSub(expected, actual, subtract_result, size);
             if (matched) {
                 if (d.is_reg_form) {
-                    self.setReg(d.dst_reg, size, outcome.destination);
+                    self.setRegOperand(d.dst_reg, size, d.dst_high8, outcome.destination);
                 } else {
                     self.writeMemVal(d.addr, size, outcome.destination);
                 }
@@ -2507,10 +2517,10 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         .xadd_mem8_reg8, .xadd_mem32_reg32, .xadd_mem64_reg64 => {
             const sz: Size = if (d.op == .xadd_mem64_reg64) .bits64 else if (d.op == .xadd_mem8_reg8) .bits8 else if (d.size == .bits16) .bits16 else .bits32;
             const old_mem = self.readMemVal(d.addr, sz);
-            const old_reg = self.regVal(d.src_reg, sz);
+            const old_reg = self.regOperandVal(d.src_reg, sz, d.src_high8);
             const result = old_mem +% old_reg;
             self.writeMemVal(d.addr, sz, result);
-            self.setReg(d.src_reg, sz, old_mem);
+            self.setRegOperand(d.src_reg, sz, d.src_high8, old_mem);
             self.setFlagsAdd(old_mem, old_reg, result, sz);
             if (d.lock) releaseBarrier();
         },
@@ -2628,17 +2638,17 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         },
         .vptest, .vtestps, .vtestpd => {
             const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
-            const low_zf = bitwiseAndAllZero(self.xmm[d.xmm_src], rhs_low);
-            const low_cf = bitwiseAndNotAllZero(self.xmm[d.xmm_src], rhs_low);
+            const low = x64_decoder.vectorTestPredicates(d.op, self.xmm[d.xmm_src], rhs_low);
             if (d.vector_256) {
                 const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
                 self.regs.rflags &= ~(RFL_OF | RFL_SF | RFL_ZF | RFL_AF | RFL_PF | RFL_CF);
-                if (low_zf and bitwiseAndAllZero(self.ymm_hi[d.xmm_src], rhs_high)) self.regs.rflags |= RFL_ZF;
-                if (low_cf and bitwiseAndNotAllZero(self.ymm_hi[d.xmm_src], rhs_high)) self.regs.rflags |= RFL_CF;
+                const high = x64_decoder.vectorTestPredicates(d.op, self.ymm_hi[d.xmm_src], rhs_high);
+                if (low.zf and high.zf) self.regs.rflags |= RFL_ZF;
+                if (low.cf and high.cf) self.regs.rflags |= RFL_CF;
             } else {
                 self.regs.rflags &= ~(RFL_OF | RFL_SF | RFL_ZF | RFL_AF | RFL_PF | RFL_CF);
-                if (low_zf) self.regs.rflags |= RFL_ZF;
-                if (low_cf) self.regs.rflags |= RFL_CF;
+                if (low.zf) self.regs.rflags |= RFL_ZF;
+                if (low.cf) self.regs.rflags |= RFL_CF;
             }
         },
         .vpdpbusd => executeVpdpbusd(self, d),
@@ -2812,22 +2822,22 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], @bitCast(converted), .little);
         },
         .vcvtss2sd => {
-            self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
-            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
             const source_bits = if (d.is_reg_form)
                 std.mem.readInt(u32, self.xmm[d.xmm_src2][0..4], .little)
             else
                 @as(u32, @truncate(self.readMemVal(d.addr, .bits32)));
+            self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
+            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
             const converted: f64 = @floatCast(@as(f32, @bitCast(source_bits)));
             std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], @bitCast(converted), .little);
         },
         .vcvtsd2ss => {
-            self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
-            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
             const source_bits = if (d.is_reg_form)
                 std.mem.readInt(u64, self.xmm[d.xmm_src2][0..8], .little)
             else
                 self.readMemVal(d.addr, .bits64);
+            self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
+            if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
             const converted: f32 = @floatCast(@as(f64, @bitCast(source_bits)));
             std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], @bitCast(converted), .little);
         },

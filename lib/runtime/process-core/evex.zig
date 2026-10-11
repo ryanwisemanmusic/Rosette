@@ -443,7 +443,8 @@ fn executeVpackedAbs(self: anytype, d: DecodedInsn) void {
     for (0..count / width) |lane| {
         const offset = lane * width;
         const value = packedValue(source, offset, width, true);
-        writePackedValue(&computed, offset, width, if (value < 0) -%value else value, true);
+        // |minimum| has no signed lane: PABSB of -128 is 0x80, read unsigned.
+        writePackedValue(&computed, offset, width, if (value < 0) -%value else value, false);
     }
     const old = readVectorRegister(self, d.xmm_dst);
     writeVectorRegister(self, d.xmm_dst, maskedVector(self, d, computed, old, count, width), count);
@@ -469,7 +470,10 @@ fn executeVpackedSign(self: anytype, d: DecodedInsn) void {
         const value = packedValue(magnitude, offset, width, true);
         const sign = packedValue(signs, offset, width, true);
         const result = if (sign < 0) -%value else if (sign == 0) 0 else value;
-        writePackedValue(&computed, offset, width, result, true);
+        // Negation wraps within the lane: PSIGNB of -128 is -128, not 128.
+        const lane_shift: u6 = @intCast(64 - width * 8);
+        const wrapped: i64 = @as(i64, @bitCast(@as(u64, @bitCast(result)) << lane_shift)) >> lane_shift;
+        writePackedValue(&computed, offset, width, wrapped, true);
     }
     const old = readVectorRegister(self, d.xmm_dst);
     writeVectorRegister(self, d.xmm_dst, maskedVector(self, d, computed, old, count, width), count);
@@ -589,11 +593,15 @@ fn executeVshufpd(self: anytype, d: DecodedInsn) void {
 
 fn executeVpermilps(self: anytype, d: DecodedInsn) void {
     const count = vectorBytes(d);
+    // The immediate form permutes its r/m operand. The variable form permutes
+    // the VEX.vvvv register with control from r/m (`VPERMILPS xmm1, xmm2,
+    // xmm3/m128`); reading them the other way round turned Xenia's
+    // auto-vectorised quad-list index conversion into garbage.
     const values = if (d.uses_imm)
         readUnaryOperand(self, d, count, 4)
     else
-        readRmOperand(self, d, count, 4, 4);
-    const indexes = if (d.uses_imm) [_]u8{0} ** 64 else readVectorRegister(self, d.xmm_src);
+        readVectorRegister(self, d.xmm_src);
+    const indexes = if (d.uses_imm) [_]u8{0} ** 64 else readRmOperand(self, d, count, 4, 4);
     var computed = [_]u8{0} ** 64;
     for (0..count / 16) |block| {
         const base = block * 16;
@@ -1051,12 +1059,19 @@ fn executeVpdpbusd(self: anytype, d: DecodedInsn) void {
 
 fn executeVpslld(self: anytype, d: DecodedInsn) void {
     const count = vectorBytes(d);
-    const source = if (d.is_reg_form)
+    // VEX.NDS 0F F2 shifts vvvv by the low 64 bits of r/m; only the
+    // immediate form (0F 72 /6) shifts r/m by imm8.
+    const source = if (!d.uses_imm or d.is_reg_form)
         readVectorRegister(self, d.xmm_src)
     else
         readRmOperand(self, d, count, 4, 4);
     var computed = [_]u8{0} ** 64;
-    const shift = @as(u8, @truncate(d.imm));
+    const shift: u64 = if (d.uses_imm)
+        @as(u8, @truncate(d.imm))
+    else if (d.is_reg_form)
+        std.mem.readInt(u64, readVectorRegister(self, d.xmm_src2)[0..8], .little)
+    else
+        std.mem.readInt(u64, self.readMem128(d.addr)[0..8], .little);
     for (0..count / 4) |lane| {
         const offset = lane * 4;
         const value = std.mem.readInt(u32, @ptrCast(&source[offset]), .little);
@@ -1138,8 +1153,11 @@ fn executeVpshufb(self: anytype, d: DecodedInsn) void {
 /// the source operand itself remains an ordinary vector load.
 fn executeVpalignr(self: anytype, d: DecodedInsn) void {
     const count = vectorBytes(d);
-    const first = readVectorRegister(self, d.xmm_src);
-    const second = readRmOperand(self, d, count, 1, 1);
+    // VPALIGNR xmm1, xmm2, xmm3/m128, imm8 shifts the concatenation
+    // xmm2:xmm3 right by imm8 bytes: the r/m operand is the LOW half and
+    // vvvv the high one. They were the other way round in both executors.
+    const high = readVectorRegister(self, d.xmm_src);
+    const low = readRmOperand(self, d, count, 1, 1);
     if (self.terminated) return;
     const shift: usize = @min(@as(usize, @intCast(d.imm)), 32);
     var computed = [_]u8{0} ** 64;
@@ -1148,9 +1166,9 @@ fn executeVpalignr(self: anytype, d: DecodedInsn) void {
         for (0..16) |byte| {
             const selected = shift + byte;
             computed[base + byte] = if (selected < 16)
-                first[base + selected]
+                low[base + selected]
             else if (selected < 32)
-                second[base + selected - 16]
+                high[base + selected - 16]
             else
                 0;
         }
