@@ -1,10 +1,34 @@
 cmake_minimum_required(VERSION 3.20)
 
-# The upstream root tests APPLE before its project() call. CMake preserves
-# the host's Darwin value while cross-configuring, so select Windows before
-# entering the untouched source mirror.
-set(APPLE FALSE)
+# Establish the cross target before entering the untouched source mirror.
+# Keeping the compiler and target variables in this outer project is
+# important: the Xenia root is intentionally included as a subdirectory so
+# it can remain a pristine checkout, and its project() call must inherit a
+# Windows/COFF toolchain rather than the host Darwin toolchain.
 set(CMAKE_SYSTEM_NAME Windows CACHE STRING "" FORCE)
 set(CMAKE_SYSTEM_PROCESSOR x86_64 CACHE STRING "" FORCE)
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY CACHE STRING "" FORCE)
+
+set(APPLE FALSE)
+set(APPLE FALSE CACHE BOOL "" FORCE)
+set(CMAKE_OSX_ARCHITECTURES "" CACHE STRING "" FORCE)
+
+set(CMAKE_C_COMPILER "@SUPPORT_BIN@/clang-c-wrapper")
+set(CMAKE_CXX_COMPILER "@SUPPORT_BIN@/clang-cxx-wrapper")
+set(CMAKE_RC_COMPILER "@SUPPORT_BIN@/windres-wrapper")
+set(CMAKE_AR "@LLVM_AR@")
+set(CMAKE_RANLIB "@LLVM_RANLIB@")
+set(CMAKE_C_COMPILER_TARGET x86_64-w64-windows-gnu)
+set(CMAKE_CXX_COMPILER_TARGET x86_64-w64-windows-gnu)
+
+set(CMAKE_EXE_LINKER_FLAGS_INIT "-fuse-ld=@LLD@")
+set(CMAKE_SHARED_LINKER_FLAGS_INIT "-fuse-ld=@LLD@")
+
+set(CMAKE_FIND_ROOT_PATH "@MINGW_ROOT@" "@MINGW_PARENT@")
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+
+project(rosette_xenia_windows LANGUAGES C CXX)
 
 add_subdirectory("@SOURCE_ROOT@" "@INNER_BUILD@")

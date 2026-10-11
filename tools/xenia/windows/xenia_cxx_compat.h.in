@@ -4,11 +4,22 @@
 
 #include "xenia_windows_compat.h"
 
-/* Load MinGW's ordinary Windows headers before advertising the MSVC macro.
- * DirectX-Headers and DXC then select their C++ ABI declarations without
- * changing how the MinGW Shell/COM headers were parsed. */
-#include "@SOURCE_ROOT@/src/xenia/base/platform_win.h"
+/* Load MinGW's ordinary Windows headers before the Xenia Windows platform
+ * header. platform_win.h includes bcrypt.h before windows.h, which is valid
+ * in the native SDK include graph but not with MinGW's case-sensitive,
+ * independently includable headers. DirectX-Headers and DXC then select
+ * their C++ ABI declarations without changing how the MinGW Shell/COM
+ * headers were parsed. */
+/* Load libstdc++'s OS configuration first: it defines NOMINMAX=1. Parse
+ * Winsock2 before windows.h, then let Xenia own the NOMINMAX definition.
+ * No macro diagnostic is disabled and neither upstream header is rewritten. */
 #include <cstdlib>
+#include <winsock2.h>
+#include <windows.h>
+#ifdef NOMINMAX
+#undef NOMINMAX
+#endif
+#include "@SOURCE_ROOT@/src/xenia/base/platform_win.h"
 
 /* Forward declarations for the interface types whose UUIDs are supplied by
  * DirectX-Headers, DXC, or the optional PIX stub later in the include graph.
@@ -140,6 +151,57 @@ __CRT_UUID_DECL(IDxcCompiler, 0x8c210bf3, 0x011f, 0x4422, 0x8d, 0x70, 0x6f,
 #ifdef FILE_RANDOM_ACCESS
 #undef FILE_RANDOM_ACCESS
 #endif
+
+/* volume.h deliberately declares the Xbox device values as members of
+ * X_FILE_DEVICE_TYPE.  MinGW's winioctl.h exposes the same spellings as
+ * numeric macros, which would turn the enum declarations into literals and
+ * later make assignments lose their enum type.  Keep the names as
+ * Rosetta-owned identifiers for the entire translation unit.  The aliases
+ * retain the enum type at Xenia call sites and also remain usable by the
+ * Windows-only libusb headers that refer to FILE_DEVICE_UNKNOWN. */
+#ifdef FILE_DEVICE_UNKNOWN
+#undef FILE_DEVICE_UNKNOWN
+#endif
+#define FILE_DEVICE_UNKNOWN rosette_xenia_file_device_unknown
+
+#ifdef FILE_DEVICE_EHSTOR
+#undef FILE_DEVICE_EHSTOR
+#endif
+#define FILE_DEVICE_EHSTOR rosette_xenia_file_device_ehstor
+
+/* xsocket.h deliberately declares the Xbox socket values as enum members
+ * named AF_INET, SOCK_STREAM, and SOCK_DGRAM.  MinGW exposes the same names
+ * as preprocessor macros, so simply undefining them would make later native
+ * socket calls lose their constants.  Give the Windows constants stable
+ * Rosetta-owned spellings instead: the Xenia enum declarations and every
+ * subsequent native use still receive the same numeric values, while the
+ * preprocessor can no longer rewrite an enum member into a literal. */
+#ifdef AF_INET
+#undef AF_INET
+#endif
+#ifndef ROSETTE_XENIA_AF_INET
+#define ROSETTE_XENIA_AF_INET rosette_xenia_af_inet
+static constexpr int rosette_xenia_af_inet = 2;
+#endif
+#define AF_INET ROSETTE_XENIA_AF_INET
+
+#ifdef SOCK_STREAM
+#undef SOCK_STREAM
+#endif
+#ifndef ROSETTE_XENIA_SOCK_STREAM
+#define ROSETTE_XENIA_SOCK_STREAM rosette_xenia_sock_stream
+static constexpr int rosette_xenia_sock_stream = 1;
+#endif
+#define SOCK_STREAM ROSETTE_XENIA_SOCK_STREAM
+
+#ifdef SOCK_DGRAM
+#undef SOCK_DGRAM
+#endif
+#ifndef ROSETTE_XENIA_SOCK_DGRAM
+#define ROSETTE_XENIA_SOCK_DGRAM rosette_xenia_sock_dgram
+static constexpr int rosette_xenia_sock_dgram = 2;
+#endif
+#define SOCK_DGRAM ROSETTE_XENIA_SOCK_DGRAM
 
 /* MinGW suppresses its __cpuidex declaration for GCC 11 and newer. Clang's
  * MS-compatibility mode does not provide the declaration either, while Xbyak

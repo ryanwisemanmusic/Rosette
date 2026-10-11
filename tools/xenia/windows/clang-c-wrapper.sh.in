@@ -4,10 +4,45 @@ set -euo pipefail
 clang="@CLANG@"
 source_root="@SOURCE_ROOT@"
 libusb_config="@LIBUSB_CONFIG@"
+target_triple="x86_64-w64-windows-gnu"
 
 rewritten=()
-for arg in "$@"; do
+args=("$@")
+index=0
+while [ "$index" -lt "${#args[@]}" ]; do
+  arg="${args[$index]}"
   case "$arg" in
+    /Od)
+      rewritten+=("-O0")
+      ;;
+    /O[123s])
+      # FFmpeg's Windows configure emits MSVC-style optimization switches.
+      # Clang's GNU driver otherwise treats /Os (for example) as a relative
+      # filename, which prevents the non-LTO Checked configuration from
+      # compiling through the Windows capsule.
+      rewritten+=("-${arg#/}")
+      ;;
+    /Ob*|/Oi|/Oy|/GL|/Gw|/Gy)
+      # These MSVC code-generation switches have no required GNU-driver
+      # equivalent for this capsule; omit them instead of passing them as
+      # filesystem paths.
+      ;;
+    -flto|-flto=*)
+      # Constructor ordering is part of the PE startup contract, so avoid
+      # ThinLTO's unstable merged global-ctor order in the capsule.
+      ;;
+    -arch|-isysroot|-iframework)
+      index=$((index + 2))
+      continue
+      ;;
+    -mmacosx-version-min=*|-miphoneos-version-min=*|-mios-simulator-version-min=*)
+      index=$((index + 1))
+      continue
+      ;;
+    -F*|-Wl,-search_paths_first|-Wl,-headerpad_max_install_names|-Wl,-syslibroot,*|-Wl,-platform_version,*|-Wl,-macosx_version_min,*)
+      index=$((index + 1))
+      continue
+      ;;
     -fuse-ld=lld)
       rewritten+=("-fuse-ld=@LLD@")
       ;;
@@ -15,20 +50,23 @@ for arg in "$@"; do
       rewritten+=("$arg")
       ;;
   esac
+  index=$((index + 1))
 done
 
 for arg in "${rewritten[@]}"; do
   case "$arg" in
     "$source_root"/third_party/libusb/*)
       exec "$clang" \
+        "--target=$target_triple" \
         -DSDL_USE_BUILTIN_OPENGL_DEFINITIONS=1 \
-        -D__GNUC__=13 -D__GNUC_MINOR__=2 -D__GNUC_PATCHLEVEL__=0 \
+        -D__GNUC__=4 -D__GNUC_MINOR__=2 -D__GNUC_PATCHLEVEL__=1 \
         -I"$libusb_config" "${rewritten[@]}"
       ;;
   esac
 done
 
 exec "$clang" \
+  "--target=$target_triple" \
   -DSDL_USE_BUILTIN_OPENGL_DEFINITIONS=1 \
-  -D__GNUC__=13 -D__GNUC_MINOR__=2 -D__GNUC_PATCHLEVEL__=0 \
+  -D__GNUC__=4 -D__GNUC_MINOR__=2 -D__GNUC_PATCHLEVEL__=1 \
   "${rewritten[@]}"

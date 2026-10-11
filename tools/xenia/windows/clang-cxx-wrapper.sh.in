@@ -5,6 +5,7 @@ clangxx="@CLANGXX@"
 source_root="@SOURCE_ROOT@"
 support_tmp="@SUPPORT_TMP@"
 support_include="@SUPPORT_DIR@/include"
+target_triple="x86_64-w64-windows-gnu"
 
 rewritten=()
 temporary_sources=()
@@ -25,7 +26,7 @@ trap cleanup EXIT
 while [ "$index" -lt "${#args[@]}" ]; do
   arg="${args[$index]}"
   case "$arg" in
-    -c|-E|-S)
+    -c|-E|-S|-fsyntax-only|-M|-MM)
       is_link=0
       ;;
   esac
@@ -42,6 +43,34 @@ while [ "$index" -lt "${#args[@]}" ]; do
   fi
 
   case "$arg" in
+    /Od)
+      rewritten+=("-O0")
+      ;;
+    /O[123s])
+      rewritten+=("-${arg#/}")
+      ;;
+    /Ob*|/Oi|/Oy|/GL|/Gw|/Gy)
+      ;;
+    -flto|-flto=*)
+      # ThinLTO currently loses the stable COFF constructor ordering that
+      # MinGW's __do_global_ctors relies on. Keep PE startup deterministic;
+      # this is capsule policy and leaves the inspected Xenia sources intact.
+      ;;
+    -arch|-isysroot|-iframework)
+      # CMake can inherit these host-Darwin options when a nested project
+      # configures itself. They are invalid for the Windows/COFF target, and
+      # the option's following value belongs to the host option as well.
+      index=$((index + 2))
+      continue
+      ;;
+    -mmacosx-version-min=*|-miphoneos-version-min=*|-mios-simulator-version-min=*)
+      index=$((index + 1))
+      continue
+      ;;
+    -F*|-Wl,-search_paths_first|-Wl,-headerpad_max_install_names|-Wl,-syslibroot,*|-Wl,-platform_version,*|-Wl,-macosx_version_min,*)
+      index=$((index + 1))
+      continue
+      ;;
     */socket_win.cc)
       needs_winsock=1
       ;;
@@ -68,6 +97,10 @@ while [ "$index" -lt "${#args[@]}" ]; do
   esac
 
   case "$arg" in
+    /Od|/O[123s]|/Ob*|/Oi|/Oy|/GL|/Gw|/Gy|-flto|-flto=*)
+      # These options were already translated or intentionally removed by
+      # the compatibility pass above. Do not append their original spelling.
+      ;;
     -fuse-ld=lld)
       rewritten+=("-fuse-ld=@LLD@")
       ;;
@@ -84,10 +117,14 @@ while [ "$index" -lt "${#args[@]}" ]; do
 done
 
 compiler_args=(
+  "--target=$target_triple"
   -fms-extensions
   -fms-compatibility
   -fms-compatibility-version=19
-  -D__GNUC__=13 -D__GNUC_MINOR__=2 -D__GNUC_PATCHLEVEL__=0
+  # -fms-compatibility removes these Clang compatibility macros. Restore
+  # Clang's real GCC compatibility level, NOT libstdc++'s version. Advertising
+  # GCC 13 selected GCC-only pragmas and features in unchanged third-party code.
+  -D__GNUC__=4 -D__GNUC_MINOR__=2 -D__GNUC_PATCHLEVEL__=1
   -D__GCC_ATOMIC_BOOL_LOCK_FREE=2
   -D__GCC_ATOMIC_CHAR8_T_LOCK_FREE=2
   -D__GCC_ATOMIC_CHAR16_T_LOCK_FREE=2
@@ -105,6 +142,7 @@ compiler_args=(
   -DXE_COMPILER_HAS_MSVC_EXTENSIONS=1
   -DUNICODE -D_UNICODE
   -include "$support_include/xenia_cxx_compat.h"
+  -ivfsoverlay "@CPP_OVERLAY@"
 )
 if [ "$needs_winsock" -eq 1 ]; then
   compiler_args+=(-include winsock2.h)
@@ -115,19 +153,29 @@ compiler_args+=(
   -I"$support_include"
   -Wno-error=macro-redefined
   -Wno-error=cpp
-  -Wno-error=format
-  -Wno-error=tautological-pointer-compare
-  -Wno-error=microsoft-cast
-  -Wno-error=ignored-pragmas
   -Wno-error=unknown-warning-option
-  -Wno-error=undefined-inline
-  -Wno-error=multichar
+  # The token-aware ABI profile fixes these at source. Keep them fatal:
+  # an upstream pattern change must surface, not silently reintroduce them.
+  -Werror=format
+  -Werror=tautological-pointer-compare
+  -Werror=microsoft-cast
+  -Werror=ignored-pragmas
+  -Werror=undefined-inline
+  -Werror=multichar
 )
 if [ "${#rewritten[@]}" -gt 0 ]; then
   compiler_args+=("${rewritten[@]}")
 fi
 if [ "$is_link" -eq 1 ]; then
   compiler_args+=(
+    # Keep the C++ and GCC runtimes inside the PE whenever the cross toolchain
+    # provides their static archives.  A Windows PE cannot resolve MinGW's
+    # libstdc++ ABI against the host libc++ runtime, and leaving these imports
+    # external turns every C++ exception/string/filesystem edge into a false
+    # Windows-ABI preflight failure.  This is a link-only capsule policy; it
+    # does not alter Xenia's source or its C++ object files.
+    -static-libstdc++
+    -static-libgcc
     -municode
     -lntdll
     -lwsock32
@@ -139,7 +187,12 @@ if [ "$is_link" -eq 1 ]; then
     -ldxguid
     -lksuser
     -lksguid
+    # The pthread shim is part of MinGW's Windows runtime, not a host
+    # library. Keep it in the PE as well so pthread synchronization does not
+    # become another unresolved DLL surface in Rosetta.
+    -Wl,-Bstatic
     -lwinpthread
+    -Wl,-Bdynamic
     -lucrt
   )
 fi

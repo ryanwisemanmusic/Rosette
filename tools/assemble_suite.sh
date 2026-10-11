@@ -169,6 +169,14 @@ fi
 mkdir -p "${OUT_DIR}"
 
 resolve_nasm() {
+    if [[ -n "${ROSETTE_NASM:-}" && -x "${ROSETTE_NASM}" ]]; then
+        printf '%s\n' "${ROSETTE_NASM}"
+        return 0
+    fi
+    if [[ -n "${ROSETTE_HOST_PREFIX:-}" && -x "${ROSETTE_HOST_PREFIX}/bin/nasm" ]]; then
+        printf '%s\n' "${ROSETTE_HOST_PREFIX}/bin/nasm"
+        return 0
+    fi
     if command -v nasm >/dev/null 2>&1; then
         command -v nasm
         return 0

@@ -40,6 +40,7 @@ Options:
   --target NAME            CMake target (default: xenia-app).
   --jobs N                 Parallel build jobs.
   --prepare                Mirror the source and generate support files.
+  --support-only           Refresh Rosette wrappers only; no Xenia source writes/build.
   --configure              Configure with Ninja Multi-Config.
   --build                  Build the selected target.
   --bundle                 Copy the executable, runtime DLLs, and manifest.
@@ -259,6 +260,7 @@ render_template() {
     local libusb_escaped="$(sed_escape "$libusb_config_dir")"
     local icon_escaped="$(sed_escape "$source_mirror/assets/icon/icon.ico")"
     local launcher_escaped="$(sed_escape "$(env_value ROSETTE_XENIA_WINDOWS_SHADER_LAUNCHER)")"
+    local cpp_overlay_escaped="$(sed_escape "$cpp_overlay")"
     sed \
         -e "s|@SOURCE_ROOT@|$source_escaped|g" \
         -e "s|@INNER_BUILD@|$inner_escaped|g" \
@@ -276,6 +278,7 @@ render_template() {
         -e "s|@LIBUSB_CONFIG@|$libusb_escaped|g" \
         -e "s|@ICON_PATH@|$icon_escaped|g" \
         -e "s|@SHADER_LAUNCHER@|$launcher_escaped|g" \
+        -e "s|@CPP_OVERLAY@|$cpp_overlay_escaped|g" \
         "$1" > "$2"
 }
 
@@ -302,7 +305,14 @@ write_version_header() {
 
 generate_support() {
     mkdir -p "$support_dir/cmake-wrapper" "$support_bin" "$support_dir/include" \
-        "$support_tmp" "$libusb_config_dir"
+        "$support_tmp" "$libusb_config_dir" "$support_dir/cpp-overlay"
+    # Token-aware C++ ABI adaptation lives in Rosette, not in source patches
+    # or warning filters. Build its small CLI in a Rosette-owned prefix and
+    # expose immutable translated inputs through Clang's virtual filesystem.
+    zig build c-fix --build-file "$repo_root/build/build.zig" \
+        --prefix "$repo_root/.rosette/windows-cpp-tool" >&2
+    cpp_overlay="$("$repo_root/.rosette/windows-cpp-tool/bin/rosette-c-fix" \
+        --windows-xenia-overlay "$source_mirror" "$support_dir/cpp-overlay")"
     if [[ "$need_shader_tools" == 1 ]]; then
         mkdir -p "$vulkan_tool_root/bin"
         ln -sfn "$glslang" "$vulkan_tool_root/bin/glslangValidator"
@@ -326,9 +336,98 @@ generate_support() {
     cp "$template_dir/xenia_windows_compat.h" "$support_dir/include/xenia_windows_compat.h"
     cp "$template_dir/DXProgrammableCapture.h" "$support_dir/include/DXProgrammableCapture.h"
     cp "$template_dir/ShlObj_core.h" "$support_dir/include/ShlObj_core.h"
+    cp "$template_dir/ObjBase.h" "$support_dir/include/ObjBase.h"
+    cp "$template_dir/mm3dnow.h" "$support_dir/include/mm3dnow.h"
     cp "$template_dir/libusb-config.h" "$libusb_config_dir/config.h"
     chmod +x "$support_bin/clang-c-wrapper" "$support_bin/clang-cxx-wrapper" \
         "$support_bin/windres-wrapper" "$support_bin/wine"
+}
+
+prepare_snappy_header() {
+    local snappy_source="$source_mirror/third_party/snappy"
+    local snappy_build="$support_dir/snappy-configure"
+    local generated_header="$snappy_build/snappy-stubs-public.h"
+
+    # The generated header is target-specific. A prior native macOS probe (or
+    # an older Windows capsule run) may have left a host header in the mirror;
+    # never let that stale state decide whether sys/uio.h is included.
+    rm -f "$snappy_source/snappy-stubs-public.h"
+
+    # Xenia's untouched third_party/CMakeLists.txt asks Snappy to configure
+    # itself in its source directory. Do the same work in the isolated
+    # Rosette mirror first, with the Windows wrappers explicitly selected, so
+    # the parent project never observes a missing public generated header or
+    # accidentally launches a host-Darwin nested configure.
+    mkdir -p "$snappy_build"
+    (
+        build_environment
+        "$cmake" -S "$snappy_source" -B "$snappy_build" \
+            -G Ninja \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_SYSTEM_PROCESSOR=x86_64 \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DCMAKE_C_COMPILER="$support_bin/clang-c-wrapper" \
+            -DCMAKE_CXX_COMPILER="$support_bin/clang-cxx-wrapper" \
+            -DCMAKE_C_COMPILER_TARGET=x86_64-w64-windows-gnu \
+            -DCMAKE_CXX_COMPILER_TARGET=x86_64-w64-windows-gnu \
+            -DCMAKE_AR="$llvm_ar" \
+            -DCMAKE_RANLIB="$llvm_ranlib" \
+            -DCMAKE_FIND_ROOT_PATH="$mingw_root;$mingw_parent" \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+            -DSNAPPY_BUILD_TESTS=OFF \
+            -DSNAPPY_BUILD_BENCHMARKS=OFF \
+            -DSNAPPY_INSTALL=OFF \
+            -DSNAPPY_REQUIRE_AVX=ON
+    )
+    [[ -f "$generated_header" ]] ||
+        die "Snappy configure did not generate $generated_header"
+    cp -p "$generated_header" "$snappy_source/snappy-stubs-public.h"
+}
+
+prepare_zlib_headers() {
+    local zlib_source="$source_mirror/third_party/zlib-ng"
+    local zlib_build="$support_dir/zlib-configure"
+    local name
+    [[ -f "$zlib_source/zlib-ng.h" &&
+        -f "$zlib_source/zconf-ng.h" &&
+        -f "$zlib_source/zlib_name_mangling-ng.h" &&
+        -f "$zlib_source/gzread.c" ]] && return 0
+
+    # The untouched Xenia third_party graph deliberately includes zlib-ng's
+    # generated files from the source directory. Configure into an isolated
+    # build directory with the Windows capsule and copy only those generated
+    # inputs into the Rosette source mirror; the selected Xenia checkout is
+    # never used as a generated-state directory.
+    mkdir -p "$zlib_build"
+    (
+        build_environment
+        "$cmake" -S "$zlib_source" -B "$zlib_build" \
+            -G Ninja \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_SYSTEM_PROCESSOR=x86_64 \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DCMAKE_C_COMPILER="$support_bin/clang-c-wrapper" \
+            -DCMAKE_C_COMPILER_TARGET=x86_64-w64-windows-gnu \
+            -DCMAKE_AR="$llvm_ar" \
+            -DCMAKE_RANLIB="$llvm_ranlib" \
+            -DCMAKE_FIND_ROOT_PATH="$mingw_root;$mingw_parent" \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+            -DZLIB_ENABLE_TESTS=OFF \
+            -DZLIBNG_ENABLE_TESTS=OFF \
+            -DWITH_GTEST=OFF \
+            -DWITH_BENCHMARKS=OFF \
+            -DWITH_BENCHMARK_APPS=OFF \
+            -DWITH_FUZZERS=OFF
+    )
+    for name in zlib-ng.h zconf-ng.h zlib_name_mangling-ng.h gzread.c; do
+        [[ -f "$zlib_build/$name" ]] ||
+            die "zlib-ng configure did not generate $zlib_build/$name"
+        cp -p "$zlib_build/$name" "$zlib_source/$name"
+    done
 }
 
 print_configuration() {
@@ -373,11 +472,18 @@ configure_xenia() {
 build_xenia() {
     [[ -f "$build_dir/CMakeCache.txt" ]] ||
         die "CMake has not been configured in $build_dir; pass --configure first"
+    local build_log="$build_dir/rosette-build.log"
+    local build_status=0
     (
         build_environment
         "$cmake" --build "$build_dir" --config "$config" --target "$target" \
             --parallel "$jobs"
-    )
+    ) 2>&1 | tee "$build_log" || build_status=$?
+    # Preserve the actual compiler output and pipeline exit; classification
+    # never suppresses findings, patches the mirror, or turns failure green.
+    python3 "$repo_root/tools/audit_compiler_warnings.py" "$build_log" \
+        --output "$build_dir/rosette-compiler-warnings.json"
+    [[ "$build_status" == 0 ]] || die "Xenia build/log pipeline failed (status=$build_status); original diagnostics and warning ledger retained"
 }
 
 sha256_file() {
@@ -396,6 +502,15 @@ bundle_xenia() {
     [[ -f "$executable" ]] || die "built Xenia executable is missing: $executable"
     mkdir -p "$bundle_dir"
     cp -p "$executable" "$bundle_dir/xenia_canary.exe"
+    local controller_db="$repo_root/tools/xenia/assets/gamecontrollerdb.txt"
+    [[ -s "$controller_db" ]] || die "Rosette SDL GameControllerDB asset is missing: $controller_db"
+    cp -p "$controller_db" "$bundle_dir/gamecontrollerdb.txt"
+    printf 'controller database: %s\n' "$bundle_dir/gamecontrollerdb.txt"
+    # The PE's MinGW constructor list is part of the executable startup
+    # contract. Repair only the Rosetta-owned bundle copy: the selected
+    # Xenia checkout and its isolated source mirror remain untouched.
+    "$python3_bin" "$repo_root/tools/xenia/scripts/repair_windows_startup.py" \
+        "$bundle_dir/xenia_canary.exe"
     for name in libgcc_s_seh-1.dll libstdc++-6.dll libwinpthread-1.dll; do
         for candidate in "$build_dir/bin/Windows/$config/$name" "$mingw_root/bin/$name"; do
             if [[ -f "$candidate" ]]; then
@@ -410,7 +525,17 @@ bundle_xenia() {
     if [[ -n "$media_image" ]]; then
         [[ -f "$media_image" ]] || die "media image does not exist: $media_image"
         media_destination="$bundle_dir/$(basename "$media_image")"
-        [[ "$media_image" == "$media_destination" ]] || cp -p "$media_image" "$media_destination"
+        if [[ "$media_image" != "$media_destination" ]]; then
+            # An I/O failure must not replace a known-good bundled ISO with a
+            # partial file or publish a manifest for incomplete media.
+            local media_copy
+            media_copy="$(mktemp "$bundle_dir/.rosette-media-copy.XXXXXX")"
+            if ! cp -p "$media_image" "$media_copy"; then
+                rm -f "$media_copy"
+                die "media copy failed reading '$media_image'; existing bundled media preserved. A source-volume I/O error is not a Vulkan/window failure; select a readable image before rebuilding the bundle"
+            fi
+            mv -f "$media_copy" "$media_destination"
+        fi
     fi
 
     local manifest="$bundle_dir/rosette-xenia-windows.json"
@@ -467,6 +592,7 @@ config=Release
 target=xenia-app
 jobs="$(env_value ROSETTE_XENIA_WINDOWS_JOBS)"
 prepare=0
+support_only=0
 configure=0
 build=0
 bundle=0
@@ -487,6 +613,7 @@ while [[ $# -gt 0 ]]; do
         --target) [[ $# -ge 2 ]] || die "--target requires a value"; target="$2"; shift 2 ;;
         --jobs) [[ $# -ge 2 ]] || die "--jobs requires a number"; jobs="$2"; shift 2 ;;
         --prepare) prepare=1; shift ;;
+        --support-only) support_only=1; shift ;;
         --configure) configure=1; shift ;;
         --build) build=1; shift ;;
         --bundle) bundle=1; shift ;;
@@ -496,7 +623,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$prepare$configure$build$bundle$print" == 00000 ]]; then
+if [[ "$prepare$configure$build$bundle$print$support_only" == 000000 ]]; then
     configure=1
     build=1
     bundle=1
@@ -525,14 +652,28 @@ need_shader_tools=0
 
 validate_source
 discover_tools
+if [[ "$support_only" == 1 ]]; then
+    [[ "$prepare$configure$build$bundle" == 0000 ]] ||
+        die "--support-only cannot be combined with source preparation/build/bundle"
+    # Preserve an existing capsule's include graph without writing its mirror.
+    # A fresh support-only capsule reads headers directly from the checkout.
+    [[ -d "$source_mirror" ]] || source_mirror="$original_source_root"
+    generate_support
+    printf 'rosette Xenia Windows support: PASS (source read-only; no Xenia build/run)\n'
+    exit 0
+fi
 if [[ "$print" == 1 ]]; then
     print_configuration
     [[ "$prepare$configure$build$bundle" == 0000 ]] && exit 0
 fi
 if [[ "$prepare" == 1 ]]; then
     mirror_source
+    python3 "$script_dir/repair_xobject_ref.py" \
+        --source-root "$original_source_root" --mirror-root "$source_mirror"
     write_version_header
     generate_support
+    prepare_snappy_header
+    prepare_zlib_headers
 fi
 [[ "$configure" == 1 ]] && configure_xenia
 [[ "$build" == 1 ]] && build_xenia
