@@ -14,6 +14,40 @@
 const std = @import("std");
 const budget_mod = @import("budget.zig");
 
+// AppKit can terminate through libc exit without running the forwarder's
+// normal device teardown. Register after loading the Vulkan layer so its
+// driver-owned dispatch data outlives our last fence wait on that exit path.
+extern fn atexit(function: *const fn () callconv(.c) void) c_int;
+var exit_mutex: std.c.pthread_mutex_t = .{};
+var exit_monitors: [64]?*Monitor = @splat(null);
+
+fn registerExitMonitor(monitor: *Monitor) bool {
+    lock(&exit_mutex);
+    defer unlock(&exit_mutex);
+    for (&exit_monitors) |*slot| {
+        if (slot.* == monitor) return true;
+    }
+    for (&exit_monitors) |*slot| {
+        if (slot.* != null) continue;
+        // Re-register for each new watcher: a recreated Vulkan loader/layer
+        // may have installed later exit destructors. Empty older callbacks
+        // are harmless. Registration failure refuses unprotected startup.
+        if (atexit(stopExitMonitors) != 0) return false;
+        slot.* = monitor;
+        return true;
+    }
+    return false;
+}
+
+fn stopExitMonitors() callconv(.c) void {
+    lock(&exit_mutex);
+    defer unlock(&exit_mutex);
+    for (&exit_monitors) |*slot| {
+        if (slot.*) |monitor| monitor.stopWatcher();
+        slot.* = null;
+    }
+}
+
 pub const capacity: usize = 1024;
 pub const poll_timeout_ns: u64 = 10 * budget_mod.ns_per_ms;
 pub const max_in_flight_segments: usize = @import("../../metal/command_buffer_policy.zig").fsi.max_in_flight;
@@ -36,6 +70,7 @@ pub fn submitInfosWouldExceed(limit: usize, outstanding: usize, incoming: usize)
 pub const WaitResult = enum { signaled, timeout, failed };
 pub const RoomResult = enum { available, failed, stopped, slow_chunk, runtime_lock_pinned };
 pub const FailureStage = enum { none, wait_for_fences, reset_fences };
+pub const TrackResult = struct { serial: u64, failed: bool };
 
 /// How the watcher reaches the device: wrappers over vkWaitForFences and
 /// vkResetFences in the forwarder, a simulated GPU in tests.
@@ -98,6 +133,8 @@ pub const Stats = struct {
     room_waits: u64,
     room_wait_ns: u64,
     max_room_wait_ns: u64,
+    ready_checks: u64,
+    ready_completions: u64,
     failed: bool,
     submissions_paused: bool,
     severe_recoveries: u64,
@@ -130,6 +167,8 @@ pub const Monitor = struct {
     room_waits: u64 = 0,
     room_wait_ns: u64 = 0,
     max_room_wait_ns: u64 = 0,
+    ready_checks: u64 = 0,
+    ready_completions: u64 = 0,
     stopping: bool = false,
     failed: bool = false,
     /// A group exceeded the severe observation-latency bound. Admit no more
@@ -162,12 +201,29 @@ pub const Monitor = struct {
     pub fn start(self: *Monitor, ops: FenceOps, report: ?*const fn (Report) void) !void {
         self.ops = ops;
         self.report = report;
-        if (self.thread == null) self.thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, watcherMain, .{self});
+        if (self.thread == null) {
+            self.thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, watcherMain, .{self});
+            if (!registerExitMonitor(self)) {
+                self.stopWatcher();
+                return error.ExitMonitorUnavailable;
+            }
+        }
     }
 
     /// Stop the watcher and wait for it. Outstanding entries are abandoned;
     /// the caller destroys every fence `collectFences` returns.
     pub fn stop(self: *Monitor) void {
+        // Keep the registry locked through join. An exit callback must not
+        // see a monitor whose owner is concurrently freeing its storage.
+        lock(&exit_mutex);
+        defer unlock(&exit_mutex);
+        for (&exit_monitors) |*slot| {
+            if (slot.* == self) slot.* = null;
+        }
+        self.stopWatcher();
+    }
+
+    fn stopWatcher(self: *Monitor) void {
         lock(&self.mutex);
         self.stopping = true;
         broadcast(&self.work);
@@ -322,8 +378,25 @@ pub const Monitor = struct {
     /// serial. The queue submitter enforces the much smaller Metal in-flight
     /// policy through `waitForRoom` before calling it.
     pub fn track(self: *Monitor, entry: Entry) u64 {
+        return self.trackImpl(entry, false).serial;
+    }
+
+    /// Check a freshly submitted fence once, without blocking, before waking
+    /// the watcher. Only an empty FIFO permits this: an older fence may be in
+    /// the watcher's wait/reset call. Pending work still goes to that watcher.
+    pub fn trackSubmitted(self: *Monitor, entry: Entry) TrackResult {
+        return self.trackImpl(entry, true);
+    }
+
+    fn trackImpl(self: *Monitor, entry: Entry, check_ready: bool) TrackResult {
+        var report: ?Report = null;
         lock(&self.mutex);
-        defer unlock(&self.mutex);
+        defer {
+            unlock(&self.mutex);
+            if (report) |value| {
+                if (self.report) |callback| callback(value);
+            }
+        }
         while (self.count == capacity and !self.stopping and !self.failed and self.thread != null) {
             self.room_waits +|= 1;
             wait(&self.room, &self.mutex);
@@ -341,8 +414,36 @@ pub const Monitor = struct {
         self.max_outstanding = @max(self.max_outstanding, self.count);
         self.max_outstanding_submit_infos = @max(self.max_outstanding_submit_infos, self.outstanding_submit_infos);
         self.tracked +|= 1;
+        if (check_ready and self.count == 1 and !self.failed and !self.stopping) {
+            if (self.ops) |ops| {
+                self.ready_checks +|= 1;
+                const result = ops.wait(ops.context, stored.fence, 0);
+                const now = ops.now(ops.context);
+                if (result == .signaled and ops.reset(ops.context, stored.fence)) {
+                    self.ready_completions +|= 1;
+                    report = self.finishHeadLocked(now);
+                    return .{ .serial = stored.serial, .failed = false };
+                }
+                if (result != .timeout) {
+                    // A failed reset is as terminal here as on the watcher.
+                    // Do not retire the entry or recycle its fence/buffers.
+                    self.failed = true;
+                    broadcast(&self.room);
+                    broadcast(&self.work);
+                    report = .{
+                        .kind = .failed,
+                        .failure_stage = if (result == .failed) .wait_for_fences else .reset_fences,
+                        .entry = stored,
+                        .running_ns = now -| stored.submit_ns,
+                        .cap = self.budget.cap,
+                        .outstanding = self.count,
+                    };
+                    return .{ .serial = stored.serial, .failed = true };
+                }
+            }
+        }
         signal(&self.work);
-        return stored.serial;
+        return .{ .serial = stored.serial, .failed = self.failed };
     }
 
     /// One watcher step: wait for the oldest outstanding fence for up to
@@ -366,20 +467,7 @@ pub const Monitor = struct {
         switch (result) {
             .signaled => {
                 if (ops.reset(ops.context, entry.fence)) {
-                    const latency = now -| entry.submit_ns;
-                    const reached = self.budget.noteOutstanding(latency, entry.escalation);
-                    if (reached != .none) {
-                        self.context_dump_requested.store(true, .release);
-                        report = .{
-                            .kind = if (reached == .severe) .severe else .risk,
-                            .completion_observed = true,
-                            .entry = entry,
-                            .running_ns = latency,
-                            .cap = self.budget.cap,
-                            .outstanding = self.count,
-                        };
-                    }
-                    self.retireHeadLocked(now, true);
+                    report = self.finishHeadLocked(now);
                 } else {
                     self.failed = true;
                     keep_watching = false;
@@ -450,10 +538,32 @@ pub const Monitor = struct {
             .room_waits = self.room_waits,
             .room_wait_ns = self.room_wait_ns,
             .max_room_wait_ns = self.max_room_wait_ns,
+            .ready_checks = self.ready_checks,
+            .ready_completions = self.ready_completions,
             .failed = self.failed,
             .submissions_paused = self.submissions_paused,
             .severe_recoveries = self.severe_recoveries,
         };
+    }
+
+    fn finishHeadLocked(self: *Monitor, now: u64) ?Report {
+        const entry = self.entries[self.head];
+        const latency = now -| entry.submit_ns;
+        const reached = self.budget.noteOutstanding(latency, entry.escalation);
+        var report: ?Report = null;
+        if (reached != .none) {
+            self.context_dump_requested.store(true, .release);
+            report = .{
+                .kind = if (reached == .severe) .severe else .risk,
+                .completion_observed = true,
+                .entry = entry,
+                .running_ns = latency,
+                .cap = self.budget.cap,
+                .outstanding = self.count,
+            };
+        }
+        self.retireHeadLocked(now, true);
+        return report;
     }
 
     fn retireHeadLocked(self: *Monitor, now: u64, measured: bool) void {
@@ -556,6 +666,153 @@ const SimulatedGpu = struct {
 };
 
 var test_reports: [8]Report = undefined;
+
+test "FSI ready fence retirement preserves pending FIFO, timing and terminal failures" {
+    for (0..5) |mode| {
+        var gpu = SimulatedGpu{ .now_ns = 7 * budget_mod.ns_per_ms };
+        gpu.done_at[1] = if (mode == 1) 9 * budget_mod.ns_per_ms else 0;
+        gpu.fail = mode == 2;
+        gpu.fail_reset = mode == 3;
+        var monitor = Monitor.init(.{});
+        monitor.ops = gpu.ops();
+        if (mode == 4) _ = monitor.track(.{ .fence = 2 });
+        const result = monitor.trackSubmitted(.{ .fence = 1, .draws = 4, .sample_work = 1024, .submit_infos = if (mode == 4) 1 else 2, .isolated = true });
+        try std.testing.expectEqual(mode == 2 or mode == 3, result.failed);
+        const stats = monitor.stats();
+        try std.testing.expectEqual(@as(u64, if (mode == 4) 0 else 1), stats.ready_checks);
+        try std.testing.expectEqual(@as(u64, if (mode == 0) 1 else 0), stats.ready_completions);
+        if (mode == 0) {
+            try std.testing.expectEqual(result.serial, stats.completed_serial);
+            try std.testing.expectEqual(@as(u64, 7 * budget_mod.ns_per_ms), stats.budget.total_observed_ns);
+            try std.testing.expectEqual(@as(usize, 0), stats.outstanding_submit_infos);
+            try std.testing.expectEqual(@as(?u64, 1), monitor.takeFence());
+        } else {
+            try std.testing.expectEqual(@as(u64, 0), stats.completed_serial);
+            try std.testing.expectEqual(@as(?u64, null), monitor.takeFence());
+            try std.testing.expectEqual(@as(usize, 2), stats.outstanding_submit_infos);
+            if (mode == 1) {
+                try std.testing.expectEqual(RoomResult.slow_chunk, monitor.waitForIsolatedSubmitInfos(2, 1, false));
+                try std.testing.expect(monitor.pollOnce());
+                try std.testing.expectEqual(result.serial, monitor.stats().completed_serial);
+            }
+        }
+    }
+    // A fence already signaled at admission can still have taken too long.
+    var gpu = SimulatedGpu{ .now_ns = 400 * budget_mod.ns_per_ms };
+    gpu.done_at[1] = 0;
+    var monitor = Monitor.init(.{});
+    monitor.ops = gpu.ops();
+    _ = monitor.trackSubmitted(.{ .fence = 1, .draws = 4, .sample_work = 1024 });
+    try std.testing.expect(monitor.stats().budget.emergency);
+    try std.testing.expectEqual(@as(u64, 1), monitor.stats().budget.severe_events);
+}
+
+test "FSI ready fence benchmark measures production monitor handoffs without a GPU" {
+    const benchmark = if (std.c.getenv("ROSETTE_FSI_FENCE_BENCH")) |value| std.mem.eql(u8, std.mem.span(value), "1") else false;
+    const iterations: u32 = if (benchmark) 20000 else 64;
+    const ReadyFence = struct {
+        resets: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        fn waitFn(_: *anyopaque, _: u64, _: u64) WaitResult {
+            return .signaled;
+        }
+        fn resetFn(context: *anyopaque, _: u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            _ = self.resets.fetchAdd(1, .monotonic);
+            return true;
+        }
+        fn nowFn(_: *anyopaque) u64 {
+            return @import("../transport_timing.zig").nowNs();
+        }
+    };
+    var elapsed: [2]u64 = undefined;
+    for (0..2) |mode| {
+        var gpu = ReadyFence{};
+        var monitor = Monitor.init(.{});
+        try monitor.start(.{ .context = &gpu, .wait = ReadyFence.waitFn, .reset = ReadyFence.resetFn, .now = ReadyFence.nowFn }, null);
+        defer monitor.stop();
+        const started = ReadyFence.nowFn(&gpu);
+        for (0..iterations) |_| {
+            try std.testing.expectEqual(RoomResult.available, monitor.waitForSubmitInfos(2, 2));
+            const entry = Entry{ .fence = 1, .submit_ns = ReadyFence.nowFn(&gpu), .draws = 2, .sample_work = 1024, .submit_infos = 2 };
+            if (mode == 0) {
+                _ = monitor.track(entry);
+            } else {
+                try std.testing.expect(!monitor.trackSubmitted(entry).failed);
+            }
+        }
+        try std.testing.expectEqual(RoomResult.available, monitor.waitForSubmitInfos(2, 2));
+        elapsed[mode] = ReadyFence.nowFn(&gpu) - started;
+        const stats = monitor.stats();
+        try std.testing.expectEqual(@as(u64, iterations), stats.completed);
+        try std.testing.expectEqual(iterations, gpu.resets.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, if (mode == 1) iterations else 0), stats.ready_completions);
+        try std.testing.expectEqual(@as(usize, 2), stats.max_outstanding_submit_infos);
+    }
+    if (benchmark) std.debug.print("FSI ready fence benchmark: groups={d} watcher_ns={d} ready_ns={d}; production monitor, already-signaled stub fences, not GPU or gameplay FPS\n", .{ iterations, elapsed[0], elapsed[1] });
+}
+
+test "FSI process exit joins active and idle watchers before driver dispatch is unloaded" {
+    const Driver = struct {
+        extern fn exit(code: c_int) noreturn;
+        extern fn _exit(code: c_int) noreturn;
+        var exit_driver: ?*@This() = null;
+        var exit_watchers: ?*[2]Monitor = null;
+        calls: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        live: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+        stale: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        fn waitFn(context: *anyopaque, _: u64, timeout_ns: u64) WaitResult {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (!self.live.load(.acquire)) _ = self.stale.fetchAdd(1, .monotonic);
+            _ = self.calls.fetchAdd(1, .release);
+            const duration = std.c.timespec{ .sec = 0, .nsec = @intCast(timeout_ns) };
+            _ = std.c.nanosleep(&duration, null);
+            if (!self.live.load(.acquire)) _ = self.stale.fetchAdd(1, .monotonic);
+            return .timeout;
+        }
+        fn resetFn(_: *anyopaque, _: u64) bool {
+            return true;
+        }
+        fn nowFn(_: *anyopaque) u64 {
+            return 0;
+        }
+        fn unloadAtExit() callconv(.c) void {
+            for (exit_watchers.?) |*monitor| {
+                if (monitor.thread != null) {
+                    std.debug.print("FSI libc exit probe FAIL: watcher still live at layer unload\n", .{});
+                    _exit(2);
+                }
+            }
+            exit_driver.?.live.store(false, .release);
+            std.debug.print("FSI libc exit probe PASS: all watchers joined before layer unload\n", .{});
+        }
+    };
+    var driver = Driver{};
+    var monitors = [_]Monitor{ Monitor.init(.{}), Monitor.init(.{}) };
+    const probe = if (std.c.getenv("ROSETTE_FSI_EXIT_PROBE")) |value| std.mem.span(value) else "";
+    if (probe.len != 0) {
+        Driver.exit_driver = &driver;
+        Driver.exit_watchers = &monitors;
+        // This models the loader/layer destructor installed before its first
+        // FSI watcher starts. Run directly as a throwaway test executable.
+        if (!std.mem.eql(u8, probe, "wrong-order")) try std.testing.expectEqual(@as(c_int, 0), atexit(Driver.unloadAtExit));
+    }
+    _ = monitors[0].track(.{ .fence = 1 });
+    for (&monitors) |*monitor| try monitor.start(.{ .context = &driver, .wait = Driver.waitFn, .reset = Driver.resetFn, .now = Driver.nowFn }, null);
+    defer for (&monitors) |*monitor| monitor.stop();
+    while (driver.calls.load(.acquire) == 0) std.Thread.yield() catch {};
+    if (probe.len != 0) {
+        if (std.mem.eql(u8, probe, "wrong-order")) try std.testing.expectEqual(@as(c_int, 0), atexit(Driver.unloadAtExit));
+        Driver.exit(0);
+    }
+    // Exercise the actual registered callback before simulating layer unload.
+    stopExitMonitors();
+    driver.live.store(false, .release);
+    for (&monitors) |*monitor| {
+        try std.testing.expect(monitor.thread == null);
+        try std.testing.expectEqual(RoomResult.stopped, monitor.waitForSubmitInfos(2, 1));
+    }
+    try std.testing.expectEqual(@as(u32, 0), driver.stale.load(.monotonic));
+}
 
 test "FSI isolated admission parks for a real watcher with a spare queue slot" {
     const FakeFence = struct {

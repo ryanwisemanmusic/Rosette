@@ -20,8 +20,8 @@
 //! Submission-to-fence-observation latency conservatively bounds GPU time and
 //! adapts each limit downward or upward only within the Metal policy's hard
 //! ceiling. A chunk still running after `risk_ns` divides both limits by four
-//! at once. That reduced ceiling survives the remainder of the run, including
-//! cheap chunks; a severe chunk pins the draw cap to its minimum. Thousands
+//! at once. That reduced draw ceiling survives the remainder of the run;
+//! a severe chunk pins the draw cap to its minimum. Thousands
 //! of representative fast completions with verified shader bounds may recover
 //! sample work only as far as the original conservative 2 Mi quantum.
 const std = @import("std");
@@ -90,13 +90,22 @@ pub const Budget = struct {
         self.shader_bounds_verified = verified;
         self.config.max_sample_work = if (verified) metal_policy.protected_max_sample_work else metal_policy.max_sample_work;
         self.sample_work_cap = @min(self.sample_work_cap, self.config.max_sample_work);
-        if (!verified and self.emergency) self.resetRecovery();
+        if (!verified and self.inRecovery()) self.resetRecovery();
+    }
+
+    fn inRecovery(self: *const Budget) bool {
+        // A risk-only run must be able to earn the same small quantum as a
+        // severe run. Keep its learned draw ceiling and the post-risk hold;
+        // never recover the protected 32 Mi work budget through this route.
+        return self.emergency or (self.risk_events != 0 and
+            self.risk_sample_ceiling < metal_policy.recovery_max_sample_work and
+            self.samples >= self.hold_until_sample);
     }
 
     fn resetRecovery(self: *Budget) void {
         self.recovery_fast_groups = 0;
         self.recovery_work_cap = self.config.min_sample_work;
-        if (self.emergency) self.sample_work_cap = self.recovery_work_cap;
+        if (self.inRecovery()) self.sample_work_cap = self.recovery_work_cap;
     }
 
     fn noteRecovery(self: *Budget, sample_work: u64, observed_ns: u64) void {
@@ -149,7 +158,7 @@ pub const Budget = struct {
         self.max_chunk_sample_work = @max(self.max_chunk_sample_work, sample_work);
         self.max_draw_sample_work = @max(self.max_draw_sample_work, max_draw_sample_work);
         if (draws == 0) {
-            if (self.emergency) self.noteRecovery(0, observed_ns);
+            if (self.inRecovery()) self.noteRecovery(0, observed_ns);
             return;
         }
         const per_draw = @max(@as(u64, 1), observed_ns / draws);
@@ -165,7 +174,7 @@ pub const Budget = struct {
             else
                 self.config.max_sample_work;
             const proposed_pixels = @min(@min(self.risk_sample_ceiling, clampPixels(self.config, fit)), calibrated_max);
-            if (self.emergency) {
+            if (self.inRecovery()) {
                 self.noteRecovery(sample_work, observed_ns);
             } else if (self.samples < self.hold_until_sample) {
                 // A risk response may tighten the work ceiling during the hold,
@@ -175,8 +184,8 @@ pub const Budget = struct {
                 self.sample_work_cap = @min(proposed_pixels, self.sample_work_cap *| 2);
             }
         }
+        if (self.inRecovery() and sample_work == 0) self.noteRecovery(0, observed_ns);
         if (self.emergency) {
-            if (sample_work == 0) self.noteRecovery(0, observed_ns);
             self.cap = self.config.min_draws;
             return;
         }
@@ -204,7 +213,7 @@ pub const Budget = struct {
             return .severe;
         }
         if (running_ns >= self.config.risk_ns and already == .none) {
-            if (self.emergency) self.resetRecovery();
+            self.resetRecovery();
             self.risk_events +|= 1;
             self.cap = @max(self.config.min_draws, self.cap / 4);
             self.sample_work_cap = @max(self.config.min_sample_work, self.sample_work_cap / 4);
@@ -388,6 +397,63 @@ fn fsiRecoveryQualify(budget: *Budget) void {
     for (0..metal_policy.recovery_samples) |_| {
         budget.noteChunk(2, budget.sample_work_cap, budget.sample_work_cap / 2, ns_per_ms);
     }
+}
+
+test "FSI risk-only recovery earns the small work quantum while retaining learned draw limits" {
+    const work = 1152 * 640;
+    for (0..2) |mode| {
+        // The FSI 14 run ended at four draws and 615,384 work units after two
+        // risk events, with over one million sub-5-ms completed groups.
+        var budget = Budget.init(.{});
+        budget.setShaderBoundsVerified(mode == 1);
+        budget.cap = 4;
+        budget.risk_draw_ceiling = 4;
+        budget.sample_work_cap = 615384;
+        budget.risk_sample_ceiling = 615384;
+        budget.risk_events = 2;
+        budget.hold_until_sample = 64;
+        for (0..63) |_| budget.noteChunk(2, work * 2, work, ns_per_ms);
+        try std.testing.expectEqual(@as(u32, 0), budget.recovery_fast_groups);
+        fsiRecoveryQualify(&budget);
+        fsiRecoveryQualify(&budget);
+        const chunks = fsiCountUniformChunks(&budget, 1000, work);
+        try std.testing.expectEqual(@as(u32, if (mode == 1) 500 else 1000), chunks);
+        try std.testing.expectEqual(@as(u32, 4), budget.cap);
+        try std.testing.expect(!budget.emergency);
+        try std.testing.expect(budget.sample_work_cap <= metal_policy.recovery_max_sample_work);
+        if (mode == 1) {
+            try std.testing.expectEqual(metal_policy.recovery_max_sample_work, budget.sample_work_cap);
+            // 4x full-screen and larger individual draws remain isolated.
+            try std.testing.expectEqual(@as(u32, 1000), fsiCountUniformChunks(&budget, 1000, work * 4));
+            // A renewed warning restarts qualification; hardening withdrawal
+            // cannot retain an earned quantum either.
+            _ = budget.noteOutstanding(metal_policy.risk_ns, .none);
+            try std.testing.expectEqual(@as(u32, 0), budget.recovery_fast_groups);
+            fsiRecoveryQualify(&budget);
+            fsiRecoveryQualify(&budget);
+            budget.setShaderBoundsVerified(false);
+            try std.testing.expectEqual(metal_policy.min_sample_work, budget.sample_work_cap);
+        }
+    }
+    if (std.c.getenv("ROSETTE_FSI_FENCE_BENCH")) |value| {
+        if (std.mem.eql(u8, std.mem.span(value), "1")) std.debug.print("FSI risk recovery proof: draws=1000 chunks_1x(before/after)=1000/500 chunks_4x=1000 draw_cap=4 recovery_max_work=2097152; representative uniform workloads, not a replay or gameplay FPS\n", .{});
+    }
+}
+
+fn fsiCountUniformChunks(budget: *const Budget, count: u32, work: u64) u32 {
+    var chunks: u32 = 1;
+    var draws: u32 = 0;
+    var chunk_work: u64 = 0;
+    for (0..count) |_| {
+        if (budget.shouldSplit(draws, chunk_work, work)) {
+            chunks += 1;
+            draws = 0;
+            chunk_work = 0;
+        }
+        draws += 1;
+        chunk_work += work;
+    }
+    return chunks;
 }
 
 test "FSI severe recovery earns only the original work quantum after representative fast completions" {
