@@ -365,6 +365,18 @@ fn fillGuest(state: anytype, address: u64, length: u64, value: u8) bool {
     return true;
 }
 
+/// Validate that a guest range is mapped without requiring a mutable borrow.
+/// Parallel executors deliberately reject `guestMemory` borrows; callers
+/// which read through scalar accessors or write through ordered guest-memory
+/// APIs must validate with the read-only address resolver instead.
+fn guestRangeAvailable(state: anytype, address: u64, length: u64) bool {
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "guestMemoryConst")) {
+        return state.guestMemoryConst(address, length) != null;
+    }
+    return state.guestMemory(address, length) != null;
+}
+
 fn copyGuestBytes(state: anytype, address: u64, source: []const u8) bool {
     const State = @TypeOf(state.*);
     if (comptime @hasDecl(State, "copyToGuest")) return state.copyToGuest(address, source);
@@ -377,6 +389,16 @@ fn copyGuestBytes(state: anytype, address: u64, source: []const u8) bool {
     }
     tso_memory.copyDirectional(bytes, source, false);
     return true;
+}
+
+/// Publish a Win32 HANDLE output through the guest-memory writer. In
+/// parallel execution `guestMemory` deliberately refuses borrowed mutable
+/// slices; using it as an address-validity probe would reject every otherwise
+/// valid output pointer before the coordinated writer gets a chance to store.
+fn writeWindowsGuestHandle(state: anytype, address: u64, handle: u64) bool {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, handle, .little);
+    return copyGuestBytes(state, address, &bytes);
 }
 
 /// Complete the empty-character-set case of a recognized guest
@@ -737,22 +759,106 @@ fn isUtf8NextSymbol(description: []const u8) bool {
     return description[prefix.len] == '<' or description[prefix.len] == '+';
 }
 
+fn shouldLogCxxThrowDetail(event: u64) bool {
+    return event <= 8 or (event != 0 and (event & (event - 1)) == 0);
+}
+
 fn observeWindowsCxaThrow(state: anytype) void {
     state.noteWindowsCxaThrowObserved();
+    const State = @TypeOf(state.*);
     const regs = &guestStateField(state, "regs").*;
     const thrown_object = regs.rcx;
     const type_info = regs.rdx;
-    if (thrown_object == 0 or type_info == 0 or state.guestMemoryConst(type_info, 16) == null) return;
+    const event = if (comptime @hasField(State, "windows_cxa_throw_events")) state.windows_cxa_throw_events else 0;
+    const type_info_readable = type_info != 0 and state.guestMemoryConst(type_info, 16) != null;
+    const type_name_address = if (type_info_readable) state.read64(type_info +| 8) else 0;
+    const type_name = if (type_name_address != 0) guestCString(state, type_name_address) else null;
+    const throw_return = if (regs.rsp != 0 and state.guestMemoryConst(regs.rsp, 8) != null) state.read64(regs.rsp) else 0;
 
-    const type_name_address = state.read64(type_info +| 8);
-    const type_name = guestCString(state, type_name_address) orelse return;
-    if (std.mem.indexOf(u8, type_name, "invalid_utf8") == null) return;
+    // C++ exceptions are not themselves the root cause; record the original
+    // guest throw site and object before MinGW forwards them through
+    // RaiseException. A bounded raw snapshot is useful for exception types
+    // whose ABI layout Rosetta has not modeled yet (including
+    // filesystem_error's paths and error_code).
+    if (shouldLogCxxThrowDetail(event)) {
+        var object_words: [32]u64 = @splat(0);
+        var object_word_count: usize = 0;
+        while (object_word_count < object_words.len and thrown_object != 0) : (object_word_count += 1) {
+            const address = thrown_object +| @as(u64, @intCast(object_word_count * 8));
+            if (state.guestMemoryConst(address, 8) == null) break;
+            object_words[object_word_count] = state.read64(address);
+        }
+        var stack_words: [12]u64 = @splat(0);
+        var stack_word_count: usize = 0;
+        while (stack_word_count < stack_words.len and regs.rsp != 0) : (stack_word_count += 1) {
+            const address = regs.rsp +| @as(u64, @intCast(stack_word_count * 8));
+            if (state.guestMemoryConst(address, 8) == null) break;
+            stack_words[stack_word_count] = state.read64(address);
+        }
+        var site_storage: [256]u8 = undefined;
+        const site_text = if (throw_return != 0)
+            state.describeGuestAddressOrUnnamed(throw_return, &site_storage)
+        else
+            "<unresolved throw site>";
+        const active_thread = if (comptime @hasField(State, "active_guest_thread")) guestStateField(state, "active_guest_thread").* else 0;
+        const thread_slot = if (comptime @hasField(State, "windows_active_guest_thread_slot")) guestStateField(state, "windows_active_guest_thread_slot").* else null;
+        const current_rip = regs.rip;
+        var rip_storage: [256]u8 = undefined;
+        const rip_text = if (current_rip != 0)
+            state.describeGuestAddressOrUnnamed(current_rip, &rip_storage)
+        else
+            "<unresolved __cxa_throw entry>";
+        log.warn("PE64 C++ THROW CAPTURE: event={d} entry=0x{x} ({s}) type={s} type_info=0x{x} object=0x{x} destructor=0x{x} throw_return=0x{x} ({s}) thread=0x{x} slot={any} rip=0x{x} rsp=0x{x} regs(rax/rcx/rdx/rsi/rdi/r8/r9/r12/r13)={x}/{x}/{x}/{x}/{x}/{x}/{x}/{x}/{x}; details emit for first eight throws then powers of two", .{
+            event,
+            current_rip,
+            rip_text,
+            type_name orelse "<unreadable type name>",
+            type_info,
+            thrown_object,
+            regs.r8,
+            throw_return,
+            site_text,
+            active_thread,
+            thread_slot,
+            current_rip,
+            regs.rsp,
+            regs.rax,
+            regs.rcx,
+            regs.rdx,
+            regs.rsi,
+            regs.rdi,
+            regs.r8,
+            regs.r9,
+            regs.r12,
+            regs.r13,
+        });
+        log.info("PE64 C++ THROW MEMORY: object_words={d}:{any} stack_words={d}:{any}; bounded guest snapshots only, addresses are guest virtual addresses", .{
+            object_word_count,
+            object_words[0..object_word_count],
+            stack_word_count,
+            stack_words[0..stack_word_count],
+        });
+        if (type_name) |name| {
+            if (std.mem.indexOf(u8, name, "filesystem_error") != null and thrown_object != 0) {
+                const message_pointer = if (object_word_count > 1) object_words[1] else 0;
+                const message = if (message_pointer != 0) guestCString(state, message_pointer) orelse "<unreadable>" else "<unavailable>";
+                log.warn("PE64 C++ FILESYSTEM ERROR CAPTURE: object=0x{x} message_ptr=0x{x} message='{s}' raw_fields(after_vptr)={any}; inspect throw_return for the filesystem operation that supplied the error_code", .{
+                    thrown_object,
+                    message_pointer,
+                    message,
+                    if (object_word_count > 1) object_words[1..object_word_count] else &.{},
+                });
+            }
+        }
+    }
+
+    const name = type_name orelse return;
+    if (std.mem.indexOf(u8, name, "invalid_utf8") == null) return;
 
     const invalid_octet = if (state.guestMemoryConst(thrown_object +| 8, 1) != null)
         state.read8(thrown_object +| 8)
     else
         0;
-    const throw_return = if (state.guestMemoryConst(regs.rsp, 8) != null) state.read64(regs.rsp) else 0;
     // The return PC is inside utf8::next after the call to __cxa_throw and
     // keeps the function attribution exact in the PE symbol table.
     const throw_site = throw_return;
@@ -821,7 +927,7 @@ fn observeWindowsCxaThrow(state: anytype) void {
     }
     state.noteWindowsInvalidUtf8Throw(
         thrown_object,
-        type_name,
+        name,
         invalid_octet,
         throw_site,
         iterator_ref,
@@ -894,7 +1000,7 @@ fn tryUtf8Utf16CodecvtIn(state: anytype) bool {
     const to_end = state.read64(stack + 0x38);
     const to_next_ref = state.read64(stack + 0x40);
     if (from_next_ref == 0 or to_next_ref == 0 or
-        state.guestMemory(from_next_ref, 8) == null or state.guestMemory(to_next_ref, 8) == null)
+        !guestRangeAvailable(state, from_next_ref, 8) or !guestRangeAvailable(state, to_next_ref, 8))
     {
         return false;
     }
@@ -902,13 +1008,13 @@ fn tryUtf8Utf16CodecvtIn(state: anytype) bool {
     const from = regs.*.r8;
     const from_end = regs.*.r9;
     if (from_end < from or to_end < to) return false;
-    if (regs.*.rdx == 0 or state.guestMemory(regs.*.rdx, 4) == null) return false;
+    if (regs.*.rdx == 0 or !guestRangeAvailable(state, regs.*.rdx, 4)) return false;
     const input_length = from_end - from;
     var input: []const u8 = &.{};
     if (input_length != 0) input = state.guestMemoryConst(from, input_length) orelse return false;
 
     const output_bytes = to_end - to;
-    if (output_bytes != 0 and state.guestMemory(to, output_bytes) == null) return false;
+    if (output_bytes != 0 and !guestRangeAvailable(state, to, output_bytes)) return false;
     const output_capacity: usize = @intCast(output_bytes / 2);
     const facet = regs.*.rcx;
     if (facet == 0 or state.guestMemoryConst(facet, 0x20) == null) return false;
@@ -1832,6 +1938,16 @@ fn windowsGuestClockTicks(state: anytype) u64 {
     return state.executed_steps;
 }
 
+/// A back-off made while still holding Xenia's global critical region lends
+/// the lock out for its duration (`yieldXeniaGlobalMutexForBackoff`). True
+/// leaves the call unanswered: the thread is queued for the lock and retries
+/// the same import once it is handed back.
+fn lendXeniaGlobalLockForBackoff(state: anytype) bool {
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "yieldXeniaGlobalMutexForBackoff")) return state.yieldXeniaGlobalMutexForBackoff();
+    return false;
+}
+
 /// A clock read, for the scheduler's poll detection.
 fn noteGuestClockRead(state: anytype) void {
     const State = @TypeOf(state.*);
@@ -2480,7 +2596,7 @@ fn handleWindowsSetjmp(state: anytype, direct_return_rip: ?u64) bool {
     const environment = arg(state, 0, direct_return_rip);
     const return_rip = direct_return_rip orelse state.read64(guestStateField(state, "regs").*.rsp);
     const return_rsp = if (direct_return_rip != null) guestStateField(state, "regs").*.rsp else guestStateField(state, "regs").*.rsp +| 8;
-    if (environment == 0 or return_rip == 0 or state.guestMemory(environment, windows_setjmp_bytes) == null) {
+    if (environment == 0 or return_rip == 0 or !guestRangeAvailable(state, environment, windows_setjmp_bytes)) {
         log.warn("Windows _setjmp rejected environment=0x{x} return=0x{x} rsp=0x{x}", .{ environment, return_rip, guestStateField(state, "regs").*.rsp });
         guestStateField(state, "regs").*.rax = 0;
         finish(state, direct_return_rip);
@@ -2637,7 +2753,12 @@ fn terminateWindowsCall(
     state.faulted = true;
     state.exit_code = exit_code;
     state.termination_reason = reason;
-    state.terminated = true;
+    // Parallel PE execution uses a process-wide termination flag distinct
+    // from the owner's compatibility field. Setting only `terminated` lets
+    // every worker revisit this same fatal import forever (notably
+    // RaiseException), flooding logs and holding the runtime lock. Wake the
+    // shared executor through the state's authoritative stop path.
+    requestWindowsStop(state);
     const return_address: u64 = if (comptime @hasField(State, "windows_current_import_return"))
         guestStateField(state, "windows_current_import_return").*
     else
@@ -2649,6 +2770,12 @@ fn terminateWindowsCall(
     // Say what stopped the run where it was decided, so the exit report does
     // not have to guess from the reason code.
     if (comptime @hasDecl(State, "recordWindowsFatalRuntimeCall")) state.recordWindowsFatalRuntimeCall(name, return_address);
+}
+
+fn requestWindowsStop(state: anytype) void {
+    const State = @TypeOf(state.*);
+    state.terminated = true;
+    if (comptime @hasDecl(State, "markTerminated")) state.markTerminated();
 }
 
 fn nextHandle(state: anytype) u64 {
@@ -2738,19 +2865,15 @@ fn clearGuestMemory(state: anytype, address: u64, length: u64) bool {
 }
 
 fn writeWindowsMessage(state: anytype, address: u64, message: anytype) bool {
-    if (address == 0 or state.guestMemory(address, 48) == null) return false;
+    if (address == 0) return false;
     // Win64 MSG: HWND at 0, UINT at 8, WPARAM at 16, LPARAM at 24,
     // DWORD time at 32, and POINT {LONG x, LONG y} at 36.
-    state.write64(address + 0, message.hwnd);
-    state.write32(address + 8, message.message);
-    state.write32(address + 12, 0);
-    state.write64(address + 16, message.wparam);
-    state.write64(address + 24, message.lparam);
-    state.write32(address + 32, 0);
-    state.write32(address + 36, 0);
-    state.write32(address + 40, 0);
-    state.write32(address + 44, 0);
-    return true;
+    var bytes: [48]u8 = @splat(0);
+    std.mem.writeInt(u64, bytes[0..8], message.hwnd, .little);
+    std.mem.writeInt(u32, bytes[8..12], message.message, .little);
+    std.mem.writeInt(u64, bytes[16..24], message.wparam, .little);
+    std.mem.writeInt(u64, bytes[24..32], message.lparam, .little);
+    return copyGuestBytes(state, address, &bytes);
 }
 
 /// Deliver a queued MSG to the guest WndProc using the Microsoft x64 callback
@@ -2759,7 +2882,11 @@ fn writeWindowsMessage(state: anytype, address: u64, message: anytype) bool {
 /// DispatchMessage caller resumes.
 fn dispatchWindowsMessage(state: anytype, message_address: u64, direct_return_rip: ?u64) bool {
     const State = @TypeOf(state.*);
-    if (message_address == 0 or state.guestMemory(message_address, 48) == null) {
+    // MSG is an input structure and is read below with scalar guest reads.
+    // `guestMemory` is a mutable borrow and is intentionally unavailable to
+    // parallel executors, so using it here rejects every otherwise-valid
+    // window message as an invalid pointer as soon as the UI loop starts.
+    if (message_address == 0 or !guestRangeAvailable(state, message_address, 48)) {
         terminateWindowsCall(state, .runtime_invariant_failure, 127, "DispatchMessage(MSG)");
         log.err("Windows DispatchMessage rejected invalid MSG address=0x{x}", .{message_address});
         return true;
@@ -2851,7 +2978,12 @@ fn windowsTlsSlot(state: anytype, index: u64) ?u64 {
     const vector = state.read64(teb + 0x58);
     if (vector == 0) return null;
     const slot = vector +| index * 8;
-    if (state.guestMemory(slot, 8) == null) return null;
+    // `guestMemory` only lends a mutable slice to serial execution. TlsSetValue
+    // uses the ordered scalar writer below, so this is an address validation,
+    // not a request for a mutable borrow. Use the read-only mapping view here;
+    // otherwise every valid TLS slot looks invalid under parallel execution
+    // and CRT thread initialization aborts after TlsSetValue returns FALSE.
+    if (state.guestMemoryConst(slot, 8) == null) return null;
     return slot;
 }
 
@@ -3329,6 +3461,16 @@ fn copyGuestWideString(state: anytype, destination: u64, capacity_units: u64, so
 /// so drain the calling executor's stores before returning the pointer.
 fn publishGuestPathWrites() void {
     tso_memory.flushActiveStoreBufferFor(.runtime_call);
+}
+
+/// The processors the machine has, as GetSystemInfo and the system half
+/// of GetProcessAffinityMask report them: the host's under the parallel
+/// executor, one under the cooperative one (see
+/// `ElfState.windows_process_affinity_mask`).
+fn guestSystemAffinityMask(state: anytype) u64 {
+    const State = @TypeOf(state.*);
+    if (comptime @hasField(State, "windows_system_affinity_mask")) return state.windows_system_affinity_mask;
+    return 1;
 }
 
 fn materializeGuestAnsi(state: anytype, source: []const u8) ?u64 {
@@ -3824,9 +3966,16 @@ fn wideEnvironmentValue(state: anytype, address: u64) ?[]const u8 {
 fn copyGuestString(state: anytype, destination: u64, capacity: u64, source: []const u8) u64 {
     if (capacity == 0) return source.len;
     const available = @min(source.len, @as(usize, @intCast(@min(capacity - 1, std.math.maxInt(usize)))));
-    if (state.guestMemory(destination, @as(u64, @intCast(available + 1))) == null) return 0;
-    if (!copyGuestBytes(state, destination, source[0..available])) return 0;
-    state.write8(destination +| @as(u64, @intCast(available)), 0);
+    const State = @TypeOf(state.*);
+    if (comptime @hasDecl(State, "copyToGuest")) {
+        if (!copyGuestBytes(state, destination, source[0..available])) return 0;
+        const terminator = [_]u8{0};
+        if (!copyGuestBytes(state, destination +| @as(u64, @intCast(available)), &terminator)) return 0;
+    } else {
+        if (state.guestMemory(destination, @as(u64, @intCast(available + 1))) == null) return 0;
+        if (!copyGuestBytes(state, destination, source[0..available])) return 0;
+        state.write8(destination +| @as(u64, @intCast(available)), 0);
+    }
     return available;
 }
 
@@ -4473,7 +4622,7 @@ fn windowsFileAttributes(stat: std.Io.File.Stat) u32 {
 }
 
 fn writeFileAttributeData(state: anytype, destination: u64, stat: std.Io.File.Stat) bool {
-    if (destination == 0 or state.guestMemory(destination, 36) == null) return false;
+    if (destination == 0 or !guestRangeAvailable(state, destination, 36)) return false;
     state.write32(destination + 0, windowsFileAttributes(stat));
     // FILETIME fields are intentionally zero: the ABI needs a valid shape,
     // while the host timestamp is not part of the graphics contract.
@@ -4584,8 +4733,8 @@ fn failWindowsFileCall(state: anytype, direct_return_rip: ?u64, error_code: u32)
 /// unaligned byte-18 layout used by some hand-written MSVC descriptions.
 /// Keeping this in one writer is important: `std::filesystem` may reach the
 /// path form or the descriptor form depending on the libstdc++ version.
-fn writeWindowsStat64(state: anytype, output: u64, stat: std.Io.File.Stat) void {
-    _ = fillGuest(state, output, 56, 0);
+fn writeWindowsStat64(state: anytype, output: u64, stat: std.Io.File.Stat) bool {
+    if (!fillGuest(state, output, 56, 0)) return false;
     state.write32(output + 0, 0); // st_dev
     state.write16(output + 4, 0); // st_ino
     state.write16(output + 6, if (stat.kind == .directory) 0x4000 else 0x8000);
@@ -4594,12 +4743,13 @@ fn writeWindowsStat64(state: anytype, output: u64, stat: std.Io.File.Stat) void 
     state.write16(output + 12, 0); // st_gid
     state.write32(output + 16, 0); // st_rdev
     state.write64(output + 24, stat.size); // st_size
+    return true;
 }
 
 fn statWindowsPath(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
     const wide = std.mem.startsWith(u8, name, "_w");
     const output = arg(state, 1, direct_return_rip);
-    if (state.guestMemory(output, 56) == null) {
+    if (output == 0 or !guestRangeAvailable(state, output, 56)) {
         guestStateField(state, "windows_last_error").* = 22; // EINVAL
         guestStateField(state, "regs").*.rax = std.math.maxInt(u64);
         noteWindowsFileFailure(state);
@@ -4621,7 +4771,13 @@ fn statWindowsPath(state: anytype, name: []const u8, direct_return_rip: ?u64) bo
         finish(state, direct_return_rip);
         return true;
     };
-    writeWindowsStat64(state, output, stat);
+    if (!writeWindowsStat64(state, output, stat)) {
+        guestStateField(state, "windows_last_error").* = 22; // EINVAL
+        guestStateField(state, "regs").*.rax = std.math.maxInt(u64);
+        noteWindowsFileFailure(state);
+        finish(state, direct_return_rip);
+        return true;
+    }
     guestStateField(state, "windows_last_error").* = 0;
     guestStateField(state, "regs").*.rax = 0;
     if (state.diagnose_abi) {
@@ -4644,7 +4800,7 @@ fn statWindowsPath(state: anytype, name: []const u8, direct_return_rip: ?u64) bo
 fn statWindowsDescriptor(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
     const fd: u32 = @truncate(arg(state, 0, direct_return_rip));
     const output = arg(state, 1, direct_return_rip);
-    if (state.guestMemory(output, 56) == null) {
+    if (output == 0 or !guestRangeAvailable(state, output, 56)) {
         guestStateField(state, "windows_last_error").* = 22; // EINVAL
         guestStateField(state, "regs").*.rax = std.math.maxInt(u64);
         noteWindowsFileFailure(state);
@@ -4664,7 +4820,10 @@ fn statWindowsDescriptor(state: anytype, name: []const u8, direct_return_rip: ?u
         return true;
     };
 
-    writeWindowsStat64(state, output, stat);
+    if (!writeWindowsStat64(state, output, stat)) {
+        failWindowsDescriptorCall(state, direct_return_rip, 22); // EINVAL
+        return true;
+    }
     guestStateField(state, "windows_last_error").* = 0;
     guestStateField(state, "regs").*.rax = 0;
     if (slot.media_authorized and state.windows_media_io_trace_events < 16) {
@@ -4722,7 +4881,7 @@ fn writeFindData(state: anytype, output: u64, entry: std.Io.Dir.Entry, stat: ?st
     const size: u64 = if (stat) |value| value.size else 0;
     const attributes: u32 = if (entry.kind == .directory) 0x10 else 0x80;
     const data_size: u64 = if (wide) 592 else 320;
-    if (output == 0 or state.guestMemory(output, data_size) == null) return false;
+    if (output == 0 or !guestRangeAvailable(state, output, data_size)) return false;
     state.write32(output + 0, attributes);
     state.write64(output + 4, 0);
     state.write64(output + 12, 0);
@@ -4971,8 +5130,11 @@ fn transferWindowsDescriptor(state: anytype, name: []const u8, direct_return_rip
         return true;
     }
     const buffer_address = arg(state, 1, direct_return_rip);
+    // Parallel execution forbids mutable guest slices. The read is staged in
+    // host storage and copyToGuest performs the coordinated write below, so
+    // validate its address through the non-borrowing output probe instead.
     const buffer_valid = if (is_read)
-        state.guestMemory(buffer_address, requested) != null
+        guestRangeAvailable(state, buffer_address, requested)
     else
         state.guestMemoryConst(buffer_address, requested) != null;
     if (!buffer_valid) {
@@ -5394,8 +5556,10 @@ fn transferWindowsStdio(state: anytype, name: []const u8, direct_return_rip: ?u6
             slot.writable,
         });
     }
+    // fread also stages its result before copyToGuest. A mutable guestMemory
+    // probe always fails in parallel mode even when the destination is valid.
     const buffer_valid = if (is_read)
-        state.guestMemory(buffer_address, total) != null
+        guestRangeAvailable(state, buffer_address, total)
     else
         state.guestMemoryConst(buffer_address, total) != null;
     if (!buffer_valid) {
@@ -5753,7 +5917,7 @@ fn windowsFileSize(state: anytype, name: []const u8, direct_return_rip: ?u64) bo
     };
     if (std.mem.eql(u8, name, "GetFileSizeEx")) {
         const output = arg(state, 1, direct_return_rip);
-        if (output == 0 or state.guestMemory(output, 8) == null) {
+        if (output == 0 or !guestRangeAvailable(state, output, 8)) {
             failWindowsFileCall(state, direct_return_rip, 87);
             return true;
         }
@@ -6067,7 +6231,8 @@ fn handleStringAndMemory(state: anytype, name: []const u8, direct_return_rip: ?u
             }
             if (copy_count < capacity_usize) {
                 const terminator_address = destination +| @as(u64, @intCast(copy_count));
-                if (state.guestMemory(terminator_address, 1) != null) state.write8(terminator_address, 0);
+                const terminator = [_]u8{0};
+                _ = copyGuestBytes(state, terminator_address, &terminator);
             }
         }
         guestStateField(state, "regs").*.rax = source.len;
@@ -6164,29 +6329,39 @@ fn handleStringAndMemory(state: anytype, name: []const u8, direct_return_rip: ?u
                 snapshotGuestBytes(state, destination_address, string_destination_before_storage[0..@intCast(byte_count)]) orelse &.{},
             });
         }
-        const destination = state.guestMemory(arg(state, 0, direct_return_rip), arg(state, 2, direct_return_rip)) orelse {
-            noteCrtMemoryUnreadable(state, destination_address, byte_count, direct_return_rip);
-            guestStateField(state, "regs").*.rax = 0;
-            finish(state, direct_return_rip);
-            return true;
-        };
         const source = state.guestMemoryConst(arg(state, 1, direct_return_rip), arg(state, 2, direct_return_rip)) orelse {
             noteCrtMemoryUnreadable(state, source_address, byte_count, direct_return_rip);
             guestStateField(state, "regs").*.rax = 0;
             finish(state, direct_return_rip);
             return true;
         };
-        const move_backwards = std.mem.eql(u8, name, "memmove") and
-            destination_address > source_address and
-            destination_address - source_address < byte_count;
-        if (comptime @hasField(@TypeOf(state.*), "parallel_guest_execution")) {
-            if (state.parallel_guest_execution) {
-                tso_memory.copyDirectionalCoordinated(destination, source, move_backwards);
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "copyGuestRange")) {
+            if (!state.copyGuestRange(destination_address, source_address, byte_count)) {
+                noteCrtMemoryUnreadable(state, destination_address, byte_count, direct_return_rip);
+                guestStateField(state, "regs").*.rax = 0;
+                finish(state, direct_return_rip);
+                return true;
+            }
+        } else {
+            const destination = state.guestMemory(destination_address, byte_count) orelse {
+                noteCrtMemoryUnreadable(state, destination_address, byte_count, direct_return_rip);
+                guestStateField(state, "regs").*.rax = 0;
+                finish(state, direct_return_rip);
+                return true;
+            };
+            const move_backwards = std.mem.eql(u8, name, "memmove") and
+                destination_address > source_address and
+                destination_address - source_address < byte_count;
+            if (comptime @hasField(State, "parallel_guest_execution")) {
+                if (state.parallel_guest_execution) {
+                    tso_memory.copyDirectionalCoordinated(destination, source, move_backwards);
+                } else {
+                    tso_memory.copyDirectional(destination, source, move_backwards);
+                }
             } else {
                 tso_memory.copyDirectional(destination, source, move_backwards);
             }
-        } else {
-            tso_memory.copyDirectional(destination, source, move_backwards);
         }
         if (trace_code_cache_copy) {
             var source_after_storage: [64]u8 = undefined;
@@ -6226,19 +6401,27 @@ fn handleStringAndMemory(state: anytype, name: []const u8, direct_return_rip: ?u
         }
         const destination_address = arg(state, 0, direct_return_rip);
         const length = arg(state, 2, direct_return_rip);
-        const destination = state.guestMemory(destination_address, length) orelse {
-            noteCrtMemoryUnreadable(state, arg(state, 0, direct_return_rip), arg(state, 2, direct_return_rip), direct_return_rip);
-            guestStateField(state, "regs").*.rax = 0;
-            finish(state, direct_return_rip);
-            return true;
-        };
         const fill_byte: u8 = @truncate(arg(state, 1, direct_return_rip));
-        if (comptime @hasDecl(@TypeOf(state.*), "fillGuestMemory")) {
-            _ = state.fillGuestMemory(destination_address, length, fill_byte);
-        } else if (comptime @hasField(@TypeOf(state.*), "parallel_guest_execution")) {
-            if (state.parallel_guest_execution) tso_memory.fillCoordinated(destination, fill_byte) else tso_memory.fill(destination, fill_byte);
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "fillGuestMemory")) {
+            if (!state.fillGuestMemory(destination_address, length, fill_byte)) {
+                noteCrtMemoryUnreadable(state, destination_address, length, direct_return_rip);
+                guestStateField(state, "regs").*.rax = 0;
+                finish(state, direct_return_rip);
+                return true;
+            }
         } else {
-            tso_memory.fill(destination, fill_byte);
+            const destination = state.guestMemory(destination_address, length) orelse {
+                noteCrtMemoryUnreadable(state, destination_address, length, direct_return_rip);
+                guestStateField(state, "regs").*.rax = 0;
+                finish(state, direct_return_rip);
+                return true;
+            };
+            if (comptime @hasField(State, "parallel_guest_execution")) {
+                if (state.parallel_guest_execution) tso_memory.fillCoordinated(destination, fill_byte) else tso_memory.fill(destination, fill_byte);
+            } else {
+                tso_memory.fill(destination, fill_byte);
+            }
         }
         guestStateField(state, "regs").*.rax = arg(state, 0, direct_return_rip);
         finish(state, direct_return_rip);
@@ -7701,6 +7884,11 @@ fn handleWindowsCompleteness(
 }
 
 fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_return_rip: ?u64) bool {
+    // SRW lock imports are a frequent Xenia synchronization boundary. Keep
+    // these four names ahead of the registry/socket/security/string handler
+    // chain; the helper retains their ownership, TSO fences, waiter handoff,
+    // and failure behavior.
+    if (handleWindowsSrwLock(state, name, direct_return_rip)) return true;
     if (handleWindowsRegistry(state, name, direct_return_rip)) return true;
     if (handleWindowsSockets(state, name, direct_return_rip)) return true;
     if (handleWindowsSecurity(state, name, direct_return_rip)) return true;
@@ -8011,10 +8199,11 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         // memory and make it stable for the lifetime of the PE state.
         const output = arg(state, 0, direct_return_rip);
         const path = cachedGuestString(state, &state.windows_crt_globals.module_path_w, true, "C:\\xenia\\xenia_canary.exe");
-        if (output == 0 or state.guestMemory(output, 8) == null or path == 0) {
+        var path_pointer: [8]u8 = undefined;
+        std.mem.writeInt(u64, &path_pointer, path, .little);
+        if (output == 0 or path == 0 or !copyGuestBytes(state, output, &path_pointer)) {
             guestStateField(state, "regs").*.rax = 22; // EINVAL
         } else {
-            state.write64(output, path);
             publishGuestPathWrites();
             guestStateField(state, "regs").*.rax = 0; // errno_t success
         }
@@ -8345,22 +8534,25 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         const target_process_valid = target_process == pseudo_process or isSyntheticWindowsHandle(state, target_process);
         const source_handle_valid = source_handle == pseudo_thread or isSyntheticWindowsHandle(state, source_handle);
 
-        if (!source_process_valid or !target_process_valid or !source_handle_valid or
-            target_handle == 0 or state.guestMemory(target_handle, 8) == null)
-        {
+        if (!source_process_valid or !target_process_valid or !source_handle_valid or target_handle == 0) {
             // DuplicateHandle reports failure through the Win32 last-error
             // channel. Do not write a fabricated output handle: CRT startup
             // uses this result to decide whether its process/thread setup is
             // valid, and a false success only moves the failure downstream.
-            guestStateField(state, "windows_last_error").* = if (target_handle == 0 or state.guestMemory(target_handle, 8) == null)
-                87 // ERROR_INVALID_PARAMETER
-            else
-                6; // ERROR_INVALID_HANDLE
+            guestStateField(state, "windows_last_error").* = if (target_handle == 0) 87 else 6; // INVALID_PARAMETER / INVALID_HANDLE
             guestStateField(state, "regs").*.rax = 0;
         } else {
-            state.write64(target_handle, nextHandle(state));
-            guestStateField(state, "windows_last_error").* = 0;
-            guestStateField(state, "regs").*.rax = 1;
+            // Stage the candidate before advancing the allocator. A failed
+            // guest write must not consume a handle or claim success.
+            const duplicated_handle = state.windows_next_handle;
+            if (writeWindowsGuestHandle(state, target_handle, duplicated_handle)) {
+                _ = nextHandle(state);
+                guestStateField(state, "windows_last_error").* = 0;
+                guestStateField(state, "regs").*.rax = 1;
+            } else {
+                guestStateField(state, "windows_last_error").* = 87; // ERROR_INVALID_PARAMETER
+                guestStateField(state, "regs").*.rax = 0;
+            }
         }
         finish(state, direct_return_rip);
         return true;
@@ -8493,7 +8685,7 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
             guestStateField(state, "regs").*.rax = 0;
         } else {
             state.write64(process_mask, state.windows_process_affinity_mask);
-            state.write64(system_mask, state.windows_process_affinity_mask);
+            state.write64(system_mask, guestSystemAffinityMask(state));
             guestStateField(state, "windows_last_error").* = 0;
             guestStateField(state, "regs").*.rax = 1;
         }
@@ -8507,6 +8699,10 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
             guestStateField(state, "regs").*.rax = 0;
         } else {
             state.windows_process_affinity_mask = mask;
+            const State = @TypeOf(state.*);
+            if (comptime @hasField(State, "windows_process_affinity_published")) {
+                state.windows_process_affinity_published.store(mask, .release);
+            }
             guestStateField(state, "windows_last_error").* = 0;
             guestStateField(state, "regs").*.rax = 1;
         }
@@ -9272,10 +9468,9 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
             }
             break :blk "unclassified";
         };
-        if (state.trace_windows_memory and state.windows_memory_trace_events < 64 and
-            (requested_base >= 0x1_0000_0000 or address >= 0x1_0000_0000))
+        if ((requested_base >= 0x1_0000_0000 or address >= 0x1_0000_0000) and
+            state.windowsMemoryTraceLive() and state.claimWindowsMemoryTraceEvent())
         {
-            state.windows_memory_trace_events += 1;
             log.info("PE64 Windows fixed-address allocation request: api={s} requested_base=0x{x} size={d} result=0x{x} contains={} rip=0x{x} step={d}", .{
                 name,
                 requested_base,
@@ -9391,7 +9586,7 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         const old_protection_out = if (extended_protect) arg(state, 4, direct_return_rip) else arg(state, 3, direct_return_rip);
         // Windows fails the call outright when the out-parameter is null, so
         // a guest relying on the old value is not silently handed nothing.
-        if (old_protection_out == 0 or state.guestMemory(old_protection_out, 4) == null) {
+        if (old_protection_out == 0 or !guestRangeAvailable(state, old_protection_out, 4)) {
             guestStateField(state, "windows_last_error").* = 87; // ERROR_INVALID_PARAMETER
             guestStateField(state, "regs").*.rax = 0;
             finish(state, direct_return_rip);
@@ -9428,7 +9623,7 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         const buffer_length = if (extended_query) arg(state, 3, direct_return_rip) else arg(state, 2, direct_return_rip);
         const information_bytes: u64 = 48; // sizeof(MEMORY_BASIC_INFORMATION) on x64
         if (buffer == 0 or buffer_length < information_bytes or
-            state.guestMemory(buffer, information_bytes) == null or
+            !guestRangeAvailable(state, buffer, information_bytes) or
             !state.windowsGuestRangeContains(address, 1))
         {
             guestStateField(state, "windows_last_error").* = 87; // ERROR_INVALID_PARAMETER
@@ -9485,9 +9680,9 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         // mandatory; ntdll answers STATUS_ACCESS_VIOLATION for a bad one
         // rather than protecting a range it could not read back.
         if (base_pointer == 0 or size_pointer == 0 or old_protection_out == 0 or
-            state.guestMemory(base_pointer, 8) == null or
-            state.guestMemory(size_pointer, 8) == null or
-            state.guestMemory(old_protection_out, 4) == null)
+            !guestRangeAvailable(state, base_pointer, 8) or
+            !guestRangeAvailable(state, size_pointer, 8) or
+            !guestRangeAvailable(state, old_protection_out, 4))
         {
             guestStateField(state, "regs").*.rax = windows_status_access_violation;
             finish(state, direct_return_rip);
@@ -9548,7 +9743,7 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
             return true;
         }
         if (buffer == 0 or buffer_length < information_bytes or
-            state.guestMemory(buffer, information_bytes) == null)
+            !guestRangeAvailable(state, buffer, information_bytes))
         {
             guestStateField(state, "regs").*.rax = windows_status_info_length_mismatch;
             finish(state, direct_return_rip);
@@ -9588,7 +9783,7 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         state.write32(buffer + 36, protection); // Protect
         state.write32(buffer + 40, 0x20000); // Type = MEM_PRIVATE
         state.write32(buffer + 44, 0); // __alignment2
-        if (result_length_out != 0 and state.guestMemory(result_length_out, 8) != null) {
+        if (result_length_out != 0 and guestRangeAvailable(state, result_length_out, 8)) {
             state.write64(result_length_out, information_bytes);
         }
         guestStateField(state, "windows_last_error").* = 0;
@@ -9606,7 +9801,7 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         return true;
     }
     if (std.mem.eql(u8, name, "_aligned_malloc")) {
-        guestStateField(state, "regs").*.rax = state.guestAlloc(arg(state, 0, direct_return_rip), arg(state, 1, direct_return_rip)) orelse 0;
+        guestStateField(state, "regs").*.rax = state.guestAllocUninitialized(arg(state, 0, direct_return_rip), arg(state, 1, direct_return_rip)) orelse 0;
         finish(state, direct_return_rip);
         return true;
     }
@@ -9631,7 +9826,7 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         return true;
     }
     if (std.mem.eql(u8, name, "malloc") or std.mem.eql(u8, name, "_malloc_base")) {
-        guestStateField(state, "regs").*.rax = state.guestAlloc(arg(state, 0, direct_return_rip), 16) orelse 0;
+        guestStateField(state, "regs").*.rax = state.guestAllocUninitialized(arg(state, 0, direct_return_rip), 16) orelse 0;
         finish(state, direct_return_rip);
         return true;
     }
@@ -10340,6 +10535,7 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
     if (std.mem.eql(u8, name, "Sleep") or std.mem.eql(u8, name, "SleepEx") or
         std.mem.eql(u8, name, "YieldProcessor") or std.mem.eql(u8, name, "PauseProcessor"))
     {
+        if (lendXeniaGlobalLockForBackoff(state)) return true;
         const State = @TypeOf(state.*);
         const is_sleep = std.mem.eql(u8, name, "Sleep") or std.mem.eql(u8, name, "SleepEx");
         const milliseconds: u64 = if (is_sleep) arg(state, 0, direct_return_rip) else 0;
@@ -11063,13 +11259,14 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         if (info == 0 or state.guestMemory(info, 48) == null) {
             guestStateField(state, "regs").*.rax = 0;
         } else {
+            const processors = guestSystemAffinityMask(state);
             state.write16(info + 0, 9); // PROCESSOR_ARCHITECTURE_AMD64
             state.write16(info + 2, 0);
             state.write32(info + 4, 4096); // dwPageSize
             state.write64(info + 8, 0x10000);
             state.write64(info + 16, 0x0000_7FFF_FFFF_F000);
-            state.write64(info + 24, 1); // active processor mask
-            state.write32(info + 32, 1); // number of processors
+            state.write64(info + 24, processors); // active processor mask
+            state.write32(info + 32, @popCount(processors)); // number of processors
             state.write32(info + 36, 8664); // PROCESSOR_INTEL_PENTIUM4-compatible
             state.write32(info + 40, 0x10000); // allocation granularity
             state.write16(info + 44, 6);
@@ -11786,111 +11983,6 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         finish(state, direct_return_rip);
         return true;
     }
-    if (std.mem.eql(u8, name, "InitializeSRWLock")) {
-        const lock = arg(state, 0, direct_return_rip);
-        const State = @TypeOf(state.*);
-        if (comptime @hasDecl(State, "initializeWindowsSrwLock")) {
-            _ = state.initializeWindowsSrwLock(lock);
-        } else if (lock != 0 and state.guestMemory(lock, 8) != null) {
-            state.write64(lock, 0);
-        }
-        returnZero(state, direct_return_rip);
-        return true;
-    }
-    if (std.mem.eql(u8, name, "AcquireSRWLockExclusive")) {
-        const lock = arg(state, 0, direct_return_rip);
-        const State = @TypeOf(state.*);
-        if (comptime @hasDecl(State, "acquireWindowsSrwLock")) {
-            var acquired = false;
-            var contended = false;
-            switch (state.acquireWindowsSrwLock(lock)) {
-                .invalid => {},
-                .acquired => acquired = true,
-                .contended => contended = true,
-            }
-            if (contended) {
-                // A worker cannot block a host thread, so leave the import
-                // call uncompleted and let the cooperative service loop save
-                // this context.  The next run retries Acquire naturally at
-                // the same guest call site after Release wakes it.
-                if (comptime @hasDecl(State, "blockWindowsGuestThreadOnSrwLock")) {
-                    if (state.blockWindowsGuestThreadOnSrwLock(lock)) return true;
-                }
-                // The owner context has no saved worker slot. Give queued
-                // workers a bounded chance to release the lock, then retry
-                // before allowing the owner to spin at the import boundary.
-                //
-                // Queue it first. A release hands the lock straight to the
-                // longest waiter, and a waiter the queue does not know about
-                // is one that can be starved forever by workers trading the
-                // lock between themselves.
-                if (comptime @hasDecl(State, "noteWindowsOwnerSrwWait")) {
-                    state.noteWindowsOwnerSrwWait(lock);
-                }
-                if (comptime @hasDecl(State, "serviceWindowsGuestThreads")) {
-                    const service_slice = if (comptime @hasDecl(State, "windowsGuestWaitServiceSlice"))
-                        state.windowsGuestWaitServiceSlice()
-                    else
-                        windows_guest_thread_service_slice;
-                    if (comptime @hasDecl(State, "serviceWindowsGuestBoundary")) {
-                        _ = state.serviceWindowsGuestBoundary(service_slice);
-                    } else {
-                        _ = state.serviceWindowsGuestThreads(service_slice);
-                    }
-                    switch (state.acquireWindowsSrwLock(lock)) {
-                        .acquired => acquired = true,
-                        .contended, .invalid => {},
-                    }
-                }
-                if (!acquired) {
-                    // Parallel mode: sleep until the lock changes hands (a
-                    // handoff to the queued owner wakes it) rather than
-                    // retrying as fast as the interpreter can.
-                    if (comptime @hasDecl(State, "parkForGuestWait")) _ = state.parkForGuestWait(null, .wake);
-                    return true;
-                }
-            }
-            if (!acquired) returnZero(state, direct_return_rip) else finish(state, direct_return_rip);
-        } else if (lock != 0 and state.guestMemory(lock, 8) != null) {
-            state.write64(lock, 1);
-            finish(state, direct_return_rip);
-        } else {
-            returnZero(state, direct_return_rip);
-        }
-        return true;
-    }
-    if (std.mem.eql(u8, name, "ReleaseSRWLockExclusive")) {
-        const lock = arg(state, 0, direct_return_rip);
-        const State = @TypeOf(state.*);
-        if (comptime @hasDecl(State, "releaseWindowsSrwLock")) {
-            state.releaseWindowsSrwLock(lock);
-        } else if (lock != 0 and state.guestMemory(lock, 8) != null) {
-            state.write64(lock, 0);
-        }
-        returnZero(state, direct_return_rip);
-        return true;
-    }
-    if (std.mem.eql(u8, name, "TryAcquireSRWLockExclusive")) {
-        const lock = arg(state, 0, direct_return_rip);
-        const State = @TypeOf(state.*);
-        if (comptime @hasDecl(State, "acquireWindowsSrwLock")) {
-            guestStateField(state, "regs").*.rax = switch (state.acquireWindowsSrwLock(lock)) {
-                .acquired => 1,
-                .invalid, .contended => 0,
-            };
-        } else {
-            if (lock == 0 or state.guestMemory(lock, 8) == null) {
-                guestStateField(state, "regs").*.rax = 0;
-            } else if (state.read64(lock) == 0) {
-                state.write64(lock, 1);
-                guestStateField(state, "regs").*.rax = 1;
-            } else {
-                guestStateField(state, "regs").*.rax = 0;
-            }
-        }
-        finish(state, direct_return_rip);
-        return true;
-    }
     if (std.mem.eql(u8, name, "DwmEnableMMCSS") or std.mem.eql(u8, name, "DwmSetWindowAttribute")) {
         returnZero(state, direct_return_rip);
         return true;
@@ -12024,6 +12116,7 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         return true;
     }
     if (std.mem.eql(u8, name, "NtDelayExecution") or std.mem.eql(u8, name, "NtYieldExecution")) {
+        if (lendXeniaGlobalLockForBackoff(state)) return true;
         // Xenia's `NanoSleep` is NtDelayExecution, and its GPU frame limiter
         // sleeps 90% of every vblank through it. Answering by returning made
         // that thread spin through every interval instead: 24% of the
@@ -12293,6 +12386,110 @@ fn handleCore(state: anytype, dll_name: []const u8, name: []const u8, direct_ret
         return true;
     }
 
+    return false;
+}
+
+/// The high-frequency SRW imports share state with the guest scheduler and
+/// waiter handoff machinery. This helper changes only dispatch order: every
+/// operation retains its existing serialized semantics and TSO boundaries.
+fn handleWindowsSrwLock(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    if (std.mem.eql(u8, name, "InitializeSRWLock")) {
+        const lock = arg(state, 0, direct_return_rip);
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "initializeWindowsSrwLock")) {
+            _ = state.initializeWindowsSrwLock(lock);
+        } else if (lock != 0 and state.guestMemory(lock, 8) != null) {
+            state.write64(lock, 0);
+        }
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "AcquireSRWLockExclusive")) {
+        const lock = arg(state, 0, direct_return_rip);
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "acquireWindowsSrwLock")) {
+            var acquired = false;
+            var contended = false;
+            switch (state.acquireWindowsSrwLock(lock)) {
+                .invalid => {},
+                .acquired => acquired = true,
+                .contended => contended = true,
+            }
+            if (contended) {
+                // A worker cannot block a host thread, so leave the import
+                // call uncompleted and let the cooperative service loop save
+                // this context. The next run retries at the same call site.
+                if (comptime @hasDecl(State, "blockWindowsGuestThreadOnSrwLock")) {
+                    if (state.blockWindowsGuestThreadOnSrwLock(lock)) return true;
+                }
+                // Queue the owner before servicing workers so a release can
+                // hand the lock directly to this context.
+                if (comptime @hasDecl(State, "noteWindowsOwnerSrwWait")) {
+                    state.noteWindowsOwnerSrwWait(lock);
+                }
+                if (comptime @hasDecl(State, "serviceWindowsGuestThreads")) {
+                    const service_slice = if (comptime @hasDecl(State, "windowsGuestWaitServiceSlice"))
+                        state.windowsGuestWaitServiceSlice()
+                    else
+                        windows_guest_thread_service_slice;
+                    if (comptime @hasDecl(State, "serviceWindowsGuestBoundary")) {
+                        _ = state.serviceWindowsGuestBoundary(service_slice);
+                    } else {
+                        _ = state.serviceWindowsGuestThreads(service_slice);
+                    }
+                    switch (state.acquireWindowsSrwLock(lock)) {
+                        .acquired => acquired = true,
+                        .contended, .invalid => {},
+                    }
+                }
+                if (!acquired) {
+                    // Parallel mode parks until handoff instead of consuming
+                    // host time retrying the same serialized import.
+                    if (comptime @hasDecl(State, "parkForGuestWait")) _ = state.parkForGuestWait(null, .wake);
+                    return true;
+                }
+            }
+            if (!acquired) returnZero(state, direct_return_rip) else finish(state, direct_return_rip);
+        } else if (lock != 0 and state.guestMemory(lock, 8) != null) {
+            state.write64(lock, 1);
+            finish(state, direct_return_rip);
+        } else {
+            returnZero(state, direct_return_rip);
+        }
+        return true;
+    }
+    if (std.mem.eql(u8, name, "ReleaseSRWLockExclusive")) {
+        const lock = arg(state, 0, direct_return_rip);
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "releaseWindowsSrwLock")) {
+            state.releaseWindowsSrwLock(lock);
+        } else if (lock != 0 and state.guestMemory(lock, 8) != null) {
+            state.write64(lock, 0);
+        }
+        returnZero(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "TryAcquireSRWLockExclusive")) {
+        const lock = arg(state, 0, direct_return_rip);
+        const State = @TypeOf(state.*);
+        if (comptime @hasDecl(State, "acquireWindowsSrwLock")) {
+            guestStateField(state, "regs").*.rax = switch (state.acquireWindowsSrwLock(lock)) {
+                .acquired => 1,
+                .invalid, .contended => 0,
+            };
+        } else {
+            if (lock == 0 or state.guestMemory(lock, 8) == null) {
+                guestStateField(state, "regs").*.rax = 0;
+            } else if (state.read64(lock) == 0) {
+                state.write64(lock, 1);
+                guestStateField(state, "regs").*.rax = 1;
+            } else {
+                guestStateField(state, "regs").*.rax = 0;
+            }
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
     return false;
 }
 
@@ -13185,18 +13382,63 @@ fn tryUser32Extras(state: anytype, name: []const u8, direct_return_rip: ?u64) bo
 /// Execute one Microsoft x64 import. The caller invokes this only for a PE
 /// state, so an unrecognized import can be made an explicit terminal event
 /// rather than silently entering a zero-return stub.
-/// Try only the deliberately narrow lock-free import set. Callers that want
-/// to bypass the shared runtime lock invoke this before entering a dispatch
-/// guard; a state that is already inside the lock declines the bypass.
+/// Try the narrow import lanes before entering general dispatch. Most bypass
+/// the runtime mutex; SRW retains that mutex and the ordinary owner/waiter
+/// implementation. A caller already inside the mutex declines these lanes.
 pub fn tryWindowsFastFunction(state: anytype, dll_name: []const u8, function_name: []const u8, direct_return_rip: ?u64) bool {
     const State = @TypeOf(state.*);
+    // This lane still takes the runtime mutex. It avoids the general import
+    // and interpreter dispatch, not SRW ownership or waiter synchronization.
+    if (comptime @hasDecl(State, "tryWindowsSrwImport")) {
+        if (std.ascii.eqlIgnoreCase(dll_name, "kernel32.dll") or
+            std.ascii.startsWithIgnoreCase(dll_name, "api-ms-win-core-synch-"))
+        {
+            if (state.tryWindowsSrwImport(function_name, direct_return_rip)) return true;
+        }
+    }
+    if (comptime @hasDecl(State, "windowsFastCrtImportMayBypassRuntimeLock")) {
+        if (state.windowsFastCrtImportMayBypassRuntimeLock()) {
+            if (fast_imports.tryCrtHeap(fast_import_host, state, dll_name, function_name, direct_return_rip)) return true;
+            if (fast_imports.tryCrtMemory(fast_import_host, state, dll_name, function_name, direct_return_rip)) return true;
+            if (fast_imports.tryCrtStrings(fast_import_host, state, dll_name, function_name, direct_return_rip)) return true;
+            if (fast_imports.tryProcessAffinityMask(fast_import_host, state, dll_name, function_name, direct_return_rip)) return true;
+        }
+    }
+    if (fast_imports.trySleepZero(fast_import_host, state, dll_name, function_name, direct_return_rip)) return true;
     if (comptime @hasDecl(State, "windowsFastImportMayBypassRuntimeLock")) {
         if (!state.windowsFastImportMayBypassRuntimeLock()) return false;
     }
+    if (fast_imports.tryIdentityQuery(fast_import_host, state, dll_name, function_name, direct_return_rip)) return true;
     return fast_imports.tryPreciseTimeQuery(fast_import_host, state, dll_name, function_name, direct_return_rip);
 }
 
 pub fn tryFunction(state: anytype, dll_name: []const u8, function_name: []const u8, direct_return_rip: ?u64) bool {
+    const State = @TypeOf(state.*);
+    // Which imports a run makes, and what one costs: the evidence for the
+    // next lock-free lane (`PE64 IMPORT HISTOGRAM`).
+    if (comptime @hasField(State, "windows_import_histogram")) {
+        if (state.windows_import_histogram) |histogram| {
+            if (histogram.note(dll_name, function_name)) |entry| {
+                const started = importClockNs();
+                defer {
+                    const finished = importClockNs();
+                    if (started != 0 and finished > started) @TypeOf(histogram.*).addSample(entry, finished - started);
+                }
+                return tryFunctionCounted(state, dll_name, function_name, direct_return_rip);
+            }
+        }
+    }
+    return tryFunctionCounted(state, dll_name, function_name, direct_return_rip);
+}
+
+fn importClockNs() u64 {
+    var timestamp: std.c.timespec = undefined;
+    if (std.c.clock_gettime(@as(std.c.clockid_t, .MONOTONIC), &timestamp) != 0) return 0;
+    if (timestamp.sec < 0 or timestamp.nsec < 0) return 0;
+    return @as(u64, @intCast(timestamp.sec)) * std.time.ns_per_s + @as(u64, @intCast(timestamp.nsec));
+}
+
+fn tryFunctionCounted(state: anytype, dll_name: []const u8, function_name: []const u8, direct_return_rip: ?u64) bool {
     const State = @TypeOf(state.*);
     if (tryWindowsFastFunction(state, dll_name, function_name, direct_return_rip)) return true;
     if (comptime @hasDecl(State, "lockWindowsRuntime")) {
@@ -13499,6 +13741,302 @@ test "guest-byte previews snapshot memory instead of retaining a borrowed slice"
     memory.bytes[2] = 0xFF;
     try std.testing.expectEqualSlices(u8, &.{ 2, 3, 4 }, snapshot);
     try std.testing.expect(snapshotGuestBytes(&memory, 7, &snapshot_storage) == null);
+}
+
+test "Windows handle outputs use the coordinated writer in parallel mode" {
+    const Memory = struct {
+        parallel_guest_execution: bool = true,
+        bytes: [8]u8 = @splat(0),
+
+        fn guestMemory(self: *@This(), address: u64, count: u64) ?[]u8 {
+            const capacity: u64 = @intCast(self.bytes.len);
+            if (self.parallel_guest_execution or address > capacity or count > capacity - address) return null;
+            const start: usize = @intCast(address);
+            const length: usize = @intCast(count);
+            return self.bytes[start..][0..length];
+        }
+
+        fn copyToGuest(self: *@This(), address: u64, source: []const u8) bool {
+            const capacity: u64 = @intCast(self.bytes.len);
+            const length: u64 = @intCast(source.len);
+            if (address > capacity or length > capacity - address) return false;
+            const start: usize = @intCast(address);
+            @memcpy(self.bytes[start..][0..source.len], source);
+            return true;
+        }
+    };
+
+    var memory: Memory = .{};
+    const duplicate: u64 = 0xFFFF_F000_0000_0123;
+    try std.testing.expect(writeWindowsGuestHandle(&memory, 0, duplicate));
+    try std.testing.expectEqual(duplicate, std.mem.readInt(u64, memory.bytes[0..8], .little));
+    try std.testing.expect(!writeWindowsGuestHandle(&memory, 1, duplicate));
+}
+
+test "guest range validation accepts read-only views in parallel mode" {
+    const Memory = struct {
+        parallel_guest_execution: bool = true,
+        bytes: [56]u8 = @splat(0),
+
+        fn guestMemory(self: *@This(), address: u64, count: u64) ?[]u8 {
+            if (self.parallel_guest_execution or address > self.bytes.len or count > self.bytes.len - address) return null;
+            const start: usize = @intCast(address);
+            const length: usize = @intCast(count);
+            return self.bytes[start..][0..length];
+        }
+
+        fn guestMemoryConst(self: *const @This(), address: u64, count: u64) ?[]const u8 {
+            if (address > self.bytes.len or count > self.bytes.len - address) return null;
+            const start: usize = @intCast(address);
+            const length: usize = @intCast(count);
+            return self.bytes[start..][0..length];
+        }
+    };
+
+    var memory: Memory = .{};
+    try std.testing.expect(memory.guestMemory(0, 56) == null);
+    // DispatchMessage reads the 48-byte Win64 MSG structure through scalar
+    // guest accesses, so its address check must work without a mutable borrow.
+    try std.testing.expect(guestRangeAvailable(&memory, 0, 48));
+    try std.testing.expect(guestRangeAvailable(&memory, 0, 56));
+    try std.testing.expect(!guestRangeAvailable(&memory, 1, 56));
+}
+
+test "parallel CRT file reads copy into guest memory without a mutable borrow" {
+    const MockFile = struct {
+        handle: i32 = 0,
+
+        fn readPositional(_: @This(), _: *u8, slices: []const []u8, _: u64) !usize {
+            @memcpy(slices[0][0..3], "abc");
+            return 3;
+        }
+
+        fn writePositional(_: @This(), _: *u8, _: []const []const u8, _: u64) !usize {
+            return 0;
+        }
+    };
+    const Slot = struct {
+        guest_handle: u64 = 0x42,
+        stdio_fd: u32 = 3,
+        file: ?MockFile = .{},
+        offset: u64 = 0,
+        readable: bool = true,
+        writable: bool = false,
+        media_authorized: bool = false,
+        standard_stream: ?u8 = null,
+    };
+    const State = struct {
+        const Registers = struct {
+            rcx: u64 = 3,
+            rdx: u64 = 0x1000,
+            r8: u64 = 3,
+            r9: u64 = 0x42,
+            rax: u64 = 0,
+            rip: u64 = 0,
+            rsp: u64 = 0,
+        };
+
+        regs: Registers = .{},
+        allocator: std.mem.Allocator = std.testing.allocator,
+        parallel_guest_execution: bool = true,
+        windows_files: [1]Slot = .{.{}},
+        windows_host_io: ?*u8 = null,
+        windows_last_error: u32 = 0,
+        windows_file_failures: u64 = 0,
+        windows_file_read_calls: u64 = 0,
+        windows_file_write_calls: u64 = 0,
+        windows_media_io_trace_events: u64 = 0,
+        diagnose_abi: bool = false,
+        bytes: [8]u8 = @splat(0),
+
+        fn guestMemory(_: *@This(), _: u64, _: u64) ?[]u8 {
+            return null;
+        }
+
+        fn read64(_: *const @This(), _: u64) u64 {
+            return 0;
+        }
+
+        fn pop(_: *@This()) u64 {
+            return 0;
+        }
+
+        fn guestMemoryConst(self: *const @This(), address: u64, count: u64) ?[]const u8 {
+            if (address < 0x1000) return null;
+            const offset = address - 0x1000;
+            if (offset > self.bytes.len or count > self.bytes.len - offset) return null;
+            const start: usize = @intCast(offset);
+            return self.bytes[start..][0..@intCast(count)];
+        }
+
+        fn copyFromGuest(self: *const @This(), destination: []u8, address: u64) bool {
+            const source = self.guestMemoryConst(address, destination.len) orelse return false;
+            @memcpy(destination, source);
+            return true;
+        }
+
+        fn copyToGuest(self: *@This(), address: u64, source: []const u8) bool {
+            if (self.guestMemoryConst(address, source.len) == null) return false;
+            const start: usize = @intCast(address - 0x1000);
+            @memcpy(self.bytes[start..][0..source.len], source);
+            return true;
+        }
+    };
+
+    var io: u8 = 0;
+    var state = State{ .windows_host_io = &io };
+    try std.testing.expect(transferWindowsDescriptor(&state, "_read", 0x2000));
+    try std.testing.expectEqualSlices(u8, "abc", state.bytes[0..3]);
+    try std.testing.expectEqual(@as(u64, 3), state.regs.rax);
+    try std.testing.expectEqual(@as(u64, 3), state.windows_files[0].offset);
+    try std.testing.expectEqual(@as(u64, 0), state.windows_file_failures);
+
+    state.regs.rdx = 0x2000;
+    try std.testing.expect(transferWindowsDescriptor(&state, "_read", 0x2000));
+    try std.testing.expectEqual(@as(u32, 14), state.windows_last_error);
+    try std.testing.expectEqual(std.math.maxInt(u64), state.regs.rax);
+    try std.testing.expectEqual(@as(u64, 3), state.windows_files[0].offset);
+
+    state.windows_files[0].offset = 0;
+    state.windows_file_failures = 0;
+    @memset(&state.bytes, 0);
+    state.regs.rcx = 0x1000;
+    state.regs.rdx = 1;
+    state.regs.r8 = 3;
+    try std.testing.expect(transferWindowsStdio(&state, "fread", 0x2000));
+    try std.testing.expectEqualSlices(u8, "abc", state.bytes[0..3]);
+    try std.testing.expectEqual(@as(u64, 3), state.regs.rax);
+    try std.testing.expectEqual(@as(u64, 3), state.windows_files[0].offset);
+    try std.testing.expectEqual(@as(u64, 0), state.windows_file_failures);
+}
+
+test "parallel setjmp saves a valid guest environment" {
+    const State = struct {
+        const Registers = struct {
+            rcx: u64 = 0x1000,
+            rdx: u64 = 0,
+            r8: u64 = 0,
+            r9: u64 = 0,
+            rsp: u64 = 0x3000,
+            rbp: u64 = 0x11,
+            rbx: u64 = 0x22,
+            rsi: u64 = 0x33,
+            rdi: u64 = 0x44,
+            r12: u64 = 0x55,
+            r13: u64 = 0x66,
+            r14: u64 = 0x77,
+            r15: u64 = 0x88,
+            rflags: u64 = 0x202,
+            rax: u64 = 9,
+            rip: u64 = 0,
+        };
+
+        regs: Registers = .{},
+        bytes: [96]u8 = @splat(0),
+
+        fn guestMemory(_: *@This(), _: u64, _: u64) ?[]u8 {
+            return null;
+        }
+
+        fn guestMemoryConst(self: *const @This(), address: u64, count: u64) ?[]const u8 {
+            if (address < 0x1000) return null;
+            const offset = address - 0x1000;
+            if (offset > self.bytes.len or count > self.bytes.len - offset) return null;
+            return self.bytes[@intCast(offset)..][0..@intCast(count)];
+        }
+
+        fn read64(_: *const @This(), _: u64) u64 {
+            return 0;
+        }
+
+        fn pop(_: *@This()) u64 {
+            return 0;
+        }
+
+        fn write64(self: *@This(), address: u64, value: u64) void {
+            const offset: usize = @intCast(address - 0x1000);
+            std.mem.writeInt(u64, self.bytes[offset..][0..8], value, .little);
+        }
+    };
+
+    var state = State{};
+    try std.testing.expect(handleWindowsSetjmp(&state, 0x4000));
+    try std.testing.expectEqual(windows_setjmp_magic, std.mem.readInt(u64, state.bytes[0..8], .little));
+    try std.testing.expectEqual(@as(u64, 0x3000), std.mem.readInt(u64, state.bytes[8..16], .little));
+    try std.testing.expectEqual(@as(u64, 0x4000), std.mem.readInt(u64, state.bytes[80..88], .little));
+    try std.testing.expectEqual(@as(u64, 0x4000), state.regs.rip);
+    try std.testing.expectEqual(@as(u64, 0), state.regs.rax);
+}
+
+test "fatal Windows runtime stop publishes parallel process termination" {
+    const State = struct {
+        terminated: bool = false,
+        parallel_guest_termination: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn markTerminated(self: *@This()) void {
+            self.parallel_guest_termination.store(true, .release);
+        }
+
+        fn recordWindowsFatalRuntimeCall(_: *@This(), _: []const u8, _: u64) void {}
+    };
+
+    var state: State = .{};
+    requestWindowsStop(&state);
+    try std.testing.expect(state.terminated);
+    try std.testing.expect(state.parallel_guest_termination.load(.acquire));
+}
+
+test "C++ throw detail logging is bounded but retains power-of-two samples" {
+    for (1..9) |event| try std.testing.expect(shouldLogCxxThrowDetail(event));
+    try std.testing.expect(!shouldLogCxxThrowDetail(9));
+    try std.testing.expect(shouldLogCxxThrowDetail(16));
+    try std.testing.expect(shouldLogCxxThrowDetail(1024));
+}
+
+test "Windows TLS slot lookup works when parallel mode forbids mutable guest borrows" {
+    const MockState = struct {
+        const Segment = struct { base: u64 = 0 };
+        const Segments = struct { gs: Segment = .{} };
+        const Registers = struct { segments: Segments = .{} };
+
+        regs: Registers = .{ .segments = .{ .gs = .{ .base = 0x1000 } } },
+        parallel_guest_execution: bool = true,
+        tls_vector: [512 * 8]u8 = @splat(0),
+
+        fn guestRange(self: anytype, address: u64, count: u64) ?[]const u8 {
+            const base: u64 = 0x2000;
+            const capacity: u64 = @intCast(self.tls_vector.len);
+            if (address < base) return null;
+            const offset = address - base;
+            if (offset > capacity or count > capacity - offset) return null;
+            const start: usize = @intCast(offset);
+            const length: usize = @intCast(count);
+            return self.tls_vector[start..][0..length];
+        }
+
+        fn read64(self: *const @This(), address: u64) u64 {
+            if (address == 0x1058) return 0x2000;
+            const bytes = guestRange(self, address, 8) orelse return 0;
+            return std.mem.readInt(u64, bytes[0..8], .little);
+        }
+
+        fn guestMemory(self: *@This(), address: u64, count: u64) ?[]u8 {
+            if (self.parallel_guest_execution) return null;
+            const bytes = guestRange(self, address, count) orelse return null;
+            const start: usize = @intCast(address - 0x2000);
+            return self.tls_vector[start..][0..bytes.len];
+        }
+
+        fn guestMemoryConst(self: *const @This(), address: u64, count: u64) ?[]const u8 {
+            return guestRange(self, address, count);
+        }
+    };
+
+    var state: MockState = .{};
+    try std.testing.expect(state.guestMemory(0x2010, 8) == null);
+    try std.testing.expectEqual(@as(?u64, 0x2010), windowsTlsSlot(&state, 2));
+    try std.testing.expectEqual(@as(?u64, 0x2FF8), windowsTlsSlot(&state, 511));
+    try std.testing.expect(windowsTlsSlot(&state, 512) == null);
 }
 
 test "import-class memo supports concurrent misses and hits" {
