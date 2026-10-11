@@ -135,6 +135,15 @@ pub fn cmpImm(width: Width, rn: Reg, value: u64) ?u32 {
     return addSubImmediate(width, .sub, true, xzr, rn, value);
 }
 
+/// `adds`/`subs` with an immediate: the result and NZCV.
+pub fn addsImm(width: Width, rd: Reg, rn: Reg, value: u64) ?u32 {
+    return addSubImmediate(width, .add, true, rd, rn, value);
+}
+
+pub fn subsImm(width: Width, rd: Reg, rn: Reg, value: u64) ?u32 {
+    return addSubImmediate(width, .sub, true, rd, rn, value);
+}
+
 /// `add`/`sub` between registers, with an optional left shift on the second.
 pub fn addSubShifted(
     width: Width,
@@ -854,6 +863,28 @@ pub fn stlr(size: MemSize, rt: Reg, rn: Reg) u32 {
     };
 }
 
+/// `ldapur`: a load-acquire (RCpc, FEAT_LRCPC2) with a signed 9-bit byte
+/// offset, so an ordered load through a base needs no address `add`. RCpc
+/// lets a later acquire pass an earlier release to another address, which
+/// x86-TSO allows too. Null when the offset does not fit.
+pub fn ldapur(size: MemSize, rt: Reg, rn: Reg, offset: i64) ?u32 {
+    return orderedUnscaled(size, 0x19400000, rt, rn, offset);
+}
+
+/// `stlur`: a store-release with a signed 9-bit byte offset (FEAT_LRCPC2).
+pub fn stlur(size: MemSize, rt: Reg, rn: Reg, offset: i64) ?u32 {
+    return orderedUnscaled(size, 0x19000000, rt, rn, offset);
+}
+
+fn orderedUnscaled(size: MemSize, base: u32, rt: Reg, rn: Reg, offset: i64) ?u32 {
+    if (offset < -256 or offset > 255) return null;
+    const imm9: u32 = @as(u32, @bitCast(@as(i32, @intCast(offset)))) & 0x1FF;
+    return switch (size) {
+        .byte, .half, .word, .doubleword => (@as(u32, size.sizeField()) << 30) | base | (imm9 << 12) | (@as(u32, rn) << 5) | rt,
+        else => unreachable,
+    };
+}
+
 /// Scalar floating-point load/store size. These use the same unsigned scaled
 /// immediate addressing shape as integer loads, with an FP register operand.
 pub const FpMemSize = enum { single, double };
@@ -972,6 +1003,26 @@ pub fn mrsNzcv(rt: Reg) u32 {
     return 0xD53B4200 | @as(u32, rt);
 }
 
+/// `msr NZCV, Xt`.
+pub fn msrNzcv(rt: Reg) u32 {
+    return 0xD51B4200 | @as(u32, rt);
+}
+
+/// `mrs Xt, FPCR` (op0=3, op1=3, CRn=4, CRm=4, op2=0).
+pub fn mrsFpcr(rt: Reg) u32 {
+    return 0xD53B4400 | @as(u32, rt);
+}
+
+/// `msr FPCR, Xt`.
+pub fn msrFpcr(rt: Reg) u32 {
+    return 0xD51B4400 | @as(u32, rt);
+}
+
+test "FPCR system register transfers match the assembler" {
+    try std.testing.expectEqual(@as(u32, 0xd53b4409), mrsFpcr(9));
+    try std.testing.expectEqual(@as(u32, 0xd51b440a), msrFpcr(10));
+}
+
 test "register pair forms match the assembler" {
     try std.testing.expectEqual(@as(?u32, 0xa9bd7bfd), stp(.pre_index, 29, 30, sp, -48));
     try std.testing.expectEqual(@as(?u32, 0xa90153f3), stp(.signed_offset, 19, 20, sp, 16));
@@ -982,6 +1033,7 @@ test "register pair forms match the assembler" {
     // An offset that is not a multiple of eight has no encoding.
     try std.testing.expectEqual(@as(?u32, null), stp(.signed_offset, 19, 20, sp, 12));
     try std.testing.expectEqual(@as(u32, 0xd53b4209), mrsNzcv(9));
+    try std.testing.expectEqual(@as(u32, 0xd51b4209), msrNzcv(9));
 }
 
 test "ordered scalar loads and stores match the assembler" {
@@ -993,6 +1045,17 @@ test "ordered scalar loads and stores match the assembler" {
     try testing.expectEqual(@as(u32, 0x489FFC20), stlr(.half, 0, 1));
     try testing.expectEqual(@as(u32, 0x889FFC20), stlr(.word, 0, 1));
     try testing.expectEqual(@as(u32, 0xC89FFC20), stlr(.doubleword, 0, 1));
+    // llvm-mc -mattr=+v8.4a,+rcpc-immo
+    try testing.expectEqual(@as(?u32, 0x994143b9), ldapur(.word, 25, 29, 20));
+    try testing.expectEqual(@as(?u32, 0xd95003a0), ldapur(.doubleword, 0, 29, -256));
+    try testing.expectEqual(@as(?u32, 0x194ff3a3), ldapur(.byte, 3, 29, 255));
+    try testing.expectEqual(@as(?u32, 0x594023a3), ldapur(.half, 3, 29, 2));
+    try testing.expectEqual(@as(?u32, 0xd91f83a3), stlur(.doubleword, 3, 29, -8));
+    try testing.expectEqual(@as(?u32, 0x990583a3), stlur(.word, 3, 29, 88));
+    try testing.expectEqual(@as(?u32, 0x190013a3), stlur(.byte, 3, 29, 1));
+    try testing.expectEqual(@as(?u32, 0x590063a3), stlur(.half, 3, 29, 6));
+    try testing.expectEqual(@as(?u32, null), ldapur(.word, 0, 1, 256));
+    try testing.expectEqual(@as(?u32, null), stlur(.word, 0, 1, -257));
 }
 
 pub fn retReg(rn: Reg) u32 {
@@ -1021,9 +1084,19 @@ pub fn dmb(option: u4) u32 {
     return 0xD50330BF | (@as(u32, option) << 8);
 }
 
-/// `dmb ish`, the barrier an emulated `mfence`/`lfence`/`sfence` becomes.
+/// `dmb ish`, the full barrier required by an emulated `mfence`.
 pub fn dmbIsh() u32 {
     return dmb(0b1011);
+}
+
+/// `dmb ishld`, the load-ordering barrier for an emulated `lfence`.
+pub fn dmbIshLd() u32 {
+    return dmb(0b1001);
+}
+
+/// `dmb ishst`, the store-ordering barrier for an emulated `sfence`.
+pub fn dmbIshSt() u32 {
+    return dmb(0b1010);
 }
 
 // -- LSE atomics (ARMv8.1) -------------------------------------------------
@@ -1170,9 +1243,11 @@ pub fn materialize(rd: Reg, value: u64, out: []u32) usize {
 const testing = std.testing;
 
 test "memory barriers match the assembler" {
-    // `dmb ish` and `dmb sy`, the two options an emulated x86 fence uses.
+    // `dmb ish`, `dmb ishld`, `dmb ishst`, and `dmb sy`.
     try testing.expectEqual(@as(u32, 0xd5033bbf), dmbIsh());
     try testing.expectEqual(@as(u32, 0xd5033bbf), dmb(0b1011));
+    try testing.expectEqual(@as(u32, 0xd50339bf), dmbIshLd());
+    try testing.expectEqual(@as(u32, 0xd5033abf), dmbIshSt());
     try testing.expectEqual(@as(u32, 0xd5033fbf), dmb(0b1111));
     // The option is the only field, so the smallest and the largest must
     // differ in exactly the CRm bits and nowhere else.
@@ -1557,6 +1632,17 @@ pub fn vabs(lanes: Lanes, rd: Reg, rn: Reg) u32 {
 /// `shl vd, vn, #shift` with 0 <= shift < element bits.
 pub fn vshl(lanes: Lanes, rd: Reg, rn: Reg, shift: u32) u32 {
     return vec2(0x4F005400 | ((lanes.elementBits() + shift) << 16), rd, rn);
+}
+/// `ushl vd, vn, vm`: each lane shifted by the signed low byte of the same
+/// lane of vm, left when positive and logically right when negative; a shift
+/// of the lane width or more either way gives 0.
+pub fn vushlReg(lanes: Lanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x6E204400 | sizeBits(lanes), rd, rn, rm);
+}
+/// `sshl vd, vn, vm`: as `vushlReg`, but a negative shift is arithmetic, so a
+/// right shift of the lane width or more fills the lane with its sign.
+pub fn vsshlReg(lanes: Lanes, rd: Reg, rn: Reg, rm: Reg) u32 {
+    return vec3(0x4E204400 | sizeBits(lanes), rd, rn, rm);
 }
 /// `ushr vd, vn, #shift` with 1 <= shift <= element bits.
 pub fn vushr(lanes: Lanes, rd: Reg, rn: Reg, shift: u32) u32 {
