@@ -1913,7 +1913,7 @@ fn fsiFenceNow(context: *anyopaque) u64 {
 /// Printed on the timing watcher's thread while the chunk is still running.
 fn fsiWatcherReport(report: fsi_timing.Report) void {
     const meaning = switch (report.kind) {
-        .risk => "submission-to-observation latency crossed the risk bound; normal calibration ceilings were reduced for this run; emergency recovery starts over at minimum work and can earn at most the original conservative sample quantum",
+        .risk => "submission-to-observation latency crossed the risk bound; draw ceilings remain reduced for this run; verified shader bounds and thousands of representative fast completions can recover only the original conservative sample quantum",
         .severe => if (report.completion_observed) "completion was observed beyond the severe bound; work returns to minimum and only a later protected recovery streak may earn the original conservative quantum; a completed fence alone does not pause the queue" else "an outstanding timing group crossed the severe bound; new FSI submissions wait until all outstanding fences complete and reset successfully, then resume at minimum work; draw cap stays pinned and only a later protected recovery streak may earn the original conservative work quantum; actual fence failures stop the run. Splitting cannot subdivide a single oversized draw",
         .failed => if (report.failure_stage == .reset_fences) "vkResetFences failed after completion; the fence is not recycled and later FSI queue submissions are stopped" else "vkWaitForFences failed on the timing watcher, which normally means the Metal-backed Vulkan device was lost; subsequent FSI submissions are stopped",
     };
@@ -6427,7 +6427,7 @@ pub const Forwarder = struct {
         guard.driver_submit_infos +|= segments.len;
         if (segments.len > 1) guard.coalesced_submit_groups +|= 1;
         guard.segments_submitted +|= segments.len;
-        const release_after = guard.monitor.track(.{
+        const tracked = guard.monitor.trackSubmitted(.{
             .isolated = combined.isolated,
             .fence = timing_fence,
             .submit_ns = submit_ns,
@@ -6446,9 +6446,10 @@ pub const Forwarder = struct {
         });
         for (segment_buffers, 0..) |buffers, segment_index| {
             for (buffers[0..segments[segment_index].command_count]) |buffer| {
-                if (buffer) |handle| guard.chunk_pool.noteSubmitted(@intFromPtr(handle), release_after);
+                if (buffer) |handle| guard.chunk_pool.noteSubmitted(@intFromPtr(handle), tracked.serial);
             }
         }
+        if (tracked.failed) return abi.ERROR_DEVICE_LOST;
         // Preserve the guest fence's completion point. The queue-order fence
         // follows the timed segment, while the timing fence already tracks
         // the actual work and therefore cannot be lost on an empty-submit
@@ -6687,6 +6688,10 @@ pub const Forwarder = struct {
         machoCapturePrint(
             "macho-processor: VULKAN QUEUE API GATE: acquisitions={d} contended={d} waits={d} wait_ms={d} wait_max_ms={d} pinned_refusals={d}; this serializes host queue calls while a blocked submit yields the guest-runtime mutex\n",
             .{ queue_gate.acquisitions, queue_gate.contended, queue_gate.waits, queue_gate.wait_ns / 1_000_000, queue_gate.max_wait_ns / 1_000_000, queue_gate.wait_refusals },
+        );
+        machoCapturePrint(
+            "macho-processor: VULKAN FSI FENCE ROUTE: ready_checks={d} ready_completions={d}; a zero-time fence wait can retire an already completed FIFO head on the submitter; pending fences keep watcher timing and queue backpressure\n",
+            .{ stats.ready_checks, stats.ready_completions },
         );
         machoCapturePrint(
             "macho-processor: VULKAN FSI CPU ROUTE: small_chunk_sync={} synchronous_commands={d} recovery_fast_groups={d} recovery_work_cap={d} recovery_growths={d}; minimum draw-cap recordings bypass worker handoffs after draining older commands; recovery work never exceeds {d}\n",
