@@ -263,16 +263,26 @@ pub const Scratch = extern struct {
     fused_b: u64 = 0,
     fused_r: u64 = 0,
     saved_nzcv: u64 = 0,
+    /// The skip counter (`skip_reg`) across a helper call, which clobbers
+    /// it.
+    skip_spill: u64 = 0,
+    /// FPCR writes the translated `ldmxcsr` made since the glue last
+    /// harvested this count: loads that changed FZ or RMode. A load that
+    /// leaves them as they are writes nothing, because `msr fpcr` costs
+    /// about 3 ns even then and about 12 ns with stores in flight when it
+    /// changes them (M2 Max, 2026-10-11): Xenia reloads MXCSR around every
+    /// switch between PowerPC FPU and VMX code and after every host call.
+    fpcr_writes: u64 = 0,
 };
 
 /// `Scratch.chain_count` keeps blocks below this bit and instructions above.
 pub const chain_count_shift: u6 = 24;
 pub const chain_count_blocks_mask: u64 = (@as(u64, 1) << chain_count_shift) - 1;
 
-/// The host register holding the hoisted base's host address inside a
-/// block. x29 is saved and restored by the prologue and epilogue and read by
-/// nothing the translator emits, and every helper preserves it.
-const hoist_host: a64.Reg = 29;
+/// Page pointers local to a block. x29 is callee-saved; x30's caller return
+/// address is on the stack, and helper calls preserve its page pointer in
+/// a separate stack slot. Neither pointer survives a block boundary.
+const hoist_hosts = [_]a64.Reg{ 29, 30 };
 /// The widest displacement span one hoist covers: one page. Xenia's PowerPC
 /// contexts are page-aligned and about 0xB00 bytes, so every span through
 /// rsi - general and vector registers together - is admitted; a base at a
@@ -280,7 +290,18 @@ const hoist_host: a64.Reg = 29;
 const hoist_max_span: u64 = 4096;
 const hoist_disp_bias: u64 = 1 << 63;
 
-const HoistCandidate = struct { base: RegId, disp: u64, bytes: u64 };
+const HoistCandidate = struct { base: ?RegId, disp: u64, bytes: u64 };
+const Hoist = struct {
+    planned: bool = false,
+    /// null represents an absolute or RIP-relative operand.
+    base: ?RegId = null,
+    dmin: u64 = 0,
+    span: u64 = 0,
+    aligned: bool = false,
+    write: bool = false,
+    live: bool = false,
+};
+const HoistedOffset = struct { slot: usize, offset: u64 };
 
 const FusedExit = struct {
     label: Label,
@@ -321,17 +342,38 @@ const ColdAbortExit = struct {
     fused: ?Fused,
 };
 
-/// A plain `[base + disp]` integer memory operand: no index, no segment,
-/// no rip-relative or 32-bit address arithmetic. Only these can share one
-/// translated page pointer.
+/// The paths of a probed scalar access that a TLB hit never runs - the
+/// byte-by-byte access of an unaligned operand and the helper call on a
+/// miss - emitted after the block body (`emitColdMemory`). Inline, every
+/// access's hot path ended in a taken branch over about twenty-five words
+/// it does not run, in the middle of the code the next access fetches.
+const ColdMemory = struct {
+    /// The unaligned operand's path, for a 2- to 8-byte access.
+    unaligned: ?Label,
+    slow: Label,
+    done: Label,
+    size: Size,
+    index: u32,
+    is_write: bool,
+    /// A read's destination (the helper returns the value in x0).
+    dest: a64.Reg,
+    /// The access is inside a fused flag run: the probe and the helper
+    /// must leave NZCV as they found it.
+    nzcv_live: bool,
+};
+
+/// An operand whose address depends on at most one guest register. Indexed,
+/// segmented and 32-bit address arithmetic retain their ordinary probes.
 fn hoistCandidate(insn: Insn) ?HoistCandidate {
     const d = insn.decoded;
     if (insn.force_fallback or !isNative(d)) return null;
-    if (d.is_reg_form or !d.sib_has_base or d.sib_has_index or d.rip_relative or d.has_0x67) return null;
-    if (insn.segment == .fs or insn.segment == .gs) return null;
+    if (d.is_reg_form or d.sib_has_index or d.has_0x67) return null;
+    if (insn.segment == .fs or insn.segment == .gs or d.op == .lea_reg_mem or d.op == .vzeroupper) return null;
+    if (!isVectorNative(d) and std.mem.indexOf(u8, @tagName(d.op), "_mem") == null) return null;
     // A vector operand is read or written as whole 16-byte halves.
     const bytes: u64 = if (isVectorNative(d)) (if (d.vector_256) 32 else 16) else @max(bits(d.size) / 8, 1);
-    return .{ .base = d.sib_base_reg, .disp = d.addr, .bytes = bytes };
+    if (d.rip_relative) return .{ .base = null, .disp = insn.rip +% d.len +% d.addr, .bytes = bytes };
+    return .{ .base = if (d.sib_has_base) d.sib_base_reg else null, .disp = d.addr, .bytes = bytes };
 }
 
 /// Whether an op can write its memory operand: its first operand is the
@@ -780,6 +822,8 @@ const scratch_fused_a_offset: u32 = @offsetOf(Scratch, "fused_a");
 const scratch_fused_b_offset: u32 = @offsetOf(Scratch, "fused_b");
 const scratch_fused_r_offset: u32 = @offsetOf(Scratch, "fused_r");
 const scratch_saved_nzcv_offset: u32 = @offsetOf(Scratch, "saved_nzcv");
+const scratch_skip_spill_offset: u32 = @offsetOf(Scratch, "skip_spill");
+const scratch_fpcr_writes_offset: u32 = @offsetOf(Scratch, "fpcr_writes");
 const scratch_block_offset: u32 = @offsetOf(Scratch, "block");
 
 pub const FallbackReason = enum(u8) {
@@ -836,6 +880,17 @@ pub const Block = struct {
     /// cross-checked against the interpreter by running both on the general
     /// register file.
     register_only: bool,
+    /// Some conditional branch jumps forward inside the block instead of
+    /// leaving it, so its instructions do not always run in order: a
+    /// cross-check following the interpreter resumes at that branch's
+    /// target.
+    internal_edges: bool = false,
+    /// Bit i: instruction i is a branch whose taken edge stays in the block.
+    /// Only these: a forward branch whose target reads a live flag still
+    /// leaves, and a cross-check that followed it inside the block compared
+    /// the interpreter's longer run with the translation's exit and dropped
+    /// a correct block.
+    internal_sources: u128 = 0,
     /// A block the glue cross-checks against the interpreter before trusting
     /// it although it reaches memory (`ROSETTE_BLOCK_JIT_VERIFY_MEMORY`); a
     /// register-only block is always checked.
@@ -957,6 +1012,12 @@ pub const Compiled = struct {
     cached_registers: u8 = 0,
     /// Memory accesses served through a hoisted base pointer.
     hoisted_accesses: u32 = 0,
+    /// Conditional branches whose taken edge stays in the block.
+    internal_edges: u32 = 0,
+    /// Which instructions those are (`Block.internal_sources`).
+    internal_sources: u128 = 0,
+    upper_clears_elided: u32 = 0,
+    xmm_loads_forwarded: u32 = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -1210,11 +1271,28 @@ const r_spare: a64.Reg = 24;
 /// reads and writes the guest register file directly, so only around its
 /// call, and on the way out of the block, does the cache have to agree with
 /// memory.
-const cache_host_regs = [_]a64.Reg{ 25, 26, 27, 28 };
+///
+/// x25-x28 come first, so the busiest guest registers get them. The rest
+/// are caller-saved registers no template uses (x4-x7, x17): a helper call
+/// would clobber them, so `emitCallHelper` spills them to the register file
+/// around it and reloads them after. Helper calls are on cold paths, while
+/// four registers were too few for Xenia's code, which keeps ten or more
+/// x86 registers busy per block: the rest went through the register file
+/// on every use, and a dependent chain through memory waits on
+/// store-to-load forwarding at every step.
+const cache_host_regs = [_]a64.Reg{ 25, 26, 27, 28, 4, 5, 6, 7, 17 };
+/// How many of `cache_host_regs` (the first ones) survive a C call.
+const cache_callee_saved: u8 = 4;
 /// A guest register is cached only if the block touches it at least this
-/// often: caching costs a load in and a store out, so fewer uses than this
-/// cannot come out ahead.
-const cache_min_uses: u32 = 3;
+/// often: caching costs a load in, and a store out if the block writes it.
+/// Two uses already repay that when one feeds the other.
+const cache_min_uses: u32 = 2;
+/// In a block with internal forward edges (`planInternalEdges`): how many
+/// of its instructions the taken edges have jumped over so far. Every exit
+/// subtracts it from the count its stub names, so the retired count stays
+/// exact on every path. ip0 is otherwise used only by the locked adc/sbb
+/// and cmpxchg16b templates, whose blocks get no internal edges.
+const skip_reg: a64.Reg = 16;
 const t0: a64.Reg = 9;
 const t1: a64.Reg = 10;
 const t2: a64.Reg = 11;
@@ -1612,6 +1690,14 @@ pub const Fused = struct {
     /// temporary: the writer's operands and result are kept in scratch
     /// (`fused_a/b/r`) for any exit that still owes its flags.
     saved: bool = false,
+    /// Where the writer's operands are while the run lasts: t1 and t2, or,
+    /// for a `cmp` or `test` read straight from the register cache
+    /// (`emitFusedCompareDirect`), the cache registers themselves and an
+    /// immediate - the paths that derive x86 flags copy them into t1 and t2
+    /// first, at the writer's width.
+    a_reg: a64.Reg = t1,
+    b_reg: a64.Reg = t2,
+    b_imm: ?u64 = null,
 };
 
 /// The ARM condition that holds exactly when x86 `cond` does after `kind`
@@ -2205,6 +2291,7 @@ const Compiler = struct {
     /// Full-probe paths of hoisted accesses, emitted after the block body so
     /// the hot path is the pointer test and the access alone.
     cold_accesses: std.ArrayList(ColdAccess) = .empty,
+    cold_memory: std.ArrayList(ColdMemory) = .empty,
     allocator: std.mem.Allocator,
     /// Per instruction: whether its flag computation must be emitted.
     flag_wants: []const bool,
@@ -2266,28 +2353,44 @@ const Compiler = struct {
     /// Every `loadReg`/`storeReg`, counted by guest register. The first pass
     /// over a block only counts; the second caches what the first found.
     use_counts: [16]u32 = @splat(0),
+    /// Guest registers some instruction in the block writes (bit = register
+    /// number), as the first pass found them; only these are written back
+    /// from the cache. A register the block never writes holds exactly what
+    /// the register file does - the interpreter calls reload the cache after
+    /// changing it - so storing it again would only cost. All of them in a
+    /// counting pass.
+    written: u16 = 0,
+    cache_written: u16 = 0xFFFF,
     flag_settles: u32 = 0,
-    /// Base-register hoisting (`planHoist`): the guest register most of the
-    /// block's plain `[base+disp]` accesses go through, the lowest
-    /// displacement and the span they cover, and whether x29 currently holds
-    /// the host address of `base + hoist_dmin` (or zero, when the span was
-    /// not admitted as one page). Xenia's JIT addresses every PowerPC
-    /// register through the context block in rsi, so almost every guest
-    /// instruction it emits is such an access; each used to pay a full TLB
-    /// probe, and now pays one per block.
-    hoist_base: ?RegId = null,
-    hoist_dmin: u64 = 0,
-    /// `hoist_dmin` is 8-aligned relative to the base, and the hoist
-    /// refuses an x29 that is not 8-aligned.
-    hoist_aligned: bool = false,
-    hoist_span: u64 = 0,
-    /// Whether any access through the base can store. A read-only span is
-    /// translated through the read TLB: constants and vtables in read-only
-    /// data never receive a write admission, and asking for one would make
-    /// the hoist fail on every execution of the block.
-    hoist_write: bool = false,
-    hoist_live: bool = false,
+    /// The two busiest address bases, admitted once per block and
+    /// invalidated whenever their guest register changes. Constants may
+    /// share the second pointer with no base register at all.
+    hoists: [hoist_hosts.len]Hoist = @splat(.{}),
     hoisted_accesses: u32 = 0,
+    /// Internal forward edges (`planInternalEdges`). Per instruction: for a
+    /// conditional branch, the later instruction its taken edge jumps to;
+    /// for a target, its label and the state every edge into it brings
+    /// (whether x29 still holds the hoist on all of them, and whether any of
+    /// them still owes an abort check).
+    internal_target: []?u32 = &.{},
+    internal_label: []?Label = &.{},
+    internal_hoist: [][hoist_hosts.len]bool = &.{},
+    internal_abort: []bool = &.{},
+    /// A target was reached along the fall-through with NZCV still owed to
+    /// a reader, which an edge from elsewhere could not supply: the block
+    /// is emitted again without internal edges.
+    internal_conflict: bool = false,
+    uses_skip_counter: bool = false,
+    internal_edges: u32 = 0,
+    internal_sources: u128 = 0,
+    /// A dominating VEX.128 write already zeroed these private register-file
+    /// lanes. Facts are local to straight-line code, never an entry/edge.
+    last_xmm: ?u8 = null,
+    forward_xmm: bool = false,
+    zero_ymm: u32 = 0,
+    zero_zmm: u32 = 0,
+    upper_clears_elided: u32 = 0,
+    xmm_loads_forwarded: u32 = 0,
 
     fn emit(self: *Compiler, word: u32) Error!void {
         try self.a.emit(word);
@@ -2327,7 +2430,7 @@ const Compiler = struct {
     }
 
     fn emitPrologue(self: *Compiler) Error!void {
-        try self.emitChecked(a64.stp(.pre_index, 29, 30, a64.sp, -96));
+        try self.emitChecked(a64.stp(.pre_index, 29, 30, a64.sp, -112));
         try self.emitChecked(a64.stp(.signed_offset, r_state, r_regs, a64.sp, 16));
         try self.emitChecked(a64.stp(.signed_offset, r_helpers, r_scratch, a64.sp, 32));
         try self.emitChecked(a64.stp(.signed_offset, r_tlb, r_spare, a64.sp, 48));
@@ -2397,7 +2500,7 @@ const Compiler = struct {
         try self.emitChecked(a64.ldp(.signed_offset, r_tlb, r_spare, a64.sp, 48));
         try self.emitChecked(a64.ldp(.signed_offset, r_helpers, r_scratch, a64.sp, 32));
         try self.emitChecked(a64.ldp(.signed_offset, r_state, r_regs, a64.sp, 16));
-        try self.emitChecked(a64.ldp(.post_index, 29, 30, a64.sp, 96));
+        try self.emitChecked(a64.ldp(.post_index, 29, 30, a64.sp, 112));
         try self.emit(a64.ret());
     }
 
@@ -2461,8 +2564,9 @@ const Compiler = struct {
     fn storeReg(self: *Compiler, id: RegId, high8: bool, size: Size, src: a64.Reg) Error!void {
         const index: usize = @intFromEnum(id);
         self.use_counts[index] +|= 1;
-        if (self.hoist_base) |base| {
-            if (base == id) self.hoist_live = false;
+        self.written |= @as(u16, 1) << @intCast(index);
+        for (&self.hoists) |*hoist| {
+            if (hoist.base == id) hoist.live = false;
         }
         if (self.cache_slot[index]) |slot| {
             // x86's width rules, applied to the cached copy instead of memory:
@@ -2504,8 +2608,9 @@ const Compiler = struct {
         if (size != .bits32) return self.storeReg(id, high8, size, src);
         const index: usize = @intFromEnum(id);
         self.use_counts[index] +|= 1;
-        if (self.hoist_base) |base| {
-            if (base == id) self.hoist_live = false;
+        self.written |= @as(u16, 1) << @intCast(index);
+        for (&self.hoists) |*hoist| {
+            if (hoist.base == id) hoist.live = false;
         }
         if (self.cache_slot[index]) |slot| {
             try self.emit(a64.mov(.x64, cache_host_regs[slot], src));
@@ -2521,13 +2626,32 @@ const Compiler = struct {
         }
     }
 
-    /// Write every cached guest register back. Whole registers, clean or
-    /// not: a register this block never wrote still holds exactly what
-    /// memory does, so writing it is harmless, and tracking which were
-    /// written would need a different answer on every path to every exit.
+    /// Write back every cached guest register the block writes anywhere.
+    /// Whole registers, on every path: one the block writes on some other
+    /// path still holds exactly what memory does here, so writing it is
+    /// harmless, while one the block never writes (`written`, from the
+    /// counting pass) needs no store at all. Xenia's context and membase
+    /// registers, read on every instruction and never written, are the
+    /// common case.
     fn emitCacheWriteBack(self: *Compiler) Error!void {
         for (self.cache_ids[0..self.cache_count], 0..) |id, slot| {
+            if (self.cache_written & (@as(u16, 1) << @intFromEnum(id)) == 0) continue;
             try self.emitChecked(a64.strImm(.doubleword, cache_host_regs[slot], r_regs, gprOffset(id)));
+        }
+    }
+
+    /// Around a C call: the cache registers it would clobber, to their
+    /// register-file slots and back. Clean ones too, since the call loses
+    /// them either way; a helper that changes a guest register changes its
+    /// slot, so the reload also picks that up.
+    fn emitCallerSavedCacheSpill(self: *Compiler, reload: bool) Error!void {
+        if (self.cache_count <= cache_callee_saved) return;
+        for (self.cache_ids[cache_callee_saved..self.cache_count], cache_callee_saved..) |id, slot| {
+            if (reload) {
+                try self.emitChecked(a64.ldrImm(.doubleword, cache_host_regs[slot], r_regs, gprOffset(id)));
+            } else {
+                try self.emitChecked(a64.strImm(.doubleword, cache_host_regs[slot], r_regs, gprOffset(id)));
+            }
         }
     }
 
@@ -2631,6 +2755,9 @@ const Compiler = struct {
     /// carries the generation its bytes were proven at.
     fn emitChainAttempt(self: *Compiler) Error!void {
         self.a.placeLabel(self.exit_path);
+        // The stub's count assumes every instruction before the exit ran;
+        // internal edges jumped over `skip_reg` of them.
+        if (self.uses_skip_counter) try self.emit(a64.sub(.x64, 0, 0, skip_reg));
         // Whatever runs next - a chained block, the glue, the interpreter,
         // a fault handler building a context - reads guest registers from
         // the register file, so the cache has to be there first.
@@ -3002,6 +3129,12 @@ const Compiler = struct {
     // -- helper calls ---------------------------------------------------------
 
     fn emitCallHelper(self: *Compiler, offset: u32) Error!void {
+        self.last_xmm = null;
+        try self.emitCallerSavedCacheSpill(false);
+        // BLR overwrites LR. Its caller return address remains at sp+8;
+        // sp+96 preserves the second page pointer independently of it.
+        if (self.hoists[1].planned) try self.emitChecked(a64.strImm(.doubleword, hoist_hosts[1], a64.sp, 96));
+        if (self.uses_skip_counter) try self.emitChecked(a64.strImm(.doubleword, skip_reg, r_scratch, scratch_skip_spill_offset));
         if (self.nzcv_live) {
             // A C call does not preserve NZCV, and a fused run's later
             // readers test it.
@@ -3015,6 +3148,9 @@ const Compiler = struct {
             try self.emitChecked(a64.ldrImm(.doubleword, t0, r_helpers, offset));
             try self.emit(a64.blr(t0));
         }
+        if (self.hoists[1].planned) try self.emitChecked(a64.ldrImm(.doubleword, hoist_hosts[1], a64.sp, 96));
+        try self.emitCallerSavedCacheSpill(true);
+        if (self.uses_skip_counter) try self.emitChecked(a64.ldrImm(.doubleword, skip_reg, r_scratch, scratch_skip_spill_offset));
         // The flag helper never sets `abort`; any other helper leaves the
         // instruction's abort check to emit.
         if (offset != helper_flags_offset) self.abort_unchecked = true;
@@ -3200,65 +3336,76 @@ const Compiler = struct {
     /// The read into `dest`: straight from the host page on a TLB hit, from
     /// the helper's x0 otherwise. Zero-extended at 32 bits either way.
     fn emitReadInto(self: *Compiler, size: Size, index: u32, dest: a64.Reg) Error!void {
-        self.touches_memory = true;
-        const access_bytes = bits(size) / 8;
-        const slow = try self.a.createLabel();
-        const done = try self.a.createLabel();
-        if (access_bytes > 1 and access_bytes <= 8) {
-            const unaligned = try self.a.createLabel();
-            try self.emit(a64.logicalImmediate(.x64, .andop, t2, 1, access_bytes - 1).?);
-            try self.a.branchIfNonZero(.x64, t2, unaligned);
-            try self.emitTlbProbe(false, access_bytes, true, slow);
-            try self.emitOrderedScalar(false, size, dest, t4);
-            try self.a.branch(done);
-
-            self.a.placeLabel(unaligned);
-            try self.emitTlbProbe(false, access_bytes, false, slow);
-            try self.emitOrderedUnalignedScalarLoad(size, dest, t4);
-            try self.a.branch(done);
-        } else {
-            try self.emitTlbProbe(false, access_bytes, true, slow);
-            try self.emitOrderedScalar(false, size, dest, t4);
-            try self.a.branch(done);
-        }
-        self.a.placeLabel(slow);
-        try self.emitCurrentIndex(index);
-        try self.emit(a64.mov(.x64, 0, r_state));
-        try self.a.loadConstant(2, @intFromEnum(size));
-        try self.emitCallHelper(helper_read_offset);
-        if (dest != 0) try self.emit(a64.mov(.x64, dest, 0));
-        self.a.placeLabel(done);
+        return self.emitProbedScalar(false, size, index, dest);
     }
 
     /// write(state, x1, size, x3), on behalf of instruction `index`.
     fn emitWrite(self: *Compiler, size: Size, index: u32) Error!void {
+        return self.emitProbedScalar(true, size, index, 3);
+    }
+
+    /// The hot path of a probed scalar access - alignment test, TLB probe,
+    /// one ordered access - falling through on a hit; the unaligned and the
+    /// helper paths go out of line (`ColdMemory`). The guest address is in
+    /// x1, a store's value in x3.
+    fn emitProbedScalar(self: *Compiler, is_write: bool, size: Size, index: u32, data: a64.Reg) Error!void {
         self.touches_memory = true;
         const access_bytes = bits(size) / 8;
         const slow = try self.a.createLabel();
         const done = try self.a.createLabel();
+        var unaligned: ?Label = null;
         if (access_bytes > 1 and access_bytes <= 8) {
-            const unaligned = try self.a.createLabel();
+            const label = try self.a.createLabel();
             try self.emit(a64.logicalImmediate(.x64, .andop, t2, 1, access_bytes - 1).?);
-            try self.a.branchIfNonZero(.x64, t2, unaligned);
-            try self.emitTlbProbe(true, access_bytes, true, slow);
-            try self.emitOrderedScalar(true, size, 3, t4);
-            try self.a.branch(done);
-
-            self.a.placeLabel(unaligned);
-            try self.emitTlbProbe(true, access_bytes, false, slow);
-            try self.emitOrderedUnalignedScalarStore(size, t4);
-            try self.a.branch(done);
-        } else {
-            try self.emitTlbProbe(true, access_bytes, true, slow);
-            try self.emitOrderedScalar(true, size, 3, t4);
-            try self.a.branch(done);
+            try self.a.branchIfNonZero(.x64, t2, label);
+            unaligned = label;
         }
-        self.a.placeLabel(slow);
-        try self.emitCurrentIndex(index);
-        try self.emit(a64.mov(.x64, 0, r_state));
-        try self.a.loadConstant(2, @intFromEnum(size));
-        try self.emitCallHelper(helper_write_offset);
+        try self.emitTlbProbe(is_write, access_bytes, true, slow);
+        try self.emitOrderedScalar(is_write, size, data, t4);
         self.a.placeLabel(done);
+        try self.cold_memory.append(self.allocator, .{
+            .unaligned = unaligned,
+            .slow = slow,
+            .done = done,
+            .size = size,
+            .index = index,
+            .is_write = is_write,
+            .dest = if (is_write) 0 else data,
+            .nzcv_live = self.nzcv_live,
+        });
+        // The helper the miss calls may set `abort`; the instruction's own
+        // check stays on the hot path, as it was when the call was inline.
+        self.abort_unchecked = true;
+    }
+
+    /// Every probed access's unaligned path and helper call
+    /// (`emitProbedScalar`), after the block body, each branching back to
+    /// where its access completes.
+    fn emitColdMemory(self: *Compiler) Error!void {
+        var position: usize = 0;
+        while (position < self.cold_memory.items.len) : (position += 1) {
+            const cold = self.cold_memory.items[position];
+            self.nzcv_live = cold.nzcv_live;
+            defer self.nzcv_live = false;
+            const access_bytes = bits(cold.size) / 8;
+            if (cold.unaligned) |label| {
+                self.a.placeLabel(label);
+                try self.emitTlbProbe(cold.is_write, access_bytes, false, cold.slow);
+                if (cold.is_write) {
+                    try self.emitOrderedUnalignedScalarStore(cold.size, t4);
+                } else {
+                    try self.emitOrderedUnalignedScalarLoad(cold.size, cold.dest, t4);
+                }
+                try self.a.branch(cold.done);
+            }
+            self.a.placeLabel(cold.slow);
+            try self.emitCurrentIndex(cold.index);
+            try self.emit(a64.mov(.x64, 0, r_state));
+            try self.a.loadConstant(2, @intFromEnum(cold.size));
+            try self.emitCallHelper(if (cold.is_write) helper_write_offset else helper_read_offset);
+            if (!cold.is_write and cold.dest != 0) try self.emit(a64.mov(.x64, cold.dest, 0));
+            try self.a.branch(cold.done);
+        }
     }
 
     /// Leave the block after instruction `index` when a helper asked for it.
@@ -3482,7 +3629,9 @@ const Compiler = struct {
         // answer and is read next.
         try self.emitCacheLoad();
         // The interpreter may have moved the hoisted base register.
-        self.hoist_live = false;
+        for (&self.hoists) |*hoist| hoist.live = false;
+        self.zero_ymm = 0;
+        self.zero_zmm = 0;
         const stub = try self.exitStub(index + 1, null);
         try self.a.branchIfNonZero(.w32, 0, stub);
     }
@@ -3501,7 +3650,9 @@ const Compiler = struct {
         try self.a.loadConstant(2, call_return);
         try self.emitCallHelper(helper_import_transfer_offset);
         try self.emitCacheLoad();
-        self.hoist_live = false;
+        for (&self.hoists) |*hoist| hoist.live = false;
+        self.zero_ymm = 0;
+        self.zero_zmm = 0;
         try self.a.branchIfZero(.w32, 0, declined);
     }
 
@@ -3517,7 +3668,9 @@ const Compiler = struct {
         try self.a.loadConstant(2, index);
         try self.emitCallHelper(helper_x87_raw_transfer_offset);
         try self.emitCacheLoad();
-        self.hoist_live = false;
+        for (&self.hoists) |*hoist| hoist.live = false;
+        self.zero_ymm = 0;
+        self.zero_zmm = 0;
         const stub = try self.exitStub(index + 1, null);
         try self.a.branchIfNonZero(.w32, 0, stub);
     }
@@ -3530,128 +3683,125 @@ const Compiler = struct {
         try self.a.loadConstant(2, index);
         try self.emitCallHelper(helper_x87_memory_offset);
         try self.emitCacheLoad();
-        self.hoist_live = false;
+        for (&self.hoists) |*hoist| hoist.live = false;
+        self.zero_ymm = 0;
+        self.zero_zmm = 0;
         const stub = try self.exitStub(index + 1, null);
         try self.a.branchIfNonZero(.w32, 0, stub);
     }
 
     /// x1 = the effective address, then x0 = the operand read at `size`.
-    /// Choose the block's hoisting base: the guest register with the most
-    /// plain `[base+disp]` accesses, if there are at least two and their
-    /// displacements span no more than a page.
+    /// Select up to two independent spans: context plus stack, another
+    /// object, or constants. Indexed accesses retain their own probes.
     fn planHoist(self: *Compiler) void {
-        var counts: [16]u32 = @splat(0);
-        var low: [16]u64 = @splat(std.math.maxInt(u64));
-        var high: [16]u64 = @splat(0);
-        var stores: [16]bool = @splat(false);
+        const groups = 17; // sixteen guest registers plus absolute addresses
+        var counts: [groups]u32 = @splat(0);
+        var low: [groups]u64 = @splat(std.math.maxInt(u64));
+        var high: [groups]u64 = @splat(0);
+        var stores: [groups]bool = @splat(false);
         for (self.insns) |insn| {
             const candidate = hoistCandidate(insn) orelse continue;
-            const index: usize = @intFromEnum(candidate.base);
+            const index: usize = if (candidate.base) |base| @intFromEnum(base) else 16;
             counts[index] += 1;
             if (mayStoreMemoryOperand(insn.decoded.op)) stores[index] = true;
-            // Displacements as signed values shifted into unsigned order.
             const key = candidate.disp +% hoist_disp_bias;
             low[index] = @min(low[index], key);
             high[index] = @max(high[index], key +% candidate.bytes);
         }
-        var best: ?usize = null;
-        for (counts, 0..) |count, index| {
-            // One hoist costs about one probe, so two accesses already pay.
-            if (count < 2) continue;
-            if (high[index] -% low[index] > hoist_max_span) continue;
-            if (best == null or count > counts[best.?]) best = index;
-        }
-        const chosen = best orelse return;
-        self.hoist_base = @enumFromInt(chosen);
-        self.hoist_dmin = low[chosen] -% hoist_disp_bias;
-        self.hoist_span = high[chosen] -% low[chosen];
-        self.hoist_write = stores[chosen];
-        // Start the span on an 8-byte boundary of the base when that still
-        // fits: x29 then has the base's own alignment, which the hoist checks
-        // once, so every naturally aligned displacement after it needs no
-        // alignment guard of its own. Xenia's PowerPC context is
-        // page-aligned and nearly every access through rsi is aligned.
-        const slack = self.hoist_dmin & 7;
-        if (self.hoist_span + slack <= hoist_max_span) {
-            self.hoist_dmin -%= slack;
-            self.hoist_span += slack;
-            self.hoist_aligned = true;
+        for (&self.hoists, 0..) |*hoist, slot| {
+            var best: ?usize = null;
+            for (counts, 0..) |count, index| {
+                if (count < @as(u32, if (slot == 0) 2 else 4) or high[index] -% low[index] > hoist_max_span) continue;
+                if (best == null or count > counts[best.?]) best = index;
+            }
+            const chosen = best orelse break;
+            counts[chosen] = 0;
+            hoist.* = .{
+                .planned = true,
+                .base = if (chosen < 16) @enumFromInt(chosen) else null,
+                .dmin = low[chosen] -% hoist_disp_bias,
+                .span = high[chosen] -% low[chosen],
+                .write = stores[chosen],
+            };
+            const slack = hoist.dmin & 7;
+            if (hoist.span + slack <= hoist_max_span) {
+                hoist.dmin -%= slack;
+                hoist.span += slack;
+                hoist.aligned = true;
+            }
         }
     }
 
-    /// The offset from the hoisted host pointer for `insn`'s operand, when
-    /// the hoist is live and the whole `size`-byte access lies inside the
-    /// admitted span; null otherwise, and the ordinary probe runs.
-    fn hoistedOffset(self: *const Compiler, insn: Insn, size: Size) ?u64 {
+    fn hoistedOffset(self: *const Compiler, insn: Insn, size: Size) ?HoistedOffset {
         return self.hoistedOffsetBytes(insn, bits(size) / 8, 0);
     }
 
-    /// The same for an access of `bytes` bytes starting `extra` past the
-    /// operand's address (the upper half of a 256-bit move).
-    fn hoistedOffsetBytes(self: *const Compiler, insn: Insn, bytes: u64, extra: u64) ?u64 {
-        const base = self.hoist_base orelse return null;
-        if (!self.hoist_live) return null;
+    /// Find an admitted span containing this whole access, including the
+    /// upper half of a 256-bit operand. Zero host pointers use cold probes.
+    fn hoistedOffsetBytes(self: *const Compiler, insn: Insn, bytes: u64, extra: u64) ?HoistedOffset {
         const candidate = hoistCandidate(insn) orelse return null;
-        if (candidate.base != base) return null;
-        const offset = (candidate.disp -% self.hoist_dmin) +% extra;
-        if (offset > self.hoist_span or bytes > self.hoist_span - offset) return null;
-        return offset;
+        for (self.hoists, 0..) |hoist, slot| {
+            if (!hoist.planned or !hoist.live or candidate.base != hoist.base) continue;
+            const offset = (candidate.disp -% hoist.dmin) +% extra;
+            if (offset > hoist.span or bytes > hoist.span - offset) continue;
+            return .{ .slot = slot, .offset = offset };
+        }
+        return null;
     }
 
-    /// Before an instruction that will use the hoisted base, and only
-    /// between instructions - never inside a template's own branches -
-    /// translate `base + dmin` once: x29 gets its host address when the
-    /// write TLB admits the page and the whole span stays on it, zero
-    /// otherwise.
+    /// Resolve a span only when an instruction first uses it, including
+    /// after a base write or an internal edge that skipped its admission.
     fn maybeEmitHoist(self: *Compiler, insn: Insn) Error!void {
-        const base = self.hoist_base orelse return;
-        if (self.hoist_live) return;
         const candidate = hoistCandidate(insn) orelse return;
-        if (candidate.base != base) return;
-        const miss = try self.a.createLabel();
-        const done = try self.a.createLabel();
-        if (self.cachedRegister(base)) |host| {
-            try self.emitAddDisplacementFrom(1, host, self.hoist_dmin);
-        } else {
-            try self.a.loadConstant(1, self.hoist_dmin);
-            try self.loadReg(t0, base, false, .bits64);
-            try self.emit(a64.add(.x64, 1, 1, t0));
+        for (&self.hoists, 0..) |*hoist, slot| {
+            if (!hoist.planned or hoist.live or candidate.base != hoist.base) continue;
+            const miss = try self.a.createLabel();
+            const done = try self.a.createLabel();
+            if (hoist.base) |base| {
+                if (self.cachedRegister(base)) |host| {
+                    try self.emitAddDisplacementFrom(1, host, hoist.dmin);
+                } else {
+                    try self.a.loadConstant(1, hoist.dmin);
+                    try self.loadReg(t0, base, false, .bits64);
+                    try self.emit(a64.add(.x64, 1, 1, t0));
+                }
+            } else {
+                try self.a.loadConstant(1, hoist.dmin);
+            }
+            try self.emitTlbProbe(hoist.write, hoist.span, false, miss);
+            if (hoist.aligned) {
+                try self.emit(a64.logicalImmediate(.x64, .andop, t5, t4, 7).?);
+                try self.a.branchIfNonZero(.x64, t5, miss);
+            }
+            try self.emit(a64.mov(.x64, hoist_hosts[slot], t4));
+            try self.a.branch(done);
+            self.a.placeLabel(miss);
+            try self.emit(a64.mov(.x64, hoist_hosts[slot], 31));
+            self.a.placeLabel(done);
+            hoist.live = true;
         }
-        try self.emitTlbProbe(self.hoist_write, self.hoist_span, false, miss);
-        if (self.hoist_aligned) {
-            // A base off its 8-byte alignment takes the ordinary probe for
-            // every access this time; the accesses below trust it.
-            try self.emit(a64.logicalImmediate(.x64, .andop, t5, t4, 7).?);
-            try self.a.branchIfNonZero(.x64, t5, miss);
-        }
-        try self.emit(a64.mov(.x64, hoist_host, t4));
-        try self.a.branch(done);
-        self.a.placeLabel(miss);
-        try self.emit(a64.mov(.x64, hoist_host, 31));
-        self.a.placeLabel(done);
-        self.hoist_live = true;
     }
 
     /// The hot path of a hoisted access: x0 = the operand (read) or the
     /// operand = x3 (write) through x29, and a branch to the ordinary probe,
     /// emitted out of line, when x29 is zero.
-    fn emitHoistedAccess(self: *Compiler, insn: Insn, size: Size, index: u32, offset: u64, is_write: bool) Error!void {
+    fn emitHoistedAccess(self: *Compiler, insn: Insn, size: Size, index: u32, offset: HoistedOffset, is_write: bool) Error!void {
         return self.emitHoistedAccessAborting(insn, size, index, offset, is_write, false);
     }
 
     /// `last_effect`: nothing of the instruction remains after this access,
     /// so the out-of-line path checks `abort` itself and the hot path does
     /// not check it at all.
-    fn emitHoistedAccessAborting(self: *Compiler, insn: Insn, size: Size, index: u32, offset: u64, is_write: bool, last_effect: bool) Error!void {
+    fn emitHoistedAccessAborting(self: *Compiler, insn: Insn, size: Size, index: u32, offset: HoistedOffset, is_write: bool, last_effect: bool) Error!void {
         return self.emitHoistedAccessWith(insn, size, index, offset, is_write, last_effect, if (is_write) 3 else 0);
     }
 
     /// A hoisted access whose value is `data`: the register a load lands in
     /// or a store takes it from, which may be a guest register's cache.
-    fn emitHoistedAccessWith(self: *Compiler, insn: Insn, size: Size, index: u32, offset: u64, is_write: bool, last_effect: bool, data: a64.Reg) Error!void {
+    fn emitHoistedAccessWith(self: *Compiler, insn: Insn, size: Size, index: u32, offset: HoistedOffset, is_write: bool, last_effect: bool, data: a64.Reg) Error!void {
         const full = try self.a.createLabel();
         const resume_at = try self.a.createLabel();
-        try self.a.branchIfZero(.x64, hoist_host, full);
+        try self.a.branchIfZero(.x64, hoist_hosts[offset.slot], full);
         try self.emitHostAccess(is_write, size, data, offset, full);
         self.a.placeLabel(resume_at);
         const abort_exit: ?ColdAbortExit = if (last_effect) .{
@@ -3758,6 +3908,128 @@ const Compiler = struct {
     /// The flags a jump to `target` must find in `rflags`: the block's own
     /// live-in at that instruction when `target` is one of its instructions,
     /// every flag otherwise.
+    /// Find the conditional branches whose taken edge can jump to a later
+    /// instruction of this block instead of leaving it.
+    ///
+    /// Xenia follows every float conversion it emits - each PowerPC lfs,
+    /// frsp and stfs - with `cmp ; jbe` over a short NaN-payload fix-up,
+    /// and the common case takes the branch. A trace follows the
+    /// fall-through, so the common case left the block there: on Halo 3's
+    /// main thread a block ran about 25 instructions on average, and every
+    /// exit paid a cache write-back, a chain proof and an indirect branch,
+    /// and the next block a cache load and a hoist probe.
+    ///
+    /// An edge qualifies when its target is a later instruction of the
+    /// trace and no flag is live into it (`flag_live_in`, which counts
+    /// every way out of the block as reading all six): the taken edge then
+    /// owes no flag, so it jumps straight to the target. A branch to the
+    /// next instruction (`je +0`) becomes no branch at all. Skipped
+    /// instructions do not retire: `skip_reg` counts them for the exits.
+    fn planInternalEdges(self: *Compiler, allowed: bool) Error!void {
+        const count = self.insns.len;
+        self.internal_target = try self.allocator.alloc(?u32, count);
+        @memset(self.internal_target, null);
+        self.internal_label = try self.allocator.alloc(?Label, count);
+        @memset(self.internal_label, null);
+        self.internal_hoist = try self.allocator.alloc([hoist_hosts.len]bool, count);
+        @memset(self.internal_hoist, @splat(true));
+        self.internal_abort = try self.allocator.alloc(bool, count);
+        @memset(self.internal_abort, false);
+        if (!allowed) return;
+        for (self.insns) |insn| {
+            // Their templates use ip0 as a temporary.
+            if (insn.decoded.lock or insn.decoded.op == .cmpxchg16b_mem or insn.decoded.op == .cmpxchg8b_mem) return;
+        }
+        for (self.insns, 0..) |insn, index| {
+            const d = insn.decoded;
+            if (!isConditionalBranch(d.op) or insn.force_fallback or !isNative(d)) continue;
+            if (index + 1 >= count) continue;
+            // `internal_sources` names each source in one bit.
+            if (index >= @bitSizeOf(u128)) continue;
+            const target_rip = insn.rip +% d.len +% d.addr;
+            var target = index + 1;
+            while (target < count and self.insns[target].rip != target_rip) : (target += 1) {}
+            if (target >= count) continue;
+            if (target > index + 1) {
+                if (self.flag_live_in[target] != 0) continue;
+                self.uses_skip_counter = true;
+                if (self.internal_label[target] == null) self.internal_label[target] = try self.a.createLabel();
+            }
+            self.internal_target[index] = @intCast(target);
+        }
+    }
+
+    fn freeInternalEdges(self: *Compiler) void {
+        self.allocator.free(self.internal_target);
+        self.allocator.free(self.internal_label);
+        self.allocator.free(self.internal_hoist);
+        self.allocator.free(self.internal_abort);
+        self.internal_target = &.{};
+        self.internal_label = &.{};
+        self.internal_hoist = &.{};
+        self.internal_abort = &.{};
+    }
+
+    /// Where internal edges arrive: the fall-through and every jump to here
+    /// must agree on the state the code after assumes. x29 holds the hoist
+    /// only if it does on all of them, and an abort check any of them owes
+    /// is still owed.
+    fn placeInternalTarget(self: *Compiler, index: u32) void {
+        if (index >= self.internal_label.len) return;
+        const label = self.internal_label[index] orelse return;
+        if (self.fused != null or self.nzcv_live) self.internal_conflict = true;
+        self.a.placeLabel(label);
+        self.last_xmm = null;
+        self.zero_ymm = 0;
+        self.zero_zmm = 0;
+        for (&self.hoists, 0..) |*hoist, slot| hoist.live = hoist.live and self.internal_hoist[index][slot];
+        self.abort_unchecked = self.abort_unchecked or self.internal_abort[index];
+    }
+
+    /// The conditional branch at `index`, whose taken edge stays in the
+    /// block: to `target`, with `skip_reg` counting the instructions it
+    /// jumps over.
+    fn emitInternalBranch(self: *Compiler, index: u32, target: u32, d: DecodedInsn) Error!void {
+        const skipped: u64 = target - index - 1;
+        self.internal_edges += 1;
+        self.internal_sources |= @as(u128, 1) << @intCast(index);
+        if (skipped != 0) {
+            for (self.hoists, 0..) |hoist, slot| self.internal_hoist[target][slot] = self.internal_hoist[target][slot] and hoist.live;
+            self.internal_abort[target] = self.internal_abort[target] or self.abort_unchecked;
+        }
+        const label = if (skipped != 0) self.internal_label[target].? else null;
+        if (self.fused) |fused| {
+            // NZCV holds the writer's answer. The taken edge owes nothing
+            // (no flag is live at the target); the fall-through pays what
+            // the original template would have.
+            const condition = fusedCondition(fused.kind, d.cond).?;
+            if (label) |taken| {
+                try self.emitChecked(a64.addImm(.x64, t5, skip_reg, skipped));
+                try self.emit(a64.csel(.x64, skip_reg, t5, skip_reg, condition));
+                try self.a.branchCond(condition, taken);
+            }
+            self.fused_branches += 1;
+            if (fused.remaining == 1) {
+                self.fused = null;
+                self.nzcv_live = false;
+                try self.emitFusedFlags(fused, fused.writes & self.flag_live_fall[index]);
+            } else {
+                var rest = fused;
+                rest.remaining -= 1;
+                self.fused = rest;
+            }
+            return;
+        }
+        // The flags are in `rflags` already, which is all either edge needs.
+        const taken = label orelse return;
+        try self.loadFlags(t3);
+        try self.emitCondition(t4, t3, d.cond);
+        try self.emitChecked(a64.cmpImm(.w32, t4, 0));
+        try self.emitChecked(a64.addImm(.x64, t5, skip_reg, skipped));
+        try self.emit(a64.csel(.x64, skip_reg, t5, skip_reg, .ne));
+        try self.a.branchCond(.ne, taken);
+    }
+
     fn liveInAt(self: *const Compiler, target: u64) u8 {
         for (self.insns, 0..) |insn, position| {
             if (insn.rip == target) return self.flag_live_in[position];
@@ -3773,6 +4045,16 @@ const Compiler = struct {
             try self.emitChecked(a64.ldrImm(.doubleword, t1, r_scratch, scratch_fused_a_offset));
             try self.emitChecked(a64.ldrImm(.doubleword, t2, r_scratch, scratch_fused_b_offset));
             try self.emitChecked(a64.ldrImm(.doubleword, t0, r_scratch, scratch_fused_r_offset));
+        } else {
+            // Operands read in place: the flag derivation wants them in t1
+            // and t2, zero-extended at the writer's width.
+            const width = arm(fused.size);
+            if (fused.a_reg != t1) try self.emit(a64.mov(width, t1, fused.a_reg));
+            if (fused.b_imm) |imm| {
+                try self.a.loadConstant(t2, imm);
+            } else if (fused.b_reg != t2) {
+                try self.emit(a64.mov(width, t2, fused.b_reg));
+            }
         }
         switch (fused.kind) {
             .add => try self.emitArithmeticFlagsLive(.add, fused.size, t1, t2, t0, false, owed),
@@ -3826,11 +4108,11 @@ const Compiler = struct {
 
     /// A 128-bit access through the hoisted pointer, with the ordinary one
     /// out of line for when x29 is zero.
-    fn emitHoistedVector(self: *Compiler, insn: Insn, index: u32, v: a64.Reg, byte_offset: u32, offset: u64, is_write: bool) Error!void {
+    fn emitHoistedVector(self: *Compiler, insn: Insn, index: u32, v: a64.Reg, byte_offset: u32, offset: HoistedOffset, is_write: bool) Error!void {
         const full = try self.a.createLabel();
         const resume_at = try self.a.createLabel();
-        try self.a.branchIfZero(.x64, hoist_host, full);
-        try self.emitHostOffset(t5, hoist_host, offset);
+        try self.a.branchIfZero(.x64, hoist_hosts[offset.slot], full);
+        try self.emitHostOffset(t5, hoist_hosts[offset.slot], offset.offset);
         if (!self.hoistProvesAlignment(offset, 8)) {
             try self.emitOrderedVectorAccess(v, t5, is_write);
         } else if (is_write) {
@@ -3845,39 +4127,31 @@ const Compiler = struct {
         self.abort_unchecked = true;
     }
 
-    /// `data` to or from `[x29 + offset]` at `size`.
-    fn emitHostAccess(self: *Compiler, is_write: bool, size: Size, data: a64.Reg, offset: u64, slow: Label) Error!void {
-        const aligned = self.hoistProvesAlignment(offset, bits(size) / 8);
+    /// Ordered access through the selected span, with an alignment guard
+    /// only when the admission did not already prove it.
+    fn emitHostAccess(self: *Compiler, is_write: bool, size: Size, data: a64.Reg, selected: HoistedOffset, slow: Label) Error!void {
+        const offset = selected.offset;
+        const host = hoist_hosts[selected.slot];
+        const aligned = self.hoistProvesAlignment(selected, bits(size) / 8);
         if (aligned and offset != 0 and offset <= 255) {
-            // One ordered access with the offset folded in (FEAT_LRCPC2):
-            // Xenia's context fields sit within a few hundred bytes of the
-            // hoisted base, and each used to cost an `add` first.
             const ms = memSize(size);
             const offset_i: i64 = @intCast(offset);
-            try self.emitChecked(if (is_write) a64.stlur(ms, data, hoist_host, offset_i) else a64.ldapur(ms, data, hoist_host, offset_i));
+            try self.emitChecked(if (is_write) a64.stlur(ms, data, host, offset_i) else a64.ldapur(ms, data, host, offset_i));
             return;
         }
         if (offset == 0) {
-            if (!aligned) try self.emitHostAlignmentGuard(hoist_host, bits(size) / 8, slow);
-            try self.emitOrderedScalar(is_write, size, data, hoist_host);
+            if (!aligned) try self.emitHostAlignmentGuard(host, bits(size) / 8, slow);
+            try self.emitOrderedScalar(is_write, size, data, host);
             return;
         }
-        if (offset <= 4095) {
-            try self.emitChecked(a64.addImm(.x64, t5, hoist_host, @intCast(offset)));
-        } else {
-            try self.a.loadConstant(t5, offset);
-            try self.emit(a64.add(.x64, t5, hoist_host, t5));
-        }
+        try self.emitHostOffset(t5, host, offset);
         if (!aligned) try self.emitHostAlignmentGuard(t5, bits(size) / 8, slow);
         try self.emitOrderedScalar(is_write, size, data, t5);
     }
 
-    /// Whether `x29 + offset` is aligned to `bytes` without a guard: the
-    /// hoist checked x29 is 8-aligned, so a displacement aligned to an
-    /// access of at most 8 bytes keeps it aligned.
-    fn hoistProvesAlignment(self: *const Compiler, offset: u64, bytes: u64) bool {
-        if (!self.hoist_aligned or bytes > 8) return false;
-        return bytes <= 1 or offset % bytes == 0;
+    fn hoistProvesAlignment(self: *const Compiler, selected: HoistedOffset, bytes: u64) bool {
+        if (!self.hoists[selected.slot].aligned or bytes > 8) return false;
+        return bytes <= 1 or selected.offset % bytes == 0;
     }
 
     /// A load straight into `dest` (a guest register's cache): no trip
@@ -3895,8 +4169,8 @@ const Compiler = struct {
     /// through the hoist straight from `value`, otherwise through x3, the
     /// write helper's argument.
     fn emitStoreValueLast(self: *Compiler, insn: Insn, size: Size, index: u32, value: a64.Reg, last_effect: bool) Error!void {
-        if (self.hoist_write) {
-            if (self.hoistedOffset(insn, size)) |offset| {
+        if (self.hoistedOffset(insn, size)) |offset| {
+            if (self.hoists[offset.slot].write) {
                 try self.emitHoistedAccessWith(insn, size, index, offset, true, last_effect, value);
                 return;
             }
@@ -3911,7 +4185,13 @@ const Compiler = struct {
     /// FTZ | DAZ, RMode is RC with its two bits swapped. The translated
     /// arithmetic that follows obeys FPCR, not the stored field.
     fn emitMxcsrToFpcr(self: *Compiler) Error!void {
+        // Write FPCR only when FZ or RMode change. `msr fpcr` synchronises:
+        // it waits for the stores in flight even when the value is the one
+        // already there. The comparison uses no flags, so it is safe inside
+        // anything that keeps NZCV live.
+        const unchanged = try self.a.createLabel();
         try self.emit(a64.mrsFpcr(t1));
+        try self.emit(a64.mov(.x64, t3, t1));
         try self.emit(a64.ubfx(.w32, t0, 0, 15, 1));
         try self.emit(a64.ubfx(.w32, t2, 0, 6, 1));
         try self.emit(a64.orrReg(.w32, t0, t0, t2));
@@ -3920,7 +4200,13 @@ const Compiler = struct {
         try self.emit(a64.bfi(.x64, t1, t0, 22, 1));
         try self.emit(a64.ubfx(.w32, t0, 0, 13, 1));
         try self.emit(a64.bfi(.x64, t1, t0, 23, 1));
+        try self.emit(a64.eorReg(.x64, t3, t3, t1));
+        try self.a.branchIfZero(.x64, t3, unchanged);
         try self.emit(a64.msrFpcr(t1));
+        try self.emitChecked(a64.ldrImm(.doubleword, t3, r_scratch, scratch_fpcr_writes_offset));
+        try self.emitChecked(a64.addImm(.x64, t3, t3, 1));
+        try self.emitChecked(a64.strImm(.doubleword, t3, r_scratch, scratch_fpcr_writes_offset));
+        self.a.placeLabel(unchanged);
     }
 
     fn emitLoadOperand(self: *Compiler, insn: Insn, size: Size, index: u32) Error!void {
@@ -3952,8 +4238,8 @@ const Compiler = struct {
 
     /// `emitStoreX3` for a store that is its instruction's last effect.
     fn emitStoreX3Last(self: *Compiler, insn: Insn, size: Size, index: u32, last_effect: bool) Error!void {
-        if (self.hoist_write) {
-            if (self.hoistedOffset(insn, size)) |offset| {
+        if (self.hoistedOffset(insn, size)) |offset| {
+            if (self.hoists[offset.slot].write) {
                 try self.emitHoistedAccessAborting(insn, size, index, offset, true, last_effect);
                 return;
             }
@@ -3966,6 +4252,16 @@ const Compiler = struct {
         const insn = self.insns[index];
         const d = insn.decoded;
         self.current = index;
+        // Only these templates load all their inputs before producing v0,
+        // and keep it through their final upper clear. Every other template
+        // discards the forwarding fact before emitting anything.
+        self.forward_xmm = !insn.force_fallback and isVectorNative(d) and d.is_reg_form and !d.vector_256 and
+            (packedIntegerForm(d.op) != null or packedFloatForm(d.op) != null or bitwiseForm(d.op) != null or unpackForm(d.op) != null or (d.op == .vmovdqu_xmm_xmm or d.op == .vmovdqa_xmm_xmm or d.op == .vmovups_xmm_xmm or d.op == .vmovaps_xmm_xmm or d.op == .vmovupd_xmm_xmm or d.op == .vmovapd_xmm_xmm));
+        if (!self.forward_xmm) self.last_xmm = null;
+        if (isConditionalBranch(d.op)) {
+            self.zero_ymm = 0;
+            self.zero_zmm = 0;
+        }
         try self.maybeEmitHoist(insn);
         self.emit_flags = self.flag_wants[index];
         self.emit_flag_mask = self.flag_live[index];
@@ -4167,6 +4463,22 @@ const Compiler = struct {
                 try self.emitAbortCheck(index);
             },
             .lea_reg_mem => {
+                // Straight into a cached destination, unless the address
+                // still has to read that register as its index after the
+                // base has been written there. Xenia forms every guest
+                // address with a displacement this way, `lea edx, [r13d+0x60]`.
+                if (self.cachedWhole(d.dst_reg, false, d.size)) |host| {
+                    const index_host: ?a64.Reg = if (d.sib_has_index) self.cachedRegister(d.sib_index_reg) else null;
+                    if (index_host == null or index_host.? != host) {
+                        try self.emitEffectiveAddress(host, insn);
+                        // A 32-bit address-size operand ends its address
+                        // already truncated, unless a segment base follows.
+                        const truncated = d.has_0x67 and insn.segment != .fs and insn.segment != .gs;
+                        if (d.size == .bits32 and !truncated) try self.emit(a64.mov(.w32, host, host));
+                        self.noteDirectWrite(d.dst_reg);
+                        return .native;
+                    }
+                }
                 try self.emitEffectiveAddress(t1, insn);
                 try self.storeReg(d.dst_reg, false, d.size, t1);
             },
@@ -4437,6 +4749,12 @@ const Compiler = struct {
                 }
             },
             .jcc_rel8, .jcc_rel32 => {
+                if (index < self.internal_target.len) {
+                    if (self.internal_target[index]) |target_index| {
+                        try self.emitInternalBranch(index, target_index, d);
+                        return .native;
+                    }
+                }
                 // The decoder keeps the displacement in `addr` for jcc.
                 const next = insn.rip +% d.len;
                 const target = next +% d.addr;
@@ -4654,6 +4972,9 @@ const Compiler = struct {
             if (!writes) return;
             if (try self.emitGroup1Direct(op, d, shape)) return;
         }
+        if (!writes and (shape == .reg_reg or shape == .reg_imm)) {
+            if (try self.emitFusedCompareDirect(op, d, index, shape)) return;
+        }
         switch (shape) {
             .reg_reg => {
                 try self.loadReg(t1, d.dst_reg, d.dst_high8, size);
@@ -4702,6 +5023,69 @@ const Compiler = struct {
         }
     }
 
+    /// A `cmp` or `test` that starts a fused run, with its operands read
+    /// where they are: a cached guest register in place, an immediate in
+    /// the instruction. Xenia guards every guest memory access with
+    /// `cmp r32, esi ; jae` and compiles every PowerPC compare-and-branch
+    /// to a `cmp` or `test` and a `jcc`; each copied both operands into t1
+    /// and t2 for the flag derivation that only an exit owing flags runs.
+    /// That copy now happens there (`emitFusedFlags`). Not when a reader
+    /// of the run writes one of the operands' registers, so a later exit
+    /// would see the new value, nor when the run saves its operands for a
+    /// memory reader. Returns false, having emitted nothing, otherwise.
+    fn emitFusedCompareDirect(self: *Compiler, op: BinaryOp, d: DecodedInsn, index: u32, shape: BinaryShape) Error!bool {
+        var fused = self.fuse_pending orelse return false;
+        if (fused.saved) return false;
+        const size = d.size;
+        if (size != .bits32 and size != .bits64) return false;
+        const width = arm(size);
+        const a_cached = self.cachedWhole(d.dst_reg, d.dst_high8, size);
+        const b_cached: ?a64.Reg = if (shape == .reg_reg) self.cachedWhole(d.src_reg, d.src_high8, size) else null;
+        // Nothing to save: both operands would be loaded into t1 and t2.
+        if (shape == .reg_reg and a_cached == null and b_cached == null) return false;
+        if (a_cached != null and self.fusedRunWrites(index, fused.remaining, d.dst_reg)) return false;
+        if (b_cached != null and self.fusedRunWrites(index, fused.remaining, d.src_reg)) return false;
+        const a: a64.Reg = a_cached orelse t1;
+        var word: u32 = undefined;
+        switch (shape) {
+            .reg_reg => {
+                const b = b_cached orelse t2;
+                word = if (op == .cmp) a64.subs(width, t0, a, b) else a64.logicalShifted(width, .ands, t0, a, b, 0);
+                fused.b_reg = b;
+            },
+            .reg_imm => {
+                const imm = immediateValue(d) & maskFor(size);
+                word = (if (op == .cmp) a64.subsImm(width, t0, a, imm) else a64.logicalImmediate(width, .ands, t0, a, imm)) orelse return false;
+                fused.b_imm = imm;
+            },
+            else => return false,
+        }
+        if (a_cached == null) try self.loadReg(t1, d.dst_reg, d.dst_high8, size);
+        if (shape == .reg_reg and b_cached == null) try self.loadReg(t2, d.src_reg, d.src_high8, size);
+        try self.emit(word);
+        fused.a_reg = a;
+        try self.beginFusedRun(fused);
+        return true;
+    }
+
+    /// Whether a reader of the fused run after the writer at `index` writes
+    /// guest register `id` (`setcc` into its byte, `cmovcc` into it).
+    fn fusedRunWrites(self: *const Compiler, index: u32, remaining: u8, id: RegId) bool {
+        var position = index + 1;
+        var left = remaining;
+        while (left > 0 and position < self.insns.len) : ({
+            position += 1;
+            left -= 1;
+        }) {
+            const reader = self.insns[position].decoded;
+            switch (reader.op) {
+                .setcc_reg8, .cmovcc_reg_reg, .cmovcc_reg_mem => if (reader.dst_reg == id) return true,
+                else => {},
+            }
+        }
+        return false;
+    }
+
     /// The host register caching guest `id`, for a whole 32- or 64-bit
     /// access; null when it is not cached or the access merges.
     fn cachedWhole(self: *const Compiler, id: RegId, high8: bool, size: Size) ?a64.Reg {
@@ -4714,8 +5098,9 @@ const Compiler = struct {
     /// cache register, which `storeReg` would otherwise have done.
     fn noteDirectWrite(self: *Compiler, id: RegId) void {
         self.use_counts[@intFromEnum(id)] +|= 1;
-        if (self.hoist_base) |base| {
-            if (base == id) self.hoist_live = false;
+        self.written |= @as(u16, 1) << @intFromEnum(id);
+        for (&self.hoists) |*hoist| {
+            if (hoist.base == id) hoist.live = false;
         }
     }
 
@@ -5991,11 +6376,20 @@ const Compiler = struct {
     }
 
     fn loadXmm(self: *Compiler, v: a64.Reg, index: u8) Error!void {
+        if (self.forward_xmm and self.last_xmm == index) {
+            if (v != v0) try self.emit(a64.vmov(v, v0));
+            self.xmm_loads_forwarded += 1;
+            return;
+        }
+        if (v == v0) self.last_xmm = null;
         try self.emitChecked(a64.vldrQ(v, r_spare, xmmOffset(index)));
     }
 
     fn storeXmm(self: *Compiler, index: u8, v: a64.Reg) Error!void {
+        // Still publish every architectural result to its private register
+        // file. Forwarding saves a subsequent load, never delays a write.
         try self.emitChecked(a64.vstrQ(v, r_spare, xmmOffset(index)));
+        self.last_xmm = if (self.forward_xmm and v == v0) index else null;
     }
 
     fn loadYmmHigh(self: *Compiler, v: a64.Reg, index: u8) Error!void {
@@ -6004,6 +6398,7 @@ const Compiler = struct {
     }
 
     fn storeYmmHigh(self: *Compiler, index: u8, v: a64.Reg) Error!void {
+        self.zero_ymm &= ~(@as(u32, 1) << @intCast(index));
         try self.emitRegisterFileAddress(t0, .ymm_hi, xmmOffset(index));
         try self.emitChecked(a64.vstrQ(v, t0, 0));
     }
@@ -6103,13 +6498,22 @@ const Compiler = struct {
     /// files are addressed from the state base: a Zig struct's fields may be
     /// laid out in any order, so nothing assumes they follow `xmm`.
     fn clearUpper(self: *Compiler, index: u8, op: Op) Error!void {
+        const bit = @as(u32, 1) << @intCast(index);
+        const ymm = self.zero_ymm & bit == 0;
+        const zmm = evexRouted(op) and self.zero_zmm & bit == 0;
+        if (!ymm) self.upper_clears_elided += 1;
+        if (!ymm and !zmm) return;
         try self.emit(a64.vmoviZero(v7));
-        try self.emitRegisterFileAddress(t0, .ymm_hi, xmmOffset(index));
-        try self.emitChecked(a64.vstrQ(v7, t0, 0));
-        if (evexRouted(op)) {
+        if (ymm) {
+            try self.emitRegisterFileAddress(t0, .ymm_hi, xmmOffset(index));
+            try self.emitChecked(a64.vstrQ(v7, t0, 0));
+            self.zero_ymm |= bit;
+        }
+        if (zmm) {
             try self.emitRegisterFileAddress(t0, .zmm_hi, @as(u32, index) * 32);
             try self.emitChecked(a64.vstrQ(v7, t0, 0));
             try self.emitChecked(a64.vstrQ(v7, t0, 16));
+            self.zero_zmm |= bit;
         }
     }
 
@@ -6156,8 +6560,9 @@ const Compiler = struct {
 
     fn emitStoreVecOffset(self: *Compiler, insn: Insn, index: u32, v: a64.Reg, byte_offset: u32) Error!void {
         const non_temporal = insn.decoded.op == .vmovntps or insn.decoded.op == .vmovntdq;
-        if (!non_temporal and self.hoist_write) {
+        if (!non_temporal) {
             if (self.hoistedOffsetBytes(insn, 16, byte_offset)) |offset| {
+                if (!self.hoists[offset.slot].write) return self.emitStoreVecProbed(insn, index, v, byte_offset);
                 try self.emitHoistedVector(insn, index, v, byte_offset, offset, true);
                 return;
             }
@@ -7245,6 +7650,7 @@ const Compiler = struct {
                 for (0..32) |register| {
                     try self.emitChecked(a64.vstrQ(v7, t0, xmmOffset(@intCast(register))));
                 }
+                self.zero_ymm = std.math.maxInt(u32);
             },
             else => return false,
         }
@@ -7272,6 +7678,9 @@ pub const Options = struct {
     /// Every exit leaves all six flags in `rflags`, even a back-edge into
     /// the block whose target reads fewer.
     exact_exit_flags: bool = false,
+    /// Let a conditional branch to a later instruction of the block jump
+    /// there instead of leaving (`planInternalEdges`).
+    internal_edges: bool = true,
 };
 
 /// Whether `op` transfers into or back out of a function.
@@ -7386,31 +7795,51 @@ pub fn compileWith(allocator: std.mem.Allocator, memory: *CodeMemory, layout: La
     // where a scan of the decoded operands would not be. The second pass
     // caches the busiest of them in host registers and emits for real.
     var counts: [16]u32 = @splat(0);
+    var written: u16 = 0xFFFF;
     // A register-only block is cross-checked against the interpreter on
     // its first run, register by register and flag by flag, so its exits
     // owe every flag; any other block's back-edge owes only what the code
     // at its target reads.
     var exact_exit_flags = false;
+    var allow_internal = options.internal_edges;
     {
         var scratch_assembler = Assembler.init(allocator);
         defer scratch_assembler.deinit();
-        var counting = try emitBlock(allocator, &scratch_assembler, layout, insns, end_rip, wants, live, live_block, live_fall, live_in, null, options);
+        var counting = try emitBlock(allocator, &scratch_assembler, layout, insns, end_rip, wants, live, live_block, live_fall, live_in, null, 0xFFFF, allow_internal, options);
         defer counting.compiler.exits.deinit(allocator);
         defer counting.compiler.cold_accesses.deinit(allocator);
+        defer counting.compiler.cold_memory.deinit(allocator);
         defer counting.compiler.fused_exits.deinit(allocator);
+        defer counting.compiler.freeInternalEdges();
         counts = counting.compiler.use_counts;
+        written = counting.compiler.written;
         const first = &counting.compiler;
         exact_exit_flags = !first.touches_memory and !first.touches_vectors and !first.touches_x87 and first.fallback_count == 0;
+        if (first.internal_conflict) allow_internal = false;
     }
 
     var assembler = Assembler.init(allocator);
     defer assembler.deinit();
     var exits = options;
     exits.exact_exit_flags = exits.exact_exit_flags or exact_exit_flags;
-    var pass = try emitBlock(allocator, &assembler, layout, insns, end_rip, wants, live, live_block, live_fall, live_in, counts, exits);
+    var pass = try emitBlock(allocator, &assembler, layout, insns, end_rip, wants, live, live_block, live_fall, live_in, counts, written, allow_internal, exits);
+    if (pass.compiler.internal_conflict) {
+        // The same flag decisions as the counting pass, so this should not
+        // happen; if it does, the block is emitted without internal edges.
+        pass.compiler.exits.deinit(allocator);
+        pass.compiler.cold_accesses.deinit(allocator);
+        pass.compiler.cold_memory.deinit(allocator);
+        pass.compiler.fused_exits.deinit(allocator);
+        pass.compiler.freeInternalEdges();
+        assembler.deinit();
+        assembler = Assembler.init(allocator);
+        pass = try emitBlock(allocator, &assembler, layout, insns, end_rip, wants, live, live_block, live_fall, live_in, counts, written, false, exits);
+    }
     defer pass.compiler.exits.deinit(allocator);
     defer pass.compiler.cold_accesses.deinit(allocator);
+    defer pass.compiler.cold_memory.deinit(allocator);
     defer pass.compiler.fused_exits.deinit(allocator);
+    defer pass.compiler.freeInternalEdges();
     const words = try assembler.finish();
 
     const code = try memory.reserve(words.len);
@@ -7433,6 +7862,10 @@ pub fn compileWith(allocator: std.mem.Allocator, memory: *CodeMemory, layout: La
         .fused_runs = pass.compiler.fused_runs,
         .cached_registers = pass.compiler.cache_count,
         .hoisted_accesses = pass.compiler.hoisted_accesses,
+        .internal_edges = pass.compiler.internal_edges,
+        .internal_sources = pass.compiler.internal_sources,
+        .upper_clears_elided = pass.compiler.upper_clears_elided,
+        .xmm_loads_forwarded = pass.compiler.xmm_loads_forwarded,
     };
 }
 
@@ -7455,6 +7888,8 @@ fn emitBlock(
     live_fall: []const u8,
     live_in: []const u8,
     cache_counts: ?[16]u32,
+    cache_written: u16,
+    allow_internal: bool,
     options: Options,
 ) Error!EmittedBlock {
     var compiler = Compiler{
@@ -7477,9 +7912,13 @@ fn emitBlock(
     };
     errdefer compiler.exits.deinit(allocator);
     errdefer compiler.cold_accesses.deinit(allocator);
+    errdefer compiler.cold_memory.deinit(allocator);
     errdefer compiler.fused_exits.deinit(allocator);
+    compiler.cache_written = cache_written;
     if (cache_counts) |counts| compiler.chooseCache(counts);
     compiler.planHoist();
+    try compiler.planInternalEdges(allow_internal);
+    errdefer compiler.freeInternalEdges();
 
     try compiler.emitPrologue();
     // Where a chained block enters: the frame is already established and
@@ -7488,8 +7927,10 @@ fn emitBlock(
     // has to load its own cache just as an entered one does.
     const chain_entry_bytes: u32 = @intCast(assembler.words.items.len * @sizeOf(u32));
     try compiler.emitCacheLoad();
+    if (compiler.uses_skip_counter) try assembler.emit(a64.mov(.x64, skip_reg, a64.xzr));
     var terminated = false;
     for (insns, 0..) |insn, index| {
+        compiler.placeInternalTarget(@intCast(index));
         const emitted = try compiler.emitInsn(@intCast(index));
         const op = insn.decoded.op;
         if (isTerminator(op) or isFallbackTerminator(op)) {
@@ -7517,6 +7958,7 @@ fn emitBlock(
         try assembler.branch(stub);
     }
     try compiler.emitColdAccesses();
+    try compiler.emitColdMemory();
     try compiler.emitFusedExits();
     try compiler.emitExitStubs();
     try compiler.emitChainAttempt();
@@ -7547,6 +7989,7 @@ const TestState = struct {
     writes: u32 = 0,
     non_temporal_writes: u32 = 0,
     interprets: u32 = 0,
+    poison_upper_on_interpret: bool = false,
     x87_fast_helpers: u32 = 0,
     x87_memory_helpers: u32 = 0,
     flag_completions: u32 = 0,
@@ -7739,6 +8182,10 @@ const TestState = struct {
         const state: *TestState = @ptrCast(@alignCast(state_ptr));
         flags(state_ptr);
         state.interprets += 1;
+        if (state.poison_upper_on_interpret) {
+            state.ymm_hi[0] = @splat(0xA5);
+            state.zmm_hi[0] = @splat(0xC7);
+        }
         state.last_interpret_index = index;
         state.flags_at_interpret = state.regs.rflags;
         // The scratch index must agree with the argument.
@@ -9618,6 +10065,254 @@ test "plain [base+disp] accesses share one hoisted page translation and stay cor
     try testing.expectEqual(@as(u64, 2), state.regs.rdx);
     try testing.expectEqual(@as(u64, 3), state.regs.rcx);
     try testing.expectEqual(@as(u64, 4), state.regs.r8);
+}
+
+test "two hoisted pages survive helpers and independent base writes with separate read/write admissions" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    // Context in rbx and another object in rsi. An indexed load between
+    // them misses the page, calls C and overwrites x30's link register.
+    for (0..3) |i| try h.add(0x1000 + i * 4, 4, baseDisp(.mov_reg64_mem64, .bits64, .al_ax_eax_rax, i * 8));
+    var secondary = baseDispAt(.mov_reg64_mem64, .bits64, .dh_si_esi_rsi, 0);
+    secondary.dst_reg = .dl_dx_edx_rdx;
+    try h.add(0x100C, 4, secondary);
+    var miss = baseDisp(.mov_reg64_mem64, .bits64, .r9b_r9w_r9d_r9, 0x3000);
+    miss.sib_has_index = true;
+    miss.sib_index_reg = .cl_cx_ecx_rcx;
+    try h.add(0x1010, 4, miss);
+    secondary.addr = 8;
+    secondary.dst_reg = .r8b_r8w_r8d_r8;
+    try h.add(0x1014, 4, secondary);
+    // Updating only rsi must re-admit the second span.
+    try h.add(0x1018, 4, regImm(.add_reg64_imm32, .bits64, .dh_si_esi_rsi, 0x100));
+    secondary.addr = 0;
+    secondary.dst_reg = .r10b_r10w_r10d_r10;
+    try h.add(0x101C, 4, secondary);
+    secondary = baseDispAt(.mov_mem64_reg64, .bits64, .dh_si_esi_rsi, 16);
+    secondary.src_reg = .r8b_r8w_r8d_r8;
+    try h.add(0x1020, 4, secondary);
+    try h.add(0x1024, 4, baseDisp(.mov_reg64_mem64, .bits64, .al_ax_eax_rax, 16));
+    const compiled = try compile(testing.allocator, &h.memory, TestState.layout, h.insns.items, 0x1028);
+    try testing.expectEqual(@as(u32, 8), compiled.hoisted_accesses);
+    for ([_]bool{ true, false }) |admitted| {
+        var state = TestState{};
+        // A read-only TLB admission cannot satisfy the secondary store.
+        state.admitMemory(admitted, false);
+        state.regs.rbx = 0x100;
+        state.regs.rsi = 0x300;
+        std.mem.writeInt(u64, state.memory[0x110..][0..8], 11, .little);
+        std.mem.writeInt(u64, state.memory[0x300..][0..8], 22, .little);
+        std.mem.writeInt(u64, state.memory[0x308..][0..8], 33, .little);
+        std.mem.writeInt(u64, state.memory[0x400..][0..8], 44, .little);
+        try testing.expectEqual(@as(u32, 10), try h.run(&state));
+        try testing.expectEqual(@as(u64, 11), state.regs.rax);
+        try testing.expectEqual(@as(u64, 22), state.regs.rdx);
+        try testing.expectEqual(@as(u64, 33), state.regs.r8);
+        try testing.expectEqual(@as(u64, 44), state.regs.r10);
+        try testing.expectEqual(@as(u64, 33), std.mem.readInt(u64, state.memory[0x410..][0..8], .little));
+        try testing.expectEqual(@as(u32, 1), state.writes);
+    }
+    // Both admitted: the helper still overwrites LR, but the next read
+    // uses the saved pointer and the write needs no helper.
+    var direct = TestState{};
+    direct.admitMemory(true, true);
+    direct.regs.rbx = 0x100;
+    direct.regs.rsi = 0x300;
+    std.mem.writeInt(u64, direct.memory[0x308..][0..8], 99, .little);
+    _ = try h.run(&direct);
+    try testing.expectEqual(@as(u64, 99), direct.regs.r8);
+    try testing.expectEqual(@as(u32, 1), direct.reads);
+    try testing.expectEqual(@as(u32, 0), direct.writes);
+}
+
+test "absolute and RIP-relative loads share a second hoisted span" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    for (0..3) |i| try h.add(0x1000 + i * 4, 4, baseDisp(.mov_reg64_mem64, .bits64, .al_ax_eax_rax, i * 8));
+    try h.add(0x100C, 8, .{ .op = .mov_reg64_mem64, .size = .bits64, .dst_reg = .dl_dx_edx_rdx, .addr = 0x300 });
+    try h.add(0x1014, 7, .{ .op = .mov_reg64_mem64, .size = .bits64, .dst_reg = .r8b_r8w_r8d_r8, .rip_relative = true, .addr = 0x308 -% @as(u64, 0x101B) });
+    try h.add(0x101B, 4, baseDisp(.mov_reg64_mem64, .bits64, .r12b_r12w_r12d_r12, 16));
+    try h.add(0x101F, 8, .{ .op = .mov_reg64_mem64, .size = .bits64, .dst_reg = .r10b_r10w_r10d_r10, .addr = 0x300 });
+    try h.add(0x1027, 8, .{ .op = .mov_reg64_mem64, .size = .bits64, .dst_reg = .r11b_r11w_r11d_r11, .addr = 0x308 });
+    const compiled = try compile(testing.allocator, &h.memory, TestState.layout, h.insns.items, 0x102F);
+    try testing.expectEqual(@as(u32, 8), compiled.hoisted_accesses);
+    for ([_]bool{ true, false }) |admitted| {
+        var state = TestState{};
+        state.admitMemory(admitted, false);
+        state.regs.rbx = 0x100;
+        std.mem.writeInt(u64, state.memory[0x300..][0..8], 123, .little);
+        std.mem.writeInt(u64, state.memory[0x308..][0..8], 456, .little);
+        _ = try h.run(&state);
+        try testing.expectEqual(@as(u64, 123), state.regs.rdx);
+        try testing.expectEqual(@as(u64, 456), state.regs.r8);
+        try testing.expectEqual(@as(u32, if (admitted) 0 else 8), state.reads);
+    }
+}
+
+test "internal edges skipping the second hoist re-admit it at the target" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    for (0..3) |i| try h.add(0x1000 + i * 4, 4, baseDisp(.mov_reg64_mem64, .bits64, .al_ax_eax_rax, i * 8));
+    try h.add(0x100C, 3, regImm(.cmp_reg64_imm32, .bits64, .cl_cx_ecx_rcx, 0));
+    try h.add(0x100F, 2, .{ .op = .jcc_rel8, .cond = .e, .addr = 4 });
+    var load = baseDispAt(.mov_reg64_mem64, .bits64, .dh_si_esi_rsi, 0);
+    load.dst_reg = .dl_dx_edx_rdx;
+    try h.add(0x1011, 4, load);
+    load.dst_reg = .r8b_r8w_r8d_r8;
+    load.addr = 8;
+    try h.add(0x1015, 4, load);
+    try h.add(0x1019, 4, load);
+    try h.add(0x101D, 4, load);
+    try h.add(0x1021, 4, baseDisp(.mov_reg64_mem64, .bits64, .al_ax_eax_rax, 16));
+    try h.add(0x1025, 4, regImm(.add_reg64_imm32, .bits64, .r8b_r8w_r8d_r8, 1));
+    const compiled = try compile(testing.allocator, &h.memory, TestState.layout, h.insns.items, 0x1029);
+    try testing.expectEqual(@as(u32, 1), compiled.internal_edges);
+    for ([_]bool{ true, false }) |take| {
+        var state = TestState{};
+        state.admitMemory(true, false);
+        state.regs.rbx = 0x100;
+        state.regs.rsi = 0x300;
+        state.regs.rcx = @intFromBool(!take);
+        state.regs.rdx = 777;
+        std.mem.writeInt(u64, state.memory[0x300..][0..8], 123, .little);
+        std.mem.writeInt(u64, state.memory[0x308..][0..8], 456, .little);
+        try testing.expectEqual(@as(u32, if (take) 10 else 11), try h.run(&state));
+        try testing.expectEqual(@as(u64, if (take) 777 else 123), state.regs.rdx);
+        try testing.expectEqual(@as(u64, 457), state.regs.r8);
+    }
+}
+
+test "redundant upper clears are elided but a YMM write requires a fresh clear" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    const narrow: DecodedInsn = .{ .op = .vmovups_xmm_xmm, .size = .bits64, .xmm_dst = 0, .xmm_src = 1, .is_reg_form = true };
+    for (0..4) |i| try h.add(0x1000 + i * 4, 4, narrow);
+    const wide: DecodedInsn = .{ .op = .vmovups_ymm_ymm, .size = .bits64, .xmm_dst = 0, .xmm_src = 2, .is_reg_form = true, .vector_256 = true };
+    try h.add(0x1010, 4, wide);
+    try h.add(0x1014, 4, narrow);
+    try h.add(0x1018, 4, narrow);
+    const compiled = try compile(testing.allocator, &h.memory, TestState.layout, h.insns.items, 0x101C);
+    try testing.expectEqual(@as(u32, 4), compiled.upper_clears_elided);
+    var state = TestState{};
+    state.xmm[1] = @splat(0x11);
+    state.ymm_hi[0] = @splat(0xA5);
+    state.ymm_hi[2] = @splat(0xB6);
+    state.zmm_hi[0] = @splat(0xC7);
+    _ = try h.run(&state);
+    try testing.expectEqualSlices(u8, &([_]u8{0x11} ** 16), &state.xmm[0]);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &state.ymm_hi[0]);
+    // MOVUPS is not routed to EVEX: its existing ZMM preservation remains.
+    try testing.expectEqualSlices(u8, &([_]u8{0xC7} ** 32), &state.zmm_hi[0]);
+}
+
+test "upper clear knowledge does not cross a conditional edge that skips its writer" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    try h.add(0x1000, 3, regImm(.cmp_reg64_imm32, .bits64, .al_ax_eax_rax, 0));
+    try h.add(0x1003, 2, .{ .op = .jcc_rel8, .cond = .e, .addr = 4 });
+    const narrow: DecodedInsn = .{ .op = .vmovups_xmm_xmm, .size = .bits64, .xmm_dst = 0, .xmm_src = 1, .is_reg_form = true };
+    try h.add(0x1005, 4, narrow);
+    try h.add(0x1009, 4, narrow);
+    try h.add(0x100D, 4, regImm(.add_reg64_imm32, .bits64, .cl_cx_ecx_rcx, 1));
+    const compiled = try compile(testing.allocator, &h.memory, TestState.layout, h.insns.items, 0x1011);
+    try testing.expectEqual(@as(u32, 1), compiled.internal_edges);
+    for ([_]u64{ 0, 1 }) |condition| {
+        var state = TestState{};
+        state.regs.rax = condition;
+        state.xmm[1] = @splat(0x11);
+        state.ymm_hi[0] = @splat(0xA5);
+        _ = try h.run(&state);
+        try testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &state.ymm_hi[0]);
+        try testing.expectEqualSlices(u8, &state.xmm[1], &state.xmm[0]);
+    }
+}
+
+test "upper clears keep YMM and ZMM proofs separate and discard them after interpreter calls" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    const move: DecodedInsn = .{ .op = .vmovups_xmm_xmm, .size = .bits64, .xmm_dst = 0, .xmm_src = 1, .is_reg_form = true };
+    const add: DecodedInsn = .{ .op = .vpxor, .size = .bits32, .xmm_dst = 0, .xmm_src = 1, .xmm_src2 = 1, .is_reg_form = true };
+    try h.add(0x1000, 4, move);
+    try h.add(0x1004, 4, add);
+    // A forced interpreter boundary must discard both proofs even when its
+    // declared opcode is harmless: the helper owns the register file.
+    try h.add(0x1008, 1, .{ .op = .nop, .is_reg_form = true });
+    h.insns.items[2].force_fallback = true;
+    try h.add(0x1009, 4, add);
+    var state = TestState{};
+    state.ymm_hi[0] = @splat(0xA5);
+    state.zmm_hi[0] = @splat(0xC7);
+    state.poison_upper_on_interpret = true;
+    _ = try h.run(&state);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &state.ymm_hi[0]);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &state.zmm_hi[0]);
+}
+
+test "vector moves and arithmetic forward only dominating XMM values" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    var prng = std.Random.DefaultPrng.init(0xF04A_4D46);
+    const random = prng.random();
+    for (0..64) |_| {
+        h.insns.clearRetainingCapacity();
+        var state = TestState{};
+        random.bytes(std.mem.asBytes(&state.xmm));
+        random.bytes(std.mem.asBytes(&state.ymm_hi));
+        random.bytes(std.mem.asBytes(&state.zmm_hi));
+        var expected = state.xmm;
+        var expected_ymm = state.ymm_hi;
+        var expected_zmm = state.zmm_hi;
+        var last: u8 = 0;
+        for (0..24) |i| {
+            const dst = random.uintLessThan(u8, 4);
+            const rhs = random.uintLessThan(u8, 4);
+            const op = ([_]Op{ .vpaddd, .vpsubd, .vpxor })[random.uintLessThan(usize, 3)];
+            const a = expected[last];
+            const b = expected[rhs];
+            for (0..4) |lane| {
+                const x = std.mem.readInt(u32, a[lane * 4 ..][0..4], .little);
+                const y = std.mem.readInt(u32, b[lane * 4 ..][0..4], .little);
+                const result = switch (op) {
+                    .vpaddd => x +% y,
+                    .vpsubd => x -% y,
+                    .vpxor => x ^ y,
+                    else => unreachable,
+                };
+                std.mem.writeInt(u32, expected[dst][lane * 4 ..][0..4], result, .little);
+            }
+            expected_ymm[dst] = @splat(0);
+            if (op == .vpaddd or op == .vpxor) expected_zmm[dst] = @splat(0);
+            try h.add(0x1000 + i * 4, 4, .{ .op = op, .size = .bits32, .xmm_dst = dst, .xmm_src = last, .xmm_src2 = rhs, .is_reg_form = true });
+            last = dst;
+        }
+        const compiled = try compile(testing.allocator, &h.memory, TestState.layout, h.insns.items, 0x1060);
+        try testing.expect(compiled.xmm_loads_forwarded >= 23);
+        _ = try h.run(&state);
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&expected), std.mem.asBytes(&state.xmm));
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&expected_ymm), std.mem.asBytes(&state.ymm_hi));
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&expected_zmm), std.mem.asBytes(&state.zmm_hi));
+    }
+}
+
+test "vector moves discard forwarding at an internal branch target" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    try h.add(0x1000, 3, regImm(.cmp_reg64_imm32, .bits64, .al_ax_eax_rax, 0));
+    try h.add(0x1003, 2, .{ .op = .jcc_rel8, .cond = .e, .addr = 4 });
+    const add: DecodedInsn = .{ .op = .vpaddd, .size = .bits32, .xmm_dst = 0, .xmm_src = 0, .xmm_src2 = 1, .is_reg_form = true };
+    try h.add(0x1005, 4, add);
+    try h.add(0x1009, 4, add);
+    try h.add(0x100D, 4, regImm(.add_reg64_imm32, .bits64, .cl_cx_ecx_rcx, 1));
+    for ([_]bool{ true, false }) |taken| {
+        var state = TestState{};
+        state.regs.rax = @intFromBool(!taken);
+        for (0..4) |lane| {
+            std.mem.writeInt(u32, state.xmm[0][lane * 4 ..][0..4], 2, .little);
+            std.mem.writeInt(u32, state.xmm[1][lane * 4 ..][0..4], 1, .little);
+        }
+        _ = try h.run(&state);
+        for (0..4) |lane| try testing.expectEqual(@as(u32, if (taken) 3 else 4), std.mem.readInt(u32, state.xmm[0][lane * 4 ..][0..4], .little));
+    }
 }
 
 test "constructor vptr stores preserve RIP-relative image addresses with cached registers" {
