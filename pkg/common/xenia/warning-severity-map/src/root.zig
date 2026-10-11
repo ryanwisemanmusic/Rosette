@@ -218,6 +218,15 @@ pub const entries = [_]Entry{
         .reason = "capability narration, printed whether or not anything is missing",
     },
 
+    // --- Guest shader translation warnings.
+    .{
+        .label = "shader-memexport-constant-index-unresolved",
+        .text = "Couldn't extract memexport stream constant index",
+        .severity = .advisory,
+        .continuation = .emulator_design,
+        .reason = "Xenia documents Halo 3 shaders that write zero to eA without writing an eM export; this warning alone does not prove a lost memexport. Correlate it with a shader that actually writes eM before attributing a visible draw to it",
+    },
+
     // --- Degradations the run survives.
     .{
         .label = "vulkan-tessellation-unavailable",
@@ -314,6 +323,17 @@ const optional_volume_extern_entry = Entry{
     .reason = "Xenia's undefined-extern fallback returned zero for an optional volume-cleanup export; this is an emulator-side cleanup no-op, not a Windows DLL or VFS miss. A title that depends on dismount side effects would still require a real kernel implementation",
 };
 
+/// A six-dword record with wire type 3 is a vertex-fetch descriptor, even if
+/// Xenia encountered it through its texture-fetch accessor. Preserve the
+/// warning as a fault until the binding context is known, but name the type
+/// mismatch instead of calling it an unclassified malformed texture.
+const vertex_fetch_in_texture_path_entry = Entry{
+    .label = "vertex-fetch-descriptor-in-texture-path",
+    .text = "Texture fetch constant",
+    .severity = .fault,
+    .reason = "the descriptor's low two bits encode Xenos type=vertex, but Xenia reached it through a texture-fetch path; this proves a resource-kind mismatch at that access, not whether the shader samples the slot or which visible draw is affected",
+};
+
 const filter = phrase_filter.Filter(blk: {
     var texts: [entries.len][]const u8 = undefined;
     for (entries, 0..) |entry, index| texts[index] = entry.text;
@@ -375,6 +395,30 @@ pub fn optionalVolumeExternName(line: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Decode the type bits only from Xenia's exact six-dword invalid-texture
+/// warning shape. A type=vertex value is diagnostically different from a
+/// malformed texture descriptor, while other types remain loud and
+/// unclassified until their format-specific cause is understood.
+pub fn vertexFetchInTexturePath(line: []const u8) bool {
+    const prefix = "Texture fetch constant (";
+    const suffix = ") is completely invalid!";
+    const start = std.mem.indexOf(u8, line, prefix) orelse return false;
+    const words_start = start + prefix.len;
+    const suffix_start = std.mem.indexOfPos(u8, line, words_start, suffix) orelse return false;
+    const record = line[words_start..suffix_start];
+    var tokens = std.mem.tokenizeAny(u8, record, " \t\r\n");
+    var first_word: ?u32 = null;
+    var count: usize = 0;
+    while (tokens.next()) |token| {
+        if (token.len != 8 or count == 6) return false;
+        const value = std.fmt.parseInt(u32, token, 16) catch return false;
+        if (count == 0) first_word = value;
+        count += 1;
+    }
+    if (count != 6) return false;
+    return (first_word.? & 0x3) == 3;
+}
+
 /// The severity of one Xenia warning-level line.
 ///
 /// Unrecognized text is a `fault`: a warning nobody has classified has to stay
@@ -382,6 +426,7 @@ pub fn optionalVolumeExternName(line: []const u8) ?[]const u8 {
 pub fn classify(line: []const u8) Severity {
     if (bareModuleLookupName(line) != null) return .informational;
     if (optionalVolumeExternName(line) != null) return .advisory;
+    if (vertexFetchInTexturePath(line)) return vertex_fetch_in_texture_path_entry.severity;
     if (filter.firstMatch(line)) |index| return entries[index].severity;
     if (isListItem(line)) return .informational;
     return .fault;
@@ -441,6 +486,7 @@ pub fn isUnresolvedImport(line: []const u8) bool {
 pub fn continuationFor(line: []const u8) Continuation {
     if (bareModuleLookupName(line) != null) return .narration;
     if (optionalVolumeExternName(line) != null) return optional_volume_extern_entry.continuation;
+    if (vertexFetchInTexturePath(line)) return vertex_fetch_in_texture_path_entry.continuation;
     if (filter.firstMatch(line)) |index| return entries[index].continuation;
     if (isListItem(line)) return .narration;
     return .stops;
@@ -450,6 +496,7 @@ pub fn continuationFor(line: []const u8) Continuation {
 pub fn labelFor(line: []const u8) []const u8 {
     if (bareModuleLookupName(line) != null) return "vfs-bare-module-lookup";
     if (optionalVolumeExternName(line) != null) return optional_volume_extern_entry.label;
+    if (vertexFetchInTexturePath(line)) return vertex_fetch_in_texture_path_entry.label;
     if (filter.firstMatch(line)) |index| return entries[index].label;
     if (isListItem(line)) return "guest-list-item";
     return "guest-warning-unclassified";
@@ -458,6 +505,7 @@ pub fn labelFor(line: []const u8) []const u8 {
 /// The matching entry, for a report that wants to print why.
 pub fn entryFor(line: []const u8) ?Entry {
     if (optionalVolumeExternName(line) != null) return optional_volume_extern_entry;
+    if (vertexFetchInTexturePath(line)) return vertex_fetch_in_texture_path_entry;
     const index = filter.firstMatch(line) orelse return null;
     return entries[index];
 }
@@ -561,6 +609,32 @@ test "a real degradation stays a finding without becoming a fault" {
     const dxgi = classify("!> 00000001 Presenter: Failed to create a DXGI factory");
     try std.testing.expectEqual(Severity.advisory, dxgi);
     try std.testing.expect(dxgi.isFinding());
+}
+
+test "Halo 3's eA-only shader warning stays visible without claiming a lost export" {
+    const line = "!> 0100000C ShaderTranslator::GatherAluInstructionInformation: Couldn't extract memexport stream constant index";
+    try std.testing.expectEqual(Severity.advisory, classify(line));
+    try std.testing.expectEqualStrings("shader-memexport-constant-index-unresolved", labelFor(line));
+    try std.testing.expectEqual(Evidence.none, evidenceFor(line));
+    try std.testing.expectEqual(Continuation.emulator_design, continuationFor(line));
+    const entry = entryFor(line).?;
+    try std.testing.expect(std.mem.indexOf(u8, entry.reason, "without writing an eM export") != null);
+}
+
+test "texture-fetch warning reports vertex wire type without claiming the draw is safe" {
+    const vertex = "w> 0100000C Texture fetch constant (053D8CC3 1000001A 00000000 00000000 00000000 00000000) is completely invalid!";
+    try std.testing.expect(vertexFetchInTexturePath(vertex));
+    try std.testing.expectEqual(Severity.fault, classify(vertex));
+    try std.testing.expectEqualStrings("vertex-fetch-descriptor-in-texture-path", labelFor(vertex));
+    try std.testing.expectEqual(Continuation.stops, continuationFor(vertex));
+    const entry = entryFor(vertex).?;
+    try std.testing.expect(std.mem.indexOf(u8, entry.reason, "low two bits encode Xenos type=vertex") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.reason, "not whether the shader samples the slot") != null);
+
+    const texture = "w> 0100000C Texture fetch constant (053D8CC2 1000001A 00000000 00000000 00000000 00000000) is completely invalid!";
+    try std.testing.expect(!vertexFetchInTexturePath(texture));
+    try std.testing.expectEqualStrings("guest-warning-unclassified", labelFor(texture));
+    try std.testing.expect(!vertexFetchInTexturePath("w> Texture fetch constant (053D8CC3 1000001A) is completely invalid!"));
 }
 
 test "a bare module name failing ResolvePath is narration, whatever the module" {
