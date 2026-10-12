@@ -923,6 +923,7 @@ pub fn logGuestSchedulingHealth(self: *const ElfState) void {
         self.windows_spin_turns_given,
     });
     __process_log.info("PE64 guest scheduling health: pause_hints(serial_global/thread_sum)={d}/{d} parallel_pause_host_yield_calls={d} serial_pause_spin_slices={d}; the serial global counter omits parallel workers, while thread_sum includes them", .{ self.windows_guest_pause_yields, thread_pause_hints, pause_host_yield_calls, self.windows_pause_spin_slices });
+    @import("windows_mutex.zig").report(self);
     __process_log.info("PE64 guest thread lifecycle: created={d} live={d} completed={d} failed={d} vacant={d} capacity={d}; completed is a normal one-shot exit, failed/refused is the missing-thread signal", .{
         threads_created,
         threads_live,

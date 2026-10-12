@@ -562,6 +562,7 @@ pub fn blockJitDropAll(self: *ElfState) void {
 
 pub fn traceWithholdsWriteTlb(self: *ElfState, page: u64) bool {
     const page_bytes = __process_block_jit.Tlb.page_bytes;
+    self.spin_watch.pollExpiry();
     if (self.spin_watch.pageWatched(page, page_bytes)) return true;
     // A watched address has no budget: it must see stores all run long.
     if (self.trace_write_address) |watch| {

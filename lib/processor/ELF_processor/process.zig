@@ -2640,6 +2640,20 @@ const WindowsWaitObject = struct {
     last_signal_rip: u64 = 0,
     last_signal_thread: u64 = 0,
     last_signal_step: u64 = 0,
+    /// Mutexes only: the Win32 thread id that owns it (zero when it is
+    /// free) and how many times that thread has acquired it. A Win32 mutex
+    /// is recursive and owned; Xenia's XMutant hands the Xbox 360's
+    /// recursive mutants straight to it (`xe::threading::Mutant`).
+    owner_thread_id: u64 = 0,
+    recursion: u32 = 0,
+    /// Mutexes only (`impl/windows_mutex.zig`): waits its owner satisfied
+    /// again at once, releases refused to a thread that did not own it, last
+    /// releases handed straight to a parked waiter, and releases made because
+    /// the owning thread exited.
+    recursive_acquisitions: u32 = 0,
+    release_refusals: u32 = 0,
+    handoffs: u32 = 0,
+    abandoned: u32 = 0,
 };
 
 /// The longest guest thread name a report keeps. Xenia's are short and
@@ -5552,5 +5566,8 @@ test {
     _ = @import("process/tests/windows_runtime.zig");
     _ = @import("process/tests/cpu_oracles.zig");
     _ = @import("process/tests/parallel_runtime.zig");
+    _ = @import("process/tests/stall_watch.zig");
+    _ = @import("process/tests/windows_mutex.zig");
+    _ = @import("process/tests/windows_mutex_contract.zig");
     _ = @import("block_jit/tests.zig");
 }

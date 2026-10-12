@@ -1316,7 +1316,7 @@ pub fn reportSpinWatchSummary(self: *const ElfState) void {
     const membase = process_impl_guest_diagnostics.xeniaVirtualMembase(self) orelse 0;
     const epoch = self.spin_watch.epoch.load(.acquire);
     const n = @min(self.spin_watch.count.load(.acquire), __process_guest_spin.WatchSet.capacity);
-    __process_log.info("PE64 GUEST SPIN WATCH: episode={d} armed={d}/{d} capacity_drops={d}; each watched address keeps its own exponentially sampled writer log, and a present retires this episode", .{
+    __process_log.info("PE64 GUEST SPIN WATCH: episode={d} armed={d}/{d} capacity_drops={d}; writer counts cover bounded 500ms leases per address; expired evidence is retained and later captures cannot renew the same address until a present retires this episode", .{
         epoch,
         n,
         __process_guest_spin.WatchSet.capacity,

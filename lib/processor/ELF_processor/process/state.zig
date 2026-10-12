@@ -460,10 +460,7 @@ pub const ElfState = struct {
     /// VEX.128 vector templates are compiled (ROSETTE_X64_BLOCK_JIT_VECTOR=0
     /// hands every vector instruction to the interpreter).
     block_jit_vectors_enabled: bool = true,
-    /// A conditional branch to a later instruction of its own block jumps
-    /// there instead of leaving the block
-    /// (ROSETTE_X64_BLOCK_JIT_INTERNAL_EDGES=0 makes every taken branch an
-    /// exit, as before 2026-10-11).
+    /// Forward branches may stay inside a block (ROSETTE_X64_BLOCK_JIT_INTERNAL_EDGES=0 turns it off).
     block_jit_internal_edges_enabled: bool = true,
     /// 16-byte vector loads and stores consult the page-protection table,
     /// so a write watch sees `vmovaps` stores (ROSETTE_X64_WIDE_ACCESS_WATCH=0
@@ -2994,6 +2991,10 @@ pub const ElfState = struct {
         return process_impl_windows_sync.resetWindowsWaitObject(self, handle);
     }
 
+    pub fn releaseWindowsMutex(self: *ElfState, handle: u64) bool {
+        return process_impl_windows_sync.releaseWindowsMutex(self, handle);
+    }
+
     pub fn releaseWindowsSemaphore(self: *ElfState, handle: u64, release_count: u64) bool {
         return process_impl_windows_sync.releaseWindowsSemaphore(self, handle, release_count);
     }
@@ -3609,8 +3610,7 @@ pub const ElfState = struct {
     /// lock while it runs the title's DPC routine inline, so a routine that
     /// calls a function another thread is compiling waits in `GetOrCreate`
     /// at depth two: its unlock only decrements, and the compiling thread
-    /// needs the lock for `LookupModule` and `MarkReady`. On 2026-09-30 that
-    /// stopped Halo 3 at boot twice, before its first frame.
+    /// needs the lock for `LookupModule` and `MarkReady`.
     ///
     /// Lending is the release the loop meant to make. The depth Xenia
     /// recorded is saved here and restored when the lock comes back, so

@@ -194,6 +194,10 @@ pub const WatchSet = struct {
     /// clock word previously exhausted one process-wide budget before a
     /// later stalled frame armed the queue entry we needed to investigate.
     pub const initial_logged_hits: u64 = 8;
+    /// Automatic stall evidence may withhold write-TLB admission for at most
+    /// this lease per address and frame. Explicit user watches are separate.
+    pub const lease_ns: u64 = 500 * std.time.ns_per_ms;
+    const expiry_poll_stride = 4096;
 
     addresses: [capacity]std.atomic.Value(u64) = [_]std.atomic.Value(u64){.init(0)} ** capacity,
     widths: [capacity]std.atomic.Value(u64) = [_]std.atomic.Value(u64){.init(0)} ** capacity,
@@ -206,7 +210,41 @@ pub const WatchSet = struct {
     epoch: std.atomic.Value(u64) = .init(1),
     arming: std.atomic.Value(u32) = .init(0),
 
+    deadlines: [capacity]u64 = @splat(0), // protected by arming
+    sampling_mask: std.atomic.Value(u32) = .init(0),
+    next_expiry_ns: std.atomic.Value(u64) = .init(0),
+    expiry_polls: std.atomic.Value(u64) = .init(0),
+
     pub const Match = struct { index: usize, epoch: u64 };
+
+    pub fn samplingCount(self: *const WatchSet) u32 {
+        return @popCount(self.sampling_mask.load(.acquire));
+    }
+
+    /// Called only while automatic sampling is active. Clock sampling is
+    /// amortized over helper admission attempts, not paid by admitted stores.
+    pub fn pollExpiry(self: *WatchSet) void {
+        if (self.sampling_mask.load(.acquire) == 0) return;
+        const polls = self.expiry_polls.fetchAdd(1, .monotonic);
+        if (polls % expiry_poll_stride == 0)
+            self.expire(@import("monotonic_clock.zig").monotonicNanoseconds());
+    }
+
+    pub fn expire(self: *WatchSet, now_ns: u64) void {
+        const next = self.next_expiry_ns.load(.acquire);
+        if (next == 0 or now_ns < next) return;
+        while (self.arming.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+        defer self.arming.store(0, .release);
+        var mask = self.sampling_mask.load(.monotonic);
+        var soonest: u64 = std.math.maxInt(u64);
+        for (0..capacity) |i| {
+            const bit = @as(u32, 1) << @intCast(i);
+            if (mask & bit == 0) continue;
+            if (now_ns >= self.deadlines[i]) mask &= ~bit else soonest = @min(soonest, self.deadlines[i]);
+        }
+        self.sampling_mask.store(mask, .release);
+        self.next_expiry_ns.store(if (mask == 0) 0 else soonest, .release);
+    }
 
     pub inline fn armed(self: *const WatchSet) bool {
         return self.count.load(.monotonic) != 0;
@@ -221,8 +259,11 @@ pub const WatchSet = struct {
     /// and reuse the same slot between the range check and the store report.
     pub fn overlappingMatch(self: *const WatchSet, address: u64, width: u64) ?Match {
         const epoch = self.epoch.load(.acquire);
+        const mask = self.sampling_mask.load(.acquire);
+        if (mask == 0) return null;
         const n = @min(self.count.load(.acquire), capacity);
         for (0..n) |index| {
+            if (mask & (@as(u32, 1) << @intCast(index)) == 0) continue;
             if (self.slot_epochs[index].load(.acquire) != epoch) continue;
             const start = self.addresses[index].load(.acquire);
             const length = self.widths[index].load(.monotonic);
@@ -249,6 +290,10 @@ pub const WatchSet = struct {
     /// were still being collected. The epoch check happens under the arming
     /// lock, so it cannot revive a retired watch after a present.
     pub fn armForEpoch(self: *WatchSet, expected_epoch: u64, address: u64, width: u64, value: u64) ?usize {
+        return self.armForEpochAt(expected_epoch, address, width, value, @import("monotonic_clock.zig").monotonicNanoseconds());
+    }
+
+    pub fn armForEpochAt(self: *WatchSet, expected_epoch: u64, address: u64, width: u64, value: u64, now_ns: u64) ?usize {
         while (self.arming.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
         defer self.arming.store(0, .release);
         const epoch = self.epoch.load(.monotonic);
@@ -267,6 +312,10 @@ pub const WatchSet = struct {
         self.addresses[n].store(address, .release);
         self.slot_epochs[n].store(epoch, .release);
         self.count.store(@intCast(n + 1), .release);
+        self.deadlines[n] = now_ns +| lease_ns;
+        _ = self.sampling_mask.fetchOr(@as(u32, 1) << @intCast(n), .release);
+        const next = self.next_expiry_ns.load(.monotonic);
+        self.next_expiry_ns.store(if (next == 0) self.deadlines[n] else @min(next, self.deadlines[n]), .release);
         return n;
     }
 
@@ -278,14 +327,17 @@ pub const WatchSet = struct {
         defer self.arming.store(0, .release);
         _ = self.epoch.fetchAdd(1, .acq_rel);
         self.count.store(0, .release);
+        self.sampling_mask.store(0, .release);
+        self.next_expiry_ns.store(0, .release);
         self.capacity_drops.store(0, .monotonic);
     }
 
-    /// Count every write, but log the first few and exponentially spaced
-    /// later ones for this address. A hot timestamp cannot silence a new
+    /// Count writes in this address's sampling lease, logging its first few
+    /// and exponentially spaced later hits. A hot timestamp cannot silence a new
     /// queue watch, and a long stall still reports who writes occasionally.
     pub fn noteHit(self: *WatchSet, match: Match) bool {
         if (self.epoch.load(.acquire) != match.epoch or
+            self.sampling_mask.load(.acquire) & (@as(u32, 1) << @intCast(match.index)) == 0 or
             self.slot_epochs[match.index].load(.acquire) != match.epoch) return false;
         const hit = self.hits[match.index].fetchAdd(1, .monotonic) +| 1;
         return (hit <= initial_logged_hits or std.math.isPowerOfTwo(hit)) and
@@ -577,4 +629,33 @@ test "watch candidates leave out the context and the spinner's own stack frame" 
     try std.testing.expect(!watchCandidate(membase + 0x7000_0050, membase, 0x1_5000_0000, 0x7000_0000));
     try std.testing.expect(!watchCandidate(0x1_5000_0030, membase, 0x1_5000_0000, 0x7000_0000));
     try std.testing.expect(!watchCandidate(0x4000, membase, 0, 0));
+}
+
+test "automatic spin watch leases expire independently and preserve collected evidence" {
+    var watches = WatchSet{};
+    const epoch = watches.epoch.load(.acquire);
+    const first = watches.armForEpochAt(epoch, 0x1200, 4, 7, 100).?;
+    const match = watches.overlappingMatch(0x1200, 4).?;
+    try std.testing.expect(watches.noteHit(match));
+    const second = watches.armForEpochAt(epoch, 0x2300, 4, 8, 200).?;
+    watches.expire(100 + WatchSet.lease_ns - 1);
+    try std.testing.expect(watches.pageWatched(0x1000, 0x1000));
+    watches.expire(100 + WatchSet.lease_ns);
+    try std.testing.expect(!watches.pageWatched(0x1000, 0x1000));
+    try std.testing.expect(watches.pageWatched(0x2000, 0x1000));
+    try std.testing.expectEqual(@as(u32, 1), watches.samplingCount());
+    try std.testing.expect(watches.armed());
+    try std.testing.expectEqual(@as(u64, 1), watches.hits[first].load(.acquire));
+    try std.testing.expectEqual(@as(u64, 8), watches.armed_values[second].load(.acquire));
+    try std.testing.expect(!watches.noteHit(match));
+    // Recapture of the same address in this frame cannot renew the lease.
+    try std.testing.expectEqual(first, watches.armForEpochAt(epoch, 0x1200, 4, 9, 300).?);
+    try std.testing.expect(!watches.pageWatched(0x1000, 0x1000));
+    watches.expire(200 + WatchSet.lease_ns);
+    try std.testing.expectEqual(@as(u32, 0), watches.samplingCount());
+    watches.retire();
+    try std.testing.expect(watches.armForEpochAt(epoch, 0x1200, 4, 0, 400) == null);
+    _ = watches.armForEpochAt(watches.epoch.load(.acquire), 0x1200, 4, 0, 400);
+    watches.expire(200 + WatchSet.lease_ns);
+    try std.testing.expect(watches.pageWatched(0x1000, 0x1000));
 }

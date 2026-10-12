@@ -12,6 +12,7 @@ const process_impl_kernel_services = @import("kernel_services.zig");
 const process_impl_lifecycle = @import("lifecycle.zig");
 const process_impl_run_reporting = @import("run_reporting.zig");
 const process_impl_windows_ui = @import("windows_ui.zig");
+const process_impl_windows_mutex = @import("windows_mutex.zig");
 const __process_HookPoints = __ProcessInternals._HookPoints;
 const __process_NativeConditionLock = __ProcessInternals._NativeConditionLock;
 const __process_PARALLEL_WORKER_STEP_BATCH = __ProcessInternals._PARALLEL_WORKER_STEP_BATCH;
@@ -663,16 +664,9 @@ pub fn registerWindowsEvent(self: *ElfState, handle: u64, manual_reset: bool, in
     }
 }
 
-pub fn registerWindowsMutex(self: *ElfState, handle: u64, initially_owned: bool) void {
-    if (ensureWindowsWaitObject(self, handle)) |object| {
-        object.* = .{
-            .handle = handle,
-            .kind = .mutex,
-            .signaled = !initially_owned,
-        };
-        noteWindowsWaitObjectCreated(self, object);
-    }
-}
+pub const registerWindowsMutex = process_impl_windows_mutex.register;
+pub const releaseWindowsMutex = process_impl_windows_mutex.release;
+pub const windowsMutexOwner = process_impl_windows_mutex.owner;
 
 pub fn registerWindowsSemaphore(self: *ElfState, handle: u64, initial_count: u64, maximum_count: u64) void {
     if (ensureWindowsWaitObject(self, handle)) |object| {
@@ -707,6 +701,7 @@ pub fn windowsWaitObjectReady(self: *const ElfState, handle: u64) ?bool {
         return switch (object.kind) {
             .semaphore => object.count != 0,
             .timer => object.signaled or (object.due_ticks != 0 and process_impl_lifecycle.windowsGuestClockTicks(self) >= object.due_ticks),
+            .mutex => object.signaled or process_impl_windows_mutex.ownedByCaller(self, &object),
             else => object.signaled,
         };
     }
@@ -888,7 +883,7 @@ pub fn consumeWindowsWaitObject(self: *ElfState, handle: u64) void {
         .event => {
             if (!object.manual_reset) object.signaled = false;
         },
-        .mutex => object.signaled = false,
+        .mutex => process_impl_windows_mutex.take(self, object),
         .semaphore => {
             if (object.count != 0) object.count -= 1;
             object.signaled = object.count != 0;
@@ -3888,6 +3883,7 @@ pub fn finishWindowsGuestThread(self: *ElfState) void {
     __process_tso_memory.flushActiveStoreBufferFor(.thread_exit);
     self.guest_store_buffers.drainContext(index, .thread_exit);
     endWindowsWaitAccounting(self, &self.windows_guest_threads[index], .aborted);
+    process_impl_windows_mutex.abandonOwnedBy(self, self.windows_guest_threads[index].thread_id);
     self.windows_guest_threads[index].status = .completed;
     self.windows_thread_completions +|= 1;
     if (windowsWaitObjectIndex(self, self.windows_guest_threads[index].handle)) |wait_index| {
