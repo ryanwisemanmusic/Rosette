@@ -2528,16 +2528,18 @@ const WindowsRuntimeLockGuard = struct {
         if (self.flush_tso_on_unlock) {
             state.flushAllGuestStoreBuffers(.runtime_call);
         }
-        // Every runtime call used to notify the workers' wake hub. With
-        // parked workers really asleep that would be a kernel wake of every
-        // blocked guest thread per import - hundreds of thousands a second
-        // from Xenia's message loop alone. Only a call that changed some
-        // thread's runnability wakes them.
+        // The owner event preserves owner-side wait semantics. Worker slots
+        // are signalled separately below, so a runnable guest thread does not
+        // wake every unrelated parked worker.
         const woke_threads = state.windows_thread_wake_epoch != self.wake_epoch_at_lock;
+        const worker_wake_mask = state.windows_thread_wake_mask;
+        state.windows_thread_wake_mask = 0;
         self.mutex.unlock();
         windows_runtime_locks.pop(self.stack_index, self.owner, self.pinned);
         _ = tso_memory.setActiveStoreBuffer(self.prior_store_buffer);
         if (woke_threads and state.parallel_guest_execution) state.parallel_guest_wake_hub.notify();
+        if (state.parallel_guest_execution)
+            state.parallel_guest_wake_hub.notifyMask(worker_wake_mask, state.windows_guest_threads.len);
     }
 };
 

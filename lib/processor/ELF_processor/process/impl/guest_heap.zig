@@ -8,6 +8,7 @@ const process_impl_guest_memory = @import("guest_memory.zig");
 const process_impl_kernel_services = @import("kernel_services.zig");
 const process_impl_lifecycle = @import("lifecycle.zig");
 const process_impl_run_reporting = @import("run_reporting.zig");
+const heap_record_index = @import("../../windows_guest/heap_record_index.zig");
 const __process_STACK_SIZE = __ProcessInternals._STACK_SIZE;
 const __process_WINDOWS_GUEST_THREAD_MAX_STACK_SIZE = __ProcessInternals._WINDOWS_GUEST_THREAD_MAX_STACK_SIZE;
 const __process_WINDOWS_GUEST_THREAD_STACK_GUARD = __ProcessInternals._WINDOWS_GUEST_THREAD_STACK_GUARD;
@@ -168,6 +169,17 @@ pub fn guestAllocWithInitialization(self: *ElfState, requested_size: u64, reques
             .allocation_import = site.import,
         };
         self.windows_heap_allocation_count += 1;
+        switch (heap_record_index.appendRecord(
+            self.allocator,
+            &self.windows_heap_address_index,
+            &self.windows_heap_address_indexed_records,
+            &self.windows_heap_address_index_disabled,
+            self.windows_heap_allocations[0..self.windows_heap_allocation_count],
+            self.windows_heap_allocation_count - 1,
+        )) {
+            .indexed, .disabled => {},
+            .failed => self.windows_heap_address_index_failures +|= 1,
+        }
         self.windows_heap_allocations_live += 1;
         noteGuestHeapBytes(self, size, true);
     }
@@ -226,6 +238,14 @@ pub fn reportGuestHeapUse(self: *const ElfState) void {
     __process_log.info("PE64 GUEST HEAP LOOKUP: exact_address_cache(hit/miss)={d}/{d}; hits still revalidate the append-only allocation record before using its index", .{
         self.windows_heap_address_cache_hits.load(.monotonic),
         self.windows_heap_address_cache_misses.load(.monotonic),
+    });
+    __process_log.info("PE64 GUEST HEAP ADDRESS INDEX: records={d}/{d} lookups={d} probes={d} binary_fallbacks={d} disabled={}; a full index handles exact bases by bounded open addressing, and any index allocation/consistency failure retains the ordered binary-search path", .{
+        self.windows_heap_address_indexed_records,
+        self.windows_heap_allocation_count,
+        self.windows_heap_address_index_lookups.load(.monotonic),
+        self.windows_heap_address_index_probes.load(.monotonic),
+        self.windows_heap_address_index_fallbacks.load(.monotonic),
+        self.windows_heap_address_index_disabled,
     });
 }
 
@@ -486,6 +506,23 @@ pub fn findGuestHeapAllocation(self: *ElfState, guest_base: u64) ?usize {
         return cached;
     }
     _ = self.windows_heap_address_cache_misses.fetchAdd(1, .monotonic);
+    if (!self.windows_heap_address_index_disabled and
+        self.windows_heap_address_indexed_records == self.windows_heap_allocation_count and
+        self.windows_heap_address_index.len != 0)
+    {
+        const indexed = heap_record_index.lookup(
+            self.windows_heap_address_index,
+            records,
+            guest_base,
+        );
+        _ = self.windows_heap_address_index_lookups.fetchAdd(1, .monotonic);
+        _ = self.windows_heap_address_index_probes.fetchAdd(indexed.probes, .monotonic);
+        if (indexed.index) |found| {
+            __process_heap_address_cache.remember(owner, guest_base, found);
+            return found;
+        }
+    }
+    _ = self.windows_heap_address_index_fallbacks.fetchAdd(1, .monotonic);
     var lower: usize = 0;
     var upper = self.windows_heap_allocation_count;
     while (lower < upper) {

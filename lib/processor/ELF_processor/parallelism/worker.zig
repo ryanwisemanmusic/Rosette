@@ -2,18 +2,23 @@
 //!
 //! The worker owns no guest state itself. The embedding Windows thread slot
 //! is stable for the lifetime of its callback and supplies the guest context.
+//! Slot notifications keep independent parked threads from waking as a herd.
 //! Callers must stop and join every worker before freeing that state or its
 //! guest address space.
 
 const std = @import("std");
 const concurrency = @import("concurrency");
 
-/// One event shared by every guest worker in a PE process. Runtime
-/// transitions notify it once, so a blocking API need not walk the whole
-/// guest-thread table to wake parked host workers. A notify with nobody
-/// asleep is one atomic increment; a sleeper is woken by the kernel.
+/// Owner-side and per-worker epoch events for PE guest execution. The owner
+/// event preserves scheduler/owner waits; worker events target only the slot
+/// made runnable. A mask coalesces repeated transitions to the same slot
+/// until the runtime lock is released.
 pub const WakeHub = struct {
-    event: concurrency.EpochEvent = concurrency.EpochEvent.init("guest worker wake hub"),
+    /// Owner-side waits listen to this event. Guest workers use their own
+    /// slot event below so waking one runnable guest does not wake every
+    /// blocked worker on the process-wide hub.
+    event: concurrency.EpochEvent = concurrency.EpochEvent.init("guest worker owner wake hub"),
+    worker_events: [worker_capacity]concurrency.EpochEvent = initWorkerEvents(),
     /// Waits that ended on the safety-net timeout rather than a notify.
     timeouts: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Waits that ended at the guest wait's own deadline (a `Sleep`, a timed
@@ -25,12 +30,62 @@ pub const WakeHub = struct {
     /// transition that should have notified and did not. Must read zero.
     lost_wakeups: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
+    pub const worker_capacity = 64;
+
+    fn initWorkerEvents() [worker_capacity]concurrency.EpochEvent {
+        var events: [worker_capacity]concurrency.EpochEvent = undefined;
+        for (&events) |*event| event.* = concurrency.EpochEvent.init("guest worker slot wake");
+        return events;
+    }
+
     pub fn notify(self: *WakeHub) void {
         self.event.notify();
     }
 
     pub fn epoch(self: *const WakeHub) u32 {
         return self.event.current();
+    }
+
+    pub fn workerEpoch(self: *const WakeHub, slot: usize) u32 {
+        std.debug.assert(slot < worker_capacity);
+        return self.worker_events[slot].current();
+    }
+
+    pub fn notifyWorker(self: *WakeHub, slot: usize) void {
+        std.debug.assert(slot < worker_capacity);
+        self.worker_events[slot].notify();
+    }
+
+    pub fn notifyAllWorkers(self: *WakeHub) void {
+        for (&self.worker_events) |*event| event.notify();
+    }
+
+    /// Notify only slots made runnable in one locked runtime transition.
+    /// `worker_count` bounds the mask to the live guest-thread table; high
+    /// bits are ignored so a stale or malformed slot cannot signal another
+    /// event in the hub.
+    pub fn notifyMask(self: *WakeHub, mask: u64, worker_count: usize) void {
+        const count = @min(worker_count, worker_capacity);
+        const valid_mask = if (count == worker_capacity)
+            std.math.maxInt(u64)
+        else if (count == 0)
+            0
+        else
+            (@as(u64, 1) << @intCast(count)) - 1;
+        var pending = mask & valid_mask;
+        while (pending != 0) : (pending &= pending - 1) {
+            self.notifyWorker(@intCast(@ctz(pending)));
+        }
+    }
+
+    pub fn workerNotificationCounts(self: *const WakeHub) struct { notifications: u64, wakes: u64 } {
+        var notifications: u64 = 0;
+        var wakes: u64 = 0;
+        for (&self.worker_events) |*event| {
+            notifications +|= event.notifies.load(.monotonic);
+            wakes +|= event.wakes.load(.monotonic);
+        }
+        return .{ .notifications = notifications, .wakes = wakes };
     }
 };
 
@@ -64,6 +119,7 @@ pub const Worker = struct {
         callback: *const fn (*anyopaque, *Worker) void,
     ) !void {
         if (self.thread != null) return error.WorkerAlreadyStarted;
+        if (slot >= WakeHub.worker_capacity) return error.WorkerSlotOutOfRange;
         self.stop_requested.store(false, .release);
         self.context = context;
         self.slot = slot;
@@ -82,12 +138,12 @@ pub const Worker = struct {
 
     /// Publish a lifecycle change (wake, shutdown, or scheduler event).
     pub fn notify(self: *Worker) void {
-        if (self.wake_hub) |hub| hub.notify();
+        if (self.wake_hub) |hub| hub.notifyWorker(self.slot);
     }
 
     pub fn epoch(self: *const Worker) u32 {
         const hub = self.wake_hub orelse return 0;
-        return hub.epoch();
+        return hub.workerEpoch(self.slot);
     }
 
     /// Wait only while the observed epoch is still current. Capturing the
@@ -104,11 +160,11 @@ pub const Worker = struct {
     pub fn waitForChange(self: *Worker, observed: u32, deadline_ns: ?u64) WaitOutcome {
         const hub = self.wake_hub orelse return .stopping;
         if (self.shouldStop()) return .stopping;
-        if (hub.epoch() != observed) return .changed;
+        if (hub.workerEpoch(self.slot) != observed) return .changed;
         const safety_net = concurrency.monotonicNanoseconds() +| wake_safety_net_ns;
         const own_deadline_first = if (deadline_ns) |requested| requested <= safety_net else false;
         const deadline = if (deadline_ns) |requested| @min(requested, safety_net) else safety_net;
-        if (hub.event.waitChange(observed, deadline)) return .changed;
+        if (hub.worker_events[self.slot].waitChange(observed, deadline)) return .changed;
         if (self.shouldStop()) return .stopping;
         if (own_deadline_first) {
             _ = hub.deadline_expiries.fetchAdd(1, .monotonic);
@@ -195,11 +251,81 @@ test "a second start is rejected until the previous worker has joined" {
     worker.join();
 }
 
+test "targeted worker notification does not wake unrelated parked guest slots" {
+    const Shared = struct {
+        entered: [2]std.atomic.Value(bool) = .{
+            std.atomic.Value(bool).init(false),
+            std.atomic.Value(bool).init(false),
+        },
+
+        fn callback(raw: *anyopaque, worker: *Worker) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            while (!worker.shouldStop()) {
+                const observed = worker.epoch();
+                self.entered[worker.slot].store(true, .release);
+                _ = worker.waitForChange(observed, null);
+            }
+        }
+    };
+
+    var shared: Shared = .{};
+    var hub: WakeHub = .{};
+    var workers = [_]Worker{ .{}, .{} };
+    try workers[0].start(@ptrCast(&shared), 0, &hub, Shared.callback);
+    try workers[1].start(@ptrCast(&shared), 1, &hub, Shared.callback);
+    defer {
+        workers[0].requestStop();
+        workers[1].requestStop();
+        workers[0].join();
+        workers[1].join();
+    }
+
+    const ready_deadline = concurrency.monotonicNanoseconds() + std.time.ns_per_s;
+    while (hub.worker_events[0].waiters.load(.acquire) == 0 or
+        hub.worker_events[1].waiters.load(.acquire) == 0)
+    {
+        if (concurrency.monotonicNanoseconds() >= ready_deadline) break;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(shared.entered[0].load(.acquire));
+    try std.testing.expect(shared.entered[1].load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), hub.worker_events[0].waiters.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), hub.worker_events[1].waiters.load(.acquire));
+
+    workers[0].notify();
+    const wake_deadline = concurrency.monotonicNanoseconds() + std.time.ns_per_s;
+    while (hub.worker_events[0].wakes.load(.acquire) == 0 and
+        concurrency.monotonicNanoseconds() < wake_deadline)
+    {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expectEqual(@as(u64, 1), hub.worker_events[0].wakes.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), hub.worker_events[1].wakes.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), hub.worker_events[0].notifies.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), hub.worker_events[1].notifies.load(.acquire));
+}
+
+test "worker notification mask coalesces and bounds runnable slots" {
+    var hub: WakeHub = .{};
+    hub.notifyMask(0b1010_0101, 6);
+    const counts = hub.workerNotificationCounts();
+    try std.testing.expectEqual(@as(u64, 3), counts.notifications);
+    try std.testing.expectEqual(@as(u64, 0), counts.wakes);
+    try std.testing.expectEqual(@as(u64, 1), hub.worker_events[0].notifies.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), hub.worker_events[1].notifies.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), hub.worker_events[2].notifies.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), hub.worker_events[3].notifies.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), hub.worker_events[4].notifies.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), hub.worker_events[5].notifies.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), hub.worker_events[6].notifies.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), hub.worker_events[7].notifies.load(.monotonic));
+}
+
 test "a wait that ends at its own deadline is not a safety-net timeout" {
     var worker: Worker = .{};
     var hub: WakeHub = .{};
     worker.wake_hub = &hub;
-    const observed = hub.epoch();
+    const observed = worker.epoch();
     const outcome = worker.waitForChange(observed, concurrency.monotonicNanoseconds() + 2 * std.time.ns_per_ms);
     try std.testing.expectEqual(WaitOutcome.deadline_reached, outcome);
     try std.testing.expectEqual(@as(u64, 1), hub.deadline_expiries.load(.acquire));

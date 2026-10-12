@@ -136,6 +136,7 @@ pub fn deinit(self: *ElfState) void {
     @memset(&self.native_memory_aliases, .{});
     self.native_memory_alias_count = 0;
     if (self.windows_heap_allocations.len != 0) self.allocator.free(self.windows_heap_allocations);
+    if (self.windows_heap_address_index.len != 0) self.allocator.free(self.windows_heap_address_index);
     if (self.windows_heap_free_indices.len != 0) self.allocator.free(self.windows_heap_free_indices);
     if (self.windows_heap_quarantine.len != 0) self.allocator.free(self.windows_heap_quarantine);
     var bins = self.windows_heap_bins.valueIterator();
@@ -150,6 +151,7 @@ pub fn deinit(self: *ElfState) void {
 pub fn stopParallelGuestWorkers(self: *ElfState) void {
     if (self.windows_guest_threads.len == 0) return;
     self.parallel_guest_wake_hub.notify();
+    self.parallel_guest_wake_hub.notifyAllWorkers();
     for (self.windows_guest_threads) |*thread| thread.parallel_worker.requestStop();
     for (self.windows_guest_threads) |*thread| thread.parallel_worker.join();
 }
@@ -215,6 +217,7 @@ pub fn markTerminated(self: *ElfState) void {
         // see the end of the run now, not at its next safety-net wake.
         self.windows_message_event.notify();
         self.parallel_guest_wake_hub.notify();
+        self.parallel_guest_wake_hub.notifyAllWorkers();
     } else {
         self.terminated = true;
     }
@@ -434,8 +437,18 @@ pub fn noteWindowsThreadWake(self: *ElfState) void {
     self.windows_thread_wake_epoch +%= 1;
 }
 
+/// Record a guest worker transition under the runtime lock. The lock guard
+/// publishes this slot's event after unlocking, avoiding a process-wide
+/// wake of unrelated blocked workers.
+pub fn noteWindowsGuestWorkerWake(self: *ElfState, slot: usize) void {
+    noteWindowsThreadWake(self);
+    if (!self.parallel_guest_execution or slot >= self.parallel_guest_wake_hub.worker_events.len) return;
+    self.windows_thread_wake_mask |= @as(u64, 1) << @intCast(slot);
+}
+
 pub fn wakeGuestWaiters(self: *ElfState) void {
     noteWindowsThreadWake(self);
+    if (self.parallel_guest_execution) self.parallel_guest_wake_hub.notifyAllWorkers();
 }
 
 pub fn captureWindowsGuestContext(self: *const ElfState) __process_WindowsGuestThreadContext {

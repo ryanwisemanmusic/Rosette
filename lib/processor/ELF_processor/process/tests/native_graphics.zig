@@ -2197,9 +2197,12 @@ test "PE heap provenance grows beyond the initial table capacity" {
         state.windows_heap_allocation_count,
     );
     try testing.expect(state.windows_heap_allocations.len > INITIAL_WINDOWS_HEAP_ALLOCATIONS);
+    try testing.expectEqual(state.windows_heap_allocation_count, state.windows_heap_address_indexed_records);
+    try testing.expect(!state.windows_heap_address_index_disabled);
     try testing.expectEqual(@as(u64, 0), state.windows_heap_provenance_growth_failures);
     try testing.expectEqual(@as(u64, 0), state.windows_heap_provenance_untracked_allocations);
     try testing.expect(state.releaseGuestAllocation(last));
+    try testing.expect(state.windows_heap_address_index_lookups.load(.monotonic) > 0);
 }
 
 test "PE heap reuses an exact released block without growing provenance" {
@@ -2217,6 +2220,15 @@ test "PE heap reuses an exact released block without growing provenance" {
     const reused = state.guestAlloc(24, 16).?;
     try testing.expectEqual(first, reused);
     try testing.expectEqual(records, state.windows_heap_allocation_count);
+    var reused_record_active = false;
+    for (state.windows_heap_allocations[0..state.windows_heap_allocation_count]) |record| {
+        if (record.guest_base == reused) {
+            reused_record_active = record.active;
+            break;
+        }
+    }
+    try testing.expect(reused_record_active);
+    try testing.expect(state.windows_heap_address_index_lookups.load(.monotonic) > 0);
     try testing.expectEqual(@as(usize, 0), state.windows_heap_free_count);
     try testing.expectEqual(@as(usize, 1), state.windows_heap_allocations_live);
     try testing.expectEqual(@as(u64, 1), state.windows_heap_reused_allocations);

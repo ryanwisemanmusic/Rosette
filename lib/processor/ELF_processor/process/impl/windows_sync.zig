@@ -10,6 +10,7 @@ const process_impl_guest_memory = @import("guest_memory.zig");
 const process_impl_instruction_decode = @import("instruction_decode.zig");
 const process_impl_kernel_services = @import("kernel_services.zig");
 const process_impl_lifecycle = @import("lifecycle.zig");
+const process_impl_windows_wake = @import("windows_sync/wake_router.zig");
 const process_impl_run_reporting = @import("run_reporting.zig");
 const process_impl_windows_ui = @import("windows_ui.zig");
 const process_impl_windows_mutex = @import("windows_mutex.zig");
@@ -199,13 +200,18 @@ pub fn queueWindowsApc(self: *ElfState, handle: u64, routine: u64, parameter: u6
     const pseudo_current_thread = __process_std.math.maxInt(u64) - 1;
     var queue: *__process_WindowsApcQueue = undefined;
     var target: ?*__process_WindowsGuestThread = null;
+    var target_slot: ?usize = null;
     if (handle == pseudo_current_thread) {
         queue = activeWindowsApcQueue(self);
-        if (process_impl_lifecycle.guestContextField(self, "windows_active_guest_thread_slot").*) |slot| target = &self.windows_guest_threads[slot];
+        if (process_impl_lifecycle.guestContextField(self, "windows_active_guest_thread_slot").*) |slot| {
+            target = &self.windows_guest_threads[slot];
+            target_slot = slot;
+        }
     } else {
-        for (self.windows_guest_threads) |*thread| {
+        for (self.windows_guest_threads, 0..) |*thread, slot| {
             if (thread.status == .vacant or thread.handle != handle) continue;
             target = thread;
+            target_slot = slot;
             break;
         }
         const thread = target orelse {
@@ -229,7 +235,10 @@ pub fn queueWindowsApc(self: *ElfState, handle: u64, routine: u64, parameter: u6
         {
             endWindowsWaitAccounting(self, thread, .aborted);
             thread.status = .runnable;
-            process_impl_lifecycle.noteWindowsThreadWake(self);
+            if (target_slot) |slot|
+                process_impl_lifecycle.noteWindowsGuestWorkerWake(self, slot)
+            else
+                process_impl_lifecycle.noteWindowsThreadWake(self);
             thread.blocked_alertable = false;
             thread.blocked_wait_handle = 0;
             thread.blocked_wait_handle_count = 0;
@@ -902,8 +911,8 @@ pub fn consumeWindowsWaitObject(self: *ElfState, handle: u64) void {
 
 pub fn wakeWindowsGuestThreadsForWait(self: *ElfState, handle: u64, wake_all: bool) u64 {
     var woken: u64 = 0;
-    for (self.windows_guest_threads) |*thread| {
-        const recheck = wakeWindowsGuestWaiterForHandle(self, thread, handle) orelse continue;
+    for (self.windows_guest_threads, 0..) |*thread, slot| {
+        const recheck = process_impl_windows_wake.wakeWindowsGuestWaiterForHandle(self, thread, slot, handle) orelse continue;
         // A wait-all waiter only looks again; it takes nothing with it,
         // so it is not a transfer the caller should account for.
         if (recheck) continue;
@@ -911,27 +920,6 @@ pub fn wakeWindowsGuestThreadsForWait(self: *ElfState, handle: u64, wake_all: bo
         if (!wake_all) break;
     }
     return woken;
-}
-
-pub fn wakeWindowsGuestWaiterForHandle(self: *ElfState, thread: *__process_WindowsGuestThread, handle: u64) ?bool {
-    if (thread.status != .blocked or !thread.waitsOnHandle(handle)) return null;
-    const recheck = thread.blocked_wait_handle_count != 0 and thread.blocked_wait_all;
-    thread.status = .runnable;
-    process_impl_lifecycle.noteWindowsThreadWake(self);
-    thread.blocked_wait_handle = 0;
-    thread.blocked_wait_timeout = 0;
-    thread.blocked_wait_deadline = 0;
-    thread.blocked_srw_lock = 0;
-    thread.blocked_condition = 0;
-    thread.blocked_wait_handle_count = 0;
-    thread.blocked_wait_all = false;
-    thread.wait_resume = true;
-    thread.wait_resume_handle = handle;
-    thread.wait_resume_timeout = false;
-    thread.wait_resume_recheck = recheck;
-    self.windows_thread_unblocks +|= 1;
-    self.windows_wait_unblocks +|= 1;
-    return recheck;
 }
 
 pub fn wakeExpiredWindowsGuestWaits(self: *ElfState) u64 {
@@ -960,7 +948,7 @@ pub fn wakeExpiredWindowsGuestWaits(self: *ElfState) u64 {
             // ETIMEDOUT instead of zero.
             noteWindowsTimedConditionTimeout(self, thread, slot, now);
             thread.status = .runnable;
-            process_impl_lifecycle.noteWindowsThreadWake(self);
+            process_impl_lifecycle.noteWindowsGuestWorkerWake(self, slot);
             thread.blocked_condition = 0;
             thread.blocked_wait_deadline = 0;
             thread.condition_resume = true;
@@ -973,7 +961,7 @@ pub fn wakeExpiredWindowsGuestWaits(self: *ElfState) u64 {
         }
         const handle = thread.blocked_wait_handle;
         thread.status = .runnable;
-        process_impl_lifecycle.noteWindowsThreadWake(self);
+        process_impl_lifecycle.noteWindowsGuestWorkerWake(self, slot);
         thread.blocked_wait_handle = 0;
         thread.blocked_wait_deadline = 0;
         thread.blocked_srw_lock = 0;
@@ -2713,7 +2701,7 @@ pub fn releaseXboxCriticalSectionWaiter(self: *ElfState, section: u64) void {
         thread.status = .runnable;
         thread.blocked_srw_lock = 0;
         thread.srw_wait_sequence = 0;
-        process_impl_lifecycle.noteWindowsThreadWake(self);
+        process_impl_lifecycle.noteWindowsGuestWorkerWake(self, index);
         self.windows_thread_unblocks +|= 1;
         __process_xbox_critical_section.Stats.bump(&stats.grants);
         return;
@@ -2848,7 +2836,7 @@ pub fn handOffWindowsSrwLock(self: *ElfState, lock: *__process_WindowsSrwLock, a
             // No identity to hand ownership to. Wake it to race, which
             // is what every waiter did before.
             thread.status = .runnable;
-            process_impl_lifecycle.noteWindowsThreadWake(self);
+            process_impl_lifecycle.noteWindowsGuestWorkerWake(self, index);
             thread.blocked_srw_lock = 0;
             self.windows_thread_unblocks +|= 1;
             continue;
@@ -2884,7 +2872,7 @@ pub fn handOffWindowsSrwLock(self: *ElfState, lock: *__process_WindowsSrwLock, a
         captureWindowsSrwOwnerStack(self, lock, thread.context.regs.rsp);
         if (address_is_guest) process_impl_guest_memory.write64(self, address, 1);
         thread.status = .runnable;
-        process_impl_lifecycle.noteWindowsThreadWake(self);
+        process_impl_lifecycle.noteWindowsGuestWorkerWake(self, index);
         thread.blocked_srw_lock = 0;
         thread.blocked_wait_handle = 0;
         thread.blocked_wait_timeout = 0;
@@ -3184,7 +3172,7 @@ pub fn waitWindowsGuestConditionFor(self: *ElfState, address: u64, mutex_address
                     if (object.signaled) {
                         if (!object.manual_reset) object.signaled = false;
                         self.windows_guest_threads[index].status = .runnable;
-                        process_impl_lifecycle.noteWindowsThreadWake(self);
+                        process_impl_lifecycle.noteWindowsGuestWorkerWake(self, index);
                         self.windows_condition_mutex_reacquire_blocks +|= 1;
                         return .blocked;
                     }
@@ -3515,10 +3503,10 @@ pub fn signalWindowsGuestCondition(self: *ElfState, address: u64, broadcast: boo
         self.windows_condition_unblocks +|= 1;
         woken +|= 1;
     }
-    for (self.windows_guest_threads) |*thread| {
+    for (self.windows_guest_threads, 0..) |*thread, slot| {
         if (thread.status != .blocked or thread.blocked_condition != address) continue;
         thread.status = .runnable;
-        process_impl_lifecycle.noteWindowsThreadWake(self);
+        process_impl_lifecycle.noteWindowsGuestWorkerWake(self, slot);
         thread.blocked_condition = 0;
         thread.blocked_srw_lock = 0;
         thread.blocked_wait_handle = 0;
@@ -3536,10 +3524,10 @@ pub fn signalWindowsGuestCondition(self: *ElfState, address: u64, broadcast: boo
 }
 
 pub fn wakeWindowsGuestThreadsForSrwLock(self: *ElfState, address: u64) void {
-    for (self.windows_guest_threads) |*thread| {
+    for (self.windows_guest_threads, 0..) |*thread, slot| {
         if (thread.status != .blocked or thread.blocked_srw_lock != address) continue;
         thread.status = .runnable;
-        process_impl_lifecycle.noteWindowsThreadWake(self);
+        process_impl_lifecycle.noteWindowsGuestWorkerWake(self, slot);
         thread.blocked_srw_lock = 0;
         thread.blocked_wait_handle = 0;
         thread.blocked_wait_timeout = 0;
@@ -4276,7 +4264,7 @@ pub fn serviceWindowsGuestThreads(self: *ElfState, max_steps: u64) u64 {
         const blocked = self.windows_guest_threads[index].status == .blocked;
         if (!blocked) {
             self.windows_guest_threads[index].status = .runnable;
-            process_impl_lifecycle.noteWindowsThreadWake(self);
+            process_impl_lifecycle.noteWindowsGuestWorkerWake(self, index);
             self.windows_thread_yields +|= 1;
             if (process_impl_lifecycle.guestContextField(self, "windows_slice_pause_yield").* and !slice_repeated_state and
                 self.windows_guest_threads[index].kernel_calls == slice_kernel_calls)
@@ -4463,7 +4451,7 @@ pub fn publishParallelWorkerSteps(self: *ElfState, pending: *u64) void {
 pub fn parkParallelWorker(self: *ElfState, slot: usize, worker: *__process_parallel_workers.Worker) void {
     drainParallelWorkerStoreBuffer(self, slot, .context_switch);
     const thread = &self.windows_guest_threads[slot];
-    const observed = self.parallel_guest_wake_hub.epoch();
+    const observed = worker.epoch();
     if (@atomicLoad(__process_WindowsGuestThreadStatus, &thread.status, .acquire) != .blocked) return;
     const deadline_ticks = @atomicLoad(u64, &thread.blocked_wait_deadline, .acquire);
     const deadline_ns = if (deadline_ticks != 0) windowsGuestTicksToHostNanoseconds(self, deadline_ticks) else null;

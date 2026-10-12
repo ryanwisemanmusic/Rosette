@@ -663,6 +663,9 @@ pub const ElfState = struct {
     /// Bumped (under the runtime lock) whenever a guest thread becomes
     /// runnable or a wait object is signalled; see `WindowsRuntimeLockGuard`.
     windows_thread_wake_epoch: u64 = 0,
+    /// Guest slots made runnable while holding the runtime lock. The guard
+    /// consumes this mask on unlock and signals only those worker events.
+    windows_thread_wake_mask: u64 = 0,
     parallel_guest_termination: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     parallel_owner_executed_steps: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     windows_runtime_mutex: HostMutex = HostMutex.init("Windows runtime mutex"),
@@ -1255,6 +1258,15 @@ pub const ElfState = struct {
     windows_title_code_fetches: u64 = 0,
     windows_heap_allocations: []WindowsHeapAllocation = &.{},
     windows_heap_allocation_count: usize = 0,
+    /// Exact-base accelerator for the append-only ordered heap provenance
+    /// records. If its allocation fails, heap semantics retain binary search.
+    windows_heap_address_index: []u32 = &.{},
+    windows_heap_address_indexed_records: usize = 0,
+    windows_heap_address_index_disabled: bool = false,
+    windows_heap_address_index_failures: u64 = 0,
+    windows_heap_address_index_lookups: std.atomic.Value(u64) = .init(0),
+    windows_heap_address_index_probes: std.atomic.Value(u64) = .init(0),
+    windows_heap_address_index_fallbacks: std.atomic.Value(u64) = .init(0),
     windows_heap_free_indices: []usize = &.{},
     windows_heap_free_count: usize = 0,
     /// Records whose block is currently live.
@@ -2950,14 +2962,6 @@ pub const ElfState = struct {
 
     fn wakeWindowsGuestThreadsForWait(self: *ElfState, handle: u64, wake_all: bool) u64 {
         return process_impl_windows_sync.wakeWindowsGuestThreadsForWait(self, handle, wake_all);
-    }
-
-    /// Wake one matching worker while retaining the handle and one-shot
-    /// result long enough for its original wait import to return correctly.
-    /// Null means this thread did not wait on the object; true means a
-    /// wait-all recheck rather than a consumed signal.
-    fn wakeWindowsGuestWaiterForHandle(self: *ElfState, thread: *WindowsGuestThread, handle: u64) ?bool {
-        return process_impl_windows_sync.wakeWindowsGuestWaiterForHandle(self, thread, handle);
     }
 
     /// Wake finite waits whose guest-clock deadline has elapsed.

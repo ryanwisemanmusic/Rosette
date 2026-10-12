@@ -17,6 +17,7 @@ const WindowsWaitObject = __ProcessInternals._WindowsWaitObject;
 const log = __ProcessInternals._log;
 const process_impl_lifecycle = @import("lifecycle.zig");
 const process_impl_windows_sync = @import("windows_sync.zig");
+const process_impl_windows_wake = @import("windows_sync/wake_router.zig");
 
 /// A mutex's owner and acquisition count, for reports and tests.
 pub const Ownership = struct { owner_thread_id: u64, recursion: u32 };
@@ -92,8 +93,8 @@ fn handOver(self: *ElfState, handle: u64, object: *WindowsWaitObject) void {
     process_impl_windows_sync.noteWindowsWaitObjectSignaled(self, object);
     object.signaled = true;
     process_impl_lifecycle.noteWindowsThreadWake(self);
-    for (self.windows_guest_threads) |*thread| {
-        const recheck = process_impl_windows_sync.wakeWindowsGuestWaiterForHandle(self, thread, handle) orelse continue;
+    for (self.windows_guest_threads, 0..) |*thread, slot| {
+        const recheck = process_impl_windows_wake.wakeWindowsGuestWaiterForHandle(self, thread, slot, handle) orelse continue;
         if (recheck) continue;
         // A slot without a thread id of its own cannot be named as the
         // owner: it resumes as it always did, with the mutex signalled.
