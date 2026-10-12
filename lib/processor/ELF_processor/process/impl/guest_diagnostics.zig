@@ -205,6 +205,7 @@ pub fn handleSyntheticRip(self: *ElfState) bool {
         process_impl_guest_memory.continueWindowsQsort(self);
         return true;
     }
+    if (process_impl_guest_memory.handleWindowsBsearchSyntheticRip(self)) return true;
     if (process_impl_lifecycle.guestContextField(self, "regs").*.rip == __process_SYNTHETIC_INIT_RETURN) {
         scheduleNextInitOrMain(self);
         return true;
@@ -216,13 +217,6 @@ pub fn handleSyntheticRip(self: *ElfState) bool {
         return true;
     }
     return false;
-}
-
-pub fn copyUnresolvedImportName(destination: []u8, source: []const u8) usize {
-    @memset(destination, 0);
-    const count = @min(destination.len, source.len);
-    if (count != 0) @memcpy(destination[0..count], source[0..count]);
-    return count;
 }
 
 pub fn shouldReportWindowsPointOccurrence(occurrences: u64) bool {
@@ -336,9 +330,9 @@ pub fn noteWindowsGuestCondition(self: *ElfState, condition: __process_xenia_fat
         }
         entry = &self.windows_guest_failure_points[self.windows_guest_failure_point_count];
         entry.?.* = .{};
-        entry.?.label_len = copyUnresolvedImportName(&entry.?.label, condition.label);
-        entry.?.owner_len = copyUnresolvedImportName(&entry.?.owner, condition.owner.label());
-        entry.?.line_len = copyUnresolvedImportName(&entry.?.line, line);
+        entry.?.label_len = process_impl_guest_memory.copyUnresolvedImportName(&entry.?.label, condition.label);
+        entry.?.owner_len = process_impl_guest_memory.copyUnresolvedImportName(&entry.?.owner, condition.owner.label());
+        entry.?.line_len = process_impl_guest_memory.copyUnresolvedImportName(&entry.?.line, line);
         entry.?.first_step = process_impl_lifecycle.observedExecutionSteps(self);
         entry.?.first_rip = process_impl_lifecycle.guestContextField(self, "regs").*.rip;
         self.windows_guest_failure_point_count += 1;
@@ -717,7 +711,7 @@ pub fn noteWindowsGuestWarning(self: *ElfState, line: []const u8) void {
     }
     var entry = &self.windows_guest_warning_points[self.windows_guest_warning_point_count];
     entry.* = .{};
-    entry.line_len = copyUnresolvedImportName(&entry.line, line);
+    entry.line_len = process_impl_guest_memory.copyUnresolvedImportName(&entry.line, line);
     entry.first_step = process_impl_lifecycle.observedExecutionSteps(self);
     entry.last_step = process_impl_lifecycle.observedExecutionSteps(self);
     entry.occurrences = 1;
@@ -1026,8 +1020,8 @@ pub fn recordUnresolvedWindowsImport(self: *ElfState, stub: __process_WindowsImp
     // buffers as well. Copy the names afterwards; assigning the lengths
     // inside that literal would be overwritten by the zeroed arrays and
     // make every later occurrence look like a new symbol.
-    record.dll_name_len = copyUnresolvedImportName(&record.dll_name, stub.dll_name);
-    record.function_name_len = copyUnresolvedImportName(&record.function_name, stub.function_name);
+    record.dll_name_len = process_impl_guest_memory.copyUnresolvedImportName(&record.dll_name, stub.dll_name);
+    record.function_name_len = process_impl_guest_memory.copyUnresolvedImportName(&record.function_name, stub.function_name);
     self.windows_unresolved_import_count += 1;
     return true;
 }

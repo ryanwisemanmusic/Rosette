@@ -1760,6 +1760,20 @@ test "guest thread snapshots preserve faults translator and callback continuatio
     state.windows_initterm_frame_count = 1;
     state.windows_qsort_frames[0] = .{ .base = MEM_BASE + 0x2000, .nmemb = 7, .element_size = 16, .i = 4, .j = 2 };
     state.windows_qsort_frame_count = 1;
+    state.windows_bsearch_frames[0] = .{
+        .key = MEM_BASE + 0x2100,
+        .base = MEM_BASE + 0x2200,
+        .nmemb = 9,
+        .element_size = 4,
+        .comparator = MEM_BASE + 0x2300,
+        .low = 3,
+        .high = 8,
+        .pending_index = 5,
+        .return_rsp = MEM_BASE + 0x2400,
+        .callback_count = 2,
+        .awaiting_comparison = true,
+    };
+    state.windows_bsearch_frame_count = 1;
     state.windows_message_dispatch_frames[0] = .{ .return_rip = MEM_BASE + 0x6100, .return_rsp = MEM_BASE + 0x7200, .return_is_direct = true };
     state.windows_message_dispatch_frame_count = 1;
     state.windows_audio_callback_frames[0] = .{ .return_rip = MEM_BASE + 0x6300, .return_rsp = MEM_BASE + 0x7300, .return_is_direct = false };
@@ -1775,6 +1789,7 @@ test "guest thread snapshots preserve faults translator and callback continuatio
     state.guest_access_violation = .{};
     state.windows_initterm_frame_count = 0;
     state.windows_qsort_frame_count = 0;
+    state.windows_bsearch_frame_count = 0;
     state.windows_message_dispatch_frame_count = 0;
     state.windows_audio_callback_frame_count = 0;
     state.block_jit_scratch = .{};
@@ -1795,6 +1810,10 @@ test "guest thread snapshots preserve faults translator and callback continuatio
     try testing.expectEqual(@as(u64, 3), state.windows_initterm_frames[0].callback_count);
     try testing.expectEqual(@as(usize, 1), state.windows_qsort_frame_count);
     try testing.expectEqual(@as(u64, 4), state.windows_qsort_frames[0].i);
+    try testing.expectEqual(@as(usize, 1), state.windows_bsearch_frame_count);
+    try testing.expectEqual(MEM_BASE + 0x2100, state.windows_bsearch_frames[0].key);
+    try testing.expectEqual(@as(u64, 3), state.windows_bsearch_frames[0].low);
+    try testing.expect(state.windows_bsearch_frames[0].awaiting_comparison);
     try testing.expectEqual(@as(usize, 1), state.windows_message_dispatch_frame_count);
     try testing.expectEqual(MEM_BASE + 0x6100, state.windows_message_dispatch_frames[0].return_rip);
     try testing.expectEqual(@as(usize, 1), state.windows_audio_callback_frame_count);
@@ -1807,6 +1826,125 @@ test "guest thread snapshots preserve faults translator and callback continuatio
     state.windows_thread_id = 1;
     state.restoreWindowsGuestContext(&worker_context);
     try testing.expectEqual(@as(u64, 17), state.currentWindowsThreadId());
+}
+
+test "Windows bsearch import calls its guest comparator and returns the matching element" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+
+    const key = state.guestAlloc(4, 4).?;
+    const base = state.guestAlloc(7 * 4, 4).?;
+    const stack_allocation = state.guestAlloc(0x80, 16).?;
+    const stack = stack_allocation + 8;
+    const comparator = MEM_BASE + 0x1800;
+    const return_rip = MEM_BASE + 0x1900;
+    const values = [_]u32{ 2, 5, 9, 17, 23, 42, 91 };
+    state.write32(key, 17);
+    for (values, 0..) |value, index| state.write32(base + @as(u64, @intCast(index * 4)), value);
+
+    state.regs = .{ .rsp = stack, .rip = MEM_BASE + 0x1700, .rcx = key, .rdx = base, .r8 = values.len, .r9 = 4 };
+    state.write64(stack, return_rip);
+    state.write64(stack + 0x28, comparator);
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "api-ms-win-crt-utility-l1-1-0.dll", "bsearch", null));
+    try testing.expectEqual(comparator, state.regs.rip);
+    try testing.expectEqual(stack - 0x30, state.regs.rsp);
+    try testing.expectEqual(x64_linux_runtime.SYNTHETIC_BSEARCH_RETURN, state.read64(state.regs.rsp));
+    try testing.expectEqual(key, state.regs.rcx);
+
+    var callback_steps: usize = 0;
+    while (state.windows_bsearch_frame_count != 0) : (callback_steps += 1) {
+        try testing.expect(callback_steps < 8);
+        const frame = state.windows_bsearch_frames[state.windows_bsearch_frame_count - 1];
+        const element = frame.base + frame.pending_index * frame.element_size;
+        const wanted = state.read32(frame.key);
+        const actual = state.read32(element);
+        const comparison: i32 = if (wanted < actual) -1 else if (wanted > actual) 1 else 0;
+        state.regs.rax = @as(u64, @as(u32, @bitCast(comparison)));
+        state.regs.rsp = stack - 0x28; // the comparator's `ret` consumed its marker
+        state.regs.rip = x64_linux_runtime.SYNTHETIC_BSEARCH_RETURN;
+        try testing.expect(state.handleSyntheticRip());
+    }
+    try testing.expectEqual(@as(u64, 0), state.windows_bsearch_frame_count);
+    try testing.expectEqual(return_rip, state.regs.rip);
+    try testing.expectEqual(stack + 8, state.regs.rsp);
+    try testing.expectEqual(base + 3 * 4, state.regs.rax);
+    try testing.expect(callback_steps <= 3);
+}
+
+test "Windows bsearch handles empty ranges and absent keys without callbacks" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+
+    const stack_allocation = state.guestAlloc(0x40, 16).?;
+    const stack = stack_allocation + 8;
+    const return_rip = MEM_BASE + 0x2900;
+    state.write64(stack, return_rip);
+    state.regs = .{ .rsp = stack, .rcx = 0, .rdx = 0, .r8 = 0, .r9 = 0 };
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ucrtbase.dll", "bsearch", null));
+    try testing.expectEqual(@as(u64, 0), state.regs.rax);
+    try testing.expectEqual(return_rip, state.regs.rip);
+    try testing.expectEqual(@as(usize, 0), state.windows_bsearch_frame_count);
+
+    const key = state.guestAlloc(4, 4).?;
+    const base = state.guestAlloc(3 * 4, 4).?;
+    const comparator = MEM_BASE + 0x2800;
+    state.write32(key, 11);
+    state.write32(base + 0, 2);
+    state.write32(base + 4, 5);
+    state.write32(base + 8, 9);
+    state.regs = .{ .rsp = stack, .rcx = key, .rdx = base, .r8 = 3, .r9 = 4 };
+    state.write64(stack, return_rip);
+    state.write64(stack + 0x28, comparator);
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "ucrtbase.dll", "bsearch", null));
+    var callback_steps: usize = 0;
+    while (state.windows_bsearch_frame_count != 0) : (callback_steps += 1) {
+        try testing.expect(callback_steps < 5);
+        const frame = state.windows_bsearch_frames[state.windows_bsearch_frame_count - 1];
+        const element = frame.base + frame.pending_index * frame.element_size;
+        const comparison: i32 = if (state.read32(frame.key) < state.read32(element)) -1 else 1;
+        state.regs.rax = @as(u64, @as(u32, @bitCast(comparison)));
+        state.regs.rsp = stack - 0x28;
+        state.regs.rip = x64_linux_runtime.SYNTHETIC_BSEARCH_RETURN;
+        try testing.expect(state.handleSyntheticRip());
+    }
+    try testing.expectEqual(return_rip, state.regs.rip);
+    try testing.expectEqual(@as(u64, 0), state.regs.rax);
+    try testing.expectEqual(@as(usize, 2), callback_steps);
+}
+
+test "Windows bsearch direct IAT calls preserve comparator stack alignment" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.windows_runtime_enabled = true;
+
+    const key = state.guestAlloc(4, 4).?;
+    const base = state.guestAlloc(4, 4).?;
+    const stack = state.guestAlloc(0x80, 16).?;
+    const comparator = MEM_BASE + 0x2A00;
+    const return_rip = MEM_BASE + 0x2B00;
+    state.write32(key, 17);
+    state.write32(base, 17);
+    state.write64(stack + 0x20, comparator);
+    state.regs = .{ .rsp = stack, .rip = MEM_BASE + 0x2C00, .rcx = key, .rdx = base, .r8 = 1, .r9 = 4 };
+
+    try testing.expect(x64_linux_runtime.tryWindowsFunction(&state, "api-ms-win-crt-utility-l1-1-0.dll", "bsearch", return_rip));
+    try testing.expectEqual(comparator, state.regs.rip);
+    try testing.expectEqual(stack - 0x28, state.regs.rsp);
+    try testing.expectEqual(@as(u64, 8), state.regs.rsp & 0xF);
+    try testing.expectEqual(key, state.regs.rcx);
+    try testing.expectEqual(base, state.regs.rdx);
+
+    state.regs.rax = 0;
+    state.regs.rsp = stack - 0x20; // the comparator's `ret` consumed its marker
+    state.regs.rip = x64_linux_runtime.SYNTHETIC_BSEARCH_RETURN;
+    try testing.expect(state.handleSyntheticRip());
+
+    try testing.expectEqual(return_rip, state.regs.rip);
+    try testing.expectEqual(stack, state.regs.rsp);
+    try testing.expectEqual(base, state.regs.rax);
+    try testing.expectEqual(@as(usize, 0), state.windows_bsearch_frame_count);
 }
 
 test "guest call tracing keeps a separate stack for each Windows worker" {

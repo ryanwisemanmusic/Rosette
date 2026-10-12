@@ -4046,6 +4046,7 @@ pub fn serviceWindowsGuestThreads(self: *ElfState, max_steps: u64) u64 {
         // stacks even if its creator is currently inside a callback.
         context.windows_initterm_frame_count = 0;
         context.windows_qsort_frame_count = 0;
+        context.windows_bsearch_frame_count = 0;
         context.windows_message_dispatch_frame_count = 0;
         context.windows_audio_callback_frame_count = 0;
         context.regs = .{};

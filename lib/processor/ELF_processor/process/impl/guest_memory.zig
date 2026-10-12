@@ -17,6 +17,7 @@ const __process_GuestAccessViolation = __ProcessInternals._GuestAccessViolation;
 const __process_GuestAccessViolationSite = __ProcessInternals._GuestAccessViolationSite;
 const __process_HookBox = __ProcessInternals._HookBox;
 const __process_MAX_WINDOWS_INITTERM_ENTRIES = __ProcessInternals._MAX_WINDOWS_INITTERM_ENTRIES;
+const __process_MAX_WINDOWS_BSEARCH_ELEMENTS = __ProcessInternals._MAX_WINDOWS_BSEARCH_ELEMENTS;
 const __process_MAX_WINDOWS_QSORT_ELEMENTS = __ProcessInternals._MAX_WINDOWS_QSORT_ELEMENTS;
 const __process_MAX_WINDOWS_QSORT_ELEMENT_BYTES = __ProcessInternals._MAX_WINDOWS_QSORT_ELEMENT_BYTES;
 const __process_STACK_COLLAPSE_FLOOR = __ProcessInternals._STACK_COLLAPSE_FLOOR;
@@ -2293,6 +2294,236 @@ pub fn beginWindowsQsort(
     };
     process_impl_lifecycle.guestContextField(self, "windows_qsort_frame_count").* += 1;
     continueWindowsQsort(self);
+    return true;
+}
+
+fn completeWindowsBsearch(self: *ElfState, direct_return_rip: ?u64, result: u64) void {
+    process_impl_lifecycle.guestContextField(self, "regs").*.rax = result;
+    process_impl_lifecycle.guestContextField(self, "regs").*.rip = if (direct_return_rip) |rip| rip else pop(self);
+}
+
+fn failWindowsBsearch(
+    self: *ElfState,
+    direct_return_rip: ?u64,
+    key: u64,
+    base: u64,
+    nmemb: u64,
+    element_size: u64,
+    comparator: u64,
+    detail: []const u8,
+) void {
+    if (comptime !@import("builtin").is_test) {
+        __process_log.warn("Windows bsearch returned NULL: {s} key=0x{x} base=0x{x} nmemb={d} size={d} comparator=0x{x} rip=0x{x}", .{
+            detail,
+            key,
+            base,
+            nmemb,
+            element_size,
+            comparator,
+            process_impl_lifecycle.guestContextField(self, "regs").*.rip,
+        });
+    }
+    completeWindowsBsearch(self, direct_return_rip, 0);
+}
+
+fn finishWindowsBsearch(self: *ElfState, result: u64) void {
+    const frame_count = process_impl_lifecycle.guestContextField(self, "windows_bsearch_frame_count");
+    if (frame_count.* == 0) {
+        process_impl_lifecycle.markFaulted(self);
+        self.exit_code = 127;
+        self.termination_reason = .runtime_invariant_failure;
+        process_impl_lifecycle.markTerminated(self);
+        __process_log.err("Windows bsearch callback completed without an active search frame rip=0x{x}", .{process_impl_lifecycle.guestContextField(self, "regs").*.rip});
+        return;
+    }
+    const frame_index = frame_count.* - 1;
+    const frame = process_impl_lifecycle.guestContextField(self, "windows_bsearch_frames").*[frame_index];
+    frame_count.* = frame_index;
+    // The comparator's synthetic call used 32 bytes of Windows shadow space
+    // plus its return address. Restore the import's exact entry stack before
+    // returning to its caller (or before continuing a nested search).
+    process_impl_lifecycle.guestContextField(self, "regs").*.rsp = frame.return_rsp;
+    process_impl_lifecycle.guestContextField(self, "regs").*.rax = result;
+    process_impl_lifecycle.guestContextField(self, "regs").*.rip = if (frame.return_is_direct) frame.return_rip else pop(self);
+    if (self.diagnose_abi) {
+        __process_log.info("Windows bsearch complete elements={d} comparisons={d} result=0x{x} continuation=0x{x}", .{
+            frame.nmemb,
+            frame.callback_count,
+            result,
+            process_impl_lifecycle.guestContextField(self, "regs").*.rip,
+        });
+    }
+}
+
+fn failActiveWindowsBsearch(self: *ElfState, detail: []const u8) void {
+    const frame_count = process_impl_lifecycle.guestContextField(self, "windows_bsearch_frame_count");
+    if (frame_count.* == 0) {
+        finishWindowsBsearch(self, 0);
+        return;
+    }
+    const frame = process_impl_lifecycle.guestContextField(self, "windows_bsearch_frames").*[frame_count.* - 1];
+    if (comptime !@import("builtin").is_test) {
+        __process_log.warn("Windows bsearch returned NULL: {s} key=0x{x} base=0x{x} nmemb={d} size={d} comparator=0x{x} rip=0x{x}", .{
+            detail,
+            frame.key,
+            frame.base,
+            frame.nmemb,
+            frame.element_size,
+            frame.comparator,
+            process_impl_lifecycle.guestContextField(self, "regs").*.rip,
+        });
+    }
+    finishWindowsBsearch(self, 0);
+}
+
+pub fn continueWindowsBsearch(self: *ElfState) void {
+    const frame_count = process_impl_lifecycle.guestContextField(self, "windows_bsearch_frame_count");
+    if (frame_count.* == 0) {
+        process_impl_lifecycle.markFaulted(self);
+        self.exit_code = 127;
+        self.termination_reason = .runtime_invariant_failure;
+        process_impl_lifecycle.markTerminated(self);
+        __process_log.err("Windows bsearch continuation has no active search frame rip=0x{x}", .{process_impl_lifecycle.guestContextField(self, "regs").*.rip});
+        return;
+    }
+
+    const frame_index = frame_count.* - 1;
+    const frame = &process_impl_lifecycle.guestContextField(self, "windows_bsearch_frames").*[frame_index];
+    // A guest `ret` from the comparator has consumed only its synthetic
+    // return address. Restore the search's original import-entry stack before
+    // probing again, so repeated and nested callbacks use the same shadow
+    // space and the original caller return remains untouched.
+    process_impl_lifecycle.guestContextField(self, "regs").*.rsp = frame.return_rsp;
+    if (frame.awaiting_comparison) {
+        frame.awaiting_comparison = false;
+        // A guest comparator returns an int. The low 32 bits carry its signed
+        // result regardless of how the guest code extended RAX.
+        const comparison: i32 = @bitCast(@as(u32, @truncate(process_impl_lifecycle.guestContextField(self, "regs").*.rax)));
+        if (comparison < 0) {
+            frame.high = frame.pending_index;
+        } else if (comparison > 0) {
+            frame.low = frame.pending_index + 1;
+        } else {
+            const result = frame.base + frame.pending_index * frame.element_size;
+            finishWindowsBsearch(self, result);
+            return;
+        }
+    }
+
+    if (frame.low >= frame.high) {
+        finishWindowsBsearch(self, 0);
+        return;
+    }
+
+    const middle = frame.low + (frame.high - frame.low) / 2;
+    const element = frame.base + middle * frame.element_size;
+    if (process_impl_execution.guestMemoryConst(self, element, frame.element_size) == null) {
+        failActiveWindowsBsearch(self, "candidate element became unreadable");
+        return;
+    }
+    frame.pending_index = middle;
+    frame.callback_count +|= 1;
+    frame.awaiting_comparison = true;
+
+    // Model a Windows x64 call: the comparator receives a return address,
+    // 32 bytes of caller-owned shadow space, and an aligned entry stack. A
+    // direct-IAT import has no original call return pushed, so its saved RSP
+    // is already the caller's call-site RSP; ordinary imports enter with the
+    // original return address on the stack. Preserve the right alignment in
+    // both cases and restore the bsearch frame's exact import stack after the
+    // callback returns.
+    const regs = process_impl_lifecycle.guestContextField(self, "regs");
+    regs.*.rsp -|= if (frame.return_is_direct) 0x20 else 0x28;
+    push(self, __process_x64_linux_runtime.SYNTHETIC_BSEARCH_RETURN);
+    regs.*.rcx = frame.key;
+    regs.*.rdx = element;
+    regs.*.r8 = 0;
+    regs.*.r9 = 0;
+    regs.*.rip = frame.comparator;
+}
+
+pub fn handleWindowsBsearchSyntheticRip(self: *ElfState) bool {
+    if (process_impl_lifecycle.guestContextField(self, "regs").*.rip != __process_x64_linux_runtime.SYNTHETIC_BSEARCH_RETURN) return false;
+    continueWindowsBsearch(self);
+    return true;
+}
+
+pub fn copyUnresolvedImportName(destination: []u8, source: []const u8) usize {
+    @memset(destination, 0);
+    const count = @min(destination.len, source.len);
+    if (count != 0) @memcpy(destination[0..count], source[0..count]);
+    return count;
+}
+
+pub fn beginWindowsBsearch(
+    self: *ElfState,
+    key: u64,
+    base: u64,
+    nmemb: u64,
+    element_size: u64,
+    comparator: u64,
+    direct_return_rip: ?u64,
+) bool {
+    if (nmemb == 0) {
+        completeWindowsBsearch(self, direct_return_rip, 0);
+        return true;
+    }
+    if (key == 0 or base == 0 or comparator == 0) {
+        failWindowsBsearch(self, direct_return_rip, key, base, nmemb, element_size, comparator, "null key, base, or comparator");
+        return true;
+    }
+    if (element_size == 0) {
+        failWindowsBsearch(self, direct_return_rip, key, base, nmemb, element_size, comparator, "zero element size");
+        return true;
+    }
+    if (nmemb > __process_MAX_WINDOWS_BSEARCH_ELEMENTS) {
+        failWindowsBsearch(self, direct_return_rip, key, base, nmemb, element_size, comparator, "element count exceeds bounded search limit");
+        return true;
+    }
+    const byte_count = __process_std.math.mul(u64, nmemb, element_size) catch {
+        failWindowsBsearch(self, direct_return_rip, key, base, nmemb, element_size, comparator, "element range overflows guest address width");
+        return true;
+    };
+    _ = __process_std.math.add(u64, base, byte_count) catch {
+        failWindowsBsearch(self, direct_return_rip, key, base, nmemb, element_size, comparator, "element range overflows guest address width");
+        return true;
+    };
+    if (process_impl_execution.guestMemoryConst(self, key, 1) == null or
+        process_impl_execution.guestMemoryConst(self, base, byte_count) == null)
+    {
+        failWindowsBsearch(self, direct_return_rip, key, base, nmemb, element_size, comparator, "key or element range is outside readable guest memory");
+        return true;
+    }
+    if (addrToOffset(self, comparator) == null) {
+        failWindowsBsearch(self, direct_return_rip, key, base, nmemb, element_size, comparator, "comparator is outside guest memory");
+        return true;
+    }
+    const frame_count = process_impl_lifecycle.guestContextField(self, "windows_bsearch_frame_count");
+    const frames = process_impl_lifecycle.guestContextField(self, "windows_bsearch_frames");
+    if (frame_count.* >= frames.len) {
+        failWindowsBsearch(self, direct_return_rip, key, base, nmemb, element_size, comparator, "nested search frame capacity exhausted");
+        return true;
+    }
+    if (direct_return_rip == null and read64(self, process_impl_lifecycle.guestContextField(self, "regs").*.rsp) == 0) {
+        failWindowsBsearch(self, direct_return_rip, key, base, nmemb, element_size, comparator, "caller continuation is null");
+        return true;
+    }
+
+    const frame_index = frame_count.*;
+    frames.*[frame_index] = .{
+        .key = key,
+        .base = base,
+        .nmemb = nmemb,
+        .element_size = element_size,
+        .comparator = comparator,
+        .low = 0,
+        .high = nmemb,
+        .return_rip = direct_return_rip orelse 0,
+        .return_is_direct = direct_return_rip != null,
+        .return_rsp = process_impl_lifecycle.guestContextField(self, "regs").*.rsp,
+    };
+    frame_count.* += 1;
+    continueWindowsBsearch(self);
     return true;
 }
 

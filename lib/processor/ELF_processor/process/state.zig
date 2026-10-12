@@ -155,6 +155,8 @@ const WindowsMultiWaitResult = __ProcessInternals._WindowsMultiWaitResult;
 const WindowsProgressSample = __ProcessInternals._WindowsProgressSample;
 const WindowsProgressWatchdog = __ProcessInternals._WindowsProgressWatchdog;
 const WindowsQsortFrame = __ProcessInternals._WindowsQsortFrame;
+const MAX_WINDOWS_BSEARCH_FRAMES = __ProcessInternals._MAX_WINDOWS_BSEARCH_FRAMES;
+const WindowsBsearchFrame = __ProcessInternals._WindowsBsearchFrame;
 const WindowsRuntimeLockGuard = __ProcessInternals._WindowsRuntimeLockGuard;
 const WindowsSrwLock = __ProcessInternals._WindowsSrwLock;
 const WindowsSrwLockIndex = __ProcessInternals._WindowsSrwLockIndex;
@@ -1357,6 +1359,8 @@ pub const ElfState = struct {
     windows_initterm_frame_count: usize = 0,
     windows_qsort_frames: [MAX_WINDOWS_QSORT_FRAMES]WindowsQsortFrame = [_]WindowsQsortFrame{.{}} ** MAX_WINDOWS_QSORT_FRAMES,
     windows_qsort_frame_count: usize = 0,
+    windows_bsearch_frames: [MAX_WINDOWS_BSEARCH_FRAMES]WindowsBsearchFrame = [_]WindowsBsearchFrame{.{}} ** MAX_WINDOWS_BSEARCH_FRAMES,
+    windows_bsearch_frame_count: usize = 0,
     // Windows PE execution is hosted by one interpreter thread, but the
     // image may create real worker entry points before the UI loop starts.
     // These slots are the bounded guest scheduler for those entry points.
@@ -4920,18 +4924,6 @@ pub const ElfState = struct {
         return process_impl_guest_memory.completeWindowsQsortWithoutFrame(self, direct_return_rip);
     }
 
-    fn failWindowsQsort(self: *ElfState, direct_return_rip: ?u64, detail: []const u8) void {
-        return process_impl_guest_memory.failWindowsQsort(self, direct_return_rip, detail);
-    }
-
-    fn finishWindowsQsort(self: *ElfState) void {
-        return process_impl_guest_memory.finishWindowsQsort(self);
-    }
-
-    fn continueWindowsQsort(self: *ElfState) void {
-        return process_impl_guest_memory.continueWindowsQsort(self);
-    }
-
     /// Start a guest-side insertion sort for the Microsoft CRT `qsort`
     /// import. The import handler has already identified the PE ABI; this
     /// method owns the callback stack and resumes the original caller only
@@ -4945,6 +4937,10 @@ pub const ElfState = struct {
         direct_return_rip: ?u64,
     ) bool {
         return process_impl_guest_memory.beginWindowsQsort(self, base, nmemb, element_size, comparator, direct_return_rip);
+    }
+
+    pub fn beginWindowsBsearch(self: *ElfState, key: u64, base: u64, nmemb: u64, element_size: u64, comparator: u64, direct_return_rip: ?u64) bool {
+        return process_impl_guest_memory.beginWindowsBsearch(self, key, base, nmemb, element_size, comparator, direct_return_rip);
     }
 
     /// Register one guest CRT termination callback without exposing a host
@@ -5031,10 +5027,6 @@ pub const ElfState = struct {
 
     pub fn handleSyntheticRip(self: *ElfState) bool {
         return process_impl_guest_diagnostics.handleSyntheticRip(self);
-    }
-
-    fn copyUnresolvedImportName(destination: []u8, source: []const u8) usize {
-        return process_impl_guest_diagnostics.copyUnresolvedImportName(destination, source);
     }
 
     fn shouldReportWindowsPointOccurrence(occurrences: u64) bool {

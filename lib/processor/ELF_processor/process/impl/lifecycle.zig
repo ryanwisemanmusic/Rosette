@@ -460,6 +460,8 @@ pub fn captureWindowsGuestContext(self: *const ElfState) __process_WindowsGuestT
         .windows_initterm_frame_count = guestContextField(self, "windows_initterm_frame_count").*,
         .windows_qsort_frames = guestContextField(self, "windows_qsort_frames").*,
         .windows_qsort_frame_count = guestContextField(self, "windows_qsort_frame_count").*,
+        .windows_bsearch_frames = guestContextField(self, "windows_bsearch_frames").*,
+        .windows_bsearch_frame_count = guestContextField(self, "windows_bsearch_frame_count").*,
         .windows_message_dispatch_frames = guestContextField(self, "windows_message_dispatch_frames").*,
         .windows_message_dispatch_frame_count = guestContextField(self, "windows_message_dispatch_frame_count").*,
         .windows_audio_callback_frames = guestContextField(self, "windows_audio_callback_frames").*,
@@ -504,6 +506,8 @@ pub fn restoreWindowsGuestContext(self: *ElfState, context: *const __process_Win
     guestContextField(self, "windows_initterm_frame_count").* = context.windows_initterm_frame_count;
     guestContextField(self, "windows_qsort_frames").* = context.windows_qsort_frames;
     guestContextField(self, "windows_qsort_frame_count").* = context.windows_qsort_frame_count;
+    guestContextField(self, "windows_bsearch_frames").* = context.windows_bsearch_frames;
+    guestContextField(self, "windows_bsearch_frame_count").* = context.windows_bsearch_frame_count;
     guestContextField(self, "windows_message_dispatch_frames").* = context.windows_message_dispatch_frames;
     guestContextField(self, "windows_message_dispatch_frame_count").* = context.windows_message_dispatch_frame_count;
     guestContextField(self, "windows_audio_callback_frames").* = context.windows_audio_callback_frames;

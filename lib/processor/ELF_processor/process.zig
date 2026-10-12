@@ -1061,6 +1061,8 @@ const MAX_WINDOWS_CRT_ATEXIT_CALLBACKS: usize = 4096;
 const MAX_WINDOWS_QSORT_FRAMES: usize = 8;
 const MAX_WINDOWS_QSORT_ELEMENT_BYTES: usize = 4096;
 const MAX_WINDOWS_QSORT_ELEMENTS: u64 = 1 << 20;
+const MAX_WINDOWS_BSEARCH_FRAMES: usize = 8;
+const MAX_WINDOWS_BSEARCH_ELEMENTS: u64 = 1 << 20;
 /// Threads Rosette holds at once. When the table is full, a new thread takes
 /// the slot of a finished one, so this bounds how many threads are alive
 /// together, not how many a run can create.
@@ -1300,7 +1302,7 @@ const WindowsApcQueue = struct {
 };
 
 comptime {
-    for ([_]u64{
+    const synthetic_addresses = [_]u64{
         SYNTHETIC_WINDOWS_APC_RETURN,
         SYNTHETIC_INIT_RETURN,
         SYNTHETIC_MAIN_RETURN,
@@ -1312,8 +1314,13 @@ comptime {
         x64_linux_runtime.SYNTHETIC_PTHREAD_ONCE_RETURN,
         x64_linux_runtime.SYNTHETIC_INITTERM_RETURN,
         x64_linux_runtime.SYNTHETIC_QSORT_RETURN,
-    }) |address| {
+        x64_linux_runtime.SYNTHETIC_BSEARCH_RETURN,
+    };
+    for (synthetic_addresses, 0..) |address, index| {
         if (address < SYNTHETIC_RIP_FLOOR) @compileError("a synthetic return address sits below SYNTHETIC_RIP_FLOOR, so step would never reach its handler");
+        for (synthetic_addresses[0..index]) |prior| {
+            if (address == prior) @compileError("synthetic return addresses must be unique");
+        }
     }
 }
 
@@ -2348,6 +2355,25 @@ const WindowsQsortFrame = struct {
     scratch: [MAX_WINDOWS_QSORT_ELEMENT_BYTES]u8 = [_]u8{0} ** MAX_WINDOWS_QSORT_ELEMENT_BYTES,
 };
 
+/// Continuation for one Windows CRT `bsearch`. The comparator is guest code,
+/// so each probe yields through a synthetic return marker and resumes this
+/// bounded binary-search state machine after the callback returns.
+const WindowsBsearchFrame = struct {
+    key: u64 = 0,
+    base: u64 = 0,
+    nmemb: u64 = 0,
+    element_size: u64 = 0,
+    comparator: u64 = 0,
+    low: u64 = 0,
+    high: u64 = 0,
+    pending_index: u64 = 0,
+    return_rsp: u64 = 0,
+    return_rip: u64 = 0,
+    return_is_direct: bool = false,
+    callback_count: u64 = 0,
+    awaiting_comparison: bool = false,
+};
+
 /// A Windows thread is guest execution state, not merely a successful handle
 /// returned by CreateThread. In production PE runs, each runnable context owns
 /// a persistent host executor; cooperative service remains for tests and the
@@ -2393,6 +2419,8 @@ const WindowsGuestThreadContext = struct {
     windows_initterm_frame_count: usize = 0,
     windows_qsort_frames: [MAX_WINDOWS_QSORT_FRAMES]WindowsQsortFrame = [_]WindowsQsortFrame{.{}} ** MAX_WINDOWS_QSORT_FRAMES,
     windows_qsort_frame_count: usize = 0,
+    windows_bsearch_frames: [MAX_WINDOWS_BSEARCH_FRAMES]WindowsBsearchFrame = [_]WindowsBsearchFrame{.{}} ** MAX_WINDOWS_BSEARCH_FRAMES,
+    windows_bsearch_frame_count: usize = 0,
     windows_message_dispatch_frames: [MAX_WINDOWS_MESSAGE_DISPATCH_FRAMES]WindowsMessageDispatchFrame = [_]WindowsMessageDispatchFrame{.{}} ** MAX_WINDOWS_MESSAGE_DISPATCH_FRAMES,
     windows_message_dispatch_frame_count: usize = 0,
     windows_audio_callback_frames: [MAX_WINDOWS_AUDIO_CALLBACK_FRAMES]WindowsAudioCallbackFrame = [_]WindowsAudioCallbackFrame{.{}} ** MAX_WINDOWS_AUDIO_CALLBACK_FRAMES,
@@ -4922,6 +4950,8 @@ pub const __ProcessInternals = struct {
     pub const _MAX_WINDOWS_INITTERM_ENTRIES = MAX_WINDOWS_INITTERM_ENTRIES;
     pub const _MAX_WINDOWS_QSORT_ELEMENTS = MAX_WINDOWS_QSORT_ELEMENTS;
     pub const _MAX_WINDOWS_QSORT_ELEMENT_BYTES = MAX_WINDOWS_QSORT_ELEMENT_BYTES;
+    pub const _MAX_WINDOWS_BSEARCH_FRAMES = MAX_WINDOWS_BSEARCH_FRAMES;
+    pub const _MAX_WINDOWS_BSEARCH_ELEMENTS = MAX_WINDOWS_BSEARCH_ELEMENTS;
     pub const _MEM_BASE = MEM_BASE;
     pub const _MEM_SIZE = MEM_SIZE;
     pub const _NativeConditionLock = NativeConditionLock;
@@ -5246,6 +5276,7 @@ pub const __ProcessInternals = struct {
     pub const _WindowsMessageDispatchFrame = WindowsMessageDispatchFrame;
     pub const _WindowsProgressWatchdog = WindowsProgressWatchdog;
     pub const _WindowsQsortFrame = WindowsQsortFrame;
+    pub const _WindowsBsearchFrame = WindowsBsearchFrame;
     pub const _WindowsSrwLockIndex = WindowsSrwLockIndex;
     pub const _WindowsTimedWaitClassification = WindowsTimedWaitClassification;
     pub const _WindowsTimedWaitSite = WindowsTimedWaitSite;
