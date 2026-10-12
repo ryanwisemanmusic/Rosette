@@ -23,6 +23,14 @@ PATTERNS = (
     re.compile(r'^\s{4,}"([A-Za-z_][A-Za-z0-9_@]*)",\s*$', re.M),
 )
 
+# A cohesive handler can live beside the dispatcher when it needs substantial
+# state of its own. Include modules that the dispatcher calls through the
+# explicit `tryFunction` contract, even when they are outside the conventional
+# `windows_runtime/` directory (for example, `windows_bsearch.zig`).
+DISPATCHED_HANDLER_IMPORT = re.compile(
+    r'@import\("([^"]+)"\)\.tryFunction\s*\('
+)
+
 POLICY_BLOCK = re.compile(
     r"(?:const|pub const)\s+(?:WINDOWS_POLICY_REFUSALS|refusals)\s*=\s*\[_\]\[\]const u8\{(.*?)\};",
     re.S,
@@ -40,6 +48,20 @@ def handled_names(source: Path) -> set[str]:
     module_dir = source.parent / source.stem
     if module_dir.is_dir():
         sources.extend(sorted(module_dir.glob("*.zig")))
+
+    # Resolve direct, local handler modules referenced from the dispatch chain.
+    # Zig's build module names omit `.zig`, while path imports usually include
+    # it; try both forms and ignore non-local build modules such as `std`.
+    source_text = source.read_text(encoding="utf-8")
+    for module_name in DISPATCHED_HANDLER_IMPORT.findall(source_text):
+        module_path = source.parent / module_name
+        candidates = [module_path]
+        if not module_path.suffix:
+            candidates.append(module_path.with_suffix(".zig"))
+        for candidate in candidates:
+            if candidate.is_file():
+                sources.append(candidate)
+                break
 
     names: set[str] = set()
     for source_file in sources:

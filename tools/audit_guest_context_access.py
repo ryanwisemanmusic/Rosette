@@ -46,6 +46,7 @@ EXECUTION_LOCAL_FIELDS = (
     "windows_guest_slice_yield_requested windows_slice_pause_yield "
     "windows_guest_handoff_requested windows_slice_clock_reads active_guest_thread "
     "windows_active_guest_thread_slot verify_journal windows_thread_id active_idle_source "
+    "windows_bsearch_frames windows_bsearch_frame_count "
     "last_decoded_op last_decoded_len last_instruction_rip "
     "decode_failure_is_invalid_control_target block_jit_tlb"
 ).split()
