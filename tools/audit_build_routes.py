@@ -28,6 +28,8 @@ import re
 import sys
 from pathlib import Path
 
+from build_graph_sources import graph_source
+
 ROOT = Path(__file__).resolve().parents[1]
 
 SOURCE = ROOT / "lib" / "processor" / "ELF_processor" / "process.zig"
@@ -51,7 +53,7 @@ def source_imports() -> set[str]:
 
 
 def zig_route(path: Path, module_variable: str) -> set[str]:
-    text = path.read_text(encoding="utf-8")
+    text, _ = graph_source(path)
     return {
         import_name
         for variable, import_name in ADD_IMPORT.findall(text)

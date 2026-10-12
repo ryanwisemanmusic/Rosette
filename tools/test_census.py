@@ -20,6 +20,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from build_graph_sources import graph_source
+
 
 TEST_RE = re.compile(r'^\s*test\s+"([^"]*)"')
 ANONYMOUS_TEST_RE = re.compile(r'^\s*test\s*\{')
@@ -312,10 +314,10 @@ def parse_artifacts(root: Path, text: str, modules: dict[str, str | None]) -> li
 
 def build_graph(root: Path) -> dict:
     path = root / "build" / "build.zig"
-    text = path.read_text(encoding="utf-8", errors="replace")
+    text, registration_inputs = graph_source(path)
     module_roots = parse_modules(root, text)
     artifacts = parse_artifacts(root, text, module_roots)
-    graph_inputs = [path, root / "build" / "Makefile"]
+    graph_inputs = [*registration_inputs, root / "build" / "Makefile"]
     graph_hash = hashlib.sha256()
     for input_path in graph_inputs:
         graph_hash.update(str(input_path.relative_to(root)).encode())

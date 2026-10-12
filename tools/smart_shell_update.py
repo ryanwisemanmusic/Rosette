@@ -17,12 +17,14 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+TIMINGS: list[dict[str, Any]] = []
 STATE_RELATIVE = Path(".rosette/shell-update-state.json")
 SNAPSHOT_SKIP_DIRS = {
     ".git",
@@ -70,6 +72,7 @@ FULL_PREREQUISITES = (
     "test-census",
     "xenia-run-systems-check",
     "shell-update-system-check",
+    "source-budget-check",
     "audit-phase-coverage",
     "xenia-fork-manifest",
     "replay-evidence",
@@ -91,7 +94,7 @@ def command_text(command: list[str], cwd: Path) -> str:
     )
     if completed.returncode:
         raise RuntimeError(f"command failed ({completed.returncode}): {' '.join(command)}\n{completed.stdout}")
-    return completed.stdout.strip()
+    return completed.stdout.rstrip("\n")
 
 
 def decode_git_path(value: str) -> str:
@@ -168,16 +171,64 @@ def hash_path(path: Path) -> str:
 
 
 def current_source_snapshot(root: Path) -> dict[str, Any]:
+    """Canonical content identities, stable across commits and staging.
+
+    Clean tracked files use Git's blob identities; modified/untracked files
+    get the exact same blob digest over their current bytes. Git HEAD alone
+    cannot distinguish a code change from committing already tested bytes.
+    """
     head = command_text(["git", "rev-parse", "HEAD"], root)
-    status = command_text(
-        ["git", "status", "--porcelain=v1", "--untracked-files=normal"], root
+    algorithm = command_text(["git", "rev-parse", "--show-object-format"], root)
+    if algorithm not in ("sha1", "sha256"):
+        raise RuntimeError("unsupported Git object format: " + algorithm)
+    entries = command_text(["git", "ls-files", "--stage", "-z"], root)
+    status = command_text(["git", "status", "--porcelain=v1", "--untracked-files=all"], root)
+    dirty = set(parse_status_paths(status))
+    flags = command_text(["git", "ls-files", "-v", "-z"], root)
+    # Honor changes hidden from status by assume-unchanged or skip-worktree.
+    dirty.update(item[2:] for item in flags.split("\0") if item and (item[0].islower() or item[0] == "S"))
+    files: dict[str, str] = {}
+    for entry in entries.split("\0"):
+        if not entry:
+            continue
+        metadata, relative = entry.split("\t", 1)
+        mode, blob, stage = metadata.split()
+        if stage != "0":
+            raise RuntimeError("unresolved index entry: " + relative)
+        if excluded_snapshot_path(relative):
+            continue
+        files[relative] = mode + ":" + blob
+    for relative in dirty:
+        if excluded_snapshot_path(relative):
+            continue
+        path = root / relative
+        if path.is_symlink():
+            data, mode = os.readlink(path).encode("utf-8", errors="surrogateescape"), "120000"
+        elif path.is_file():
+            data = path.read_bytes()
+            mode = "100755" if path.stat().st_mode & 0o111 else "100644"
+        elif not path.exists():
+            files.pop(relative, None)
+            continue
+        else:
+            raise RuntimeError("source status did not enumerate individual files: " + relative)
+        digest = hashlib.new(algorithm)
+        digest.update(b"blob " + str(len(data)).encode() + b"\0" + data)
+        files[relative] = mode + ":" + digest.hexdigest()
+    encoded = json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
+    return {"head": head, "files": files, "sha256": sha256_bytes(encoded),
+            "identity": "git-blob-content-and-mode-v1"}
+
+
+def excluded_snapshot_path(relative: str) -> bool:
+    first = relative.split("/", 1)[0]
+    if first in EXCLUDED_STATUS_ROOTS:
+        return True
+    # Session notes are documentation, not executable inputs. Source fixtures,
+    # scripts, build definitions and configuration remain in the snapshot.
+    return relative == "AGENTS.md" or (
+        relative.endswith(".md") and first in {"docs", "Rosette_Brain"}
     )
-    paths = parse_status_paths(status)
-    files = {path: hash_path(root / path) for path in paths}
-    encoded = json.dumps(
-        {"head": head, "files": files}, sort_keys=True, separators=(",", ":")
-    ).encode()
-    return {"head": head, "files": files, "sha256": sha256_bytes(encoded)}
 
 
 def external_fingerprint(root: Path, xenia_root: Path) -> dict[str, str]:
@@ -206,25 +257,27 @@ def external_fingerprint(root: Path, xenia_root: Path) -> dict[str, str]:
 
 def run_checked(command: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
     print("+ " + " ".join(command), flush=True)
-    subprocess.run(command, cwd=cwd, env=env, check=True)
+    start = time.monotonic()
+    result = subprocess.run(command, cwd=cwd, env=env, check=False)
+    elapsed = time.monotonic() - start
+    TIMINGS.append({"command": command, "elapsed_seconds": elapsed, "exit_code": result.returncode})
+    print(f"shell-update timing: {elapsed:.3f}s exit={result.returncode} {Path(command[0]).name}", flush=True)
+    result.check_returncode()
 
 
 def make_command(root: Path, xenia_root: Path, targets: list[str]) -> list[str]:
-    make = shutil.which("make") or "make"
-    return [
-        make,
-        "--file",
-        str(root / "build" / "Makefile"),
-        f"XENIA_ROOT={xenia_root}",
-        "ROSETTE_RUNTIME_OPTIMIZE=ReleaseFast",
-        *targets,
-    ]
+    # GNUmakefile already selects build/Makefile from the repository root.
+    # Configuration travels in the environment; Make invocations stay bare.
+    return [shutil.which("make") or "make", *targets]
 
 
-def make_env() -> dict[str, str]:
+def make_env(xenia_root: Path | None = None) -> dict[str, str]:
     env = os.environ.copy()
     for name in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL"):
         env.pop(name, None)
+    env["ROSETTE_RUNTIME_OPTIMIZE"] = "ReleaseFast"
+    if xenia_root is not None:
+        env["XENIA_ROOT"] = str(xenia_root)
     return env
 
 
@@ -299,7 +352,7 @@ def full_update(root: Path, xenia_root: Path) -> None:
         "WARNING: shell-update-all is the full sanity check. It runs the complete Zig census and all shell build audits; allow about 20 minutes or longer.",
         flush=True,
     )
-    run_checked(make_command(root, xenia_root, list(FULL_PREREQUISITES)), root, make_env())
+    run_checked(make_command(root, xenia_root, list(FULL_PREREQUISITES)), root, make_env(xenia_root))
     install_shell(root)
     record_update(root, xenia_root, "full", "all", ("zig-build-check=0",))
     refresh_identity(root, xenia_root)
@@ -399,12 +452,14 @@ def focused_update(root: Path, xenia_root: Path, scope: str) -> None:
     env["ZIG_GLOBAL_CACHE_DIR"] = str(cache / "global")
     run_checked(zig_command, root, env)
     if scope.startswith("elf-"):
-        build_target = "elf-processor-build"
+        targets = ["elf-processor-build", "elf-processor-dylib", "exe-runner-build"]
+        if scope == "elf-processor-windows-runtime":
+            targets.append("macho-processor-build")
     elif scope == "macho-processor":
-        build_target = "macho-processor-build"
+        targets = ["macho-processor-build", "exe-runner-build"]
     else:
-        build_target = "dyld-processor-build"
-    run_checked(make_command(root, xenia_root, [build_target]), root, make_env())
+        targets = ["dyld-processor-build", "elf-processor-dylib", "exe-runner-build"]
+    run_checked(make_command(root, xenia_root, targets), root, make_env(xenia_root))
     install_shell(root)
     record_update(root, xenia_root, "incremental", scope, tuple(f"{name}=0" for name in tests))
     refresh_identity(root, xenia_root)
@@ -439,8 +494,6 @@ def run(root: Path, xenia_root: Path, requested_scope: str) -> int:
         if snapshot["files"].get(path) != previous["snapshot"].get("files", {}).get(path)
     )
     reasons: list[str] = []
-    if snapshot["head"] != previous["snapshot"].get("head"):
-        reasons.append("Git HEAD changed")
     try:
         external = external_fingerprint(root, xenia_root)
     except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
@@ -506,11 +559,19 @@ def main() -> int:
     requested_scope = "auto" if args.scope in ("auto", "relink") else args.scope
     if args.scope == "relink":
         requested_scope = "relink"
+    started = time.monotonic()
+    result = 1
     try:
-        return run(root, xenia_root, requested_scope)
+        result = run(root, xenia_root, requested_scope)
+        return result
     except (OSError, RuntimeError, subprocess.CalledProcessError, ValueError) as error:
         print(f"shell-update: ERROR: {error}", file=sys.stderr, flush=True)
         return 1
+    finally:
+        report = {"schema_version": 1, "elapsed_seconds": time.monotonic() - started,
+                  "exit_code": result, "requested_scope": requested_scope, "stages": TIMINGS}
+        (root / ".rosette").mkdir(exist_ok=True)
+        (root / ".rosette/shell-update-timings.json").write_text(json.dumps(report, indent=2) + "\n")
 
 
 if __name__ == "__main__":
