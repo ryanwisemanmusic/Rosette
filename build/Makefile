@@ -295,7 +295,7 @@ ISO_BIN := $(ZIG_OUT_DIR)/bin/rosette-iso
 ISO_SRC := $(ROOT_DIR)/src/tooling/iso/main.zig
 XBOX360_MEDIA_TOOL := $(ROOT_DIR)/tools/xbox360_media.py
 
-.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build dyld-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build link-audit-build pkg-boundary-audit isa-execution-audit build-routes-audit dll-coverage-audit guest-context-audit vendor-library-audit vendor-audit diagnostic-audit shell-helper-build test-census xenia-run-systems-check shell-update-system-check audit-phase-coverage xenia-fork-manifest xenia-windows-prepare xenia-windows-build build-identity evidence-fixture replay-evidence shell shell-update shell-update-all shell-update-relink shell-update-elf-processor shell-update-elf-processor-process-impl shell-update-elf-processor-windows-runtime shell-update-elf-processor-block-jit shell-update-macho-processor shell-update-dyld-forwarder shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse iso-build iso-run app-wrapper installer uninstaller app-all release notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
+.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build dyld-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build link-audit-build pkg-boundary-audit isa-execution-audit build-routes-audit dll-coverage-audit guest-context-audit vendor-library-audit vendor-audit diagnostic-audit shell-helper-build test-census xenia-run-systems-check shell-update-system-check source-budget-check audit-phase-coverage xenia-fork-manifest xenia-windows-prepare xenia-windows-build build-identity evidence-fixture replay-evidence shell shell-update shell-update-all shell-update-relink shell-update-elf-processor shell-update-elf-processor-process-impl shell-update-elf-processor-windows-runtime shell-update-elf-processor-block-jit shell-update-macho-processor shell-update-dyld-forwarder shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse iso-build iso-run app-wrapper installer uninstaller app-all release notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
 
 all: headers-check zig-build test-run
 
@@ -527,8 +527,12 @@ xenia-run-systems-check:
 	@cd "$(ROOT_DIR)" && python3 "$(XENIA_RUN_SYSTEMS_TEST)"
 	@bash -n "$(XENIA_RUN_LAUNCHER)"
 
+source-budget-check:
+	@cd "$(ROOT_DIR)" && python3 tools/audit_source_size.py
+
 shell-update-system-check:
 	@cd "$(ROOT_DIR)" && python3 "$(SHELL_UPDATE_SYSTEM_TEST)"
+	@cd "$(ROOT_DIR)" && python3 tools/test_build_organization.py
 
 # The six-phase matrix is source-only and deliberately does not inspect or
 # execute Xenia. Its hash is included in build identity so a green test census
