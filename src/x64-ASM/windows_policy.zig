@@ -24,7 +24,6 @@ pub const refusals = [_][]const u8{
     "ungetwc",
     "strtok",
     "_wutime64",
-    "bsearch",
     "_snprintf",
     "CancelIo",
     "CancelIoEx",
@@ -102,4 +101,8 @@ test "policy catalogue is explicit and nonzero" {
     try std.testing.expect(refusals.len > 0);
     try std.testing.expect(contains("CreateDXGIFactory1") == false);
     try std.testing.expect(contains("SetupDiEnumDeviceInfo"));
+    // `bsearch` is implemented by the CRT bridge and calls the guest
+    // comparator. Keeping it in this later refusal list would mask that
+    // implementation if its dispatcher route regressed.
+    try std.testing.expect(!contains("bsearch"));
 }

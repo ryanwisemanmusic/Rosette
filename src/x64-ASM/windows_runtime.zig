@@ -30,7 +30,7 @@ const crt_time = @import("windows_runtime/crt_time.zig");
 const io_integrity = @import("windows_runtime/io_integrity.zig");
 const fast_imports = @import("windows_runtime/fast_imports.zig");
 const core_imports = @import("windows_runtime/core_imports.zig");
-
+pub const SYNTHETIC_BSEARCH_RETURN = @import("windows_bsearch").SYNTHETIC_BSEARCH_RETURN;
 const log = std.log.scoped(.windows_runtime);
 
 const _core_import_api = struct {
@@ -6331,7 +6331,7 @@ fn handleStringAndMemory(state: anytype, name: []const u8, direct_return_rip: ?u
             );
         }
     }
-    if (tryCrtMath(state, name, direct_return_rip)) return true;
+    if (@import("windows_bsearch").tryFunction(state, name, direct_return_rip, arg) or tryCrtMath(state, name, direct_return_rip)) return true;
     if (tryCrtStrings(state, name, direct_return_rip)) return true;
     if (tryImm32(state, name, direct_return_rip)) return true;
     if (trySmallWin32(state, name, direct_return_rip)) return true;

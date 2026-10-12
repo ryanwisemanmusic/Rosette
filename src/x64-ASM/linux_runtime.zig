@@ -18,6 +18,7 @@ else
 pub const SYNTHETIC_PTHREAD_ONCE_RETURN = windows_runtime.SYNTHETIC_PTHREAD_ONCE_RETURN;
 pub const SYNTHETIC_INITTERM_RETURN = windows_runtime.SYNTHETIC_INITTERM_RETURN;
 pub const SYNTHETIC_QSORT_RETURN = windows_runtime.SYNTHETIC_QSORT_RETURN;
+pub const SYNTHETIC_BSEARCH_RETURN = windows_runtime.SYNTHETIC_BSEARCH_RETURN;
 
 // The Windows import fallback contract, re-exported for the PE state that
 // owns the ledger.  Routing it through this module keeps the executor's
