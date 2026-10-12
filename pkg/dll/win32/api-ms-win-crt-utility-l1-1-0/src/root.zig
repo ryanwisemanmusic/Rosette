@@ -13,7 +13,6 @@ pub const match_prefix = "";
 pub const subsystem_name = "unrecognized";
 
 pub const degraded_imports = [_][]const u8{
-    "bsearch",
     "rand_s",
 };
 
@@ -34,7 +33,7 @@ pub fn hasDegradedImport(function_name: []const u8) bool {
 test "DLL identity is case-insensitive and the degraded inventory is local" {
     try std.testing.expect(matches("api-ms-win-crt-utility-l1-1-0.dll"));
     try std.testing.expect(matches("api-ms-win-crt-utility-l1-1-0"));
-    try std.testing.expect(hasDegradedImport("bsearch"));
+    try std.testing.expect(!hasDegradedImport("bsearch"));
     try std.testing.expect(!hasDegradedImport("__not_in_this_dll__"));
 }
 
@@ -46,7 +45,7 @@ test "DLL identity is case-insensitive and the degraded inventory is local" {
 /// `python3 tools/audit_dll_coverage.py`, which fails when this table and the
 /// dispatcher disagree about what is handled.
 pub const exports = [_]export_contract.Export{
-    .{ .name = "bsearch", .convention = .handle, .behaviour = .refused_by_policy, .zero_is_an_answer = true, .reviewed = true, .note = "bsearch returns NULL when the key is absent, which is the answer" },
+    .{ .name = "bsearch", .convention = .handle, .behaviour = .modelled, .zero_is_an_answer = true, .reviewed = true, .note = "bsearch returns NULL when the key is absent, which is the answer" },
     .{ .name = "qsort", .convention = .handle, .behaviour = .modelled, .zero_is_an_answer = true, .reviewed = true, .note = "bsearch returns NULL when the key is absent, which is the answer" },
     .{ .name = "rand_s", .arity = 1, .convention = .zero_count, .behaviour = .modelled, .zero_is_an_answer = true, .reviewed = true, .note = "returns an errno_t: zero is success" },
 };
