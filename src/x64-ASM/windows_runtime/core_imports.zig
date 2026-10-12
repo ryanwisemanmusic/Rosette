@@ -2576,8 +2576,8 @@ pub fn handleCore(comptime api: type, state: anytype, dll_name: []const u8, name
                     guestStateField(state, "windows_last_error").* = if (release_count == 0) 87 else 6; // INVALID_PARAMETER / INVALID_HANDLE
                 }
             }
-        } else if (comptime @hasDecl(State, "signalWindowsWaitObject")) {
-            _ = state.signalWindowsWaitObject(handle, false);
+        } else if (comptime @hasDecl(State, "releaseWindowsMutex")) {
+            succeeded = state.releaseWindowsMutex(handle);
         }
         guestStateField(state, "regs").*.rax = @intFromBool(succeeded);
         finish(state, direct_return_rip);
