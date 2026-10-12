@@ -2072,6 +2072,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const windows_bsearch_mod = b.createModule(.{
+        .root_source_file = b.path("../src/x64-ASM/windows_bsearch.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    windows_runtime_mod.addImport("windows_bsearch", windows_bsearch_mod);
     windows_runtime_mod.addImport("tso_memory", tso_memory_mod);
     windows_runtime_mod.addImport("utf8_codec", utf8_codec_mod);
     windows_runtime_mod.addImport("dll_win32_return_contract", dll_win32_return_contract_mod);

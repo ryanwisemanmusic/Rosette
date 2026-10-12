@@ -171,6 +171,12 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
         .filters = &.{ "a mutex's owner", "released mutex belongs", "initially owned mutex", "wait takes a mutex", "exits owning a mutex", "ERROR_NOT_OWNER", "custom-game stall", "contract: " },
     });
     windows_mutex_check.dependOn(&b.addRunArtifact(windows_mutex_test).step);
+    const windows_bsearch_check = b.step("windows-bsearch-check", "Run the Windows CRT bsearch callback and import-routing regressions");
+    const windows_bsearch_test = b.addTest(.{
+        .root_module = elf_processor_test_mod,
+        .filters = &.{"Windows bsearch"},
+    });
+    windows_bsearch_check.dependOn(&b.addRunArtifact(windows_bsearch_test).step);
     const sse_oracle_check = b.step("sse-oracle-check", "Compare every VEX.128 register form Xenia's JIT emits with native SSE results");
     const sse_oracle_test = b.addTest(.{
         .root_module = elf_processor_test_mod,
