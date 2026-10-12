@@ -63,4 +63,6 @@ pub const compileWith = core.compileWith;
 
 test {
     _ = @import("block_jit/tests.zig");
+    _ = @import("block_jit/register_flow_tests.zig");
+    _ = @import("block_jit/ordered_lane_tests.zig");
 }

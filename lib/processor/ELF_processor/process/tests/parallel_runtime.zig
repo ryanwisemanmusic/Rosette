@@ -1107,6 +1107,7 @@ const BlockJitBenchProgram = struct {
     streaming_stores: bool = true,
     verify_vector_copy: ?u8 = null,
     verify_vector_adds: bool = false,
+    verify_vector_accumulators: bool = false,
 };
 
 fn blockJitBenchRel32(from_end: u64, to: u64) [4]u8 {
@@ -1242,6 +1243,19 @@ fn blockJitBenchVectorChain() BlockJitBenchProgram {
     return p;
 }
 
+/// Four interleaved accumulators retain independent VMX register state.
+fn blockJitBenchVectorAccumulators() BlockJitBenchProgram {
+    var p: BlockJitBenchProgram = .{ .name = "independent VMX accumulators", .bytes = @splat(0xCC), .exit_offset = 265, .iterations = 2_000_000, .instructions_per_iteration = 66, .verify_vector_adds = true, .verify_vector_accumulators = true };
+    for (0..16) |round| for ([_]u8{ 0, 2, 3, 4 }, 0..) |dst, slot| {
+        const offset = (round * 4 + slot) * 4;
+        @memcpy(p.bytes[offset..][0..4], &[_]u8{ 0xC5, 0xF9 ^ (dst << 3), 0xFE, 0xC1 | (dst << 3) });
+    };
+    @memcpy(p.bytes[256..261], &[_]u8{ 0x48, 0xFF, 0xC9, 0x0F, 0x85 });
+    @memcpy(p.bytes[261..265], &blockJitBenchRel32(265, 0));
+    @memcpy(p.bytes[265..267], &[_]u8{ 0xEB, 0xFE });
+    return p;
+}
+
 fn runBlockJitBench(program: BlockJitBenchProgram, mapped: bool) !void {
     const state = try testing.allocator.create(ElfState);
     defer testing.allocator.destroy(state);
@@ -1307,6 +1321,9 @@ fn runBlockJitBench(program: BlockJitBenchProgram, mapped: bool) !void {
     if (program.verify_vector_adds) {
         for (0..4) |lane| try testing.expectEqual(@as(u32, @truncate(program.iterations * 16)), std.mem.readInt(u32, state.xmm[0][lane * 4 ..][0..4], .little));
     }
+    if (program.verify_vector_accumulators) {
+        for ([_]u8{ 0, 2, 3, 4 }) |reg| for (0..4) |lane| try testing.expectEqual(@as(u32, @truncate(program.iterations * 16)), std.mem.readInt(u32, state.xmm[reg][lane * 4 ..][0..4], .little));
+    }
     const instructions = program.iterations * program.instructions_per_iteration;
     const jit = state.block_jit.?;
     std.debug.print("BLOCK JIT BENCH: {s} ({s}): {d} instructions in {d} ms = {d} M instr/s ({d}.{d:0>2} ns/instr) steps={d} entries={d} relinks={d} native_hops={d} links_armed={d} revalidations={d} tlb_fills={d} compiled={d}\n", .{
@@ -1338,7 +1355,7 @@ fn runBlockJitBench(program: BlockJitBenchProgram, mapped: bool) !void {
     }
 }
 
-test "ordered vector TLB production benchmark (ROSETTE_VECTOR_BENCH=1)" {
+test "block jit benchmark: ordered vector TLB production benchmark (ROSETTE_VECTOR_BENCH=1)" {
     if (std.c.getenv("ROSETTE_VECTOR_BENCH") == null) return error.SkipZigTest;
     if (!block_jit.CodeMemory.available()) return error.SkipZigTest;
     for ([_]u8{ 0, 4, 1 }) |alignment| {
@@ -1441,7 +1458,7 @@ test "block jit benchmark: hops, relinks and memory traffic (ROSETTE_BLOCK_JIT_B
     const only: ?[]const u8 = if (std.c.getenv("ROSETTE_BLOCK_JIT_BENCH_ONLY")) |raw| std.mem.sliceTo(raw, 0) else null;
     const scale = envU64("ROSETTE_BLOCK_JIT_BENCH_SCALE") orelse 1;
     for ([_]bool{ false, true }) |mapped| {
-        for ([_]BlockJitBenchProgram{ blockJitBenchCallFanIn(), blockJitBenchIndirectCall(), blockJitBenchBranchy(), blockJitBenchMemory(), blockJitBenchXeniaFunction(), blockJitBenchVectorChain() }) |program| {
+        for ([_]BlockJitBenchProgram{ blockJitBenchCallFanIn(), blockJitBenchIndirectCall(), blockJitBenchBranchy(), blockJitBenchMemory(), blockJitBenchXeniaFunction(), blockJitBenchVectorChain(), blockJitBenchVectorAccumulators() }) |program| {
             if (only) |name| if (std.mem.indexOf(u8, program.name, name) == null) continue;
             var scaled = program;
             scaled.iterations *|= @max(scale, 1);

@@ -216,7 +216,7 @@ const EmittedBlock = core._test_api._EmittedBlock;
 const emitBlock = core._test_api._emitBlock;
 const testing = std.testing;
 
-const TestState = struct {
+pub const TestState = struct {
     regs: Regs = .{},
     scratch: Scratch = .{},
     tlb: Tlb = Tlb.empty,
@@ -265,7 +265,7 @@ const TestState = struct {
     image_targets_hooked: u8 = 1,
     memory: [4096]u8 align(16) = [_]u8{0} ** 4096,
 
-    const layout = Layout{
+    pub const layout = Layout{
         .regs_offset = @offsetOf(TestState, "regs"),
         .scratch_offset = @offsetOf(TestState, "scratch"),
         .tlb_offset = @offsetOf(TestState, "tlb"),
@@ -442,13 +442,13 @@ const TestState = struct {
     }
 };
 
-const TestHarness = struct {
+pub const TestHarness = struct {
     memory: CodeMemory,
     block: Block,
     insns: std.ArrayList(Insn),
     flags_elided: u32 = 0,
 
-    fn init() !TestHarness {
+    pub fn init() !TestHarness {
         if (!CodeMemory.available()) return error.SkipZigTest;
         return .{
             .memory = try CodeMemory.init(8 * 1024 * 1024),
@@ -457,25 +457,25 @@ const TestHarness = struct {
         };
     }
 
-    fn deinit(self: *TestHarness) void {
+    pub fn deinit(self: *TestHarness) void {
         self.insns.deinit(testing.allocator);
         self.memory.deinit();
     }
 
-    fn add(self: *TestHarness, rip: u64, len: u8, d: DecodedInsn) !void {
+    pub fn add(self: *TestHarness, rip: u64, len: u8, d: DecodedInsn) !void {
         var decoded = d;
         decoded.len = len;
         try self.insns.append(testing.allocator, .{ .rip = rip, .len = len, .decoded = decoded, .segment = .ds });
     }
 
     /// Compile the queued instructions and run them once on `state`.
-    fn run(self: *TestHarness, state: *TestState) !u32 {
+    pub fn run(self: *TestHarness, state: *TestState) !u32 {
         return self.runWith(state, .{});
     }
 
     /// `run` with the compile options the glue passes, e.g. the Windows
     /// calling convention's `flags_dead_at_calls`.
-    fn runWith(self: *TestHarness, state: *TestState, options: Options) !u32 {
+    pub fn runWith(self: *TestHarness, state: *TestState, options: Options) !u32 {
         const insns = self.insns.items;
         const last = insns[insns.len - 1];
         const compiled = try compileWith(testing.allocator, &self.memory, TestState.layout, insns, last.rip + last.len, options);

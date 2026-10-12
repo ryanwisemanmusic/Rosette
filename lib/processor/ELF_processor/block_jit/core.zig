@@ -10,16 +10,10 @@
 //! straight-line run of guest instructions is decoded once and emitted as one
 //! ARM64 function that performs the same architected state changes.
 //!
-//! ## What it is, and what it is not
-//!
-//! Guest state stays in `ElfState` in memory. Every emitted instruction loads
-//! its operands from the register file and stores its result back, exactly as
-//! the interpreter does; there is no register allocation. That is a deliberate
-//! first version: the win is removing the fetch, decode, validate and dispatch
-//! work, which is most of the 230 cycles, and a memory-resident register file
-//! keeps every emitted sequence auditable as a flat list against the
-//! interpreter arm it mirrors. The register-file traffic it leaves behind is
-//! L1-resident.
+//! Guest state has a private architectural register file. Blocks cache busy
+//! GPRs, forward dominating vector values, and publish state at observer
+//! boundaries. Proven self-loops retain their GPR assignment between native
+//! iterations while preserving source-generation and scheduler checks.
 //!
 //! The compiled subset is the integer core a compiler and Xenia's own x64
 //! emitter produce most: moves, `movbe`, zero/sign extension, `lea`, the
@@ -76,6 +70,10 @@
 //! the TLB and x24 the vector register file for the life of the block;
 //! x9-x15 are scratch and nothing lives in them across a helper call.
 
+const vector_cache = @import("vector_cache.zig");
+const ordered_lanes = @import("ordered_lanes.zig");
+const self_loops = @import("self_loops.zig");
+const register_cache = @import("register_cache.zig");
 const std = @import("std");
 const testing = std.testing;
 const a64 = @import("arm64_encode");
@@ -1019,6 +1017,7 @@ pub const Compiled = struct {
     internal_sources: u128 = 0,
     upper_clears_elided: u32 = 0,
     xmm_loads_forwarded: u32 = 0,
+    xmm_stores_elided: u32 = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -2288,6 +2287,7 @@ const Compiler = struct {
     epilogue: Label,
     exit_path: Label,
     epilogue_path: Label,
+    resident_loop: ?Label = null,
     exits: std.ArrayList(ExitStub),
     /// Full-probe paths of hoisted accesses, emitted after the block body so
     /// the hot path is the pointer test and the access alone.
@@ -2386,12 +2386,16 @@ const Compiler = struct {
     internal_sources: u128 = 0,
     /// A dominating VEX.128 write already zeroed these private register-file
     /// lanes. Facts are local to straight-line code, never an entry/edge.
+    resident_vectors: bool = true,
+    xmm_valid: u16 = 0,
+    xmm_dirty: u16 = 0,
     last_xmm: ?u8 = null,
     forward_xmm: bool = false,
     zero_ymm: u32 = 0,
     zero_zmm: u32 = 0,
     upper_clears_elided: u32 = 0,
     xmm_loads_forwarded: u32 = 0,
+    xmm_stores_elided: u32 = 0,
 
     fn emit(self: *Compiler, word: u32) Error!void {
         try self.a.emit(word);
@@ -2620,40 +2624,18 @@ const Compiler = struct {
         try self.emitChecked(a64.strImm(.doubleword, src, r_regs, gprOffset(id)));
     }
 
-    /// Read every cached guest register out of the register file.
+    /// Pair adjacent private slots; guest-memory ordering is unchanged.
     fn emitCacheLoad(self: *Compiler) Error!void {
-        for (self.cache_ids[0..self.cache_count], 0..) |id, slot| {
-            try self.emitChecked(a64.ldrImm(.doubleword, cache_host_regs[slot], r_regs, gprOffset(id)));
-        }
+        try register_cache.transfer(self.a, self.cache_ids[0..self.cache_count], cache_host_regs[0..self.cache_count], r_regs, 0xFFFF, false);
     }
 
-    /// Write back every cached guest register the block writes anywhere.
-    /// Whole registers, on every path: one the block writes on some other
-    /// path still holds exactly what memory does here, so writing it is
-    /// harmless, while one the block never writes (`written`, from the
-    /// counting pass) needs no store at all. Xenia's context and membase
-    /// registers, read on every instruction and never written, are the
-    /// common case.
     fn emitCacheWriteBack(self: *Compiler) Error!void {
-        for (self.cache_ids[0..self.cache_count], 0..) |id, slot| {
-            if (self.cache_written & (@as(u16, 1) << @intFromEnum(id)) == 0) continue;
-            try self.emitChecked(a64.strImm(.doubleword, cache_host_regs[slot], r_regs, gprOffset(id)));
-        }
+        try register_cache.transfer(self.a, self.cache_ids[0..self.cache_count], cache_host_regs[0..self.cache_count], r_regs, self.cache_written, true);
     }
 
-    /// Around a C call: the cache registers it would clobber, to their
-    /// register-file slots and back. Clean ones too, since the call loses
-    /// them either way; a helper that changes a guest register changes its
-    /// slot, so the reload also picks that up.
     fn emitCallerSavedCacheSpill(self: *Compiler, reload: bool) Error!void {
         if (self.cache_count <= cache_callee_saved) return;
-        for (self.cache_ids[cache_callee_saved..self.cache_count], cache_callee_saved..) |id, slot| {
-            if (reload) {
-                try self.emitChecked(a64.ldrImm(.doubleword, cache_host_regs[slot], r_regs, gprOffset(id)));
-            } else {
-                try self.emitChecked(a64.strImm(.doubleword, cache_host_regs[slot], r_regs, gprOffset(id)));
-            }
-        }
+        try register_cache.transfer(self.a, self.cache_ids[cache_callee_saved..self.cache_count], cache_host_regs[cache_callee_saved..self.cache_count], r_regs, 0xFFFF, !reload);
     }
 
     /// Choose which guest registers to cache from a counting pass's totals:
@@ -2759,10 +2741,9 @@ const Compiler = struct {
         // The stub's count assumes every instruction before the exit ran;
         // internal edges jumped over `skip_reg` of them.
         if (self.uses_skip_counter) try self.emit(a64.sub(.x64, 0, 0, skip_reg));
-        // Whatever runs next - a chained block, the glue, the interpreter,
-        // a fault handler building a context - reads guest registers from
-        // the register file, so the cache has to be there first.
-        try self.emitCacheWriteBack();
+        // Resident iterations keep the same cache assignment. Other exits
+        // publish below, after their proof or before leaving for the glue.
+        if (self.resident_loop == null) try self.emitCacheWriteBack();
         const leave = self.epilogue_path;
         // Account this block, whether or not the chain goes on: one more
         // block, x0 more instructions. x0 stays as it is, since it is also
@@ -2791,6 +2772,7 @@ const Compiler = struct {
         // t4 = the successor's guest address, t2 = this block.
         try self.emit(a64.mov(.x64, t4, r_exit_rip));
         try self.emitChecked(a64.ldrImm(.doubleword, t2, r_helpers, helper_block_offset));
+        if (self.resident_loop) |loop| try self_loops.emit(self.a, t2, t4, r_scratch, loop, leave);
         const prove = try self.a.createLabel();
         // A block that leaves through `ret` or an indirect transfer has more
         // successors than ways, so it asks the jump cache first; any other
@@ -2823,6 +2805,7 @@ const Compiler = struct {
         try self.emitChecked(a64.ldrImm(.doubleword, t1, t5, @offsetOf(Block, "chain_generation")));
         try self.emit(a64.cmp(.x64, t3, t1));
         try self.a.branchCond(.ne, leave);
+        if (self.resident_loop != null) try self.emitCacheWriteBack();
         // Go. `scratch.block` follows the chain because the continuation
         // check reads it to decide whether a store hit the code ahead.
         try self.emitChecked(a64.strImm(.doubleword, t2, r_scratch, scratch_chain_previous_offset));
@@ -2887,6 +2870,7 @@ const Compiler = struct {
     /// by whichever block finally leaves.
     fn emitFlagCompletion(self: *Compiler) Error!void {
         self.a.placeLabel(self.epilogue_path);
+        if (self.resident_loop != null) try self.emitCacheWriteBack();
         // Leaving for the glue: now the register file needs the RIP.
         try self.emitChecked(a64.strImm(.doubleword, r_exit_rip, r_regs, rip_offset));
         try self.emitChecked(a64.ldrImm(.byte, t0, r_scratch, scratch_flag_kind_offset));
@@ -3215,34 +3199,13 @@ const Compiler = struct {
         try self.emit(if (is_write) a64.stlr(ms, data, host) else a64.ldar(ms, data, host));
     }
 
-    /// Preserve the x86 allowance for tearing on ordinary unaligned scalar
-    /// accesses while keeping each host byte access data-race-free. The
-    /// mapping's page-span check runs before this helper, so even the final
-    /// byte cannot cross into an unadmitted page.
+    /// Keep the existing per-byte atomic accesses and ordering.
     fn emitOrderedUnalignedScalarLoad(self: *Compiler, size: Size, destination: a64.Reg, host: a64.Reg) Error!void {
-        const byte_count = bits(size) / 8;
-        try self.emit(a64.eorReg(.x64, destination, destination, destination));
-        for (0..byte_count) |byte_index| {
-            try self.emit(a64.ldar(.byte, t2, host));
-            const shift: u6 = @intCast(byte_index * 8);
-            if (shift != 0) try self.emit(a64.lslImm(.x64, t2, t2, shift));
-            try self.emit(a64.orrReg(.x64, destination, destination, t2));
-            if (byte_index + 1 != byte_count) try self.emitChecked(a64.addImm(.x64, host, host, 1));
-        }
+        try ordered_lanes.scalarLoad(self.a, destination, host, @intCast(bits(size) / 8));
     }
 
     fn emitOrderedUnalignedScalarStore(self: *Compiler, size: Size, host: a64.Reg) Error!void {
-        const byte_count = bits(size) / 8;
-        for (0..byte_count) |byte_index| {
-            const shift: u6 = @intCast(byte_index * 8);
-            if (shift == 0) {
-                try self.emit(a64.mov(.x64, t2, 3));
-            } else {
-                try self.emit(a64.lsrImm(.x64, t2, 3, shift));
-            }
-            try self.emit(a64.stlr(.byte, t2, host));
-            if (byte_index + 1 != byte_count) try self.emitChecked(a64.addImm(.x64, host, host, 1));
-        }
+        try ordered_lanes.scalarStore(self.a, host, @intCast(bits(size) / 8));
     }
 
     /// Route a host pointer that does not meet the host atomic instruction's
@@ -3277,7 +3240,7 @@ const Compiler = struct {
     fn emitOrderedVectorLoad(self: *Compiler, vector: a64.Reg, host: a64.Reg) Error!void {
         try self.emit(a64.mov(.x64, t1, host));
         try self.emitOrderedScalar(false, .bits64, t0, host);
-        try self.emit(a64.vinsGpr(.d2, vector, 0, t0));
+        try self.emit(a64.fmovFromGpr(vector, t0));
         try self.emitChecked(a64.addImm(.x64, host, t1, 8));
         try self.emitOrderedScalar(false, .bits64, t2, host);
         try self.emit(a64.vinsGpr(.d2, vector, 1, t2));
@@ -3315,17 +3278,7 @@ const Compiler = struct {
     }
 
     fn emitOrderedVectorLanes(self: *Compiler, vector: a64.Reg, host: a64.Reg, is_write: bool, lanes: a64.Lanes, size: a64.MemSize, comptime width: usize) Error!void {
-        try self.emit(a64.mov(.x64, t1, host));
-        for (0..16 / width) |lane| {
-            if (is_write) {
-                try self.emit(a64.vumov(lanes, t0, vector, @intCast(lane)));
-                try self.emit(a64.stlr(size, t0, t1));
-            } else {
-                try self.emit(a64.ldar(size, t0, t1));
-                try self.emit(a64.vinsGpr(lanes, vector, @intCast(lane), t0));
-            }
-            if (lane + 1 != 16 / width) try self.emitChecked(a64.addImm(.x64, t1, t1, width));
-        }
+        try ordered_lanes.vector(self.a, vector, host, is_write, lanes, size, width);
     }
 
     /// x0 = read(state, x1, size), on behalf of instruction `index`: through
@@ -3975,10 +3928,11 @@ const Compiler = struct {
     /// must agree on the state the code after assumes. x29 holds the hoist
     /// only if it does on all of them, and an abort check any of them owes
     /// is still owed.
-    fn placeInternalTarget(self: *Compiler, index: u32) void {
+    fn placeInternalTarget(self: *Compiler, index: u32) Error!void {
         if (index >= self.internal_label.len) return;
         const label = self.internal_label[index] orelse return;
         if (self.fused != null or self.nzcv_live) self.internal_conflict = true;
+        try vector_cache.flush(self, r_spare);
         self.a.placeLabel(label);
         self.last_xmm = null;
         self.zero_ymm = 0;
@@ -4256,9 +4210,8 @@ const Compiler = struct {
         // Only these templates load all their inputs before producing v0,
         // and keep it through their final upper clear. Every other template
         // discards the forwarding fact before emitting anything.
-        self.forward_xmm = !insn.force_fallback and isVectorNative(d) and d.is_reg_form and !d.vector_256 and
-            (packedIntegerForm(d.op) != null or packedFloatForm(d.op) != null or bitwiseForm(d.op) != null or unpackForm(d.op) != null or (d.op == .vmovdqu_xmm_xmm or d.op == .vmovdqa_xmm_xmm or d.op == .vmovups_xmm_xmm or d.op == .vmovaps_xmm_xmm or d.op == .vmovupd_xmm_xmm or d.op == .vmovapd_xmm_xmm));
-        if (!self.forward_xmm) self.last_xmm = null;
+        self.forward_xmm = !insn.force_fallback and forwardsXmm(d);
+        if (!self.forward_xmm) try vector_cache.flush(self, r_spare);
         if (isConditionalBranch(d.op)) {
             self.zero_ymm = 0;
             self.zero_zmm = 0;
@@ -6376,21 +6329,27 @@ const Compiler = struct {
         return @as(u32, index) * 16;
     }
 
+    fn forwardsXmm(d: DecodedInsn) bool {
+        return isVectorNative(d) and d.is_reg_form and !d.vector_256 and
+            (packedIntegerForm(d.op) != null or packedFloatForm(d.op) != null or bitwiseForm(d.op) != null or unpackForm(d.op) != null or (d.op == .vmovdqu_xmm_xmm or d.op == .vmovdqa_xmm_xmm or d.op == .vmovups_xmm_xmm or d.op == .vmovaps_xmm_xmm or d.op == .vmovupd_xmm_xmm or d.op == .vmovapd_xmm_xmm));
+    }
+
     fn loadXmm(self: *Compiler, v: a64.Reg, index: u8) Error!void {
-        if (self.forward_xmm and self.last_xmm == index) {
-            if (v != v0) try self.emit(a64.vmov(v, v0));
-            self.xmm_loads_forwarded += 1;
-            return;
-        }
-        if (v == v0) self.last_xmm = null;
-        try self.emitChecked(a64.vldrQ(v, r_spare, xmmOffset(index)));
+        try vector_cache.load(self, v, index, r_spare);
     }
 
     fn storeXmm(self: *Compiler, index: u8, v: a64.Reg) Error!void {
-        // Still publish every architectural result to its private register
-        // file. Forwarding saves a subsequent load, never delays a write.
-        try self.emitChecked(a64.vstrQ(v, r_spare, xmmOffset(index)));
-        self.last_xmm = if (self.forward_xmm and v == v0) index else null;
+        try vector_cache.store(self, index, v, r_spare);
+    }
+
+    fn vectorOperands(self: *Compiler, insn: Insn, index: u32) Error!struct { lhs: a64.Reg, rhs: a64.Reg } {
+        if (self.forward_xmm) return .{
+            .lhs = try vector_cache.operand(self, insn.decoded.xmm_src, v1, r_spare),
+            .rhs = try vector_cache.operand(self, insn.decoded.xmm_src2, v2, r_spare),
+        };
+        try self.loadSource2(insn, index, v2);
+        try self.loadXmm(v1, insn.decoded.xmm_src);
+        return .{ .lhs = v1, .rhs = v2 };
     }
 
     fn loadYmmHigh(self: *Compiler, v: a64.Reg, index: u8) Error!void {
@@ -6890,21 +6849,22 @@ const Compiler = struct {
         if (!isVectorNative(d)) return false;
         self.touches_vectors = true;
         const dst = d.xmm_dst;
+        const result = vector_cache.destination(self, dst);
         if (d.op == .vptest or d.op == .vtestps or d.op == .vtestpd) {
             try self.emitVectorTest(insn, index);
             return true;
         }
         if (d.op == .vextractf128) {
             if ((d.imm & 1) == 0) {
-                try self.loadXmm(v0, d.xmm_src);
+                try self.loadXmm(result, d.xmm_src);
             } else {
-                try self.loadYmmHigh(v0, d.xmm_src);
+                try self.loadYmmHigh(result, d.xmm_src);
             }
             if (d.is_reg_form) {
-                try self.storeXmm(dst, v0);
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
             } else {
-                try self.emitStoreVecOffset(insn, index, v0, 0);
+                try self.emitStoreVecOffset(insn, index, result, 0);
                 try self.emitAbortCheck(index);
             }
             return true;
@@ -6943,9 +6903,9 @@ const Compiler = struct {
                 // Four singles from the 128-bit source: the low two to the
                 // xmm half, the high two to the upper half.
                 try self.loadSource2(insn, index, v2);
-                try self.emit(a64.vfcvtl(v0, v2));
+                try self.emit(a64.vfcvtl(result, v2));
                 try self.emit(a64.vfcvtl2(v1, v2));
-                try self.storeXmm(dst, v0);
+                try self.storeXmm(dst, result);
                 try self.storeYmmHigh(dst, v1);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
                 return true;
@@ -6961,11 +6921,11 @@ const Compiler = struct {
                     try self.emitAbortCheck(index);
                 }
                 try self.loadXmm(v1, d.xmm_src);
-                try self.emitPackedFloat(form, v0, v1, v2);
-                try self.storeXmm(dst, v0);
+                try self.emitPackedFloat(form, result, v1, v2);
+                try self.storeXmm(dst, result);
                 try self.loadYmmHigh(v1, d.xmm_src);
-                try self.emitPackedFloat(form, v0, v1, v3);
-                try self.storeYmmHigh(dst, v0);
+                try self.emitPackedFloat(form, result, v1, v3);
+                try self.storeYmmHigh(dst, result);
                 return true;
             }
             if (bitwiseForm(d.op)) |kind| {
@@ -6979,35 +6939,35 @@ const Compiler = struct {
                     try self.emitAbortCheck(index);
                 }
                 try self.loadXmm(v1, d.xmm_src);
-                try self.emitBitwise(kind, v0, v1, v2);
-                try self.storeXmm(dst, v0);
+                try self.emitBitwise(kind, result, v1, v2);
+                try self.storeXmm(dst, result);
                 try self.loadYmmHigh(v1, d.xmm_src);
-                try self.emitBitwise(kind, v0, v1, v3);
-                try self.storeYmmHigh(dst, v0);
+                try self.emitBitwise(kind, result, v1, v3);
+                try self.storeYmmHigh(dst, result);
                 return true;
             }
             // Two 128-bit halves, and no upper-half clear: at 256 bits the
             // upper half is what the instruction writes.
             switch (ymmMoveForm(d.op).?) {
                 .load => {
-                    try self.emitLoadVecOffset(insn, index, v0, 0);
-                    try self.storeXmm(dst, v0);
-                    try self.emitLoadVecOffset(insn, index, v0, 16);
-                    try self.storeYmmHigh(dst, v0);
+                    try self.emitLoadVecOffset(insn, index, result, 0);
+                    try self.storeXmm(dst, result);
+                    try self.emitLoadVecOffset(insn, index, result, 16);
+                    try self.storeYmmHigh(dst, result);
                     try self.emitAbortCheck(index);
                 },
                 .store => {
-                    try self.loadXmm(v0, d.xmm_src);
-                    try self.emitStoreVecOffset(insn, index, v0, 0);
-                    try self.loadYmmHigh(v0, d.xmm_src);
-                    try self.emitStoreVecOffset(insn, index, v0, 16);
+                    try self.loadXmm(result, d.xmm_src);
+                    try self.emitStoreVecOffset(insn, index, result, 0);
+                    try self.loadYmmHigh(result, d.xmm_src);
+                    try self.emitStoreVecOffset(insn, index, result, 16);
                     try self.emitAbortCheck(index);
                 },
                 .register => {
-                    try self.loadXmm(v0, d.xmm_src);
-                    try self.storeXmm(dst, v0);
-                    try self.loadYmmHigh(v0, d.xmm_src);
-                    try self.storeYmmHigh(dst, v0);
+                    try self.loadXmm(result, d.xmm_src);
+                    try self.storeXmm(dst, result);
+                    try self.loadYmmHigh(result, d.xmm_src);
+                    try self.storeYmmHigh(dst, result);
                 },
             }
             return true;
@@ -7015,34 +6975,33 @@ const Compiler = struct {
         // Memory operands are read before any vector register is loaded: a
         // TLB miss calls a helper, and helpers keep no vector register.
         if (packedIntegerForm(d.op)) |form| {
-            try self.loadSource2(insn, index, v2);
-            try self.loadXmm(v1, d.xmm_src);
+            const operands = try self.vectorOperands(insn, index);
             try self.emit(switch (form.kind) {
-                .add => a64.vadd(form.lanes, v0, v1, v2),
-                .sub => a64.vsub(form.lanes, v0, v1, v2),
-                .mul => a64.vmul(form.lanes, v0, v1, v2),
-                .cmeq => a64.vcmeq(form.lanes, v0, v1, v2),
-                .cmgt => a64.vcmgt(form.lanes, v0, v1, v2),
-                .smax => a64.vsmax(form.lanes, v0, v1, v2),
-                .smin => a64.vsmin(form.lanes, v0, v1, v2),
-                .umax => a64.vumax(form.lanes, v0, v1, v2),
-                .umin => a64.vumin(form.lanes, v0, v1, v2),
-                .sqadd => a64.vsqadd(form.lanes, v0, v1, v2),
-                .uqadd => a64.vuqadd(form.lanes, v0, v1, v2),
-                .sqsub => a64.vsqsub(form.lanes, v0, v1, v2),
-                .uqsub => a64.vuqsub(form.lanes, v0, v1, v2),
-                .urhadd => a64.vurhadd(form.lanes, v0, v1, v2),
+                .add => a64.vadd(form.lanes, result, operands.lhs, operands.rhs),
+                .sub => a64.vsub(form.lanes, result, operands.lhs, operands.rhs),
+                .mul => a64.vmul(form.lanes, result, operands.lhs, operands.rhs),
+                .cmeq => a64.vcmeq(form.lanes, result, operands.lhs, operands.rhs),
+                .cmgt => a64.vcmgt(form.lanes, result, operands.lhs, operands.rhs),
+                .smax => a64.vsmax(form.lanes, result, operands.lhs, operands.rhs),
+                .smin => a64.vsmin(form.lanes, result, operands.lhs, operands.rhs),
+                .umax => a64.vumax(form.lanes, result, operands.lhs, operands.rhs),
+                .umin => a64.vumin(form.lanes, result, operands.lhs, operands.rhs),
+                .sqadd => a64.vsqadd(form.lanes, result, operands.lhs, operands.rhs),
+                .uqadd => a64.vuqadd(form.lanes, result, operands.lhs, operands.rhs),
+                .sqsub => a64.vsqsub(form.lanes, result, operands.lhs, operands.rhs),
+                .uqsub => a64.vuqsub(form.lanes, result, operands.lhs, operands.rhs),
+                .urhadd => a64.vurhadd(form.lanes, result, operands.lhs, operands.rhs),
             });
-            try self.storeXmm(dst, v0);
+            try self.storeXmm(dst, result);
             try self.clearUpper(dst, d.op);
             if (touchesMemory(d)) try self.emitAbortCheck(index);
             return true;
         }
         if (packedFloatForm(d.op)) |form| {
-            try self.loadSource2(insn, index, v2);
-            try self.loadXmm(v1, d.xmm_src);
-            try self.emitPackedFloat(form, v0, v1, v2);
-            try self.storeXmm(dst, v0);
+            const operands = try self.vectorOperands(insn, index);
+            const target: a64.Reg = if (form.kind == .min or form.kind == .max) v0 else result;
+            try self.emitPackedFloat(form, target, operands.lhs, operands.rhs);
+            try self.storeXmm(dst, target);
             try self.clearUpper(dst, d.op);
             if (touchesMemory(d)) try self.emitAbortCheck(index);
             return true;
@@ -7064,27 +7023,25 @@ const Compiler = struct {
                     try self.emit(a64.fcsel(form.fp, v3, v1, v2, .gt));
                 },
             }
-            try self.emit(a64.vmov(v0, v1));
-            try self.emit(a64.vinsLane(if (form.fp == .single) .s4 else .d2, v0, 0, v3, 0));
-            try self.storeXmm(dst, v0);
+            try self.emit(a64.vmov(result, v1));
+            try self.emit(a64.vinsLane(if (form.fp == .single) .s4 else .d2, result, 0, v3, 0));
+            try self.storeXmm(dst, result);
             try self.clearUpper(dst, d.op);
             if (touchesMemory(d)) try self.emitAbortCheck(index);
             return true;
         }
         if (bitwiseForm(d.op)) |kind| {
-            try self.loadSource2(insn, index, v2);
-            try self.loadXmm(v1, d.xmm_src);
-            try self.emitBitwise(kind, v0, v1, v2);
-            try self.storeXmm(dst, v0);
+            const operands = try self.vectorOperands(insn, index);
+            try self.emitBitwise(kind, result, operands.lhs, operands.rhs);
+            try self.storeXmm(dst, result);
             try self.clearUpper(dst, d.op);
             if (touchesMemory(d)) try self.emitAbortCheck(index);
             return true;
         }
         if (unpackForm(d.op)) |form| {
-            try self.loadSource2(insn, index, v2);
-            try self.loadXmm(v1, d.xmm_src);
-            try self.emit(if (form.high) a64.vzip2(form.lanes, v0, v1, v2) else a64.vzip1(form.lanes, v0, v1, v2));
-            try self.storeXmm(dst, v0);
+            const operands = try self.vectorOperands(insn, index);
+            try self.emit(if (form.high) a64.vzip2(form.lanes, result, operands.lhs, operands.rhs) else a64.vzip1(form.lanes, result, operands.lhs, operands.rhs));
+            try self.storeXmm(dst, result);
             if (!d.legacy_sse) try self.clearUpper(dst, d.op);
             if (touchesMemory(d)) try self.emitAbortCheck(index);
             return true;
@@ -7106,8 +7063,8 @@ const Compiler = struct {
             try self.emit(a64.csel(.x64, t0, t0, t1, .lo));
             if (form.kind != .left) try self.emit(a64.neg(.x64, t0, t0));
             try self.emit(a64.vdupGpr(form.lanes, v3, t0));
-            try self.emit(if (form.kind == .right_arithmetic) a64.vsshlReg(form.lanes, v0, v1, v3) else a64.vushlReg(form.lanes, v0, v1, v3));
-            try self.storeXmm(dst, v0);
+            try self.emit(if (form.kind == .right_arithmetic) a64.vsshlReg(form.lanes, result, v1, v3) else a64.vushlReg(form.lanes, result, v1, v3));
+            try self.storeXmm(dst, result);
             try self.clearUpper(dst, d.op);
             if (touchesMemory(d)) try self.emitAbortCheck(index);
             return true;
@@ -7120,55 +7077,55 @@ const Compiler = struct {
             const count: u64 = d.imm & 0xFF;
             const width: u64 = if (form.kind == .left_bytes or form.kind == .right_bytes) 16 else form.lanes.elementBits();
             if (count == 0) {
-                try self.emit(a64.vmov(v0, v1));
+                try self.emit(a64.vmov(result, v1));
             } else switch (form.kind) {
-                .left => if (count >= width) try self.emit(a64.vmoviZero(v0)) else try self.emit(a64.vshl(form.lanes, v0, v1, @intCast(count))),
-                .right_logical => if (count >= width) try self.emit(a64.vmoviZero(v0)) else try self.emit(a64.vushr(form.lanes, v0, v1, @intCast(count))),
-                .right_arithmetic => try self.emit(a64.vsshr(form.lanes, v0, v1, @intCast(@min(count, width)))),
-                .left_bytes => if (count >= 16) try self.emit(a64.vmoviZero(v0)) else {
+                .left => if (count >= width) try self.emit(a64.vmoviZero(result)) else try self.emit(a64.vshl(form.lanes, result, v1, @intCast(count))),
+                .right_logical => if (count >= width) try self.emit(a64.vmoviZero(result)) else try self.emit(a64.vushr(form.lanes, result, v1, @intCast(count))),
+                .right_arithmetic => try self.emit(a64.vsshr(form.lanes, result, v1, @intCast(@min(count, width)))),
+                .left_bytes => if (count >= 16) try self.emit(a64.vmoviZero(result)) else {
                     try self.emit(a64.vmoviZero(v7));
-                    try self.emit(a64.vext(v0, v7, v1, @intCast(16 - count)));
+                    try self.emit(a64.vext(result, v7, v1, @intCast(16 - count)));
                 },
-                .right_bytes => if (count >= 16) try self.emit(a64.vmoviZero(v0)) else {
+                .right_bytes => if (count >= 16) try self.emit(a64.vmoviZero(result)) else {
                     try self.emit(a64.vmoviZero(v7));
-                    try self.emit(a64.vext(v0, v1, v7, @intCast(count)));
+                    try self.emit(a64.vext(result, v1, v7, @intCast(count)));
                 },
             }
-            try self.storeXmm(dst, v0);
+            try self.storeXmm(dst, result);
             try self.clearUpper(dst, d.op);
             if (touchesMemory(d)) try self.emitAbortCheck(index);
             return true;
         }
         if (extendForm(d.op)) |form| {
-            try self.loadUnarySource(insn, index, v0);
+            try self.loadUnarySource(insn, index, result);
             var lanes = form.source;
             for (0..form.steps) |_| {
-                try self.emit(if (form.signed) a64.vsxtl(lanes, v0, v0) else a64.vuxtl(lanes, v0, v0));
+                try self.emit(if (form.signed) a64.vsxtl(lanes, result, result) else a64.vuxtl(lanes, result, result));
                 lanes = @enumFromInt(@intFromEnum(lanes) + 1);
             }
-            try self.storeXmm(dst, v0);
+            try self.storeXmm(dst, result);
             try self.clearUpper(dst, d.op);
             if (touchesMemory(d)) try self.emitAbortCheck(index);
             return true;
         }
         switch (d.op) {
             .movups_xmm_mem => {
-                try self.emitLoadVec(insn, index, v0);
-                try self.storeXmm(dst, v0);
+                try self.emitLoadVec(insn, index, result);
+                try self.storeXmm(dst, result);
                 try self.emitAbortCheck(index);
             },
             .movups_mem_xmm => {
-                try self.loadXmm(v0, d.xmm_src);
-                try self.emitStoreVec(insn, index, v0);
+                try self.loadXmm(result, d.xmm_src);
+                try self.emitStoreVec(insn, index, result);
                 try self.emitAbortCheck(index);
             },
             .movaps_xmm_xmm => {
-                try self.loadXmm(v0, d.xmm_src);
-                try self.storeXmm(dst, v0);
+                try self.loadXmm(result, d.xmm_src);
+                try self.storeXmm(dst, result);
             },
             .vmovdqu_xmm_xmm, .vmovdqa_xmm_xmm, .vmovups_xmm_xmm, .vmovaps_xmm_xmm, .vmovupd_xmm_xmm, .vmovapd_xmm_xmm => {
-                try self.loadXmm(v0, d.xmm_src);
-                try self.storeXmm(dst, v0);
+                try self.loadXmm(result, d.xmm_src);
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
             },
             .vpmuludq => {
@@ -7179,19 +7136,19 @@ const Compiler = struct {
                 try self.loadXmm(v1, d.xmm_src);
                 try self.emit(a64.vuzp1(.s4, v1, v1, v1));
                 try self.emit(a64.vuzp1(.s4, v2, v2, v2));
-                try self.emit(a64.vumull(v0, v1, v2));
-                try self.storeXmm(dst, v0);
+                try self.emit(a64.vumull(result, v1, v2));
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
             .vpblendw => {
                 // `blendPackedWords`: word i from SRC2 when bit i is set.
                 try self.loadSource2(insn, index, v2);
-                try self.loadXmm(v0, d.xmm_src);
+                try self.loadXmm(result, d.xmm_src);
                 for (0..8) |lane| {
-                    if ((d.imm >> @intCast(lane)) & 1 != 0) try self.emit(a64.vinsLane(.h8, v0, @intCast(lane), v2, @intCast(lane)));
+                    if ((d.imm >> @intCast(lane)) & 1 != 0) try self.emit(a64.vinsLane(.h8, result, @intCast(lane), v2, @intCast(lane)));
                 }
-                try self.storeXmm(dst, v0);
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
@@ -7201,9 +7158,9 @@ const Compiler = struct {
                 // a source.
                 try self.loadSource2(insn, index, v2);
                 try self.loadXmm(v1, d.xmm_src);
-                try self.emit(a64.vinsLane(.d2, v0, 0, v1, @intCast(d.imm & 1)));
-                try self.emit(a64.vinsLane(.d2, v0, 1, v2, @intCast((d.imm >> 1) & 1)));
-                try self.storeXmm(dst, v0);
+                try self.emit(a64.vinsLane(.d2, result, 0, v1, @intCast(d.imm & 1)));
+                try self.emit(a64.vinsLane(.d2, result, 1, v2, @intCast((d.imm >> 1) & 1)));
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
@@ -7219,40 +7176,40 @@ const Compiler = struct {
                     try self.emitLoadOperand(insn, .bits32, index);
                     try self.emit(a64.fmovSFromW(v2, 0));
                 }
-                try self.loadXmm(v0, d.xmm_src);
-                try self.emit(a64.vinsLane(.s4, v0, @intCast((d.imm >> 4) & 3), v2, source_lane));
+                try self.loadXmm(result, d.xmm_src);
+                try self.emit(a64.vinsLane(.s4, result, @intCast((d.imm >> 4) & 3), v2, source_lane));
                 if (d.imm & 0xF != 0) {
                     try self.emit(a64.vmovi8(v3, 0));
                     for (0..4) |lane| {
-                        if ((d.imm >> @intCast(lane)) & 1 != 0) try self.emit(a64.vinsLane(.s4, v0, @intCast(lane), v3, 0));
+                        if ((d.imm >> @intCast(lane)) & 1 != 0) try self.emit(a64.vinsLane(.s4, result, @intCast(lane), v3, 0));
                     }
                 }
-                try self.storeXmm(dst, v0);
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
             .vmovdqu_xmm_mem, .vmovdqa_xmm_mem, .vmovups_xmm_mem, .vmovaps_xmm_mem, .vmovupd_xmm_mem, .vmovapd_xmm_mem => {
-                try self.emitLoadVec(insn, index, v0);
-                try self.storeXmm(dst, v0);
+                try self.emitLoadVec(insn, index, result);
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 try self.emitAbortCheck(index);
             },
             .vmovdqu_mem_xmm, .vmovdqa_mem_xmm, .vmovups_mem_xmm, .vmovaps_mem_xmm, .vmovupd_mem_xmm, .vmovapd_mem_xmm, .vmovntps, .vmovntdq => {
-                try self.loadXmm(v0, d.xmm_src);
-                try self.emitStoreVec(insn, index, v0);
+                try self.loadXmm(result, d.xmm_src);
+                try self.emitStoreVec(insn, index, result);
                 try self.emitAbortCheck(index);
             },
             .vmovd_xmm_reg32, .vmovq_xmm_reg64 => {
                 try self.loadReg(0, d.src_reg, false, if (d.op == .vmovd_xmm_reg32) .bits32 else .bits64);
-                try self.emit(if (d.op == .vmovd_xmm_reg32) a64.fmovSFromW(v0, 0) else a64.fmovFromGpr(v0, 0));
-                try self.storeXmm(dst, v0);
+                try self.emit(if (d.op == .vmovd_xmm_reg32) a64.fmovSFromW(result, 0) else a64.fmovFromGpr(result, 0));
+                try self.storeXmm(dst, result);
                 if (!d.legacy_sse) try self.clearUpper(dst, d.op);
             },
             .vmovd_xmm_mem32, .vmovq_xmm_mem64, .vmovss_xmm_mem, .vmovsd_xmm_mem => {
                 const wide = d.op == .vmovq_xmm_mem64 or d.op == .vmovsd_xmm_mem;
                 try self.emitLoadOperand(insn, if (wide) .bits64 else .bits32, index);
-                try self.emit(if (wide) a64.fmovFromGpr(v0, 0) else a64.fmovSFromW(v0, 0));
-                try self.storeXmm(dst, v0);
+                try self.emit(if (wide) a64.fmovFromGpr(result, 0) else a64.fmovSFromW(result, 0));
+                try self.storeXmm(dst, result);
                 if (!d.legacy_sse) try self.clearUpper(dst, d.op);
                 try self.emitAbortCheck(index);
             },
@@ -7272,24 +7229,24 @@ const Compiler = struct {
             },
             .vmovq_xmm_xmm => {
                 try self.loadXmm(v1, d.xmm_src);
-                try self.emit(a64.vmoviZero(v0));
-                try self.emit(a64.vinsLane(.d2, v0, 0, v1, 0));
-                try self.storeXmm(dst, v0);
+                try self.emit(a64.vmoviZero(result));
+                try self.emit(a64.vinsLane(.d2, result, 0, v1, 0));
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
             },
             .vmovss_xmm_xmm_xmm, .vmovsd_xmm_xmm_xmm => {
                 try self.loadXmm(v2, d.xmm_src2);
-                try self.loadXmm(v0, d.xmm_src);
-                try self.emit(if (d.op == .vmovss_xmm_xmm_xmm) a64.vinsLane(.s4, v0, 0, v2, 0) else a64.vinsLane(.d2, v0, 0, v2, 0));
-                try self.storeXmm(dst, v0);
+                try self.loadXmm(result, d.xmm_src);
+                try self.emit(if (d.op == .vmovss_xmm_xmm_xmm) a64.vinsLane(.s4, result, 0, v2, 0) else a64.vinsLane(.d2, result, 0, v2, 0));
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
             },
             .vmovlps_xmm_xmm_mem64, .vmovlpd_xmm_xmm_mem64, .vmovhps_xmm_xmm_mem64, .vmovhpd_xmm_xmm_mem64 => {
                 const high = d.op == .vmovhps_xmm_xmm_mem64 or d.op == .vmovhpd_xmm_xmm_mem64;
                 try self.emitLoadOperand(insn, .bits64, index);
-                try self.loadXmm(v0, d.xmm_src);
-                try self.emit(a64.vinsGpr(.d2, v0, if (high) 1 else 0, 0));
-                try self.storeXmm(dst, v0);
+                try self.loadXmm(result, d.xmm_src);
+                try self.emit(a64.vinsGpr(.d2, result, if (high) 1 else 0, 0));
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 try self.emitAbortCheck(index);
             },
@@ -7304,20 +7261,20 @@ const Compiler = struct {
             .vmovhlps, .vmovlhps => {
                 // VEX: the low quadword from SRC2's high half (hlps) or the
                 // high quadword from SRC2's low half (lhps), the rest from SRC1.
-                try self.loadXmm(v0, d.xmm_src);
+                try self.loadXmm(result, d.xmm_src);
                 try self.loadXmm(v2, d.xmm_src2);
-                try self.emit(if (d.op == .vmovhlps) a64.vinsLane(.d2, v0, 0, v2, 1) else a64.vinsLane(.d2, v0, 1, v2, 0));
-                try self.storeXmm(dst, v0);
+                try self.emit(if (d.op == .vmovhlps) a64.vinsLane(.d2, result, 0, v2, 1) else a64.vinsLane(.d2, result, 1, v2, 0));
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
             },
             .vmovddup, .vmovsldup, .vmovshdup => {
                 try self.loadUnarySource(insn, index, v1);
                 switch (d.op) {
-                    .vmovddup => try self.emit(a64.vdupLane(.d2, v0, v1, 0)),
-                    .vmovsldup => try self.emit(a64.vtrn1(.s4, v0, v1, v1)),
-                    else => try self.emit(a64.vtrn2(.s4, v0, v1, v1)),
+                    .vmovddup => try self.emit(a64.vdupLane(.d2, result, v1, 0)),
+                    .vmovsldup => try self.emit(a64.vtrn1(.s4, result, v1, v1)),
+                    else => try self.emit(a64.vtrn2(.s4, result, v1, v1)),
                 }
-                try self.storeXmm(dst, v0);
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
@@ -7329,8 +7286,8 @@ const Compiler = struct {
                 try self.loadXmm(v1, d.xmm_src);
                 try self.emit(a64.vmovi8(v3, 0x8F));
                 try self.emit(a64.vand(v2, v2, v3));
-                try self.emit(a64.vtbl(v0, v1, v2));
-                try self.storeXmm(dst, v0);
+                try self.emit(a64.vtbl(result, v1, v2));
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
@@ -7338,9 +7295,9 @@ const Compiler = struct {
                 try self.loadUnarySource(insn, index, v1);
                 for (0..4) |lane| {
                     const selected: u32 = @intCast((d.imm >> @intCast(lane * 2)) & 3);
-                    try self.emit(a64.vinsLane(.s4, v0, @intCast(lane), v1, selected));
+                    try self.emit(a64.vinsLane(.s4, result, @intCast(lane), v1, selected));
                 }
-                try self.storeXmm(dst, v0);
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
@@ -7351,9 +7308,9 @@ const Compiler = struct {
                 try self.loadXmm(v1, d.xmm_src);
                 for (0..4) |lane| {
                     const selected: u32 = @intCast((d.imm >> @intCast(lane * 2)) & 3);
-                    try self.emit(a64.vinsLane(.s4, v0, @intCast(lane), if (lane < 2) v1 else v2, selected));
+                    try self.emit(a64.vinsLane(.s4, result, @intCast(lane), if (lane < 2) v1 else v2, selected));
                 }
-                try self.storeXmm(dst, v0);
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
@@ -7362,23 +7319,23 @@ const Compiler = struct {
                 try self.loadXmm(v1, d.xmm_src);
                 switch (d.op) {
                     .vpacksswb => {
-                        try self.emit(a64.vsqxtn(.b16, false, v0, v1));
-                        try self.emit(a64.vsqxtn(.b16, true, v0, v2));
+                        try self.emit(a64.vsqxtn(.b16, false, result, v1));
+                        try self.emit(a64.vsqxtn(.b16, true, result, v2));
                     },
                     .vpackuswb => {
-                        try self.emit(a64.vsqxtun(.b16, false, v0, v1));
-                        try self.emit(a64.vsqxtun(.b16, true, v0, v2));
+                        try self.emit(a64.vsqxtun(.b16, false, result, v1));
+                        try self.emit(a64.vsqxtun(.b16, true, result, v2));
                     },
                     .vpackssdw => {
-                        try self.emit(a64.vsqxtn(.h8, false, v0, v1));
-                        try self.emit(a64.vsqxtn(.h8, true, v0, v2));
+                        try self.emit(a64.vsqxtn(.h8, false, result, v1));
+                        try self.emit(a64.vsqxtn(.h8, true, result, v2));
                     },
                     else => {
-                        try self.emit(a64.vsqxtun(.h8, false, v0, v1));
-                        try self.emit(a64.vsqxtun(.h8, true, v0, v2));
+                        try self.emit(a64.vsqxtun(.h8, false, result, v1));
+                        try self.emit(a64.vsqxtun(.h8, true, result, v2));
                     },
                 }
-                try self.storeXmm(dst, v0);
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
@@ -7389,8 +7346,8 @@ const Compiler = struct {
                     .vpabsw => .h8,
                     else => .s4,
                 };
-                try self.emit(a64.vabs(lanes, v0, v1));
-                try self.storeXmm(dst, v0);
+                try self.emit(a64.vabs(lanes, result, v1));
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
@@ -7426,9 +7383,9 @@ const Compiler = struct {
                 } else {
                     try self.emitLoadOperand(insn, d.size, index);
                 }
-                try self.loadXmm(v0, d.xmm_src);
-                try self.emit(a64.vinsGpr(lanes, v0, lane, 0));
-                try self.storeXmm(dst, v0);
+                try self.loadXmm(result, d.xmm_src);
+                try self.emit(a64.vinsGpr(lanes, result, lane, 0));
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (!d.is_reg_form) try self.emitAbortCheck(index);
             },
@@ -7439,28 +7396,28 @@ const Compiler = struct {
                 try self.loadXmm(v1, d.xmm_src);
                 const shift: u64 = @min(d.imm & 0xFF, 32);
                 if (shift >= 32) {
-                    try self.emit(a64.vmoviZero(v0));
+                    try self.emit(a64.vmoviZero(result));
                 } else if (shift >= 16) {
                     try self.emit(a64.vmoviZero(v7));
-                    try self.emit(a64.vext(v0, v1, v7, @intCast(shift - 16)));
+                    try self.emit(a64.vext(result, v1, v7, @intCast(shift - 16)));
                 } else if (shift == 0) {
-                    try self.emit(a64.vmov(v0, v2));
+                    try self.emit(a64.vmov(result, v2));
                 } else {
-                    try self.emit(a64.vext(v0, v2, v1, @intCast(shift)));
+                    try self.emit(a64.vext(result, v2, v1, @intCast(shift)));
                 }
-                try self.storeXmm(dst, v0);
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
             .vblendps, .vblendpd => {
                 try self.loadSource2(insn, index, v2);
-                try self.loadXmm(v0, d.xmm_src);
+                try self.loadXmm(result, d.xmm_src);
                 const lanes: a64.Lanes = if (d.op == .vblendps) .s4 else .d2;
                 const count: u32 = if (d.op == .vblendps) 4 else 2;
                 for (0..count) |lane| {
-                    if ((d.imm >> @intCast(lane)) & 1 != 0) try self.emit(a64.vinsLane(lanes, v0, @intCast(lane), v2, @intCast(lane)));
+                    if ((d.imm >> @intCast(lane)) & 1 != 0) try self.emit(a64.vinsLane(lanes, result, @intCast(lane), v2, @intCast(lane)));
                 }
-                try self.storeXmm(dst, v0);
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
@@ -7488,7 +7445,7 @@ const Compiler = struct {
                 };
                 if (d.is_reg_form) {
                     try self.loadXmm(v1, d.xmm_src);
-                    try self.emit(a64.vdupLane(lanes, v0, v1, 0));
+                    try self.emit(a64.vdupLane(lanes, result, v1, 0));
                 } else {
                     const size: Size = switch (lanes) {
                         .h8 => .bits16,
@@ -7496,16 +7453,16 @@ const Compiler = struct {
                         else => .bits32,
                     };
                     try self.emitLoadOperand(insn, size, index);
-                    try self.emit(a64.vdupGpr(lanes, v0, 0));
+                    try self.emit(a64.vdupGpr(lanes, result, 0));
                 }
-                try self.storeXmm(dst, v0);
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (!d.is_reg_form) try self.emitAbortCheck(index);
             },
             .vsqrtps, .vsqrtpd => {
                 try self.loadSource2(insn, index, v2);
-                try self.emit(a64.vfsqrt(if (d.op == .vsqrtps) .s4 else .d2, v0, v2));
-                try self.storeXmm(dst, v0);
+                try self.emit(a64.vfsqrt(if (d.op == .vsqrtps) .s4 else .d2, result, v2));
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
@@ -7517,8 +7474,8 @@ const Compiler = struct {
                 if (d.op == .vrsqrtps) {
                     try self.emit(a64.vfsqrt(.s4, v2, v2));
                 }
-                try self.emit(a64.vfdiv(.s4, v0, v3, v2));
-                try self.storeXmm(dst, v0);
+                try self.emit(a64.vfdiv(.s4, result, v3, v2));
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
@@ -7527,52 +7484,52 @@ const Compiler = struct {
                 // reciprocal. Keep VEX's upper lanes from SRC1 and compute
                 // only lane 0 from SRC2 (or the scalar memory operand).
                 try self.loadScalarSource2(insn, index, .single, v2);
-                try self.loadXmm(v0, d.xmm_src);
+                try self.loadXmm(result, d.xmm_src);
                 try self.emit(a64.vfmovOne(v3));
                 try self.emit(a64.fdiv(.single, v3, v3, v2));
-                try self.emit(a64.vinsLane(.s4, v0, 0, v3, 0));
-                try self.storeXmm(dst, v0);
+                try self.emit(a64.vinsLane(.s4, result, 0, v3, 0));
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
             .vsqrtss, .vsqrtsd => {
                 const fp: a64.FpWidth = if (d.op == .vsqrtss) .single else .double;
                 try self.loadScalarSource2(insn, index, fp, v2);
-                try self.loadXmm(v0, d.xmm_src);
+                try self.loadXmm(result, d.xmm_src);
                 try self.emit(a64.fsqrt(fp, v3, v2));
-                try self.emit(a64.vinsLane(if (fp == .single) .s4 else .d2, v0, 0, v3, 0));
-                try self.storeXmm(dst, v0);
+                try self.emit(a64.vinsLane(if (fp == .single) .s4 else .d2, result, 0, v3, 0));
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
             .vcvtss2sd, .vcvtsd2ss => {
                 const from_single = d.op == .vcvtss2sd;
                 try self.loadScalarSource2(insn, index, if (from_single) .single else .double, v2);
-                try self.loadXmm(v0, d.xmm_src);
+                try self.loadXmm(result, d.xmm_src);
                 try self.emit(if (from_single) a64.fcvtDouble(v3, v2) else a64.fcvtSingle(v3, v2));
-                try self.emit(if (from_single) a64.vinsLane(.d2, v0, 0, v3, 0) else a64.vinsLane(.s4, v0, 0, v3, 0));
-                try self.storeXmm(dst, v0);
+                try self.emit(if (from_single) a64.vinsLane(.d2, result, 0, v3, 0) else a64.vinsLane(.s4, result, 0, v3, 0));
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
             .vcvtps2pd, .vcvtpd2ps => {
                 try self.loadSource2(insn, index, v2);
-                try self.emit(if (d.op == .vcvtps2pd) a64.vfcvtl(v0, v2) else a64.vfcvtn(v0, v2));
-                try self.storeXmm(dst, v0);
+                try self.emit(if (d.op == .vcvtps2pd) a64.vfcvtl(result, v2) else a64.vfcvtn(result, v2));
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
             .vcvtdq2ps => {
                 try self.loadSource2(insn, index, v2);
-                try self.emit(a64.vscvtf(.s4, v0, v2));
-                try self.storeXmm(dst, v0);
+                try self.emit(a64.vscvtf(.s4, result, v2));
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
             .vcvttps2dq, .vcvtps2dq => {
                 try self.loadSource2(insn, index, v2);
                 try self.emitPackedFloatToDword(d.op == .vcvttps2dq);
-                try self.storeXmm(dst, v0);
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
@@ -7584,10 +7541,10 @@ const Compiler = struct {
                 } else {
                     try self.emitLoadOperand(insn, d.size, index);
                 }
-                try self.loadXmm(v0, d.xmm_src);
+                try self.loadXmm(result, d.xmm_src);
                 try self.emit(a64.scvtfScalar(fp, from_64, v3, 0));
-                try self.emit(a64.vinsLane(if (fp == .single) .s4 else .d2, v0, 0, v3, 0));
-                try self.storeXmm(dst, v0);
+                try self.emit(a64.vinsLane(if (fp == .single) .s4 else .d2, result, 0, v3, 0));
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (d.op == .vcvtsi2ss_xmm_mem or d.op == .vcvtsi2sd_xmm_mem) try self.emitAbortCheck(index);
             },
@@ -7615,8 +7572,8 @@ const Compiler = struct {
             .vcmpps, .vcmppd => {
                 try self.loadSource2(insn, index, v2);
                 try self.loadXmm(v1, d.xmm_src);
-                try self.emitFloatCompareMask(if (d.op == .vcmpps) .s4 else .d2, v0, @truncate(d.imm));
-                try self.storeXmm(dst, v0);
+                try self.emitFloatCompareMask(if (d.op == .vcmpps) .s4 else .d2, result, @truncate(d.imm));
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
@@ -7627,21 +7584,21 @@ const Compiler = struct {
                 try self.loadSource2(insn, index, v2);
                 const lanes: a64.FpLanes = if (d.op == .vroundps) .s4 else .d2;
                 try self.emit(a64.vfrint(roundModeOf(d.imm), lanes, v3, v2));
-                try self.emit(a64.vfcmeq(lanes, v0, v2, v2));
-                try self.emit(a64.vbsl(v0, v3, v2));
-                try self.storeXmm(dst, v0);
+                try self.emit(a64.vfcmeq(lanes, result, v2, v2));
+                try self.emit(a64.vbsl(result, v3, v2));
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
             .vroundss, .vroundsd => {
                 const fp: a64.FpWidth = if (d.op == .vroundss) .single else .double;
                 try self.loadScalarSource2(insn, index, fp, v2);
-                try self.loadXmm(v0, d.xmm_src);
+                try self.loadXmm(result, d.xmm_src);
                 try self.emit(a64.frintScalar(roundModeOf(d.imm), fp, v3, v2));
                 try self.emit(a64.fcmp(fp, v2, v2));
                 try self.emit(a64.fcsel(fp, v3, v2, v3, .vs));
-                try self.emit(a64.vinsLane(if (fp == .single) .s4 else .d2, v0, 0, v3, 0));
-                try self.storeXmm(dst, v0);
+                try self.emit(a64.vinsLane(if (fp == .single) .s4 else .d2, result, 0, v3, 0));
+                try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
@@ -7682,6 +7639,8 @@ pub const Options = struct {
     /// Let a conditional branch to a later instruction of the block jump
     /// there instead of leaving (`planInternalEdges`).
     internal_edges: bool = true,
+    resident_self_loops: bool = true,
+    resident_vectors: bool = true,
 };
 
 /// Whether `op` transfers into or back out of a function.
@@ -7867,6 +7826,7 @@ pub fn compileWith(allocator: std.mem.Allocator, memory: *CodeMemory, layout: La
         .internal_sources = pass.compiler.internal_sources,
         .upper_clears_elided = pass.compiler.upper_clears_elided,
         .xmm_loads_forwarded = pass.compiler.xmm_loads_forwarded,
+        .xmm_stores_elided = pass.compiler.xmm_stores_elided,
     };
 }
 
@@ -7900,6 +7860,7 @@ fn emitBlock(
         .end_rip = end_rip,
         .ledger = options.ledger,
         .exact_exit_flags = options.exact_exit_flags,
+        .resident_vectors = options.resident_vectors,
         .epilogue = try assembler.createLabel(),
         .exit_path = try assembler.createLabel(),
         .epilogue_path = try assembler.createLabel(),
@@ -7918,6 +7879,7 @@ fn emitBlock(
     compiler.cache_written = cache_written;
     if (cache_counts) |counts| compiler.chooseCache(counts);
     compiler.planHoist();
+    if (options.resident_self_loops and compiler.cache_count != 0 and self_loops.hasEdge(insns)) compiler.resident_loop = try assembler.createLabel();
     try compiler.planInternalEdges(allow_internal);
     errdefer compiler.freeInternalEdges();
 
@@ -7928,10 +7890,11 @@ fn emitBlock(
     // has to load its own cache just as an entered one does.
     const chain_entry_bytes: u32 = @intCast(assembler.words.items.len * @sizeOf(u32));
     try compiler.emitCacheLoad();
+    if (compiler.resident_loop) |loop| assembler.placeLabel(loop);
     if (compiler.uses_skip_counter) try assembler.emit(a64.mov(.x64, skip_reg, a64.xzr));
     var terminated = false;
     for (insns, 0..) |insn, index| {
-        compiler.placeInternalTarget(@intCast(index));
+        try compiler.placeInternalTarget(@intCast(index));
         const emitted = try compiler.emitInsn(@intCast(index));
         const op = insn.decoded.op;
         if (isTerminator(op) or isFallbackTerminator(op)) {
@@ -7954,6 +7917,7 @@ fn emitBlock(
             }
         }
     }
+    try vector_cache.flush(&compiler, r_spare);
     if (!terminated) {
         const stub = try compiler.exitStub(@intCast(insns.len), end_rip);
         try assembler.branch(stub);
