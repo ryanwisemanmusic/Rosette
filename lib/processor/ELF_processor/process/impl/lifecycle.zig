@@ -157,17 +157,13 @@ pub fn stopParallelGuestWorkers(self: *ElfState) void {
 }
 
 pub fn windowsWorkerSteps(self: *const ElfState) u64 {
+    // This is the sole guest-worker step total. The former
+    // `windows_thread_service_steps` mirror was incremented at the same two
+    // serial and parallel sites and only repeated the read for reports.
     if (self.parallel_guest_execution) {
         return __process_parallel_metrics.load(u64, &self.windows_worker_executed_steps);
     }
     return self.windows_worker_executed_steps;
-}
-
-pub fn windowsThreadServiceSteps(self: *const ElfState) u64 {
-    if (self.parallel_guest_execution) {
-        return __process_parallel_metrics.load(u64, &self.windows_thread_service_steps);
-    }
-    return self.windows_thread_service_steps;
 }
 
 pub fn windowsGuestThreadSteps(self: *const ElfState, thread: *const __process_WindowsGuestThread) u64 {

@@ -967,7 +967,7 @@ pub fn logGraphicsProgress(self: *ElfState, steps: u64) void {
     __process_log.info("PE64 GUEST CLOCK/VBLANK: clock_ticks={d} owner_steps={d} worker_steps={d} vblanks={d} (via {s}) scheduler_calls={d} active_thread=0x{x}; worker-side time must advance independently of the owner loop", .{
         process_impl_lifecycle.windowsGuestClockTicks(self),
         process_impl_lifecycle.observedExecutionSteps(self),
-        process_impl_lifecycle.windowsThreadServiceSteps(self),
+        process_impl_lifecycle.windowsWorkerSteps(self),
         process_impl_kernel_services.guestMilestoneStageHits(self, "_ZN2xe3gpu14GraphicsSystem10MarkVblankEv"),
         process_impl_guest_diagnostics.vblankWitnessName(self),
         self.windows_thread_service_calls,
@@ -1103,7 +1103,7 @@ pub fn logGraphicsStop(self: *ElfState) void {
     __process_log.info("PE64 GUEST CLOCK/VBLANK: clock_ticks={d} owner_steps={d} worker_steps={d} vblanks={d} (via {s}) scheduler_calls={d} active_thread=0x{x}", .{
         process_impl_lifecycle.windowsGuestClockTicks(self),
         process_impl_lifecycle.observedExecutionSteps(self),
-        process_impl_lifecycle.windowsThreadServiceSteps(self),
+        process_impl_lifecycle.windowsWorkerSteps(self),
         process_impl_kernel_services.guestMilestoneStageHits(self, "_ZN2xe3gpu14GraphicsSystem10MarkVblankEv"),
         process_impl_guest_diagnostics.vblankWitnessName(self),
         self.windows_thread_service_calls,

@@ -4198,7 +4198,6 @@ pub fn serviceWindowsGuestThreads(self: *ElfState, max_steps: u64) u64 {
             process_impl_lifecycle.guestContextField(self, "windows_guest_slice_yield_requested").* = false;
             break;
         }
-        self.windows_thread_service_steps +|= process_impl_lifecycle.guestContextField(self, "step_retired").*;
         self.windows_guest_threads[index].executed_steps +|= process_impl_lifecycle.guestContextField(self, "step_retired").*;
         self.windows_worker_executed_steps +|= process_impl_lifecycle.guestContextField(self, "step_retired").*;
         // Every sixty-fourth instruction, note where this thread is. See
@@ -4364,7 +4363,7 @@ pub fn runParallelWindowsGuestThread(self: *ElfState, slot: usize, worker: *__pr
     __process_host_profile.registerWorkerWithGuestHandle(slot, thread.handle);
     defer __process_host_profile.unregisterWorker(slot);
     var pending_steps: u64 = 0;
-    defer publishParallelWorkerSteps(self, &pending_steps);
+    defer publishParallelWorkerSteps(self, thread, &pending_steps);
     // This thread's registers as it left its last step. While it runs,
     // nobody else writes them; while it is parked a waker may finish its
     // call, so the tripwire is disarmed across every park and resume.
@@ -4372,15 +4371,21 @@ pub fn runParallelWindowsGuestThread(self: *ElfState, slot: usize, worker: *__pr
 
     var qos_generation: u32 = __process_std.math.maxInt(u32);
     while (!worker.shouldStop() and !self.parallel_guest_termination.load(.acquire)) {
-        const name_generation = @atomicLoad(u32, &thread.name_generation, .acquire);
-        if (name_generation != qos_generation) {
-            qos_generation = name_generation;
-            process_impl_guest_diagnostics.applyParallelWorkerQos(self, thread);
+        // The guest can rename this thread while it runs. QoS is host
+        // scheduling metadata, so poll for changes at the existing bounded
+        // progress-publication boundary instead of loading an atomic on
+        // every translated block.
+        if (pending_steps == 0) {
+            const name_generation = @atomicLoad(u32, &thread.name_generation, .acquire);
+            if (name_generation != qos_generation) {
+                qos_generation = name_generation;
+                process_impl_guest_diagnostics.applyParallelWorkerQos(self, thread);
+            }
         }
         switch (@atomicLoad(__process_WindowsGuestThreadStatus, &thread.status, .acquire)) {
             .blocked => {
                 tripwire.disarm();
-                publishParallelWorkerSteps(self, &pending_steps);
+                publishParallelWorkerSteps(self, thread, &pending_steps);
                 parkParallelWorker(self, slot, worker);
                 continue;
             },
@@ -4406,10 +4411,7 @@ pub fn runParallelWindowsGuestThread(self: *ElfState, slot: usize, worker: *__pr
         tripwire.arm(context.regs.rip, context.regs.rsp);
         const retired: u64 = @max(context.step_retired, 1);
         pending_steps += retired;
-        // This thread is the only writer of its own count; reports read
-        // it with an atomic load.
-        @atomicStore(u64, &thread.executed_steps, @atomicLoad(u64, &thread.executed_steps, .monotonic) +| retired, .monotonic);
-        if (pending_steps >= __process_PARALLEL_WORKER_STEP_BATCH) publishParallelWorkerSteps(self, &pending_steps);
+        if (pending_steps >= __process_PARALLEL_WORKER_STEP_BATCH) publishParallelWorkerSteps(self, thread, &pending_steps);
 
         if (!continue_running) {
             self.parallel_guest_termination.store(true, .release);
@@ -4440,10 +4442,13 @@ pub fn parallelWorkerWatchName(self: *const ElfState, slot: usize, buffer: []u8)
     return text;
 }
 
-pub fn publishParallelWorkerSteps(self: *ElfState, pending: *u64) void {
+pub fn publishParallelWorkerSteps(self: *ElfState, thread: *__process_WindowsGuestThread, pending: *u64) void {
     if (pending.* == 0) return;
+    // Each worker is the sole writer of its own progress counter. Publish it
+    // with the shared totals so diagnostics still see exact counts at every
+    // batch, park, and exit while avoiding one atomic read/write per block.
+    _ = __process_parallel_metrics.saturatingAdd(u64, &thread.executed_steps, pending.*);
     _ = __process_parallel_metrics.saturatingAdd(u64, &self.windows_worker_executed_steps, pending.*);
-    _ = __process_parallel_metrics.saturatingAdd(u64, &self.windows_thread_service_steps, pending.*);
     __process_concurrency.watch.noteProgress(pending.*);
     pending.* = 0;
 }

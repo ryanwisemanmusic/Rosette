@@ -1504,7 +1504,6 @@ pub const ElfState = struct {
     // until the object becomes ready, just as it does for a blocked worker.
     windows_main_wait_handle: u64 = 0,
     windows_thread_service_calls: u64 = 0,
-    windows_thread_service_steps: u64 = 0,
     windows_thread_yields: u64 = 0,
     windows_thread_blocks: u64 = 0,
     windows_thread_unblocks: u64 = 0,
@@ -2104,10 +2103,6 @@ pub const ElfState = struct {
 
     pub fn windowsWorkerSteps(self: *const ElfState) u64 {
         return process_impl_lifecycle.windowsWorkerSteps(self);
-    }
-
-    fn windowsThreadServiceSteps(self: *const ElfState) u64 {
-        return process_impl_lifecycle.windowsThreadServiceSteps(self);
     }
 
     fn windowsGuestThreadSteps(self: *const ElfState, thread: *const WindowsGuestThread) u64 {
@@ -3947,8 +3942,8 @@ pub const ElfState = struct {
 
     /// Publish a worker's batched step count to the shared totals and its
     /// watchdog record.
-    fn publishParallelWorkerSteps(self: *ElfState, pending: *u64) void {
-        return process_impl_windows_sync.publishParallelWorkerSteps(self, pending);
+    fn publishParallelWorkerSteps(self: *ElfState, thread: *WindowsGuestThread, pending: *u64) void {
+        return process_impl_windows_sync.publishParallelWorkerSteps(self, thread, pending);
     }
 
     /// Sleep until this worker's guest thread may run again.

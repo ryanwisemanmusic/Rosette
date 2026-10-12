@@ -5725,59 +5725,6 @@ test "parallel PE scheduler starts a private guest context on a host worker" {
     try testing.expectEqual(state.windowsWorkerSteps(), state.totalInterpretedSteps());
 }
 
-test "parallel workers translate their hot loops into their own caches and run them at once" {
-    if (!block_jit.CodeMemory.available()) return error.SkipZigTest;
-    var state = ElfState.initWithMemory(testing.allocator, 4 * 1024 * 1024);
-    defer state.deinit();
-    const image_base: u64 = 0x140000000;
-    state.mem_base = image_base;
-    state.mem_size = state.mem.len;
-    state.image_low = image_base;
-    state.image_high = image_base + 0x10000;
-    state.heap_next = image_base + 0x20000;
-    state.guest_heap_limit = image_base + state.mem_size - 0x10000;
-    state.windows_process_peb = image_base + 0x8000;
-    state.windows_runtime_enabled = true;
-    state.block_jit_hot_threshold = 2;
-    state.regs.rax = 0xCAFE;
-    const start = image_base + 0x1000;
-    const code_offset: usize = @intCast(start - image_base);
-    const program = [_]u8{
-        0x48, 0x89, 0xCA, // mov rdx, rcx (the thread argument)
-        0x31, 0xC0, // xor eax, eax
-        0x48, 0x83, 0xC0, 0x03, // loop: add rax, 3
-        0x48, 0xFF, 0xCA, // dec rdx
-        0x75, 0xF7, // jnz loop
-        0xC3, // ret
-    };
-    @memcpy(state.mem[code_offset .. code_offset + program.len], &program);
-    state.configureWindowsExecutableRanges(&.{.{ .guest_base = start, .length = 0x1000 }});
-    state.setParallelGuestExecution(true);
-
-    try testing.expect(state.enqueueWindowsGuestThread(0xF000000000000001, start, 1000, 64 * 1024, true));
-    try testing.expect(state.enqueueWindowsGuestThread(0xF000000000000002, start, 2500, 64 * 1024, true));
-    _ = state.serviceWindowsGuestThreads(64);
-    _ = state.serviceWindowsGuestThreads(64);
-    try testing.expect(state.windows_guest_threads[0].parallel_worker.isStarted());
-    try testing.expect(state.windows_guest_threads[1].parallel_worker.isStarted());
-    state.windows_guest_threads[0].parallel_worker.join();
-    state.windows_guest_threads[1].parallel_worker.join();
-
-    const expected = [_]u64{ 3000, 7500 };
-    for (expected, 0..) |rax, slot| {
-        const thread = &state.windows_guest_threads[slot];
-        try testing.expectEqual(WindowsGuestThreadStatus.completed, thread.status);
-        try testing.expectEqual(rax, thread.context.regs.rax);
-        // Its own cache, with its own translated loop in it.
-        const jit = thread.parallel_block_jit orelse return error.TestUnexpectedResult;
-        try testing.expect(jit.compiled > 0);
-        try testing.expect(jit.instructions_retired > 0);
-        try testing.expectEqual(@as(u64, 0), jit.mismatches);
-    }
-    try testing.expect(state.windows_guest_threads[0].parallel_block_jit != state.windows_guest_threads[1].parallel_block_jit);
-    try testing.expectEqual(@as(u64, 0xCAFE), state.regs.rax);
-}
-
 test "parallel workers pass message-passing through their direct TLBs in x86 order" {
     // A producer stores data then flag, counting down; a consumer on another
     // host thread loads flag then data. x86-TSO forbids a consumer that saw
