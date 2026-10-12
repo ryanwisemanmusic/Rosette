@@ -6,6 +6,7 @@
 //! QueryPerformanceFrequency) and the C runtime's memcpy, memmove and memset.
 
 const std = @import("std");
+const crt_scan = @import("crt_scan.zig");
 
 /// The clock queries the time lane answers. Each reads only the published
 /// clock counter or a constant and writes one 64-bit guest output.
@@ -221,29 +222,54 @@ pub fn tryCrtStrings(host: anytype, state: anytype, dll_name: []const u8, functi
 /// source bytes and returns the full source length. Xenia calls this from its
 /// option parser's regex path; stage short strings before writing so an
 /// overlapping source/destination pair has the same behavior as the locked
-/// handler. Longer or unreadable inputs return to that handler unchanged.
+/// handler. The scan copies each guest chunk directly into the staging buffer,
+/// avoiding a second guest snapshot of the same prefix. Longer or unreadable
+/// inputs return to that handler unchanged.
 const crt_strxfrm_source_limit: usize = 512;
 
 fn fastCrtStrxfrm(state: anytype, destination: u64, source: u64, capacity: u64) ?i64 {
-    const source_length = fastCStringLength(state, source) orelse return null;
+    // When the caller only asks for the length, avoid staging bytes that will
+    // not be written. For the common transforming form, stage and inspect in
+    // one coordinated guest read per chunk.
+    if (destination == 0 or capacity == 0) {
+        const source_length = fastCStringLength(state, source) orelse return null;
+        if (source_length > crt_strxfrm_source_limit) return null;
+        return source_length;
+    }
+
+    var staged: [crt_strxfrm_source_limit + 1]u8 = undefined;
+    const source_length = fastCStringStage(state, source, &staged) orelse return null;
     if (source_length < 0 or source_length > crt_strxfrm_source_limit) return null;
     const length: usize = @intCast(source_length);
-    var staged: [crt_strxfrm_source_limit + 1]u8 = undefined;
-    if (length != 0 and !state.copyFromGuest(staged[0..length], source)) return null;
 
-    if (destination != 0 and capacity != 0) {
-        const capacity_usize: usize = if (capacity > std.math.maxInt(usize))
-            std.math.maxInt(usize)
-        else
-            @intCast(capacity);
-        const copy_count = @min(length, capacity_usize);
-        const needs_terminator = copy_count < capacity_usize;
-        const output_count = copy_count + @intFromBool(needs_terminator);
-        if (needs_terminator) staged[copy_count] = 0;
-        if (state.guestMemory(destination, @intCast(output_count)) == null) return null;
-        if (!state.copyToGuest(destination, staged[0..output_count])) return null;
-    }
+    const capacity_usize: usize = if (capacity > std.math.maxInt(usize))
+        std.math.maxInt(usize)
+    else
+        @intCast(capacity);
+    const copy_count = @min(length, capacity_usize);
+    const needs_terminator = copy_count < capacity_usize;
+    const output_count = copy_count + @intFromBool(needs_terminator);
+    if (needs_terminator) staged[copy_count] = 0;
+    if (state.guestMemory(destination, @intCast(output_count)) == null) return null;
+    if (!state.copyToGuest(destination, staged[0..output_count])) return null;
     return source_length;
+}
+
+fn fastCStringStage(state: anytype, address: u64, staged: []u8) ?i32 {
+    const tail = state.guestMemoryTailConst(address, staged.len) orelse return null;
+    if (tail.len == 0) return null;
+
+    var offset: usize = 0;
+    while (offset < tail.len) {
+        const amount = @min(crt_compare_chunk_bytes, tail.len - offset);
+        const at = std.math.add(u64, address, offset) catch return null;
+        if (!state.copyFromGuest(staged[offset..][0..amount], at)) return null;
+        if (crt_scan.firstZero(staged[offset..][0..amount])) |terminator| {
+            return std.math.cast(i32, offset + terminator) orelse null;
+        }
+        offset += amount;
+    }
+    return null;
 }
 
 fn fastCompareGuestRanges(state: anytype, left: u64, right: u64, count: u64) ?i32 {
@@ -258,8 +284,8 @@ fn fastCompareGuestRanges(state: anytype, left: u64, right: u64, count: u64) ?i3
         const right_address = std.math.add(u64, right, offset) catch return null;
         if (!state.copyFromGuest(left_bytes[0..amount], left_address) or
             !state.copyFromGuest(right_bytes[0..amount], right_address)) return null;
-        for (left_bytes[0..amount], right_bytes[0..amount]) |a, b| {
-            if (a != b) return @as(i32, a) - @as(i32, b);
+        if (crt_scan.firstDifference(left_bytes[0..amount], right_bytes[0..amount])) |difference| {
+            return @as(i32, left_bytes[difference]) - @as(i32, right_bytes[difference]);
         }
         offset += amount;
     }
@@ -275,7 +301,7 @@ fn fastCStringLength(state: anytype, address: u64) ?i32 {
         const amount = @min(tail.len - offset, chunk.len);
         const at = std.math.add(u64, address, offset) catch return null;
         if (!state.copyFromGuest(chunk[0..amount], at)) return null;
-        if (std.mem.indexOfScalar(u8, chunk[0..amount], 0)) |terminator| {
+        if (crt_scan.firstZero(chunk[0..amount])) |terminator| {
             return std.math.cast(i32, offset + terminator) orelse null;
         }
         offset += amount;
@@ -286,13 +312,27 @@ fn fastCStringLength(state: anytype, address: u64) ?i32 {
 }
 
 fn fastCompareGuestStrings(state: anytype, left: u64, right: u64) ?i32 {
-    const left_length = fastCStringLength(state, left) orelse return null;
-    const right_length = fastCStringLength(state, right) orelse return null;
-    const shared = @min(left_length, right_length);
-    const common = fastCompareGuestRanges(state, left, right, @intCast(shared)) orelse return null;
-    if (common != 0) return common;
-    if (left_length == right_length) return 0;
-    return if (left_length < right_length) -1 else 1;
+    const left_tail = state.guestMemoryTailConst(left, crt_string_scan_limit) orelse return null;
+    const right_tail = state.guestMemoryTailConst(right, crt_string_scan_limit) orelse return null;
+    if (left_tail.len == 0 or right_tail.len == 0) return null;
+
+    var left_bytes: [crt_compare_chunk_bytes]u8 = undefined;
+    var right_bytes: [crt_compare_chunk_bytes]u8 = undefined;
+    var offset: usize = 0;
+    while (offset < crt_string_scan_limit) {
+        if (offset >= left_tail.len or offset >= right_tail.len) return null;
+        const amount = @min(crt_compare_chunk_bytes, @min(left_tail.len - offset, right_tail.len - offset));
+        const left_address = std.math.add(u64, left, offset) catch return null;
+        const right_address = std.math.add(u64, right, offset) catch return null;
+        if (!state.copyFromGuest(left_bytes[0..amount], left_address) or
+            !state.copyFromGuest(right_bytes[0..amount], right_address)) return null;
+        switch (crt_scan.compareStringChunk(left_bytes[0..amount], right_bytes[0..amount])) {
+            .continue_scan => offset += amount,
+            .result => |result| return result,
+        }
+    }
+    // Unterminated bounded snapshots remain on the ordinary CRT path.
+    return null;
 }
 
 pub fn crtMemoryOp(dll_name: []const u8, function_name: []const u8) ?CrtMemoryOp {
@@ -612,8 +652,10 @@ test "the CRT read-only string lane compares and measures guest snapshots withou
         trace_write_address: ?u64 = null,
         memory_trace_live: bool = false,
         context: Context = .{},
-        memory: [128]u8 = @splat(0),
+        memory: [2048]u8 = @splat(0),
         calls: [4]u32 = @splat(0),
+        copy_calls: u32 = 0,
+        copied_bytes: usize = 0,
         scope_begins: u32 = 0,
         scope_ends: u32 = 0,
 
@@ -644,6 +686,8 @@ test "the CRT read-only string lane compares and measures guest snapshots withou
             if (address > self.memory.len) return false;
             const start: usize = @intCast(address);
             if (destination.len > self.memory.len - start) return false;
+            self.copy_calls += 1;
+            self.copied_bytes += destination.len;
             @memcpy(destination, self.memory[start..][0..destination.len]);
             return true;
         }
@@ -702,6 +746,35 @@ test "the CRT read-only string lane compares and measures guest snapshots withou
     try std.testing.expectEqual([_]u32{ 1, 1, 1, 0 }, state.calls);
     try std.testing.expectEqual(state.scope_begins, state.scope_ends);
 
+    // A shared equal prefix is visited once, including strings longer than a
+    // guest snapshot chunk. A late mismatch still returns the first byte's
+    // signed difference, and a terminator takes precedence over later bytes.
+    @memset(state.memory[128..828], 'q');
+    @memset(state.memory[1024..1724], 'q');
+    state.memory[828] = 0;
+    state.memory[1724] = 0;
+    state.context.regs = .{ .rcx = 128, .rdx = 1024 };
+    state.copy_calls = 0;
+    state.copied_bytes = 0;
+    try std.testing.expect(tryCrtStrings(FakeHost, &state, "ucrtbase.dll", "strcmp", 0x1400_3050));
+    try std.testing.expectEqual(@as(u64, 0), state.context.regs.rax);
+    // The new path reads four bounded chunks. The previous implementation
+    // scanned both strings for NUL (four chunks), then copied the shared
+    // prefix again (four more chunks): 3448 bytes in eight snapshots here.
+    try std.testing.expectEqual(@as(u32, 4), state.copy_calls);
+    try std.testing.expectEqual(@as(usize, 2048), state.copied_bytes);
+
+    state.memory[1024 + 517] = 'r';
+    state.context.regs = .{ .rcx = 128, .rdx = 1024 };
+    try std.testing.expect(tryCrtStrings(FakeHost, &state, "ucrtbase.dll", "strcmp", 0x1400_3060));
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -1))), state.context.regs.rax);
+
+    state.memory[128 + 511] = 0;
+    state.memory[1024 + 511] = 'r';
+    state.context.regs = .{ .rcx = 128, .rdx = 1024 };
+    try std.testing.expect(tryCrtStrings(FakeHost, &state, "ucrtbase.dll", "strcmp", 0x1400_3070));
+    try std.testing.expect(state.context.regs.rax == 0 or @as(i64, @bitCast(state.context.regs.rax)) < 0);
+
     // The launcher enables a mapped-write trace. Read-only operations still
     // use snapshots, while the transforming operation is kept on the locked
     // path when a guest write would need tracing.
@@ -718,6 +791,19 @@ test "the CRT read-only string lane compares and measures guest snapshots withou
     try std.testing.expectEqual(@as(u64, 5), state.context.regs.rax);
     try std.testing.expectEqualStrings("hello\x00", state.memory[80..86]);
     try std.testing.expectEqual(@as(u64, 0x1400_3300), state.context.regs.rip);
+
+    // The staging scan reads each source chunk once. The former length scan
+    // plus copy read this 400-byte prefix twice (512 + 400 bytes total).
+    @memset(state.memory[256..656], 'z');
+    state.memory[656] = 0;
+    state.copy_calls = 0;
+    state.copied_bytes = 0;
+    state.context.regs = .{ .rcx = 800, .rdx = 256, .r8 = 512 };
+    try std.testing.expect(tryCrtStrings(FakeHost, &state, "ucrtbase.dll", "strxfrm", 0x1400_3350));
+    try std.testing.expectEqual(@as(u64, 400), state.context.regs.rax);
+    try std.testing.expectEqualSlices(u8, state.memory[256..657], state.memory[800..1201]);
+    try std.testing.expectEqual(@as(u32, 1), state.copy_calls);
+    try std.testing.expectEqual(@as(usize, 512), state.copied_bytes);
 
     // strxfrm copies exactly capacity bytes and does not append NUL when the
     // transformed source is at least that long.
@@ -739,7 +825,7 @@ test "the CRT read-only string lane compares and measures guest snapshots withou
     state.trace_string_memory = true;
     state.context.regs = .{ .rcx = 0 };
     try std.testing.expect(!tryCrtStrings(FakeHost, &state, "ucrtbase.dll", "strlen", 0x1400_5000));
-    try std.testing.expectEqual([_]u32{ 1, 2, 1, 2 }, state.calls);
+    try std.testing.expectEqual([_]u32{ 1, 2, 4, 3 }, state.calls);
 }
 
 pub const CrtHeapOp = enum(u2) { malloc_uninitialized, calloc_zeroed, aligned_malloc, free };
