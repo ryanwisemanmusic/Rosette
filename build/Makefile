@@ -295,7 +295,7 @@ ISO_BIN := $(ZIG_OUT_DIR)/bin/rosette-iso
 ISO_SRC := $(ROOT_DIR)/src/tooling/iso/main.zig
 XBOX360_MEDIA_TOOL := $(ROOT_DIR)/tools/xbox360_media.py
 
-.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build dyld-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build link-audit-build pkg-boundary-audit isa-execution-audit build-routes-audit dll-coverage-audit guest-context-audit vendor-library-audit vendor-audit diagnostic-audit shell-helper-build test-census xenia-run-systems-check shell-update-system-check source-budget-check audit-phase-coverage xenia-fork-manifest xenia-windows-prepare xenia-windows-build build-identity evidence-fixture replay-evidence shell shell-update shell-update-all shell-update-relink shell-update-elf-processor shell-update-elf-processor-process-impl shell-update-elf-processor-windows-runtime shell-update-elf-processor-block-jit shell-update-macho-processor shell-update-dyld-forwarder shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse iso-build iso-run app-wrapper installer uninstaller app-all release notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
+.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build dyld-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build link-audit-build pkg-boundary-audit isa-execution-audit build-routes-audit dll-coverage-audit guest-context-audit vendor-library-audit vendor-audit diagnostic-audit shell-helper-build test-census xenia-run-systems-check shell-update-system-check source-budget-check audit-phase-coverage xenia-fork-manifest xenia-fork-manifest-shell-update xenia-windows-prepare xenia-windows-build build-identity evidence-fixture replay-evidence shell shell-update shell-update-all shell-update-relink shell-update-elf-processor shell-update-elf-processor-process-impl shell-update-elf-processor-windows-runtime shell-update-elf-processor-block-jit shell-update-macho-processor shell-update-dyld-forwarder shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse iso-build iso-run app-wrapper installer uninstaller app-all release notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
 
 all: headers-check zig-build test-run
 
@@ -330,6 +330,7 @@ help:
 		'  make test-census  Execute zig build check and write the source/artifact test census' \
 		'  make xenia-run-systems-check  Verify Rosetta run manager, benchmark, and admission tooling' \
 		'  make xenia-fork-manifest  Record the pinned Xenia base and classify every fork path' \
+		'  make xenia-fork-manifest-shell-update  Record an unavailable source if the external Xenia drive is unmounted' \
 		'  make xenia-windows-prepare  Stage an isolated Windows Xenia source mirror and support capsule' \
 		'  make xenia-windows-build    Configure/build/bundle the Rosette-owned Windows Xenia PE' \
 		'  make build-identity  Hash Rosette/Xenia/build/test/shell inputs into an admission manifest' \
@@ -494,7 +495,12 @@ guest-context-audit:
 	@cd "$(ROOT_DIR)" && python3 tools/audit_guest_context_access.py
 
 vendor-library-audit:
-	@cd "$(ROOT_DIR)" && python3 tools/check_vendor_libraries.py $(if $(XENIA_ROOT),--xenia-root "$(XENIA_ROOT)",)
+	@if [ -d "$(XENIA_ROOT)" ]; then \
+		cd "$(ROOT_DIR)" && python3 tools/check_vendor_libraries.py --xenia-root "$(XENIA_ROOT)"; \
+	else \
+		echo "vendor audit: Xenia source comparison SKIP (checkout unavailable at $(XENIA_ROOT)); vendored sources, host providers, and ABI probes still run"; \
+		cd "$(ROOT_DIR)" && python3 tools/check_vendor_libraries.py; \
+	fi
 
 vendor-audit: vendor-library-audit
 
@@ -545,6 +551,12 @@ audit-phase-coverage:
 # base without pretending that a source census is a behavior proof.
 xenia-fork-manifest:
 	@cd "$(ROOT_DIR)" && python3 "$(XENIA_FORK_MANIFEST_SCRIPT)" --root "$(XENIA_ROOT)" --output "$(XENIA_FORK_MANIFEST_OUT)"
+
+# Shell updates do not need the external Xenia checkout. If its removable
+# drive is absent, preserve that fact in an unavailable manifest and continue;
+# build-identity and authentic run admission remain strict about Xenia source.
+xenia-fork-manifest-shell-update:
+	@cd "$(ROOT_DIR)" && python3 "$(XENIA_FORK_MANIFEST_SCRIPT)" --root "$(XENIA_ROOT)" --output "$(XENIA_FORK_MANIFEST_OUT)" --allow-missing-root
 
 # Replay is a release gate even on a clean checkout. Preserve a real journal
 # if one exists; otherwise create the deterministic source-only fixture so the
@@ -602,6 +614,13 @@ shell: shell-helper-build
 #   check`, shell/build audits, Xenia source manifest, install, and identities.
 #   Expect about 20 minutes or longer. Use it periodically and after changes
 #   to the updater/dependency model; it is intentionally not the default.
+# - The shell-update identity records Xenia as explicitly unavailable when
+#   its external drive is unmounted. This lets Rosette's shell refresh proceed;
+#   `make build-identity` and authentic Xenia run admission still require the
+#   actual source checkout and will not accept an incomplete identity.
+# - The vendored-library audit always checks Rosette's pinned copies, host
+#   providers and ABI probes. Its comparison against Xenia's submodule commits
+#   is explicitly skipped only when the configured Xenia checkout is absent.
 shell-update:
 	@cd "$(ROOT_DIR)" && python3 "$(SHELL_UPDATE_SMART_SCRIPT)" --root "$(ROOT_DIR)" --xenia-root "$(XENIA_ROOT)" --scope auto
 
