@@ -9024,8 +9024,7 @@ fn tryUser32Extras(state: anytype, name: []const u8, direct_return_rip: ?u64) bo
 /// Execute one Microsoft x64 import. The caller invokes this only for a PE
 /// state, so an unrecognized import can be made an explicit terminal event
 /// rather than silently entering a zero-return stub.
-/// Try the narrow import lanes before entering general dispatch. Most bypass
-/// the runtime mutex; SRW retains that mutex and the ordinary owner/waiter
+/// Try narrow import lanes before general dispatch; SRW retains its runtime mutex.
 pub fn tryWindowsFastFunction(state: anytype, dll_name: []const u8, function_name: []const u8, direct_return_rip: ?u64) bool {
     const State = @TypeOf(state.*);
     // SRW retains its runtime mutex and owner/waiter synchronization.
@@ -9045,7 +9044,8 @@ pub fn tryWindowsFastFunction(state: anytype, dll_name: []const u8, function_nam
             if (fast_imports.tryProcessAffinityMask(fast_import_host, state, dll_name, function_name, direct_return_rip)) return true;
         }
     }
-    if (fast_imports.trySleepZero(fast_import_host, state, dll_name, function_name, direct_return_rip)) return true;
+    if (@import("windows_runtime/fast_nt_yield.zig").tryFunction(fast_import_host, state, dll_name, function_name, direct_return_rip) or
+        fast_imports.trySleepZero(fast_import_host, state, dll_name, function_name, direct_return_rip)) return true;
     if (comptime @hasDecl(State, "windowsFastImportMayBypassRuntimeLock")) {
         if (!state.windowsFastImportMayBypassRuntimeLock()) return false;
     }
