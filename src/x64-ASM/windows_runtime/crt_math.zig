@@ -55,11 +55,28 @@ fn returnGuestFloat(state: anytype, value: f32) void {
     std.mem.writeInt(u32, guestStateField(state, "xmm").*[0][0..4], @bitCast(value), .little);
 }
 
+/// Shared exact implementation for ordinary dispatch and the parallel lane.
+pub fn tryExp2(comptime host: type, state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    if (std.mem.eql(u8, name, "exp2")) {
+        returnGuestDouble(state, std.math.exp2(guestDouble(state, 0)));
+        guestStateField(state, "windows_last_error").* = 0;
+        host.completeCall(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "exp2f")) {
+        returnGuestFloat(state, std.math.exp2(guestFloat(state, 0)));
+        host.completeCall(state, direct_return_rip);
+        return true;
+    }
+    return false;
+}
+
 /// The C runtime maths functions Rosette computes exactly.
 ///
 /// Returns false for a name this does not own, so the caller carries on down
 /// its chain.
 pub fn tryFunction(comptime host: type, state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    if (tryExp2(host, state, name, direct_return_rip)) return true;
     const Unary = struct { name: []const u8, apply: *const fn (f64) f64 };
     const unary = [_]Unary{
         .{ .name = "acos", .apply = struct {
@@ -102,11 +119,6 @@ pub fn tryFunction(comptime host: type, state: anytype, name: []const u8, direct
                 return std.math.tanh(x);
             }
         }.f },
-        .{ .name = "exp2", .apply = struct {
-            fn f(x: f64) f64 {
-                return std.math.exp2(x);
-            }
-        }.f },
         .{ .name = "log10", .apply = struct {
             fn f(x: f64) f64 {
                 return std.math.log10(x);
@@ -121,11 +133,6 @@ pub fn tryFunction(comptime host: type, state: anytype, name: []const u8, direct
         return true;
     }
 
-    if (std.mem.eql(u8, name, "exp2f")) {
-        returnGuestFloat(state, std.math.exp2(guestFloat(state, 0)));
-        host.completeCall(state, direct_return_rip);
-        return true;
-    }
     if (std.mem.eql(u8, name, "log2f")) {
         returnGuestFloat(state, std.math.log2(guestFloat(state, 0)));
         host.completeCall(state, direct_return_rip);

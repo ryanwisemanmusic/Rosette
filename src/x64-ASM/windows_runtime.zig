@@ -29,6 +29,7 @@ const crt_math = @import("windows_runtime/crt_math.zig");
 const crt_time = @import("windows_runtime/crt_time.zig");
 const io_integrity = @import("windows_runtime/io_integrity.zig");
 const fast_imports = @import("windows_runtime/fast_imports.zig");
+const fast_math = @import("windows_runtime/fast_math.zig");
 const core_imports = @import("windows_runtime/core_imports.zig");
 pub const SYNTHETIC_BSEARCH_RETURN = @import("windows_bsearch").SYNTHETIC_BSEARCH_RETURN;
 const log = std.log.scoped(.windows_runtime);
@@ -9025,11 +9026,9 @@ fn tryUser32Extras(state: anytype, name: []const u8, direct_return_rip: ?u64) bo
 /// rather than silently entering a zero-return stub.
 /// Try the narrow import lanes before entering general dispatch. Most bypass
 /// the runtime mutex; SRW retains that mutex and the ordinary owner/waiter
-/// implementation. A caller already inside the mutex declines these lanes.
 pub fn tryWindowsFastFunction(state: anytype, dll_name: []const u8, function_name: []const u8, direct_return_rip: ?u64) bool {
     const State = @TypeOf(state.*);
-    // This lane still takes the runtime mutex. It avoids the general import
-    // and interpreter dispatch, not SRW ownership or waiter synchronization.
+    // SRW retains its runtime mutex and owner/waiter synchronization.
     if (comptime @hasDecl(State, "tryWindowsSrwImport")) {
         if (std.ascii.eqlIgnoreCase(dll_name, "kernel32.dll") or
             std.ascii.startsWithIgnoreCase(dll_name, "api-ms-win-core-synch-"))
@@ -9039,7 +9038,8 @@ pub fn tryWindowsFastFunction(state: anytype, dll_name: []const u8, function_nam
     }
     if (comptime @hasDecl(State, "windowsFastCrtImportMayBypassRuntimeLock")) {
         if (state.windowsFastCrtImportMayBypassRuntimeLock()) {
-            if (fast_imports.tryCrtHeap(fast_import_host, state, dll_name, function_name, direct_return_rip)) return true;
+            if (fast_math.tryFunction(fast_import_host, state, dll_name, function_name, direct_return_rip) or
+                fast_imports.tryCrtHeap(fast_import_host, state, dll_name, function_name, direct_return_rip)) return true;
             if (fast_imports.tryCrtMemory(fast_import_host, state, dll_name, function_name, direct_return_rip)) return true;
             if (fast_imports.tryCrtStrings(fast_import_host, state, dll_name, function_name, direct_return_rip)) return true;
             if (fast_imports.tryProcessAffinityMask(fast_import_host, state, dll_name, function_name, direct_return_rip)) return true;
