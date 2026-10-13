@@ -71,6 +71,8 @@
 //! x9-x15 are scratch and nothing lives in them across a helper call.
 
 const vector_cache = @import("vector_cache.zig");
+const vector_permute = @import("vector_permute.zig");
+const wide_unpacks = @import("wide_unpacks.zig");
 const ordered_lanes = @import("ordered_lanes.zig");
 const self_loops = @import("self_loops.zig");
 const register_cache = @import("register_cache.zig");
@@ -2196,6 +2198,7 @@ pub fn isVectorNative(d: DecodedInsn) bool {
         else => false,
     };
     if (d.vector_256) {
+        if (unpackForm(d.op) != null) return d.is_reg_form;
         if (d.op == .vextractf128) return memoryOperandSupported(d);
         if (d.op == .vinsertf128 or d.op == .vpermilps) return d.is_reg_form or memoryOperandSupported(d);
         if (d.op == .vmovmskps or d.op == .vmovmskpd) return d.is_reg_form;
@@ -2225,7 +2228,7 @@ pub fn isVectorNative(d: DecodedInsn) bool {
         .vpshufb, .vpshufd, .vshufps => d.is_reg_form or memoryOperandSupported(d),
         .vpackssdw, .vpacksswb, .vpackuswb, .vpackusdw => d.is_reg_form or memoryOperandSupported(d),
         .vpabsb, .vpabsw, .vpabsd => d.is_reg_form or memoryOperandSupported(d),
-        .vpextrb, .vpextrw, .vpextrd, .vpextrq => d.is_reg_form or memoryOperandSupported(d),
+        .vpextrb, .vpextrw, .vpextrd, .vpextrq, .vextractps => d.is_reg_form or memoryOperandSupported(d),
         .vpinsrb_xmm_xmm_reg32, .vpinsrw, .vpinsrd, .vpinsrq => d.is_reg_form or memoryOperandSupported(d),
         .vpinsrb_xmm_xmm_mem8 => memoryOperandSupported(d),
         .vpalignr => d.is_reg_form or memoryOperandSupported(d),
@@ -2397,7 +2400,7 @@ const Compiler = struct {
     xmm_loads_forwarded: u32 = 0,
     xmm_stores_elided: u32 = 0,
 
-    fn emit(self: *Compiler, word: u32) Error!void {
+    pub fn emit(self: *Compiler, word: u32) Error!void {
         try self.a.emit(word);
     }
 
@@ -6331,14 +6334,14 @@ const Compiler = struct {
 
     fn forwardsXmm(d: DecodedInsn) bool {
         return isVectorNative(d) and d.is_reg_form and !d.vector_256 and
-            (packedIntegerForm(d.op) != null or packedFloatForm(d.op) != null or bitwiseForm(d.op) != null or unpackForm(d.op) != null or (d.op == .vmovdqu_xmm_xmm or d.op == .vmovdqa_xmm_xmm or d.op == .vmovups_xmm_xmm or d.op == .vmovaps_xmm_xmm or d.op == .vmovupd_xmm_xmm or d.op == .vmovapd_xmm_xmm));
+            (packedIntegerForm(d.op) != null or packedFloatForm(d.op) != null or bitwiseForm(d.op) != null or unpackForm(d.op) != null or d.op == .vpermilps or (d.op == .vmovdqu_xmm_xmm or d.op == .vmovdqa_xmm_xmm or d.op == .vmovups_xmm_xmm or d.op == .vmovaps_xmm_xmm or d.op == .vmovupd_xmm_xmm or d.op == .vmovapd_xmm_xmm));
     }
 
-    fn loadXmm(self: *Compiler, v: a64.Reg, index: u8) Error!void {
+    pub fn loadXmm(self: *Compiler, v: a64.Reg, index: u8) Error!void {
         try vector_cache.load(self, v, index, r_spare);
     }
 
-    fn storeXmm(self: *Compiler, index: u8, v: a64.Reg) Error!void {
+    pub fn storeXmm(self: *Compiler, index: u8, v: a64.Reg) Error!void {
         try vector_cache.store(self, index, v, r_spare);
     }
 
@@ -6352,12 +6355,12 @@ const Compiler = struct {
         return .{ .lhs = v1, .rhs = v2 };
     }
 
-    fn loadYmmHigh(self: *Compiler, v: a64.Reg, index: u8) Error!void {
+    pub fn loadYmmHigh(self: *Compiler, v: a64.Reg, index: u8) Error!void {
         try self.emitRegisterFileAddress(t0, .ymm_hi, xmmOffset(index));
         try self.emitChecked(a64.vldrQ(v, t0, 0));
     }
 
-    fn storeYmmHigh(self: *Compiler, index: u8, v: a64.Reg) Error!void {
+    pub fn storeYmmHigh(self: *Compiler, index: u8, v: a64.Reg) Error!void {
         self.zero_ymm &= ~(@as(u32, 1) << @intCast(index));
         try self.emitRegisterFileAddress(t0, .ymm_hi, xmmOffset(index));
         try self.emitChecked(a64.vstrQ(v, t0, 0));
@@ -6751,23 +6754,7 @@ const Compiler = struct {
     /// Each selected float contributes its four bytes without crossing a
     /// 128-bit lane, matching VPERMILPS for both XMM and each YMM half.
     fn emitPermilpsVariable(self: *Compiler, dst: a64.Reg, source: a64.Reg, control: a64.Reg) Error!void {
-        try self.emit(a64.vmoviZero(v4));
-        try self.emit(a64.vmoviZero(v5));
-        for (0..4) |lane| {
-            try self.emit(a64.vumov(.s4, t1, control, @intCast(lane)));
-            try self.emit(a64.logicalImmediate(.w32, .andop, t1, t1, 3).?);
-            try self.emit(a64.lslImm(.w32, t1, t1, 2));
-            // The selected dword's byte offset goes into all four index
-            // bytes, so the table reads bytes offset..offset+3. Only the low
-            // byte held it before: every result took bytes 1-3 from dword 0.
-            try self.emit(a64.logicalShifted(.w32, .orr, t1, t1, t1, 8));
-            try self.emit(a64.logicalShifted(.w32, .orr, t1, t1, t1, 16));
-            try self.emit(a64.vinsGpr(.s4, v4, @intCast(lane), t1));
-            try self.a.loadConstant(t1, 0x0302_0100);
-            try self.emit(a64.vinsGpr(.s4, v5, @intCast(lane), t1));
-        }
-        try self.emit(a64.vadd(.s4, v4, v4, v5));
-        try self.emit(a64.vtbl(dst, source, v4));
+        try vector_permute.variable(self.a, dst, source, control, v4, v5, t1);
     }
 
     fn emitVectorMoveMask(self: *Compiler, d: DecodedInsn) Error!void {
@@ -6878,6 +6865,10 @@ const Compiler = struct {
             return true;
         }
         if (d.vector_256) {
+            if (unpackForm(d.op)) |form| {
+                try wide_unpacks.registers(self, d, form.lanes, form.high);
+                return true;
+            }
             if (d.op == .vinsertf128) {
                 // Read the XMM/m128 insert source before touching either
                 // destination half. A failed memory read therefore leaves
@@ -7351,11 +7342,11 @@ const Compiler = struct {
                 try self.clearUpper(dst, d.op);
                 if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
-            .vpextrb, .vpextrw, .vpextrd, .vpextrq => {
+            .vpextrb, .vpextrw, .vpextrd, .vpextrq, .vextractps => {
                 const lanes: a64.Lanes = switch (d.op) {
                     .vpextrb => .b16,
                     .vpextrw => .h8,
-                    .vpextrd => .s4,
+                    .vpextrd, .vextractps => .s4,
                     else => .d2,
                 };
                 const lane: u32 = @intCast(d.imm & (@as(u64, 16) / (lanes.elementBits() / 8) - 1));

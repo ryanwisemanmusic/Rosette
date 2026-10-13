@@ -1030,6 +1030,7 @@ pub fn reportWindowsFastImports(self: *ElfState, final: bool) void {
     if (newly_observed == 0 and !final) return;
     self.windows_fast_time_imports_reported = total;
     if (total == 0) return;
+    self.windows_fast_math.report();
     __process_log.info("PE64 WINDOWS FAST IMPORTS: GetSystemTimePreciseAsFileTime calls={d} QueryPerformanceCounter={d} QueryPerformanceFrequency={d} new_since_report={d} import_slot_transfers={d} shared_runtime_lock_bypassed=true clock_snapshot=atomic guest_output_store=coordinated; exact dynamic proc-address stubs and direct imports with verified IAT bindings are eligible, while diagnostics use the ordinary locked path; import_slot_transfers counts call [IAT] and thunk jmp [IAT] answered without a step", .{
         self.windows_fast_time_import_calls.load(.acquire),
         self.windows_fast_counter_import_calls[0].load(.acquire),
@@ -1067,7 +1068,6 @@ pub fn reportWindowsFastImports(self: *ElfState, final: bool) void {
         });
     }
 }
-
 pub fn reportConcurrency(self: *ElfState) void {
     if (!self.windows_runtime_enabled) return;
     const gate = self.guest_execution_gate.snapshot();

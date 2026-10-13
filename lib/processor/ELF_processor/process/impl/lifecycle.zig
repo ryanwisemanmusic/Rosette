@@ -686,6 +686,7 @@ pub fn windowsFastImportCalls(self: *const ElfState) u64 {
         self.windows_fast_affinity_import_calls.load(.acquire) +%
         self.windows_fast_sleep_zero_import_calls.load(.acquire) +%
         windowsFastCrtImportCalls(self) +%
+        self.windows_fast_math.total() +%
         self.windows_fast_heap_import_calls[0].load(.acquire) +%
         self.windows_fast_heap_import_calls[1].load(.acquire) +%
         self.windows_fast_heap_import_calls[2].load(.acquire);

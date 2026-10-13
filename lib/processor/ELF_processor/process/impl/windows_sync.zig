@@ -4368,14 +4368,14 @@ pub fn runParallelWindowsGuestThread(self: *ElfState, slot: usize, worker: *__pr
     // nobody else writes them; while it is parked a waker may finish its
     // call, so the tripwire is disarmed across every park and resume.
     var tripwire: __process_parallel_diagnostics.register_tripwire.Tripwire = .{};
+    var throughput_pulse: @import("worker_runtime_pulse.zig").Pulse = .{};
 
     var qos_generation: u32 = __process_std.math.maxInt(u32);
     while (!worker.shouldStop() and !self.parallel_guest_termination.load(.acquire)) {
         // The guest can rename this thread while it runs. QoS is host
-        // scheduling metadata, so poll for changes at the existing bounded
-        // progress-publication boundary instead of loading an atomic on
-        // every translated block.
+        // scheduling metadata, polled at the progress-publication boundary.
         if (pending_steps == 0) {
+            throughput_pulse.poll(__process_concurrency.monotonicNanoseconds(), slot, thread.parallel_block_jit, &self.windows_fast_math);
             const name_generation = @atomicLoad(u32, &thread.name_generation, .acquire);
             if (name_generation != qos_generation) {
                 qos_generation = name_generation;
