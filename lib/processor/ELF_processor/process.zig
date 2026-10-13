@@ -5603,6 +5603,7 @@ test {
     _ = @import("process/tests/vector_expansion.zig");
     _ = @import("process/tests/vector_extract.zig");
     _ = @import("process/tests/windows_fast_math.zig");
+    _ = @import("process/tests/windows_fast_nt_yield.zig");
     _ = @import("process/tests/windows_mutex.zig");
     _ = @import("process/tests/windows_mutex_contract.zig");
     _ = @import("block_jit/tests.zig");

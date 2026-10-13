@@ -1023,7 +1023,6 @@ pub fn reportRuntimeLockHolds(self: *ElfState) void {
         }
     }
 }
-
 pub fn reportWindowsFastImports(self: *ElfState, final: bool) void {
     const total = process_impl_lifecycle.windowsFastImportCalls(self);
     const newly_observed = total -| self.windows_fast_time_imports_reported;
@@ -1031,6 +1030,7 @@ pub fn reportWindowsFastImports(self: *ElfState, final: bool) void {
     self.windows_fast_time_imports_reported = total;
     if (total == 0) return;
     self.windows_fast_math.report();
+    self.windows_fast_nt_yield.report();
     __process_log.info("PE64 WINDOWS FAST IMPORTS: GetSystemTimePreciseAsFileTime calls={d} QueryPerformanceCounter={d} QueryPerformanceFrequency={d} new_since_report={d} import_slot_transfers={d} shared_runtime_lock_bypassed=true clock_snapshot=atomic guest_output_store=coordinated; exact dynamic proc-address stubs and direct imports with verified IAT bindings are eligible, while diagnostics use the ordinary locked path; import_slot_transfers counts call [IAT] and thunk jmp [IAT] answered without a step", .{
         self.windows_fast_time_import_calls.load(.acquire),
         self.windows_fast_counter_import_calls[0].load(.acquire),

@@ -1087,6 +1087,7 @@ pub const ElfState = struct {
     windows_asctime_storage: u64 = 0,
     windows_import_calls: u64 = 0,
     windows_fast_math: @import("impl/windows_fast_math.zig").Ledger = .{},
+    windows_fast_nt_yield: @import("impl/windows_fast_nt_yield.zig").Ledger = .{},
     /// A direct, pure time query can bypass the shared runtime lock in
     /// parallel execution. Keep its count separate and atomic so the lock's
     /// diagnostics remain honest and progress accounting still sees it.

@@ -900,7 +900,7 @@ pub fn logGuestSchedulingHealth(self: *const ElfState) void {
         self.windows_condition_timed_immediate,
         self.windows_condition_timeouts,
         self.windows_nt_delay_parks,
-        self.windows_nt_delay_yields,
+        self.windows_nt_delay_yields +| self.windows_fast_nt_yield.total(),
         self.windows_guest_sleep_parks,
         self.windows_clock_poll_yields,
         self.windows_guest_slice_yields,
