@@ -1,8 +1,19 @@
-//! Bounded host worker for Vulkan commands whose arguments contain no
-//! pointers into guest memory. The queue is a FIFO; callers must drain it
+//! Bounded host worker for Vulkan commands with scalar or owned snapshot
+//! arguments. The queue is a FIFO; callers must drain it
 //! before issuing any Vulkan call that is not submitted through this worker.
 const std = @import("std");
 const abi = @import("abi.zig");
+pub const owned = @import("owned_command_payloads.zig");
+const queued_command = @import("queued_command.zig");
+
+/// The dispatch gate and command implementation share this list. Snapshot
+/// commands copy their arrays before admission and retain synchronous fallback.
+pub fn isCandidate(name: []const u8) bool {
+    inline for (.{ "vkCmdBindPipeline", "vkCmdBindIndexBuffer", "vkCmdDraw", "vkCmdDrawIndexed", "vkCmdBindDescriptorSets", "vkCmdPushConstants" }) |candidate| {
+        if (std.mem.eql(u8, name, candidate)) return true;
+    }
+    return false;
+}
 
 pub const queue_capacity = 128;
 
@@ -45,15 +56,8 @@ pub const Job = union(enum) {
     bind_index_buffer: BindIndexBuffer,
     draw: Draw,
     draw_indexed: DrawIndexed,
-
-    fn execute(self: Job) void {
-        switch (self) {
-            .bind_pipeline => |call| call.function(call.command_buffer, call.bind_point, call.pipeline),
-            .bind_index_buffer => |call| call.function(call.command_buffer, call.buffer, call.offset, call.index_type),
-            .draw => |call| call.function(call.command_buffer, call.vertex_count, call.instance_count, call.first_vertex, call.first_instance),
-            .draw_indexed => |call| call.function(call.command_buffer, call.index_count, call.instance_count, call.first_index, call.vertex_offset, call.first_instance),
-        }
-    }
+    bind_descriptor_sets: owned.DescriptorSets,
+    push_constants: owned.PushConstants,
 };
 
 /// Result of a non-blocking queue admission. A full queue is not an error:
@@ -66,7 +70,7 @@ pub const Submission = union(enum) {
 
 const QueuedJob = struct {
     sequence: u64,
-    command: Job,
+    command: queued_command.Command,
 };
 
 pub const max_batch_size: usize = 16;
@@ -82,6 +86,8 @@ pub const Stats = struct {
     drain_broadcasts: u64,
     last_submitted_sequence: u64,
     completed_sequence: u64,
+    descriptor_snapshots: u64,
+    push_snapshots: u64,
 };
 
 pub const Worker = struct {
@@ -89,6 +95,7 @@ pub const Worker = struct {
     work_available: std.c.pthread_cond_t = .{},
     drained: std.c.pthread_cond_t = .{},
     slots: [queue_capacity]QueuedJob = undefined,
+    payloads: [queue_capacity]queued_command.Payload = undefined,
     read_index: usize = 0,
     write_index: usize = 0,
     count: usize = 0,
@@ -107,6 +114,8 @@ pub const Worker = struct {
     submitted: u64 = 0,
     completed: u64 = 0,
     saturated_submissions: u64 = 0,
+    descriptor_snapshots: u64 = 0,
+    push_snapshots: u64 = 0,
     stopping: bool = false,
     thread: ?std.Thread = null,
 
@@ -132,11 +141,16 @@ pub const Worker = struct {
         const was_empty = self.count == 0;
         self.last_submitted_sequence +|= 1;
         const sequence = self.last_submitted_sequence;
-        self.slots[self.write_index] = .{ .sequence = sequence, .command = job };
+        self.slots[self.write_index] = .{ .sequence = sequence, .command = queued_command.Command.pack(&job, &self.payloads[self.write_index]) };
         self.write_index = (self.write_index + 1) % queue_capacity;
         self.count += 1;
         self.max_depth = @max(self.max_depth, self.count);
         self.submitted +|= 1;
+        switch (job) {
+            .bind_descriptor_sets => self.descriptor_snapshots +|= 1,
+            .push_constants => self.push_snapshots +|= 1,
+            else => {},
+        }
         // The worker sleeps only while the queue is empty. Submissions to a
         // nonempty queue are already covered by that first wake and need no
         // pthread condition signal (millions of redundant calls per run).
@@ -196,6 +210,8 @@ pub const Worker = struct {
             .drain_broadcasts = self.drain_broadcasts,
             .last_submitted_sequence = self.last_submitted_sequence,
             .completed_sequence = self.completed_sequence,
+            .descriptor_snapshots = self.descriptor_snapshots,
+            .push_snapshots = self.push_snapshots,
         };
         unlock(mutex);
         return result;
@@ -219,6 +235,7 @@ pub const Worker = struct {
 
 fn workerMain(worker: *Worker) void {
     var batch: [max_batch_size]QueuedJob = undefined;
+    var payloads: [max_batch_size]queued_command.Payload = undefined;
     while (true) {
         lock(&worker.mutex);
         while (worker.count == 0 and !worker.stopping) wait(&worker.work_available, &worker.mutex);
@@ -229,12 +246,13 @@ fn workerMain(worker: *Worker) void {
         const batch_len = @min(worker.count, max_batch_size);
         for (0..batch_len) |index| {
             batch[index] = worker.slots[worker.read_index];
+            batch[index].command.relocate(&payloads[index]);
             worker.read_index = (worker.read_index + 1) % queue_capacity;
         }
         worker.count -= batch_len;
         unlock(&worker.mutex);
 
-        for (batch[0..batch_len]) |queued| queued.command.execute();
+        for (batch[0..batch_len]) |*queued| queued.command.execute();
 
         lock(&worker.mutex);
         worker.completed +|= batch_len;
@@ -248,6 +266,11 @@ fn workerMain(worker: *Worker) void {
         }
         unlock(&worker.mutex);
     }
+}
+
+test {
+    _ = owned;
+    _ = @import("command_flow_tests.zig");
 }
 
 fn lock(mutex: *std.c.pthread_mutex_t) void {

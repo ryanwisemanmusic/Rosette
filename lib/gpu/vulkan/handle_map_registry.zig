@@ -79,6 +79,16 @@ pub const Entry = struct {
     }
 
     pub fn findReal(map: []const Entry, synthetic: u64) ?RealHandle {
+        if (synthetic == 0) return null;
+        const base = @intFromPtr(map.ptr);
+        const cached = &lookup_cache[cacheSlot(base, synthetic)];
+        if (cached.synthetic == synthetic and cached.base == base and cached.index < map.len) {
+            // One coherent snapshot already proves identity and value. The
+            // old findIndex + snapshotAt path validated this same slot twice.
+            if (Entry.snapshotAt(map, cached.index)) |mapped| {
+                if (mapped.synthetic == synthetic and mapped.real != 0) return mapped.real;
+            }
+        }
         const index = findIndex(map, synthetic) orelse return null;
         const mapped = Entry.snapshotAt(map, index) orelse return null;
         if (mapped.synthetic != synthetic or mapped.real == 0) return null;
@@ -89,6 +99,9 @@ pub const Entry = struct {
     pub fn findSynthetic(map: []const Entry, real: RealHandle) ?u64 {
         if (real == 0) return null;
         for (map) |*entry| {
+            // A key is only a rejection filter; a matching slot still needs
+            // the full seqlock validation before any identity is returned.
+            if (@atomicLoad(u64, &entry.real, .acquire) != real) continue;
             const mapped = Entry.snapshot(entry) orelse continue;
             if (mapped.real == real) return mapped.synthetic;
         }
@@ -106,6 +119,7 @@ pub const Entry = struct {
         }
 
         for (map, 0..) |*entry, index| {
+            if (@atomicLoad(u64, &entry.synthetic, .acquire) != synthetic) continue;
             const mapped = Entry.snapshot(entry) orelse continue;
             if (mapped.synthetic == synthetic) {
                 cached.* = .{ .base = base, .synthetic = synthetic, .index = @intCast(index) };
@@ -214,6 +228,10 @@ pub const Entry = struct {
         for (map) |*entry| Entry.publish(entry, 0, 0, 0);
     }
 };
+
+test "Vulkan handle lookup retains cache lifetime and concurrent identity checks" {
+    try @import("handle_lookup_tests.zig").check(Entry);
+}
 
 test "handle registry maps, replaces, removes and reclaims owned handles" {
     var map: [2]Entry = .{ .{}, .{} };
