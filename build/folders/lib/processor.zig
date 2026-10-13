@@ -171,6 +171,12 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
         .filters = &.{ "a mutex's owner", "released mutex belongs", "initially owned mutex", "wait takes a mutex", "exits owning a mutex", "ERROR_NOT_OWNER", "custom-game stall", "contract: " },
     });
     windows_mutex_check.dependOn(&b.addRunArtifact(windows_mutex_test).step);
+    const expansion_check = b.step("vector-expansion-check", "Check compact permutation and native YMM unpack production loops");
+    const expansion_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "vector expansion", "compact permutation", "YMM unpack", "worker runtime pulse", "VPERMILPS with a control", "SSE oracle" } });
+    expansion_check.dependOn(&b.addRunArtifact(expansion_test).step);
+    const math_check = b.step("windows-math-check", "Check exact pure-math imports and translated IAT transfers offline");
+    const math_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "fast math", "native vector extraction" } });
+    math_check.dependOn(&b.addRunArtifact(math_test).step);
     const windows_bsearch_check = b.step("windows-bsearch-check", "Run the Windows CRT bsearch callback and import-routing regressions");
     const windows_bsearch_test = b.addTest(.{
         .root_module = elf_processor_test_mod,
