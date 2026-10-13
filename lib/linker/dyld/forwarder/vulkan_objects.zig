@@ -141,8 +141,6 @@ pub fn fsiBeforeDraw(self: anytype, guard: *FsiGuard, recording: *fsi_chain.Reco
         guard.unscissored_draws +|= 1;
         break :blk @as(u64, area.width) * area.height;
     };
-    const cap = guard.monitor.capValue();
-    const pixel_cap = guard.monitor.sampleWorkCapValue();
     const bound_pipeline = recording.shadow.pipelines[fsi_chain.bind_point_graphics];
     const diagnostic = self.vulkan_fsi_tracker.findPipeline(bound_pipeline);
     const samples = self.fsi_raster.pipelineSampleCount(bound_pipeline) orelse
@@ -152,7 +150,11 @@ pub fn fsiBeforeDraw(self: anytype, guard: *FsiGuard, recording: *fsi_chain.Reco
     const isolated = self.fsi_raster.isolated_pipelines.contains(bound_pipeline);
     const isolation_boundary = recording.segment_draws != 0 and
         (isolated or recording.segment_isolated[recording.chunk_count]);
-    if (isolation_boundary or guard.monitor.shouldSplit(recording.segment_draws, segment_pixels, sample_work)) {
+    const decision = guard.monitor.splitDecision(recording.segment_draws, segment_pixels, sample_work);
+    const cap = decision.draw_cap;
+    const pixel_cap = decision.work_cap;
+    guard.split_profile.note(decision, isolation_boundary);
+    if (isolation_boundary or decision.required()) {
         const allowed = recording.splitAllowed();
         if (allowed == .none) {
             if (self.fsiSplitRecording(guard, recording)) {
@@ -712,6 +714,8 @@ pub fn printFsiGuardReport(self: anytype) void {
     const stats = guard.monitor.stats();
     const budget = stats.budget;
     const queue_gate = self.vulkan_queue_api_gate.stats();
+    const reasons = guard.split_profile.masks;
+    machoCapturePrint("macho-processor: VULKAN FSI SPLIT REASONS: none={d} draw_only={d} work_only={d} draw_work={d} isolation_only={d} draw_isolation={d} work_isolation={d} all={d} oversized_draws={d}; decision counts include refused/deferred boundaries; overlaps are retained; no watchdog limits changed\n", .{ reasons[0], reasons[1], reasons[2], reasons[3], reasons[4], reasons[5], reasons[6], reasons[7], guard.split_profile.oversized_draws });
     machoCapturePrint(
         "macho-processor: VULKAN FSI GUARD: armed=true fsi_draws={d} splits={d} split_failures={d} serialized_split_boundaries={d} worker_drains={d} cap_now={d} latency_ns_per_draw={d} timing_groups_timed={d} completion_ms_per_group(mean/p50/p95/p99/max)={d}/{d}/{d}/{d}/{d} max_group_draws={d} risk_events={d} severe_events={d} emergency={} submissions_paused={} severe_recoveries={d} outstanding_groups(now/max)={d}/{d} outstanding_metal_command_buffers(now/max)={d}/{d} timing_basis=submit_to_fence_observation_upper_bound; latency includes queue wait and CPU observation delay; submit_infos remain distinct Metal command buffers\n",
         .{
@@ -744,6 +748,10 @@ pub fn printFsiGuardReport(self: anytype) void {
     machoCapturePrint(
         "macho-processor: VULKAN FSI FENCE ROUTE: ready_checks={d} ready_completions={d}; a zero-time fence wait can retire an already completed FIFO head on the submitter; pending fences keep watcher timing and queue backpressure\n",
         .{ stats.ready_checks, stats.ready_completions },
+    );
+    machoCapturePrint(
+        "macho-processor: VULKAN FSI ROOM OBSERVER: inline_waits={d} inline_completions={d} inline_timeouts={d} watcher_waits={d}; a runtime-lock-released room waiter may observe the FIFO head directly; single observer custody, reset checks, watchdog limits and Metal depth are unchanged\n",
+        .{ stats.observer.inline_waits, stats.observer.inline_completions, stats.observer.inline_timeouts, stats.observer.watcher_waits },
     );
     machoCapturePrint(
         "macho-processor: VULKAN FSI CPU ROUTE: small_chunk_sync={} synchronous_commands={d} recovery_fast_groups={d} recovery_work_cap={d} recovery_growths={d}; minimum draw-cap recordings bypass worker handoffs after draining older commands; recovery work never exceeds {d}\n",
@@ -1261,6 +1269,7 @@ pub fn printVulkanCommandAdmission(self: anytype) void {
                 .{ self.vulkan_async_command_worker_enabled, stats.submitted, stats.completed, stats.last_submitted_sequence, stats.completed_sequence, stats.batches, stats.max_batch_size, stats.max_depth, stats.work_signals, stats.drain_broadcasts, self.vulkan_async_queue_saturated_fallbacks, self.vulkan_async_worker_stopped_fallbacks, self.vulkan_async_command_barriers },
             );
             machoCapturePrint("macho-processor: VULKAN OWNED COMMAND FLOW: descriptor_snapshots={d} push_snapshots={d} queue_capacity={d}; arrays copied before admission; update/free/reset/destroy/submit and FSI continuation boundaries retain FIFO drains; handle_lookup=one_snapshot_cache/key_prefilter\n", .{ stats.descriptor_snapshots, stats.push_snapshots, async_vulkan_command.queue_capacity });
+            machoCapturePrint("macho-processor: VULKAN BARRIER COMMAND FLOW: barrier_snapshots={d}; small pointer-free pipeline barriers retain Vulkan stage/access/layout/ownership semantics in the recording FIFO; larger barriers drain and run synchronously\n", .{stats.barrier_snapshots});
         } else {
             machoCapturePrint(
                 "macho-processor: PRESENT CHAIN:   hybrid_command_worker=enabled:{} submitted=0 completed=0 sequence(queued/completed)=0/0 batches=0 max_batch=0 max_queue_depth=0 queue_full_fallbacks={d} worker_stopped_fallbacks={d} ordering_barriers_with_work={d}\n",
@@ -1961,18 +1970,23 @@ pub fn forwardVulkanCommand(self: anytype, state: anytype, requested_hash: u64, 
             barrier.p_next = null;
         }
         if (!self.copyGuestImageBarriers(state, image_address, image_count, &images)) return self.noteVulkanCommandRefusal(@src().line);
-        if (self.real_vulkan.fn_ptrs.cmd_pipeline_barrier) |function| self.callNativeVulkanCommand(function, .{
-            command_buffer,
-            @intCast(guest_context.registers(state).rsi),
-            @intCast(guest_context.registers(state).rdx),
-            @intCast(guest_context.registers(state).rcx),
-            @intCast(memory_count),
-            if (memory_count == 0) null else &memory,
-            @intCast(buffer_count),
-            if (buffer_count == 0) null else &buffers,
-            @intCast(image_count),
-            if (image_count == 0) null else &images,
-        });
+        if (self.real_vulkan.fn_ptrs.cmd_pipeline_barrier) |function| {
+            if (async_vulkan_command.barriers.Snapshot.init(function, command_buffer, @intCast(guest_context.registers(state).rsi), @intCast(guest_context.registers(state).rdx), @intCast(guest_context.registers(state).rcx), memory[0..@intCast(memory_count)], buffers[0..@intCast(buffer_count)], images[0..@intCast(image_count)])) |snapshot| {
+                if (self.queueAsyncVulkanCommand(.{ .pipeline_barrier = snapshot })) return;
+            }
+            self.callNativeVulkanCommand(function, .{
+                command_buffer,
+                @intCast(guest_context.registers(state).rsi),
+                @intCast(guest_context.registers(state).rdx),
+                @intCast(guest_context.registers(state).rcx),
+                @intCast(memory_count),
+                if (memory_count == 0) null else &memory,
+                @intCast(buffer_count),
+                if (buffer_count == 0) null else &buffers,
+                @intCast(image_count),
+                if (image_count == 0) null else &images,
+            });
+        }
     } else if ((name_hash == vulkanNameHash("vkCmdPipelineBarrier2") and std.mem.eql(u8, name, "vkCmdPipelineBarrier2")) or (name_hash == vulkanNameHash("vkCmdPipelineBarrier2KHR") and std.mem.eql(u8, name, "vkCmdPipelineBarrier2KHR"))) {
         self.forwardPipelineBarrier2(state, command_buffer);
     } else if ((name_hash == vulkanNameHash("vkCmdBeginQuery") and std.mem.eql(u8, name, "vkCmdBeginQuery"))) {

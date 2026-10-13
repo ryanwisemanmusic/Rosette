@@ -32,6 +32,7 @@ const Calls = struct {
 };
 
 pub fn check(comptime State: type) !void {
+    try @import("barrier_argument_tests.zig").check(State);
     try std.testing.expect(fifo.isCandidate("vkCmdBindDescriptorSets"));
     try std.testing.expect(fifo.isCandidate("vkCmdPushConstants"));
     inline for (.{ "vkUpdateDescriptorSets", "vkFreeDescriptorSets", "vkResetCommandPool", "vkDestroyPipelineLayout", "vkQueueSubmit", "vkCmdEndRenderPass" }) |name| try std.testing.expect(!fifo.isCandidate(name));

@@ -1701,6 +1701,7 @@ fn fsiCanCoalesceSegments(first: FsiSegment, second: FsiSegment) bool {
 /// Allocated on the first vkAllocateCommandBuffers; armed only by Xenia's FSI
 /// render pass, so a host render target run never splits or times anything.
 const FsiGuard = struct {
+    split_profile: @import("gpu").vulkan.fsi.split_decision.Profile = .{},
     protected_batching_enabled: bool = true,
     armed: bool = false,
     directory: [fsi_command_buffer_directory_capacity]FsiCommandBufferEntry = [_]FsiCommandBufferEntry{.{}} ** fsi_command_buffer_directory_capacity,
@@ -1755,7 +1756,6 @@ const FsiGuard = struct {
     slow_chunk_submit_aborts: u64 = 0,
     escalation_dumps: u64 = 0,
 };
-
 /// Re-issues an FSI recording's bound state into a new chunk
 /// (`fsi_chain.Shadow.replay`).
 const FsiReplayOps = struct {
