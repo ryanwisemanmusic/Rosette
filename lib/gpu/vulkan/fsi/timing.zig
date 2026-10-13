@@ -12,6 +12,7 @@
 //! completed when this CPU thread next runs, inventing a zero-cost tail.
 //! This conservative bound feeds `budget.zig`; it is not a GPU timestamp.
 const std = @import("std");
+const observer_route = @import("observer_route.zig");
 const budget_mod = @import("budget.zig");
 
 // AppKit can terminate through libc exit without running the forwarder's
@@ -121,6 +122,7 @@ pub const Report = struct {
 };
 
 pub const Stats = struct {
+    observer: observer_route.Route,
     budget: budget_mod.Budget,
     tracked: u64,
     completed: u64,
@@ -181,6 +183,7 @@ pub const Monitor = struct {
     thread: ?std.Thread = null,
     ops: ?FenceOps = null,
     report: ?*const fn (Report) void = null,
+    observer: observer_route.Route = .{},
 
     pub fn init(config: budget_mod.Config) Monitor {
         var monitor: Monitor = .{ .budget = budget_mod.Budget.init(config) };
@@ -228,6 +231,9 @@ pub const Monitor = struct {
         self.stopping = true;
         broadcast(&self.work);
         broadcast(&self.room);
+        // Inline observers run with no guest runtime lock, just like the
+        // watcher. Join their driver wait and report before loader teardown.
+        while (self.observer.active_serial != 0) wait(&self.room, &self.mutex);
         unlock(&self.mutex);
         if (self.thread) |*thread| {
             thread.join();
@@ -271,6 +277,10 @@ pub const Monitor = struct {
         return chunk_pixels > pixel_cap - next_draw_pixels;
     }
 
+    pub fn splitDecision(self: *const Monitor, draws: u32, work: u64, next: u64) @import("split_decision.zig").Decision {
+        return @import("split_decision.zig").evaluate(self.capValue(), self.sampleWorkCapValue(), draws, work, next);
+    }
+
     /// Bound the number of Vulkan submissions MoltenVK can leave queued as
     /// Metal command buffers. This is called on the queue-submit thread, not
     /// the GPU watcher, and wakes as soon as the oldest timing fence retires.
@@ -283,6 +293,7 @@ pub const Monitor = struct {
             if (wait_started_ns == null) {
                 if (self.ops) |ops| wait_started_ns = ops.now(ops.context);
             }
+            if (self.pollForRoomLocked()) continue;
             self.room_waits +|= 1;
             wait(&self.room, &self.mutex);
         }
@@ -319,6 +330,7 @@ pub const Monitor = struct {
             if (wait_started_ns == null) {
                 if (self.ops) |ops| wait_started_ns = ops.now(ops.context);
             }
+            if (self.pollForRoomLocked()) continue;
             self.room_waits +|= 1;
             wait(&self.room, &self.mutex);
         }
@@ -414,7 +426,7 @@ pub const Monitor = struct {
         self.max_outstanding = @max(self.max_outstanding, self.count);
         self.max_outstanding_submit_infos = @max(self.max_outstanding_submit_infos, self.outstanding_submit_infos);
         self.tracked +|= 1;
-        if (check_ready and self.count == 1 and !self.failed and !self.stopping) {
+        if (check_ready and self.count == 1 and self.observer.active_serial == 0 and !self.failed and !self.stopping) {
             if (self.ops) |ops| {
                 self.ready_checks +|= 1;
                 const result = ops.wait(ops.context, stored.fence, 0);
@@ -442,6 +454,9 @@ pub const Monitor = struct {
                 }
             }
         }
+        if (check_ready and self.count == 1 and stored.submit_infos == max_in_flight_segments and self.thread != null) {
+            self.observer.prefer(stored.serial);
+        }
         signal(&self.work);
         return .{ .serial = stored.serial, .failed = self.failed };
     }
@@ -450,20 +465,44 @@ pub const Monitor = struct {
     /// `poll_timeout_ns`. Returns false when there is nothing to watch or the
     /// monitor stopped.
     pub fn pollOnce(self: *Monitor) bool {
-        const ops = self.ops orelse return false;
+        if (self.ops == null) return false;
         lock(&self.mutex);
         if (self.count == 0 or self.stopping or self.failed) {
             unlock(&self.mutex);
             return false;
         }
         const entry = self.entries[self.head];
+        if (!self.observer.claim(entry.serial, false)) {
+            unlock(&self.mutex);
+            return true;
+        }
         unlock(&self.mutex);
+        return self.pollClaimed(entry, false);
+    }
+
+    /// Called with the monitor locked, returns with it locked. Only a room
+    /// waiter may borrow the head; forwarder room waits release the Windows
+    /// runtime mutex before entering here. The FIFO entry remains owned until
+    /// reset and reporting finish, including during shutdown.
+    fn pollForRoomLocked(self: *Monitor) bool {
+        if (self.count == 0 or self.ops == null) return false;
+        const entry = self.entries[self.head];
+        if (!self.observer.claim(entry.serial, true)) return false;
+        unlock(&self.mutex);
+        _ = self.pollClaimed(entry, true);
+        lock(&self.mutex);
+        return true;
+    }
+
+    fn pollClaimed(self: *Monitor, entry: Entry, inline_wait: bool) bool {
+        const ops = self.ops.?;
 
         const result = ops.wait(ops.context, entry.fence, poll_timeout_ns);
         const now = ops.now(ops.context);
         var report: ?Report = null;
         var keep_watching = true;
         lock(&self.mutex);
+        std.debug.assert(self.entries[self.head].serial == entry.serial);
         switch (result) {
             .signaled => {
                 if (ops.reset(ops.context, entry.fence)) {
@@ -519,6 +558,12 @@ pub const Monitor = struct {
         if (report) |value| {
             if (self.report) |callback| callback(value);
         }
+        lock(&self.mutex);
+        const completed = result == .signaled and !self.failed;
+        self.observer.finish(entry.serial, inline_wait, if (result == .signaled and !completed) .failed else result);
+        broadcast(&self.room);
+        broadcast(&self.work);
+        unlock(&self.mutex);
         return keep_watching;
     }
 
@@ -526,6 +571,7 @@ pub const Monitor = struct {
         lock(&self.mutex);
         defer unlock(&self.mutex);
         return .{
+            .observer = self.observer,
             .budget = self.budget,
             .tracked = self.tracked,
             .completed = self.completed,
@@ -598,8 +644,15 @@ pub const Monitor = struct {
 fn watcherMain(monitor: *Monitor) void {
     while (true) {
         lock(&monitor.mutex);
-        while (monitor.count == 0 and !monitor.stopping and !monitor.failed) wait(&monitor.work, &monitor.mutex);
+        while ((monitor.count == 0 or monitor.observer.active_serial != 0) and !monitor.stopping and !monitor.failed) wait(&monitor.work, &monitor.mutex);
         const done = monitor.stopping or monitor.failed;
+        if (!done and monitor.observer.takePreference(monitor.entries[monitor.head].serial)) {
+            // One bounded opportunity, not a recurring delay. If the queue
+            // thread is still recording, the watcher observes the fence.
+            waitGrace(&monitor.work, &monitor.mutex);
+            unlock(&monitor.mutex);
+            continue;
+        }
         unlock(&monitor.mutex);
         if (done) return;
         if (!monitor.pollOnce()) {
@@ -609,6 +662,28 @@ fn watcherMain(monitor: *Monitor) void {
             if (finished) return;
         }
     }
+}
+
+fn waitGrace(condition: *std.c.pthread_cond_t, mutex: *std.c.pthread_mutex_t) void {
+    if (comptime @import("builtin").os.tag == .macos) {
+        const Relative = struct {
+            extern "c" fn pthread_cond_timedwait_relative_np(*std.c.pthread_cond_t, *std.c.pthread_mutex_t, *const std.c.timespec) c_int;
+        };
+        // macOS' relative wait cannot be stretched by wall-clock changes.
+        const delay = std.c.timespec{ .sec = 0, .nsec = observer_route.grace_ns };
+        const result = Relative.pthread_cond_timedwait_relative_np(condition, mutex, &delay);
+        if (result != 0 and result != @intFromEnum(std.c.E.TIMEDOUT)) unreachable;
+        return;
+    }
+    var deadline: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.REALTIME, &deadline) != 0) return;
+    deadline.nsec += observer_route.grace_ns;
+    if (deadline.nsec >= std.time.ns_per_s) {
+        deadline.sec += 1;
+        deadline.nsec -= std.time.ns_per_s;
+    }
+    const result = std.c.pthread_cond_timedwait(condition, mutex, &deadline);
+    if (result != .SUCCESS and result != .TIMEDOUT) unreachable;
 }
 
 fn lock(mutex: *std.c.pthread_mutex_t) void {
@@ -1072,7 +1147,10 @@ test "the FSI submitter waits for Metal queue room and resumes when a chunk comp
     try std.testing.expectEqual(RoomResult.available, monitor.waitForSubmitInfos(max_in_flight_segments, 2));
     signaler.join();
     monitor.stop();
-    try std.testing.expect(monitor.stats().room_waits > 0);
+    // Completion still gates admission; observing it on the room thread
+    // deliberately avoids the old condition-variable round trip.
+    const stats = monitor.stats();
+    try std.testing.expect(stats.room_waits + stats.observer.inline_waits > 0);
     try std.testing.expectEqual(@as(usize, 0), monitor.stats().outstanding_submit_infos);
     try std.testing.expectEqual(max_in_flight_segments, monitor.stats().max_outstanding_submit_infos);
 }

@@ -4,12 +4,13 @@
 const std = @import("std");
 const abi = @import("abi.zig");
 pub const owned = @import("owned_command_payloads.zig");
+pub const barriers = @import("barrier_payload.zig");
 const queued_command = @import("queued_command.zig");
 
 /// The dispatch gate and command implementation share this list. Snapshot
 /// commands copy their arrays before admission and retain synchronous fallback.
 pub fn isCandidate(name: []const u8) bool {
-    inline for (.{ "vkCmdBindPipeline", "vkCmdBindIndexBuffer", "vkCmdDraw", "vkCmdDrawIndexed", "vkCmdBindDescriptorSets", "vkCmdPushConstants" }) |candidate| {
+    inline for (.{ "vkCmdBindPipeline", "vkCmdBindIndexBuffer", "vkCmdDraw", "vkCmdDrawIndexed", "vkCmdBindDescriptorSets", "vkCmdPushConstants", "vkCmdPipelineBarrier" }) |candidate| {
         if (std.mem.eql(u8, name, candidate)) return true;
     }
     return false;
@@ -58,6 +59,7 @@ pub const Job = union(enum) {
     draw_indexed: DrawIndexed,
     bind_descriptor_sets: owned.DescriptorSets,
     push_constants: owned.PushConstants,
+    pipeline_barrier: barriers.Snapshot,
 };
 
 /// Result of a non-blocking queue admission. A full queue is not an error:
@@ -76,6 +78,7 @@ const QueuedJob = struct {
 pub const max_batch_size: usize = 16;
 
 pub const Stats = struct {
+    barrier_snapshots: u64,
     submitted: u64,
     completed: u64,
     saturated_submissions: u64,
@@ -91,7 +94,9 @@ pub const Stats = struct {
 };
 
 pub const Worker = struct {
-    mutex: std.c.pthread_mutex_t = .{},
+    // Pin the lock at a cache-line boundary despite auto-layout changes when
+    // new payload/counter fields are added to the worker.
+    mutex: std.c.pthread_mutex_t align(std.atomic.cache_line) = .{},
     work_available: std.c.pthread_cond_t = .{},
     drained: std.c.pthread_cond_t = .{},
     slots: [queue_capacity]QueuedJob = undefined,
@@ -118,6 +123,7 @@ pub const Worker = struct {
     push_snapshots: u64 = 0,
     stopping: bool = false,
     thread: ?std.Thread = null,
+    barrier_snapshots: u64 = 0,
 
     pub fn start(self: *Worker) (std.Thread.SpawnError || error{AlreadyStarted})!void {
         if (self.thread != null) return error.AlreadyStarted;
@@ -126,7 +132,15 @@ pub const Worker = struct {
 
     /// Admit a command without blocking the guest thread. Each accepted call
     /// receives a monotonically increasing sequence in Vulkan call order.
-    pub fn trySubmit(self: *Worker, job: Job) Submission {
+    pub inline fn trySubmit(self: *Worker, job: Job) Submission {
+        return self.submitBorrowed(&job);
+    }
+
+    // Keep admission specialized by reference. A by-value union here made
+    // LLVM copy all 552 payload bytes even for a scalar draw after the extra
+    // barrier case crossed its inlining threshold. Admission still copies the
+    // selected payload under the mutex before the caller's storage expires.
+    inline fn submitBorrowed(self: *Worker, job: *const Job) Submission {
         lock(&self.mutex);
         if (self.stopping) {
             unlock(&self.mutex);
@@ -141,12 +155,13 @@ pub const Worker = struct {
         const was_empty = self.count == 0;
         self.last_submitted_sequence +|= 1;
         const sequence = self.last_submitted_sequence;
-        self.slots[self.write_index] = .{ .sequence = sequence, .command = queued_command.Command.pack(&job, &self.payloads[self.write_index]) };
+        self.slots[self.write_index] = .{ .sequence = sequence, .command = queued_command.Command.pack(job, &self.payloads[self.write_index]) };
         self.write_index = (self.write_index + 1) % queue_capacity;
         self.count += 1;
         self.max_depth = @max(self.max_depth, self.count);
         self.submitted +|= 1;
-        switch (job) {
+        switch (job.*) {
+            .pipeline_barrier => self.barrier_snapshots +|= 1,
             .bind_descriptor_sets => self.descriptor_snapshots +|= 1,
             .push_constants => self.push_snapshots +|= 1,
             else => {},
@@ -212,6 +227,7 @@ pub const Worker = struct {
             .completed_sequence = self.completed_sequence,
             .descriptor_snapshots = self.descriptor_snapshots,
             .push_snapshots = self.push_snapshots,
+            .barrier_snapshots = self.barrier_snapshots,
         };
         unlock(mutex);
         return result;
@@ -269,6 +285,7 @@ fn workerMain(worker: *Worker) void {
 }
 
 test {
+    _ = @import("barrier_flow_tests.zig");
     _ = owned;
     _ = @import("command_flow_tests.zig");
 }

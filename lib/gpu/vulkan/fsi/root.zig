@@ -34,10 +34,13 @@ pub const rasterization = @import("rasterization.zig");
 pub const budget = @import("budget.zig");
 pub const chain = @import("chain.zig");
 pub const timing = @import("timing.zig");
+pub const split_decision = @import("split_decision.zig");
 pub const evidence = @import("evidence.zig");
 pub const pixel_frequency = @import("pixel_frequency.zig");
 
 test {
+    _ = @import("split_decision.zig");
+    _ = @import("observer_route_tests.zig");
     _ = contract;
     _ = descriptor_repair;
     _ = tracker;
