@@ -2416,10 +2416,10 @@ test "a surface enumeration is bounded to what the fill can deliver" {
 }
 
 test "Vulkan procedure availability requires an implemented command ABI" {
-    try std.testing.expect(!isForwardableVulkanSymbol("vkCmdUnknownRosetteCommand"));
-    try std.testing.expect(isForwardableVulkanSymbol("vkCmdSetDepthTestEnableEXT"));
-    try std.testing.expectEqualStrings("vkCmdSetDepthTestEnable", canonicalVulkanCommand("vkCmdSetDepthTestEnableEXT"));
-    try std.testing.expect(!isForwardableVulkanSymbol("rosette_xenia_launch_assist_query"));
+    try @import("owned_argument_tests.zig").checkAvailability();
+}
+test "FSI owned command flow preserves guest marshalling and synchronous boundaries" {
+    try @import("owned_argument_tests.zig").check(TestState);
 }
 
 test "native command dispatch forwards EXT aliases and scalar depth state" {

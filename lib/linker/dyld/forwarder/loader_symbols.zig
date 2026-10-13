@@ -871,10 +871,7 @@ pub fn dispatchGuestSymbol(self: anytype, state: anytype, token: u64) bool {
         return true;
     }
     const entry_name = entry.name[0..entry.name_length];
-    const asynchronous_candidate = entry.kind == .command and (std.mem.eql(u8, entry_name, "vkCmdBindPipeline") or
-        std.mem.eql(u8, entry_name, "vkCmdBindIndexBuffer") or
-        std.mem.eql(u8, entry_name, "vkCmdDraw") or
-        std.mem.eql(u8, entry_name, "vkCmdDrawIndexed"));
+    const asynchronous_candidate = entry.kind == .command and __ForwarderInternals._async_vulkan_command.isCandidate(entry_name);
     if (!asynchronous_candidate) self.drainAsyncVulkanCommands();
     self.frame_provenance.noteGuestVulkanCall();
     switch (entry.kind) {

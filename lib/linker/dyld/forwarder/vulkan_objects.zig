@@ -1038,7 +1038,7 @@ pub fn asyncVulkanWorker(self: anytype) ?*async_vulkan_command.Worker {
         }
         self.vulkan_async_command_worker_enabled = enabled;
         machoCapturePrint(
-            "macho-processor: Vulkan hybrid command worker: enabled={} default=macOS production only; set ROSETTE_VULKAN_COMMAND_WORKER=0 to disable; FIFO pointer-free commands only, barriers drain before all other Vulkan calls\n",
+            "macho-processor: Vulkan hybrid command worker: enabled={} default=macOS production only; set ROSETTE_VULKAN_COMMAND_WORKER=0 to disable; FIFO scalar and owned descriptor/push snapshots, barriers drain before all other Vulkan calls\n",
             .{enabled},
         );
     }
@@ -1260,6 +1260,7 @@ pub fn printVulkanCommandAdmission(self: anytype) void {
                 "macho-processor: PRESENT CHAIN:   hybrid_command_worker=enabled:{} submitted={d} completed={d} sequence(queued/completed)={d}/{d} batches={d} max_batch={d} max_queue_depth={d} work_signals={d} drain_broadcasts={d} queue_full_fallbacks={d} worker_stopped_fallbacks={d} ordering_barriers_with_work={d}; FSI continuation boundaries drain this worker before synchronous pass close/replay\n",
                 .{ self.vulkan_async_command_worker_enabled, stats.submitted, stats.completed, stats.last_submitted_sequence, stats.completed_sequence, stats.batches, stats.max_batch_size, stats.max_depth, stats.work_signals, stats.drain_broadcasts, self.vulkan_async_queue_saturated_fallbacks, self.vulkan_async_worker_stopped_fallbacks, self.vulkan_async_command_barriers },
             );
+            machoCapturePrint("macho-processor: VULKAN OWNED COMMAND FLOW: descriptor_snapshots={d} push_snapshots={d} queue_capacity={d}; arrays copied before admission; update/free/reset/destroy/submit and FSI continuation boundaries retain FIFO drains; handle_lookup=one_snapshot_cache/key_prefilter\n", .{ stats.descriptor_snapshots, stats.push_snapshots, async_vulkan_command.queue_capacity });
         } else {
             machoCapturePrint(
                 "macho-processor: PRESENT CHAIN:   hybrid_command_worker=enabled:{} submitted=0 completed=0 sequence(queued/completed)=0/0 batches=0 max_batch=0 max_queue_depth=0 queue_full_fallbacks={d} worker_stopped_fallbacks={d} ordering_barriers_with_work={d}\n",
@@ -1453,7 +1454,8 @@ pub fn forwardVulkanCommand(self: anytype, state: anytype, requested_hash: u64, 
             self.rejectDescriptorBind(.native_entry_point_missing, guest_context.registers(state).rdi, guest_context.registers(state).rdx, set_count, guest_sets, dynamic_count, guest_dynamic_offsets, 0);
             return self.noteVulkanCommandRefusal(@src().line);
         };
-        self.callNativeVulkanCommand(function, .{
+        const snapshot = async_vulkan_command.owned.DescriptorSets.init(function, command_buffer, @intCast(guest_context.registers(state).rsi), layout, @intCast(guest_context.registers(state).rcx), sets[0..@intCast(set_count)], dynamic_offsets[0..@intCast(dynamic_count)]).?;
+        if (!self.queueAsyncVulkanCommand(.{ .bind_descriptor_sets = snapshot })) self.callNativeVulkanCommand(function, .{
             command_buffer,
             @intCast(guest_context.registers(state).rsi),
             layout,
@@ -1692,7 +1694,10 @@ pub fn forwardVulkanCommand(self: anytype, state: anytype, requested_hash: u64, 
         if (guest_context.registers(state).rdx & 0x20 != 0) if (self.native_texture_state) |native| {
             if (native.command(guest_context.registers(state).rdi)) |command| command.constants(layout, @intCast(guest_context.registers(state).rcx), bytes[0..@intCast(size)]);
         };
-        if (self.real_vulkan.fn_ptrs.cmd_push_constants) |function| self.callNativeVulkanCommand(function, .{ command_buffer, layout, @intCast(guest_context.registers(state).rdx), @intCast(guest_context.registers(state).rcx), @intCast(size), if (size == 0) null else &bytes });
+        if (self.real_vulkan.fn_ptrs.cmd_push_constants) |function| {
+            const snapshot = async_vulkan_command.owned.PushConstants.init(function, command_buffer, layout, @intCast(guest_context.registers(state).rdx), @intCast(guest_context.registers(state).rcx), bytes[0..@intCast(size)]).?;
+            if (!self.queueAsyncVulkanCommand(.{ .push_constants = snapshot })) self.callNativeVulkanCommand(function, .{ command_buffer, layout, @intCast(guest_context.registers(state).rdx), @intCast(guest_context.registers(state).rcx), @intCast(size), if (size == 0) null else &bytes });
+        }
         if (self.fsiShadow(guest_context.registers(state).rdi)) |shadow| self.fsiNoteShadowBlock(guest_context.registers(state).rdi, shadow.pushConstants(layout, @intCast(guest_context.registers(state).rdx), @intCast(guest_context.registers(state).rcx), bytes[0..@intCast(size)]));
     } else if ((name_hash == vulkanNameHash("vkCmdBeginConditionalRenderingEXT") and std.mem.eql(u8, name, "vkCmdBeginConditionalRenderingEXT"))) {
         if (self.real_vulkan.fn_ptrs.cmd_begin_conditional_rendering) |function| {
