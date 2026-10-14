@@ -33,9 +33,12 @@ pub const tracker = @import("tracker.zig");
 pub const rasterization = @import("rasterization.zig");
 pub const budget = @import("budget.zig");
 pub const chain = @import("chain.zig");
+pub const recycling = @import("recycling.zig");
 pub const timing = @import("timing.zig");
 pub const split_decision = @import("split_decision.zig");
 pub const evidence = @import("evidence.zig");
+pub const evidence_async = @import("evidence_async.zig");
+pub const shader_profile = @import("shader_profile.zig");
 pub const pixel_frequency = @import("pixel_frequency.zig");
 
 test {
@@ -49,5 +52,6 @@ test {
     _ = chain;
     _ = timing;
     _ = evidence;
+    _ = @import("evidence_async_tests.zig");
     _ = pixel_frequency;
 }

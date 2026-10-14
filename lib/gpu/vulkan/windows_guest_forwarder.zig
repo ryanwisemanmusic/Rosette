@@ -27,11 +27,9 @@ const max_stack_arguments: usize = 16;
 const scratch_stack_bytes: u64 = (max_stack_arguments + 1) * 8;
 const scratch_stack_alignment: u64 = 16;
 /// How many Microsoft-ABI Vulkan calls may be live at once before the bridge
-/// stops reusing a cached scratch stack. A forwarded call runs to completion
-/// without the interpreter scheduling another guest thread, so the depth is
-/// one in every observed run; the remaining slots exist so that a driver that
-/// calls back into guest code cannot make a nested dispatch share the outer
-/// call's stack.
+/// stops reusing a cached scratch stack. Native calls may temporarily release
+/// the runtime lock, so nested or parallel dispatches need independent slots
+/// until their owning calls complete, including out-of-order returns.
 const scratch_stack_cache_depth: usize = 4;
 const metal_surface_create_info_bytes: u64 = 32;
 
@@ -91,6 +89,7 @@ pub const Bridge = struct {
     /// read is rewritten on entry, so one allocation serves every call.
     scratch_stacks: [scratch_stack_cache_depth]u64 = @splat(0),
     scratch_stack_depth: usize = 0,
+    scratch_stack_busy: [scratch_stack_cache_depth]bool = @splat(false),
     scratch_stack_allocations: u64 = 0,
     scratch_stack_reuses: u64 = 0,
     scratch_stack_overflow_allocations: u64 = 0,
@@ -104,25 +103,34 @@ pub const Bridge = struct {
     /// really does re-enter this deeply is visible instead of silently
     /// reintroducing the leak this cache removed.
     fn acquireScratchStack(self: *Bridge, state: anytype) ?u64 {
-        const depth = self.scratch_stack_depth;
-        if (depth >= self.scratch_stacks.len) {
-            const fresh = state.guestAlloc(scratch_stack_bytes, scratch_stack_alignment) orelse return null;
-            self.scratch_stack_overflow_allocations +|= 1;
+        // Native shader/pipeline calls release the runtime lock and can
+        // return out of order. Active-count indexing would reuse a still
+        // borrowed slot when an earlier call returns before a later one.
+        for (&self.scratch_stacks, &self.scratch_stack_busy) |*stack, *busy| {
+            if (busy.*) continue;
+            if (stack.* == 0) {
+                stack.* = state.guestAlloc(scratch_stack_bytes, scratch_stack_alignment) orelse return null;
+                self.scratch_stack_allocations +|= 1;
+            } else self.scratch_stack_reuses +|= 1;
+            busy.* = true;
             self.scratch_stack_depth += 1;
-            return fresh;
+            return stack.*;
         }
-        if (self.scratch_stacks[depth] == 0) {
-            self.scratch_stacks[depth] = state.guestAlloc(scratch_stack_bytes, scratch_stack_alignment) orelse return null;
-            self.scratch_stack_allocations +|= 1;
-        } else {
-            self.scratch_stack_reuses +|= 1;
-        }
+        const fresh = state.guestAlloc(scratch_stack_bytes, scratch_stack_alignment) orelse return null;
+        self.scratch_stack_overflow_allocations +|= 1;
         self.scratch_stack_depth += 1;
-        return self.scratch_stacks[depth];
+        return fresh;
     }
 
-    fn releaseScratchStack(self: *Bridge) void {
-        if (self.scratch_stack_depth != 0) self.scratch_stack_depth -= 1;
+    fn releaseScratchStack(self: *Bridge, stack: u64) void {
+        std.debug.assert(self.scratch_stack_depth != 0);
+        for (self.scratch_stacks, &self.scratch_stack_busy) |cached, *busy| {
+            if (cached != stack) continue;
+            std.debug.assert(busy.*);
+            busy.* = false;
+            break;
+        }
+        self.scratch_stack_depth -= 1;
     }
 
     fn normalizeMicrosoftArgument(self: *Bridge, name: []const u8, signature: vulkan_contract.argument_widths.Signature, index: usize, raw: u64) u64 {
@@ -511,7 +519,7 @@ pub const Bridge = struct {
             trace_outcome = "scratch_stack_unavailable";
             return false;
         };
-        defer self.releaseScratchStack();
+        defer self.releaseScratchStack(scratch_stack);
         // A first allocation arrives zeroed; a reused one still carries the
         // previous call's bytes. Every stack-argument slot is rewritten below
         // whether or not this signature declares it, so clearing the return
@@ -929,10 +937,10 @@ test "Windows Vulkan scratch stacks are reused rather than leaked per call" {
     // The leak this replaces took one allocation per call. A thousand
     // sequential calls must take exactly one, at one address.
     const first = bridge.acquireScratchStack(&state).?;
-    bridge.releaseScratchStack();
+    bridge.releaseScratchStack(first);
     for (0..999) |_| {
         try std.testing.expectEqual(first, bridge.acquireScratchStack(&state).?);
-        bridge.releaseScratchStack();
+        bridge.releaseScratchStack(first);
     }
     try std.testing.expectEqual(@as(u32, 1), state.allocations);
     try std.testing.expectEqual(@as(u64, 1), bridge.scratch_stack_allocations);
@@ -946,18 +954,19 @@ test "Windows Vulkan scratch stacks are reused rather than leaked per call" {
     try std.testing.expectEqual(first, outer);
     try std.testing.expectEqual(outer + stride, inner);
     try std.testing.expectEqual(@as(usize, 2), bridge.scratch_stack_depth);
-    bridge.releaseScratchStack();
-    bridge.releaseScratchStack();
+    bridge.releaseScratchStack(inner);
+    bridge.releaseScratchStack(outer);
     try std.testing.expectEqual(@as(usize, 0), bridge.scratch_stack_depth);
     try std.testing.expectEqual(@as(u64, 2), bridge.scratch_stack_allocations);
 
     // The allocator has one scratch stack left. Nesting past the cache falls
     // back to a fresh allocation and says so, rather than aliasing a live one.
     bridge.scratch_stack_depth = scratch_stack_cache_depth;
+    bridge.scratch_stack_busy = @splat(true);
     const overflow = bridge.acquireScratchStack(&state).?;
     try std.testing.expect(overflow != outer and overflow != inner);
     try std.testing.expectEqual(@as(u64, 1), bridge.scratch_stack_overflow_allocations);
-    bridge.releaseScratchStack();
+    bridge.releaseScratchStack(overflow);
     try std.testing.expectEqual(@as(usize, scratch_stack_cache_depth), bridge.scratch_stack_depth);
 
     // Exhausted: the refusal is reported, and it does not leave the bridge
@@ -966,6 +975,7 @@ test "Windows Vulkan scratch stacks are reused rather than leaked per call" {
     try std.testing.expect(bridge.acquireScratchStack(&state) == null);
     try std.testing.expectEqual(@as(usize, scratch_stack_cache_depth), bridge.scratch_stack_depth);
     bridge.scratch_stack_depth = 2;
+    bridge.scratch_stack_busy = .{ true, true, false, false };
     try std.testing.expect(bridge.acquireScratchStack(&state) == null);
     try std.testing.expectEqual(@as(usize, 2), bridge.scratch_stack_depth);
     try std.testing.expectEqual(@as(u32, 3), state.allocations);
@@ -989,4 +999,27 @@ test "Vulkan host time is split by entry point and ranked by wall time" {
     try std.testing.expectEqual(@as(u64, 100_000_000), leaders[0].ns);
     try std.testing.expectEqual(@as(u64, 90_000_000), leaders[0].max_ns);
     try std.testing.expectEqualStrings(wait, leaders[1].label());
+}
+
+test "Vulkan scratch stack leases survive out-of-order native compile completion" {
+    const State = struct {
+        next: u64 = 0x1000,
+        pub fn guestAlloc(self: *@This(), _: u64, _: u64) ?u64 {
+            self.next += 0x100;
+            return self.next;
+        }
+    };
+    var state: State = .{};
+    var bridge: Bridge = .{};
+    defer bridge.deinit();
+    const early = bridge.acquireScratchStack(&state).?;
+    const late = bridge.acquireScratchStack(&state).?;
+    bridge.releaseScratchStack(early);
+    const third = bridge.acquireScratchStack(&state).?;
+    try std.testing.expectEqual(early, third);
+    try std.testing.expect(third != late);
+    bridge.releaseScratchStack(late);
+    bridge.releaseScratchStack(third);
+    try std.testing.expectEqual(@as(usize, 0), bridge.scratch_stack_depth);
+    for (bridge.scratch_stack_busy) |busy| try std.testing.expect(!busy);
 }
