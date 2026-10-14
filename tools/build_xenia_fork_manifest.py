@@ -528,6 +528,14 @@ def main() -> int:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--base")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--allow-missing-root",
+        action="store_true",
+        help=(
+            "return success when the requested root is absent, while writing "
+            "an explicit unavailable manifest; existing invalid roots still fail"
+        ),
+    )
     args = parser.parse_args()
     root = args.root.expanduser().resolve()
     report = build_manifest(root, args.base)
@@ -543,7 +551,16 @@ def main() -> int:
             output,
         )
     )
-    return 0 if report["status"] == "available" else 1
+    if report["status"] == "available":
+        return 0
+    # Shell refresh does not build or launch Xenia.  It can proceed without a
+    # removable source drive as long as the missing source stays explicit in
+    # the manifest.  Do not extend this exception to an existing but unreadable
+    # or malformed checkout, and keep all other callers strict by default.
+    if args.allow_missing_root and not root.exists():
+        print("xenia-fork-manifest: continuing with explicit unavailable source", flush=True)
+        return 0
+    return 1
 
 
 if __name__ == "__main__":

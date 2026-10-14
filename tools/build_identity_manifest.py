@@ -691,6 +691,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--xenia-root", type=Path)
+    parser.add_argument(
+        "--allow-unavailable-xenia",
+        action="store_true",
+        help=(
+            "write an explicitly incomplete identity only when the Xenia root "
+            "is absent; intended for refreshing the Rosette shell without the source drive"
+        ),
+    )
     parser.add_argument("--helper", type=Path)
     parser.add_argument("--census", type=Path)
     parser.add_argument("--shell-update", type=Path)
@@ -835,7 +843,10 @@ def main() -> int:
         for name in ("xenia_source_revision", "xenia_base_commit")
         if set(identity.get(name, "")) == {"0"}
     ]
-    if unsealable:
+    missing_xenia_is_explicitly_allowed = (
+        args.allow_unavailable_xenia and (xenia is None or not xenia.exists())
+    )
+    if unsealable and not missing_xenia_is_explicitly_allowed:
         print(
             "build-identity: REFUSING to write an unsealable manifest; "
             "{} could not be determined from xenia-root={} (git status={}). "
@@ -849,6 +860,12 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    if unsealable:
+        print(
+            "build-identity: writing explicitly incomplete identity because "
+            "the Xenia source root is absent; authentic run admission remains unavailable",
+            file=sys.stderr,
+        )
 
     output = args.output if args.output.is_absolute() else root / args.output
     output.parent.mkdir(parents=True, exist_ok=True)

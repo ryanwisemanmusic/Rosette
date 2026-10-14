@@ -36,6 +36,15 @@ ADD_TEST_RE = re.compile(
     r"\s*\.root_module\s*=\s*(\w+)\s*\}\s*\)",
     re.DOTALL,
 )
+NESTED_RUN_TEST_ALIAS_RE = re.compile(
+    r"(?:const|var)\s+(\w+)\s*=\s*b\.addRunArtifact\(\s*"
+    r"b\.addTest\(\.\{\s*\.root_module\s*=\s*(\w+)\s*\}\s*\)\s*\)"
+)
+PATH_ARRAY_LOOP_RE = re.compile(
+    r"for\s*\(\s*\[_\]\[\]const\s+u8\s*\{(?P<paths>.*?)\}\s*,"
+    r"\s*0\.\.\)\s*\|\s*path\s*,\s*\w+\s*\|\s*\{",
+    re.DOTALL,
+)
 RUN_INLINE_RE = re.compile(
     r"check_step\.dependOn\(&b\.addRunArtifact\(\s*(\w+)\s*\)\.step\)"
 )
@@ -146,6 +155,15 @@ def quoted_array(text: str, name: str) -> list[str]:
 
 def dynamic_sources(text: str, module: str, match_start: int) -> list[str]:
     """Resolve source lists used by comptime test-artifact loops."""
+    if module == "module":
+        # Some folder build registrations create a test module from each path
+        # in a local array, then pass that module to addTest inside the loop.
+        # Resolve only the enclosing path-array loop that also constructs the
+        # module from `path`; unrelated loops in the build graph stay opaque.
+        for loop in reversed(list(PATH_ARRAY_LOOP_RE.finditer(text, 0, match_start))):
+            body = text[loop.end() : match_start]
+            if re.search(r"\.root_source_file\s*=\s*b\.path\(path\)", body):
+                return re.findall(r'"([^"\n]+\.zig)"', loop.group("paths"))
     if module == "tp_mod":
         return [f"third_party/{item}" for item in quoted_array(text, "third_party_test_files")]
     if module == "subsystem_mod":
@@ -186,10 +204,13 @@ def dynamic_sources(text: str, module: str, match_start: int) -> list[str]:
 def parse_artifacts(root: Path, text: str, modules: dict[str, str | None]) -> list[dict]:
     artifacts: list[dict] = []
     used_names: set[str] = set()
-    for index, match in enumerate(ADD_TEST_RE.finditer(text), 1):
+    test_matches = list(ADD_TEST_RE.finditer(text))
+    test_names_by_start: dict[int, str] = {}
+    for index, match in enumerate(test_matches, 1):
         declared_name = match.group(1)
         module = match.group(2).strip()
         base_name = declared_name or f"anonymous_add_test_{index}"
+        test_names_by_start[match.start()] = base_name
         sources = dynamic_sources(text, module, match.start())
         if not sources:
             sources = [modules.get(module)]
@@ -215,6 +236,21 @@ def parse_artifacts(root: Path, text: str, modules: dict[str, str | None]) -> li
     # by the dynamic-linker portion of build.zig.
     run_artifacts: set[str] = set(RUN_INLINE_RE.findall(text))
     aliases = {alias: artifact for alias, artifact in RUN_ALIAS_RE.findall(text)}
+    # Folder registrations sometimes construct a test directly inside
+    # addRunArtifact. Associate that run alias with the same test artifact
+    # instead of treating it as an unrelated build step.
+    for alias_match in NESTED_RUN_TEST_ALIAS_RE.finditer(text):
+        test_match = next(
+            (
+                item
+                for item in test_matches
+                if item.start() >= alias_match.start()
+                and item.start() < alias_match.end()
+            ),
+            None,
+        )
+        if test_match is not None:
+            aliases[alias_match.group(1)] = test_names_by_start[test_match.start()]
     for alias in RUN_REFERENCE_RE.findall(text):
         if alias in aliases:
             run_artifacts.add(aliases[alias])
@@ -399,6 +435,9 @@ def run_check(root: Path, expected_artifacts: list[dict]) -> dict:
         )
         output_file.seek(0)
         output_bytes = output_file.read()
+    check_log = root / ".rosette" / "test-census-check.log"
+    check_log.parent.mkdir(parents=True, exist_ok=True)
+    check_log.write_bytes(output_bytes)
     output = output_bytes.decode("utf-8", errors="replace")
     counts = [int(value) for value in PASS_RE.findall(output)]
     run_required = [
@@ -416,6 +455,7 @@ def run_check(root: Path, expected_artifacts: list[dict]) -> dict:
         "command": command,
         "exit_code": completed.returncode,
         "output_sha256": sha256_bytes(output_bytes),
+        "output_log": str(check_log),
         "executed_artifact_count": len(counts),
         "executed_test_count": sum(counts),
         "artifact_pass_counts": counts,

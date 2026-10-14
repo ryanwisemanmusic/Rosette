@@ -74,7 +74,7 @@ FULL_PREREQUISITES = (
     "shell-update-system-check",
     "source-budget-check",
     "audit-phase-coverage",
-    "xenia-fork-manifest",
+    "xenia-fork-manifest-shell-update",
     "replay-evidence",
 )
 
@@ -239,7 +239,15 @@ def external_fingerprint(root: Path, xenia_root: Path) -> dict[str, str]:
     manifest_path = root / ".rosette" / "xenia-fork-manifest.json"
     xenia_script = tools_dir / "build_xenia_fork_manifest.py"
     run_checked(
-        [sys.executable, str(xenia_script), "--root", str(xenia_root), "--output", str(manifest_path)],
+        [
+            sys.executable,
+            str(xenia_script),
+            "--root",
+            str(xenia_root),
+            "--output",
+            str(manifest_path),
+            "--allow-missing-root",
+        ],
         root,
     )
     try:
@@ -250,6 +258,8 @@ def external_fingerprint(root: Path, xenia_root: Path) -> dict[str, str]:
         "toolchain": identity.toolchain_identity()["hash"],
         "configuration": identity.configuration_identity()["hash"],
         "xenia_root": str(xenia_root.resolve()),
+        "xenia_root_present": str(bool(xenia_manifest.get("root_present", False))).lower(),
+        "xenia_status": str(xenia_manifest.get("status", "unavailable")),
         "xenia_identity": str(xenia_manifest.get("identity_hash", "unavailable")),
         "runtime_optimize": "ReleaseFast",
     }
@@ -313,31 +323,31 @@ def record_update(
 
 
 def refresh_identity(root: Path, xenia_root: Path) -> None:
-    run_checked(
-        [
-            sys.executable,
-            str(root / "tools/build_identity_manifest.py"),
-            "--root",
-            str(root),
-            "--xenia-root",
-            str(xenia_root),
-            "--helper",
-            str(root / "zig-out/bin/rosette-shell"),
-            "--census",
-            str(root / ".rosette/test-census.json"),
-            "--shell-update",
-            str(root / ".rosette/shell-update.json"),
-            "--fork-manifest",
-            str(root / ".rosette/xenia-fork-manifest.json"),
-            "--phase-coverage",
-            str(root / ".rosette/audit-phase-coverage.json"),
-            "--evidence-replay",
-            str(root / ".rosette/evidence-replay.json"),
-            "--output",
-            str(root / ".rosette/build-identity.json"),
-        ],
-        root,
-    )
+    command = [
+        sys.executable,
+        str(root / "tools/build_identity_manifest.py"),
+        "--root",
+        str(root),
+        "--xenia-root",
+        str(xenia_root),
+        "--helper",
+        str(root / "zig-out/bin/rosette-shell"),
+        "--census",
+        str(root / ".rosette/test-census.json"),
+        "--shell-update",
+        str(root / ".rosette/shell-update.json"),
+        "--fork-manifest",
+        str(root / ".rosette/xenia-fork-manifest.json"),
+        "--phase-coverage",
+        str(root / ".rosette/audit-phase-coverage.json"),
+        "--evidence-replay",
+        str(root / ".rosette/evidence-replay.json"),
+        "--output",
+        str(root / ".rosette/build-identity.json"),
+    ]
+    if not xenia_root.exists():
+        command.append("--allow-unavailable-xenia")
+    run_checked(command, root)
 
 
 def install_shell(root: Path) -> None:

@@ -3,14 +3,20 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import build_identity_manifest as identity
 import build_xenia_fork_manifest as fork_manifest
 import smart_shell_update as updater
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ShellUpdatePolicyTests(unittest.TestCase):
@@ -145,6 +151,108 @@ class ShellUpdatePolicyTests(unittest.TestCase):
             self.assertNotEqual(
                 source_hash_after, identity.hash_git_tree(root, "xenia-source")
             )
+
+    def test_shell_update_records_an_absent_xenia_checkout_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tools = root / "tools"
+            tools.mkdir()
+            # external_fingerprint calls this script through run_checked; the
+            # fake runner below records exactly the unavailable manifest that
+            # the real CLI is contract-tested to emit.
+            script = tools / "build_xenia_fork_manifest.py"
+            script.write_text("# test stub\n", encoding="utf-8")
+            missing_xenia = root / "external-drive" / "xenia"
+
+            def write_explicitly_unavailable(command: list[str], cwd: Path) -> None:
+                self.assertIn("--allow-missing-root", command)
+                manifest = Path(command[command.index("--output") + 1])
+                manifest.parent.mkdir(parents=True, exist_ok=True)
+                manifest.write_text(json.dumps({
+                    "status": "unavailable",
+                    "root_present": False,
+                    "identity_hash": fork_manifest.ZERO_HASH,
+                }), encoding="utf-8")
+
+            with patch.object(updater, "run_checked", side_effect=write_explicitly_unavailable):
+                external = updater.external_fingerprint(root, missing_xenia)
+
+            self.assertEqual("false", external["xenia_root_present"])
+            self.assertEqual("unavailable", external["xenia_status"])
+            self.assertEqual(fork_manifest.ZERO_HASH, external["xenia_identity"])
+
+    def test_missing_xenia_manifest_cli_is_opt_in_and_existing_bad_root_stays_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            missing = directory / "not-mounted" / "xenia"
+            output = directory / "manifest.json"
+            script = REPO_ROOT / "tools/build_xenia_fork_manifest.py"
+            base_command = [
+                sys.executable, str(script), "--root", str(missing),
+                "--output", str(output),
+            ]
+            strict = subprocess.run(base_command, capture_output=True, text=True)
+            self.assertEqual(1, strict.returncode)
+            self.assertEqual("unavailable", json.loads(output.read_text())["status"])
+
+            allowed = subprocess.run(
+                [*base_command, "--allow-missing-root"], capture_output=True, text=True
+            )
+            self.assertEqual(0, allowed.returncode, allowed.stderr)
+
+            existing_bad_root = directory / "empty-xenia"
+            existing_bad_root.mkdir()
+            strict_existing = subprocess.run(
+                [
+                    sys.executable, str(script), "--root", str(existing_bad_root),
+                    "--output", str(output), "--allow-missing-root",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(1, strict_existing.returncode)
+            self.assertTrue(json.loads(output.read_text())["root_present"])
+
+    def test_shell_identity_may_be_incomplete_only_for_absent_xenia_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            root = directory / "rosette"
+            root.mkdir()
+            missing_xenia = directory / "unmounted" / "xenia"
+            output = directory / "identity.json"
+            script = REPO_ROOT / "tools/build_identity_manifest.py"
+            base_command = [
+                sys.executable, str(script), "--root", str(root),
+                "--xenia-root", str(missing_xenia), "--output", str(output),
+            ]
+            strict = subprocess.run(base_command, capture_output=True, text=True)
+            self.assertEqual(1, strict.returncode)
+            self.assertFalse(output.exists())
+
+            allowed = subprocess.run(
+                [*base_command, "--allow-unavailable-xenia"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(0, allowed.returncode, allowed.stderr)
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertFalse(report["admission"]["complete"])
+            self.assertFalse(report["xenia"]["root_present"])
+
+            present_bad_root = directory / "present-but-invalid-xenia"
+            present_bad_root.mkdir()
+            rejected_output = directory / "rejected-identity.json"
+            existing = subprocess.run(
+                [
+                    sys.executable, str(script), "--root", str(root),
+                    "--xenia-root", str(present_bad_root), "--output", str(rejected_output),
+                    "--allow-unavailable-xenia",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(1, existing.returncode)
+            self.assertFalse(rejected_output.exists())
 
 
 if __name__ == "__main__":
