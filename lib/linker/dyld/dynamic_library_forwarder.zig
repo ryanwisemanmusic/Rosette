@@ -3096,8 +3096,8 @@ pub const Forwarder = struct {
     fsi_guard: ?*FsiGuard = null,
     /// Correct attachment-less MSAA even when watchdog chunking is disabled.
     fsi_raster: fsi_rasterization.Registry = .{},
-    fsi_evidence_enabled: ?bool = null,
-    fsi_evidence_writer: gpu_vulkan.fsi.evidence.Writer = .{},
+    fsi_evidence_io: gpu_vulkan.fsi.evidence_async.State = .{},
+    shader_host_profile: gpu_vulkan.fsi.shader_profile.Stats = .{},
     /// Vulkan queue host calls are externally synchronized even while a
     /// dispatch-only runtime lock is yielded for FSI backpressure.
     vulkan_queue_api_gate: queue_api_gate.Gate = .{},

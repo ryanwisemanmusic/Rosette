@@ -677,10 +677,10 @@ pub fn fsiSubmitExpanded(
 }
 
 pub fn fsiEvidenceEnabled(self: anytype) bool {
-    if (self.fsi_evidence_enabled) |enabled| return enabled;
+    if (self.fsi_evidence_io.enabled) |enabled| return enabled;
     const raw = std.c.getenv("ROSETTE_FSI_EVIDENCE");
     const enabled = if (raw) |value| std.mem.eql(u8, std.mem.span(value), "1") else false;
-    self.fsi_evidence_enabled = enabled;
+    self.fsi_evidence_io.enabled = enabled;
     if (enabled) machoCapturePrint("macho-processor: VULKAN FSI EVIDENCE: exact guest/native shader modules saved under {s}/vulkan-shaders (256 MiB run limit); all FSI pipeline identities are logged\n", .{captureRunDirectory()});
     return enabled;
 }
@@ -690,8 +690,15 @@ pub fn fsiSaveShaderEvidence(self: anytype, guest: u64, info: *const marshal.Sha
     const code = info.code orelse return;
     if (info.code_size % 4 != 0 or info.code_size > gpu_vulkan.fsi.evidence.maximum_module_bytes) return;
     const words: [*]const u32 = @ptrCast(@alignCast(code));
-    const result = self.fsi_evidence_writer.save(captureRunDirectory(), guest, words[0 .. info.code_size / 4], version);
-    if (result != .saved and self.fsi_evidence_writer.failures + self.fsi_evidence_writer.limits <= 4) machoCapturePrint("macho-processor: VULKAN FSI EVIDENCE: shader save {s} module=0x{x} version={s} bytes={d}; capture evidence is incomplete\n", .{ @tagName(result), guest, @tagName(version), info.code_size });
+    if (self.fsi_evidence_io.writer == null) self.fsi_evidence_io.writer = gpu_vulkan.fsi.evidence_async.Writer.create(std.heap.c_allocator, null, null) catch {
+        self.fsi_evidence_io.start_failures +|= 1;
+        if (self.fsi_evidence_io.start_failures <= 4) machoCapturePrint("macho-processor: VULKAN FSI EVIDENCE: writer startup failed; capture evidence is incomplete; shader rendering proceeds\n", .{});
+        return;
+    };
+    const writer = self.fsi_evidence_io.writer.?;
+    const result = writer.enqueue(.{ .directory = captureRunDirectory(), .guest = guest, .words = words[0 .. info.code_size / 4], .version = version });
+    const snapshot = writer.snapshot();
+    if (result != .queued and snapshot.failures + snapshot.limited <= 4) machoCapturePrint("macho-processor: VULKAN FSI EVIDENCE: shader enqueue {s} module=0x{x} version={s} bytes={d}; capture evidence is incomplete\n", .{ @tagName(result), guest, @tagName(version), info.code_size });
 }
 
 pub fn fsiPrintEscalationContext(self: anytype, guard: *FsiGuard) void {
@@ -729,6 +736,9 @@ pub fn printFsiGuardReport(self: anytype) void {
             stats.outstanding_submit_infos,    stats.max_outstanding_submit_infos,
         },
     );
+    const recycle = guard.chunk_pool.work;
+    machoCapturePrint("macho-processor: VULKAN FSI RECORDING RETIREMENT: calls={d} chunks={d} total_us={d} max_us={d}; host release bookkeeping plus recording clear; GPU completion and driver fence/reset times are separate\n", .{ recycle.recording_releases, recycle.recording_chunks, recycle.recording_host_ns / 1000, recycle.recording_max_host_ns / 1000 });
+    machoCapturePrint("macho-processor: VULKAN FSI RECYCLING WORK: pool_entries={d} acquire_calls={d} candidate_checks={d} find_calls={d} hash_probes={d} releases={d}; indexed CPU custody only; release and completed serial both required; poisoned chunks never reused\n", .{ guard.chunk_pool.count, recycle.acquire_calls, recycle.candidate_checks, recycle.find_calls, recycle.hash_probes, recycle.releases });
     machoCapturePrint(
         "macho-processor: VULKAN FSI GUARD:   submission expanded_submits={d} segments={d} driver_queue_submit_calls={d} driver_submit_infos={d} coalesced_groups={d} max_submit_infos_per_group={d} max_segments_per_submit={d} untimed_segments={d} slow_chunk_submit_aborts={d} chunk_buffers(allocated/reused/exhausted/poisoned)={d}/{d}/{d}/{d} timing_fences(created/failed)={d}/{d} watcher(started/failed)={}/{} replay_missing={d} recordings_overflow={d} fsi_render_passes={d} framebuffer={d}x{d} scissor_pixels(max/over_4M_draws/unscissored_draws)={d}/{d}/{d}; adjacent chunks share the host queue call but remain separate VkSubmitInfo batches and Metal command buffers\n",
         .{

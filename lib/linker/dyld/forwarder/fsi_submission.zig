@@ -764,14 +764,29 @@ pub fn createRealVulkanObject(self: anytype, state: anytype, synthetic_handle: u
             self.real_create_result = if (result != abi.SUCCESS) result else abi.ERROR_INITIALIZATION_FAILED;
         }
     } else if (std.mem.eql(u8, name, "vkCreateShaderModule")) {
+        var profile = gpu_vulkan.fsi.shader_profile.Call.start();
+        defer {
+            profile.mark(.other);
+            self.shader_host_profile.add(profile);
+        }
         // Marshalled: every pointer and handle inside the structure is
 
         // translated, and a refusal keeps the modelled path rather than
 
         // handing the driver a guest address.
 
-        const info = self.marshalCreateInfo(state, create_info, name) orelse return error.InvalidInfo;
+        const borrowed = self.marshalCreateInfo(state, create_info, name) orelse return error.InvalidInfo;
+        // Other workers may reuse vulkan_scratch during the native compile.
+        // Own the original as well as every rewrite used by a retry/proof.
+        const shader_compile = @import("shader_compile.zig");
+        var owned = shader_compile.Owned.copy(std.heap.c_allocator, borrowed) catch |err| {
+            self.real_create_result = if (err == error.OutOfMemory) abi.ERROR_OUT_OF_HOST_MEMORY else abi.ERROR_INITIALIZATION_FAILED;
+            return;
+        };
+        defer owned.deinit();
+        const info = owned.bytes();
         const module_info: *marshal.ShaderModuleCreateInfo = @ptrCast(@alignCast(info.ptr));
+        profile.mark(.marshal);
         const ModuleInspection = struct {
             stages: gpu_vulkan.spirv_stage.ModuleStages,
             fingerprint: u64,
@@ -811,12 +826,15 @@ pub fn createRealVulkanObject(self: anytype, state: anytype, synthetic_handle: u
         if ((tessellation_stage_mask & 1) != 0) self.vulkan_tess_control_shader_modules +|= 1;
         if ((tessellation_stage_mask & 2) != 0) self.vulkan_tess_eval_shader_modules +|= 1;
         const create_fn = self.real_vulkan.fn_ptrs.create_shader_module orelse return error.MissingFn;
+        profile.mark(.inspect);
         self.fsiSaveShaderEvidence(synthetic_handle, @ptrCast(@alignCast(info.ptr)), .guest);
+        profile.mark(.guest_evidence);
         const hdr_resolve = self.correctHdrResolve(info) catch {
             self.real_create_result = abi.ERROR_OUT_OF_HOST_MEMORY;
             return;
         };
         defer if (hdr_resolve) |words| std.heap.c_allocator.free(words);
+        profile.mark(.hdr);
         // Give a vertex shader the ability to expand a Xenos rectangle
         // list itself. Xenia's SPIR-V translator never implemented the
         // `kRectangleListAsTriangleStrip` fallback it selects on a host
@@ -824,11 +842,13 @@ pub fn createRealVulkanObject(self: anytype, state: anytype, synthetic_handle: u
         // every rectangle is never shaded. See `rect_list_expand`.
         const expanded = self.expandRectangleListShader(info, synthetic_handle, module_inspection.fingerprint);
         defer if (expanded) |expansion| std.heap.c_allocator.free(expansion.words);
+        profile.mark(.rectangle);
         const pixel_frequency = self.normalizeFsiPixelFrequency(info) catch {
             self.real_create_result = abi.ERROR_OUT_OF_HOST_MEMORY;
             return;
         };
         defer if (pixel_frequency) |words| std.heap.c_allocator.free(words);
+        profile.mark(.pixel);
         // Then bound every dynamic index: Metal has no robustBufferAccess.
         const hardened = self.hardenShaderModule(info, synthetic_handle) catch {
             self.fsiUpdateShaderBoundsBudget();
@@ -836,8 +856,10 @@ pub fn createRealVulkanObject(self: anytype, state: anytype, synthetic_handle: u
             return;
         };
         defer if (hardened) |hardening| std.heap.c_allocator.free(hardening.words);
+        profile.mark(.robust);
         var real_module: u64 = 0;
-        var result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_module);
+        var result = shader_compile.call(state, create_fn, device, module_info, &real_module);
+        profile.mark(.driver);
         if (result != 0 and hdr_resolve != null) self.hdr_resolve_driver_rejections +|= 1;
         if (result != 0 and pixel_frequency != null) self.fsi_pixel_frequency_driver_rejections +|= 1;
         if (result != 0 and hardened != null) {
@@ -866,11 +888,16 @@ pub fn createRealVulkanObject(self: anytype, state: anytype, synthetic_handle: u
                 "macho-processor: RECT EXPAND: the driver refused the rewritten vertex shader (VkResult={d}); the guest's own module was created instead\n",
                 .{result},
             );
-            result = create_fn(device, @ptrCast(@alignCast(info.ptr)), null, &real_module);
+            result = shader_compile.call(state, create_fn, device, module_info, &real_module);
+            profile.mark(.driver);
         }
+        // Another creation may have written this shared result while the
+        // driver ran. Restore this call's result before returning to its caller.
+        self.real_create_result = abi.SUCCESS;
         self.fsiUpdateShaderBoundsBudget();
         if (result == 0 and real_module != 0) {
             self.fsiSaveShaderEvidence(synthetic_handle, @ptrCast(@alignCast(info.ptr)), .native);
+            profile.mark(.native_evidence);
             self.metal_backend_health.noteSpirvModule();
             if (native_format) |format| if (self.native_texture_state) |native| {
                 native.noteShader(real_module, format);

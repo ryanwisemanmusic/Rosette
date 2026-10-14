@@ -164,6 +164,12 @@ const writeResourceMemoryRequirements = Forwarder.writeResourceMemoryRequirement
 const writeResourceMemoryRequirements2 = Forwarder.writeResourceMemoryRequirements2;
 
 pub fn deinit(self: anytype) void {
+    if (self.fsi_evidence_io.writer) |writer| {
+        writer.stop();
+        writer.report();
+        writer.destroy();
+        self.fsi_evidence_io.writer = null;
+    }
     self.stopAsyncVulkanCommandWorker();
     // A guest-side all-or-nothing resource warning can otherwise be
     // reported with no per-create evidence when the run still presents
@@ -1901,6 +1907,8 @@ pub fn fsiUpdateShaderBoundsBudget(self: anytype) void {
 }
 
 pub fn printRobustAccessReport(self: anytype) void {
+    self.shader_host_profile.report();
+    if (self.fsi_evidence_io.writer) |writer| writer.report();
     const stats = self.robust_access_stats;
     machoCapturePrint(
         "macho-processor: VULKAN ROBUST ACCESS: enabled={} modules(hardened/unchanged/refused/driver_rejected)={d}/{d}/{d}/{d} clamps(runtime_array/fixed_array/component)={d}/{d}/{d} hoisted_lengths={d} unclamped_dynamic_indices={d} interface_indices={d} allocation_failures={d} uniform_zero_loads={d}; buffer indices are bounded and out-of-range uniform loads return zero; failed hardening refuses shader creation\n",
@@ -2328,8 +2336,7 @@ pub fn fsiRecording(self: anytype, guest: u64) ?*fsi_chain.Recording {
 }
 
 pub fn fsiReleaseRecording(guard: *FsiGuard, recording: *fsi_chain.Recording) void {
-    for (recording.chunks[0..recording.chunk_count]) |chunk| guard.chunk_pool.release(chunk);
-    recording.* = .{};
+    gpu_vulkan.fsi.recycling.release(&guard.chunk_pool, recording);
 }
 
 pub fn fsiBeginRecording(self: anytype, guest: u64, own: abi.CommandBuffer, usage_flags: u32, has_inheritance: bool) void {
