@@ -43,7 +43,7 @@ EXECUTION_LOCAL_FIELDS = (
     "windows_message_dispatch_frame_count windows_audio_callback_frames "
     "windows_audio_callback_frame_count block_jit_scratch step_retired "
     "parallel_code_sample_steps guest_clock_sample_steps "
-    "windows_guest_slice_yield_requested windows_slice_pause_yield "
+    "windows_guest_slice_yield_requested windows_slice_pause_yield windows_slice_nt_zero_yield "
     "windows_guest_handoff_requested windows_slice_clock_reads active_guest_thread "
     "windows_active_guest_thread_slot verify_journal windows_thread_id active_idle_source "
     "windows_bsearch_frames windows_bsearch_frame_count "
