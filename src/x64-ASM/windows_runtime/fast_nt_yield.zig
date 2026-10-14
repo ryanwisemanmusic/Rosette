@@ -23,6 +23,7 @@ pub fn tryFunction(comptime host: type, state: anytype, dll: []const u8, name: [
     _ = state.windows_fast_nt_yield.calls[index].fetchAdd(1, .monotonic);
     state.windowsGuestContextField("windows_current_import").* = if (index == 0) "NtDelayExecution" else "NtYieldExecution";
     host.completeCall(state, return_rip);
+    state.windowsGuestContextField("windows_slice_nt_zero_yield").* = true;
     state.requestWindowsGuestSliceYield();
     return true;
 }

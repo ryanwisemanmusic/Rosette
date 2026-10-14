@@ -159,6 +159,10 @@ pub fn tryWindowsFastFunction(state: anytype, dll_name: []const u8, name: []cons
     return windows_runtime.tryWindowsFastFunction(state, dll_name, name, direct_return_rip);
 }
 
+pub fn tryWindowsFastRegisteredTail(state: anytype, dll: []const u8, name: []const u8, rip: ?u64) bool {
+    return windows_runtime.tryWindowsFastRegisteredTail(state, dll, name, rip);
+}
+
 /// Complete a Rosetta-owned semantic compatibility boundary for a Windows
 /// guest before its first instruction executes. This stays alongside the
 /// Windows ABI bridge so the ELF executor only owns the architectural return

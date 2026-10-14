@@ -9026,31 +9026,11 @@ fn tryUser32Extras(state: anytype, name: []const u8, direct_return_rip: ?u64) bo
 /// rather than silently entering a zero-return stub.
 /// Try narrow import lanes before general dispatch; SRW retains its runtime mutex.
 pub fn tryWindowsFastFunction(state: anytype, dll_name: []const u8, function_name: []const u8, direct_return_rip: ?u64) bool {
-    const State = @TypeOf(state.*);
-    // SRW retains its runtime mutex and owner/waiter synchronization.
-    if (comptime @hasDecl(State, "tryWindowsSrwImport")) {
-        if (std.ascii.eqlIgnoreCase(dll_name, "kernel32.dll") or
-            std.ascii.startsWithIgnoreCase(dll_name, "api-ms-win-core-synch-"))
-        {
-            if (state.tryWindowsSrwImport(function_name, direct_return_rip)) return true;
-        }
-    }
-    if (comptime @hasDecl(State, "windowsFastCrtImportMayBypassRuntimeLock")) {
-        if (state.windowsFastCrtImportMayBypassRuntimeLock()) {
-            if (fast_math.tryFunction(fast_import_host, state, dll_name, function_name, direct_return_rip) or
-                fast_imports.tryCrtHeap(fast_import_host, state, dll_name, function_name, direct_return_rip)) return true;
-            if (fast_imports.tryCrtMemory(fast_import_host, state, dll_name, function_name, direct_return_rip)) return true;
-            if (fast_imports.tryCrtStrings(fast_import_host, state, dll_name, function_name, direct_return_rip)) return true;
-            if (fast_imports.tryProcessAffinityMask(fast_import_host, state, dll_name, function_name, direct_return_rip)) return true;
-        }
-    }
-    if (@import("windows_runtime/fast_nt_yield.zig").tryFunction(fast_import_host, state, dll_name, function_name, direct_return_rip) or
-        fast_imports.trySleepZero(fast_import_host, state, dll_name, function_name, direct_return_rip)) return true;
-    if (comptime @hasDecl(State, "windowsFastImportMayBypassRuntimeLock")) {
-        if (!state.windowsFastImportMayBypassRuntimeLock()) return false;
-    }
-    if (fast_imports.tryIdentityQuery(fast_import_host, state, dll_name, function_name, direct_return_rip)) return true;
-    return fast_imports.tryPreciseTimeQuery(fast_import_host, state, dll_name, function_name, direct_return_rip);
+    return @import("windows_runtime/fast_dispatch.zig").tryFunction(fast_import_host, state, dll_name, function_name, direct_return_rip);
+}
+
+pub fn tryWindowsFastRegisteredTail(state: anytype, dll: []const u8, name: []const u8, rip: ?u64) bool {
+    return @import("windows_runtime/fast_dispatch.zig").tryRegisteredTail(fast_import_host, state, dll, name, rip);
 }
 
 pub fn tryFunction(state: anytype, dll_name: []const u8, function_name: []const u8, direct_return_rip: ?u64) bool {
