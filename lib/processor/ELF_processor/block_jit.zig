@@ -66,4 +66,6 @@ test {
     _ = @import("block_jit/register_flow_tests.zig");
     _ = @import("block_jit/ordered_lane_tests.zig");
     _ = @import("block_jit/vector_expansion_tests.zig");
+    _ = @import("block_jit/xbox_critical_section_transfer_tests.zig");
+    _ = @import("block_jit/atomic_retry_yield_tests.zig");
 }

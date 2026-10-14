@@ -42,6 +42,7 @@ const __process_WindowsGuestThreadStatus = __ProcessInternals._WindowsGuestThrea
 const __process_WindowsMappedCodeSlice = __ProcessInternals._WindowsMappedCodeSlice;
 const __process_blockJitFlags = __ProcessInternals._blockJitFlags;
 const __process_blockJitHookedTransfer = __ProcessInternals._blockJitHookedTransfer;
+const __process_blockJitXboxCriticalSectionTransfer = __ProcessInternals._blockJitXboxCriticalSectionTransfer;
 const __process_blockJitImportTransfer = __ProcessInternals._blockJitImportTransfer;
 const __process_blockJitInterpret = __ProcessInternals._blockJitInterpret;
 const __process_blockJitMappedTransferAllowed = __ProcessInternals._blockJitMappedTransferAllowed;
@@ -77,6 +78,7 @@ const __process_std = __ProcessInternals._std;
 const __process_tlb_diagnostics = __ProcessInternals._tlb_diagnostics;
 const __process_tso_memory = __ProcessInternals._tso_memory;
 const __process_windows_guest_execution_binding = __ProcessInternals._windows_guest_execution_binding;
+const __process_xbox_critical_section = __ProcessInternals._xbox_critical_section;
 const __process_x64_decoder = __ProcessInternals._x64_decoder;
 const __process_x64_interpreter = __ProcessInternals._x64_interpreter;
 const __process_x64_linux_runtime = __ProcessInternals._x64_linux_runtime;
@@ -88,7 +90,6 @@ const __state_block_jit_layout = __StateInternals._block_jit_layout;
 const __state_op_names = __StateInternals._op_names;
 const __state_op_value_limit = __StateInternals._op_value_limit;
 const __state_windows_memory_trace_floor = __StateInternals._windows_memory_trace_floor;
-
 pub fn refreshBlockJitTransferTraced(self: *ElfState) void {
     self.block_jit_transfer_traced = self.trace_windows_messages or self.trace_windows_threads;
 }
@@ -188,6 +189,17 @@ pub fn publishBlockJitHookFilter(self: *ElfState) void {
         if (slot.address == 0) continue;
         if (@atomicLoad(__process_kernel_call_census.Saturation, &slot.saturation, .acquire) == .saturated) continue;
         __process_block_jit.hookFilterAdd(&filter, slot.address);
+    }
+    // Unlike the ordinary export census, the per-step Xbox critical-section
+    // dispatcher remains active after a kernel-call counter saturates. Keep
+    // enter/leave discoverable so translated indirect calls still reach that
+    // dispatcher and retain their call-side accounting.
+    inline for (.{
+        __process_xbox_critical_section.Export.enter,
+        __process_xbox_critical_section.Export.leave,
+    }) |api| {
+        const address = self.xbox_critical_section_hooks.addresses[@intFromEnum(api)];
+        if (address != 0) __process_block_jit.hookFilterAdd(&filter, address);
     }
     for (self.guest_milestone_addresses) |address| {
         if (address != 0) __process_block_jit.hookFilterAdd(&filter, address);
@@ -369,6 +381,11 @@ pub fn blockJitIndirectTargetHooked(self: *const ElfState, target: u64) bool {
     return false;
 }
 
+/// Preserve the call-side observations for a translated call to the pinned
+/// Xbox enter/leave trampolines. The following translated transfer still
+/// exits through the ordinary per-step hook, which owns the guest lock
+/// protocol. Return zero when runtime instrumentation or a changed hook table
+/// requires the interpreter path.
 pub fn blockJitGenerationPointer(self: *ElfState, mapped: bool, kind: u8, index: usize) ?*const u64 {
     if (!mapped) return &self.windows_image_code_generation;
     return switch (@as(__process_mapped_ranges.Kind, @enumFromInt(kind))) {
@@ -1551,6 +1568,7 @@ pub fn compileBlockJit(self: *ElfState, jit: *__process_BlockJitState, rip: u64)
         // call or a return.
         .flags_dead_at_calls = self.windows_runtime_enabled,
         .internal_edges = self.block_jit_internal_edges_enabled,
+        .pause_helper_preserves_state = self.pause_options.helper_preserves_state,
     };
     jit.last_refusal = .compile_error;
     jit.last_refusal_op = insns.items[0].decoded.op;
@@ -1594,6 +1612,7 @@ pub fn compileBlockJit(self: *ElfState, jit: *__process_BlockJitState, rip: u64)
             .write128_non_temporal = __process_blockJitWrite128NonTemporal,
             .mapped_transfer = __process_blockJitMappedTransferAllowed,
             .hooked_transfer = __process_blockJitHookedTransfer,
+            .xbox_critical_section_transfer = __process_blockJitXboxCriticalSectionTransfer,
             .import_transfer = __process_blockJitImportTransfer,
             .x87_raw_transfer = __process_blockJitX87RawTransfer,
             .x87_memory = __process_blockJitX87Memory,
@@ -2732,7 +2751,7 @@ pub fn reportParallelTlbInvalidationWork(self: *const ElfState) void {
         self.windows_srw_stack_capture_all,              self.windows_srw_stack_captures,                 self.windows_srw_stack_skipped,
     });
     __process_log.info("PE64 CPU FAST PATHS: streaming_stores={} pause_batches={} additional_pause_instructions={d}; streaming stores retain release ordering and require admitted write pages with no guest queue; additional_pause_instructions retired inside bounded PAUSE bundles still count toward hint and execution totals", .{
-        self.block_jit_streaming_stores_enabled,                   self.parallel_pause_batches_enabled,
+        self.block_jit_streaming_stores_enabled,                   self.pause_options.scheduler_batches_enabled,
         self.parallel_pause_batched_instructions.load(.monotonic),
     });
     @import("tlb_invalidation.zig").report(self);

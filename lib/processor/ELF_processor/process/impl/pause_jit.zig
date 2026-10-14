@@ -38,9 +38,19 @@ pub fn execute(self: *ElfState, block: *const I._block_jit.Block, index: u32) u3
     // queued before the rest of the trace resumes with direct native loads.
     I._tso_memory.flushActiveStoreBufferFor(.jit_fallback);
     if (self.currentBlockJit()) |active| {
-        // One executor owns the writer; diagnostic readers use atomic loads.
-        const calls = @atomicLoad(u64, &active.pause_helper_calls, .monotonic);
-        @atomicStore(u64, &active.pause_helper_calls, calls +| 1, .monotonic);
+        // One executor owns this counter. Publish on the exact same cadence
+        // as the PAUSE scheduler snapshot; worker progress/exit publishes any
+        // non-boundary tail before diagnostics consume the final totals.
+        if (self.pause_options.counter_batches_enabled) {
+            active.pause_helper_calls_local +%= 1;
+            if (ctx.field("windows_slice_pause_yield").*) {
+                @atomicStore(u64, &active.pause_helper_calls, active.pause_helper_calls_local, .monotonic);
+            }
+        } else {
+            const calls = @atomicLoad(u64, &active.pause_helper_calls, .monotonic) +| 1;
+            active.pause_helper_calls_local = calls;
+            @atomicStore(u64, &active.pause_helper_calls, calls, .monotonic);
+        }
     }
     const capturing = if (ctx.field("windows_active_guest_thread_slot").*) |slot|
         self.windows_guest_threads[slot].spin.capture_remaining != 0 or self.windows_guest_threads[slot].status != .running

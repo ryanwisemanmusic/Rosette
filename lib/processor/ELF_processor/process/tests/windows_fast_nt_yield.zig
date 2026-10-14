@@ -213,6 +213,7 @@ test "PAUSE bundle production dispatch benchmark (ROSETTE_YIELD_BENCH=1)" {
     const hints: u64 = 2000000;
     for (0..7) |pair| {
         state.windows_guest_threads[3].pause_hints = 0;
+        state.windows_guest_threads[3].pause_hints_local = 0;
         var retired: u64 = 0;
         var dispatches: u64 = 0;
         const started = I._monotonicNanoseconds();
@@ -225,6 +226,8 @@ test "PAUSE bundle production dispatch benchmark (ROSETTE_YIELD_BENCH=1)" {
             dispatches += 1;
         }
         const elapsed = I._monotonicNanoseconds() - started;
+        try testing.expectEqual(retired, state.windows_guest_threads[3].pause_hints_local);
+        @import("../impl/lifecycle.zig").publishParallelPauseCounters(&state.windows_guest_threads[3]);
         try testing.expectEqual(retired, state.windows_guest_threads[3].pause_hints);
         try testing.expect(state.regs.rip <= rip + 16);
         std.debug.print("pause_bundle pair={d} hints={d} elapsed_ns={d} dispatches={d}\n", .{ pair, retired, elapsed, dispatches });

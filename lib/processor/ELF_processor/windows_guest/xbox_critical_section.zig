@@ -297,6 +297,7 @@ pub const Hooks = struct {
     addresses: [Export.count]u64 = @splat(0),
     calls: [Export.count]u64 = @splat(0),
     fallbacks: [Export.count]u64 = @splat(0),
+    jit_direct_calls: [Export.count]u64 = @splat(0),
 
     pub fn arm(self: *Hooks, export_name: []const u8, address: u64) bool {
         const api = Export.fromName(export_name) orelse return false;
@@ -320,6 +321,10 @@ pub const Hooks = struct {
 
     pub fn noteFallback(self: *Hooks, api: Export) void {
         Stats.bump(&self.fallbacks[@intFromEnum(api)]);
+    }
+
+    pub fn noteJitDirect(self: *Hooks, api: Export) void {
+        Stats.bump(&self.jit_direct_calls[@intFromEnum(api)]);
     }
 };
 

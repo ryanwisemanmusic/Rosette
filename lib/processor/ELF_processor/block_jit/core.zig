@@ -76,6 +76,7 @@ const wide_unpacks = @import("wide_unpacks.zig");
 const ordered_lanes = @import("ordered_lanes.zig");
 const self_loops = @import("self_loops.zig");
 const register_cache = @import("register_cache.zig");
+const atomic_retry = @import("atomic_retry_yield.zig");
 const std = @import("std");
 const testing = std.testing;
 const a64 = @import("arm64_encode");
@@ -124,6 +125,11 @@ pub const Helpers = extern struct {
     /// not force a hot indirect transfer through the interpreter forever.
     /// Returns 1 only when the current runtime still owns this exact target.
     hooked_transfer: *const fn (state: *anyopaque, target: u64) callconv(.c) u8,
+    /// Observe a call into a pinned Xbox critical-section trampoline without
+    /// running the general instruction interpreter. Returns 1 only when
+    /// call-side observations were recorded and the normal step hook may
+    /// consume the transfer.
+    xbox_critical_section_transfer: *const fn (state: *anyopaque, target: u64, return_rip: u64) callconv(.c) u32,
     /// A `call [slot]` or `jmp [slot]` through an import address table slot,
     /// answered on one of the runtime's lock-free import lanes without
     /// leaving translated code. `call_return` is the call's next RIP, or 0
@@ -161,6 +167,7 @@ const helper_write128_offset: u32 = @offsetOf(Helpers, "write128");
 const helper_write128_non_temporal_offset: u32 = @offsetOf(Helpers, "write128_non_temporal");
 const helper_mapped_transfer_offset: u32 = @offsetOf(Helpers, "mapped_transfer");
 const helper_hooked_transfer_offset: u32 = @offsetOf(Helpers, "hooked_transfer");
+const helper_xbox_critical_section_transfer_offset: u32 = @offsetOf(Helpers, "xbox_critical_section_transfer");
 const helper_import_transfer_offset: u32 = @offsetOf(Helpers, "import_transfer");
 const helper_x87_raw_transfer_offset: u32 = @offsetOf(Helpers, "x87_raw_transfer");
 const helper_x87_memory_offset: u32 = @offsetOf(Helpers, "x87_memory");
@@ -1971,6 +1978,21 @@ fn atomicForm(op: Op) ?AtomicForm {
     };
 }
 
+/// The retry hint is limited to the common lock-acquisition form: a locked
+/// compare-exchange immediately followed by a backward JNZ. Other atomic
+/// operations and branches retain their original translation.
+fn isLockedCompareExchange(d: DecodedInsn) bool {
+    if (!d.lock) return false;
+    return switch (d.op) {
+        .cmpxchg_mem8_reg8,
+        .cmpxchg_mem16_reg16,
+        .cmpxchg_mem32_reg32,
+        .cmpxchg_mem64_reg64,
+        => true,
+        else => false,
+    };
+}
+
 /// Whether an explicitly supplied LOCK prefix is architecturally valid for
 /// this decoded form. Valid memory operations may still use the interpreter
 /// when the native path cannot prove alignment or protection state.
@@ -2248,6 +2270,13 @@ const Compiler = struct {
     /// A dominating VEX.128 write already zeroed these private register-file
     /// lanes. Facts are local to straight-line code, never an entry/edge.
     resident_vectors: bool = true,
+    /// The PAUSE scheduling callback only updates the register-file RIP and
+    /// flags; unlike an arbitrary interpreter escape, it leaves every guest
+    /// GPR, vector register, and hoisted base untouched. Keep the old reload
+    /// path available to the differential process tests.
+    pause_helper_preserves_state: bool = true,
+    xbox_critical_section_transfer_enabled: bool = true,
+    atomic_retry_yield_enabled: bool = true,
     xmm_valid: u16 = 0,
     xmm_dirty: u16 = 0,
     last_xmm: ?u8 = null,
@@ -3321,11 +3350,13 @@ const Compiler = struct {
     /// proven Xenia code-cache address may take the native transfer template;
     /// every other out-of-image target remains classified by the interpreter.
     /// Clobbers x0-x1 and t0-t4; the original target is preserved in scratch.
-    fn emitHookedTargetCheck(self: *Compiler, reg: a64.Reg, slow: Label) Error!void {
+    fn emitHookedTargetCheck(self: *Compiler, reg: a64.Reg, slow: Label, call_return_rip: ?u64) Error!void {
         const external = try self.a.createLabel();
         const external_unmapped = try self.a.createLabel();
         const external_outside_published_range = try self.a.createLabel();
         const checked = try self.a.createLabel();
+        const xbox_critical_section = try self.a.createLabel();
+        const continue_checked = try self.a.createLabel();
         try self.emitStateScalar(.doubleword, t0, self.layout.image_low_offset);
         try self.emit(a64.cmp(.x64, reg, t0));
         try self.a.branchCond(.lo, external);
@@ -3345,22 +3376,22 @@ const Compiler = struct {
         try self.emit(a64.logicalImmediate(.w32, .andop, t3, t3, 1).?);
         const bloom_miss = try self.a.createLabel();
         try self.a.branchIfZero(.w32, t3, bloom_miss);
-        // Most Bloom hits are stale/retired census targets and should reach
-        // the exact helper. These two are different: the guest critical-
-        // section bridge keeps them pinned, and millions of calls hit them.
-        // Check just those positive hits inline so the pinned fast bridge
-        // does not pay an extra C helper call on every enter/leave.
+        // The guest critical-section bridge remains pinned after the generic
+        // kernel-call census saturates. Its filter bits are retained for
+        // enter/leave, so these two exact comparisons route only the lock
+        // calls through the narrow observer below; ordinary Bloom collisions
+        // still use the general exact hook check.
         const not_enter = try self.a.createLabel();
         try self.emitStateScalar(.doubleword, t0, self.layout.xbox_critical_section_enter_offset);
         try self.emit(a64.cmp(.x64, reg, t0));
         try self.a.branchCond(.ne, not_enter);
-        try self.a.branch(slow);
+        try self.a.branch(if (self.xbox_critical_section_transfer_enabled) xbox_critical_section else slow);
         self.a.placeLabel(not_enter);
         const not_leave = try self.a.createLabel();
         try self.emitStateScalar(.doubleword, t0, self.layout.xbox_critical_section_leave_offset);
         try self.emit(a64.cmp(.x64, reg, t0));
         try self.a.branchCond(.ne, not_leave);
-        try self.a.branch(slow);
+        try self.a.branch(if (self.xbox_critical_section_transfer_enabled) xbox_critical_section else slow);
         self.a.placeLabel(not_leave);
         // The filter intentionally has one bit per address. Do not make its
         // false positives permanent interpreter exits: save the target, ask
@@ -3397,6 +3428,17 @@ const Compiler = struct {
         // bootstrap/unpublished case; a known out-of-range target can go
         // straight to the interpreter-owned transfer path.
         self.a.placeLabel(external_outside_published_range);
+        // Kernel trampolines are outside Xenia's generated-code cache. Keep
+        // this exact check on that cold range-refusal edge so the common
+        // code-cache transfer path pays no additional comparisons.
+        if (self.xbox_critical_section_transfer_enabled) {
+            try self.emitStateScalar(.doubleword, t0, self.layout.xbox_critical_section_enter_offset);
+            try self.emit(a64.cmp(.x64, reg, t0));
+            try self.a.branchCond(.eq, xbox_critical_section);
+            try self.emitStateScalar(.doubleword, t0, self.layout.xbox_critical_section_leave_offset);
+            try self.emit(a64.cmp(.x64, reg, t0));
+            try self.a.branchCond(.eq, xbox_critical_section);
+        }
         try self.a.branch(slow);
 
         self.a.placeLabel(external_unmapped);
@@ -3407,6 +3449,29 @@ const Compiler = struct {
         try self.a.branchIfZero(.w32, 0, slow);
         try self.emitChecked(a64.ldrImm(.doubleword, reg, r_scratch, scratch_transfer_target_offset));
         self.a.placeLabel(checked);
+        try self.a.branch(continue_checked);
+
+        self.a.placeLabel(xbox_critical_section);
+        if (call_return_rip) |return_rip| {
+            // The callback declines before making changes if a probe or a
+            // tracing mode became active after this block was compiled. On
+            // success it records the same call-side observers as the
+            // interpreter; the ordinary call template still pushes the
+            // return address and exits to the per-step Xbox hook.
+            try self.emitChecked(a64.strImm(.doubleword, reg, r_scratch, scratch_transfer_target_offset));
+            try self.emitCacheWriteBack();
+            try self.emit(a64.mov(.x64, 0, r_state));
+            try self.emitChecked(a64.ldrImm(.doubleword, 1, r_scratch, scratch_transfer_target_offset));
+            try self.a.loadConstant(2, return_rip);
+            try self.emitCallHelper(helper_xbox_critical_section_transfer_offset);
+            try self.emitCacheLoad();
+            try self.a.branchIfZero(.w32, 0, slow);
+            try self.emitChecked(a64.ldrImm(.doubleword, reg, r_scratch, scratch_transfer_target_offset));
+            try self.a.branch(continue_checked);
+        } else {
+            try self.a.branch(slow);
+        }
+        self.a.placeLabel(continue_checked);
     }
 
     /// Branch to `slow` when the address in `reg` lies inside the guest
@@ -3431,6 +3496,14 @@ const Compiler = struct {
     /// `compiled_instructions(native/fallback)` and inflate exactly the
     /// number these templates exist to reduce.
     fn emitInterpretCall(self: *Compiler, index: u32) Error!void {
+        try self.emitInterpretCallWithStatePolicy(index, false);
+    }
+
+    /// Run the interpreter helper with the register-state guarantee supplied
+    /// by a specifically admitted helper. `true` is valid only for the
+    /// parallel PAUSE callback: it settles flags, advances RIP, and may ask
+    /// the scheduler to stop, but does not modify guest registers.
+    fn emitInterpretCallWithStatePolicy(self: *Compiler, index: u32, helper_preserves_state: bool) Error!void {
         try self.emitCurrentIndex(index);
         // The interpreter reads and writes guest registers in memory. Hand
         // it the cache's values, and take back whatever it changed.
@@ -3439,16 +3512,22 @@ const Compiler = struct {
         try self.emitChecked(a64.ldrImm(.doubleword, 1, r_helpers, helper_block_offset));
         try self.a.loadConstant(2, index);
         try self.emitCallHelper(helper_interpret_offset);
-        // x25-x28 survived the call, but the guest registers they stand for
-        // may not have. Reload into the cache only - w0 is the interpreter's
-        // answer and is read next.
-        try self.emitCacheLoad();
-        // The interpreter may have moved the hoisted base register.
-        for (&self.hoists) |*hoist| hoist.live = false;
-        self.zero_ymm = 0;
-        self.zero_zmm = 0;
+        if (!helper_preserves_state) {
+            // x25-x28 survived the call, but the guest registers they stand
+            // for may not have. Reload the cache only - w0 is the
+            // interpreter's answer and is read next.
+            try self.emitCacheLoad();
+            // The interpreter may have moved a hoisted base or vector state.
+            for (&self.hoists) |*hoist| hoist.live = false;
+            self.zero_ymm = 0;
+            self.zero_zmm = 0;
+        }
         const stub = try self.exitStub(index + 1, null);
         try self.a.branchIfNonZero(.w32, 0, stub);
+    }
+
+    fn emitPauseCall(self: *Compiler, index: u32) Error!void {
+        try self.emitInterpretCallWithStatePolicy(index, self.pause_helper_preserves_state);
     }
 
     /// With x1 = an import slot's address: ask the runtime's lock-free import
@@ -4089,7 +4168,7 @@ const Compiler = struct {
             self.native_count += 1;
             self.touches_memory = true; // the scheduling observer is external
             self.pending_record = 0; // the helper settles the actual record
-            try self.emitInterpretCall(index);
+            try self.emitPauseCall(index);
             return .native;
         }
         if (insn.force_fallback or !isNative(d)) {
@@ -4572,6 +4651,16 @@ const Compiler = struct {
                 }
             },
             .jcc_rel8, .jcc_rel32 => {
+                const next = insn.rip +% d.len;
+                const target = next +% d.addr;
+                const follows_locked_compare_exchange = index != 0 and
+                    isLockedCompareExchange(self.insns[index - 1].decoded);
+                const retry_yield = atomic_retry.eligible(
+                    self.atomic_retry_yield_enabled,
+                    d.cond == .ne,
+                    target < insn.rip,
+                    follows_locked_compare_exchange,
+                );
                 if (index < self.internal_target.len) {
                     if (self.internal_target[index]) |target_index| {
                         try self.emitInternalBranch(index, target_index, d);
@@ -4579,8 +4668,6 @@ const Compiler = struct {
                     }
                 }
                 // The decoder keeps the displacement in `addr` for jcc.
-                const next = insn.rip +% d.len;
-                const target = next +% d.addr;
                 if (self.fused) |fused| {
                     // NZCV holds the writer's answer: branch on it, and pay
                     // for the x86 flags only on the edges that still owe
@@ -4616,7 +4703,11 @@ const Compiler = struct {
                 try self.loadFlags(t3);
                 try self.emitCondition(t4, t3, d.cond);
                 const taken = try self.exitStub(index + 1, target);
-                try self.a.branchIfNonZero(.w32, t4, taken);
+                if (retry_yield) {
+                    try atomic_retry.emitTakenRetryHint(self, t4, taken, a64.yieldHint());
+                } else {
+                    try self.a.branchIfNonZero(.w32, t4, taken);
+                }
                 // The not-taken edge is the next instruction. When the trace
                 // continues across this branch that is simply the next thing
                 // emitted, so only a branch that ends the block needs a stub
@@ -4690,7 +4781,7 @@ const Compiler = struct {
                     try self.loadReg(0, d.dst_reg, false, .bits64);
                 }
                 try self.a.branchIfZero(.x64, 0, slow);
-                try self.emitHookedTargetCheck(0, slow);
+                try self.emitHookedTargetCheck(0, slow, if (is_call) next_rip else null);
                 if (is_call) {
                     try self.emitChecked(a64.strImm(.doubleword, 0, r_scratch, scratch_transfer_target_offset));
                     // push(next_rip), exactly as the `call_rel32` template does.
@@ -7498,6 +7589,15 @@ pub const Options = struct {
     internal_edges: bool = true,
     resident_self_loops: bool = true,
     resident_vectors: bool = true,
+    /// Set false only for differential tests of the pre-specialization
+    /// PAUSE bridge. Production's PAUSE helper is register preserving.
+    pause_helper_preserves_state: bool = true,
+    /// Test-only differential switch for the pinned Xbox lock transfer
+    /// observer. Production keeps this enabled.
+    xbox_critical_section_transfer_enabled: bool = true,
+    /// Yield only on a backward JNZ immediately following LOCK CMPXCHG.
+    /// False is reserved for differential translation tests.
+    atomic_retry_yield_enabled: bool = true,
 };
 
 /// Whether `op` transfers into or back out of a function.
@@ -7718,6 +7818,9 @@ fn emitBlock(
         .ledger = options.ledger,
         .exact_exit_flags = options.exact_exit_flags,
         .resident_vectors = options.resident_vectors,
+        .pause_helper_preserves_state = options.pause_helper_preserves_state,
+        .xbox_critical_section_transfer_enabled = options.xbox_critical_section_transfer_enabled,
+        .atomic_retry_yield_enabled = options.atomic_retry_yield_enabled,
         .epilogue = try assembler.createLabel(),
         .exit_path = try assembler.createLabel(),
         .epilogue_path = try assembler.createLabel(),

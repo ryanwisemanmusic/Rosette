@@ -2514,12 +2514,14 @@ test "a worker's PAUSE ends its slice; the owner's does not" {
     try testing.expect(state.windows_guest_slice_yield_requested);
     try testing.expectEqual(@as(u64, 1), state.windows_guest_pause_yields);
     try testing.expectEqual(@as(u64, 1), parallel_metrics.load(u64, &state.windows_guest_threads[3].pause_hints));
+    try testing.expectEqual(@as(u64, 1), state.windows_guest_threads[3].pause_hints_local);
 
     state.parallel_guest_execution = true;
     state.windows_guest_slice_yield_requested = false;
     state.noteWindowsGuestPause();
     try testing.expectEqual(@as(u64, 1), state.windows_guest_pause_yields);
-    try testing.expectEqual(@as(u64, 2), parallel_metrics.load(u64, &state.windows_guest_threads[3].pause_hints));
+    try testing.expectEqual(@as(u64, 1), parallel_metrics.load(u64, &state.windows_guest_threads[3].pause_hints));
+    try testing.expectEqual(@as(u64, 2), state.windows_guest_threads[3].pause_hints_local);
     try testing.expect(!state.windows_guest_slice_yield_requested);
     for (0..255) |_| state.noteWindowsGuestPause();
     try testing.expect(state.windows_guest_slice_yield_requested);
@@ -2587,11 +2589,13 @@ test "parallel PAUSE batches preserve hint counts, flags, and the exact yield bo
     try testing.expect(state.step());
     try testing.expectEqual(@as(u32, 7), state.step_retired);
     try testing.expectEqual(rip + 16, state.regs.rip);
-    try testing.expectEqual(@as(u64, 8), state.windows_guest_threads[3].pause_hints);
+    try testing.expectEqual(@as(u64, 8), state.windows_guest_threads[3].pause_hints_local);
+    try testing.expectEqual(@as(u64, 1), state.windows_guest_threads[3].pause_hints);
     try testing.expectEqual(@as(u64, 0xAD7), state.regs.rflags);
     try testing.expectEqual(rip + 14, state.last_instruction_rip);
     // A 256-hint boundary in the middle of a bundle must stop there.
     state.windows_guest_threads[3].pause_hints = 254;
+    state.windows_guest_threads[3].pause_hints_local = 254;
     state.regs.rip = rip;
     try testing.expect(state.step());
     try testing.expectEqual(@as(u32, 3), state.step_retired);
@@ -2622,7 +2626,7 @@ test "parallel PAUSE batches production benchmark (ROSETTE_VECTOR_BENCH=1)" {
         defer state.deinit();
         state.parallel_guest_execution = true;
         state.block_jit_enabled = false;
-        state.parallel_pause_batches_enabled = batched;
+        state.pause_options.scheduler_batches_enabled = batched;
         state.windows_active_guest_thread_slot = 3;
         const rip = MEM_BASE + 0x1A00;
         for (0..8) |i| {
@@ -2644,6 +2648,8 @@ test "parallel PAUSE batches production benchmark (ROSETTE_VECTOR_BENCH=1)" {
         }
         _ = std.c.clock_gettime(.MONOTONIC, &finished);
         const ns = (finished.sec - started.sec) * std.time.ns_per_s + finished.nsec - started.nsec;
+        try testing.expectEqual(retired, state.windows_guest_threads[3].pause_hints_local);
+        @import("../impl/lifecycle.zig").publishParallelPauseCounters(&state.windows_guest_threads[3]);
         try testing.expectEqual(retired, state.windows_guest_threads[3].pause_hints);
         std.debug.print("PAUSE BENCH: batched={} retired={d} dispatches={d} elapsed_us={d}\n", .{ batched, retired, dispatches, @divTrunc(ns, 1000) });
     }
@@ -2656,6 +2662,7 @@ test "parallel PAUSE batches retain single-instruction trace and clock boundarie
     state.parallel_guest_execution = true;
     state.windows_active_guest_thread_slot = 3;
     state.windows_guest_threads[3].pause_hints = 8;
+    state.windows_guest_threads[3].pause_hints_local = 8;
     const rip = MEM_BASE + 0x1A00;
     for (0..8) |i| {
         state.write8(rip + i * 2, 0xF3);

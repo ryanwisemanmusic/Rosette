@@ -743,18 +743,42 @@ pub fn requestWindowsGuestSliceYield(self: *ElfState) void {
     }
 }
 
+/// A PAUSE counter snapshot is useful at each real scheduling boundary:
+/// the first hint, then one out of every 256 hints. Keep this predicate
+/// shared by the note and test paths so the accounting never drifts from
+/// the scheduler cadence.
+pub fn pauseHintPublicationBoundary(hints: u64) bool {
+    return hints == 1 or hints == __process_std.math.maxInt(u64) or (hints != 0 and (hints - 1) % 256 == 0);
+}
+
+/// Publish worker-owned counters for observers and final reports. Call only
+/// on the owning worker, at its existing progress/exit boundaries.
+pub fn publishParallelPauseCounters(thread: *__process_WindowsGuestThread) void {
+    @atomicStore(u64, &thread.pause_hints, thread.pause_hints_local, .monotonic);
+    if (thread.parallel_block_jit) |jit| {
+        @atomicStore(u64, &jit.pause_helper_calls, jit.pause_helper_calls_local, .monotonic);
+    }
+}
+
 pub fn noteWindowsGuestPause(self: *ElfState) void {
     const slot = guestContextField(self, "windows_active_guest_thread_slot").* orelse return;
     var yield_host = true;
     var pause_batch: u64 = 1;
     if (self.parallel_guest_execution) {
-        // Only this guest thread's executor writes its PAUSE count; the
-        // reporting thread merely reads it atomically. Avoid a contended
-        // compare-exchange loop for every spin hint. One relaxed atomic
-        // RMW supplies both the exact count and the 256-hint scheduling
-        // cadence; the old load+store pair issued two atomics per PAUSE.
-        const counter = &self.windows_guest_threads[slot].pause_hints;
-        const hints = @atomicRmw(u64, counter, .Add, 1, .monotonic) +% 1;
+        // This guest worker exclusively owns the exact local count. The
+        // report-facing atomic is only a snapshot, refreshed at the same
+        // first/256-hint boundaries that already end a PAUSE slice.
+        const thread = &self.windows_guest_threads[slot];
+        const hints = if (self.pause_options.counter_batches_enabled) blk: {
+            thread.pause_hints_local +%= 1;
+            const total = thread.pause_hints_local;
+            if (pauseHintPublicationBoundary(total)) @atomicStore(u64, &thread.pause_hints, total, .monotonic);
+            break :blk total;
+        } else blk: {
+            const total = @atomicRmw(u64, &thread.pause_hints, .Add, 1, .monotonic) +% 1;
+            thread.pause_hints_local = total;
+            break :blk total;
+        };
         // Each guest worker already has a preemptible host thread. Halo 3
         // issued 369 million PAUSEs on RENDER in one gameplay run; a
         // pthread yield for every hint spent time in the host scheduler
@@ -764,7 +788,9 @@ pub fn noteWindowsGuestPause(self: *ElfState) void {
         yield_host = hints == __process_std.math.maxInt(u64) or (hints - 1) % 256 == 0;
         pause_batch = if (hints == 1) 1 else 256;
     } else {
-        self.windows_guest_threads[slot].pause_hints +|= 1;
+        const thread = &self.windows_guest_threads[slot];
+        thread.pause_hints +|= 1;
+        thread.pause_hints_local = thread.pause_hints;
         self.windows_guest_pause_yields +|= 1;
     }
     if (yield_host) {
@@ -801,7 +827,7 @@ pub fn noteWindowsGuestPause(self: *ElfState) void {
 }
 
 pub fn retireParallelPauseTail(self: *ElfState) void {
-    if (!self.parallel_guest_execution or !self.parallel_pause_batches_enabled or process_impl_block_jit.blockJitTracingActive(self) or
+    if (!self.parallel_guest_execution or !self.pause_options.scheduler_batches_enabled or process_impl_block_jit.blockJitTracingActive(self) or
         self.guest_clock.source == .retired_instructions) return;
     const slot = guestContextField(self, "windows_active_guest_thread_slot").* orelse return;
     if (slot >= self.windows_guest_threads.len) return;

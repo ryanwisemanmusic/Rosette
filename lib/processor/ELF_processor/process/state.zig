@@ -420,7 +420,7 @@ pub const ElfState = struct {
     block_jit_tlb_active: ?*block_jit.Tlb = null,
     block_jit_tlb_enabled: bool = true,
     block_jit_streaming_stores_enabled: bool = true,
-    parallel_pause_batches_enabled: bool = true,
+    pause_options: __ProcessInternals._PauseOptions = .{},
     parallel_pause_batched_instructions: std.atomic.Value(u64) = .init(0),
     /// Whether guest threads run on their own host threads (see
     /// `parallelDirectTlbActive` for how their translated code reaches
@@ -2049,7 +2049,7 @@ pub const ElfState = struct {
         state.block_jit_enabled = !envPresentAndFalse("ROSETTE_X64_BLOCK_JIT");
         state.block_jit_tlb_enabled = !envPresentAndFalse("ROSETTE_X64_BLOCK_JIT_TLB");
         state.block_jit_streaming_stores_enabled = !envPresentAndFalse("ROSETTE_X64_STREAMING_STORES");
-        state.parallel_pause_batches_enabled = !envPresentAndFalse("ROSETTE_PE64_PAUSE_BATCHES");
+        state.pause_options.configureFromEnvironment(envPresentAndFalse);
         @import("impl/register_import.zig").configure(&state, envPresentAndFalse);
         state.windows_srw_stack_capture_all = envEquals("ROSETTE_SRW_STACK_CAPTURE", "all");
         state.windows_srw_import_lane = !envPresentAndFalse("ROSETTE_SRW_IMPORT_LANE");

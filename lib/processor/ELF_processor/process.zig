@@ -2743,6 +2743,10 @@ const WindowsGuestThread = struct {
     /// This is per-thread because the process-wide serial counter is not
     /// updated by parallel executors.
     pause_hints: u64 = 0,
+    /// Exact owner-only PAUSE total. The atomic `pause_hints` snapshot is
+    /// published at scheduling/progress boundaries, avoiding a shared RMW
+    /// on every spin hint while keeping final diagnostics exact.
+    pause_hints_local: u64 = 0,
     /// Host yield requests caused by PAUSE, counted at the parallel worker
     /// boundary where the per-thread slice flag is consumed.
     pause_host_yields: u64 = 0,
@@ -4193,6 +4197,10 @@ const BlockJitState = struct {
     /// RMode), harvested from the scratch record after every entry.
     fpcr_writes: u64 = 0,
     pause_helper_calls: u64 = 0,
+    /// Owner-only total mirrored to `pause_helper_calls` at existing worker
+    /// publication boundaries; the diagnostic counter is not a hot-path
+    /// synchronization primitive.
+    pause_helper_calls_local: u64 = 0,
     register_import_tail_calls: u64 = 0,
     tlb_fill_refusals: u64 = 0,
     tlb_refusal_stats: tlb_diagnostics.RefusalStats = .{},
@@ -4872,6 +4880,7 @@ const process_impl_kernel_services = @import("process/impl/kernel_services.zig")
 const process_impl_guest_heap = @import("process/impl/guest_heap.zig");
 const process_impl_instruction_decode = @import("process/impl/instruction_decode.zig");
 const process_impl_block_jit = @import("process/impl/block_jit.zig");
+const process_impl_xbox_critical_section_transfer = @import("process/impl/xbox_critical_section_transfer.zig");
 const process_impl_run_reporting = @import("process/impl/run_reporting.zig");
 const process_impl_windows_audio = @import("process/impl/windows_audio.zig");
 const process_impl_execution = @import("process/impl/execution.zig");
@@ -4882,6 +4891,7 @@ const GuestMilestoneActivity = struct { hits: u64, last_step: u64, armed: bool }
 
 /// Narrow bridge for the split process implementation modules.
 pub const __ProcessInternals = struct {
+    pub const _PauseOptions = @import("process/pause_options.zig").Options;
     pub const _AUDIO_STAGE_COUNT = AUDIO_STAGE_COUNT;
     pub const _BLOCK_JIT_CHAIN_BLOCKS = BLOCK_JIT_CHAIN_BLOCKS;
     pub const _BLOCK_JIT_CHAIN_INSTRUCTIONS = BLOCK_JIT_CHAIN_INSTRUCTIONS;
@@ -5094,6 +5104,7 @@ pub const __ProcessInternals = struct {
     pub const _XeniaGlobalLend = XeniaGlobalLend;
     pub const _blockJitFlags = blockJitFlags;
     pub const _blockJitHookedTransfer = blockJitHookedTransfer;
+    pub const _blockJitXboxCriticalSectionTransfer = process_impl_xbox_critical_section_transfer.observe;
     pub const _blockJitImportTransfer = blockJitImportTransfer;
     pub const _blockJitInterpret = blockJitInterpret;
     pub const _blockJitMappedTransferAllowed = blockJitMappedTransferAllowed;

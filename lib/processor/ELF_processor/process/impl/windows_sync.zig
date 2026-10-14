@@ -3862,6 +3862,9 @@ pub fn finishWindowsGuestThread(self: *ElfState) void {
     // guard's protection goes through the address-space lock itself).
     var completion_guard = process_impl_lifecycle.lockGuestRuntimeMutationIfParallel(self);
     defer if (completion_guard) |*guard| guard.unlock();
+    if (self.parallel_guest_execution) {
+        process_impl_lifecycle.publishParallelPauseCounters(&self.windows_guest_threads[index]);
+    }
     // Thread termination is a release boundary: a successful join or
     // wait on this handle must not complete ahead of stores the worker
     // performed before returning. Those are this thread's own stores, in
@@ -4444,6 +4447,7 @@ pub fn parallelWorkerWatchName(self: *const ElfState, slot: usize, buffer: []u8)
 }
 
 pub fn publishParallelWorkerSteps(self: *ElfState, thread: *__process_WindowsGuestThread, pending: *u64) void {
+    process_impl_lifecycle.publishParallelPauseCounters(thread);
     if (pending.* == 0) return;
     // Each worker is the sole writer of its own progress counter. Publish it
     // with the shared totals so diagnostics still see exact counts at every

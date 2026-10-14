@@ -3845,27 +3845,31 @@ pub fn reportGuestLockContention(self: *const ElfState) void {
     var xbox_armed: usize = 0;
     var xbox_handled: u64 = 0;
     var xbox_fallbacks: u64 = 0;
+    var xbox_jit_direct: u64 = 0;
     inline for (@typeInfo(__process_xbox_critical_section.Export).@"enum".fields) |field| {
         const api: __process_xbox_critical_section.Export = @enumFromInt(field.value);
         const index = @intFromEnum(api);
         if (self.xbox_critical_section_hooks.addresses[index] != 0) xbox_armed += 1;
         xbox_handled +|= self.xbox_critical_section_hooks.calls[index];
         xbox_fallbacks +|= self.xbox_critical_section_hooks.fallbacks[index];
+        xbox_jit_direct +|= self.xbox_critical_section_hooks.jit_direct_calls[index];
         if (self.xbox_critical_section_hooks.addresses[index] != 0) {
-            __process_log.info("PE64 XBOX CRITICAL SECTION BRIDGE: export={s} trampoline=0x{x} handled={d} native_fallbacks={d}", .{
+            __process_log.info("PE64 XBOX CRITICAL SECTION BRIDGE: export={s} trampoline=0x{x} handled={d} native_fallbacks={d} jit_direct_observations={d}", .{
                 api.name(),
                 self.xbox_critical_section_hooks.addresses[index],
                 self.xbox_critical_section_hooks.calls[index],
                 self.xbox_critical_section_hooks.fallbacks[index],
+                self.xbox_critical_section_hooks.jit_direct_calls[index],
             });
         }
     }
     const xbox = &self.xbox_critical_section_stats;
     const read = __process_xbox_critical_section.Stats.read;
-    __process_log.info("PE64 XBOX CRITICAL SECTION BRIDGE: armed={d}/5 handled={d} native_fallbacks={d} initialized={d} enters(acquired/recursed/counted)={d}/{d}/{d} waits(parked/granted/signalled/consumed)={d}/{d}/{d}/{d} try_failures={d} leave_mismatches={d} null_sections={d} synthetic_owners={d}; Xenia's lock protocol on the guest structure, decoded from each call's PPCContext (section=r3, result=r3): uncontended calls take no lock, a counted waiter parks in the scheduler, and a release hands the section to the longest parked waiter or leaves the embedded event set for one that has not parked yet", .{
+    __process_log.info("PE64 XBOX CRITICAL SECTION BRIDGE: armed={d}/5 handled={d} native_fallbacks={d} jit_direct_observations={d} initialized={d} enters(acquired/recursed/counted)={d}/{d}/{d} waits(parked/granted/signalled/consumed)={d}/{d}/{d}/{d} try_failures={d} leave_mismatches={d} null_sections={d} synthetic_owners={d}; Xenia's lock protocol on the guest structure, decoded from each call's PPCContext (section=r3, result=r3): uncontended calls take no lock, a counted waiter parks in the scheduler, and a release hands the section to the longest parked waiter or leaves the embedded event set for one that has not parked yet", .{
         xbox_armed,
         xbox_handled,
         xbox_fallbacks,
+        xbox_jit_direct,
         read(&xbox.initializations),
         read(&xbox.acquired),
         read(&xbox.recursed),

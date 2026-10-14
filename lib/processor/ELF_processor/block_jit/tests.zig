@@ -252,6 +252,10 @@ pub const TestState = struct {
     mapped_transfer_allowed: bool = false,
     mapped_transfer_calls: u32 = 0,
     hooked_transfer_calls: u32 = 0,
+    xbox_transfer_allowed: bool = false,
+    xbox_transfer_calls: u32 = 0,
+    xbox_transfer_target: u64 = 0,
+    xbox_transfer_return_rip: u64 = 0,
     exact_hook_targets: [8]u64 = @splat(0),
     exact_hook_target_count: u8 = 0,
     /// Whether the import-lane stand-in answers an import slot, and what it
@@ -386,6 +390,14 @@ pub const TestState = struct {
         return 0;
     }
 
+    fn xboxCriticalSectionTransfer(state_ptr: *anyopaque, target: u64, return_rip: u64) callconv(.c) u32 {
+        const state: *TestState = @ptrCast(@alignCast(state_ptr));
+        state.xbox_transfer_calls += 1;
+        state.xbox_transfer_target = target;
+        state.xbox_transfer_return_rip = return_rip;
+        return @intFromBool(state.xbox_transfer_allowed);
+    }
+
     fn x87RawTransfer(state_ptr: *anyopaque, block: *const Block, index: u32) callconv(.c) u32 {
         const state: *TestState = @ptrCast(@alignCast(state_ptr));
         state.x87_fast_helpers += 1;
@@ -436,7 +448,7 @@ pub const TestState = struct {
     }
 
     /// Admit the whole test memory (guest page 0) to the TLB.
-    fn admitMemory(self: *TestState, reads: bool, writes: bool) void {
+    pub fn admitMemory(self: *TestState, reads: bool, writes: bool) void {
         if (reads) self.tlb.fill(false, 0, &self.memory);
         if (writes) self.tlb.fill(true, 0, &self.memory);
     }
@@ -499,6 +511,7 @@ pub const TestHarness = struct {
             .write128_non_temporal = TestState.write128NonTemporal,
             .mapped_transfer = TestState.mappedTransfer,
             .hooked_transfer = TestState.hookedTransfer,
+            .xbox_critical_section_transfer = TestState.xboxCriticalSectionTransfer,
             .import_transfer = TestState.importTransfer,
             .x87_raw_transfer = TestState.x87RawTransfer,
             .x87_memory = TestState.x87Memory,
@@ -4435,26 +4448,6 @@ test "indirect transfers outside the image and hooked image targets use the inte
         try testing.expectEqual(@as(u32, 0), state.interprets);
         try testing.expectEqual(@as(u64, 0x1_4000_2000), state.regs.rip);
         try testing.expectEqual(stack - 8, state.regs.rsp);
-    }
-    // Permanently pinned Xbox critical-section hooks take the inline exact
-    // precheck. They still reach the interpreter-owned bridge, but avoid a
-    // second host helper call solely to re-prove a Bloom-positive target.
-    {
-        var state = TestState{};
-        state.admitMemory(true, true);
-        state.regs.rsp = stack;
-        state.regs.rbx = 0x1_4000_2000;
-        state.image_low = 0x1_4000_0000;
-        state.image_high = 0x1_5000_0000;
-        state.image_targets_hooked = 0;
-        state.xbox_critical_section_enter = 0x1_4000_2000;
-        hookFilterAdd(&state.hook_filter, 0x1_4000_2000);
-        h.insns.clearRetainingCapacity();
-        try h.add(0xC000, 2, .{ .op = .call_reg64, .dst_reg = .bl_bx_ebx_rbx });
-        _ = try h.run(&state);
-        try testing.expectEqual(@as(u32, 1), state.interprets);
-        try testing.expectEqual(@as(u32, 0), state.hooked_transfer_calls);
-        try testing.expectEqual(stack, state.regs.rsp);
     }
     // call [rbx + 0x20]: IAT operands and external function pointers both
     // reach the interpreter, which owns the import and mapped-code routes.

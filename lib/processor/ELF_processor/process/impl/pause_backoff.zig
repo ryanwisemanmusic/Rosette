@@ -48,6 +48,14 @@ pub const Route = struct {
     /// Exact private architectural bytes, not a hash. Productive FP/vector
     /// loops cannot qualify merely because their integer registers match.
     pub fn observeVectors(self: *Route, context: anytype) bool {
+        return self.observeVectorsImpl(context, false);
+    }
+
+    /// The old always-copy form remains available only to this module's
+    /// differential microbenchmark. Keeping one implementation for both
+    /// modes ensures the comparison and architectural field list cannot
+    /// drift apart.
+    fn observeVectorsImpl(self: *Route, context: anytype, comptime always_copy: bool) bool {
         comptime {
             var needed: usize = 0;
             for (.{ "xmm", "ymm_hi", "zmm_hi", "k", "x87_stack", "x87_tags", "x87_top", "x87_status", "x87_control" }) |name| {
@@ -61,8 +69,15 @@ pub const Route = struct {
             if (@hasField(@TypeOf(context.*), name)) {
                 const bytes = std.mem.asBytes(&@field(context.*, name));
                 const target = self.vector_state[offset..][0..bytes.len];
-                same = same and std.mem.eql(u8, bytes, target);
-                @memcpy(target, bytes);
+                const equal = std.mem.eql(u8, bytes, target);
+                same = same and equal;
+                // The equality check is still exact; avoid writing the same
+                // architectural bytes into the private snapshot again.
+                if (comptime always_copy) {
+                    @memcpy(target, bytes);
+                } else if (!self.vector_valid or !equal) {
+                    @memcpy(target, bytes);
+                }
                 offset += bytes.len;
             }
         }
@@ -141,6 +156,59 @@ test "PAUSE backoff exact vectors and x87 snapshots see productive floating stat
         bytes[bytes.len - 1] ^= 1;
         try std.testing.expect(!route.observeVectors(&context));
         try std.testing.expect(route.observeVectors(&context));
+    }
+}
+
+test "PAUSE vector snapshot exact-copy differential benchmark (ROSETTE_PAUSE_VECTOR_SNAPSHOT_BENCH=1)" {
+    if (std.c.getenv("ROSETTE_PAUSE_VECTOR_SNAPSHOT_BENCH") == null) return error.SkipZigTest;
+    const Context = struct {
+        xmm: [32][16]u8 = @splat(@splat(0x31)),
+        ymm_hi: [32][16]u8 = @splat(@splat(0x42)),
+        zmm_hi: [32][32]u8 = @splat(@splat(0x53)),
+        k: [8]u64 = @splat(0x6464646464646464),
+        x87_stack: [8][10]u8 = @splat(@splat(0x75)),
+        x87_tags: [8]bool = @splat(true),
+        x87_top: u3 = 3,
+        x87_status: u16 = 0x1234,
+        x87_control: u16 = 0x5678,
+    };
+    const iterations = 50_000;
+    const snapshot_bytes = @sizeOf(@FieldType(Context, "xmm")) + @sizeOf(@FieldType(Context, "ymm_hi")) +
+        @sizeOf(@FieldType(Context, "zmm_hi")) + @sizeOf(@FieldType(Context, "k")) +
+        @sizeOf(@FieldType(Context, "x87_stack")) + @sizeOf(@FieldType(Context, "x87_tags")) +
+        @sizeOf(@FieldType(Context, "x87_top")) + @sizeOf(@FieldType(Context, "x87_status")) +
+        @sizeOf(@FieldType(Context, "x87_control"));
+    var context: Context = .{};
+    for (0..7) |pair| {
+        for (0..2) |order| {
+            const legacy = (pair + order) % 2 == 0;
+            var route: Route = .{};
+            if (legacy) {
+                _ = route.observeVectorsImpl(&context, true);
+            } else {
+                _ = route.observeVectorsImpl(&context, false);
+            }
+            const start = clock.monotonicNanoseconds();
+            var equal_count: u32 = 0;
+            if (legacy) {
+                for (0..iterations) |_| {
+                    equal_count += @intFromBool(route.observeVectorsImpl(&context, true));
+                }
+            } else {
+                for (0..iterations) |_| {
+                    equal_count += @intFromBool(route.observeVectorsImpl(&context, false));
+                }
+            }
+            const elapsed = clock.monotonicNanoseconds() -| start;
+            try std.testing.expectEqual(iterations, equal_count);
+            std.debug.print("pause_vector_snapshot pair={d} always_copy={} exact_equal=true iterations={d} bytes_per_snapshot={d} elapsed_ns={d}\n", .{
+                pair,
+                legacy,
+                iterations,
+                snapshot_bytes,
+                elapsed,
+            });
+        }
     }
 }
 

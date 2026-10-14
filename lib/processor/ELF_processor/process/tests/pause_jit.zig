@@ -2,11 +2,22 @@
 //! instruction bytes, with the block translator enabled in both variants.
 const process = @import("../../process.zig");
 const I = process.__ProcessInternals;
+const life = @import("../impl/lifecycle.zig");
 const std = I._std;
 const t = std.testing;
 const base = I._MEM_BASE;
 const code = base + 0x1000;
 const ElfState = process.ElfState;
+const register_preservation_program = [_]u8{
+    0xF3, 0x90, // PAUSE
+    0x48, 0xFF, 0xC3, 0x48, 0xFF, 0xC3, // inc rbx twice
+    0x49, 0xFF, 0xC4, 0x49, 0xFF, 0xC4, // inc r12 twice
+    0x49, 0xFF, 0xC5, 0x49, 0xFF, 0xC5, // inc r13 twice
+    0x49, 0xFF, 0xC6, 0x49, 0xFF, 0xC6, // inc r14 twice
+    0x49, 0xFF, 0xC0, 0x49, 0xFF, 0xC0, // inc r8 twice
+    0x49, 0xFF, 0xC1, 0x49, 0xFF, 0xC1, // inc r9 twice
+    0x48, 0xFF, 0xC9, 0x75, 0xD5, // dec rcx; loop
+};
 
 fn create(enabled: bool, bundle: usize) !*ElfState {
     const s = try t.allocator.create(ElfState);
@@ -39,6 +50,7 @@ fn destroy(s: *ElfState) void {
 fn seed(s: *ElfState, loops: u64, hints: u64) void {
     s.regs = .{ .rip = code, .rsp = base + 0x40000, .rcx = loops, .rbx = 0xDEADBEEF, .r12 = 0x12345678, .rflags = 0x246 };
     s.windows_guest_threads[3].pause_hints = hints;
+    s.windows_guest_threads[3].pause_hints_local = hints;
     s.windows_guest_slice_yield_requested = false;
     s.windows_slice_pause_yield = false;
 }
@@ -62,7 +74,39 @@ fn run(s: *ElfState, bundle: usize, loops: u64, host_yield: bool) !Result {
     try t.expectEqual(@as(u64, 0xDEADBEEF), s.regs.rbx);
     try t.expectEqual(@as(u64, 0x12345678), s.regs.r12);
     try t.expectEqual(base + 0x40000, s.regs.rsp);
+    // Mirror the real worker's exit/progress publication; keep it outside the
+    // measured interval above.
+    life.publishParallelPauseCounters(&s.windows_guest_threads[3]);
     return r;
+}
+
+fn runRegisterPreservationProgram(s: *ElfState, loops: u64, host_yield: bool) !Result {
+    var r: Result = .{};
+    const started = I._monotonicNanoseconds();
+    while (s.regs.rcx != 0 and r.steps < loops * 16 + 100) {
+        try t.expect(s.step());
+        r.retired += s.step_retired;
+        r.steps += 1;
+        if (s.windows_guest_slice_yield_requested) {
+            r.yields += 1;
+            if (host_yield) std.Thread.yield() catch {};
+        }
+        s.windows_guest_slice_yield_requested = false;
+        s.windows_slice_pause_yield = false;
+    }
+    try t.expectEqual(@as(u64, 0), s.regs.rcx);
+    r.elapsed_ns = I._monotonicNanoseconds() - started;
+    life.publishParallelPauseCounters(&s.windows_guest_threads[3]);
+    return r;
+}
+
+fn registerPreservationBlock(s: *ElfState) ?*I._block_jit.Block {
+    const jit = s.windows_guest_threads[3].parallel_block_jit orelse return null;
+    for (jit.blocks) |maybe_block| {
+        const block = maybe_block orelse continue;
+        if (block.start_rip == code) return block;
+    }
+    return null;
 }
 
 test "translated PAUSE keeps exact first and 256-hint yield boundaries and flags" {
@@ -77,12 +121,14 @@ test "translated PAUSE keeps exact first and 256-hint yield boundaries and flags
         const boundary: u64 = if (start >= std.math.maxInt(u64) - 2) std.math.maxInt(u64) else if (start == 0) 1 else ((start + 255) / 256) * 256 + 1;
         if (boundary - start <= 8) {
             try t.expectEqual(boundary, s.windows_guest_threads[3].pause_hints);
+            try t.expectEqual(boundary, s.windows_guest_threads[3].pause_hints_local);
             try t.expectEqual(code + (boundary - start) * 2, s.regs.rip);
             try t.expect(s.windows_guest_slice_yield_requested);
             try t.expectEqual(@as(u64, 0x246), s.regs.rflags);
             try t.expectEqual(s.regs.rip - 2, s.last_instruction_rip);
         } else {
-            try t.expectEqual(start + 8, s.windows_guest_threads[3].pause_hints);
+            try t.expectEqual(start + 8, s.windows_guest_threads[3].pause_hints_local);
+            try t.expectEqual(start, s.windows_guest_threads[3].pause_hints);
             try t.expect(!s.windows_guest_slice_yield_requested);
         }
         try t.expect(s.windows_guest_threads[3].parallel_block_jit.?.pause_helper_calls > 0);
@@ -166,6 +212,7 @@ test "translated PAUSE source revalidation sees a replaced hint and preserves sp
     fresh.windows_runtime_enabled = true;
     fresh.frame_cost.swaps = 1;
     fresh.windows_guest_threads[3].pause_hints = 256;
+    fresh.windows_guest_threads[3].pause_hints_local = 256;
     const spin = &fresh.windows_guest_threads[3].spin;
     spin.seen_swaps = 1;
     spin.seen_swaps_ns = I._monotonicNanoseconds() - 7_000_000_000;
@@ -219,6 +266,7 @@ test "translated PAUSE publishes the bound worker context and backoff excludes p
     I._windows_guest_execution_binding().* = .{ .owner = @ptrCast(s), .context = &context };
     defer I._windows_guest_execution_binding().* = old;
     s.windows_guest_threads[3].pause_hints = 256;
+    s.windows_guest_threads[3].pause_hints_local = 256;
     try t.expect(s.step());
     try t.expect(context.windows_guest_slice_yield_requested);
     try t.expectEqual(code + 2, context.regs.rip);
@@ -240,6 +288,97 @@ test "translated PAUSE publishes the bound worker context and backoff excludes p
     try t.expectEqual(@as(u8, 0x34), bytes[0]);
     s.diagnose_abi = true;
     try t.expect(!policy.canBackoff(s, false));
+}
+
+test "translated PAUSE cache reuse matches the conservative bridge with caller and callee saved GPRs" {
+    if (!I._block_jit.CodeMemory.available()) return error.SkipZigTest;
+    var expected_regs: ?I._ElfRegs = null;
+    var expected_code_words: ?usize = null;
+    for ([_]bool{ false, true }) |preserve_state| {
+        const s = try create(true, 1);
+        defer destroy(s);
+        s.pause_options.helper_preserves_state = preserve_state;
+        for (register_preservation_program, 0..) |byte, offset| s.write8(code + offset, byte);
+        s.configureWindowsExecutableRanges(&.{.{ .guest_base = code, .length = register_preservation_program.len }});
+        seed(s, 2048, 0);
+        s.regs.rbx = 10;
+        s.regs.r12 = 20;
+        s.regs.r13 = 30;
+        s.regs.r14 = 40;
+        s.regs.r8 = 50;
+        s.regs.r9 = 60;
+        const r = try runRegisterPreservationProgram(s, 2048, false);
+        try t.expectEqual(@as(u64, 4096), s.regs.rbx -% 10);
+        try t.expectEqual(@as(u64, 4096), s.regs.r12 -% 20);
+        try t.expectEqual(@as(u64, 4096), s.regs.r13 -% 30);
+        try t.expectEqual(@as(u64, 4096), s.regs.r14 -% 40);
+        try t.expectEqual(@as(u64, 4096), s.regs.r8 -% 50);
+        try t.expectEqual(@as(u64, 4096), s.regs.r9 -% 60);
+        try t.expectEqual(@as(u64, 2048), s.windows_guest_threads[3].pause_hints);
+        const block = registerPreservationBlock(s) orelse return error.TestUnexpectedResult;
+        try t.expect(s.windows_guest_threads[3].parallel_block_jit.?.cached_registers >= 5);
+        try t.expectEqual(@as(u64, (2048 + 255) / 256), r.yields);
+        if (expected_regs) |regs| {
+            try t.expectEqualDeep(regs, s.regs);
+            try t.expect(block.code.len < expected_code_words.?);
+        } else {
+            expected_regs = s.regs;
+            expected_code_words = block.code.len;
+        }
+    }
+}
+
+test "translated PAUSE cache preservation alternating benchmark (ROSETTE_PAUSE_CACHE_BENCH=1)" {
+    if (std.c.getenv("ROSETTE_PAUSE_CACHE_BENCH") == null) return error.SkipZigTest;
+    if (!I._block_jit.CodeMemory.available()) return error.SkipZigTest;
+    for (0..7) |pair| for ([_]bool{ false, true }) |host_yield| for (0..2) |order| {
+        const preserve_state = (pair + order) % 2 != 0;
+        const s = try create(true, 1);
+        defer destroy(s);
+        s.pause_options.helper_preserves_state = preserve_state;
+        for (register_preservation_program, 0..) |byte, offset| s.write8(code + offset, byte);
+        s.configureWindowsExecutableRanges(&.{.{ .guest_base = code, .length = register_preservation_program.len }});
+        seed(s, 2048, 0);
+        _ = try runRegisterPreservationProgram(s, 2048, false);
+        seed(s, 100000, 0);
+        const r = try runRegisterPreservationProgram(s, 100000, host_yield);
+        try t.expectEqual(@as(u64, 100000), s.windows_guest_threads[3].pause_hints);
+        try t.expectEqual(@as(u64, (100000 + 255) / 256), r.yields);
+        const block = registerPreservationBlock(s) orelse return error.TestUnexpectedResult;
+        std.debug.print("pause_cache_trace pair={d} host_yield={} preserve_state={} hints={d} retired={d} steps={d} yields={d} cached_total={d} code_words={d} elapsed_ns={d}\n", .{ pair, host_yield, preserve_state, s.windows_guest_threads[3].pause_hints, r.retired, r.steps, r.yields, s.windows_guest_threads[3].parallel_block_jit.?.cached_registers, block.code.len, r.elapsed_ns });
+    };
+}
+
+test "translated PAUSE diagnostic counter batching matches per-hint atomics (ROSETTE_PAUSE_COUNTER_BENCH=1)" {
+    if (std.c.getenv("ROSETTE_PAUSE_COUNTER_BENCH") == null) return error.SkipZigTest;
+    if (!I._block_jit.CodeMemory.available()) return error.SkipZigTest;
+    for (0..7) |pair| for ([_]bool{ false, true }) |host_yield| for (0..2) |order| {
+        const batched = (pair + order) % 2 != 0;
+        const s = try create(true, 8);
+        defer destroy(s);
+        s.pause_options.counter_batches_enabled = batched;
+        seed(s, 2048, 0);
+        _ = try run(s, 8, 2048, false);
+        const jit = s.windows_guest_threads[3].parallel_block_jit.?;
+        jit.pause_helper_calls = 0;
+        jit.pause_helper_calls_local = 0;
+        seed(s, 12500, 0);
+        const r = try run(s, 8, 12500, host_yield);
+        try t.expectEqual(@as(u64, 100000), s.windows_guest_threads[3].pause_hints_local);
+        try t.expectEqual(@as(u64, 100000), s.windows_guest_threads[3].pause_hints);
+        try t.expectEqual(@as(u64, 100000), s.windows_guest_threads[3].parallel_block_jit.?.pause_helper_calls);
+        try t.expectEqual(@as(u64, (100000 + 255) / 256), r.yields);
+        std.debug.print("pause_counter_trace pair={d} host_yield={} batched={} hints={d} helper_calls={d} retired={d} yields={d} elapsed_ns={d}\n", .{
+            pair,
+            host_yield,
+            batched,
+            s.windows_guest_threads[3].pause_hints,
+            s.windows_guest_threads[3].parallel_block_jit.?.pause_helper_calls,
+            r.retired,
+            r.yields,
+            r.elapsed_ns,
+        });
+    };
 }
 
 test "translated PAUSE admission follows bounded trace liveness without disabling diagnostics" {

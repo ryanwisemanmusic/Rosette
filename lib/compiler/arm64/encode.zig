@@ -1074,6 +1074,12 @@ pub fn nop() u32 {
     return 0xD503201F;
 }
 
+/// `yield`: an architectural HINT #1. It changes no architectural state and
+/// lets a host core give another runnable thread priority during a spin retry.
+pub fn yieldHint() u32 {
+    return 0xD503203F;
+}
+
 pub fn brk(imm16: u16) u32 {
     return 0xD4200000 | (@as(u32, imm16) << 5);
 }
@@ -1404,6 +1410,7 @@ test "branch and return forms match the assembler" {
     try testing.expectEqual(@as(u32, 0xd61f00e0), br(7));
     try testing.expectEqual(@as(u32, 0xd63f0100), blr(8));
     try testing.expectEqual(@as(u32, 0xd503201f), nop());
+    try testing.expectEqual(@as(u32, 0xd503203f), yieldHint());
 }
 
 test "logical immediates use the bitmask encoding" {
