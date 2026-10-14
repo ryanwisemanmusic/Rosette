@@ -177,6 +177,33 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const math_check = b.step("windows-math-check", "Check exact pure-math imports and translated IAT transfers offline");
     const math_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "fast math", "native vector extraction" } });
     math_check.dependOn(&b.addRunArtifact(math_test).step);
+    const yield_check = b.step("windows-yield-check", "Check zero-delay NT imports and bounded PAUSE scheduling offline");
+    const yield_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "NT zero-delay", "PAUSE", "parallel pause", "an NT delay", "NtDelayExecution", "back-off", "Sleep(0)", "worker yield backoff", "native shader compile", "frame cost" } });
+    yield_check.dependOn(&b.addRunArtifact(yield_test).step);
+    const worker_yield_mod = b.createModule(.{
+        .root_source_file = b.path("../lib/processor/ELF_processor/process/impl/worker_yield_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    worker_yield_mod.addImport("parallelism", parallelism_mod);
+    worker_yield_mod.addImport("concurrency", concurrency_mod);
+    const worker_yield_check = b.step("worker-yield-check", "Check and measure bounded explicit worker-yield backoff offline");
+    const worker_yield_test = b.addTest(.{ .root_module = worker_yield_mod });
+    worker_yield_check.dependOn(&b.addRunArtifact(worker_yield_test).step);
+    check_step.dependOn(&b.addRunArtifact(worker_yield_test).step);
+    const retirement_check = b.step("retirement-flush-check", "Check indexed FSI recycling and TLB invalidation filters without GPU work");
+    for ([_][]const u8{ "../lib/gpu/retirement_tests.zig", "../lib/processor/ELF_processor/block_jit/tlb_invalidation_tests.zig" }, 0..) |path, index| {
+        const module = b.createModule(.{ .root_source_file = b.path(path), .target = target, .optimize = optimize, .link_libc = true });
+        const run = b.addRunArtifact(b.addTest(.{ .root_module = module }));
+        const focused = b.step(if (index == 0) "recycling-check" else "tlb-flush-check", if (index == 0) "Check FSI continuation recycling and recording retirement offline" else "Check cross-executor TLB invalidation and fill costs offline");
+        focused.dependOn(&run.step);
+        retirement_check.dependOn(focused);
+        check_step.dependOn(&run.step);
+    }
+    const flush_cpu_check = b.step("flush-cpu-check", "Check native TLB probes, protection, alias lifetimes, write watch and parallel ordering");
+    const flush_cpu_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "TLB", "TLBs", "tlb", "mapped alias", "page protection", "parallel mapped", "ordered vector", "a spin watch", "native pipeline", "native shader compile" } });
+    flush_cpu_check.dependOn(&b.addRunArtifact(flush_cpu_test).step);
     const windows_bsearch_check = b.step("windows-bsearch-check", "Run the Windows CRT bsearch callback and import-routing regressions");
     const windows_bsearch_test = b.addTest(.{
         .root_module = elf_processor_test_mod,

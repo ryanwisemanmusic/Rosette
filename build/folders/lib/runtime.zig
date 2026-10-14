@@ -573,6 +573,11 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const fsi_dyld_test = b.addTest(.{ .root_module = dyld_mod, .filters = &.{ "FSI", "Fsi", "fsi", "presentation ceiling" } });
     fsi_check.dependOn(&b.addRunArtifact(fsi_gpu_test).step);
     fsi_check.dependOn(&b.addRunArtifact(fsi_dyld_test).step);
+    const evidence_io_mod = b.createModule(.{ .root_source_file = b.path("../lib/gpu/evidence_io_tests.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    const evidence_io_test = b.addTest(.{ .root_module = evidence_io_mod });
+    const evidence_io_run = b.addRunArtifact(evidence_io_test);
+    b.step("evidence-io-check", "Check bounded owned shader diagnostic I/O without GPU work").dependOn(&evidence_io_run.step);
+    check_step.dependOn(&evidence_io_run.step);
     const metal_live_check = b.step("metal-live-check", "Run native Metal live texture routing regression tests");
     const metal_live_gpu_test = b.addTest(.{ .root_module = gpu_mod, .filters = &.{"native Metal live texture"} });
     const metal_live_dyld_test = b.addTest(.{ .root_module = dyld_mod, .filters = &.{"native Metal live texture"} });
