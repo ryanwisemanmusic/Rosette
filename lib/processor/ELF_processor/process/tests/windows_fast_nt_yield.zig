@@ -27,6 +27,7 @@ fn seed(state: *ElfState) void {
     state.write64(state.regs.rsp, base + 0x1200);
     state.windows_last_error = 0xBEEF;
     state.windows_guest_slice_yield_requested = false;
+    state.windows_slice_nt_zero_yield = false;
 }
 
 test "NT zero-delay fast lane preserves the ordinary ABI and scheduler yield" {
@@ -46,6 +47,7 @@ test "NT zero-delay fast lane preserves the ordinary ABI and scheduler yield" {
         try testing.expectEqualDeep(expected, state.regs);
         try testing.expectEqual(last_error, state.windows_last_error);
         try testing.expectEqual(yielded, state.windows_guest_slice_yield_requested);
+        try testing.expect(state.windows_slice_nt_zero_yield);
         try testing.expectEqual(locks, state.windows_runtime_mutex.inner.stats.acquisitions.load(.monotonic));
         try testing.expectEqual(I._WindowsGuestThreadStatus.running, state.windows_guest_threads[3].status);
     }

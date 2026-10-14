@@ -4097,6 +4097,7 @@ pub fn serviceWindowsGuestThreads(self: *ElfState, max_steps: u64) u64 {
         context.windows_guest_slice_yield_requested = false;
         context.windows_guest_handoff_requested = false;
         context.windows_slice_pause_yield = false;
+        context.windows_slice_nt_zero_yield = false;
         // Stack/TEB/TLS setup used the owner's store queue. Publish it
         // before the worker can enter the guest context.
         self.guest_store_buffers.drainContext(null, .context_switch);
@@ -4153,6 +4154,7 @@ pub fn serviceWindowsGuestThreads(self: *ElfState, max_steps: u64) u64 {
     process_impl_lifecycle.guestContextField(self, "windows_guest_handoff_requested").* = false;
     process_impl_lifecycle.guestContextField(self, "windows_slice_clock_reads").* = 0;
     process_impl_lifecycle.guestContextField(self, "windows_slice_pause_yield").* = false;
+    process_impl_lifecycle.guestContextField(self, "windows_slice_nt_zero_yield").* = false;
     const slice_kernel_calls = self.windows_guest_threads[index].kernel_calls;
     var spin_probe_rip: u64 = 0;
     var spin_probe_state: u64 = 0;
@@ -4370,6 +4372,8 @@ pub fn runParallelWindowsGuestThread(self: *ElfState, slot: usize, worker: *__pr
     var tripwire: __process_parallel_diagnostics.register_tripwire.Tripwire = .{};
     var throughput_pulse: @import("worker_runtime_pulse.zig").Pulse = .{};
 
+    var idle_yield: @import("worker_yield.zig").Route = .{};
+    defer idle_yield.flush(&self.windows_idle_yield);
     var qos_generation: u32 = __process_std.math.maxInt(u32);
     while (!worker.shouldStop() and !self.parallel_guest_termination.load(.acquire)) {
         // The guest can rename this thread while it runs. QoS is host
@@ -4380,6 +4384,7 @@ pub fn runParallelWindowsGuestThread(self: *ElfState, slot: usize, worker: *__pr
             if (name_generation != qos_generation) {
                 qos_generation = name_generation;
                 process_impl_guest_diagnostics.applyParallelWorkerQos(self, thread);
+                idle_yield.setLabel(thread.nameText());
             }
         }
         switch (@atomicLoad(__process_WindowsGuestThreadStatus, &thread.status, .acquire)) {
@@ -4404,6 +4409,7 @@ pub fn runParallelWindowsGuestThread(self: *ElfState, slot: usize, worker: *__pr
         context.windows_guest_slice_yield_requested = false;
         context.windows_guest_handoff_requested = false;
         context.windows_slice_pause_yield = false;
+        context.windows_slice_nt_zero_yield = false;
         if (tripwire.check(context.regs.rip, context.regs.rsp)) |finding| {
             process_impl_block_jit.noteContextRace(self, thread.handle, slot, finding);
         }
@@ -4425,13 +4431,7 @@ pub fn runParallelWindowsGuestThread(self: *ElfState, slot: usize, worker: *__pr
         if (context.windows_guest_handoff_requested or context.windows_guest_slice_yield_requested or
             context.windows_slice_pause_yield)
         {
-            if (context.windows_slice_pause_yield) {
-                _ = __process_parallel_metrics.saturatingAdd(u64, &thread.pause_host_yields, 1);
-            }
-            context.windows_guest_handoff_requested = false;
-            context.windows_guest_slice_yield_requested = false;
-            context.windows_slice_pause_yield = false;
-            __process_std.Thread.yield() catch __process_std.atomic.spinLoopHint();
+            @import("worker_yield.zig").handle(self, thread, context, worker, &idle_yield, __process_parallel_metrics.load(u64, &thread.executed_steps) +| pending_steps);
         }
     }
 }

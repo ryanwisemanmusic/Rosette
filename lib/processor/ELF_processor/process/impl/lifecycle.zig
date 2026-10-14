@@ -307,9 +307,11 @@ pub fn tryWithWindowsRuntimeLockReleasedForVulkanQueueWait(self: *ElfState, cont
     return true;
 }
 
+pub const RuntimeReleasePurpose = enum { native_pipeline, native_shader_module, gpu_fence_wait, gpu_queue_wait };
+
 pub fn withWindowsRuntimeLockReleasedFor(
     self: *ElfState,
-    purpose: enum { native_pipeline, gpu_fence_wait, gpu_queue_wait },
+    purpose: RuntimeReleasePurpose,
     context: anytype,
     callback: anytype,
 ) @TypeOf(callback(context)) {
@@ -318,6 +320,7 @@ pub fn withWindowsRuntimeLockReleasedFor(
     if (__ProcessInternals._windows_runtime_locks().*.depth(owner) == 0) return callback(context);
     if (__ProcessInternals._windows_runtime_locks().*.pinnedDepth(owner) != 0) {
         switch (purpose) {
+            .native_shader_module => self.runtime_lock_native_shader_refusals +|= 1,
             .native_pipeline => self.runtime_lock_native_pipeline_yield_refusals +|= 1,
             .gpu_fence_wait => self.runtime_lock_gpu_fence_wait_yield_refusals +|= 1,
             .gpu_queue_wait => self.runtime_lock_gpu_queue_wait_yield_refusals +|= 1,
@@ -336,6 +339,10 @@ pub fn withWindowsRuntimeLockReleasedFor(
         const released = __process_concurrency.monotonicNanoseconds() -| started;
         __ProcessInternals._runtime_lock_released_ns().* +%= released;
         switch (purpose) {
+            .native_shader_module => {
+                self.runtime_lock_native_shader_yields +|= 1;
+                self.runtime_lock_native_shader_ns +|= released;
+            },
             .native_pipeline => {
                 self.runtime_lock_native_pipeline_yields +|= 1;
                 self.runtime_lock_native_pipeline_yield_ns +|= released;
@@ -481,6 +488,7 @@ pub fn captureWindowsGuestContext(self: *const ElfState) __process_WindowsGuestT
         .guest_clock_sample_steps = guestContextField(self, "guest_clock_sample_steps").*,
         .windows_guest_slice_yield_requested = guestContextField(self, "windows_guest_slice_yield_requested").*,
         .windows_slice_pause_yield = guestContextField(self, "windows_slice_pause_yield").*,
+        .windows_slice_nt_zero_yield = guestContextField(self, "windows_slice_nt_zero_yield").*,
         .windows_guest_handoff_requested = guestContextField(self, "windows_guest_handoff_requested").*,
         .windows_slice_clock_reads = guestContextField(self, "windows_slice_clock_reads").*,
         .active_guest_thread = guestContextField(self, "active_guest_thread").*,
@@ -527,6 +535,7 @@ pub fn restoreWindowsGuestContext(self: *ElfState, context: *const __process_Win
     guestContextField(self, "guest_clock_sample_steps").* = context.guest_clock_sample_steps;
     guestContextField(self, "windows_guest_slice_yield_requested").* = context.windows_guest_slice_yield_requested;
     guestContextField(self, "windows_slice_pause_yield").* = context.windows_slice_pause_yield;
+    guestContextField(self, "windows_slice_nt_zero_yield").* = context.windows_slice_nt_zero_yield;
     guestContextField(self, "windows_guest_handoff_requested").* = context.windows_guest_handoff_requested;
     guestContextField(self, "windows_slice_clock_reads").* = context.windows_slice_clock_reads;
     guestContextField(self, "active_guest_thread").* = context.active_guest_thread;

@@ -319,6 +319,7 @@ pub const ElfState = struct {
     /// took an equal turn every round - 101 million slice switches on
     /// 2026-09-21, most of them XThread001A and RENDER waiting on MAIN.
     windows_slice_pause_yield: bool = false,
+    windows_slice_nt_zero_yield: bool = false,
     windows_pause_spin_slices: u64 = 0,
     /// A worker signalled an object the owner is waiting on. The worker's
     /// slice ends at the next step, before any minimum-slice floor, so the
@@ -1088,6 +1089,7 @@ pub const ElfState = struct {
     windows_import_calls: u64 = 0,
     windows_fast_math: @import("impl/windows_fast_math.zig").Ledger = .{},
     windows_fast_nt_yield: @import("impl/windows_fast_nt_yield.zig").Ledger = .{},
+    windows_idle_yield: @import("impl/worker_yield.zig").Ledger = .{},
     /// A direct, pure time query can bypass the shared runtime lock in
     /// parallel execution. Keep its count separate and atomic so the lock's
     /// diagnostics remain honest and progress accounting still sees it.
@@ -1647,6 +1649,9 @@ pub const ElfState = struct {
     /// Windows runtime lock even though its complete create-info graph has
     /// already been copied into host-owned scratch. These counters record
     /// dispatch-only lock yields around those driver calls.
+    runtime_lock_native_shader_yields: u64 = 0,
+    runtime_lock_native_shader_ns: u64 = 0,
+    runtime_lock_native_shader_refusals: u64 = 0,
     runtime_lock_native_pipeline_yields: u64 = 0,
     runtime_lock_native_pipeline_yield_ns: u64 = 0,
     runtime_lock_native_pipeline_yield_refusals: u64 = 0,
@@ -2044,6 +2049,7 @@ pub const ElfState = struct {
         state.block_jit_tlb_enabled = !envPresentAndFalse("ROSETTE_X64_BLOCK_JIT_TLB");
         state.block_jit_streaming_stores_enabled = !envPresentAndFalse("ROSETTE_X64_STREAMING_STORES");
         state.parallel_pause_batches_enabled = !envPresentAndFalse("ROSETTE_PE64_PAUSE_BATCHES");
+        state.windows_idle_yield.enabled = !envPresentAndFalse("ROSETTE_PE64_IDLE_YIELD_BACKOFF");
         state.windows_srw_stack_capture_all = envEquals("ROSETTE_SRW_STACK_CAPTURE", "all");
         state.windows_srw_import_lane = !envPresentAndFalse("ROSETTE_SRW_IMPORT_LANE");
         state.parallel_direct_tlb = !envPresentAndFalse("ROSETTE_PE64_PARALLEL_TLB");
@@ -2242,9 +2248,9 @@ pub const ElfState = struct {
         return process_impl_lifecycle.tryWithWindowsRuntimeLockReleasedForVulkanQueueWait(self, context, callback);
     }
 
-    fn withWindowsRuntimeLockReleasedFor(
+    pub fn withWindowsRuntimeLockReleasedFor(
         self: *ElfState,
-        purpose: enum { native_pipeline, gpu_fence_wait, gpu_queue_wait },
+        purpose: process_impl_lifecycle.RuntimeReleasePurpose,
         context: anytype,
         callback: anytype,
     ) @TypeOf(callback(context)) {

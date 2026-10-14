@@ -174,6 +174,17 @@ pub const Worker = struct {
         return .timed_out;
     }
 
+    /// Host-only bounded idle backoff. Does not expire or count guest waits.
+    /// The epoch is captured before the preceding guest poll, so a racing
+    /// notification returns immediately. Unnotified memory polls retry at
+    /// the deadline; shutdown always notifies this event.
+    pub fn waitForHostBackoff(self: *Worker, observed: u32, deadline: u64) WaitOutcome {
+        const hub = self.wake_hub orelse return .stopping;
+        if (self.shouldStop()) return .stopping;
+        if (hub.worker_events[self.slot].waitChange(observed, deadline)) return .changed;
+        return if (self.shouldStop()) .stopping else .deadline_reached;
+    }
+
     /// The caller found its thread runnable after a `.timed_out` wait.
     pub fn noteLostWakeup(self: *Worker) void {
         if (self.wake_hub) |hub| _ = hub.lost_wakeups.fetchAdd(1, .monotonic);

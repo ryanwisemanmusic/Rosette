@@ -114,6 +114,7 @@ pub const InvalidationSnapshot = struct {
     explicit_flushes: u64,
     table_visits: u64,
     tag_slots_touched: u64,
+    membership_skipped_directions: u64,
 };
 
 /// Process-wide work estimates for cross-executor invalidations. They count
@@ -126,6 +127,7 @@ pub const InvalidationWork = struct {
     explicit_flushes: std.atomic.Value(u64) = .init(0),
     table_visits: std.atomic.Value(u64) = .init(0),
     tag_slots_touched: std.atomic.Value(u64) = .init(0),
+    membership_skipped_directions: std.atomic.Value(u64) = .init(0),
 
     pub fn noteRange(
         self: *InvalidationWork,
@@ -143,6 +145,15 @@ pub const InvalidationWork = struct {
         _ = self.tag_slots_touched.fetchAdd(slots_per_table * table_count, .monotonic);
     }
 
+    pub fn noteRangeMeasured(self: *InvalidationWork, pages: u64, table_count: u64, entries: u64, scan_limit: u64, slots: u64, skipped: u64) void {
+        _ = self.range_calls.fetchAdd(1, .monotonic);
+        _ = self.requested_pages.fetchAdd(pages, .monotonic);
+        _ = self.table_visits.fetchAdd(table_count, .monotonic);
+        if (pages >= @min(entries, scan_limit)) _ = self.wide_range_flushes.fetchAdd(1, .monotonic);
+        _ = self.tag_slots_touched.fetchAdd(slots, .monotonic);
+        _ = self.membership_skipped_directions.fetchAdd(skipped, .monotonic);
+    }
+
     pub fn noteFlush(self: *InvalidationWork, reads: bool, writes: bool, table_count: u64, entries: u64) void {
         _ = self.explicit_flushes.fetchAdd(1, .monotonic);
         _ = self.table_visits.fetchAdd(table_count, .monotonic);
@@ -158,6 +169,7 @@ pub const InvalidationWork = struct {
             .explicit_flushes = self.explicit_flushes.load(.monotonic),
             .table_visits = self.table_visits.load(.monotonic),
             .tag_slots_touched = self.tag_slots_touched.load(.monotonic),
+            .membership_skipped_directions = self.membership_skipped_directions.load(.monotonic),
         };
     }
 };
@@ -205,4 +217,13 @@ test "TLB invalidation work distinguishes page ranges from full-table flushes" {
     try std.testing.expectEqual(@as(u64, 1), snapshot.explicit_flushes);
     try std.testing.expectEqual(@as(u64, 12), snapshot.table_visits);
     try std.testing.expectEqual(@as(u64, 3 * 2 * 4 + 8192 * 2 * 4 + 8192 * 4), snapshot.tag_slots_touched);
+}
+
+test "TLB measured invalidation records actual directions without modeling skipped tag visits" {
+    var work: InvalidationWork = .{};
+    work.noteRangeMeasured(512, 40, 32768, 1024, 512, 79);
+    const snapshot = work.snapshot();
+    try std.testing.expectEqual(@as(u64, 40), snapshot.table_visits);
+    try std.testing.expectEqual(@as(u64, 512), snapshot.tag_slots_touched);
+    try std.testing.expectEqual(@as(u64, 79), snapshot.membership_skipped_directions);
 }

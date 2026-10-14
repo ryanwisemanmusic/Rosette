@@ -925,6 +925,8 @@ pub fn logGuestSchedulingHealth(self: *const ElfState) void {
     const worker_wakes = self.parallel_guest_wake_hub.workerNotificationCounts();
     __process_log.info("PE64 guest scheduling health: pause_hints(serial_global/thread_sum)={d}/{d} parallel_pause_host_yield_calls={d} serial_pause_spin_slices={d} targeted_worker_notify/wake={d}/{d}; targeted wake counters exclude the owner-only event", .{ self.windows_guest_pause_yields, thread_pause_hints, pause_host_yield_calls, self.windows_pause_spin_slices, worker_wakes.notifications, worker_wakes.wakes });
     @import("windows_mutex.zig").report(self);
+    self.windows_idle_yield.report();
+    @import("native_shader_stats.zig").report(self);
     __process_log.info("PE64 guest thread lifecycle: created={d} live={d} completed={d} failed={d} vacant={d} capacity={d}; completed is a normal one-shot exit, failed/refused is the missing-thread signal", .{
         threads_created,
         threads_live,

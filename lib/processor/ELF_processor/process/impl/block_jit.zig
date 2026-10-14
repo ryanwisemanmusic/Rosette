@@ -1256,24 +1256,7 @@ pub fn invalidateAllBlockJitTlbTables(self: *ElfState, base: u64, length: u64, r
         if (!self.parallel_direct_tlb) return;
         _ = self.block_jit_tlb_epoch.fetchAdd(1, .seq_cst);
         if (!(reads or writes)) return;
-        const owner_tlb = ownerBlockJitTlb(self);
-        owner_tlb.invalidateRangeOrderedTables(base, length, reads, writes);
-        var table_count: u64 = 1;
-        for (&self.windows_guest_thread_tlbs) |*tlb_slot| {
-            if (@atomicLoad(?*__process_block_jit.Tlb, tlb_slot, .acquire)) |tlb| {
-                if (tlb != owner_tlb) {
-                    tlb.invalidateRangeOrderedTables(base, length, reads, writes);
-                    table_count +|= 1;
-                }
-            }
-        }
-        const pages = if (length == 0) 0 else ((base +| (length - 1)) >> __process_block_jit.Tlb.page_shift) - (base >> __process_block_jit.Tlb.page_shift) + 1;
-        self.parallel_tlb_invalidation_work.noteRange(
-            pages,
-            table_count,
-            __process_block_jit.Tlb.entries,
-            __process_block_jit.Tlb.invalidate_scan_limit,
-        );
+        @import("tlb_invalidation.zig").range(self, ownerBlockJitTlb(self), base, length, reads, writes);
         _ = self.parallel_tlb_cross_invalidations.fetchAdd(1, .monotonic);
         return;
     }
@@ -2746,15 +2729,7 @@ pub fn reportParallelTlbInvalidationWork(self: *const ElfState) void {
         self.block_jit_streaming_stores_enabled,                   self.parallel_pause_batches_enabled,
         self.parallel_pause_batched_instructions.load(.monotonic),
     });
-    const work = self.parallel_tlb_invalidation_work.snapshot();
-    __process_log.info("PE64 BLOCK JIT TLB INVALIDATION WORK: range_calls={d} requested_pages={d} wide_range_flushes={d} explicit_flushes={d} table_visits={d} tag_slots_touched={d}; tag_slots counts the tags probed or written across executor tables and exposes broad invalidation fanout", .{
-        work.range_calls,
-        work.requested_pages,
-        work.wide_range_flushes,
-        work.explicit_flushes,
-        work.table_visits,
-        work.tag_slots_touched,
-    });
+    @import("tlb_invalidation.zig").report(self);
 }
 
 pub fn reportParallelWorkerFallbackOps(self: *ElfState) void {

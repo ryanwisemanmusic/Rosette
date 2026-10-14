@@ -2441,6 +2441,7 @@ const WindowsGuestThreadContext = struct {
     /// wait handoff from ending another guest thread's slice.
     windows_guest_slice_yield_requested: bool = false,
     windows_slice_pause_yield: bool = false,
+    windows_slice_nt_zero_yield: bool = false,
     windows_guest_handoff_requested: bool = false,
     windows_slice_clock_reads: u32 = 0,
     active_guest_thread: u64 = 0,
@@ -5604,6 +5605,7 @@ test {
     _ = @import("process/tests/vector_extract.zig");
     _ = @import("process/tests/windows_fast_math.zig");
     _ = @import("process/tests/windows_fast_nt_yield.zig");
+    _ = @import("process/tests/native_shader_compile.zig");
     _ = @import("process/tests/windows_mutex.zig");
     _ = @import("process/tests/windows_mutex_contract.zig");
     _ = @import("block_jit/tests.zig");

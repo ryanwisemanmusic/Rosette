@@ -5652,7 +5652,7 @@ pub fn noteFrameCostSwap(self: *ElfState, swap_step: u64) void {
     const profile_active = self.host_profile_started and __process_host_profile.active();
     const closed_host_epoch = if (profile_active) __process_host_profile.noteFrameBoundary() else 0;
     const cost = &self.frame_cost;
-    cost.swaps +|= 1;
+    @atomicStore(u64, &cost.swaps, @atomicLoad(u64, &cost.swaps, .monotonic) +| 1, .monotonic);
     self.spin_watch.retire();
     const audio_frames = process_impl_kernel_services.guestMilestoneHitsNamed(self, "_ZN2xe3apu11AudioSystem11SubmitFrameEyPf");
     if (cost.swaps == 1) {
