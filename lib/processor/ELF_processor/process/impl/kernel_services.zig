@@ -1807,30 +1807,7 @@ pub fn recoverMisalignedVulkanImportStub(
 }
 
 pub fn tryWindowsFastImportStub(self: *ElfState, stub_address: u64) bool {
-    // The weakest condition any fast import has; each one checks its
-    // own on top (`windows_runtime.tryWindowsFastFunction`).
-    if (!process_impl_lifecycle.windowsFastCrtImportMayBypassRuntimeLock(self)) return false;
-    const stub = process_impl_guest_heap.windowsImportStubAt(self, stub_address) orelse return false;
-    if (stub.is_dynamic) {
-        if (stub.iat_address != 0) return false;
-    } else {
-        if (stub.iat_address == 0 or process_impl_guest_memory.read64(self, stub.iat_address) != stub.address) return false;
-    }
-
-    const regs = process_impl_lifecycle.guestContextField(self, "regs");
-    const return_rip = process_impl_guest_memory.read64(self, regs.rsp);
-    if (return_rip == 0) return false;
-    if (!__process_x64_linux_runtime.tryWindowsFastFunction(
-        self,
-        stub.dll_name,
-        stub.function_name,
-        return_rip,
-    )) return false;
-    // `finish` takes the direct-return form here to avoid rereading the
-    // stack slot, so retire the return address exactly as the ordinary
-    // import-stub path's `pop` does.
-    regs.rsp +%= 8;
-    return true;
+    return @import("register_import.zig").tryStub(self, stub_address);
 }
 
 pub fn handleWindowsImportStub(self: *ElfState) bool {

@@ -4192,6 +4192,8 @@ const BlockJitState = struct {
     /// FPCR writes translated `ldmxcsr` made (loads that changed FZ or
     /// RMode), harvested from the scratch record after every entry.
     fpcr_writes: u64 = 0,
+    pause_helper_calls: u64 = 0,
+    register_import_tail_calls: u64 = 0,
     tlb_fill_refusals: u64 = 0,
     tlb_refusal_stats: tlb_diagnostics.RefusalStats = .{},
     tlb_refusal_cache: tlb_diagnostics.RefusalCache = .{},
@@ -4736,6 +4738,8 @@ fn blockJitRuntimeFallbackReason(insn: block_jit.Insn) block_jit.FallbackReason 
 
 fn blockJitInterpret(state_ptr: *anyopaque, block: *const block_jit.Block, index: u32) callconv(.c) u32 {
     const self: *ElfState = @ptrCast(@alignCast(state_ptr));
+    if (block.insns[index].parallel_pause) return @import("process/impl/pause_jit.zig").execute(self, block, index);
+    if (@import("process/impl/register_import.zig").tryExecute(self, &block.insns[index])) return 1;
     const insn = block.insns[index];
     const atomic_width = blockJitAtomicMemoryWidth(insn.decoded);
     const resolved_atomic_base = if (atomic_width != null) x64_decoder.resolveMemoryAddress(&self.guestContextField("regs").*, .{
@@ -5605,6 +5609,9 @@ test {
     _ = @import("process/tests/vector_extract.zig");
     _ = @import("process/tests/windows_fast_math.zig");
     _ = @import("process/tests/windows_fast_nt_yield.zig");
+    _ = @import("process/tests/pause_jit.zig");
+    _ = @import("process/tests/pause_workers.zig");
+    _ = @import("process/tests/register_import.zig");
     _ = @import("process/tests/native_shader_compile.zig");
     _ = @import("process/tests/windows_mutex.zig");
     _ = @import("process/tests/windows_mutex_contract.zig");

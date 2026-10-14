@@ -710,6 +710,12 @@ pub const Insn = struct {
     /// observing: native once the milestone's saturated flag is set, with its
     /// hit counter bumped in place; the interpreter's arm until then.
     milestone_gate: ?u16 = null,
+    /// Exact F3 90 admitted by the parallel runtime, using its scheduling
+    /// helper. Cooperative executors still end their block before PAUSE.
+    parallel_pause: bool = false,
+    /// A runtime import may consume this tail transfer. It has external
+    /// effects and cannot be replayed by the register-only verifier.
+    registered_import_tail: bool = false,
 };
 
 /// A block's entry: the state the helpers receive, the block's helper table,
@@ -4060,6 +4066,7 @@ const Compiler = struct {
 
     fn emitInsn(self: *Compiler, index: u32) Error!Emitted {
         const insn = self.insns[index];
+        if (insn.registered_import_tail) self.touches_memory = true;
         const d = insn.decoded;
         self.current = index;
         // Only these templates load all their inputs before producing v0,
@@ -4078,6 +4085,13 @@ const Compiler = struct {
             self.flags_narrowed += 1;
         }
         const effects = flagEffects(insn);
+        if (insn.parallel_pause) {
+            self.native_count += 1;
+            self.touches_memory = true; // the scheduling observer is external
+            self.pending_record = 0; // the helper settles the actual record
+            try self.emitInterpretCall(index);
+            return .native;
+        }
         if (insn.force_fallback or !isNative(d)) {
             // `blockJitInterpret` settles the record before the interpreter
             // runs, so nothing is emitted here - but the tracker has to know.
@@ -7571,7 +7585,7 @@ pub fn compileWith(allocator: std.mem.Allocator, memory: *CodeMemory, layout: La
     if (insns.len == 0) return Error.NothingToCompile;
     var native: u32 = 0;
     for (insns) |insn| {
-        if (!insn.force_fallback and isNative(insn.decoded)) native += 1;
+        if (!insn.force_fallback and (isNative(insn.decoded) or insn.parallel_pause)) native += 1;
     }
     if (native == 0) return Error.NothingToCompile;
 

@@ -1,8 +1,9 @@
-//! Bounded, cancellable host backoff for repeated explicit zero-delay yields
-//! from noncritical title workers. Runs after the guest execution lease ends.
+//! Bounded, cancellable backoff for repeated NT yields and quiet PAUSE loops.
+//! NT role restrictions remain separate. Runs after the execution lease ends.
 //! Never changes guest wait status, deadlines, clock or synchronization tables.
 const std = @import("std");
 const clock = @import("concurrency");
+const pause = @import("pause_backoff.zig");
 
 pub const Config = struct {
     warm_yields: u32 = 16,
@@ -23,11 +24,19 @@ pub const Counters = struct {
 };
 pub const Ledger = struct {
     enabled: bool = true,
+    pause_translated_enabled: bool = true,
+    pause: pause.Ledger = .{},
     values: [7]std.atomic.Value(u64) = @splat(.init(0)),
+    pub fn configure(self: *Ledger, envFalse: *const fn ([:0]const u8) bool) void {
+        self.enabled = !envFalse("ROSETTE_PE64_IDLE_YIELD_BACKOFF");
+        self.pause.enabled = !envFalse("ROSETTE_PE64_PAUSE_BACKOFF");
+        self.pause_translated_enabled = !envFalse("ROSETTE_PE64_TRANSLATED_PAUSE");
+    }
     pub fn add(self: *Ledger, c: Counters) void {
         inline for (std.meta.fields(Counters), 0..) |f, i| _ = self.values[i].fetchAdd(@field(c, f.name), .monotonic);
     }
     pub fn report(self: *const Ledger) void {
+        self.pause.report();
         if (self.values[0].load(.acquire) == 0) return;
         std.log.info("PE64 WORKER YIELD BACKOFF: enabled={} explicit={d} excluded={d} progress_resets={d} parks={d} host_wait_ms={d} notified={d} stopped={d} requested_max_us=500; explicit registered zero-delay yields only; noncritical title workers; guest wait status and clocks unchanged; wait duration includes host scheduling", .{ self.enabled, self.values[0].load(.acquire), self.values[1].load(.acquire), self.values[2].load(.acquire), self.values[3].load(.acquire), self.values[4].load(.acquire) / std.time.ns_per_ms, self.values[5].load(.acquire), self.values[6].load(.acquire) });
     }
@@ -46,11 +55,13 @@ pub const Route = struct {
     consecutive: u32 = 0,
     earned_wait_ns: u64 = 0,
     counters: Counters = .{},
+    pause_route: pause.Route = .{},
 
     pub fn setLabel(self: *Route, name: []const u8) void {
-        // MAIN_THREAD, RENDER, GPU, input, timer and audio service workers
-        // retain ordinary yielding. Generic Xbox title workers are eligible.
+        // For NT yields only: MAIN_THREAD, RENDER, GPU, input, timer and
+        // audio service workers retain ordinary yielding.
         self.eligible_role = std.mem.startsWith(u8, name, "XThread");
+        self.pause_route.reset();
         self.reset();
     }
     pub fn reset(self: *Route) void {
@@ -107,19 +118,44 @@ pub const Route = struct {
         self.last_ns = end;
     }
     pub fn flush(self: *Route, ledger: *Ledger) void {
+        self.pause_route.flush(&ledger.pause);
         ledger.add(self.counters);
         self.counters = .{};
     }
 };
 
-pub fn handle(state: anytype, thread: anytype, context: anytype, worker: anytype, route: *Route, retired: u64) void {
+pub fn handle(state: anytype, thread: anytype, context: anytype, worker: anytype, route: *Route, retired: u64, pause_allowed: bool) void {
     if (context.windows_slice_pause_yield) _ = @import("parallelism").metrics.saturatingAdd(u64, &thread.pause_host_yields, 1);
+    const pause_hint = context.windows_slice_pause_yield and !context.windows_guest_handoff_requested;
     const explicit = context.windows_slice_nt_zero_yield and !context.windows_slice_pause_yield and !context.windows_guest_handoff_requested;
     context.windows_guest_handoff_requested = false;
     context.windows_guest_slice_yield_requested = false;
     context.windows_slice_pause_yield = false;
     context.windows_slice_nt_zero_yield = false;
     var wait_ns: u64 = 0;
+    // Unlike NT yields, an exact PAUSE explicitly names a spin hint. All
+    // roles can qualify, with a shorter deadline and all GPRs/MXCSR checked.
+    if (pause_hint) {
+        var wants_park = false;
+        if (pause_allowed and state.windows_idle_yield.pause.enabled) {
+            if (!route.pause_route.observeVectors(context)) {
+                if (route.pause_route.last_ns != 0) route.pause_route.counters.resets +|= 1;
+                route.pause_route.reset();
+            }
+            const frame = @atomicLoad(u64, &state.frame_cost.swaps, .monotonic);
+            wants_park = route.pause_route.observe(context.regs.rip, context.regs.rsp, frame, retired, pause.snapshot(context.regs), clock.monotonicNanoseconds());
+        } else {
+            route.pause_route.counters.yields +|= 1;
+            route.pause_route.counters.excluded +|= 1;
+            route.pause_route.reset();
+        }
+        if (wants_park) route.pause_route.park(worker) else std.Thread.yield() catch {};
+        route.pause_route.epoch = worker.epoch();
+        route.reset();
+        if (route.pause_route.counters.yields >= 4096) route.pause_route.flush(&state.windows_idle_yield.pause);
+        return;
+    }
+    route.pause_route.reset();
     if (explicit and state.windows_idle_yield.enabled and route.eligible_role) {
         const frame = @atomicLoad(u64, &state.frame_cost.swaps, .monotonic);
         const registers = registerSnapshot(context.regs);

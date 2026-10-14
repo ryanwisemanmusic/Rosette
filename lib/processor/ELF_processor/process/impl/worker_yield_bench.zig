@@ -5,6 +5,10 @@ const scheduling = @import("worker_yield.zig");
 const workers = @import("parallelism").worker;
 const atomic = std.atomic.Value;
 const Regs = struct {
+    rax: u64 = 0,
+    rcx: u64 = 0,
+    rdx: u64 = 0,
+    mxcsr: u64 = 0x1F80,
     rip: u64 = 0x1000,
     rsp: u64 = 0x2000,
     rbx: u64 = 0,
@@ -70,7 +74,7 @@ const Poller = struct {
             if (self.productive) self.context.regs.r12 +%= 1;
             self.context.windows_slice_nt_zero_yield = true;
             self.context.windows_guest_slice_yield_requested = true;
-            scheduling.handle(&self.state, &self.thread, &self.context, worker, &self.route, self.iterations * 10);
+            scheduling.handle(&self.state, &self.thread, &self.context, worker, &self.route, self.iterations * 10, true);
             self.iterations += 1;
         }
         self.cpu_ns = cpuNanoseconds() - started;
@@ -102,14 +106,14 @@ test "worker yield backoff only handles explicit marker and retains PAUSE counts
     var worker: workers.Worker = .{ .wake_hub = &hub };
     var route: scheduling.Route = .{};
     route.setLabel("XThread0022");
-    scheduling.handle(&state, &thread, &context, &worker, &route, 10);
+    scheduling.handle(&state, &thread, &context, &worker, &route, 10, true);
     try std.testing.expectEqual(@as(u64, 1), thread.pause_host_yields);
     try std.testing.expectEqual(@as(u64, 0), route.counters.explicit);
     try std.testing.expect(!context.windows_slice_nt_zero_yield);
     try std.testing.expect(!context.windows_guest_slice_yield_requested);
     context.windows_slice_nt_zero_yield = true;
     context.windows_guest_handoff_requested = true;
-    scheduling.handle(&state, &thread, &context, &worker, &route, 20);
+    scheduling.handle(&state, &thread, &context, &worker, &route, 20, true);
     try std.testing.expectEqual(@as(u64, 0), route.counters.explicit);
     try std.testing.expect(!context.windows_guest_handoff_requested);
 }

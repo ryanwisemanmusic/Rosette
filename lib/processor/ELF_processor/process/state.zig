@@ -1090,6 +1090,7 @@ pub const ElfState = struct {
     windows_fast_math: @import("impl/windows_fast_math.zig").Ledger = .{},
     windows_fast_nt_yield: @import("impl/windows_fast_nt_yield.zig").Ledger = .{},
     windows_idle_yield: @import("impl/worker_yield.zig").Ledger = .{},
+    windows_register_imports: @import("impl/register_import.zig").Ledger = .{},
     /// A direct, pure time query can bypass the shared runtime lock in
     /// parallel execution. Keep its count separate and atomic so the lock's
     /// diagnostics remain honest and progress accounting still sees it.
@@ -2049,7 +2050,7 @@ pub const ElfState = struct {
         state.block_jit_tlb_enabled = !envPresentAndFalse("ROSETTE_X64_BLOCK_JIT_TLB");
         state.block_jit_streaming_stores_enabled = !envPresentAndFalse("ROSETTE_X64_STREAMING_STORES");
         state.parallel_pause_batches_enabled = !envPresentAndFalse("ROSETTE_PE64_PAUSE_BATCHES");
-        state.windows_idle_yield.enabled = !envPresentAndFalse("ROSETTE_PE64_IDLE_YIELD_BACKOFF");
+        @import("impl/register_import.zig").configure(&state, envPresentAndFalse);
         state.windows_srw_stack_capture_all = envEquals("ROSETTE_SRW_STACK_CAPTURE", "all");
         state.windows_srw_import_lane = !envPresentAndFalse("ROSETTE_SRW_IMPORT_LANE");
         state.parallel_direct_tlb = !envPresentAndFalse("ROSETTE_PE64_PARALLEL_TLB");

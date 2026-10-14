@@ -4431,7 +4431,8 @@ pub fn runParallelWindowsGuestThread(self: *ElfState, slot: usize, worker: *__pr
         if (context.windows_guest_handoff_requested or context.windows_guest_slice_yield_requested or
             context.windows_slice_pause_yield)
         {
-            @import("worker_yield.zig").handle(self, thread, context, worker, &idle_yield, __process_parallel_metrics.load(u64, &thread.executed_steps) +| pending_steps);
+            const pause_allowed = context.windows_slice_pause_yield and @import("pause_jit.zig").canBackoff(self, thread.spin.capture_remaining != 0);
+            @import("worker_yield.zig").handle(self, thread, context, worker, &idle_yield, __process_parallel_metrics.load(u64, &thread.executed_steps) +| pending_steps, pause_allowed);
         }
     }
 }

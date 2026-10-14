@@ -1475,7 +1475,8 @@ pub fn compileBlockJit(self: *ElfState, jit: *__process_BlockJitState, rip: u64)
             jit.last_refusal_op = d.op;
             break;
         }
-        if (__process_block_jit.endsBlockBefore(d)) {
+        const parallel_pause = @import("pause_jit.zig").canCompile(self, d, fetch_bytes);
+        if (__process_block_jit.endsBlockBefore(d) and !parallel_pause) {
             jit.last_refusal = .ends_before;
             jit.last_refusal_op = d.op;
             break;
@@ -1486,6 +1487,8 @@ pub fn compileBlockJit(self: *ElfState, jit: *__process_BlockJitState, rip: u64)
             .rip = address,
             .len = d.len,
             .decoded = d,
+            .parallel_pause = parallel_pause,
+            .registered_import_tail = d.op == .jmp_reg64 and self.parallel_guest_execution and self.windows_runtime_enabled and !self.block_jit_verify_memory,
             .segment = __process_x64_decoder.selectSegment(.explicit_data, base, prefixes.segment_override),
         };
         if (d.op == .jmp_rel8) {
@@ -2602,12 +2605,15 @@ pub fn reportParallelWorkerBlockJits(self: *ElfState) void {
 }
 
 pub fn reportParallelWorkerBlockJitThreads(self: *ElfState) void {
+    @import("register_import.zig").report(self);
     const shown = 8;
     var ranked: [shown]?usize = @splat(null);
     var ranked_interpreted: [shown]u64 = @splat(0);
     for (self.windows_guest_threads, 0..) |thread, slot| {
         const jit = thread.parallel_block_jit orelse continue;
         const interpreted = jit.interpreted_cold +| jit.interpreted_refused +| jit.interpreted_reset_pending;
+        const pauses = @atomicLoad(u64, &jit.pause_helper_calls, .monotonic);
+        if (pauses != 0) __process_log.info("PE64 TRANSLATED PAUSE: slot={d} name='{s}' hints={d}; exact scheduling cadence and spin capture retained; helper calls, not useful CPU work", .{ slot, thread.nameText(), pauses });
         if (interpreted == 0 and jit.growths == 0) continue;
         for (0..shown) |rank| {
             if (ranked[rank] != null and interpreted <= ranked_interpreted[rank]) continue;
