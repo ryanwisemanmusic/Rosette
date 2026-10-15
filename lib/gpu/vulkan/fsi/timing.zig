@@ -14,6 +14,7 @@
 const std = @import("std");
 const observer_route = @import("observer_route.zig");
 const budget_mod = @import("budget.zig");
+const host_wait_cpu = @import("host_wait_cpu.zig");
 
 // AppKit can terminate through libc exit without running the forwarder's
 // normal device teardown. Register after loading the Vulkan layer so its
@@ -123,6 +124,7 @@ pub const Report = struct {
 
 pub const Stats = struct {
     observer: observer_route.Route,
+    wait_host_cpu: host_wait_cpu.Stats,
     budget: budget_mod.Budget,
     tracked: u64,
     completed: u64,
@@ -184,6 +186,7 @@ pub const Monitor = struct {
     ops: ?FenceOps = null,
     report: ?*const fn (Report) void = null,
     observer: observer_route.Route = .{},
+    wait_host_cpu: host_wait_cpu.Stats = .{},
 
     pub fn init(config: budget_mod.Config) Monitor {
         var monitor: Monitor = .{ .budget = budget_mod.Budget.init(config) };
@@ -496,12 +499,16 @@ pub const Monitor = struct {
 
     fn pollClaimed(self: *Monitor, entry: Entry, inline_wait: bool) bool {
         const ops = self.ops.?;
-
+        const ordinal = if (inline_wait) self.observer.inline_waits else self.observer.watcher_waits;
+        const sampled = ordinal % host_wait_cpu.period == 1;
+        const stamp = if (sampled) host_wait_cpu.begin() else null;
         const result = ops.wait(ops.context, entry.fence, poll_timeout_ns);
+        const cost = if (stamp) |started| host_wait_cpu.finish(started) else null;
         const now = ops.now(ops.context);
         var report: ?Report = null;
         var keep_watching = true;
         lock(&self.mutex);
+        if (sampled) self.wait_host_cpu.note(inline_wait, cost);
         std.debug.assert(self.entries[self.head].serial == entry.serial);
         switch (result) {
             .signaled => {
@@ -572,6 +579,7 @@ pub const Monitor = struct {
         defer unlock(&self.mutex);
         return .{
             .observer = self.observer,
+            .wait_host_cpu = self.wait_host_cpu,
             .budget = self.budget,
             .tracked = self.tracked,
             .completed = self.completed,
