@@ -1031,7 +1031,7 @@ fn executeVpmaddwd(self: anytype, d: DecodedInsn) void {
         const a1: i32 = std.mem.readInt(i16, @ptrCast(&lhs[offset + 2]), .little);
         const b0: i32 = std.mem.readInt(i16, @ptrCast(&rhs[offset]), .little);
         const b1: i32 = std.mem.readInt(i16, @ptrCast(&rhs[offset + 2]), .little);
-        const result: i32 = a0 * b0 + a1 * b1;
+        const result: i32 = a0 * b0 +% a1 * b1;
         std.mem.writeInt(i32, @ptrCast(&computed[offset]), result, .little);
     }
     const old = readVectorRegister(self, d.xmm_dst);
