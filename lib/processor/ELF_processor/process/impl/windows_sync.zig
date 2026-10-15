@@ -449,14 +449,7 @@ pub fn ensureWindowsSrwLock(self: *ElfState, address: u64) ?*__process_WindowsSr
 }
 
 pub fn windowsWaitObjectIndex(self: *const ElfState, handle: u64) ?usize {
-    if (handle == 0) return null;
-    // Only as far as the highest slot in use. A freed slot below it is
-    // the next one filled, so a run holding a few hundred objects scans
-    // a few hundred entries however large the table is.
-    for (self.windows_wait_objects[0..self.windows_wait_object_high_water], 0..) |*object, index| {
-        if (object.handle == handle) return index;
-    }
-    return null;
+    return @import("wait_lookup.zig").find(self, handle);
 }
 
 pub fn ensureWindowsWaitObject(self: *ElfState, handle: u64) ?*__process_WindowsWaitObject {

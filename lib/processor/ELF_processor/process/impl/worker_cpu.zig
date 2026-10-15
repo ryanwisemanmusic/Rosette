@@ -65,6 +65,7 @@ pub const Ledger = struct {
         const s = self.read() orelse return;
         std.log.info("PE64 WORKER HOST CPU: slot={d} handle=0x{x} name='{s}' cpu_us={d} elapsed_us={d} sampled_at_lifetime_us={d}; THREAD_CPUTIME_ID includes this host worker's compute and kernel CPU, excludes parked/off-core time; elapsed includes waits; worker sums overlap and are not frame critical-path fractions", .{ slot, handle, name, s.cpu_ns / 1000, s.wall_ns / 1000, s.wall_ns / 1000 });
         if (s.imports.stub_lookups != 0 or s.imports.callsites != 0) std.log.info("PE64 IMPORT METADATA: slot={d} name='{s}' stub_lookups={d} stub_hits={d} stub_scanned={d} dynamic_entries_peak={d} callsites={d} callsite_hits={d} callsite_rebuilds={d} callsite_fallbacks={d}; worker-owned counts published with host CPU; identities and code bytes rechecked, targets remain live; not saved CPU milliseconds", .{ slot, name, s.imports.stub_lookups, s.imports.stub_hits, s.imports.stub_scanned, s.imports.dynamic_entries_peak, s.imports.callsites, s.imports.callsite_hits, s.imports.callsite_rebuilds, s.imports.callsite_fallbacks });
+        if (s.imports.wait_lookups != 0) std.log.info("PE64 WAIT LOOKUP: slot={d} name='{s}' lookups={d} hits={d} scanned={d} entries_peak={d}; host-thread metadata only; current slot/handle rechecked, readiness and event state remain live; not saved CPU milliseconds", .{ slot, name, s.imports.wait_lookups, s.imports.wait_hits, s.imports.wait_scanned, s.imports.wait_entries_peak });
     }
 };
 

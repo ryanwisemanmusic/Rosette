@@ -9,6 +9,10 @@ pub const Counts = struct {
     callsite_hits: u64 = 0,
     callsite_rebuilds: u64 = 0,
     callsite_fallbacks: u64 = 0,
+    wait_lookups: u64 = 0,
+    wait_hits: u64 = 0,
+    wait_scanned: u64 = 0,
+    wait_entries_peak: u64 = 0,
 };
 threadlocal var owner: usize = 0;
 threadlocal var counts: Counts = .{};

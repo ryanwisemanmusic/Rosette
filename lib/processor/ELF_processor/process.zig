@@ -5638,6 +5638,7 @@ test {
     _ = @import("process/tests/native_completion.zig");
     _ = @import("process/tests/pause_recheck.zig");
     _ = @import("process/tests/import_metadata.zig");
+    _ = @import("process/tests/wait_lookup.zig");
     _ = @import("process/tests/native_shader_compile.zig");
     _ = @import("process/tests/windows_mutex.zig");
     _ = @import("process/tests/windows_mutex_contract.zig");
