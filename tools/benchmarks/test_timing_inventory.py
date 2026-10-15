@@ -85,6 +85,12 @@ class InventoryTests(unittest.TestCase):
         data = parse(["VULKAN FSI OBSERVER HOST CPU: scope=watcher samples=0 sampled_cpu_max_ns=0 sampled_elapsed_max_ns=0"])
         self.assertEqual([r["max_ms"] for r in data["maxima"]], [None, None])
 
+    def test_slow_pipeline_cpu_is_not_elapsed_or_an_all_call_maximum(self):
+        data = parse(["VULKAN PIPELINE NATIVE CALL: scope=graphics calls=1 max_native_elapsed_ns=90000000 max_native_cpu_ns=5000000 threshold_ms=50"])
+        self.assertEqual([r["basis"] for r in data["maxima"]], ["elapsed", "thread CPU"])
+        self.assertEqual([r["max_ms"] for r in data["maxima"]], [90, 5])
+        self.assertTrue(all("other calls unreported" in r["coverage"] for r in data["maxima"]))
+
     def test_detailed_ledger_supersedes_ranked_aliases_but_keeps_evidence(self):
         data = parse([
             "PE64 IMPORT HISTOGRAM: import=CRT!foo calls=128 mean_ns=100 estimated_ms=1 samples=2 sampled_max_ns=800",

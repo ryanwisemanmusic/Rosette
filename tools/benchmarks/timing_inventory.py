@@ -49,7 +49,9 @@ def parse(lines, ticks_per_ms=None):
                 coverage = "reported recent window"
             else:
                 coverage = "logged scope; elapsed may include waits"
-            basis = "thread CPU" if identity.startswith("VULKAN FSI OBSERVER HOST CPU") and "_cpu_" in field else "elapsed"
+            basis = "thread CPU" if identity.startswith(("VULKAN FSI OBSERVER HOST CPU", "VULKAN PIPELINE NATIVE CALL")) and "_cpu_" in field else "elapsed"
+            if identity.startswith("VULKAN PIPELINE NATIVE CALL"):
+                coverage = "one reported native call with elapsed >=50ms; other calls unreported"
             maxima[key] = dict(label=identity, field=field, max_ms=value,
                                peak_reported_ms=max(value, prior["peak_reported_ms"] if prior else value),
                                line=number, raw=line, coverage=coverage, basis=basis)
