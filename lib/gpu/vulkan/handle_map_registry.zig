@@ -61,9 +61,13 @@ pub const Entry = struct {
                 continue;
             }
 
-            const synthetic = @atomicLoad(u64, &entry.synthetic, .monotonic);
-            const real = @atomicLoad(u64, &entry.real, .monotonic);
-            const owner = @atomicLoad(u64, &entry.owner, .monotonic);
+            // Pair with each publisher's release store. If any payload load
+            // observes a value from an in-progress replacement, its preceding
+            // odd-generation store happens-before the trailing generation
+            // load, which therefore cannot validate the old even generation.
+            const synthetic = @atomicLoad(u64, &entry.synthetic, .acquire);
+            const real = @atomicLoad(u64, &entry.real, .acquire);
+            const owner = @atomicLoad(u64, &entry.owner, .acquire);
             // The trailing SC read also prevents the payload loads moving
             // past validation on weakly ordered hosts such as Apple silicon.
             const after = @atomicLoad(u64, &entry.generation, .seq_cst);
@@ -133,9 +137,9 @@ pub const Entry = struct {
         const generation = @atomicLoad(u64, &entry.generation, .monotonic);
         std.debug.assert((generation & 1) == 0);
         @atomicStore(u64, &entry.generation, generation +% 1, .seq_cst);
-        @atomicStore(u64, &entry.synthetic, synthetic, .monotonic);
-        @atomicStore(u64, &entry.real, real, .monotonic);
-        @atomicStore(u64, &entry.owner, owner, .monotonic);
+        @atomicStore(u64, &entry.synthetic, synthetic, .release);
+        @atomicStore(u64, &entry.real, real, .release);
+        @atomicStore(u64, &entry.owner, owner, .release);
         @atomicStore(u64, &entry.generation, generation +% 2, .release);
     }
 

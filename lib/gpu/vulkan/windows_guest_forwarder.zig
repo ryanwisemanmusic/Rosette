@@ -14,6 +14,7 @@ const vulkan_contract = @import("dll_win32_catalogue").vulkan;
 const dynamic_forwarder = @import("dyld").dynamic_library_forwarder;
 const register_file = @import("windows_guest_forwarder/context/register_file.zig");
 const windows_abi = @import("windows_guest_forwarder/abi/microsoft_to_sysv.zig");
+pub const route_metadata = @import("windows_guest_forwarder/abi/route_metadata.zig");
 const surface_calls_module = @import("windows_guest_forwarder/diagnostics/surface_calls.zig");
 
 const log = std.log.scoped(.windows_guest_vulkan);
@@ -93,6 +94,7 @@ pub const Bridge = struct {
     scratch_stack_allocations: u64 = 0,
     scratch_stack_reuses: u64 = 0,
     scratch_stack_overflow_allocations: u64 = 0,
+    route_facts: route_metadata.Counts = .{},
 
     /// Hand out the scratch stack for the dispatch that is about to run, and
     /// leave it owned until `releaseScratchStack`.
@@ -407,7 +409,7 @@ pub const Bridge = struct {
                 entry.max_ns / 1_000_000,
             });
         }
-        log.info("Vulkan host time: calls={d} host_ms={d} mean_ns={d} max_ns={d}; native Vulkan work done on the one host thread every guest thread runs on, so this much wall time is what a second host thread could take off the guest before any memory model is needed", .{
+        log.info("Vulkan host time: calls={d} host_ms={d} mean_ns={d} max_ns={d}; outermost bridge spans after route admission; elapsed includes native work, marshalling, runtime-lock reacquisition and overlapping dispatches; neither exclusive CPU nor GPU time", .{
             self.host_timed_calls,
             self.host_ns / 1_000_000,
             if (self.host_timed_calls == 0) 0 else self.host_ns / self.host_timed_calls,
@@ -416,6 +418,7 @@ pub const Bridge = struct {
     }
 
     fn reportScratchStacks(self: *const Bridge) void {
+        log.info("Vulkan ABI route facts: lookups={d} hits={d} misses={d}; copied names and immutable ownership/signature/float facts only; loader tokens and native capability checks remain live", .{ self.route_facts.lookups, self.route_facts.hits, self.route_facts.misses });
         log.info("Vulkan ABI scratch stacks: allocations={d} reuses={d} overflow_allocations={d} bytes_each={d} cache_depth={d} live_depth={d} guest_heap_bytes_held={d}; one stack per nesting level serves every call, because a dispatch owns it for exactly its own duration", .{
             self.scratch_stack_allocations,
             self.scratch_stack_reuses,
@@ -443,7 +446,9 @@ pub const Bridge = struct {
     /// normal Windows runtime may apply its explicit modelled path.
     pub fn dispatch(self: *Bridge, state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
         if (vulkan_contract.isProcLookup(name)) return self.lookupWindowsProc(state, direct_return_rip);
-        if (!owns(name)) return false;
+        if (!std.mem.startsWith(u8, name, "vk")) return false;
+        const facts = if (std.mem.startsWith(u8, name, "vkCmd")) classifyRoute(name) else route_metadata.lookup(classifyRoute, name, &self.route_facts);
+        if (!facts.owned) return false;
         const is_surface_call = std.mem.eql(u8, name, "vkCreateWin32SurfaceKHR");
         var surface_dispatch_completed = false;
         defer if (is_surface_call and !surface_dispatch_completed) self.surface_calls.noteDispatchRefusal();
@@ -502,7 +507,7 @@ pub const Bridge = struct {
         }
 
         const original_regs = register_file.field(state, "regs").*;
-        const signature = vulkan_contract.argument_widths.lookup(name) orelse {
+        const signature = facts.signature orelse {
             self.dispatch_failures +|= 1;
             trace_outcome = "argument_signature_missing";
             return false;
@@ -520,12 +525,8 @@ pub const Bridge = struct {
             return false;
         };
         defer self.releaseScratchStack(scratch_stack);
-        // A first allocation arrives zeroed; a reused one still carries the
-        // previous call's bytes. Every stack-argument slot is rewritten below
-        // whether or not this signature declares it, so clearing the return
-        // slot is all that reuse needs to be byte-identical to a fresh one.
+        // Preserve the original return-store position before reading arguments.
         state.write64(scratch_stack, 0);
-
         // Read declared parameters, not entire untyped eight-byte values.
         // DWORD stack stores leave the upper half unspecified; forwarding
         // that half made count=2 become 0x1_00000002 and dropped every bind.
@@ -589,7 +590,7 @@ pub const Bridge = struct {
         defer register_file.field(state, "xmm").* = original_xmm;
         windows_abi.mapScalarFloatArguments(
             register_file.field(state, "xmm"),
-            vulkan_contract.scalarFloatCount(name),
+            facts.float_count,
         );
         const command = std.mem.startsWith(u8, name, "vkCmd");
         const native_commands_before = self.forwarder.vulkan_real_command_calls;
@@ -679,6 +680,25 @@ fn owns(name: []const u8) bool {
         std.mem.eql(u8, name, "vkGetDeviceProcAddr")) return false;
     if (std.mem.eql(u8, name, "vkCreateWin32SurfaceKHR")) return true;
     return dynamic_forwarder.isForwardableVulkanSymbol(name);
+}
+fn classifyRoute(name: []const u8) route_metadata.Facts {
+    return .{ .owned = owns(name), .signature = vulkan_contract.argument_widths.lookup(name), .float_count = vulkan_contract.scalarFloatCount(name) };
+}
+test "Windows Vulkan route facts keep mutable names aliases widths and cold results" {
+    var counts: route_metadata.Counts = .{};
+    var mutable: [20]u8 = undefined;
+    const a = "vkCmdSetDepthBias";
+    const b = "vkCmdSetLineWidth";
+    @memcpy(mutable[0..a.len], a);
+    const first = route_metadata.lookup(classifyRoute, mutable[0..a.len], &counts);
+    try std.testing.expectEqualDeep(classifyRoute(a), first);
+    _ = route_metadata.lookup(classifyRoute, mutable[0..a.len], &counts);
+    try std.testing.expectEqual(@as(u64, 1), counts.hits);
+    @memcpy(mutable[0..b.len], b);
+    try std.testing.expectEqualDeep(classifyRoute(b), route_metadata.lookup(classifyRoute, mutable[0..b.len], &counts));
+    for ([_][]const u8{ "vkCmdDraw", "vkCmdDrawIndirectCountKHR", "vkCreateWin32SurfaceKHR", "vkUpdateDescriptorSets", "vkMadeUp", "Sleep", "" }) |name| {
+        for (0..3) |_| try std.testing.expectEqualDeep(classifyRoute(name), route_metadata.lookup(classifyRoute, name, &counts));
+    }
 }
 
 fn isForwarderFrameEvidenceBoundary(name: []const u8) bool {
