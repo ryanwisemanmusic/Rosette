@@ -1,11 +1,11 @@
 //! Pure CRT math imports with no shared Windows table state. Only the exact
-//! registered exp2/exp2f surface is admitted; its arithmetic and ABI return
+//! registered exp2/exp2f/log10 surface is admitted; its arithmetic and ABI return
 //! are the ordinary CRT handler's, including XMM0 clearing and LastError.
 const std = @import("std");
 const crt_math = @import("crt_math.zig");
 
 pub fn candidate(dll: []const u8, name: []const u8) ?usize {
-    const index: usize = if (std.mem.eql(u8, name, "exp2")) 0 else if (std.mem.eql(u8, name, "exp2f")) 1 else return null;
+    const index: usize = if (std.mem.eql(u8, name, "exp2")) 0 else if (std.mem.eql(u8, name, "exp2f")) 1 else if (std.mem.eql(u8, name, "log10")) 2 else return null;
     inline for (.{ "api-ms-win-crt-math-l1-1-0.dll", "ucrtbase.dll", "msvcrt.dll" }) |module| {
         if (std.ascii.eqlIgnoreCase(dll, module)) return index;
     }
@@ -30,9 +30,9 @@ pub fn tryFunction(comptime host: type, state: anytype, dll: []const u8, name: [
     defer host.end(state, scope);
     // Reuse the same width, numeric implementation and side effects instead
     // of introducing approximate math or a second floating-point contract.
-    if (!crt_math.tryExp2(host, state, name, return_rip)) return false;
+    if (!(if (index == 2) crt_math.tryLog10(host, state, name, return_rip) else crt_math.tryExp2(host, state, name, return_rip))) return false;
     _ = state.windows_fast_math.calls[index].fetchAdd(1, .monotonic);
-    state.windowsGuestContextField("windows_current_import").* = if (index == 0) "exp2" else "exp2f";
+    state.windowsGuestContextField("windows_current_import").* = ([_][]const u8{ "exp2", "exp2f", "log10" })[index];
     return true;
 }
 

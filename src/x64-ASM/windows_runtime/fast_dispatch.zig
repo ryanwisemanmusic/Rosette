@@ -35,7 +35,7 @@ pub fn tryRegisteredTail(comptime host: type, state: anytype, dll: []const u8, n
     if (!state.windowsFastCrtImportMayBypassRuntimeLock()) return false;
     if (std.mem.eql(u8, name, "NtDelayExecution") or std.mem.eql(u8, name, "NtYieldExecution"))
         return @import("fast_nt_yield.zig").tryFunction(host, state, dll, name, rip);
-    if (std.mem.eql(u8, name, "exp2") or std.mem.eql(u8, name, "exp2f"))
+    if (fast_math.candidate(dll, name) != null)
         return fast_math.tryFunction(host, state, dll, name, rip);
     return false;
 }

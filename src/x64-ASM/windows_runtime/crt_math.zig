@@ -71,12 +71,20 @@ pub fn tryExp2(comptime host: type, state: anytype, name: []const u8, direct_ret
     return false;
 }
 
+pub fn tryLog10(comptime host: type, state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    if (!std.mem.eql(u8, name, "log10")) return false;
+    returnGuestDouble(state, std.math.log10(guestDouble(state, 0)));
+    guestStateField(state, "windows_last_error").* = 0;
+    host.completeCall(state, direct_return_rip);
+    return true;
+}
+
 /// The C runtime maths functions Rosette computes exactly.
 ///
 /// Returns false for a name this does not own, so the caller carries on down
 /// its chain.
 pub fn tryFunction(comptime host: type, state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
-    if (tryExp2(host, state, name, direct_return_rip)) return true;
+    if (tryExp2(host, state, name, direct_return_rip) or tryLog10(host, state, name, direct_return_rip)) return true;
     const Unary = struct { name: []const u8, apply: *const fn (f64) f64 };
     const unary = [_]Unary{
         .{ .name = "acos", .apply = struct {
@@ -117,11 +125,6 @@ pub fn tryFunction(comptime host: type, state: anytype, name: []const u8, direct
         .{ .name = "tanh", .apply = struct {
             fn f(x: f64) f64 {
                 return std.math.tanh(x);
-            }
-        }.f },
-        .{ .name = "log10", .apply = struct {
-            fn f(x: f64) f64 {
-                return std.math.log10(x);
             }
         }.f },
     };
