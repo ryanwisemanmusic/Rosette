@@ -763,6 +763,7 @@ pub fn printFsiGuardReport(self: anytype) void {
         "macho-processor: VULKAN FSI ROOM OBSERVER: inline_waits={d} inline_completions={d} inline_timeouts={d} watcher_waits={d}; a runtime-lock-released room waiter may observe the FIFO head directly; single observer custody, reset checks, watchdog limits and Metal depth are unchanged\n",
         .{ stats.observer.inline_waits, stats.observer.inline_completions, stats.observer.inline_timeouts, stats.observer.watcher_waits },
     );
+    stats.wait_host_cpu.report();
     machoCapturePrint(
         "macho-processor: VULKAN FSI CPU ROUTE: small_chunk_sync={} synchronous_commands={d} recovery_fast_groups={d} recovery_work_cap={d} recovery_growths={d}; minimum draw-cap recordings bypass worker handoffs after draining older commands; recovery work never exceeds {d}\n",
         .{ self.fsi_small_chunk_sync, self.fsi_small_chunk_sync_commands, budget.recovery_fast_groups, budget.recovery_work_cap, budget.recovery_growths, rosette_gpu.metal.command_buffer_policy.fsi.recovery_max_sample_work },
