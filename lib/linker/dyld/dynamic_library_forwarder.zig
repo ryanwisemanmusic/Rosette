@@ -5847,29 +5847,8 @@ pub const Forwarder = struct {
         return forwarder_impl_texture_capture.marshalSpecializationInfo(state, guest_address, scratch);
     }
 
-    const NativeGraphicsPipelineCall = struct {
-        function: abi.PfnCreateGraphicsPipelines,
-        device: abi.Device,
-        cache: abi.PipelineCache,
-        info: *const abi.GraphicsPipelineCreateInfo,
-        output: *u64,
-
-        pub fn invoke(call: @This()) abi.Result {
-            return call.function(call.device, call.cache, 1, @ptrCast(call.info), null, @ptrCast(call.output));
-        }
-    };
-
-    const NativeComputePipelineCall = struct {
-        function: abi.PfnCreateComputePipelines,
-        device: abi.Device,
-        cache: abi.PipelineCache,
-        info: *const abi.ComputePipelineCreateInfo,
-        output: *u64,
-
-        pub fn invoke(call: @This()) abi.Result {
-            return call.function(call.device, call.cache, 1, @ptrCast(call.info), null, @ptrCast(call.output));
-        }
-    };
+    const NativeGraphicsPipelineCall = @import("pipeline_host_call.zig").Graphics;
+    const NativeComputePipelineCall = @import("pipeline_host_call.zig").Compute;
 
     pub fn callNativeGraphicsPipeline(
         state: anytype,
