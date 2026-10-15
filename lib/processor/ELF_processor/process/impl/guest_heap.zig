@@ -698,14 +698,7 @@ pub fn windowsImportStubAt(self: *const ElfState, address: u64) ?__process_Windo
     }
 
     const dynamic_start = @min(self.windows_dynamic_stub_start, self.windows_stub_count);
-    for (self.windows_stub_storage[dynamic_start..self.windows_stub_count]) |stub| {
-        if (stub.address == address) {
-            var dynamic_stub = stub;
-            dynamic_stub.is_dynamic = true;
-            return dynamic_stub;
-        }
-    }
-    return null;
+    return @import("import_stub_cache.zig").lookup(self, address, dynamic_start);
 }
 
 pub fn registerSyntheticThunk(_: *ElfState, _: u64, _: u64, _: []const u8) void {}

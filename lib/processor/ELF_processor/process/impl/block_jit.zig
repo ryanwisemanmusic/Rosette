@@ -1508,6 +1508,7 @@ pub fn compileBlockJit(self: *ElfState, jit: *__process_BlockJitState, rip: u64)
             .registered_import_tail = d.op == .jmp_reg64 and self.parallel_guest_execution and self.windows_runtime_enabled and !self.block_jit_verify_memory,
             .segment = __process_x64_decoder.selectSegment(.explicit_data, base, prefixes.segment_override),
         };
+        if (!jit.native_completions and @import("../../block_jit/completion_policy.zig").contains(d.op)) insn.force_fallback = true;
         if (d.op == .jmp_rel8) {
             const target = address +% d.len +% d.imm;
             if (blockJitTargetHooked(self, target)) {
@@ -1652,6 +1653,7 @@ pub fn compileBlockJit(self: *ElfState, jit: *__process_BlockJitState, rip: u64)
     jit.fused_runs +|= compiled.fused_runs;
     jit.cached_registers +|= compiled.cached_registers;
     jit.hoisted_accesses +|= compiled.hoisted_accesses;
+    @import("scalar_cache_report.zig").compiled(jit, compiled.scalar_resident_ops);
     return block;
 }
 
@@ -2325,6 +2327,7 @@ pub fn runBlockJit(self: *ElfState) ?bool {
         break;
     }
     const hot = blockJitHotness(jit, rip);
+    @import("pause_recheck.zig").revive(self, jit, hot, rip);
     if (hot.refused) {
         // Retried after `block_jit_refusal_retry_base << retries`
         // interpreted runs: the cost of a refusal that keeps failing is
@@ -2363,6 +2366,7 @@ pub fn runBlockJit(self: *ElfState) ?bool {
             return null;
         }
         hot.refused = true;
+        hot.pause_policy_refused = @import("pause_recheck.zig").deferred(self, jit, rip);
         hot.refused_runs = 0;
         jit.compile_refusals +|= 1;
         jit.interpreted_refused +|= 1;
@@ -2624,7 +2628,7 @@ pub fn reportParallelWorkerBlockJits(self: *ElfState) void {
 }
 
 pub fn reportParallelWorkerBlockJitThreads(self: *ElfState) void {
-    @import("register_import.zig").report(self);
+    @import("cpu_path_report.zig").report(self);
     const shown = 8;
     var ranked: [shown]?usize = @splat(null);
     var ranked_interpreted: [shown]u64 = @splat(0);
@@ -2763,6 +2767,7 @@ pub fn reportParallelWorkerFallbackOps(self: *ElfState) void {
         ops: [__state_op_value_limit]u64 = @splat(0),
         samples: [__state_op_value_limit]u64 = @splat(0),
         nanos: [__state_op_value_limit]u64 = @splat(0),
+        maxima: [__state_op_value_limit]u64 = @splat(0),
         reasons: [@typeInfo(__process_block_jit.FallbackReason).@"enum".fields.len]u64 = @splat(0),
         transfer_imports: u64 = 0,
         transfer_hooked: u64 = 0,
@@ -2781,6 +2786,7 @@ pub fn reportParallelWorkerFallbackOps(self: *ElfState) void {
         for (&sums.ops, jit.fallback_ops) |*sum, value| sum.* +|= value;
         for (&sums.samples, jit.fallback_cost_sample_count) |*sum, value| sum.* +|= value;
         for (&sums.nanos, jit.fallback_cost_sampled_nanos) |*sum, value| sum.* +|= value;
+        for (&sums.maxima, jit.fallback_cost_sampled_max_nanos) |*max, value| max.* = @max(max.*, value);
         for (&sums.reasons, jit.fallback_reason_counts) |*sum, value| sum.* +|= value;
         sums.transfer_imports +|= jit.transfer_fallback_imports;
         sums.transfer_hooked +|= jit.transfer_fallback_hooked;
@@ -2813,6 +2819,7 @@ pub fn reportParallelWorkerFallbackOps(self: *ElfState) void {
         .ops = &sums.ops,
         .samples = &sums.samples,
         .nanos = &sums.nanos,
+        .maxima = &sums.maxima,
         .reasons = &sums.reasons,
     });
     reportBlockJitTransferFallbackSummary(
@@ -2834,68 +2841,14 @@ pub fn reportBlockJitFallbackOps(self: *ElfState, jit: *const __process_BlockJit
         .ops = &jit.fallback_ops,
         .samples = &jit.fallback_cost_sample_count,
         .nanos = &jit.fallback_cost_sampled_nanos,
+        .maxima = &jit.fallback_cost_sampled_max_nanos,
         .reasons = &jit.fallback_reason_counts,
     });
     reportBlockJitTransferFallbacks(self, jit);
 }
 
 pub fn reportBlockJitFallbackView(view: __state_BlockJitFallbackView) void {
-    if (view.calls == 0) {
-        __process_log.info("PE64 BLOCK JIT {s}FALLBACK OPS: none", .{view.label});
-        __process_log.info("PE64 BLOCK JIT {s}FALLBACK LEDGER: calls=0 reasons(missing_native_template/native_slow_path/hook_observation/vector_policy_disabled)=0/0/0/0 samples=0 sampled_host_ns=0 estimated_interpreter_ns=0 per_op_sample_period={d}", .{ view.label, __process_BLOCK_JIT_FALLBACK_COST_SAMPLE_PERIOD });
-        return;
-    }
-    var ranked: [12]usize = undefined;
-    var ranked_count: usize = 0;
-    for (view.ops, 0..) |count, op_index| {
-        if (count == 0) continue;
-        var position = ranked_count;
-        while (position > 0 and view.ops[ranked[position - 1]] < count) : (position -= 1) {}
-        if (position >= ranked.len) continue;
-        var cursor = @min(ranked_count, ranked.len - 1);
-        while (cursor > position) : (cursor -= 1) ranked[cursor] = ranked[cursor - 1];
-        ranked[position] = op_index;
-        if (ranked_count < ranked.len) ranked_count += 1;
-    }
-    var buffer: [2048]u8 = undefined;
-    var written: usize = 0;
-    for (ranked[0..ranked_count]) |op_index| {
-        const name = __state_op_names[op_index] orelse continue;
-        const count = view.ops[op_index];
-        const percent = @divTrunc(count *| 100, view.calls);
-        const samples = view.samples[op_index];
-        const sampled_ns = view.nanos[op_index];
-        const estimated_ns: u64 = if (samples == 0) 0 else @intCast(@min(
-            (@as(u128, sampled_ns) * @as(u128, count)) / @as(u128, samples),
-            @as(u128, __process_std.math.maxInt(u64)),
-        ));
-        const piece = __process_std.fmt.bufPrint(buffer[written..], " {s}={d}({d}%,estimated_ns={d},samples={d})", .{ name, count, percent, estimated_ns, samples }) catch break;
-        written += piece.len;
-    }
-    __process_log.info("PE64 BLOCK JIT {s}FALLBACK OPS:{s}; each is an instruction the translator hands to the interpreter one at a time; estimated_ns is a per-operation sampled host-time estimate, not guest time", .{ view.label, buffer[0..written] });
-    var sampled_calls: u64 = 0;
-    var sampled_nanos: u64 = 0;
-    var estimated_total: u64 = 0;
-    for (view.ops, 0..) |count, op_index| {
-        const samples = view.samples[op_index];
-        if (samples == 0) continue;
-        sampled_calls +|= samples;
-        sampled_nanos +|= view.nanos[op_index];
-        const estimate = (@as(u128, view.nanos[op_index]) * @as(u128, count)) / @as(u128, samples);
-        estimated_total +|= @intCast(@min(estimate, @as(u128, __process_std.math.maxInt(u64))));
-    }
-    __process_log.info("PE64 BLOCK JIT {s}FALLBACK LEDGER: calls={d} reasons(missing_native_template/native_slow_path/hook_observation/vector_policy_disabled)={d}/{d}/{d}/{d} samples={d} sampled_host_ns={d} estimated_interpreter_ns={d} per_op_sample_period={d}; native_slow_path counts translated templates that escaped through a runtime guard, while hook and vector-policy reasons preserve explicit interpreter boundaries; estimated time is an in-run count-weighted sample, not guest time", .{
-        view.label,
-        view.calls,
-        view.reasons[@intFromEnum(__process_block_jit.FallbackReason.missing_native_template)],
-        view.reasons[@intFromEnum(__process_block_jit.FallbackReason.native_slow_path)],
-        view.reasons[@intFromEnum(__process_block_jit.FallbackReason.hook_observation)],
-        view.reasons[@intFromEnum(__process_block_jit.FallbackReason.vector_policy_disabled)],
-        sampled_calls,
-        sampled_nanos,
-        estimated_total,
-        __process_BLOCK_JIT_FALLBACK_COST_SAMPLE_PERIOD,
-    });
+    @import("fallback_report.zig").reportBlockJitFallbackView(view);
 }
 
 pub fn reportBlockJitTransferFallbacks(self: *ElfState, jit: *const __process_BlockJitState) void {

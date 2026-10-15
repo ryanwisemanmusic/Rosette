@@ -1542,7 +1542,7 @@ pub fn reportImportHistogram(self: *const ElfState) void {
     for (histogram.top(&storage), 1..) |entry, rank| {
         const calls = entry.calls.load(.monotonic);
         const mean = entry.meanNs();
-        __process_log.info("PE64 IMPORT HISTOGRAM:   rank={d} import={s}!{s} calls={d} share={d}% mean_ns={d} estimated_ms={d}", .{
+        __process_log.info("PE64 IMPORT HISTOGRAM:   rank={d} import={s}!{s} calls={d} share={d}% mean_ns={d} estimated_ms={d} samples={d} sampled_max_ns={d}", .{
             rank,
             entry.dll(),
             entry.name(),
@@ -1550,6 +1550,15 @@ pub fn reportImportHistogram(self: *const ElfState) void {
             calls *| 100 / total,
             mean,
             calls *| mean / __process_std.time.ns_per_ms,
+            entry.samples.load(.monotonic),
+            entry.sampled_max_ns.load(.monotonic),
+        });
+    }
+    for (&histogram.entries) |*entry| {
+        const calls = entry.calls.load(.monotonic);
+        if (calls == 0) continue;
+        __process_log.info("PE64 IMPORT TIMING: import={s}!{s} calls={d} samples={d} sampled_ns={d} sampled_max_ns={d} sample_period={d}; elapsed includes waits; maximum covers timed samples only", .{
+            entry.dll(), entry.name(), calls, entry.samples.load(.monotonic), entry.sampled_ns.load(.monotonic), entry.sampled_max_ns.load(.monotonic), __process_import_histogram.sample_period,
         });
     }
 }

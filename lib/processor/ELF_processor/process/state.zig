@@ -8322,15 +8322,7 @@ pub const ElfState = struct {
     /// calls. This is the list of templates the next version should add.
     /// The fallback counters one report reads: one translator's, or the
     /// workers' summed.
-    const BlockJitFallbackView = struct {
-        /// "" for the owner's translator, "WORKER " for the workers' sum.
-        label: []const u8,
-        calls: u64,
-        ops: *const [ElfState.op_value_limit]u64,
-        samples: *const [ElfState.op_value_limit]u64,
-        nanos: *const [ElfState.op_value_limit]u64,
-        reasons: *const [@typeInfo(block_jit.FallbackReason).@"enum".fields.len]u64,
-    };
+    const BlockJitFallbackView = @import("impl/fallback_report.zig").View;
 
     fn reportBlockJitFallbackOps(self: *ElfState, jit: *const BlockJitState) void {
         return process_impl_block_jit.reportBlockJitFallbackOps(self, jit);

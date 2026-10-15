@@ -4374,6 +4374,8 @@ pub fn runParallelWindowsGuestThread(self: *ElfState, slot: usize, worker: *__pr
     // call, so the tripwire is disarmed across every park and resume.
     var tripwire: __process_parallel_diagnostics.register_tripwire.Tripwire = .{};
     var throughput_pulse: @import("worker_runtime_pulse.zig").Pulse = .{};
+    thread.host_cpu.begin(__process_concurrency.monotonicNanoseconds());
+    defer thread.host_cpu.finish(__process_concurrency.monotonicNanoseconds());
 
     var idle_yield: @import("worker_yield.zig").Route = .{};
     defer idle_yield.flush(&self.windows_idle_yield);
@@ -4382,7 +4384,9 @@ pub fn runParallelWindowsGuestThread(self: *ElfState, slot: usize, worker: *__pr
         // The guest can rename this thread while it runs. QoS is host
         // scheduling metadata, polled at the progress-publication boundary.
         if (pending_steps == 0) {
-            throughput_pulse.poll(__process_concurrency.monotonicNanoseconds(), slot, thread.parallel_block_jit, &self.windows_fast_math);
+            const progress_now = __process_concurrency.monotonicNanoseconds();
+            thread.host_cpu.poll(progress_now);
+            throughput_pulse.poll(progress_now, slot, thread.parallel_block_jit, &self.windows_fast_math);
             const name_generation = @atomicLoad(u32, &thread.name_generation, .acquire);
             if (name_generation != qos_generation) {
                 qos_generation = name_generation;

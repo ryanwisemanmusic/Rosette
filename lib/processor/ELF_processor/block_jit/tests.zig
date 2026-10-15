@@ -4860,3 +4860,10 @@ test "busy guest registers live in host registers for a whole block, and meet me
     try testing.expectEqual(@as(u32, 1), state4.interprets);
     try testing.expectEqual(@as(u64, 13), state4.regs.rax);
 }
+
+test {
+    _ = @import("atomic_throughput_tests.zig");
+    _ = @import("packed_madd.zig");
+    _ = @import("completion_tests.zig");
+    _ = @import("scalar_residency_tests.zig");
+}

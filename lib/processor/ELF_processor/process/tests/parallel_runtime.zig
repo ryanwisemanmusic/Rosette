@@ -647,6 +647,10 @@ fn runTsoTierBoundaryFixture(translate: bool, fallbacks: *u64) !u64 {
     defer state.deinit();
     // Windows mode binds the per-context store buffers.
     state.windows_runtime_enabled = true;
+    // Keep MOVAPS on the interpreter path even though the translator now has
+    // a native template for it: this fixture specifically exercises the TSO
+    // boundary between an interpreted store and translated code.
+    state.block_jit_vectors_enabled = false;
     const code = state.mem_base + 0x1000;
     @memcpy(state.guestMemory(code, program.len).?, &program);
     state.regs.rip = code;

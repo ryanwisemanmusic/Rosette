@@ -27,6 +27,7 @@ pub const Entry = struct {
     calls: std.atomic.Value(u64) = .init(0),
     samples: std.atomic.Value(u64) = .init(0),
     sampled_ns: std.atomic.Value(u64) = .init(0),
+    sampled_max_ns: std.atomic.Value(u64) = .init(0),
 
     pub fn name(self: *const Entry) []const u8 {
         const ptr = self.name_ptr.load(.acquire);
@@ -84,6 +85,7 @@ pub const Histogram = struct {
     pub fn addSample(entry: *Entry, nanoseconds: u64) void {
         _ = entry.samples.fetchAdd(1, .monotonic);
         _ = entry.sampled_ns.fetchAdd(nanoseconds, .monotonic);
+        _ = entry.sampled_max_ns.fetchMax(nanoseconds, .monotonic);
     }
 
     /// The `out.len` busiest entries, busiest first.
@@ -137,4 +139,20 @@ test "the histogram counts by name and ranks the busiest first" {
     try std.testing.expectEqual(@as(u64, 100), ranked[0].meanNs());
     try std.testing.expectEqualStrings(srw, ranked[1].name());
     try std.testing.expectEqual(@as(u64, 250), histogram.totalCalls());
+}
+
+test "sampled timing maximum survives concurrent import reporters" {
+    var entry: Entry = .{};
+    const Worker = struct {
+        fn run(e: *Entry, offset: u64) void {
+            for (0..1000) |n| Histogram.addSample(e, offset + n);
+        }
+    };
+    const a = try std.Thread.spawn(.{}, Worker.run, .{ &entry, @as(u64, 0) });
+    const b = try std.Thread.spawn(.{}, Worker.run, .{ &entry, @as(u64, 1000) });
+    a.join();
+    b.join();
+    try std.testing.expectEqual(@as(u64, 2000), entry.samples.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1999), entry.sampled_max_ns.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1999000), entry.sampled_ns.load(.monotonic));
 }

@@ -1575,42 +1575,7 @@ pub fn reportWindowsImportFallbacks(self: *ElfState, full: bool) void {
 }
 
 pub fn windowsImportCallsite(self: *ElfState, return_rip: u64, target: u64) ?__process_WindowsImportCallsite {
-    // Import telemetry used `last_instruction_rip`, which translated
-    // blocks do not necessarily refresh for every native transfer. Read
-    // backwards from the architectural return address and accept only a
-    // decoded CALL whose operand currently resolves to this exact stub.
-    // The bounded scan covers every x86-64 instruction encoding length.
-    var length: u8 = 1;
-    while (length <= 15) : (length += 1) {
-        if (return_rip < length) continue;
-        const rip = return_rip - length;
-        var bytes: [16]u8 = undefined;
-        const available = process_impl_instruction_decode.guestInstructionBytes(self, rip, &bytes);
-        if (available.len < length) continue;
-        const decoded = __process_decodeInsn(available);
-        if (decoded.len != length) continue;
-        switch (decoded.op) {
-            .call_reg64 => {
-                if (process_impl_execution.regVal(self, decoded.dst_reg, .bits64) == target) return .{ .rip = rip, .decoded = decoded };
-            },
-            .call_mem64 => {
-                const regs = process_impl_lifecycle.guestContextField(self, "regs").*;
-                const operand = __process_x64_decoder.resolveMemoryAddress(&regs, .{
-                    .displacement = decoded.addr,
-                    .has_index = decoded.sib_has_index,
-                    .index_reg = decoded.sib_index_reg,
-                    .scale = decoded.sib_scale,
-                    .has_base = decoded.sib_has_base,
-                    .base_reg = decoded.sib_base_reg,
-                    .rip_relative = decoded.rip_relative,
-                    .segment = decoded.segment,
-                }, rip +| decoded.len, if (decoded.has_0x67) .bits32 else .bits64, .long64, true);
-                if (process_impl_guest_memory.read64(self, operand) == target) return .{ .rip = rip, .decoded = decoded };
-            },
-            else => {},
-        }
-    }
-    return null;
+    return @import("import_callsite_cache.zig").find(self, return_rip, target);
 }
 
 pub fn tryImportSlotFastTransfer(self: *ElfState, slot: u64, call_return: u64) bool {

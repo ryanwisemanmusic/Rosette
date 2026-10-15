@@ -2713,6 +2713,7 @@ const TimeAuditSample = struct {
 };
 
 const WindowsGuestThread = struct {
+    host_cpu: @import("process/impl/worker_cpu.zig").Ledger = .{},
     status: WindowsGuestThreadStatus = .vacant,
     handle: u64 = 0,
     /// The name the guest gave this thread through `SetThreadDescription`.
@@ -3997,6 +3998,7 @@ const BlockHotness = struct {
     /// Compilation was tried and produced nothing worth running, or a
     /// cross-check failed: stay with the interpreter for this address.
     refused: bool = false,
+    pause_policy_refused: bool = false,
     /// Compilations retried after a refusal. A refusal used to be forever,
     /// so one that came from a passing state - the code not yet complete,
     /// a hook armed for a while - left a hot address interpreted for the
@@ -4202,6 +4204,13 @@ const BlockJitState = struct {
     /// synchronization primitive.
     pause_helper_calls_local: u64 = 0,
     register_import_tail_calls: u64 = 0,
+    recheck_pause_policy: bool = true, // false only in offline policy comparison
+    pause_policy_revived: u64 = 0,
+    scalar_resident_ops_compiled: u64 = 0,
+    native_completions: bool = true, // false only in offline differential replay
+    admit_failed_compare: bool = true, // false only in the offline before fixture
+    failed_compare_admitted: u64 = 0,
+    failed_compare_refused: u64 = 0,
     tlb_fill_refusals: u64 = 0,
     tlb_refusal_stats: tlb_diagnostics.RefusalStats = .{},
     tlb_refusal_cache: tlb_diagnostics.RefusalCache = .{},
@@ -4213,6 +4222,7 @@ const BlockJitState = struct {
     fallback_reason_counts: [@typeInfo(block_jit.FallbackReason).@"enum".fields.len]u64 = @splat(0),
     fallback_cost_sample_count: [ElfState.op_value_limit]u64 = @splat(0),
     fallback_cost_sampled_nanos: [ElfState.op_value_limit]u64 = @splat(0),
+    fallback_cost_sampled_max_nanos: [ElfState.op_value_limit]u64 = @splat(0),
     /// Indirect and relative transfers the interpreter ran, by why: an
     /// import (the IAT shim owns it), a hooked target (a shim, milestone or
     /// census entry may claim it), or neither - a transfer that could have
@@ -4806,14 +4816,14 @@ fn blockJitInterpret(state_ptr: *anyopaque, block: *const block_jit.Block, index
     // made inside a block was invisible to the rest of the block.
     tso_memory.flushActiveStoreBufferFor(.jit_fallback);
     // A native atomic instruction that misses its worker TLB takes the full
-    // interpreter path above. Admit the page after a successful write so the
+    // interpreter path above. Re-prove writable backing after the access so the
     // next execution reaches the inline acquire/release or LSE template
     // instead of repeating the same interpreter round-trip forever.
     if (atomic_width) |width| {
         if (!self.isTerminated() and !self.guestContextField("guest_access_violation_pending").*) {
             const wrote = blockJitAtomicAlwaysWrites(insn.decoded.op) or
                 blockJitCompareExchangeWriteCommitted(insn.decoded.op, self.guestContextField("regs").*.rflags);
-            if (wrote) self.blockJitTlbConsider(atomic_address, width, true);
+            @import("process/impl/atomic_admission.zig").consider(self, insn.decoded.op, atomic_address, width, wrote);
         }
     }
     if (sample_fallback_cost and sample_started != 0) {
@@ -4822,6 +4832,7 @@ fn blockJitInterpret(state_ptr: *anyopaque, block: *const block_jit.Block, index
             if (self.currentBlockJit()) |jit| {
                 jit.fallback_cost_sample_count[op_index] +|= 1;
                 jit.fallback_cost_sampled_nanos[op_index] +|= sample_finished - sample_started;
+                jit.fallback_cost_sampled_max_nanos[op_index] = @max(jit.fallback_cost_sampled_max_nanos[op_index], sample_finished - sample_started);
             }
         }
     }
@@ -5623,6 +5634,10 @@ test {
     _ = @import("process/tests/pause_jit.zig");
     _ = @import("process/tests/pause_workers.zig");
     _ = @import("process/tests/register_import.zig");
+    _ = @import("process/tests/atomic_admission.zig");
+    _ = @import("process/tests/native_completion.zig");
+    _ = @import("process/tests/pause_recheck.zig");
+    _ = @import("process/tests/import_metadata.zig");
     _ = @import("process/tests/native_shader_compile.zig");
     _ = @import("process/tests/windows_mutex.zig");
     _ = @import("process/tests/windows_mutex_contract.zig");

@@ -312,6 +312,7 @@ const Hoist = struct {
 const HoistedOffset = struct { slot: usize, offset: u64 };
 
 const FusedExit = struct {
+    retry_yield: bool = false,
     label: Label,
     fused: Fused,
     /// The x86 flags the edge must find in `rflags`.
@@ -885,6 +886,7 @@ pub const Compiled = struct {
     upper_clears_elided: u32 = 0,
     xmm_loads_forwarded: u32 = 0,
     xmm_stores_elided: u32 = 0,
+    scalar_resident_ops: u32 = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -983,6 +985,7 @@ pub fn isNative(d: DecodedInsn) bool {
                 .imul_reg32_mem32_imm8, .imul_reg32_mem32_imm32, .imul_reg64_mem64_imm8, .imul_reg64_mem64_imm32 => !d.is_reg_form and memoryOperandSupported(d),
                 .mul_reg32, .mul_reg64, .imul_reg32, .imul_reg64 => true,
                 .div_reg32, .div_reg64, .idiv_reg32, .idiv_reg64 => true,
+                .div_mem32 => !d.is_reg_form and memoryOperandSupported(d),
                 .bt_reg_reg, .bts_reg_reg, .btr_reg_reg, .bt_reg_imm, .bts_reg_imm, .btr_reg_imm => d.size != .bits8,
                 // The immediate form never moves the address, so it is a
                 // plain read, a bit, and a write. `btr [mem], imm` was the
@@ -1010,7 +1013,7 @@ pub fn isNative(d: DecodedInsn) bool {
                 // needs a guest-interpreter round trip.
                 .mfence, .lfence, .sfence => true,
                 .push_reg, .push_imm, .pop_reg => true,
-                .cdqe, .cdq, .cqo => true,
+                .cwde, .cdqe, .cdq, .cqo => true,
                 .bswap_reg => wide,
                 .jcc_rel8, .jcc_rel32, .jmp_rel8 => true,
                 // The zero-return marker and optional call/return observers
@@ -1675,7 +1678,7 @@ const v7: a64.Reg = 7;
 /// the ZMM upper half as well as the YMM one (`evex.handles`).
 fn evexRouted(op: Op) bool {
     return switch (op) {
-        .vpxor, .vpaddd, .vpslld, .vpshufd, .vpshufb, .vpalignr => true,
+        .vpxor, .vpaddd, .vpmaddwd, .vpslld, .vpshufd, .vpshufb, .vpalignr => true,
         .vmovd_xmm_reg32, .vmovd_xmm_mem32 => true,
         .vpackssdw, .vpacksswb, .vpackuswb, .vpackusdw => true,
         .vpabsb, .vpabsw, .vpabsd => true,
@@ -1861,122 +1864,11 @@ fn ymmMoveForm(op: Op) ?enum { load, store, register } {
 /// Memory read-modify-writes that must be host-atomic before guest execution
 /// can be split across host threads. `xchg` with memory is locked whether or
 /// not it carries the prefix. The arithmetic/logic update forms use a CAS
-/// loop because ARM's LSE has no single-instruction AND/OR/XOR or SUB form.
+/// loop for ADC/SBB and NEG; other updates use width-matched LSE operations.
 /// Acquire-release atomics preserve the locked operation's ordering edge.
-const AtomicForm = enum {
-    exchange,
-    compare_exchange,
-    compare_exchange8b,
-    compare_exchange16b,
-    exchange_add,
-    update,
-    increment,
-    decrement,
-    negate,
-    bitwise_not,
-    bit_set,
-    bit_reset,
-    bit_complement,
-};
-
-fn atomicForm(op: Op) ?AtomicForm {
-    return switch (op) {
-        .xchg_mem8_reg8, .xchg_mem32_reg32, .xchg_mem64_reg64 => .exchange,
-        .cmpxchg_mem8_reg8, .cmpxchg_mem16_reg16, .cmpxchg_mem32_reg32, .cmpxchg_mem64_reg64 => .compare_exchange,
-        .cmpxchg8b_mem => .compare_exchange8b,
-        .cmpxchg16b_mem => .compare_exchange16b,
-        .xadd_mem8_reg8, .xadd_mem32_reg32, .xadd_mem64_reg64 => .exchange_add,
-        .bts_mem_imm => .bit_set,
-        .btr_mem_imm => .bit_reset,
-        .btc_mem_imm => .bit_complement,
-        .bts_mem_reg => .bit_set,
-        .btr_mem_reg => .bit_reset,
-        .btc_mem_reg => .bit_complement,
-        .inc_mem8, .inc_mem16, .inc_mem32, .inc_mem64 => .increment,
-        .dec_mem8, .dec_mem16, .dec_mem32, .dec_mem64 => .decrement,
-        .neg_mem8, .neg_mem16, .neg_mem32, .neg_mem64 => .negate,
-        .not_mem8, .not_mem16, .not_mem32, .not_mem64 => .bitwise_not,
-        .add_mem8_reg8,
-        .add_mem16_reg16,
-        .add_mem32_reg32,
-        .add_mem64_reg64,
-        .add_mem8_imm8,
-        .add_mem16_imm8,
-        .add_mem32_imm8,
-        .add_mem64_imm8,
-        .add_mem16_imm32,
-        .add_mem32_imm32,
-        .add_mem64_imm32,
-        .sub_mem8_reg8,
-        .sub_mem16_reg16,
-        .sub_mem32_reg32,
-        .sub_mem64_reg64,
-        .sub_mem8_imm8,
-        .sub_mem16_imm8,
-        .sub_mem32_imm8,
-        .sub_mem64_imm8,
-        .sub_mem16_imm32,
-        .sub_mem32_imm32,
-        .sub_mem64_imm32,
-        .and_mem8_reg8,
-        .and_mem16_reg16,
-        .and_mem32_reg32,
-        .and_mem64_reg64,
-        .and_mem8_imm8,
-        .and_mem16_imm8,
-        .and_mem32_imm8,
-        .and_mem64_imm8,
-        .and_mem16_imm32,
-        .and_mem32_imm32,
-        .and_mem64_imm32,
-        .or_mem8_reg8,
-        .or_mem16_reg16,
-        .or_mem32_reg32,
-        .or_mem64_reg64,
-        .or_mem8_imm8,
-        .or_mem16_imm8,
-        .or_mem32_imm8,
-        .or_mem64_imm8,
-        .or_mem16_imm32,
-        .or_mem32_imm32,
-        .or_mem64_imm32,
-        .xor_mem8_reg8,
-        .xor_mem16_reg16,
-        .xor_mem32_reg32,
-        .xor_mem64_reg64,
-        .xor_mem8_imm8,
-        .xor_mem16_imm8,
-        .xor_mem32_imm8,
-        .xor_mem64_imm8,
-        .xor_mem16_imm32,
-        .xor_mem32_imm32,
-        .xor_mem64_imm32,
-        .adc_mem8_reg8,
-        .adc_mem16_reg16,
-        .adc_mem32_reg32,
-        .adc_mem64_reg64,
-        .adc_mem8_imm8,
-        .adc_mem16_imm8,
-        .adc_mem32_imm8,
-        .adc_mem64_imm8,
-        .adc_mem16_imm32,
-        .adc_mem32_imm32,
-        .adc_mem64_imm32,
-        .sbb_mem8_reg8,
-        .sbb_mem16_reg16,
-        .sbb_mem32_reg32,
-        .sbb_mem64_reg64,
-        .sbb_mem8_imm8,
-        .sbb_mem16_imm8,
-        .sbb_mem32_imm8,
-        .sbb_mem64_imm8,
-        .sbb_mem16_imm32,
-        .sbb_mem32_imm32,
-        .sbb_mem64_imm32,
-        => .update,
-        else => null,
-    };
-}
+const atomic_updates = @import("atomic_updates.zig");
+const AtomicForm = atomic_updates.Form;
+const atomicForm = atomic_updates.of;
 
 /// The retry hint is limited to the common lock-acquisition form: a locked
 /// compare-exchange immediately followed by a backward JNZ. Other atomic
@@ -2065,6 +1957,8 @@ pub fn isVectorNative(d: DecodedInsn) bool {
         // half must survive, unlike the corresponding VEX.128 operation.
         .movups_xmm_mem,
         .movups_mem_xmm,
+        .movaps_xmm_mem,
+        .movaps_mem_xmm,
         .vmovss_xmm_mem,
         .vmovsd_xmm_mem,
         .vmovss_mem_xmm,
@@ -2130,7 +2024,7 @@ pub fn isVectorNative(d: DecodedInsn) bool {
         // 2026-09-21 fallbacks: vpmuludq 19.1M, vinsertps 6.3M, vpblendw
         // 6.2M, vshufpd 4.6M - all VEX.128 here, the ymm forms stay
         // interpreted.
-        .vpmuludq, .vpblendw, .vshufpd, .vinsertps => d.is_reg_form or memoryOperandSupported(d),
+        .vpmaddwd, .vpmuludq, .vpblendw, .vshufpd, .vinsertps => d.is_reg_form or memoryOperandSupported(d),
         else => false,
     };
 }
@@ -2270,6 +2164,8 @@ const Compiler = struct {
     /// A dominating VEX.128 write already zeroed these private register-file
     /// lanes. Facts are local to straight-line code, never an entry/edge.
     resident_vectors: bool = true,
+    scalar_residency: bool = true,
+    scalar_resident_ops: u32 = 0,
     /// The PAUSE scheduling callback only updates the register-file RIP and
     /// flags; unlike an arbitrary interpreter escape, it leaves every guest
     /// GPR, vector register, and hoisted base untouched. Keep the old reload
@@ -2277,6 +2173,8 @@ const Compiler = struct {
     pause_helper_preserves_state: bool = true,
     xbox_critical_section_transfer_enabled: bool = true,
     atomic_retry_yield_enabled: bool = true,
+    atomic_direct_updates: bool = true,
+    atomic_compare_fusion: bool = false, // offline experiment; retry timing regressed
     xmm_valid: u16 = 0,
     xmm_dirty: u16 = 0,
     last_xmm: ?u8 = null,
@@ -2291,7 +2189,7 @@ const Compiler = struct {
         try self.a.emit(word);
     }
 
-    fn emitChecked(self: *Compiler, word: ?u32) Error!void {
+    pub fn emitChecked(self: *Compiler, word: ?u32) Error!void {
         // Every offset this compiler forms is a register-file slot or a
         // helper-table slot, both small and aligned; an unencodable one is
         // a compiler bug, not a guest property.
@@ -2430,7 +2328,7 @@ const Compiler = struct {
 
     /// Load a register operand, zero-extended to the host register, at the
     /// operand's width.
-    fn loadReg(self: *Compiler, dst: a64.Reg, id: RegId, high8: bool, size: Size) Error!void {
+    pub fn loadReg(self: *Compiler, dst: a64.Reg, id: RegId, high8: bool, size: Size) Error!void {
         const index: usize = @intFromEnum(id);
         self.use_counts[index] +|= 1;
         if (self.cache_slot[index]) |slot| {
@@ -2456,7 +2354,7 @@ const Compiler = struct {
 
     /// Store a result at the operand's width: 64 and 32 replace the whole
     /// register (32 zero-extends, as x86 does), 16 and 8 merge.
-    fn storeReg(self: *Compiler, id: RegId, high8: bool, size: Size, src: a64.Reg) Error!void {
+    pub fn storeReg(self: *Compiler, id: RegId, high8: bool, size: Size, src: a64.Reg) Error!void {
         const index: usize = @intFromEnum(id);
         self.use_counts[index] +|= 1;
         self.written |= @as(u16, 1) << @intCast(index);
@@ -3257,7 +3155,7 @@ const Compiler = struct {
     /// have served its access. Only a helper sets `abort`, so nothing is
     /// emitted when no helper that could set it was called since the last
     /// check.
-    fn emitAbortCheck(self: *Compiler, index: u32) Error!void {
+    pub fn emitAbortCheck(self: *Compiler, index: u32) Error!void {
         if (!self.abort_unchecked) return;
         self.abort_unchecked = false;
         if (self.fused) |fused| {
@@ -3321,7 +3219,7 @@ const Compiler = struct {
 
     const Emitted = enum { native, fallback };
 
-    fn emitFallback(self: *Compiler, index: u32) Error!void {
+    pub fn emitFallback(self: *Compiler, index: u32) Error!void {
         self.fallback_count += 1;
         try self.emitInterpretCall(index);
     }
@@ -3734,7 +3632,10 @@ const Compiler = struct {
     fn fusibleRun(self: *const Compiler, index: u32) ?Fused {
         if (index + 1 >= self.insns.len) return null;
         const writer = self.insns[index];
-        if (writer.force_fallback or !isNative(writer.decoded) or writer.decoded.lock) return null;
+        if (writer.force_fallback or !isNative(writer.decoded)) return null;
+        const atomic_compare = self.atomic_compare_fusion and isLockedCompareExchange(writer.decoded) and
+            (writer.decoded.size == .bits32 or writer.decoded.size == .bits64);
+        if (writer.decoded.lock and !atomic_compare) return null;
         const d = writer.decoded;
         var size = d.size;
         const kind: FusedKind = if (binaryOpOf(d.op)) |op| blk: {
@@ -3750,7 +3651,7 @@ const Compiler = struct {
             if (form.mem) return null;
             size = incDecSize(d.op);
             break :blk if (form.inc) .inc else .dec;
-        } else return null;
+        } else if (atomic_compare) .sub else return null;
         const writes = flagEffects(writer).writes;
         var remaining: u8 = 0;
         var saved = false;
@@ -3964,6 +3865,7 @@ const Compiler = struct {
     fn emitFusedExits(self: *Compiler) Error!void {
         for (self.fused_exits.items) |exit| {
             self.a.placeLabel(exit.label);
+            if (exit.retry_yield) try self.emit(a64.yieldHint());
             try self.emitFusedFlags(exit.fused, exit.owed);
             try self.a.branch(exit.stub);
         }
@@ -4104,7 +4006,7 @@ const Compiler = struct {
         self.a.placeLabel(unchanged);
     }
 
-    fn emitLoadOperand(self: *Compiler, insn: Insn, size: Size, index: u32) Error!void {
+    pub fn emitLoadOperand(self: *Compiler, insn: Insn, size: Size, index: u32) Error!void {
         if (self.hoistedOffset(insn, size)) |offset| {
             try self.emitHoistedAccess(insn, size, index, offset, false);
             return;
@@ -4151,7 +4053,7 @@ const Compiler = struct {
         // Only these templates load all their inputs before producing v0,
         // and keep it through their final upper clear. Every other template
         // discards the forwarding fact before emitting anything.
-        self.forward_xmm = !insn.force_fallback and forwardsXmm(d);
+        self.forward_xmm = !insn.force_fallback and (forwardsXmm(d) or (self.scalar_residency and @import("scalar_residency.zig").candidate(d)));
         if (!self.forward_xmm) try vector_cache.flush(self, r_spare);
         if (isConditionalBranch(d.op)) {
             self.zero_ymm = 0;
@@ -4508,7 +4410,7 @@ const Compiler = struct {
                 try self.storeReg(.al_ax_eax_rax, false, .bits64, t0);
                 try self.storeReg(.dl_dx_edx_rdx, false, .bits64, t4);
             },
-            .div_reg32, .div_reg64, .idiv_reg32, .idiv_reg64 => try self.emitDivide(d, index),
+            .div_reg32, .div_reg64, .idiv_reg32, .idiv_reg64, .div_mem32 => try @import("scalar_completion.zig").divide(self, insn, index),
             .bt_reg_reg => try self.emitBitTest(d, .probe, false),
             .bts_reg_reg => try self.emitBitTest(d, .set, false),
             .btr_reg_reg => try self.emitBitTest(d, .reset, false),
@@ -4625,6 +4527,7 @@ const Compiler = struct {
                 try self.storeReg(d.dst_reg, false, .bits64, 0);
                 try self.emitAbortCheck(index);
             },
+            .cwde => try @import("scalar_completion.zig").cwde(self),
             .cdqe => {
                 try self.loadReg(t1, .al_ax_eax_rax, false, .bits32);
                 try self.emit(a64.sxtw(t1, t1));
@@ -4678,6 +4581,7 @@ const Compiler = struct {
                     try self.a.branchCond(fusedCondition(fused.kind, d.cond).?, taken_path);
                     try self.fused_exits.append(self.allocator, .{
                         .label = taken_path,
+                        .retry_yield = retry_yield,
                         .fused = fused,
                         // A jump back into this block - a loop's back-edge
                         // to its head - owes only what the code there reads.
@@ -5560,44 +5464,6 @@ const Compiler = struct {
         try self.storeReg(dst, false, size, t0);
     }
 
-    /// `div`/`idiv` at 32 or 64 bits when the quotient provably fits: a
-    /// zero divisor, a high half that would overflow, or a divisor of -1
-    /// (the one signed case that overflows with a fitting high half) go to
-    /// the interpreter, which raises #DE exactly as it always did.
-    fn emitDivide(self: *Compiler, d: DecodedInsn, index: u32) Error!void {
-        const size: Size = switch (d.op) {
-            .div_reg32, .idiv_reg32 => .bits32,
-            else => .bits64,
-        };
-        const signed = d.op == .idiv_reg32 or d.op == .idiv_reg64;
-        const width = arm(size);
-        const w = bits(size);
-        const slow = try self.a.createLabel();
-        const done = try self.a.createLabel();
-        try self.loadReg(t2, d.src_reg, false, size);
-        try self.a.branchIfZero(width, t2, slow);
-        try self.loadReg(t1, .al_ax_eax_rax, false, size);
-        try self.loadReg(t4, .dl_dx_edx_rdx, false, size);
-        if (signed) {
-            try self.emitChecked(a64.addSubImmediate(width, .add, true, a64.xzr, t2, 1)); // cmn t2, #1
-            try self.a.branchCond(.eq, slow);
-            try self.emit(a64.asrImm(width, t5, t1, @intCast(w - 1)));
-            try self.emit(a64.cmp(width, t5, t4));
-            try self.a.branchCond(.ne, slow);
-            try self.emit(a64.sdiv(width, t0, t1, t2));
-        } else {
-            try self.a.branchIfNonZero(width, t4, slow);
-            try self.emit(a64.udiv(width, t0, t1, t2));
-        }
-        try self.emit(a64.msub(width, t4, t0, t2, t1));
-        try self.storeReg(.al_ax_eax_rax, false, size, t0);
-        try self.storeReg(.dl_dx_edx_rdx, false, size, t4);
-        try self.a.branch(done);
-        self.a.placeLabel(slow);
-        try self.emitFallback(index);
-        self.a.placeLabel(done);
-    }
-
     const BitTestKind = enum { probe, set, reset, complement };
 
     /// `bt`/`bts`/`btr` on a register (`bit_test.applyRegister`): the index
@@ -5645,9 +5511,8 @@ const Compiler = struct {
     /// accumulator, sets the flags of `cmp acc, old`, and on a mismatch
     /// loads the accumulator with the old value; `xadd` sets the flags of
     /// the add and returns the old value in the register; `xchg` swaps.
-    /// Locked Group-1 updates use a compare-and-swap retry loop so the
-    /// complete read/compute/write remains atomic even when a future guest
-    /// scheduler runs this context beside another one.
+    /// Direct LSE updates return the committed old value for exact flags.
+    /// ADC/SBB and NEG retain their compare-and-swap retry loops.
     fn emitAtomic(self: *Compiler, insn: Insn, index: u32, form: AtomicForm) Error!void {
         if (form == .compare_exchange8b) {
             try self.emitAtomicCompareExchange8b(insn, index);
@@ -5691,9 +5556,14 @@ const Compiler = struct {
                 try self.loadReg(t0, d.src_reg, false, size);
                 try self.emit(a64.casalScalar(memSize(size), 3, t0, 2));
                 try self.emit(a64.mov(width, t2, 3));
-                try self.emit(a64.sub(width, t0, t1, t2));
-                if (size == .bits8 or size == .bits16) try self.emit(a64.ubfx(.w32, t0, t0, 0, @intCast(bits(size))));
-                try self.emitArithmeticFlags(.sub, size, t1, t2, t0, false);
+                if (self.fuse_pending) |fused| {
+                    try self.emit(a64.subs(width, t0, t1, t2));
+                    try self.beginFusedRun(fused);
+                } else {
+                    try self.emit(a64.sub(width, t0, t1, t2));
+                    if (size == .bits8 or size == .bits16) try self.emit(a64.ubfx(.w32, t0, t0, 0, @intCast(bits(size))));
+                    try self.emitArithmeticFlags(.sub, size, t1, t2, t0, false);
+                }
                 const matched = try self.a.createLabel();
                 try self.emit(a64.cmp(width, t1, t2));
                 try self.a.branchCond(.eq, matched);
@@ -5727,9 +5597,19 @@ const Compiler = struct {
                     try self.emit(a64.logicalImmediate(.w32, .andop, t5, t3, 1).?);
                     try self.emit(a64.mov(.x64, 16, t5));
                 }
+                const direct = self.atomic_direct_updates and !carry_operation;
                 const retry = try self.a.createLabel();
                 self.a.placeLabel(retry);
-                try self.emitChecked(a64.ldrImm(memSize(size), t1, t4, 0).?);
+                if (direct) {
+                    try atomic_updates.emit(self.a, memSize(size), switch (op) {
+                        .add => .add,
+                        .sub => .sub,
+                        .bit_and => .bit_and,
+                        .bit_or => .bit_or,
+                        .bit_xor => .bit_xor,
+                        else => unreachable,
+                    }, t2, t1, t4, 3);
+                } else try self.emitChecked(a64.ldrImm(memSize(size), t1, t4, 0).?);
                 switch (op) {
                     .add => try self.emit(a64.add(width, t0, t1, t2)),
                     .sub => try self.emit(a64.sub(width, t0, t1, t2)),
@@ -5740,10 +5620,12 @@ const Compiler = struct {
                     else => unreachable,
                 }
                 if (size == .bits8 or size == .bits16) try self.emit(a64.ubfx(.w32, t0, t0, 0, @intCast(bits(size))));
-                try self.emit(a64.mov(width, 3, t1));
-                try self.emit(a64.casalScalar(memSize(size), 3, t0, t4));
-                try self.emit(a64.cmp(width, 3, t1));
-                try self.a.branchCond(.ne, retry);
+                if (!direct) {
+                    try self.emit(a64.mov(width, 3, t1));
+                    try self.emit(a64.casalScalar(memSize(size), 3, t0, t4));
+                    try self.emit(a64.cmp(width, 3, t1));
+                    try self.a.branchCond(.ne, retry);
+                }
                 const kind: ArithKind = switch (op) {
                     .add => .add,
                     .sub => .sub,
@@ -5761,7 +5643,10 @@ const Compiler = struct {
                 // pointer in t6 while the value is loaded and retried.
                 try self.emit(a64.mov(.x64, t6, t4));
                 self.a.placeLabel(retry);
-                try self.emitChecked(a64.ldrImm(memSize(size), t1, t6, 0).?);
+                if (self.atomic_direct_updates) {
+                    try self.a.loadConstant(t2, if (is_inc) 1 else maskFor(size));
+                    try atomic_updates.emit(self.a, memSize(size), .add, t2, t1, t6, 3);
+                } else try self.emitChecked(a64.ldrImm(memSize(size), t1, t6, 0).?);
                 if (is_inc) {
                     try self.emitChecked(a64.addImm(width, t0, t1, 1));
                 } else {
@@ -5770,10 +5655,12 @@ const Compiler = struct {
                 if (size == .bits8 or size == .bits16) {
                     try self.emit(a64.logicalImmediate(.w32, .andop, t0, t0, maskFor(size)).?);
                 }
-                try self.emit(a64.mov(width, 3, t1));
-                try self.emit(a64.casalScalar(memSize(size), 3, t0, t6));
-                try self.emit(a64.cmp(width, 3, t1));
-                try self.a.branchCond(.ne, retry);
+                if (!self.atomic_direct_updates) {
+                    try self.emit(a64.mov(width, 3, t1));
+                    try self.emit(a64.casalScalar(memSize(size), 3, t0, t6));
+                    try self.emit(a64.cmp(width, 3, t1));
+                    try self.a.branchCond(.ne, retry);
+                }
                 // Recompute the committed value and INC/DEC flags from the
                 // successful old value; CF is preserved by this helper.
                 try self.emitIncDecCompute(size, is_inc);
@@ -5813,7 +5700,17 @@ const Compiler = struct {
         try self.emit(a64.dmbIsh());
         try self.a.branch(done);
         self.a.placeLabel(slow);
+        const fast_fused = self.fused;
+        if (self.fused != null) {
+            self.fused = null;
+            self.nzcv_live = false;
+        }
         try self.emitInterpretCall(index);
+        if (fast_fused != null) {
+            try self.a.branch(try self.exitStub(index + 1, null));
+            self.fused = fast_fused;
+            self.nzcv_live = true;
+        }
         self.a.placeLabel(done);
     }
 
@@ -6302,7 +6199,7 @@ const Compiler = struct {
         try vector_cache.store(self, index, v, r_spare);
     }
 
-    fn vectorOperands(self: *Compiler, insn: Insn, index: u32) Error!struct { lhs: a64.Reg, rhs: a64.Reg } {
+    pub fn vectorOperands(self: *Compiler, insn: Insn, index: u32) Error!struct { lhs: a64.Reg, rhs: a64.Reg } {
         if (self.forward_xmm) return .{
             .lhs = try vector_cache.operand(self, insn.decoded.xmm_src, v1, r_spare),
             .rhs = try vector_cache.operand(self, insn.decoded.xmm_src2, v2, r_spare),
@@ -6417,7 +6314,7 @@ const Compiler = struct {
     /// ZMM upper half too for the forms the EVEX executor serves. The upper
     /// files are addressed from the state base: a Zig struct's fields may be
     /// laid out in any order, so nothing assumes they follow `xmm`.
-    fn clearUpper(self: *Compiler, index: u8, op: Op) Error!void {
+    pub fn clearUpper(self: *Compiler, index: u8, op: Op) Error!void {
         const bit = @as(u32, 1) << @intCast(index);
         const ymm = self.zero_ymm & bit == 0;
         const zmm = evexRouted(op) and self.zero_zmm & bit == 0;
@@ -6955,27 +6852,12 @@ const Compiler = struct {
             return true;
         }
         if (scalarFloatForm(d.op)) |form| {
-            try self.loadScalarSource2(insn, index, form.fp, v2);
-            try self.loadXmm(v1, d.xmm_src);
-            switch (form.kind) {
-                .add => try self.emit(a64.fadd(form.fp, v3, v1, v2)),
-                .sub => try self.emit(a64.fsub(form.fp, v3, v1, v2)),
-                .mul => try self.emit(a64.fmul(form.fp, v3, v1, v2)),
-                .div => try self.emit(a64.fdiv(form.fp, v3, v1, v2)),
-                .min => {
-                    try self.emit(a64.fcmp(form.fp, v1, v2));
-                    try self.emit(a64.fcsel(form.fp, v3, v1, v2, .mi));
-                },
-                .max => {
-                    try self.emit(a64.fcmp(form.fp, v1, v2));
-                    try self.emit(a64.fcsel(form.fp, v3, v1, v2, .gt));
-                },
+            // The source loader still takes a scalar-sized memory read.
+            if (!d.is_reg_form) {
+                try self.loadScalarSource2(insn, index, form.fp, v2);
+                try self.loadXmm(v1, d.xmm_src);
             }
-            try self.emit(a64.vmov(result, v1));
-            try self.emit(a64.vinsLane(if (form.fp == .single) .s4 else .d2, result, 0, v3, 0));
-            try self.storeXmm(dst, result);
-            try self.clearUpper(dst, d.op);
-            if (touchesMemory(d)) try self.emitAbortCheck(index);
+            try @import("scalar_residency.zig").emit(self, insn, index, form, result);
             return true;
         }
         if (bitwiseForm(d.op)) |kind| {
@@ -7057,12 +6939,12 @@ const Compiler = struct {
             return true;
         }
         switch (d.op) {
-            .movups_xmm_mem => {
+            .movups_xmm_mem, .movaps_xmm_mem => {
                 try self.emitLoadVec(insn, index, result);
                 try self.storeXmm(dst, result);
                 try self.emitAbortCheck(index);
             },
-            .movups_mem_xmm => {
+            .movups_mem_xmm, .movaps_mem_xmm => {
                 try self.loadXmm(result, d.xmm_src);
                 try self.emitStoreVec(insn, index, result);
                 try self.emitAbortCheck(index);
@@ -7075,6 +6957,13 @@ const Compiler = struct {
                 try self.loadXmm(result, d.xmm_src);
                 try self.storeXmm(dst, result);
                 try self.clearUpper(dst, d.op);
+            },
+            .vpmaddwd => {
+                const operands = try self.vectorOperands(insn, index);
+                try @import("packed_madd.zig").emit(self.a, result, operands.lhs, operands.rhs);
+                try self.storeXmm(dst, result);
+                try self.clearUpper(dst, d.op);
+                if (touchesMemory(d)) try self.emitAbortCheck(index);
             },
             .vpmuludq => {
                 // `multiplyUnsignedEvenDwords`: the low dword of each qword
@@ -7589,6 +7478,7 @@ pub const Options = struct {
     internal_edges: bool = true,
     resident_self_loops: bool = true,
     resident_vectors: bool = true,
+    scalar_residency: bool = true,
     /// Set false only for differential tests of the pre-specialization
     /// PAUSE bridge. Production's PAUSE helper is register preserving.
     pause_helper_preserves_state: bool = true,
@@ -7598,6 +7488,8 @@ pub const Options = struct {
     /// Yield only on a backward JNZ immediately following LOCK CMPXCHG.
     /// False is reserved for differential translation tests.
     atomic_retry_yield_enabled: bool = true,
+    atomic_direct_updates: bool = true,
+    atomic_compare_fusion: bool = false, // offline experiment; retry timing regressed
 };
 
 /// Whether `op` transfers into or back out of a function.
@@ -7784,6 +7676,7 @@ pub fn compileWith(allocator: std.mem.Allocator, memory: *CodeMemory, layout: La
         .upper_clears_elided = pass.compiler.upper_clears_elided,
         .xmm_loads_forwarded = pass.compiler.xmm_loads_forwarded,
         .xmm_stores_elided = pass.compiler.xmm_stores_elided,
+        .scalar_resident_ops = pass.compiler.scalar_resident_ops,
     };
 }
 
@@ -7818,9 +7711,12 @@ fn emitBlock(
         .ledger = options.ledger,
         .exact_exit_flags = options.exact_exit_flags,
         .resident_vectors = options.resident_vectors,
+        .scalar_residency = options.scalar_residency,
         .pause_helper_preserves_state = options.pause_helper_preserves_state,
         .xbox_critical_section_transfer_enabled = options.xbox_critical_section_transfer_enabled,
         .atomic_retry_yield_enabled = options.atomic_retry_yield_enabled,
+        .atomic_direct_updates = options.atomic_direct_updates,
+        .atomic_compare_fusion = options.atomic_compare_fusion,
         .epilogue = try assembler.createLabel(),
         .exit_path = try assembler.createLabel(),
         .epilogue_path = try assembler.createLabel(),

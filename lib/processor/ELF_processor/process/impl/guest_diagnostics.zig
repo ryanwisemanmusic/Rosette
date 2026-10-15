@@ -2527,6 +2527,7 @@ pub fn reportGuestThreads(self: *const ElfState) void {
     });
     var spinning_threads: usize = 0;
     for (self.windows_guest_threads, 0..) |*thread, index| {
+        thread.host_cpu.report(index, thread.handle, thread.nameText());
         if (!__process_isLiveWindowsGuestThread(thread.status)) continue;
         var where: [__process_guest_symbol_text_bytes]u8 = undefined;
         var start: [__process_guest_symbol_text_bytes]u8 = undefined;

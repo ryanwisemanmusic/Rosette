@@ -19,7 +19,7 @@ const register_preservation_program = [_]u8{
     0x48, 0xFF, 0xC9, 0x75, 0xD5, // dec rcx; loop
 };
 
-fn create(enabled: bool, bundle: usize) !*ElfState {
+pub fn create(enabled: bool, bundle: usize) !*ElfState {
     const s = try t.allocator.create(ElfState);
     s.* = ElfState.init(t.allocator);
     s.parallel_guest_execution = true;
@@ -42,12 +42,12 @@ fn create(enabled: bool, bundle: usize) !*ElfState {
     s.configureWindowsExecutableRanges(&.{.{ .guest_base = code, .length = bundle * 2 + tail.len }});
     return s;
 }
-fn destroy(s: *ElfState) void {
+pub fn destroy(s: *ElfState) void {
     s.setParallelGuestExecution(false);
     s.deinit();
     t.allocator.destroy(s);
 }
-fn seed(s: *ElfState, loops: u64, hints: u64) void {
+pub fn seed(s: *ElfState, loops: u64, hints: u64) void {
     s.regs = .{ .rip = code, .rsp = base + 0x40000, .rcx = loops, .rbx = 0xDEADBEEF, .r12 = 0x12345678, .rflags = 0x246 };
     s.windows_guest_threads[3].pause_hints = hints;
     s.windows_guest_threads[3].pause_hints_local = hints;
@@ -55,7 +55,7 @@ fn seed(s: *ElfState, loops: u64, hints: u64) void {
     s.windows_slice_pause_yield = false;
 }
 const Result = struct { steps: u64 = 0, retired: u64 = 0, yields: u64 = 0, elapsed_ns: u64 = 0 };
-fn run(s: *ElfState, bundle: usize, loops: u64, host_yield: bool) !Result {
+pub fn run(s: *ElfState, bundle: usize, loops: u64, host_yield: bool) !Result {
     var r: Result = .{};
     const started = I._monotonicNanoseconds();
     while (s.regs.rcx != 0 and r.steps < loops * (bundle + 5) + 100) {

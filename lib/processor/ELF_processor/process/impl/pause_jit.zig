@@ -6,11 +6,13 @@ const jit = @import("block_jit.zig");
 const ElfState = process.ElfState;
 const I = process.__ProcessInternals;
 
-pub fn canCompile(self: *ElfState, d: I._block_jit.DecodedInsn, bytes: []const u8) bool {
+pub fn policyReady(self: *ElfState) bool {
     return self.parallel_guest_execution and self.windows_idle_yield.pause_translated_enabled and
         self.guest_clock.source == .host_monotonic and !self.block_jit_verify_memory and !self.diagnose_abi and !self.windowsMemoryTraceLive() and !jit.blockJitTracingActive(self) and
-        jit.parallelWorkerSlot(self) != null and
-        d.op == .nop and d.len == 2 and bytes.len >= 2 and bytes[0] == 0xF3 and bytes[1] == 0x90;
+        jit.parallelWorkerSlot(self) != null;
+}
+pub fn canCompile(self: *ElfState, d: I._block_jit.DecodedInsn, bytes: []const u8) bool {
+    return policyReady(self) and d.op == .nop and d.len == 2 and bytes.len >= 2 and bytes[0] == 0xF3 and bytes[1] == 0x90;
 }
 
 pub fn canBackoff(self: *ElfState, capturing: bool) bool {
