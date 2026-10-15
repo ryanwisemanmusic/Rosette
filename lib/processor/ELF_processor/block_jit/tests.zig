@@ -589,7 +589,6 @@ fn referenceBinary(op: BinaryOp, size: Size, a: u64, b: u64, rflags: *u32) u64 {
     }
     return r;
 }
-
 test "register arithmetic produces the interpreter's flags at every width" {
     var h = try TestHarness.init();
     defer h.deinit();
@@ -4866,4 +4865,5 @@ test {
     _ = @import("packed_madd.zig");
     _ = @import("completion_tests.zig");
     _ = @import("scalar_residency_tests.zig");
+    _ = @import("rearrangement_residency_tests.zig");
 }

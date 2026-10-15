@@ -3533,6 +3533,7 @@ pub fn reportWindowsUpstreamWaitPriority(self: *const ElfState) void {
 pub fn reportWindowsWaitCost(self: *const ElfState) void {
     const ledger = &self.windows_wait_cost;
     if (ledger.count == 0 and ledger.dropped_sites == 0 and ledger.unmatched_signals == 0) return;
+    ledger.signal_index.report();
     var waits: u64 = 0;
     var active: u64 = 0;
     var signals: u64 = 0;

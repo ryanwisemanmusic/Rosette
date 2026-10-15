@@ -273,7 +273,8 @@ pub const Table = struct {
     /// block that begins mid-page is exactly where that happens.
     pub fn faults(self: *const Table, address: u64, width: u8, is_write: bool) bool {
         const first = @intFromEnum(self.get(address));
-        const last = if (width > 1) @intFromEnum(self.get(address +% (width - 1))) else first;
+        const end = address +% (width -| 1);
+        const last = if (width > 1 and (!@import("protection_words.zig").same_page or address >> page_shift != end >> page_shift)) @intFromEnum(self.get(end)) else first;
         const worst = @max(first, last);
         return worst == @intFromEnum(Protection.no_access) or
             (is_write and worst == @intFromEnum(Protection.read_only));
@@ -321,6 +322,14 @@ pub const Table = struct {
                 self.leaves[chunk_index].store(leaf_address, .release);
             }
             const leaf: *[words_per_chunk]Word = @ptrFromInt(leaf_address);
+            if (@import("protection_words.zig").enabled) {
+                const word_index: usize = @intCast((page & (pages_per_chunk - 1)) / pages_per_word);
+                const old_word = leaf[word_index].load(.monotonic);
+                const consumed = @import("protection_words.zig").update(self, leaf, chunk_index, page, last_page, protection);
+                outcome.pages_changed +|= @import("protection_words.zig").changed(old_word, leaf[word_index].load(.monotonic));
+                page += consumed;
+                continue;
+            }
             const index: usize = @intCast(page & (pages_per_chunk - 1));
             const shift: u6 = @intCast((index % pages_per_word) * 2);
             const word = &leaf[index / pages_per_word];

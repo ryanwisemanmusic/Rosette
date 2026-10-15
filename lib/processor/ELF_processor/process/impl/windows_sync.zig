@@ -169,16 +169,7 @@ pub fn endWindowsHandleWaitAccounting(self: *ElfState, thread: *__process_Window
 }
 
 pub fn noteWindowsWaitSignal(self: *ElfState, key: u64) void {
-    const thread_handle = if (process_impl_lifecycle.guestContextField(self, "windows_active_guest_thread_slot").*) |slot|
-        self.windows_guest_threads[slot].handle
-    else
-        process_impl_lifecycle.guestContextField(self, "active_guest_thread").*;
-    self.windows_wait_cost.signal(
-        key,
-        process_impl_run_reporting.totalInterpretedSteps(self),
-        process_impl_lifecycle.windowsGuestClockTicks(self),
-        .{ .thread_handle = thread_handle, .rip = process_impl_lifecycle.guestContextField(self, "last_instruction_rip").* },
-    );
+    @import("wait_signal.zig").note(self, key);
 }
 
 pub fn endActiveWindowsSrwWaitAccounting(self: *ElfState) void {

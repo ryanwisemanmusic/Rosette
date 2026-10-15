@@ -236,17 +236,11 @@ pub const Ledger = struct {
     dropped_sites: u64 = 0,
     dropped_events: u64 = 0,
     unmatched_signals: u64 = 0,
+    signal_index: @import("wait_signal_index.zig").Index = .{},
 
     fn find(self: *const Ledger, key: u64, kind: WaitKind) ?usize {
         for (self.sites[0..self.count], 0..) |site, index| {
             if (site.key == key and site.kind == kind) return index;
-        }
-        return null;
-    }
-
-    fn findKey(self: *const Ledger, key: u64) ?usize {
-        for (self.sites[0..self.count], 0..) |site, index| {
-            if (site.key == key) return index;
         }
         return null;
     }
@@ -299,7 +293,7 @@ pub const Ledger = struct {
     /// still useful evidence: it means the signal happened outside the
     /// bounded wait sample or before the waiter registered.
     pub fn signal(self: *Ledger, key: u64, step: u64, _: u64, evidence: SignalEvidence) void {
-        const index = self.findKey(key) orelse {
+        const index = self.signal_index.find(self.sites[0..self.count], key) orelse {
             self.unmatched_signals +|= 1;
             return;
         };

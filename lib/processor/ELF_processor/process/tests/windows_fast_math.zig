@@ -44,9 +44,9 @@ test "fast math production results and ABI match general dispatch in every MXCSR
     var prng = std.Random.DefaultPrng.init(0xE2F064);
     const random = prng.random();
     for ([_]u32{ 0x1F80, 0x3F80, 0x5F80, 0x7F80, 0x9FC0, 0xBFC0, 0xDFC0, 0xFFC0 }) |mxcsr| {
-        for ([_][]const u8{ "exp2", "exp2f" }) |name| {
+        for ([_][]const u8{ "exp2", "exp2f", "log10" }) |name| {
             for (0..256) |index| {
-                const input: u64 = if (index < edges.len) (if (name.len == 5) float_edges[index] else edges[index]) else random.int(u64);
+                const input: u64 = if (index < edges.len) (if (std.mem.eql(u8, name, "exp2f")) float_edges[index] else edges[index]) else random.int(u64);
                 seed(state, input);
                 state.regs.mxcsr = mxcsr;
                 fp.applyGuestMxcsr(mxcsr);
@@ -73,7 +73,7 @@ test "fast math production results and ABI match general dispatch in every MXCSR
             }
         }
     }
-    try testing.expectEqual(@as(u64, 4096), state.windows_fast_math.total());
+    try testing.expectEqual(@as(u64, 6144), state.windows_fast_math.total());
 }
 
 test "fast math refuses diagnostics lock recursion and a rebound IAT without side effects" {

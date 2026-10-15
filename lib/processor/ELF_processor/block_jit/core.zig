@@ -2165,6 +2165,7 @@ const Compiler = struct {
     /// lanes. Facts are local to straight-line code, never an entry/edge.
     resident_vectors: bool = true,
     scalar_residency: bool = true,
+    rearrangement_residency: bool = true,
     scalar_resident_ops: u32 = 0,
     /// The PAUSE scheduling callback only updates the register-file RIP and
     /// flags; unlike an arbitrary interpreter escape, it leaves every guest
@@ -4053,7 +4054,7 @@ const Compiler = struct {
         // Only these templates load all their inputs before producing v0,
         // and keep it through their final upper clear. Every other template
         // discards the forwarding fact before emitting anything.
-        self.forward_xmm = !insn.force_fallback and (forwardsXmm(d) or (self.scalar_residency and @import("scalar_residency.zig").candidate(d)));
+        self.forward_xmm = !insn.force_fallback and (forwardsXmm(d) or (self.scalar_residency and @import("scalar_residency.zig").candidate(d)) or (self.rearrangement_residency and @import("rearrangement_residency.zig").candidate(d)));
         if (!self.forward_xmm) try vector_cache.flush(self, r_spare);
         if (isConditionalBranch(d.op)) {
             self.zero_ymm = 0;
@@ -7479,6 +7480,7 @@ pub const Options = struct {
     resident_self_loops: bool = true,
     resident_vectors: bool = true,
     scalar_residency: bool = true,
+    rearrangement_residency: bool = true,
     /// Set false only for differential tests of the pre-specialization
     /// PAUSE bridge. Production's PAUSE helper is register preserving.
     pause_helper_preserves_state: bool = true,
@@ -7712,6 +7714,7 @@ fn emitBlock(
         .exact_exit_flags = options.exact_exit_flags,
         .resident_vectors = options.resident_vectors,
         .scalar_residency = options.scalar_residency,
+        .rearrangement_residency = options.rearrangement_residency,
         .pause_helper_preserves_state = options.pause_helper_preserves_state,
         .xbox_critical_section_transfer_enabled = options.xbox_critical_section_transfer_enabled,
         .atomic_retry_yield_enabled = options.atomic_retry_yield_enabled,
