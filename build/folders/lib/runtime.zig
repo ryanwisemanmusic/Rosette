@@ -555,17 +555,30 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     });
     windows_vulkan_integration_mod.addImport("windows_guest_forwarder", windows_vulkan_adapter_mod);
     windows_vulkan_integration_mod.addImport("gpu", gpu_mod);
+    windows_vulkan_integration_mod.addImport("dyld", dyld_mod);
     windows_vulkan_integration_mod.addImport("elf_processor_state", windows_graphics_state_test_mod);
     const windows_vulkan_integration_test = b.addTest(.{ .root_module = windows_vulkan_integration_mod });
     const run_windows_vulkan_integration_test = b.addRunArtifact(windows_vulkan_integration_test);
     windows_vulkan_adapter_check.dependOn(&run_windows_vulkan_integration_test.step);
     check_step.dependOn(&run_windows_vulkan_integration_test.step);
+    const fifo_test = b.addTest(.{ .root_module = gpu_mod, .filters = &.{ "FIFO", "Vulkan command worker", "Vulkan worker", "command flow", "spinUntil", "drain", "barrier" } });
+    b.step("vulkan-fifo-check", "Check the hybrid Vulkan command FIFO and its handoff offline").dependOn(&b.addRunArtifact(fifo_test).step);
+    // Xenia's per-draw Vulkan call stream through the whole PE route, CPU only.
+    const draw_stream_test = b.addTest(.{ .root_module = windows_vulkan_integration_mod, .filters = &.{ "draw stream", "Vulkan command lane" } });
+    const run_draw_stream_test = b.addRunArtifact(draw_stream_test);
+    b.step("vulkan-draw-stream-check", "Replay Xenia's per-draw Vulkan call stream through the PE route offline").dependOn(&run_draw_stream_test.step);
     check_step.dependOn(&run_windows_vulkan_adapter_test.step);
     const dyld_test = b.addTest(.{ .root_module = dyld_mod });
     const run_dyld_test = b.addRunArtifact(dyld_test);
     const dyld_check = b.step("dyld-check", "Run the dynamic linker and Vulkan loader bridge tests");
     dyld_check.dependOn(&run_dyld_test.step);
     check_step.dependOn(&run_dyld_test.step);
+    // Every 2026-10-16 Vulkan command-path change in one small gate.
+    const command_path_check = b.step("vulkan-command-path-check", "Check the Vulkan command-path changes offline: FIFO handoff, draw stream, pipeline memo, bridge clock");
+    command_path_check.dependOn(&b.addRunArtifact(fifo_test).step);
+    command_path_check.dependOn(&run_draw_stream_test.step);
+    command_path_check.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = dyld_mod, .filters = &.{"pipeline memo"} })).step);
+    command_path_check.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = windows_vulkan_adapter_mod, .filters = &.{"bridge host-time"} })).step);
     // A small gate for the FSI bridge that avoids the full CPU/OS suite.
     // The full check still includes these tests through gpu_test/dyld_test.
     const fsi_check = b.step("fsi-check", "Run the FSI support and forwarder regression tests");

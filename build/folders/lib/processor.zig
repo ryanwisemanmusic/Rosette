@@ -180,6 +180,32 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const yield_check = b.step("windows-yield-check", "Check zero-delay NT imports and bounded PAUSE scheduling offline");
     const yield_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "NT zero-delay", "PAUSE", "parallel pause", "an NT delay", "NtDelayExecution", "back-off", "Sleep(0)", "worker yield backoff", "native shader compile", "frame cost" } });
     yield_check.dependOn(&b.addRunArtifact(yield_test).step);
+    const pause_check = b.step("pause-cpu-check", "Check translated PAUSE boundaries and CPU backoff offline");
+    const pause_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "translated PAUSE", "PAUSE", "spin watch", "chain", "native hop" } });
+    pause_check.dependOn(&b.addRunArtifact(pause_test).step);
+    const critical_cpu_check = b.step("critical-cpu-check", "Check transient PAUSE admission and scalar floating residency offline");
+    const critical_cpu_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "PAUSE policy recheck", "scalar residency", "translated PAUSE", "scalar float", "scalar arithmetic" } });
+    critical_cpu_check.dependOn(&b.addRunArtifact(critical_cpu_test).step);
+    const frame_work_check = b.step("frame-work-check", "Check ordinary import metadata and fence host CPU offline");
+    const frame_work_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "import metadata", "worker host CPU", "native Vulkan refusal", "Windows import ABI", "registered import tail" } });
+    frame_work_check.dependOn(&b.addRunArtifact(frame_work_test).step);
+    const routing_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "wait lookup", "worker host CPU", "NT event", "NT wait", "wait object", "mutex ownership" } });
+    b.step("import-routing-check", "Check cached wait-object lookup with ordinary NT semantics").dependOn(&b.addRunArtifact(routing_test).step);
+    const chain_layout_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "native first successor", "direct scalar paths", "flags", "fused", "carry", "borrow", "shift", "rotate", "register arithmetic", "cached register", "native hops", "emitted code writes", "arithmetic throughput", "natural scalar lanes", "locked", "exchange", "TSO", "internal edge" } });
+    b.step("native-chain-layout-check", "Check native chain branch layout and ordinary state publication offline").dependOn(&b.addRunArtifact(chain_layout_test).step);
+    const arithmetic_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "arithmetic throughput", "natural scalar lanes", "TLB unaligned lanes", "register arithmetic", "flags", "fused", "carry", "borrow", "internal edge", "native hops", "locked", "exchange", "TSO" } });
+    b.step("arithmetic-throughput-check", "Check exact eager arithmetic flags and native CPU throughput").dependOn(&b.addRunArtifact(arithmetic_test).step);
+    const cpu_throughput_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "CPU throughput", "fast math", "rearrangement residency", "protection", "wait cost" } });
+    b.step("cpu-throughput-check", "Check packed protection updates, signal indexing, math and vector residency offline").dependOn(&b.addRunArtifact(cpu_throughput_test).step);
+    const completion_check = b.step("native-completion-check", "Check native scalar/vector completion and sampled timing maxima offline");
+    const completion_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "native completion", "sampled timing maximum", "histogram counts", "ordered vector TLB", "vector loads and stores", "legacy MOVUPS", "divides", "division", "guarded divide" } });
+    completion_check.dependOn(&b.addRunArtifact(completion_test).step);
+    const atomic_check = b.step("atomic-cpu-check", "Check exact native atomic templates and ordering offline");
+    const atomic_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "atomic update", "atomic compare", "atomic failed compare", "locked", "cmpxchg", "native atomic", "atomic store", "TSO", "worker host CPU" } });
+    atomic_check.dependOn(&b.addRunArtifact(atomic_test).step);
+    const register_check = b.step("register-import-check", "Check fused registered import tail jumps offline");
+    const register_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "registered import tail", "fast math", "NT zero-delay" } });
+    register_check.dependOn(&b.addRunArtifact(register_test).step);
     const worker_yield_mod = b.createModule(.{
         .root_source_file = b.path("../lib/processor/ELF_processor/process/impl/worker_yield_bench.zig"),
         .target = target,
