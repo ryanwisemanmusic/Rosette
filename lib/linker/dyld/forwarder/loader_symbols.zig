@@ -1655,10 +1655,12 @@ pub fn vulkanTopologyLabel(topology: u32) []const u8 {
 
 pub fn trackedGraphicsPipeline(self: anytype, real: u64) ?*const TrackedGraphicsPipeline {
     if (real == 0) return null;
-    for (&self.tracked_graphics_pipelines) |*record| {
-        if (record.real == real) return record;
-    }
-    return null;
+    const pipeline_lookup = __ForwarderInternals._forwarder_pipeline_lookup;
+    const index = if (comptime @typeInfo(@TypeOf(self)).pointer.is_const)
+        pipeline_lookup.scan(&self.tracked_graphics_pipelines, real)
+    else
+        self.tracked_pipeline_lookup.find(&self.tracked_graphics_pipelines, real);
+    return &self.tracked_graphics_pipelines[index orelse return null];
 }
 
 pub fn trackedPipelineLayout(self: anytype, real: u64) ?*const TrackedPipelineLayout {
@@ -2085,6 +2087,7 @@ pub fn rememberGraphicsPipeline(self: anytype, real: u64, root: *const abi.Graph
     for (&self.tracked_graphics_pipelines) |*record| {
         if (record.real == real or record.real == 0) {
             record.* = metadata;
+            self.tracked_pipeline_lookup.invalidate();
             return;
         }
     }
@@ -2100,6 +2103,7 @@ pub fn forgetGraphicsPipeline(self: anytype, real: u64) void {
     for (&self.tracked_graphics_pipelines) |*record| {
         if (record.real == real) record.* = .{};
     }
+    self.tracked_pipeline_lookup.invalidate();
 }
 
 pub fn noteCommandPipelineState(self: anytype, command_buffer: u64, guest_pipeline: u64, real_pipeline: u64, bind_point: u64) void {
@@ -2131,7 +2135,9 @@ pub fn noteCommandPipelineState(self: anytype, command_buffer: u64, guest_pipeli
     trace.pipeline_bind_point = @intCast(bind_point);
     trace.pipeline_bound = true;
     trace.pipeline_topology_known = false;
-    if (self.trackedGraphicsPipeline(real_pipeline)) |metadata| {
+    // The module function, not the const `Forwarder` wrapper: the memo
+    // needs the mutable forwarder to record what the scan found.
+    if (trackedGraphicsPipeline(self, real_pipeline)) |metadata| {
         trace.pipeline_layout_real = metadata.layout;
         trace.pipeline_repair_real = metadata.repair_real;
         trace.pipeline_guest_output_candidate = metadata.guest_output_candidate;

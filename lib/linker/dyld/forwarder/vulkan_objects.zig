@@ -1281,6 +1281,9 @@ pub fn printVulkanCommandAdmission(self: anytype) void {
             );
             machoCapturePrint("macho-processor: VULKAN OWNED COMMAND FLOW: descriptor_snapshots={d} push_snapshots={d} queue_capacity={d}; arrays copied before admission; update/free/reset/destroy/submit and FSI continuation boundaries retain FIFO drains; handle_lookup=one_snapshot_cache/key_prefilter\n", .{ stats.descriptor_snapshots, stats.push_snapshots, async_vulkan_command.queue_capacity });
             machoCapturePrint("macho-processor: VULKAN BARRIER COMMAND FLOW: barrier_snapshots={d}; small pointer-free pipeline barriers retain Vulkan stage/access/layout/ownership semantics in the recording FIFO; larger barriers drain and run synchronously\n", .{stats.barrier_snapshots});
+            const handoff = async_vulkan_command.handoff;
+            const memo = &self.tracked_pipeline_lookup;
+            machoCapturePrint("macho-processor: VULKAN COMMAND HANDOFF: spin_then_park=enabled:{} worker_spin_ns={d} drain_spin_ns={d} parks={d} spin_pickups={d} drain_spin_hits={d} work_signals={d}; pipeline_memo=enabled:{} hits={d} misses={d}; counts, not saved time; same FIFO order and drains\n", .{ handoff.enabled, handoff.worker_spin_ns, handoff.drain_spin_ns, stats.parks, stats.spin_pickups, stats.drain_spin_hits, stats.work_signals, __ForwarderInternals._forwarder_pipeline_lookup.enabled, memo.hits, memo.misses });
         } else {
             machoCapturePrint(
                 "macho-processor: PRESENT CHAIN:   hybrid_command_worker=enabled:{} submitted=0 completed=0 sequence(queued/completed)=0/0 batches=0 max_batch=0 max_queue_depth=0 queue_full_fallbacks={d} worker_stopped_fallbacks={d} ordering_barriers_with_work={d}\n",

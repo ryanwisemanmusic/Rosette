@@ -556,12 +556,18 @@ fn lastDlError() []const u8 {
 /// cannot see the subsequent native dispatch by itself.  This hook records
 /// the shared forwarder's call sequence without turning normal command
 /// traffic into a log stream.
+/// Read once: this runs on every Vulkan dispatch, and `getenv` walks the
+/// environment under libc's lock (4% of a replayed draw stream's CPU).
+var vulkan_dispatch_trace_setting = std.atomic.Value(u8).init(0);
+pub var vulkan_dispatch_trace_cached = true; // internal control for offline comparison
 fn vulkanDispatchTraceEnabled() bool {
-    const raw = std.c.getenv("ROSETTE_ELF_GRAPHICS_TRACE") orelse return false;
-    const value = std.mem.span(raw);
-    return std.mem.eql(u8, value, "1") or
-        std.ascii.eqlIgnoreCase(value, "true") or
-        std.ascii.eqlIgnoreCase(value, "yes");
+    const known = if (vulkan_dispatch_trace_cached) vulkan_dispatch_trace_setting.load(.monotonic) else 0;
+    if (known != 0) return known == 2;
+    const raw = std.c.getenv("ROSETTE_ELF_GRAPHICS_TRACE");
+    const value = if (raw) |pointer| std.mem.span(pointer) else "";
+    const enabled = std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "yes");
+    vulkan_dispatch_trace_setting.store(if (enabled) 2 else 1, .monotonic);
+    return enabled;
 }
 
 const GuestSymbolKind = enum {
@@ -2937,6 +2943,7 @@ pub const Forwarder = struct {
     tracked_framebuffers: [MAX_REAL_FRAMEBUFFERS]TrackedFramebuffer = [_]TrackedFramebuffer{.{}} ** MAX_REAL_FRAMEBUFFERS,
     tracked_command_targets: [MAX_REAL_COMMAND_BUFFERS]TrackedCommandTargets = [_]TrackedCommandTargets{.{}} ** MAX_REAL_COMMAND_BUFFERS,
     tracked_graphics_pipelines: [MAX_REAL_PIPELINES]TrackedGraphicsPipeline = [_]TrackedGraphicsPipeline{.{}} ** MAX_REAL_PIPELINES,
+    tracked_pipeline_lookup: forwarder_pipeline_lookup.Cache = .{},
     tracked_pipeline_layouts: [MAX_REAL_PIPELINE_LAYOUTS]TrackedPipelineLayout = [_]TrackedPipelineLayout{.{}} ** MAX_REAL_PIPELINE_LAYOUTS,
     /// State-trace counters are separate from command-shape counters.  A
     /// command can be forwarded successfully while carrying a malformed
@@ -6592,6 +6599,7 @@ pub const __ForwarderInternals = struct {
     pub const _vkErrorOutOfHostMemory = vkErrorOutOfHostMemory;
     pub const _vkErrorOutOfHostMemorySigned = vkErrorOutOfHostMemorySigned;
     pub const _vulkanDispatchTraceEnabled = vulkanDispatchTraceEnabled;
+    pub const _forwarder_pipeline_lookup = forwarder_pipeline_lookup;
     pub const _vulkanLoaderCandidates = vulkanLoaderCandidates;
     pub const _vulkanNameHash = vulkanNameHash;
     pub const _vulkan_capture = &vulkan_capture;
@@ -6641,6 +6649,7 @@ const forwarder_impl_graphics_observation = @import("forwarder/graphics_observat
 const forwarder_impl_present_routing = @import("forwarder/present_routing.zig");
 const forwarder_impl_texture_capture = @import("forwarder/texture_capture.zig");
 const forwarder_impl_runtime_dispatch = @import("forwarder/runtime_dispatch.zig");
+pub const forwarder_pipeline_lookup = @import("forwarder/pipeline_lookup.zig");
 
 /// FNV-1a 64-bit. Mirrors `dispatch.importNameHash`: the forwarder cannot
 /// import the import-handler module, so the five-line hash is repeated here
@@ -7532,4 +7541,5 @@ fn nulTerminate(buffer: []u8, value: []const u8) ?[*:0]const u8 {
 
 test {
     _ = @import("forwarder/tests.zig");
+    _ = forwarder_pipeline_lookup;
 }

@@ -1454,6 +1454,7 @@ pub fn clearRealVulkanObjectMaps(self: anytype) void {
     @memset(&self.tracked_framebuffers, .{});
     @memset(&self.tracked_command_targets, .{});
     @memset(&self.tracked_graphics_pipelines, .{});
+    self.tracked_pipeline_lookup.invalidate();
     @memset(&self.tracked_pipeline_layouts, .{});
 }
 
@@ -1715,6 +1716,7 @@ pub fn destroyRealDevice(self: anytype) void {
     @memset(&self.tracked_framebuffers, .{});
     @memset(&self.tracked_command_targets, .{});
     @memset(&self.tracked_graphics_pipelines, .{});
+    self.tracked_pipeline_lookup.invalidate();
     @memset(&self.tracked_pipeline_layouts, .{});
     // Destroy the device.
     if (self.real_vulkan.fn_ptrs.destroy_device) |destroy| {

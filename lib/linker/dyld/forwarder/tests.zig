@@ -3439,4 +3439,5 @@ test "Vulkan device provenance rejects a lost native device" {
 
 test {
     _ = @import("shader_compile_tests.zig");
+    _ = @import("pipeline_lookup_tests.zig");
 }
