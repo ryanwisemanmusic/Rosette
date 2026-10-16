@@ -16,6 +16,7 @@ const register_file = @import("windows_guest_forwarder/context/register_file.zig
 const windows_abi = @import("windows_guest_forwarder/abi/microsoft_to_sysv.zig");
 pub const route_metadata = @import("windows_guest_forwarder/abi/route_metadata.zig");
 const surface_calls_module = @import("windows_guest_forwarder/diagnostics/surface_calls.zig");
+pub const bridge_route = @import("windows_guest_forwarder/abi/bridge_route.zig");
 
 const log = std.log.scoped(.windows_guest_vulkan);
 
@@ -91,6 +92,10 @@ pub const Bridge = struct {
     scratch_stacks: [scratch_stack_cache_depth]u64 = @splat(0),
     scratch_stack_depth: usize = 0,
     scratch_stack_busy: [scratch_stack_cache_depth]bool = @splat(false),
+    /// Leading stack-argument slots of each cached scratch stack that may
+    /// hold a nonzero value; every later slot is known to be zero. A fresh
+    /// stack's contents are unknown, so it starts with all of them.
+    scratch_stack_dirty: [scratch_stack_cache_depth]u8 = @splat(max_stack_arguments),
     scratch_stack_allocations: u64 = 0,
     scratch_stack_reuses: u64 = 0,
     scratch_stack_overflow_allocations: u64 = 0,
@@ -133,6 +138,13 @@ pub const Bridge = struct {
             break;
         }
         self.scratch_stack_depth -= 1;
+    }
+
+    fn cachedScratchIndex(self: *const Bridge, stack: u64) ?usize {
+        for (self.scratch_stacks, 0..) |cached, index| {
+            if (cached == stack) return index;
+        }
+        return null;
     }
 
     fn normalizeMicrosoftArgument(self: *Bridge, name: []const u8, signature: vulkan_contract.argument_widths.Signature, index: usize, raw: u64) u64 {
@@ -456,11 +468,11 @@ pub const Bridge = struct {
         self.dispatch_attempts +|= 1;
         const outermost = self.dispatch_depth == 0;
         self.dispatch_depth +|= 1;
-        const started_ns: u64 = if (outermost) gpu.vulkan.transport_timing.nowNs() else 0;
+        const started_ns: u64 = if (outermost) bridge_route.durationNs() else 0;
         defer {
             self.dispatch_depth -|= 1;
             if (outermost and started_ns != 0) {
-                const now = gpu.vulkan.transport_timing.nowNs();
+                const now = bridge_route.durationNs();
                 if (now >= started_ns) {
                     const spent = now - started_ns;
                     self.host_ns +|= spent;
@@ -528,6 +540,7 @@ pub const Bridge = struct {
         // Preserve the original return-store position before reading arguments.
         state.write64(scratch_stack, 0);
         // Read declared parameters, not entire untyped eight-byte values.
+        const scratch_index = self.cachedScratchIndex(scratch_stack);
         // DWORD stack stores leave the upper half unspecified; forwarding
         // that half made count=2 become 0x1_00000002 and dropped every bind.
         // Normalize registers too, while preserving full 64-bit pointers,
@@ -547,9 +560,19 @@ pub const Bridge = struct {
             arguments[index] = self.normalizeMicrosoftArgument(name, signature, index, raw);
         }
         if (normalization_before != self.scalar_width_normalizations) self.scalar_width_normalized_calls +|= 1;
-        for (0..max_stack_arguments) |index| {
+        // Every slot past the call's own arguments must read zero, as the
+        // original 16-slot copy left it. A cached stack remembers how many of
+        // its leading slots the last call could have made nonzero, so only
+        // this call's arguments and those slots are written.
+        const needed: usize = signature.argument_count -| 6;
+        const written: usize = if (bridge_route.scratch_enabled and scratch_index != null)
+            @max(needed, self.scratch_stack_dirty[scratch_index.?])
+        else
+            max_stack_arguments;
+        for (0..written) |index| {
             state.write64(scratch_stack +| 8 +| @as(u64, @intCast(index * 8)), arguments[index + 6]);
         }
+        if (scratch_index) |index| self.scratch_stack_dirty[index] = @intCast(if (bridge_route.scratch_enabled) needed else max_stack_arguments);
 
         const mapped = windows_abi.mapArguments(
             .{
@@ -830,6 +853,7 @@ test "Xenia Windows GPU and UI entry points have a bridge dispatch contract" {
 
 test {
     _ = windows_abi;
+    _ = bridge_route;
 }
 
 test "Windows proc lookup keeps absent commands null and returns Windows thunks" {

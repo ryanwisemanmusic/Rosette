@@ -5,6 +5,7 @@ const Bridge = @import("windows_guest_forwarder").Bridge;
 const abi = @import("gpu").vulkan.abi;
 test {
     _ = @import("windows_guest_forwarder_routing_tests.zig");
+    _ = @import("windows_guest_forwarder_draw_stream_tests.zig");
 }
 
 test "PE Vulkan mapped memory retains native byte identity across stores and unmap" {

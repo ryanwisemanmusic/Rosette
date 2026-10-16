@@ -5,6 +5,7 @@ const std = @import("std");
 const abi = @import("abi.zig");
 pub const owned = @import("owned_command_payloads.zig");
 pub const barriers = @import("barrier_payload.zig");
+pub const handoff = @import("fifo_handoff.zig");
 const queued_command = @import("queued_command.zig");
 
 /// The dispatch gate and command implementation share this list. Snapshot
@@ -91,6 +92,12 @@ pub const Stats = struct {
     completed_sequence: u64,
     descriptor_snapshots: u64,
     push_snapshots: u64,
+    /// Times the worker slept on its condition variable.
+    parks: u64 = 0,
+    /// Commands the worker found while polling, without a wake signal.
+    spin_pickups: u64 = 0,
+    /// Ordering barriers satisfied by polling, without sleeping.
+    drain_spin_hits: u64 = 0,
 };
 
 pub const Worker = struct {
@@ -124,6 +131,15 @@ pub const Worker = struct {
     stopping: bool = false,
     thread: ?std.Thread = null,
     barrier_snapshots: u64 = 0,
+    /// The worker is asleep in `work_available`; only then does a
+    /// submission need to signal (see `fifo_handoff`).
+    parked: bool = false,
+    parks: u64 = 0,
+    spin_pickups: u64 = 0,
+    drain_spin_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// `last_submitted_sequence`, published for the polling worker.
+    submitted_atomic: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn start(self: *Worker) (std.Thread.SpawnError || error{AlreadyStarted})!void {
         if (self.thread != null) return error.AlreadyStarted;
@@ -141,7 +157,7 @@ pub const Worker = struct {
     // barrier case crossed its inlining threshold. Admission still copies the
     // selected payload under the mutex before the caller's storage expires.
     inline fn submitBorrowed(self: *Worker, job: *const Job) Submission {
-        lock(&self.mutex);
+        handoff.lockSpinning(&self.mutex);
         if (self.stopping) {
             unlock(&self.mutex);
             return .stopped;
@@ -166,10 +182,12 @@ pub const Worker = struct {
             .push_constants => self.push_snapshots +|= 1,
             else => {},
         }
-        // The worker sleeps only while the queue is empty. Submissions to a
-        // nonempty queue are already covered by that first wake and need no
-        // pthread condition signal (millions of redundant calls per run).
-        if (was_empty) {
+        self.submitted_atomic.store(sequence, .release);
+        // The worker sleeps only while the queue is empty, and with the
+        // spin-then-park handoff only after it has polled for a while: a
+        // worker that is running or polling sees this submission without a
+        // pthread condition signal (millions of system calls per run).
+        if (if (handoff.enabled) self.parked else was_empty) {
             signal(&self.work_available);
             self.work_signals +|= 1;
         }
@@ -195,7 +213,20 @@ pub const Worker = struct {
     /// Wait until all calls through `sequence` have run on the Vulkan thread.
     pub fn drainThrough(self: *Worker, sequence: u64) void {
         if (self.completedThrough(sequence)) return;
-        lock(&self.mutex);
+        if (handoff.enabled) {
+            const Target = struct {
+                worker: *const Worker,
+                sequence: u64,
+                fn ready(target: @This()) bool {
+                    return target.worker.completedThrough(target.sequence);
+                }
+            };
+            if (handoff.spinUntil(handoff.drain_spin_ns, Target{ .worker = self, .sequence = sequence }, Target.ready)) {
+                _ = self.drain_spin_hits.fetchAdd(1, .monotonic);
+                return;
+            }
+        }
+        handoff.lockSpinning(&self.mutex);
         if (self.completed_sequence < sequence) {
             self.drain_waiters += 1;
             defer self.drain_waiters -= 1;
@@ -228,6 +259,9 @@ pub const Worker = struct {
             .descriptor_snapshots = self.descriptor_snapshots,
             .push_snapshots = self.push_snapshots,
             .barrier_snapshots = self.barrier_snapshots,
+            .parks = self.parks,
+            .spin_pickups = self.spin_pickups,
+            .drain_spin_hits = self.drain_spin_hits.load(.monotonic),
         };
         unlock(mutex);
         return result;
@@ -237,6 +271,7 @@ pub const Worker = struct {
         self.drain();
         lock(&self.mutex);
         self.stopping = true;
+        self.stop_requested.store(true, .release);
         signal(&self.work_available);
         unlock(&self.mutex);
         if (self.thread) |*thread| {
@@ -253,8 +288,26 @@ fn workerMain(worker: *Worker) void {
     var batch: [max_batch_size]QueuedJob = undefined;
     var payloads: [max_batch_size]queued_command.Payload = undefined;
     while (true) {
-        lock(&worker.mutex);
-        while (worker.count == 0 and !worker.stopping) wait(&worker.work_available, &worker.mutex);
+        handoff.lockSpinning(&worker.mutex);
+        while (worker.count == 0 and !worker.stopping) {
+            if (handoff.enabled) {
+                // Poll for the next command before sleeping. Every queued
+                // command has completed here, so new work is exactly a
+                // submitted sequence beyond the completed one.
+                unlock(&worker.mutex);
+                const found = handoff.spinUntil(handoff.worker_spin_ns, worker, workAvailable);
+                handoff.lockSpinning(&worker.mutex);
+                if (worker.count != 0) {
+                    if (found) worker.spin_pickups +|= 1;
+                    break;
+                }
+                if (worker.stopping) break;
+            }
+            worker.parked = true;
+            worker.parks +|= 1;
+            wait(&worker.work_available, &worker.mutex);
+            worker.parked = false;
+        }
         if (worker.count == 0 and worker.stopping) {
             unlock(&worker.mutex);
             return;
@@ -270,7 +323,7 @@ fn workerMain(worker: *Worker) void {
 
         for (batch[0..batch_len]) |*queued| queued.command.execute();
 
-        lock(&worker.mutex);
+        handoff.lockSpinning(&worker.mutex);
         worker.completed +|= batch_len;
         worker.completed_sequence = batch[batch_len - 1].sequence;
         worker.completed_sequence_atomic.store(worker.completed_sequence, .release);
@@ -284,7 +337,14 @@ fn workerMain(worker: *Worker) void {
     }
 }
 
+fn workAvailable(worker: *const Worker) bool {
+    return worker.submitted_atomic.load(.acquire) != worker.completed_sequence_atomic.load(.monotonic) or
+        worker.stop_requested.load(.acquire);
+}
+
 test {
+    _ = handoff;
+    _ = @import("fifo_handoff_tests.zig");
     _ = @import("barrier_flow_tests.zig");
     _ = owned;
     _ = @import("command_flow_tests.zig");
@@ -449,6 +509,9 @@ test "full Vulkan worker queue requests ordered synchronous fallback" {
     try std.testing.expectEqual(@as(u64, queue_capacity + 1), stats.completed);
     try std.testing.expectEqual(@as(u64, 1), stats.saturated_submissions);
     // The blocked native call keeps the worker busy while the entire queue
-    // fills. Only the two empty-to-nonempty transitions need a wake signal.
-    try std.testing.expectEqual(@as(u64, 2), stats.work_signals);
+    // fills. Only the two empty-to-nonempty transitions need a wake signal,
+    // and with the spin-then-park handoff only a parked worker gets one.
+    if (handoff.enabled) {
+        try std.testing.expect(stats.work_signals <= 2);
+    } else try std.testing.expectEqual(@as(u64, 2), stats.work_signals);
 }
