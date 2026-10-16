@@ -17,6 +17,7 @@ pub const event = @import("event.zig");
 pub const safepoint = @import("safepoint.zig");
 pub const counter = @import("counter.zig");
 pub const stall = @import("stall.zig");
+pub const duration_clock = @import("duration_clock.zig");
 
 pub const Mutex = mutex.Mutex;
 pub const Condition = condition.Condition;
@@ -37,4 +38,5 @@ test {
     _ = safepoint;
     _ = counter;
     _ = stall;
+    _ = duration_clock;
 }
