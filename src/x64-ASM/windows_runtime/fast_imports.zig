@@ -1392,3 +1392,34 @@ test "Sleep zero fast lane yields only for an eligible parallel worker" {
     try std.testing.expectEqual(@as(u32, 0), state.yields);
     try std.testing.expectEqual(@as(u32, 1), state.scope_ends);
 }
+
+test "no fast import lane admits a vulkan-1.dll name, so Vulkan stubs may skip them" {
+    // `register_import.tryStub` returns early for dynamic vulkan-1.dll stubs
+    // (Xenia's ~17,000 Vulkan calls per heavy frame). That is exact only
+    // while every lane gates on its own modules: the pure predicates are
+    // checked here; the Sleep, affinity, NT-yield and SRW lanes compare
+    // against literal kernel32/kernelbase/ntdll/api-ms-win-core names.
+    const fast_math = @import("fast_math.zig");
+    const names = [_][]const u8{
+        "memcpy",                         "memmove",                 "memset",                    "memcmp",           "strlen",           "strcmp",
+        "strxfrm",                        "malloc",                  "_malloc_base",              "calloc",           "_aligned_malloc",  "free",
+        "_free_base",                     "_aligned_free",           "exp2",                      "exp2f",            "log10",            "GetCurrentThreadId",
+        "GetCurrentThread",               "GetCurrentProcess",       "GetCurrentProcessId",       "Sleep",            "NtDelayExecution", "GetProcessAffinityMask",
+        "GetSystemTimePreciseAsFileTime", "QueryPerformanceCounter", "QueryPerformanceFrequency", "vkCmdDrawIndexed", "vkQueueSubmit",    "vkUpdateDescriptorSets",
+    };
+    for ([_][]const u8{ "vulkan-1.dll", "VULKAN-1.DLL", "Vulkan-1.dll" }) |dll| for (names) |name| {
+        try std.testing.expect(crtStringOp(dll, name) == null);
+        try std.testing.expect(crtMemoryOp(dll, name) == null);
+        try std.testing.expect(crtHeapOp(dll, name) == null);
+        try std.testing.expect(identityQuery(dll, name) == null);
+        try std.testing.expect(fast_math.candidate(dll, name) == null);
+        try std.testing.expect(!isPreciseTimeQuery(dll, name, 0x1400_2345, true, true, false, false, false));
+    };
+    // Positive controls: the same predicates admit their own modules.
+    try std.testing.expect(crtStringOp("ucrtbase.dll", "strlen") != null);
+    try std.testing.expect(crtMemoryOp("ucrtbase.dll", "memcpy") != null);
+    try std.testing.expect(crtHeapOp("ucrtbase.dll", "malloc") != null);
+    try std.testing.expect(identityQuery("KERNEL32.dll", "GetCurrentThreadId") != null);
+    try std.testing.expect(fast_math.candidate("ucrtbase.dll", "exp2") != null);
+    try std.testing.expect(isPreciseTimeQuery("kernel32.dll", "QueryPerformanceCounter", 0x1400_2345, true, true, false, false, false));
+}
