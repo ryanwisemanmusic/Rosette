@@ -1787,7 +1787,9 @@ pub fn handleWindowsImportStub(self: *ElfState) bool {
     // before the caller's guard releases the lock.
     __process_concurrency.watch.beginActivity(stub.function_name);
     const timed = self.parallel_guest_execution;
-    const entered_ns = if (timed) __process_concurrency.monotonicNanoseconds() else 0;
+    // Hold/wait durations only: the cheap duration clock, as the lock
+    // request time in `step` is stamped.
+    const entered_ns = if (timed) __process_concurrency.duration_clock.nanoseconds() else 0;
     const released_before = __ProcessInternals._runtime_lock_released_ns().*;
     const lock_requested_ns = __ProcessInternals._import_lock_requested_ns().*;
     __ProcessInternals._import_lock_requested_ns().* = 0;
@@ -1795,7 +1797,7 @@ pub fn handleWindowsImportStub(self: *ElfState) bool {
         __process_concurrency.watch.endActivity();
         if (timed) {
             const released = __ProcessInternals._runtime_lock_released_ns().* -% released_before;
-            const held = (__process_concurrency.monotonicNanoseconds() -| entered_ns) -| released;
+            const held = (__process_concurrency.duration_clock.nanoseconds() -| entered_ns) -| released;
             const waited = if (lock_requested_ns != 0 and lock_requested_ns <= entered_ns) entered_ns - lock_requested_ns else 0;
             self.runtime_lock_ledger.note(stub.function_name, held, waited, released);
         }

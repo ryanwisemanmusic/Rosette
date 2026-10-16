@@ -4207,6 +4207,9 @@ const BlockJitState = struct {
     recheck_pause_policy: bool = true, // false only in offline policy comparison
     pause_policy_revived: u64 = 0,
     scalar_resident_ops_compiled: u64 = 0,
+    arithmetic_flag_ops_compiled: u64 = 0,
+    direct_chain_templates_compiled: u64 = 0,
+    direct_scalar_ops_compiled: u64 = 0,
     native_completions: bool = true, // false only in offline differential replay
     admit_failed_compare: bool = true, // false only in the offline before fixture
     failed_compare_admitted: u64 = 0,
@@ -4902,6 +4905,7 @@ const GuestMilestoneActivity = struct { hits: u64, last_step: u64, armed: bool }
 
 /// Narrow bridge for the split process implementation modules.
 pub const __ProcessInternals = struct {
+    pub const _register_import = @import("process/impl/register_import.zig");
     pub const _PauseOptions = @import("process/pause_options.zig").Options;
     pub const _AUDIO_STAGE_COUNT = AUDIO_STAGE_COUNT;
     pub const _BLOCK_JIT_CHAIN_BLOCKS = BLOCK_JIT_CHAIN_BLOCKS;

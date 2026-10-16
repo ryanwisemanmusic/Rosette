@@ -1654,6 +1654,8 @@ pub fn compileBlockJit(self: *ElfState, jit: *__process_BlockJitState, rip: u64)
     jit.cached_registers +|= compiled.cached_registers;
     jit.hoisted_accesses +|= compiled.hoisted_accesses;
     @import("scalar_cache_report.zig").compiled(jit, compiled.scalar_resident_ops);
+    @import("arithmetic_report.zig").compiled(jit, compiled.arithmetic_flag_ops);
+    @import("native_path_report.zig").compiled(jit, compiled.first_way_fallthrough, compiled.direct_scalar_ops);
     return block;
 }
 
@@ -3009,7 +3011,7 @@ pub fn step(self: *ElfState) bool {
         // dispatch guard; entering the ordinary import path first would
         // already serialize every caller and erase the fast path's gain.
         if (process_impl_kernel_services.tryWindowsFastImportStub(self, step_rip)) return !process_impl_lifecycle.isTerminated(self);
-        if (self.parallel_guest_execution) __ProcessInternals._import_lock_requested_ns().* = __process_concurrency.monotonicNanoseconds();
+        if (self.parallel_guest_execution) __ProcessInternals._import_lock_requested_ns().* = __process_concurrency.duration_clock.nanoseconds();
         defer __ProcessInternals._import_lock_requested_ns().* = 0;
         var runtime_guard = process_impl_lifecycle.lockWindowsRuntimeForDispatch(self);
         defer runtime_guard.unlock();

@@ -887,6 +887,9 @@ pub const Compiled = struct {
     xmm_loads_forwarded: u32 = 0,
     xmm_stores_elided: u32 = 0,
     scalar_resident_ops: u32 = 0,
+    arithmetic_flag_ops: u32 = 0,
+    direct_scalar_ops: u32 = 0,
+    first_way_fallthrough: bool = false,
 };
 
 // ---------------------------------------------------------------------------
@@ -2065,6 +2068,8 @@ const Compiler = struct {
     exit_path: Label,
     epilogue_path: Label,
     resident_loop: ?Label = null,
+    first_way_fallthrough: bool = true,
+    direct_scalar_paths: bool = true,
     exits: std.ArrayList(ExitStub),
     /// Full-probe paths of hoisted accesses, emitted after the block body so
     /// the hot path is the pointer test and the access alone.
@@ -2166,7 +2171,12 @@ const Compiler = struct {
     resident_vectors: bool = true,
     scalar_residency: bool = true,
     rearrangement_residency: bool = true,
+    fresh_arithmetic_nzcv: bool = false,
+    arithmetic_flags: bool = true,
+    natural_scalar_lanes: bool = true,
     scalar_resident_ops: u32 = 0,
+    arithmetic_flag_ops: u32 = 0,
+    direct_scalar_ops: u32 = 0,
     /// The PAUSE scheduling callback only updates the register-file RIP and
     /// flags; unlike an arbitrary interpreter escape, it leaves every guest
     /// GPR, vector register, and hoisted base untouched. Keep the old reload
@@ -2567,14 +2577,18 @@ const Compiler = struct {
         // successors than ways, so it asks the jump cache first; any other
         // asks its own ways first, where a direct exit always is.
         const indirect = self.endsIndirect();
+        const later = try self.a.createLabel();
+        const fallthrough = self.first_way_fallthrough and !indirect;
         if (indirect) {
             const ways = try self.a.createLabel();
             try self.emitJumpCacheProbe(prove, ways);
             self.a.placeLabel(ways);
-            try self.emitWayScan(prove);
+            try self.emitWayScan(0, prove);
             try self.a.branch(leave);
+        } else if (fallthrough) {
+            try @import("chain_layout.zig").first(self.a, later);
         } else {
-            try self.emitWayScan(prove);
+            try self.emitWayScan(0, prove);
             try self.emitJumpCacheProbe(prove, leave);
         }
         // t6 = the link. t5 = the block in its slot now, acquired: a slot
@@ -2602,6 +2616,11 @@ const Compiler = struct {
         try self.emitStateOffsetAddress(r_helpers, t5, @offsetOf(Block, "helpers"));
         try self.emitChecked(a64.ldrImm(.doubleword, t3, t5, @offsetOf(Block, "chain_entry_address")));
         try self.emit(a64.br(t3));
+        self.a.placeLabel(later);
+        if (fallthrough) {
+            try self.emitWayScan(1, prove);
+            try self.emitJumpCacheProbe(prove, leave);
+        }
     }
 
     /// Whether the block's last instruction is a transfer whose target is
@@ -2616,8 +2635,8 @@ const Compiler = struct {
 
     /// Branch to `prove` with t6 = the way whose address is t4. Each way
     /// costs only its address compare; the way that matches is proved once.
-    fn emitWayScan(self: *Compiler, prove: Label) Error!void {
-        for (0..link_ways) |way| {
+    fn emitWayScan(self: *Compiler, first: usize, prove: Label) Error!void {
+        for (first..link_ways) |way| {
             const base: u32 = @intCast(@offsetOf(Block, "links") + way * @sizeOf(Link));
             const next_way = try self.a.createLabel();
             try self.emitChecked(a64.ldrImm(.doubleword, t3, t2, base + @offsetOf(Link, "rip")));
@@ -2776,6 +2795,11 @@ const Compiler = struct {
         if (mask == 0) return;
         try self.loadFlags(t3);
         try self.clearFlagBits(t3, mask);
+        if (self.arithmetic_flags and @import("arithmetic_flags.zig").eligible(size, kind, carry_in_t6, live)) {
+            self.arithmetic_flag_ops += 1;
+            try @import("arithmetic_flags.zig").emit(self, size, kind, a, b, r, live);
+            return self.storeFlags(t3);
+        }
         try self.emitResultFlags(t3, r, size, live);
         if (kind != .logic) {
             // AF: bit 4 of a ^ b ^ r.
@@ -2988,12 +3012,14 @@ const Compiler = struct {
         try self.emit(if (is_write) a64.stlr(ms, data, host) else a64.ldar(ms, data, host));
     }
 
-    /// Keep the existing per-byte atomic accesses and ordering.
+    /// Ordered natural lanes on admitted spans; the byte path is the offline control.
     fn emitOrderedUnalignedScalarLoad(self: *Compiler, size: Size, destination: a64.Reg, host: a64.Reg) Error!void {
+        if (self.natural_scalar_lanes) return @import("natural_scalar_lanes.zig").emit(self.a, destination, host, @intCast(bits(size) / 8), false);
         try ordered_lanes.scalarLoad(self.a, destination, host, @intCast(bits(size) / 8));
     }
 
     fn emitOrderedUnalignedScalarStore(self: *Compiler, size: Size, host: a64.Reg) Error!void {
+        if (self.natural_scalar_lanes) return @import("natural_scalar_lanes.zig").emit(self.a, 3, host, @intCast(bits(size) / 8), true);
         try ordered_lanes.scalarStore(self.a, host, @intCast(bits(size) / 8));
     }
 
@@ -4300,6 +4326,7 @@ const Compiler = struct {
                 try self.storeReg(d.src_reg, false, d.size, t1);
             },
             .neg_reg8, .neg_reg16, .neg_reg32, .neg_reg64 => {
+                if (try self.emitScalarDirect(d, true)) return .native;
                 // setFlagsSub(0, a, r): a subtraction with a zero left side.
                 // A byte operand may be AH..BH (`dst_high8`).
                 try self.emit(a64.mov(.x64, t1, a64.xzr));
@@ -4316,6 +4343,7 @@ const Compiler = struct {
                 try self.emitAbortCheck(index);
             },
             .not_reg8, .not_reg16, .not_reg32, .not_reg64 => {
+                if (try self.emitScalarDirect(d, false)) return .native;
                 try self.loadReg(t1, d.dst_reg, d.dst_high8, d.size);
                 try self.emit(a64.mvn(arm(d.size), t1, t1));
                 try self.storeReg(d.dst_reg, d.dst_high8, d.size, t1);
@@ -5028,6 +5056,13 @@ const Compiler = struct {
             try self.beginFusedRun(fused);
             return;
         }
+        const fresh_kind: ArithKind = if (op == .add) .add else if (op == .sub or op == .cmp) .sub else .logic;
+        if (self.arithmetic_flags and self.emit_flags and @import("arithmetic_flags.zig").eligible(size, fresh_kind, false, self.emit_flag_mask)) {
+            try self.emit(if (op == .add) a64.adds(width, t0, t1, t2) else a64.subs(width, t0, t1, t2));
+            self.fresh_arithmetic_nzcv = true;
+            defer self.fresh_arithmetic_nzcv = false;
+            return self.emitArithmeticFlags(fresh_kind, size, t1, t2, t0, false);
+        }
         switch (op) {
             .adc, .sbb => return self.emitCarryCompute(op == .adc, size),
             .add => try self.emit(a64.add(width, t0, t1, t2)),
@@ -5169,10 +5204,20 @@ const Compiler = struct {
         try self.storeFlags(t3);
     }
 
+    fn emitScalarDirect(self: *Compiler, d: DecodedInsn, flags: bool) Error!bool {
+        if (!self.direct_scalar_paths or (flags and self.emit_flags)) return false;
+        const host = self.cachedWhole(d.dst_reg, d.dst_high8, d.size) orelse return false;
+        if (!try @import("scalar_register_paths.zig").emit(self.a, d, host)) return false;
+        self.noteDirectWrite(d.dst_reg);
+        self.direct_scalar_ops += 1;
+        return true;
+    }
+
     /// Shift by an immediate at 32 or 64 bits, with the interpreter's
     /// `setFlagsShl/Shr/Sar`: CF, SF, ZF, and OF only when the count is one;
     /// PF and AF untouched; nothing when the count is zero.
     fn emitShift(self: *Compiler, d: DecodedInsn) Error!void {
+        if (try self.emitScalarDirect(d, true)) return;
         const size = d.size;
         const width = arm(size);
         const w = bits(size);
@@ -5346,6 +5391,7 @@ const Compiler = struct {
     /// zero count does nothing at all; CF is the bit rotated around, OF is
     /// written only for a count of one.
     fn emitRotateImm(self: *Compiler, d: DecodedInsn) Error!void {
+        if (try self.emitScalarDirect(d, true)) return;
         const size = d.size;
         const width = arm(size);
         const w = bits(size);
@@ -7478,9 +7524,13 @@ pub const Options = struct {
     /// there instead of leaving (`planInternalEdges`).
     internal_edges: bool = true,
     resident_self_loops: bool = true,
+    first_way_fallthrough: bool = true,
+    direct_scalar_paths: bool = true,
     resident_vectors: bool = true,
     scalar_residency: bool = true,
     rearrangement_residency: bool = true,
+    arithmetic_flags: bool = true,
+    natural_scalar_lanes: bool = true,
     /// Set false only for differential tests of the pre-specialization
     /// PAUSE bridge. Production's PAUSE helper is register preserving.
     pause_helper_preserves_state: bool = true,
@@ -7679,6 +7729,9 @@ pub fn compileWith(allocator: std.mem.Allocator, memory: *CodeMemory, layout: La
         .xmm_loads_forwarded = pass.compiler.xmm_loads_forwarded,
         .xmm_stores_elided = pass.compiler.xmm_stores_elided,
         .scalar_resident_ops = pass.compiler.scalar_resident_ops,
+        .arithmetic_flag_ops = pass.compiler.arithmetic_flag_ops,
+        .direct_scalar_ops = pass.compiler.direct_scalar_ops,
+        .first_way_fallthrough = pass.compiler.first_way_fallthrough and !pass.compiler.endsIndirect(),
     };
 }
 
@@ -7715,6 +7768,8 @@ fn emitBlock(
         .resident_vectors = options.resident_vectors,
         .scalar_residency = options.scalar_residency,
         .rearrangement_residency = options.rearrangement_residency,
+        .arithmetic_flags = options.arithmetic_flags,
+        .natural_scalar_lanes = options.natural_scalar_lanes,
         .pause_helper_preserves_state = options.pause_helper_preserves_state,
         .xbox_critical_section_transfer_enabled = options.xbox_critical_section_transfer_enabled,
         .atomic_retry_yield_enabled = options.atomic_retry_yield_enabled,
@@ -7736,6 +7791,8 @@ fn emitBlock(
     errdefer compiler.cold_memory.deinit(allocator);
     errdefer compiler.fused_exits.deinit(allocator);
     compiler.cache_written = cache_written;
+    compiler.first_way_fallthrough = options.first_way_fallthrough;
+    compiler.direct_scalar_paths = options.direct_scalar_paths;
     if (cache_counts) |counts| compiler.chooseCache(counts);
     compiler.planHoist();
     if (options.resident_self_loops and compiler.cache_count != 0 and self_loops.hasEdge(insns)) compiler.resident_loop = try assembler.createLabel();

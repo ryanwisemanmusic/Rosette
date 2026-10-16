@@ -28,8 +28,14 @@ pub fn report(state: *process.ElfState) void {
 pub fn tryStub(self: *process.ElfState, address: u64) bool {
     if (!life.windowsFastCrtImportMayBypassRuntimeLock(self)) return false;
     const stub = self.windowsImportStubAt(address) orelse return false;
+    // Every fast lane claims CRT, kernel32 or ntdll names only, so a Vulkan
+    // thunk (`vkGetDeviceProcAddr` hands out ~17,000 calls per heavy frame)
+    // skips their name tests and goes straight to its locked adapter.
+    if (vulkan_stub_early_out and stub.is_dynamic and std.ascii.eqlIgnoreCase(stub.dll_name, "vulkan-1.dll")) return false;
     return tryRegistered(self, stub, false);
 }
+/// Internal control for offline comparison; production keeps it on.
+pub var vulkan_stub_early_out = true;
 fn tryRegistered(self: *process.ElfState, stub: anytype, comptime narrow: bool) bool {
     if (stub.is_dynamic) {
         if (stub.iat_address != 0) return false;

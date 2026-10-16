@@ -4,4 +4,6 @@ pub fn report(state: anytype) void {
     @import("atomic_admission.zig").report(state);
     @import("pause_recheck.zig").report(state);
     @import("scalar_cache_report.zig").report(state);
+    @import("arithmetic_report.zig").report(state);
+    @import("native_path_report.zig").report(state);
 }

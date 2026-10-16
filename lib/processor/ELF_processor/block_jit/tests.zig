@@ -4686,10 +4686,8 @@ test "emitted code size per instruction, and a trace costing less than its basic
     load.sib_has_base = true;
     load.sib_base_reg = .bl_bx_ebx_rbx;
     const load_cost = try Sizes.single(&h, 0x1000, 3, load) - overhead;
-    // The TSO path includes an out-of-line helper branch for legal unaligned
-    // accesses, even though aligned loads take the short LDAR path. Count
-    // both paths in code size, not just the hot path.
-    try testing.expect(load_cost >= 12 and load_cost <= 80);
+    // Natural-width unaligned lanes expand the cold route; 110 remains below doubling.
+    try testing.expect(load_cost >= 12 and load_cost <= 110);
 
     // Three basic blocks of `cmp; jcc; add` as one trace, against what the
     // same nine instructions cost as three separate blocks. The words saved
@@ -4859,11 +4857,11 @@ test "busy guest registers live in host registers for a whole block, and meet me
     try testing.expectEqual(@as(u32, 1), state4.interprets);
     try testing.expectEqual(@as(u64, 13), state4.regs.rax);
 }
-
 test {
     _ = @import("atomic_throughput_tests.zig");
     _ = @import("packed_madd.zig");
     _ = @import("completion_tests.zig");
     _ = @import("scalar_residency_tests.zig");
     _ = @import("rearrangement_residency_tests.zig");
+    _ = @import("arithmetic_flags_tests.zig");
 }
