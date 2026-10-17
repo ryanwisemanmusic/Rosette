@@ -162,6 +162,11 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
         .filters = &.{ "Halo 3's clear-colour", "operand sources", "SSE oracle", "shifts by an xmm count" },
     });
     halo3_clear_check.dependOn(&b.addRunArtifact(halo3_clear_test).step);
+    // Xenia's GPU command processor register-write path, replayed from
+    // the shipped bytes: the critical thread of Halo 3's heavy scenes.
+    const command_replay_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{"Xenia command replay"} });
+    // Timing: ROSETTE_COMMAND_REPLAY_BENCH=1 zig build xenia-command-replay-check -Doptimize=ReleaseFast
+    b.step("xenia-command-replay-check", "Replay Xenia's command-processor register writes interpreted and translated").dependOn(&b.addRunArtifact(command_replay_test).step);
     // Win32 mutex ownership in the wait model, the semantics Xenia's
     // XMutant hands every Xbox 360 mutant to. Run 20261012T000703Z stopped
     // on a recursive acquisition the model could not express.
@@ -191,6 +196,8 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     frame_work_check.dependOn(&b.addRunArtifact(frame_work_test).step);
     const routing_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "wait lookup", "worker host CPU", "NT event", "NT wait", "wait object", "mutex ownership" } });
     b.step("import-routing-check", "Check cached wait-object lookup with ordinary NT semantics").dependOn(&b.addRunArtifact(routing_test).step);
+    const operand_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "register operands", "native first successor", "direct scalar paths", "flags", "fused", "shift", "rotate", "carry", "borrow", "memory operands", "MOVBE", "locked", "TSO" } });
+    b.step("register-operands-check", "Check native cached variable shifts, conversions and multiply offline").dependOn(&b.addRunArtifact(operand_test).step);
     const chain_layout_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "native first successor", "direct scalar paths", "flags", "fused", "carry", "borrow", "shift", "rotate", "register arithmetic", "cached register", "native hops", "emitted code writes", "arithmetic throughput", "natural scalar lanes", "locked", "exchange", "TSO", "internal edge" } });
     b.step("native-chain-layout-check", "Check native chain branch layout and ordinary state publication offline").dependOn(&b.addRunArtifact(chain_layout_test).step);
     const arithmetic_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "arithmetic throughput", "natural scalar lanes", "TLB unaligned lanes", "register arithmetic", "flags", "fused", "carry", "borrow", "internal edge", "native hops", "locked", "exchange", "TSO" } });

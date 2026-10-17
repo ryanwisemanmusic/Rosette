@@ -7,18 +7,24 @@ const reference_include = "../.rosette/include";
 pub fn build(b: *std.Build) void {
     var target_query = b.standardTargetOptionsQueryOnly(.{});
     const host_os = target_query.os_tag orelse builtin.target.os.tag;
-    const macos_sdk_root = b.graph.environ_map.get("SDKROOT") orelse
-        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk";
     if (host_os == .macos) {
         const deployment: std.SemanticVersion = .{ .major = 13, .minor = 0, .patch = 0 };
         target_query.os_tag = .macos;
         target_query.os_version_min = .{ .semver = deployment };
         target_query.os_version_max = .{ .semver = deployment };
-        if (b.sysroot == null) {
-            b.sysroot = macos_sdk_root;
-        }
     }
     const target = b.resolveTargetQuery(target_query);
+    if (host_os == .macos and b.sysroot == null) {
+        // Prefer the caller's selected SDK. Otherwise ask Xcode's active
+        // developer-directory selection, so Xcode installed outside
+        // /Applications works without editing the build definition.
+        if (b.graph.environ_map.get("SDKROOT")) |sdk_root| {
+            b.sysroot = sdk_root;
+        } else if (std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result)) |sdk_root| {
+            b.sysroot = sdk_root;
+        }
+    }
+    const macos_sdk_root = b.sysroot orelse "";
     const optimize = b.standardOptimizeOption(.{});
 
     const is_macos = target.result.os.tag == .macos;
