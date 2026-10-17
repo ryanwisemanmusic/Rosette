@@ -141,8 +141,6 @@ static void discover_third_party(const char *root) {
     char base[MAX_PATH_LEN];
     snprintf(base, sizeof(base), "%s/third_party", root);
     discover_third_party_at(base, "");
-    snprintf(base, sizeof(base), "%s/.rosette/third_party", root);
-    discover_third_party_at(base, "ref");
 }
 
 static void discover_suites(const char *root) {

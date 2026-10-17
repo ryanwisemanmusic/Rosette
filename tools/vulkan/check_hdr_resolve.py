@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -33,9 +34,22 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--out', required=True, type=Path)
     p.add_argument('--sdk', type=Path, default=Path.home()/'VulkanSDK/vulkan/macOS')
-    p.add_argument('--xenia-build', type=Path, default=ROOT/'.rosette/xenia-windows-clean')
-    p.add_argument('--snapshot', type=Path, default=ROOT/'.rosette/diagnostics/graphics-backlog-20261009-run3/final/snapshot.json')
+    p.add_argument('--xenia-build', type=Path, help='legacy capsule layout containing source/ and bundle/')
+    p.add_argument('--xenia-source', type=Path, default=Path(os.environ['XENIA_ROOT']) if os.environ.get('XENIA_ROOT') else None,
+                   help='Xenia source checkout (or set XENIA_ROOT)')
+    p.add_argument('--xenia-bundle', type=Path, default=ROOT/'build/xenia-windows-clean/bundle',
+                   help='directory containing the offline xenia_canary.exe identity')
+    p.add_argument('--snapshot', type=Path, required=True,
+                   help='explicit shader snapshot JSON; old snapshots are not kept in .rosette')
     a = p.parse_args(); out = a.out.resolve()
+    if a.xenia_build:
+        xenia_source = a.xenia_build/'source'
+        xenia_bundle = a.xenia_build/'bundle'
+    else:
+        xenia_source = a.xenia_source
+        xenia_bundle = a.xenia_bundle
+    if xenia_source is None:
+        p.error('pass --xenia-source or set XENIA_ROOT')
     if out.exists(): p.error('Use a fresh evidence directory')
     out.mkdir(parents=True)
     m = {'schema': 'rosette-hdr-resolve-v1', 'status': 'incomplete', 'commands': [], 'kernels': [], 'checks': [],
@@ -56,8 +70,8 @@ def main():
         # references change, even if the standalone decoder stays identical.
         sources += [x.resolve(strict=True) for x in (
             ROOT/'lib/linker/dyld/dynamic_library_forwarder.zig', ROOT/'lib/gpu/vulkan/root.zig',
-            a.xenia_build/'source/src/xenia/gpu/spirv_shader_translator_rb.cc',
-            a.xenia_build/'source/src/xenia/gpu/shaders/resolve.xesli')]
+            xenia_source/'src/xenia/gpu/spirv_shader_translator_rb.cc',
+            xenia_source/'src/xenia/gpu/shaders/resolve.xesli')]
         metal = Path(subprocess.check_output(['xcrun', '--find', 'metal'], text=True).strip())
         metallib = Path(subprocess.check_output(['xcrun', '--find', 'metallib'], text=True).strip())
         clang = Path(subprocess.check_output(['xcrun', '--find', 'clang++'], text=True).strip())
@@ -109,8 +123,8 @@ def main():
         # Exact shipped kernels, read only. Only compile them; no game dispatch.
         snapshot = json.loads(a.snapshot.read_text()); sources.append(a.snapshot)
         observed = {x['sha256'] for x in snapshot['shader_archive']['modules'] if x['role'] == 'guest'}
-        pe = a.xenia_build/'bundle/xenia_canary.exe'; exe = pe.read_bytes(); sources.append(pe)
-        for header in sorted((a.xenia_build/'source/src/xenia/gpu/shaders/bytecode/vulkan_spirv').glob('resolve_full*cs.h')):
+        pe = xenia_bundle/'xenia_canary.exe'; exe = pe.read_bytes(); sources.append(pe)
+        for header in sorted((xenia_source/'src/xenia/gpu/shaders/bytecode/vulkan_spirv').glob('resolve_full*cs.h')):
             words = [int(x, 16) for x in re.findall(r'0x([\da-fA-F]{8})', header.read_text())]
             data = struct.pack('<'+'I'*len(words), *words); sources.append(header)
             offset = exe.find(data)

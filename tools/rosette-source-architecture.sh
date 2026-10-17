@@ -55,7 +55,7 @@ rosette_source_library_architecture() {
 
 rosette_source_provider_for_architecture() {
     local architecture="${1:?library architecture is required}"
-    local managed_root="${ROSETTE_MACOS_HOST_ROOT:-${_rosette_source_arch_repo_root}/.rosette/macos-host}"
+    local managed_root="${ROSETTE_MACOS_HOST_ROOT:-${_rosette_source_arch_repo_root}/build/rosette-support/macos-host}"
     if [[ "${architecture}" == "x86_64" ]]; then
         if [[ -d "${managed_root}/x86_64" ]]; then
             printf '%s\n' "${managed_root}/x86_64"
@@ -125,7 +125,7 @@ _rosette_source_arch_sanitize_flags() {
 }
 
 rosette_configure_arm64_environment() {
-    local managed_root="${ROSETTE_MACOS_HOST_ROOT:-${_rosette_source_arch_repo_root}/.rosette/macos-host}"
+    local managed_root="${ROSETTE_MACOS_HOST_ROOT:-${_rosette_source_arch_repo_root}/build/rosette-support/macos-host}"
     local prefix="${ROSETTE_ARM64_HOST_PREFIX:-}"
     if [[ -z "${prefix}" && -d "${managed_root}/arm64" ]]; then
         prefix="${managed_root}/arm64"

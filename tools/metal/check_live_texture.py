@@ -8,6 +8,7 @@ Failure is terminal; only short, bounded workloads are dispatched.
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import struct
@@ -67,8 +68,17 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--out',type=Path,required=True)
     p.add_argument('--sdk',type=Path,default=Path.home()/'VulkanSDK/vulkan/macOS')
-    p.add_argument('--xenia-build',type=Path,default=ROOT/'.rosette/xenia-windows-clean')
+    p.add_argument('--xenia-build',type=Path,help='legacy capsule layout containing source/ and bundle/')
+    p.add_argument('--xenia-source',type=Path,default=Path(os.environ['XENIA_ROOT']) if os.environ.get('XENIA_ROOT') else None,
+                   help='Xenia source checkout (or set XENIA_ROOT)')
+    p.add_argument('--xenia-bundle',type=Path,default=ROOT/'build/xenia-windows-clean/bundle',
+                   help='directory containing the offline xenia_canary.exe identity')
     a=p.parse_args();out=a.out.resolve()
+    if a.xenia_build:
+        xenia_source=a.xenia_build/'source';xenia_bundle=a.xenia_build/'bundle'
+    else:
+        xenia_source=a.xenia_source;xenia_bundle=a.xenia_bundle
+    if xenia_source is None:p.error('pass --xenia-source or set XENIA_ROOT')
     if out.exists():p.error('Use a fresh evidence directory')
     out.mkdir(parents=True);original=out/'original';original.mkdir();hardened=out/'hardened';hardened.mkdir();cases=out/'cases';cases.mkdir()
     manifest={'schema':'rosette-live-metal-texture-v1','scope':'Synthetic live route contracts, not ISO payload or Halo rendering/FPS proof','status':'incomplete','commands':[],'checks':[]}
@@ -79,9 +89,9 @@ def main():
         if r.returncode:raise RuntimeError(log.read_text()[-4000:])
         return log
     try:
-        pe=a.xenia_build/'bundle/xenia_canary.exe';exe=pe.read_bytes();manifest['xenia_pe']={'path':str(pe),'sha256':sha(pe)};identities=[]
+        pe=xenia_bundle/'xenia_canary.exe';exe=pe.read_bytes();manifest['xenia_pe']={'path':str(pe),'sha256':sha(pe)};identities=[]
         for name,expected in zip(NAMES,HASHES):
-            header=a.xenia_build/'source/src/xenia/gpu/shaders/bytecode/vulkan_spirv'/('texture_load_'+name+'_cs.h')
+            header=xenia_source/'src/xenia/gpu/shaders/bytecode/vulkan_spirv'/('texture_load_'+name+'_cs.h')
             text=header.read_text();words=re.findall(r'0x([0-9a-fA-F]{8})',text)
             data=struct.pack('<'+'I'*len(words),*(int(w,16) for w in words));path=original/(name+'.original.spv');path.write_bytes(data)
             offset=exe.find(data)

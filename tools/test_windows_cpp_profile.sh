@@ -5,7 +5,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 [[ $# == 2 ]] || { echo "usage: $0 SOURCE_ROOT SUPPORT_DIR" >&2; exit 2; }
 source_root="$1"
 support_dir="$2"
-transpiler="$repo_root/.rosette/windows-cpp-tool/bin/rosette-c-fix"
+cpp_tool_prefix="${ROSETTE_XENIA_CPP_TOOL_PREFIX:-${repo_root}/build/rosette-support/windows-cpp-tool}"
+transpiler="${cpp_tool_prefix}/bin/rosette-c-fix"
 compiler="$support_dir/bin/clang-cxx-wrapper"
 llvm_dis="${ROSETTE_XENIA_WINDOWS_LLVM_PREFIX:+${ROSETTE_XENIA_WINDOWS_LLVM_PREFIX}/bin/llvm-objdump}"
 if [[ -z "$llvm_dis" ]]; then

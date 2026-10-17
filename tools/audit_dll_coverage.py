@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "dll"))
 from dispatcher import handled_names, policy_refused_names  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-IMAGE = ROOT / ".rosette" / "xenia-windows-clean" / "bundle" / "xenia_canary.exe"
+IMAGE = ROOT / "build" / "xenia-windows-clean" / "bundle" / "xenia_canary.exe"
 DISPATCHER = ROOT / "src" / "x64-ASM" / "windows_runtime.zig"
 PACKAGES = ROOT / "pkg" / "dll" / "win32"
 

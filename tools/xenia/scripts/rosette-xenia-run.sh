@@ -74,7 +74,7 @@ EOF
 }
 
 source_root="${ROSETTE_XENIA_ROOT:-${XENIA_ROOT:-}}"
-build_dir="${ROSETTE_XENIA_WINDOWS_BUILD_DIR:-${repo_root}/.rosette/xenia-windows-clean}"
+build_dir="${ROSETTE_XENIA_WINDOWS_BUILD_DIR:-${repo_root}/build/xenia-windows-clean}"
 bundle_dir="${ROSETTE_XENIA_WINDOWS_BUNDLE_DIR:-${build_dir}/bundle}"
 media_image="${ROSETTE_XENIA_MEDIA_IMAGE:-}"
 media_origin="${ROSETTE_XENIA_MEDIA_IMAGE:+environment}"

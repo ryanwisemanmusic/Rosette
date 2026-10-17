@@ -29,7 +29,7 @@ _rosette_macos_env_script_dir="$(cd "$(dirname "${_rosette_macos_env_source_path
 _rosette_macos_env_repo_root="$(cd "${_rosette_macos_env_script_dir}/.." && pwd)"
 
 if [[ -z "${ROSETTE_MACOS_HOST_ROOT:-}" ]]; then
-    export ROSETTE_MACOS_HOST_ROOT="${_rosette_macos_env_repo_root}/.rosette/macos-host"
+    export ROSETTE_MACOS_HOST_ROOT="${_rosette_macos_env_repo_root}/build/rosette-support/macos-host"
 fi
 
 _rosette_macos_sanitize_path() {

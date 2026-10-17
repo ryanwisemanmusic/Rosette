@@ -11,6 +11,7 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "$BASH_SOURCE")" && pwd)"
 repo_root="$(cd "$script_dir/../../.." && pwd)"
 template_dir="$repo_root/tools/xenia/windows"
+cpp_tool_prefix="${ROSETTE_XENIA_CPP_TOOL_PREFIX:-${repo_root}/build/rosette-support/windows-cpp-tool}"
 
 die() {
     echo "ERROR: $*" >&2
@@ -317,8 +318,8 @@ generate_support() {
     # or warning filters. Build its small CLI in a Rosette-owned prefix and
     # expose immutable translated inputs through Clang's virtual filesystem.
     zig build c-fix --build-file "$repo_root/build/build.zig" \
-        --prefix "$repo_root/.rosette/windows-cpp-tool" >&2
-    cpp_overlay="$("$repo_root/.rosette/windows-cpp-tool/bin/rosette-c-fix" \
+        --prefix "$cpp_tool_prefix" >&2
+    cpp_overlay="$("$cpp_tool_prefix/bin/rosette-c-fix" \
         --windows-xenia-overlay "$source_mirror" "$support_dir/cpp-overlay")"
     if [[ "$need_shader_tools" == 1 ]]; then
         mkdir -p "$vulkan_tool_root/bin"
@@ -592,7 +593,7 @@ PY
 original_source_root="$(env_value ROSETTE_XENIA_WINDOWS_SOURCE_ROOT)"
 [[ -n "$original_source_root" ]] || original_source_root="$(env_value XENIA_ROOT)"
 build_dir="$(env_value ROSETTE_XENIA_WINDOWS_BUILD_DIR)"
-[[ -n "$build_dir" ]] || build_dir="$repo_root/.rosette/xenia-windows"
+[[ -n "$build_dir" ]] || build_dir="$repo_root/build/xenia-windows"
 bundle_dir="$(env_value ROSETTE_XENIA_WINDOWS_BUNDLE_DIR)"
 media_image="$(env_value ROSETTE_XENIA_WINDOWS_MEDIA_IMAGE)"
 config=Release

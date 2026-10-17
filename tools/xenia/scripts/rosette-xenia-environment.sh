@@ -108,7 +108,7 @@ rosette_xenia_configure_environment() {
 
 rosette_xenia_provider_kind() {
     local provider="${ROSETTE_XENIA_PROVIDER_ROOT:-}"
-    local managed_root="${ROSETTE_MACOS_HOST_ROOT:-${_rosette_xenia_env_repo_root}/.rosette/macos-host}"
+    local managed_root="${ROSETTE_MACOS_HOST_ROOT:-${_rosette_xenia_env_repo_root}/build/rosette-support/macos-host}"
     case "${provider}" in
         "${managed_root}"|"${managed_root}"/*)
             printf '%s\n' "rosette-managed"
