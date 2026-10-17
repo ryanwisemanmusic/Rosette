@@ -21,7 +21,7 @@ gates AVX2, AVX-512, FMA, BMI, XOP and GFNI on CPUID, so forms needing them
 are never emitted here. Advertising one of those later means extending the
 filter below, and the test then holds Rosette to it.
 
-Usage: tools/gen_xenia_jit_corpus.py --xenia-root "/Volumes/2023 Drive/xenia/xenia"
+Usage: tools/gen_xenia_jit_corpus.py --xenia-root /path/to/xenia
 Needs clang (x86_64 assembler) and llvm-objdump.
 """
 import argparse

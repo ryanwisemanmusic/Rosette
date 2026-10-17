@@ -26,6 +26,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -452,15 +453,22 @@ def rosette_macos_host_bases() -> list[Path]:
 
 
 def macos_header_candidates(relative: str) -> list[Path]:
-    sdk = Path(os.environ["VULKAN_SDK"]) if os.environ.get("VULKAN_SDK") else None
+    sdk_value = os.environ.get("VULKAN_SDK") or os.environ.get("VK_SDK_PATH")
+    sdk = Path(sdk_value).expanduser() if sdk_value else None
     bases = rosette_macos_host_bases()
     if sdk:
         bases.extend([sdk, sdk / "macOS"])
+    brew = shutil.which("brew")
+    if brew:
+        try:
+            result = subprocess.run([brew, "--prefix"], capture_output=True, text=True, check=False, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+        if result and result.returncode == 0 and result.stdout.strip():
+            bases.append(Path(result.stdout.strip()))
     bases.extend(
         [
             Path("/usr/local"),
-            Path("/opt/homebrew"),
-            Path("/Users/ryanwiseman/VulkanSDK/1.3/macOS"),
         ]
     )
     return unique_paths([base / "include" / relative for base in bases])

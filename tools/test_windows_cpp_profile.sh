@@ -7,7 +7,20 @@ source_root="$1"
 support_dir="$2"
 transpiler="$repo_root/.rosette/windows-cpp-tool/bin/rosette-c-fix"
 compiler="$support_dir/bin/clang-cxx-wrapper"
-llvm_dis="${ROSETTE_XENIA_WINDOWS_LLVM_PREFIX:-/opt/homebrew/opt/llvm@19}/bin/llvm-objdump"
+llvm_dis="${ROSETTE_XENIA_WINDOWS_LLVM_PREFIX:+${ROSETTE_XENIA_WINDOWS_LLVM_PREFIX}/bin/llvm-objdump}"
+if [[ -z "$llvm_dis" ]]; then
+  llvm_dis="$(command -v llvm-objdump || true)"
+fi
+if [[ -z "$llvm_dis" ]] && command -v brew >/dev/null 2>&1; then
+  for formula in llvm@19 llvm@18 llvm; do
+    prefix="$(brew --prefix "$formula" 2>/dev/null || true)"
+    if [[ -n "$prefix" && -x "$prefix/bin/llvm-objdump" ]]; then
+      llvm_dis="$prefix/bin/llvm-objdump"
+      break
+    fi
+  done
+fi
+[[ -n "$llvm_dis" && -x "$llvm_dis" ]] || { echo "llvm-objdump not found; install LLVM or set ROSETTE_XENIA_WINDOWS_LLVM_PREFIX" >&2; exit 127; }
 fixture_dir="$(mktemp -d /tmp/rosette-windows-cpp-test.XXXXXX)"
 fixture="$repo_root/tools/xenia/windows/warning_contract_test.cc"
 profiles=(

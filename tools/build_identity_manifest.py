@@ -710,11 +710,8 @@ def main() -> int:
     root = args.root.resolve()
     xenia = args.xenia_root
     if xenia is None:
-        env_xenia = os.environ.get("XENIA_ROOT")
+        env_xenia = os.environ.get("ROSETTE_XENIA_ROOT") or os.environ.get("XENIA_ROOT")
         xenia = Path(env_xenia).expanduser() if env_xenia else None
-    if xenia is None:
-        conventional = Path("/Volumes/2023 Drive/xenia/xenia")
-        xenia = conventional if conventional.exists() else None
     if xenia is not None:
         xenia = xenia.resolve()
 

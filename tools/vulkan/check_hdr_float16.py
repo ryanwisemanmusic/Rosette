@@ -5,7 +5,9 @@ import bisect
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
+import platform
 import shutil
 import shlex
 import struct
@@ -67,9 +69,15 @@ def extract_functions(source):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out',required=True,type=Path)
-    parser.add_argument('--xenia',type=Path,default=Path('/Volumes/2023 Drive 1/xenia/xenia'))
-    parser.add_argument('--sdk',type=Path,default=Path.home()/'VulkanSDK/vulkan/macOS')
+    xenia_env=os.environ.get('ROSETTE_XENIA_ROOT') or os.environ.get('XENIA_ROOT')
+    sdk_env=os.environ.get('VULKAN_SDK') or os.environ.get('VK_SDK_PATH')
+    spirv_val=shutil.which('spirv-val')
+    discovered_sdk=Path(sdk_env).expanduser() if sdk_env else (Path(spirv_val).resolve().parent.parent if spirv_val else None)
+    parser.add_argument('--xenia',type=Path,default=Path(xenia_env).expanduser() if xenia_env else None)
+    parser.add_argument('--sdk',type=Path,default=discovered_sdk)
     args=parser.parse_args();out=args.out.resolve()
+    if args.xenia is None: parser.error('pass --xenia or set ROSETTE_XENIA_ROOT/XENIA_ROOT')
+    if args.sdk is None: parser.error('pass --sdk or set VULKAN_SDK/VK_SDK_PATH (or put spirv-val on PATH)')
     if out.exists():parser.error('Use a fresh evidence directory')
     out.mkdir(parents=True);commands=[]
     manifest={'schema':'rosette-hdr-float16-v1','status':'incomplete','commands':commands,
@@ -94,13 +102,19 @@ def main():
         for name,data in [('input',records),('expected',expected)]:
             (out/(name+'.bin')).write_bytes(b''.join(struct.pack('<4I',*r) for r in data))
         (out/'hdr_production.inc').write_text(extract_functions(source))
-        compiler=Path('/opt/homebrew/opt/llvm@19/bin/clang++')
+        compiler_command=shlex.split(os.environ.get('CXX',''))
+        if not compiler_command:
+            clangxx=shutil.which('clang++')
+            if not clangxx and shutil.which('xcrun'):
+                clangxx=subprocess.check_output(['xcrun','--find','clang++'],text=True).strip()
+            if not clangxx: raise RuntimeError('clang++ not found; install Xcode command-line tools or set CXX')
+            compiler_command=[clangxx]
         sysroot=subprocess.check_output(['xcrun','--sdk','macosx','--show-sdk-path'],text=True).strip()
         base=args.xenia;builder=base/'third_party/glslang/SPIRV'
         dependencies=[base/'src/xenia/gpu/spirv_builder.cc']+[builder/n for n in ('SpvBuilder.cpp','SpvPostProcess.cpp','Logger.cpp','InReadableOrder.cpp')]+[ROOT/'tools/graphics_support/native/support.cc']
         sources+=dependencies
         generator=out/'generate'
-        compile_args=[compiler,'-std=c++20','-arch','arm64','-isysroot',sysroot,'-O2','-DFMT_HEADER_ONLY','-I',out,'-I',base/'src','-I',base,'-I',base/'third_party/glslang',ROOT/'tools/vulkan/hdr_float16_generate.cc',*dependencies]
+        compile_args=[*compiler_command,'-std=c++20','-arch',platform.machine(),'-isysroot',sysroot,'-O2','-DFMT_HEADER_ONLY','-I',out,'-I',base/'src','-I',base,'-I',base/'third_party/glslang',ROOT/'tools/vulkan/hdr_float16_generate.cc',*dependencies]
         run([*compile_args,'-M','-MT','HDR_DEPS'],'generator-dependencies',180)
         dependency_tokens=shlex.split((out/'generator-dependencies.log').read_text().replace('\\\n',' '))
         sources += [Path(p).resolve() for p in dependency_tokens if p != 'HDR_DEPS:' and Path(p).is_file()]

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import struct
@@ -24,6 +25,20 @@ from pathlib import Path
 
 GENERATED_CODE_START = 0xA0000000
 GENERATED_CODE_END = 0xB0000000
+
+
+def llvm_tool_candidates(name: str, env_name: str) -> list[str | None]:
+    candidates = [os.environ.get(env_name), shutil.which(name)]
+    brew = shutil.which("brew")
+    if brew:
+        for formula in ("llvm@19", "llvm@18", "llvm"):
+            try:
+                result = subprocess.run([brew, "--prefix", formula], capture_output=True, text=True, check=False, timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if result.returncode == 0 and result.stdout.strip():
+                candidates.append(str(Path(result.stdout.strip()) / "bin" / name))
+    return candidates
 
 
 @dataclass(frozen=True)
@@ -230,13 +245,7 @@ def generated_mapping(address: int) -> Mapping | None:
 
 
 def disassembler_candidates() -> list[tuple[str, str]]:
-    paths = (
-        "/opt/homebrew/opt/llvm@19/bin/llvm-objdump",
-        "/opt/homebrew/opt/llvm/bin/llvm-objdump",
-        "/usr/local/opt/llvm/bin/llvm-objdump",
-        shutil.which("llvm-objdump"),
-        shutil.which("objdump"),
-    )
+    paths = [*llvm_tool_candidates("llvm-objdump", "LLVM_OBJDUMP"), shutil.which("objdump")]
     result: list[tuple[str, str]] = []
     for path in paths:
         if path and Path(path).exists() and all(path != existing for _, existing in result):
@@ -287,12 +296,7 @@ def run_disassembler(path: Path, start: int, stop: int) -> tuple[str | None, str
 
 
 def nearest_symbol(path: Path, address: int) -> str | None:
-    candidates = (
-        "/opt/homebrew/opt/llvm@19/bin/llvm-nm",
-        "/opt/homebrew/opt/llvm/bin/llvm-nm",
-        shutil.which("llvm-nm"),
-        shutil.which("nm"),
-    )
+    candidates = [*llvm_tool_candidates("llvm-nm", "LLVM_NM"), shutil.which("nm")]
     best: tuple[int, str] | None = None
     for tool in candidates:
         if not tool or not Path(tool).exists():

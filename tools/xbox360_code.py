@@ -328,8 +328,15 @@ def branch_target(address: int, word: int) -> Optional[int]:
 
 def llvm_mc() -> str:
     candidates = [os.environ.get("LLVM_MC"), shutil.which("llvm-mc")]
-    for prefix in ("/opt/homebrew/opt/llvm/bin", "/opt/homebrew/opt/llvm@19/bin", "/opt/homebrew/opt/llvm@18/bin", "/usr/local/opt/llvm/bin"):
-        candidates.append(os.path.join(prefix, "llvm-mc"))
+    brew = shutil.which("brew")
+    if brew:
+        for formula in ("llvm@19", "llvm@18", "llvm"):
+            try:
+                result = subprocess.run([brew, "--prefix", formula], capture_output=True, text=True, check=False, timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if result.returncode == 0 and result.stdout.strip():
+                candidates.append(os.path.join(result.stdout.strip(), "bin", "llvm-mc"))
     for candidate in candidates:
         if candidate and os.path.exists(candidate):
             return candidate

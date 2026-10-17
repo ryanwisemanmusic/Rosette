@@ -22,7 +22,9 @@ operation" reads them. Regenerate after a Xenia rebuild:
 """
 
 import argparse
+import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -156,7 +158,7 @@ def family(raw):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exe", required=True)
-    parser.add_argument("--objdump", default="/opt/homebrew/opt/llvm/bin/llvm-objdump")
+    parser.add_argument("--objdump", default=os.environ.get("LLVM_OBJDUMP") or shutil.which("llvm-objdump") or "llvm-objdump")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 

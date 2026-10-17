@@ -73,11 +73,7 @@ transport counters; UI clears never start the picture epoch.
 EOF
 }
 
-default_source_root="/Volumes/2023 Drive/xenia/xenia"
-if [[ ! -d "$default_source_root" && -d "/Volumes/2023 Drive 1/xenia/xenia" ]]; then
-    default_source_root="/Volumes/2023 Drive 1/xenia/xenia"
-fi
-source_root="${ROSETTE_XENIA_ROOT:-$default_source_root}"
+source_root="${ROSETTE_XENIA_ROOT:-${XENIA_ROOT:-}}"
 build_dir="${ROSETTE_XENIA_WINDOWS_BUILD_DIR:-${repo_root}/.rosette/xenia-windows-clean}"
 bundle_dir="${ROSETTE_XENIA_WINDOWS_BUNDLE_DIR:-${build_dir}/bundle}"
 media_image="${ROSETTE_XENIA_MEDIA_IMAGE:-}"

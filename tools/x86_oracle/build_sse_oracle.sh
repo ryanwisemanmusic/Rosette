@@ -11,7 +11,17 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 data="$root/lib/processor/ELF_processor"
-llvm_mc="${LLVM_MC:-$(command -v llvm-mc || echo /opt/homebrew/opt/llvm@19/bin/llvm-mc)}"
+llvm_mc="${LLVM_MC:-$(command -v llvm-mc || true)}"
+if [[ -z "$llvm_mc" ]] && command -v brew >/dev/null 2>&1; then
+  for formula in llvm@19 llvm@18 llvm; do
+    prefix="$(brew --prefix "$formula" 2>/dev/null || true)"
+    if [[ -n "$prefix" && -x "$prefix/bin/llvm-mc" ]]; then
+      llvm_mc="$prefix/bin/llvm-mc"
+      break
+    fi
+  done
+fi
+[[ -n "$llvm_mc" && -x "$llvm_mc" ]] || { echo "llvm-mc not found; install LLVM or set LLVM_MC" >&2; exit 127; }
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 

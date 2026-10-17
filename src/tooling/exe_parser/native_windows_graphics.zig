@@ -17,6 +17,7 @@ const window_access = @import("native_windows_graphics/window_access.zig");
 
 extern fn dlopen(path: [*:0]const u8, flags: c_int) ?*anyopaque;
 extern fn dlsym(handle: ?*anyopaque, name: [*:0]const u8) ?*anyopaque;
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 const rtld_now: c_int = 0x2;
 const rtld_local: c_int = 0x4;
@@ -42,36 +43,41 @@ pub const NativeWindowsGraphics = struct {
         if (self.loader) |loader| return loader;
         if (comptime builtin.target.os.tag != .macos) return null;
 
-        const candidates = [_][*:0]const u8{
-            // Keep the SDK locations ahead of generic search paths.  The
-            // shell audit records these as the host's validated providers, and
-            // selecting the same loader here avoids accidentally mixing a
-            // header/runtime pair from two Vulkan installations.
-            "/Users/ryanwiseman/VulkanSDK/vulkan/macOS/lib/libvulkan.1.3.275.dylib",
-            "/Users/ryanwiseman/VulkanSDK/vulkan/macOS/lib/libvulkan.1.dylib",
-            "/Users/ryanwiseman/VulkanSDK/vulkan/macOS/lib/libvulkan.dylib",
-            "libvulkan.1.dylib",
-            "libvulkan.dylib",
-            "/opt/homebrew/lib/libvulkan.1.dylib",
-            "/opt/homebrew/lib/libvulkan_lvp.dylib",
-            "/usr/local/lib/libvulkan.1.4.341.dylib",
-            "/usr/local/lib/libvulkan.1.dylib",
-            "/usr/local/lib/libvulkan.dylib",
-        };
+        // SDK installations can live anywhere. Resolve the active SDK from
+        // its standard environment variables, then let dyld search its
+        // configured paths for a system/package-manager loader.
+        const sdk_variables = [_][*:0]const u8{ "VULKAN_SDK", "VK_SDK_PATH" };
+        const sdk_libraries = [_][]const u8{ "libvulkan.1.dylib", "libvulkan.dylib" };
+        var sdk_candidate: [4096:0]u8 = undefined;
+        for (sdk_variables) |variable| {
+            const sdk_root_ptr = getenv(variable) orelse continue;
+            const sdk_root = std.mem.span(sdk_root_ptr);
+            if (sdk_root.len == 0) continue;
+            for (sdk_libraries) |library| {
+                const candidate = std.fmt.bufPrintZ(&sdk_candidate, "{s}/lib/{s}", .{ sdk_root, library }) catch continue;
+                if (self.tryLoadVulkan(candidate)) |loader| return loader;
+            }
+        }
+
+        const candidates = [_][*:0]const u8{ "libvulkan.1.dylib", "libvulkan.dylib" };
         for (candidates) |candidate| {
+            if (self.tryLoadVulkan(candidate)) |loader| return loader;
+        }
+        return null;
+    }
+
+    fn tryLoadVulkan(self: *NativeWindowsGraphics, candidate: [*:0]const u8) ?*anyopaque {
             self.loader_attempts +|= 1;
             const handle = dlopen(candidate, rtld_now | rtld_local) orelse {
                 self.loader_failures +|= 1;
-                continue;
+                return null;
             };
             if (dlsym(handle, "vkGetInstanceProcAddr") == null) {
                 self.loader_failures +|= 1;
-                continue;
+                return null;
             }
             self.loader = handle;
             return handle;
-        }
-        return null;
     }
 
     /// Return the presenter's public stage code.  The value is intentionally

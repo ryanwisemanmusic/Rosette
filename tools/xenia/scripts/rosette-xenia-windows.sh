@@ -160,8 +160,15 @@ discover_tools() {
     mingw_request="$(env_value ROSETTE_XENIA_WINDOWS_MINGW_ROOT)"
     lld_request="$(env_value ROSETTE_XENIA_WINDOWS_LLD)"
 
-    if [[ -z "$llvm_prefix" && -x /opt/homebrew/opt/llvm@19/bin/clang ]]; then
-        llvm_prefix=/opt/homebrew/opt/llvm@19/bin
+    if [[ -z "$llvm_prefix" ]] && command -v brew >/dev/null 2>&1; then
+        local formula_prefix
+        for formula in llvm@19 llvm@18 llvm; do
+            formula_prefix="$(brew --prefix "$formula" 2>/dev/null || true)"
+            if [[ -n "$formula_prefix" && -x "$formula_prefix/bin/clang" ]]; then
+                llvm_prefix="$formula_prefix/bin"
+                break
+            fi
+        done
     fi
     [[ -z "$llvm_prefix" ]] || llvm_prefix="$(existing_dir "$llvm_prefix")"
     if [[ -z "$clang_request" && -n "$llvm_prefix" && -x "$llvm_prefix/clang" ]]; then

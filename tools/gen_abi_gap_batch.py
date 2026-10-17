@@ -8,7 +8,7 @@ Mirrors the proven gen_batch13.py format exactly.
 
 import os
 
-ISA = "/Users/ryanwiseman/Documents/Rosetta 3/ISA"
+ISA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ISA")
 
 instructions = {}
 
