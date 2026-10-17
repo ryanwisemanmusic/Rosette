@@ -845,7 +845,7 @@ test "absolute preserves a long absolute path without a compatibility allocation
     const input_object: u64 = 32;
     const output_object: u64 = 80;
     const backing: u64 = 256;
-    const path = "/Users/ryanwiseman/Desktop/8CEB1ABA7AC20BDAF62EEA16699E0227.iso";
+    const path = "/tmp/halo3-fixture.iso";
     var state = TestState{};
     @memcpy(state.mem[@intCast(backing)..][0..path.len], path);
     state.write64(input_object, 80 | 1);

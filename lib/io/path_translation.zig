@@ -146,11 +146,11 @@ test "translate passes through known absolute paths" {
     var buf: [4096]u8 = undefined;
     const paths = [_][]const u8{
         "/var/folders/ab/cd/ef/T/",
-        "/Users/ryan/test.txt",
+        "/Users/example/test.txt",
         "/usr/local/lib/something.dylib",
         "/System/Library/Frameworks/CoreFoundation.framework",
         "/Library/Preferences/test.plist",
-        "/Applications/Xcode.app",
+        "/Applications/Example.app",
         "/private/var/log/system.log",
         "/dev/null",
         "/etc/hosts",
