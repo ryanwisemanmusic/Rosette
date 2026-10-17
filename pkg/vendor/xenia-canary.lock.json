@@ -1,0 +1,895 @@
+{
+  "dependencies": [
+    {
+      "commit": "33374754f65baac0500dda6187e371136357246f",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 78,
+      "id": "directx-headers",
+      "license_files": [
+        "LICENSE"
+      ],
+      "license_status": "upstream-files",
+      "name": "DirectX-Headers",
+      "nested_gitlinks": [],
+      "source_dir": "sources/directx-headers",
+      "source_tree_sha256": "49a3c95d2f1c9218e93a2591ec0f2be059ac63933ef7337ad71b1a116bf5c5f6",
+      "upstream": "https://github.com/microsoft/DirectX-Headers.git",
+      "version": "v1.618.2-16-g3337475",
+      "xenia_path": "third_party/DirectX-Headers"
+    },
+    {
+      "commit": "69e54e29086b7035acffb304cec57a350225f8b0",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 18998,
+      "id": "directxshadercompiler",
+      "license_files": [
+        "LICENSE.TXT",
+        "external/DirectX-Headers/LICENSE",
+        "external/SPIRV-Headers/LICENSE",
+        "external/SPIRV-Tools/LICENSE",
+        "external/SPIRV-Tools/utils/vscode/src/lsp/LICENSE",
+        "external/effcee/LICENSE",
+        "external/re2/LICENSE",
+        "external/re2/python/LICENSE",
+        "external/re2/re2/fuzzing/compiler-rt/LICENSE",
+        "lib/DxilCompression/LICENSE.TXT",
+        "test/YAMLParser/LICENSE.txt",
+        "utils/unittest/googlemock/LICENSE.txt",
+        "utils/unittest/googletest/LICENSE.TXT"
+      ],
+      "license_status": "upstream-files",
+      "name": "DirectXShaderCompiler",
+      "nested_gitlinks": [
+        {
+          "commit": "980971e835876dc0cde415e8f9bc646e64667bf7",
+          "path": "external/DirectX-Headers"
+        },
+        {
+          "commit": "51b106461707f46d962554efe1bf56dee28958a3",
+          "path": "external/SPIRV-Headers"
+        },
+        {
+          "commit": "ec90d2872acbb4802661c9186a1e0fce8924e97b",
+          "path": "external/SPIRV-Tools"
+        },
+        {
+          "commit": "66edefd2bb641de8a2f46b476de21f227fc03a28",
+          "path": "external/effcee"
+        },
+        {
+          "commit": "b76a3eac1dfc7f0fe1d6a64cb59eab868056f099",
+          "path": "external/re2"
+        }
+      ],
+      "source_dir": "sources/directxshadercompiler",
+      "source_tree_sha256": "b943f51363be7b9606f84b16e50996ea297e5f668eb84076e6b6f738125a44d0",
+      "upstream": "https://github.com/microsoft/DirectXShaderCompiler.git",
+      "version": "v1.7.2308",
+      "xenia_path": "third_party/DirectXShaderCompiler"
+    },
+    {
+      "commit": "d980192e175e6ff95bcd287af77e16fcb6597974",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 10128,
+      "id": "ffmpeg",
+      "license_files": [
+        "LICENSE.md"
+      ],
+      "license_status": "upstream-files",
+      "name": "FFmpeg",
+      "nested_gitlinks": [],
+      "source_dir": "sources/ffmpeg",
+      "source_tree_sha256": "0768c151896147a79a1eb0236154ac55e2682f2c91cec0e7cfbc4dc4e36b70ec",
+      "upstream": "https://github.com/has207/FFmpeg.git",
+      "version": "d980192e17",
+      "xenia_path": "third_party/FFmpeg"
+    },
+    {
+      "commit": "9fabcc9a2c45f958aff55ddfda337e74ef894b7f",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 480,
+      "id": "fidelityfx-cas",
+      "license_files": [
+        "LICENSE.txt",
+        "sample/libs/cauldron/libs/AGS/license.txt",
+        "sample/libs/cauldron/libs/VulkanMemoryAllocator/license.txt",
+        "sample/libs/cauldron/libs/d3d12x/license.txt",
+        "sample/libs/cauldron/libs/imgui/License.txt",
+        "sample/libs/cauldron/libs/json/License.txt",
+        "sample/libs/cauldron/license.txt",
+        "sample/libs/cauldron/src/License.txt",
+        "sample/libs/cauldron/src/VK/License.txt",
+        "sample/media/buster_drone/LICENSE.md"
+      ],
+      "license_status": "upstream-files",
+      "name": "FidelityFX-CAS",
+      "nested_gitlinks": [
+        {
+          "commit": "e7ca80d72d3cf750ebb3237e907fb7d3632f3748",
+          "path": "sample/libs/cauldron"
+        }
+      ],
+      "source_dir": "sources/fidelityfx-cas",
+      "source_tree_sha256": "4ae547701c20e420f7f14f97280ca774cdfa7d7d2d97d9cb3fdf057fc1b7487a",
+      "upstream": "https://github.com/GPUOpen-Effects/FidelityFX-CAS.git",
+      "version": "v1.0.2",
+      "xenia_path": "third_party/FidelityFX-CAS"
+    },
+    {
+      "commit": "a21ffb8f6c13233ba336352bdff293894c706575",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 680,
+      "id": "fidelityfx-fsr",
+      "license_files": [
+        "license.txt",
+        "sample/libs/Cauldron/libs/AGS/license.txt",
+        "sample/libs/Cauldron/libs/VulkanMemoryAllocator/license.txt",
+        "sample/libs/Cauldron/libs/d3d12x/license.txt",
+        "sample/libs/Cauldron/libs/imgui/License.txt",
+        "sample/libs/Cauldron/libs/json/License.txt",
+        "sample/libs/Cauldron/libs/vectormath/LICENSE.txt",
+        "sample/libs/Cauldron/license.txt",
+        "sample/media/Cauldron-Media/buster_drone/LICENSE.md"
+      ],
+      "license_status": "upstream-files",
+      "name": "FidelityFX-FSR",
+      "nested_gitlinks": [
+        {
+          "commit": "3e4a021fc0d3e0372347126771a5155016810a11",
+          "path": "sample/libs/Cauldron"
+        },
+        {
+          "commit": "bf0e04475f916617d3f65e6f15001f5ee1682867",
+          "path": "sample/media/Cauldron-Media"
+        }
+      ],
+      "source_dir": "sources/fidelityfx-fsr",
+      "source_tree_sha256": "056c84c18c10f9a16c08743797eb09cebe57188a2b42ac01cf66dea777547657",
+      "upstream": "https://github.com/GPUOpen-Effects/FidelityFX-FSR.git",
+      "version": "v1.0.2",
+      "xenia_path": "third_party/FidelityFX-FSR"
+    },
+    {
+      "commit": "e11183ea6caa3ae4895f4bc54cad2bbb0e365417",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 1759,
+      "id": "sdl2",
+      "license_files": [
+        "LICENSE.txt",
+        "Xcode-iOS/Demos/data/bitmapfont/license.txt",
+        "Xcode/SDL/pkg-support/resources/License.txt",
+        "src/hidapi/LICENSE.txt",
+        "src/video/yuv2rgb/LICENSE",
+        "test/COPYING",
+        "visualtest/COPYING.txt"
+      ],
+      "license_status": "upstream-files",
+      "name": "SDL2",
+      "nested_gitlinks": [],
+      "source_dir": "sources/sdl2/2.32.2",
+      "source_tree_sha256": "9d72b72f89bc769f290eb2293dc3b41791de3cf5a04ba1756a018b615f00b9a4",
+      "upstream": "https://github.com/libsdl-org/SDL.git",
+      "version": "release-2.32.2",
+      "xenia_path": "third_party/SDL2"
+    },
+    {
+      "commit": "33e02568181e3312f49a3cf33df470bf96ef293a",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 1731,
+      "id": "spirv-tools",
+      "license_files": [
+        "LICENSE",
+        "utils/vscode/src/lsp/LICENSE"
+      ],
+      "license_status": "upstream-files",
+      "name": "SPIRV-Tools",
+      "nested_gitlinks": [],
+      "source_dir": "sources/spirv-tools",
+      "source_tree_sha256": "d5225b4e630f37a8210c1912edb52c9c22e771124a1beaae0a887c258f351770",
+      "upstream": "https://github.com/KhronosGroup/SPIRV-Tools.git",
+      "version": "v2025.3",
+      "xenia_path": "third_party/SPIRV-Tools"
+    },
+    {
+      "commit": "2cd90f9d20df57eac214c148f3aed885372ddcfe",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 88,
+      "id": "vulkan-headers",
+      "license_files": [
+        "LICENSE.md"
+      ],
+      "license_status": "upstream-files",
+      "name": "Vulkan-Headers",
+      "nested_gitlinks": [],
+      "source_dir": "sources/vulkan-headers/1.4.321",
+      "source_tree_sha256": "075e07b0e9ca72451fe46e867f570017463c16a857a5ffbee1ae2f1397df43d4",
+      "upstream": "https://github.com/KhronosGroup/Vulkan-Headers.git",
+      "version": "v1.4.321",
+      "xenia_path": "third_party/Vulkan-Headers"
+    },
+    {
+      "commit": "1d8f600fd424278486eade7ed3e877c99f0846b1",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 266,
+      "id": "vulkanmemoryallocator",
+      "license_files": [
+        "LICENSE.txt"
+      ],
+      "license_status": "upstream-files",
+      "name": "VulkanMemoryAllocator",
+      "nested_gitlinks": [],
+      "source_dir": "sources/vulkanmemoryallocator",
+      "source_tree_sha256": "758dd0e71f669c05d6aed8a2a0057f8f54aedca0738084aa088d175d8bc51c12",
+      "upstream": "https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git",
+      "version": "v3.3.0",
+      "xenia_path": "third_party/VulkanMemoryAllocator"
+    },
+    {
+      "commit": "7e3ac3bb6b478187472b4ac6f1698eb203e8e90b",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 13,
+      "id": "aes-128",
+      "license_files": [
+        "LICENSE"
+      ],
+      "license_status": "upstream-files",
+      "name": "aes_128",
+      "nested_gitlinks": [],
+      "source_dir": "sources/aes-128",
+      "source_tree_sha256": "d7afc9dfb7a448317381cf89686e5c7943655e4e728d6bb5ad685d22129312c0",
+      "upstream": "https://github.com/openluopworld/aes_128.git",
+      "version": "v0.1.0-22-g7e3ac3b",
+      "xenia_path": "third_party/aes_128"
+    },
+    {
+      "commit": "cd31ae450f14434b0fccf3b1dc69d51ed2442750",
+      "commit_kind": "xenia-tree",
+      "file_count": 4,
+      "id": "binutils",
+      "license_files": [],
+      "license_status": "review-required-no-license-file",
+      "name": "binutils",
+      "nested_gitlinks": [],
+      "source_dir": "sources/binutils",
+      "source_tree_sha256": "259c42ad5dc205391a83c6d12bcbe40ec0b232b40f1a60d0089301de22d341cd",
+      "upstream": "https://github.com/xenia-canary/xenia-canary.git/tree/159337dbba7bddc9b684bd3dded31a12dbc0b62e/third_party/binutils",
+      "version": "xenia-159337dbba7b",
+      "xenia_path": "third_party/binutils"
+    },
+    {
+      "commit": "66b08439abd988e87b4542389b4937ce13bd0063",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 3971,
+      "id": "capstone",
+      "license_files": [
+        "LICENSES/LICENSE.TXT",
+        "bindings/python/LICENSE.TXT"
+      ],
+      "license_status": "upstream-files",
+      "name": "capstone",
+      "nested_gitlinks": [],
+      "source_dir": "sources/capstone",
+      "source_tree_sha256": "d76238e07cca3efb1ecbd0ad6e8b67eb8d0dbef308c142f6856d8fce63f35561",
+      "upstream": "https://github.com/capstone-engine/capstone.git",
+      "version": "6.0.0-Alpha2",
+      "xenia_path": "third_party/capstone"
+    },
+    {
+      "commit": "ee1450f268dfd5c13aa8670ba97e93cabaf2e15d",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 392,
+      "id": "catch",
+      "license_files": [
+        "LICENSE.txt"
+      ],
+      "license_status": "upstream-files",
+      "name": "catch",
+      "nested_gitlinks": [],
+      "source_dir": "sources/catch",
+      "source_tree_sha256": "b8e019b1dc993ae485a8b75cb8f45e47bb6f51c240ee68c04b24a56f731c7d3d",
+      "upstream": "https://github.com/catchorg/Catch2.git",
+      "version": "v2.13.10-6-gee1450f2",
+      "xenia_path": "third_party/catch"
+    },
+    {
+      "commit": "b24dae08d1c04fe5f3d9bf844c747ac87b58b772",
+      "commit_kind": "xenia-tree",
+      "file_count": 7,
+      "id": "clang-format",
+      "license_files": [
+        "LICENSE.TXT"
+      ],
+      "license_status": "upstream-files",
+      "name": "clang-format",
+      "nested_gitlinks": [],
+      "source_dir": "sources/clang-format",
+      "source_tree_sha256": "6a1c35bbd2314f9ac522b79ba33fb37cb19173fb82a82692b85756fea8f6104d",
+      "upstream": "https://github.com/xenia-canary/xenia-canary.git/tree/159337dbba7bddc9b684bd3dded31a12dbc0b62e/third_party/clang-format",
+      "version": "xenia-159337dbba7b",
+      "xenia_path": "third_party/clang-format"
+    },
+    {
+      "commit": "350702a4d39395571bd118c9a3cff0a573488d61",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 64,
+      "id": "cpplint",
+      "license_files": [
+        "LICENSE",
+        "samples/boost-sample/LICENSE",
+        "samples/chromium-sample/LICENSE",
+        "samples/codelite-sample/LICENSE",
+        "samples/protobuf-sample/LICENSE",
+        "samples/v8-sample/LICENSE",
+        "samples/vlc-sample/COPYING"
+      ],
+      "license_status": "upstream-files",
+      "name": "cpplint",
+      "nested_gitlinks": [],
+      "source_dir": "sources/cpplint",
+      "source_tree_sha256": "cec9373cd4c345a446eb0c7d3e4be4deb4ee1ed726873f37ffdb4fbfba4100ff",
+      "upstream": "https://github.com/cpplint/cpplint.git",
+      "version": "2.0.2",
+      "xenia_path": "third_party/cpplint"
+    },
+    {
+      "commit": "4e882f175da76de13bb36a06383f7d84089c677b",
+      "commit_kind": "xenia-tree",
+      "file_count": 14,
+      "id": "crypto",
+      "license_files": [
+        "des/LICENSE"
+      ],
+      "license_status": "upstream-files",
+      "name": "crypto",
+      "nested_gitlinks": [],
+      "source_dir": "sources/crypto",
+      "source_tree_sha256": "94623b8cb8bd1efc89787717d73bed14abab5433d8724dff5ec1e2ed4b08310c",
+      "upstream": "https://github.com/xenia-canary/xenia-canary.git/tree/159337dbba7bddc9b684bd3dded31a12dbc0b62e/third_party/crypto",
+      "version": "xenia-159337dbba7b",
+      "xenia_path": "third_party/crypto"
+    },
+    {
+      "commit": "f029892dab60526184ee42ae63a7f6d19a6b0e49",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 35,
+      "id": "cxxopts",
+      "license_files": [
+        "LICENSE"
+      ],
+      "license_status": "upstream-files",
+      "name": "cxxopts",
+      "nested_gitlinks": [],
+      "source_dir": "sources/cxxopts",
+      "source_tree_sha256": "bf54a5c0f2a73f9ea0fdda95749a898bec3075d754e824ae25e3c21be99a329d",
+      "upstream": "https://github.com/jarro2783/cxxopts.git",
+      "version": "v3.2.1-9-gf029892",
+      "xenia_path": "third_party/cxxopts"
+    },
+    {
+      "commit": "f94b8f36c6180be0021876c4a397a054fe50c6f2",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 140,
+      "id": "date",
+      "license_files": [
+        "LICENSE.txt"
+      ],
+      "license_status": "upstream-files",
+      "name": "date",
+      "nested_gitlinks": [],
+      "source_dir": "sources/date",
+      "source_tree_sha256": "a9abe78d7338ac559a42b12ee9b0a2c6686c5559cb201687d5f539cc93b6bcf5",
+      "upstream": "https://github.com/HowardHinnant/date.git",
+      "version": "v3.0.4",
+      "xenia_path": "third_party/date"
+    },
+    {
+      "commit": "963aa9f3e5ce81a4682c6ca3d136cddda614db33",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 83,
+      "id": "discord-rpc",
+      "license_files": [
+        "LICENSE"
+      ],
+      "license_status": "upstream-files",
+      "name": "discord-rpc",
+      "nested_gitlinks": [],
+      "source_dir": "sources/discord-rpc",
+      "source_tree_sha256": "0fc5fc27c14c7d38d34e78269b04f40efe8617dd0eb12d225a40437c9fecf5ff",
+      "upstream": "https://github.com/discordapp/discord-rpc.git",
+      "version": "v3.4.0-10-g963aa9f",
+      "xenia_path": "third_party/discord-rpc"
+    },
+    {
+      "commit": "bf9c70c0cc92b6435f7edec75e12751ea37e5c2f",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 27,
+      "id": "disruptorplus",
+      "license_files": [
+        "LICENSE.txt"
+      ],
+      "license_status": "upstream-files",
+      "name": "disruptorplus",
+      "nested_gitlinks": [],
+      "source_dir": "sources/disruptorplus",
+      "source_tree_sha256": "88f096c03f1dc02c5546bd57b4103a667255017c2e1956007d8b6352e2e40ded",
+      "upstream": "https://github.com/xenia-canary/disruptorplus.git",
+      "version": "bf9c70c",
+      "xenia_path": "third_party/disruptorplus"
+    },
+    {
+      "commit": "d868f10d04f00217747d919e96f3c945c7acf255",
+      "commit_kind": "xenia-tree",
+      "file_count": 2,
+      "id": "dxbc",
+      "license_files": [],
+      "license_status": "review-required-no-license-file",
+      "name": "dxbc",
+      "nested_gitlinks": [],
+      "source_dir": "sources/dxbc",
+      "source_tree_sha256": "08f6f7bbe633289cc1903e824bb2ae5203507509d9f4f9775f9ca1f55b535748",
+      "upstream": "https://github.com/xenia-canary/xenia-canary.git/tree/159337dbba7bddc9b684bd3dded31a12dbc0b62e/third_party/dxbc",
+      "version": "xenia-159337dbba7b",
+      "xenia_path": "third_party/dxbc"
+    },
+    {
+      "commit": "540c0bf22c00b531ca3a820be63aaad36ce0156e",
+      "commit_kind": "xenia-tree",
+      "file_count": 13,
+      "id": "ffmpeg-xenia",
+      "license_files": [],
+      "license_status": "review-required-no-license-file",
+      "name": "ffmpeg-xenia",
+      "nested_gitlinks": [],
+      "source_dir": "sources/ffmpeg-xenia",
+      "source_tree_sha256": "8222af3e8529e3cd9d072b1bfb23d5447a04fedb61c9495ce865f29b2d5e526d",
+      "upstream": "https://github.com/xenia-canary/xenia-canary.git/tree/159337dbba7bddc9b684bd3dded31a12dbc0b62e/third_party/ffmpeg-xenia",
+      "version": "xenia-159337dbba7b",
+      "xenia_path": "third_party/ffmpeg-xenia"
+    },
+    {
+      "commit": "407c905e45ad75fc29bf0f9bb7c5c2fd3475976f",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 128,
+      "id": "fmt",
+      "license_files": [
+        "LICENSE"
+      ],
+      "license_status": "upstream-files",
+      "name": "fmt",
+      "nested_gitlinks": [],
+      "source_dir": "sources/fmt",
+      "source_tree_sha256": "a564a52aed40f68d011841c5f9d11403f620f08e83fd188025846693e3500e25",
+      "upstream": "https://github.com/fmtlib/fmt.git",
+      "version": "12.1.0",
+      "xenia_path": "third_party/fmt"
+    },
+    {
+      "commit": "cdca57f44ce1952f65a4699683595a1416641ad2",
+      "commit_kind": "xenia-tree",
+      "file_count": 2,
+      "id": "fxaa",
+      "license_files": [
+        "LICENSE"
+      ],
+      "license_status": "upstream-files",
+      "name": "fxaa",
+      "nested_gitlinks": [],
+      "source_dir": "sources/fxaa",
+      "source_tree_sha256": "c146071160964715a23bf03caf1c002d7f39148036cb3bf6f29a6ec7fa1620ae",
+      "upstream": "https://github.com/xenia-canary/xenia-canary.git/tree/159337dbba7bddc9b684bd3dded31a12dbc0b62e/third_party/fxaa",
+      "version": "xenia-159337dbba7b",
+      "xenia_path": "third_party/fxaa"
+    },
+    {
+      "commit": "a57276bf558f5cf94d3a9854ebdf5a2236849a5a",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 3131,
+      "id": "glslang",
+      "license_files": [
+        "LICENSE.txt"
+      ],
+      "license_status": "upstream-files",
+      "name": "glslang",
+      "nested_gitlinks": [],
+      "source_dir": "sources/glslang",
+      "source_tree_sha256": "fbdabf136dbf3702e6a90ca22489586433c90dc66f1e6fad837dcf38337a2b49",
+      "upstream": "https://github.com/KhronosGroup/glslang.git",
+      "version": "16.0.0",
+      "xenia_path": "third_party/glslang"
+    },
+    {
+      "commit": "d4796778704629c310deb2c9bc70d6c9ee555ab7",
+      "commit_kind": "xenia-tree",
+      "file_count": 4,
+      "id": "half",
+      "license_files": [
+        "LICENSE.txt"
+      ],
+      "license_status": "upstream-files",
+      "name": "half",
+      "nested_gitlinks": [],
+      "source_dir": "sources/half",
+      "source_tree_sha256": "056709cf35eb3763b67c1536343662197b230a2273ae0d35d67a9d7ea5aaa6d5",
+      "upstream": "https://github.com/xenia-canary/xenia-canary.git/tree/159337dbba7bddc9b684bd3dded31a12dbc0b62e/third_party/half",
+      "version": "xenia-159337dbba7b",
+      "xenia_path": "third_party/half"
+    },
+    {
+      "commit": "4806a1924ff6181180bf5e4b8b79ab4394118875",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 243,
+      "id": "imgui",
+      "license_files": [
+        "LICENSE.txt",
+        "examples/libs/glfw/COPYING.txt"
+      ],
+      "license_status": "upstream-files",
+      "name": "imgui",
+      "nested_gitlinks": [],
+      "source_dir": "sources/imgui",
+      "source_tree_sha256": "e9774900223099205b4a1592bfd763ba23540efecf132237b560d5ad2ca72cd8",
+      "upstream": "https://github.com/ocornut/imgui.git",
+      "version": "v1.91.9b-docking",
+      "xenia_path": "third_party/imgui"
+    },
+    {
+      "commit": "a61afe5f75d969c4561a1d0ad753aa23cee6329a",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 148,
+      "id": "libusb",
+      "license_files": [
+        "COPYING"
+      ],
+      "license_status": "upstream-files",
+      "name": "libusb",
+      "nested_gitlinks": [],
+      "source_dir": "sources/libusb",
+      "source_tree_sha256": "a6a683da2a86d6480f584386f1d82dfa2b8b4acca492dd08bb4bb141c8940bad",
+      "upstream": "https://github.com/libusb/libusb.git",
+      "version": "v1.0.28",
+      "xenia_path": "third_party/libusb"
+    },
+    {
+      "commit": "df45b77d424cf33feb7150739e7cb77dd28b618d",
+      "commit_kind": "xenia-tree",
+      "file_count": 4,
+      "id": "llvm",
+      "license_files": [
+        "LICENSE.txt"
+      ],
+      "license_status": "upstream-files",
+      "name": "llvm",
+      "nested_gitlinks": [],
+      "source_dir": "sources/llvm",
+      "source_tree_sha256": "5a9cac282ea6f6b19f63c0d27bad8594e1b296e1dbbab6221e3aa3d70ea2795e",
+      "upstream": "https://github.com/xenia-canary/xenia-canary.git/tree/159337dbba7bddc9b684bd3dded31a12dbc0b62e/third_party/llvm",
+      "version": "xenia-159337dbba7b",
+      "xenia_path": "third_party/llvm"
+    },
+    {
+      "commit": "ee6747a11d3efcf285ecffa9abc5887a049c0566",
+      "commit_kind": "xenia-tree",
+      "file_count": 5,
+      "id": "microprofile",
+      "license_files": [],
+      "license_status": "review-required-no-license-file",
+      "name": "microprofile",
+      "nested_gitlinks": [],
+      "source_dir": "sources/microprofile",
+      "source_tree_sha256": "ce70b017296394f78440b1f45dbeb1ac9c4ee02afcbfea2317633b3c50bbd229",
+      "upstream": "https://github.com/xenia-canary/xenia-canary.git/tree/159337dbba7bddc9b684bd3dded31a12dbc0b62e/third_party/microprofile",
+      "version": "xenia-159337dbba7b",
+      "xenia_path": "third_party/microprofile"
+    },
+    {
+      "commit": "91d0f9431729969b6d015dd8cd1e4168a27f74de",
+      "commit_kind": "xenia-tree",
+      "file_count": 10,
+      "id": "mspack",
+      "license_files": [
+        "COPYING.LIB"
+      ],
+      "license_status": "upstream-files",
+      "name": "mspack",
+      "nested_gitlinks": [],
+      "source_dir": "sources/mspack",
+      "source_tree_sha256": "fd37c00e5e2da8b220e8a55878f4a351a6f0267d5cde812504d8ee683a409c87",
+      "upstream": "https://github.com/xenia-canary/xenia-canary.git/tree/159337dbba7bddc9b684bd3dded31a12dbc0b62e/third_party/mspack",
+      "version": "xenia-159337dbba7b",
+      "xenia_path": "third_party/mspack"
+    },
+    {
+      "commit": "b2b466403084667c90a0f0cc4e960405cfc8117a",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 187,
+      "id": "pugixml",
+      "license_files": [
+        "LICENSE.md"
+      ],
+      "license_status": "upstream-files",
+      "name": "pugixml",
+      "nested_gitlinks": [],
+      "source_dir": "sources/pugixml",
+      "source_tree_sha256": "0eb3a0dafe6e6359a54e6b2375bb01b0097ee3f14a442187191af1e253d7a124",
+      "upstream": "https://github.com/zeux/pugixml.git",
+      "version": "v1.14-33-gb2b4664",
+      "xenia_path": "third_party/pugixml"
+    },
+    {
+      "commit": "a98b85e663114b8fdc9c0dc03abf22c296f38241",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 146,
+      "id": "rapidcsv",
+      "license_files": [
+        "LICENSE"
+      ],
+      "license_status": "upstream-files",
+      "name": "rapidcsv",
+      "nested_gitlinks": [],
+      "source_dir": "sources/rapidcsv",
+      "source_tree_sha256": "980692a31e8c4cc1208a7fab9dc93979d39e34baf96f27223bcc343b5fba8a0b",
+      "upstream": "https://github.com/d99kris/rapidcsv.git",
+      "version": "v8.84",
+      "xenia_path": "third_party/rapidcsv"
+    },
+    {
+      "commit": "7c73dd7de7c4f14379b781418c6e947ad464c818",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 632,
+      "id": "rapidjson",
+      "license_files": [
+        "bin/jsonschema/LICENSE",
+        "contrib/natvis/LICENSE",
+        "license.txt",
+        "thirdparty/gtest/LICENSE",
+        "thirdparty/gtest/googlemock/LICENSE",
+        "thirdparty/gtest/googlemock/scripts/generator/LICENSE",
+        "thirdparty/gtest/googletest/LICENSE"
+      ],
+      "license_status": "upstream-files",
+      "name": "rapidjson",
+      "nested_gitlinks": [
+        {
+          "commit": "ba96d0b1161f540656efdaed035b3c062b60e006",
+          "path": "thirdparty/gtest"
+        }
+      ],
+      "source_dir": "sources/rapidjson",
+      "source_tree_sha256": "4bca615fd0cce0bb196e3a23abd95a01b14a9a7829f839023d51583f9d2cbbc4",
+      "upstream": "https://github.com/Tencent/rapidjson.git",
+      "version": "v1.1.0-753-g7c73dd7d",
+      "xenia_path": "third_party/rapidjson"
+    },
+    {
+      "commit": "781ffde8317997522c897fbf812419e48679f291",
+      "commit_kind": "xenia-tree",
+      "file_count": 1,
+      "id": "renderdoc",
+      "license_files": [],
+      "license_status": "review-required-no-license-file",
+      "name": "renderdoc",
+      "nested_gitlinks": [],
+      "source_dir": "sources/renderdoc",
+      "source_tree_sha256": "2238e2153c468c135602e58c9a4e1401c88f5601562bf46a572b180c8f484204",
+      "upstream": "https://github.com/xenia-canary/xenia-canary.git/tree/159337dbba7bddc9b684bd3dded31a12dbc0b62e/third_party/renderdoc",
+      "version": "xenia-159337dbba7b",
+      "xenia_path": "third_party/renderdoc"
+    },
+    {
+      "commit": "6af9287fbdb913f0794d0148c6aa43b58e63c8e3",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 472,
+      "id": "snappy",
+      "license_files": [
+        "COPYING",
+        "third_party/benchmark/LICENSE",
+        "third_party/googletest/LICENSE"
+      ],
+      "license_status": "upstream-files",
+      "name": "snappy",
+      "nested_gitlinks": [
+        {
+          "commit": "d572f4777349d43653b21d6c2fc63020ab326db2",
+          "path": "third_party/benchmark"
+        },
+        {
+          "commit": "b796f7d44681514f58a683a3a71ff17c94edb0c1",
+          "path": "third_party/googletest"
+        }
+      ],
+      "source_dir": "sources/snappy",
+      "source_tree_sha256": "55a02d804d360fa766c6ca1f2f97b786902ef1876608f5be0131dc9d0d2db1ac",
+      "upstream": "https://github.com/google/snappy.git",
+      "version": "1.2.2",
+      "xenia_path": "third_party/snappy"
+    },
+    {
+      "commit": "3acf512d389e7c37823367c79459aad517ff784c",
+      "commit_kind": "xenia-tree",
+      "file_count": 3,
+      "id": "stb",
+      "license_files": [],
+      "license_status": "review-required-no-license-file",
+      "name": "stb",
+      "nested_gitlinks": [],
+      "source_dir": "sources/stb",
+      "source_tree_sha256": "3a9585fac940d301f9350e9f7a67d970de9eb93ff822cd439e50731a6749fc3a",
+      "upstream": "https://github.com/xenia-canary/xenia-canary.git/tree/159337dbba7bddc9b684bd3dded31a12dbc0b62e/third_party/stb",
+      "version": "xenia-159337dbba7b",
+      "xenia_path": "third_party/stb"
+    },
+    {
+      "commit": "3a58301067bbc03da89ae5a51b3e05b7da719d38",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 76,
+      "id": "tabulate",
+      "license_files": [
+        "LICENSE",
+        "utils/amalgamate/LICENSE.md"
+      ],
+      "license_status": "upstream-files",
+      "name": "tabulate",
+      "nested_gitlinks": [],
+      "source_dir": "sources/tabulate",
+      "source_tree_sha256": "2f9e1842fd881186f622bde8054b4a8612663dbdf99d0e03debfde6964b72b96",
+      "upstream": "https://github.com/p-ranav/tabulate.git",
+      "version": "v1.5-15-g3a58301",
+      "xenia_path": "third_party/tabulate"
+    },
+    {
+      "commit": "708fff700f36ab3c2ab107b984ec9f3b8be5f055",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 219,
+      "id": "tomlplusplus",
+      "license_files": [
+        "LICENSE"
+      ],
+      "license_status": "upstream-files",
+      "name": "tomlplusplus",
+      "nested_gitlinks": [],
+      "source_dir": "sources/tomlplusplus",
+      "source_tree_sha256": "883b7c6574d5cc48c1bfa9e166fdc5a494f4d4d6674c2699113ae1b12520c137",
+      "upstream": "https://github.com/marzer/tomlplusplus.git",
+      "version": "v3.4.0-38-g708fff7",
+      "xenia_path": "third_party/tomlplusplus"
+    },
+    {
+      "commit": "65701fe00700577f9f4e9b96d682bd7cfcc0b76e",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 33,
+      "id": "utfcpp",
+      "license_files": [
+        "LICENSE",
+        "extern/ftest/LICENSE"
+      ],
+      "license_status": "upstream-files",
+      "name": "utfcpp",
+      "nested_gitlinks": [
+        {
+          "commit": "c4ad4af0946b73ce1a40cbc72205d15d196c7e06",
+          "path": "extern/ftest"
+        }
+      ],
+      "source_dir": "sources/utfcpp",
+      "source_tree_sha256": "712f461f26505aa2baa2e9e046d22ad261c24934d45107494112f7a90ed80913",
+      "upstream": "https://github.com/nemtrif/utfcpp.git",
+      "version": "v4.0.6-1-g65701fe",
+      "xenia_path": "third_party/utfcpp"
+    },
+    {
+      "commit": "4e44f4614ddbf038f2a6296f5b906d5c72691e0f",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 146,
+      "id": "xbyak",
+      "license_files": [],
+      "license_status": "review-required-no-license-file",
+      "name": "xbyak",
+      "nested_gitlinks": [],
+      "source_dir": "sources/xbyak",
+      "source_tree_sha256": "c3e3272e1050f361fe79e31e5dc9e008255ff28c122bdbc5ddadfa3ea640c195",
+      "upstream": "https://github.com/herumi/xbyak.git",
+      "version": "v7.22",
+      "xenia_path": "third_party/xbyak"
+    },
+    {
+      "commit": "59c6a7e7368cd2dbb07c46abe83239ace4d58849",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 469,
+      "id": "xbyak-aarch64",
+      "license_files": [
+        "LICENSE"
+      ],
+      "license_status": "upstream-files",
+      "name": "xbyak_aarch64",
+      "nested_gitlinks": [],
+      "source_dir": "sources/xbyak-aarch64",
+      "source_tree_sha256": "02a4830b031c99261f2d97021bf19e01b5f9ac1e30536bec59319c9b2795fe7d",
+      "upstream": "https://github.com/fujitsu/xbyak_aarch64.git",
+      "version": "v1.1.3-12-g59c6a7e",
+      "xenia_path": "third_party/xbyak_aarch64"
+    },
+    {
+      "commit": "e626a72bc2321cd320e953a0ccf1584cad60f363",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 87,
+      "id": "xxhash",
+      "license_files": [
+        "LICENSE",
+        "cli/COPYING",
+        "tests/bench/LICENSE",
+        "tests/collisions/LICENSE"
+      ],
+      "license_status": "upstream-files",
+      "name": "xxhash",
+      "nested_gitlinks": [],
+      "source_dir": "sources/xxhash",
+      "source_tree_sha256": "60bef7a88980fce43c77611310e811b718426fb8b6b2cc1e52cc01a1eb9650f0",
+      "upstream": "https://github.com/Cyan4973/xxHash.git",
+      "version": "v0.8.3",
+      "xenia_path": "third_party/xxhash"
+    },
+    {
+      "commit": "b467f7aa342895e66a1a003377ed63b3c1be3de3",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 17,
+      "id": "zarchive",
+      "license_files": [
+        "LICENSE"
+      ],
+      "license_status": "upstream-files",
+      "name": "zarchive",
+      "nested_gitlinks": [],
+      "source_dir": "sources/zarchive",
+      "source_tree_sha256": "e90e888e7955574803785e38ee721f4cf932016605d1fa48f44136525a3ba4a7",
+      "upstream": "https://github.com/exzap/ZArchive.git",
+      "version": "v0.1.2-3-gb467f7a",
+      "xenia_path": "third_party/zarchive"
+    },
+    {
+      "commit": "860e4cff7917d93f54f5d7f0bc1d0e8b1a3cb988",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 330,
+      "id": "zlib-ng",
+      "license_files": [
+        "LICENSE.md"
+      ],
+      "license_status": "upstream-files",
+      "name": "zlib-ng",
+      "nested_gitlinks": [],
+      "source_dir": "sources/zlib-ng",
+      "source_tree_sha256": "37a1f80df0860495d08067618f730208652876df5833690e3f49c019df2772c6",
+      "upstream": "https://github.com/zlib-ng/zlib-ng.git",
+      "version": "2.2.4",
+      "xenia_path": "third_party/zlib-ng"
+    },
+    {
+      "commit": "20707e3718ee14250fb8a44b3bf023ea36bd88df",
+      "commit_kind": "submodule-gitlink",
+      "file_count": 639,
+      "id": "zstd",
+      "license_files": [
+        "COPYING",
+        "LICENSE",
+        "build/LICENSE"
+      ],
+      "license_status": "upstream-files",
+      "name": "zstd",
+      "nested_gitlinks": [],
+      "source_dir": "sources/zstd",
+      "source_tree_sha256": "701beabc33bafb6d66785fa53de3e2901bb1e347266d08088baa94202afccbac",
+      "upstream": "https://github.com/facebook/zstd.git",
+      "version": "v1.4.7-2242-g20707e37",
+      "xenia_path": "third_party/zstd"
+    }
+  ],
+  "dependency_count": 46,
+  "repository": {
+    "branch": "canary_experimental",
+    "commit": "159337dbba7bddc9b684bd3dded31a12dbc0b62e",
+    "license_file": "licenses/xenia-canary.txt",
+    "name": "Xenia Canary",
+    "url": "https://github.com/xenia-canary/xenia-canary.git"
+  },
+  "schema_version": 1,
+  "source_root": "sources"
+}
