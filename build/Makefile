@@ -22,8 +22,14 @@ SHIM_DIR := $(INCLUDE_DIR)/shims/win32
 MACOS_SHIM_DIR := $(INCLUDE_DIR)/shims/macos
 WIN32_DIR := $(INCLUDE_DIR)/win32
 
-CREDENTIALS := /Users/ryanwiseman/Downloads/DevKeysCerts/rosette.signing.env
--include $(CREDENTIALS)
+# Signing credentials are optional and machine-local. Keep a private default
+# beside generated Rosette state; release automation can point at another file
+# with ROSETTE_SIGNING_ENV without editing this Makefile.
+ROSETTE_SIGNING_ENV ?= $(ROOT_DIR)/.rosette/signing.env
+empty :=
+space := $(empty) $(empty)
+make_escape_spaces = $(subst $(space),\$(space),$(1))
+-include $(call make_escape_spaces,$(ROSETTE_SIGNING_ENV))
 export
 
 CC ?= clang
@@ -160,16 +166,11 @@ WARNING_LEDGER_SCRIPT := $(ROOT_DIR)/tools/audit_warning_ledger.py
 WARNING_LEDGER_OUT := $(ROOT_DIR)/.rosette/warning-ledger.json
 GENERATED_TRACE_SCRIPT := $(ROOT_DIR)/tools/analyze_generated_code_trace.py
 GENERATED_TRACE_OUT := $(ROOT_DIR)/.rosette/generated-code-trace.json
-# Prefer the checkout on the volume used by the Rosette/Xenia run when it is
-# present. The user-facing volume path is the parent directory; the Git
-# checkout itself is its xenia/ child. Keep the older local path as an
-# override-compatible fallback for machines that have that checkout instead.
-# The sanctioned macOS Xenia checkout is intentionally the default.  Keeping
-# Keep the historical mount first, but follow the current external-drive
-# naming when that mount has been renumbered by macOS. The path is only ever
-# read by Rosetta's audits/build helpers; callers on another machine can still
-# override XENIA_ROOT explicitly.
-XENIA_ROOT ?= $(shell if [ -d "/Volumes/2023 Drive/xenia/xenia" ]; then printf '%s' "/Volumes/2023 Drive/xenia/xenia"; elif [ -d "/Volumes/2023 Drive 1/xenia/xenia" ]; then printf '%s' "/Volumes/2023 Drive 1/xenia/xenia"; else printf '%s' "/Volumes/2023 Drive/xenia/xenia"; fi)
+# Xenia is an optional external input, never a machine-specific mount point.
+# Set ROSETTE_XENIA_ROOT (or XENIA_ROOT) when a source comparison is wanted.
+# The absent-source sentinel is project-relative and lets shell refreshes record
+# that Xenia was unavailable without confusing the Rosetta tree for Xenia.
+XENIA_ROOT ?= $(if $(strip $(ROSETTE_XENIA_ROOT)),$(ROSETTE_XENIA_ROOT),$(ROOT_DIR)/.rosette/xenia-source-unavailable)
 XENIA_WINDOWS_BUILD_SCRIPT := $(ROOT_DIR)/tools/xenia/scripts/rosette-xenia-windows.sh
 XENIA_WINDOWS_SOURCE_ROOT ?= $(XENIA_ROOT)
 XENIA_WINDOWS_BUILD_DIR ?= $(ROOT_DIR)/.rosette/xenia-windows
