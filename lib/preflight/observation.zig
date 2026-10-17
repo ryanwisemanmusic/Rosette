@@ -45,7 +45,7 @@
 
 const std = @import("std");
 const check = @import("check.zig");
-const xenia = @import("xenia.zig");
+const xenia = @import("guest.zig");
 
 /// When the gate is evaluated. Each phase can only judge what is knowable by
 /// then; judging earlier produces false alarms and judging later wastes the run.

@@ -1,7 +1,7 @@
 //! Runtime evidence ledger for the complete translated-graphics path.
 //!
 //! The immutable stage/path vocabulary lives in
-//! `pkg/common/xenia/graphics-health-contract`.  This file owns only mutable
+//! `pkg/common/console/graphics-health-contract`.  This file owns only mutable
 //! observations: status, source, step stamps, counts and a bounded note.  It
 //! is deliberately separate from the existing graphics and VdSwap ledgers so
 //! that a historical milestone in one subsystem cannot silently satisfy a

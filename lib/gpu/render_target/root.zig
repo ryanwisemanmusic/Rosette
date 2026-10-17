@@ -12,7 +12,7 @@
 //! every sum that could wrap a `u32` is done in `u64` with a test that would
 //! catch the wrap.
 //!
-//! The geometry is `pkg/common/xenia/render-target-contract`.
+//! The geometry is `pkg/common/console/render-target-contract`.
 
 pub const edram_surface = @import("edram_surface.zig");
 pub const rt_cache = @import("rt_cache.zig");

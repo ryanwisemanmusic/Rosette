@@ -1,6 +1,6 @@
 //! Runtime evidence ledger for the guest VdSwap -> PM4_XE_SWAP boundary.
 //!
-//! The static vocabulary lives in `pkg/common/xenia/vd-swap-contract`.  This
+//! The static vocabulary lives in `pkg/common/console/vd-swap-contract`.  This
 //! file owns mutable observations: where a front buffer came from, which ring
 //! projections contained a candidate packet, whether that packet passed the
 //! strict decoder, and which boundary actually consumed it.  It never writes

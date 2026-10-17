@@ -12,8 +12,8 @@ pub const runtime = @import("runtime.zig");
 pub const plan = @import("plan.zig");
 pub const cache = @import("cache.zig");
 pub const package = @import("package.zig");
-pub const xenia_plan = @import("xenia_plan.zig");
-pub const xenia = @import("xenia.zig");
+pub const xenia_plan = @import("guest_plan.zig");
+pub const xenia = @import("guest.zig");
 
 pub const Phase = types.Phase;
 pub const CompileState = types.CompileState;

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Regenerates lib/processor/ELF_processor/xenia_jit_sse_oracle.{txt,bin}: the
+# Regenerates lib/processor/ELF_processor/guest_jit_sse_oracle.{txt,bin}: the
 # native SSE results `zig build sse-oracle-check` compares Rosette with.
 #
 # The VEX.128 register forms of Xenia's JIT corpus and of xenia_canary.exe's
@@ -28,10 +28,10 @@ trap 'rm -rf "$work"' EXIT
 python3 - "$data" "$llvm_mc" "$work" <<'PY'
 import subprocess, sys
 data, llvm_mc, work = sys.argv[1:4]
-jit = open(data + '/xenia_jit_corpus.txt').read()
+jit = open(data + '/guest_jit_corpus.txt').read()
 known = set(line.split('|')[0] for line in jit.splitlines())
 forms = []
-for line in open(data + '/xenia_image_corpus.txt'):
+for line in open(data + '/guest_image_corpus.txt'):
     parts = line.split('|')
     if len(parts) < 2: continue
     hexs, shape = parts[0], parts[1]
@@ -77,7 +77,7 @@ for index, form in enumerate(forms):
         else:
             result = bytes(16)
         packed += result + record[384:392]
-open(data + '/xenia_jit_sse_oracle.bin', 'wb').write(packed)
-open(data + '/xenia_jit_sse_oracle.txt', 'w').write(''.join('|'.join(form) + '\n' for form in forms))
+open(data + '/guest_jit_sse_oracle.bin', 'wb').write(packed)
+open(data + '/guest_jit_sse_oracle.txt', 'w').write(''.join('|'.join(form) + '\n' for form in forms))
 print('%d forms, %d bytes' % (len(forms), len(packed)))
 PY

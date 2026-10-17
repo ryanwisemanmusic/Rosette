@@ -31,7 +31,7 @@
 pub const check = @import("check.zig");
 pub const host_capability = @import("host_capability.zig");
 pub const component_readiness = @import("component_readiness.zig");
-pub const xenia = @import("xenia.zig");
+pub const xenia = @import("guest.zig");
 pub const observation = @import("observation.zig");
 pub const collector = @import("collector.zig");
 pub const prelaunch_audit = @import("prelaunch_audit.zig");

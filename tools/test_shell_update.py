@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import build_identity_manifest as identity
-import build_xenia_fork_manifest as fork_manifest
+import build_guest_fork_manifest as fork_manifest
 import smart_shell_update as updater
 
 
@@ -160,7 +160,7 @@ class ShellUpdatePolicyTests(unittest.TestCase):
             # external_fingerprint calls this script through run_checked; the
             # fake runner below records exactly the unavailable manifest that
             # the real CLI is contract-tested to emit.
-            script = tools / "build_xenia_fork_manifest.py"
+            script = tools / "build_guest_fork_manifest.py"
             script.write_text("# test stub\n", encoding="utf-8")
             missing_xenia = root / "external-drive" / "xenia"
 
@@ -186,7 +186,7 @@ class ShellUpdatePolicyTests(unittest.TestCase):
             directory = Path(temporary)
             missing = directory / "not-mounted" / "xenia"
             output = directory / "manifest.json"
-            script = REPO_ROOT / "tools/build_xenia_fork_manifest.py"
+            script = REPO_ROOT / "tools/build_guest_fork_manifest.py"
             base_command = [
                 sys.executable, str(script), "--root", str(missing),
                 "--output", str(output),

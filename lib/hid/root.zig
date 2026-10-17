@@ -13,7 +13,7 @@
 //! Each stage's verdict names the earliest failure it can see, so the first
 //! stage that reports a problem owns it.
 //!
-//! The console-side layout is `pkg/common/xenia/input-contract`; the route's
+//! The console-side layout is `pkg/common/console/input-contract`; the route's
 //! atomic publish width is `pkg/{x86,ARM64}/xenia/input-driver`.
 
 pub const controller_map = @import("controller_map.zig");

@@ -1,7 +1,7 @@
 //! Configuration.
 //!
 //! The schema — every key, its type, its default, and the registry that makes
-//! a typo detectable — is `pkg/common/xenia/config-schema`. This library is the
+//! a typo detectable — is `pkg/common/console/config-schema`. This library is the
 //! runtime half: parsing a TOML file with `lib/processor/TOML_processor`,
 //! binding it onto the schema, and layering per-title overrides.
 //!

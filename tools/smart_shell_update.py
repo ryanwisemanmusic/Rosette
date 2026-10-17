@@ -237,7 +237,7 @@ def external_fingerprint(root: Path, xenia_root: Path) -> dict[str, str]:
     import build_identity_manifest as identity
 
     manifest_path = root / ".rosette" / "xenia-fork-manifest.json"
-    xenia_script = tools_dir / "build_xenia_fork_manifest.py"
+    xenia_script = tools_dir / "build_guest_fork_manifest.py"
     run_checked(
         [
             sys.executable,

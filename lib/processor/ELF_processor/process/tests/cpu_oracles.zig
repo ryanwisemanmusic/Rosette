@@ -117,7 +117,7 @@ test "every Xenia JIT form writes only the general registers its assembler text 
     // assembler's own disassembly names as written - plus each mnemonic's
     // architectural implicit writes - may have changed. rsp in particular
     // moves only for the stack instructions.
-    const corpus = @embedFile("../../xenia_jit_corpus.txt");
+    const corpus = @embedFile("../../guest_jit_corpus.txt");
     var state = ElfState.init(testing.allocator);
     state.block_jit_enabled = false;
     defer state.deinit();
@@ -609,12 +609,12 @@ test "timed condition site classification separates polling from lost wakeups" {
 }
 
 test "every instruction form in xenia_canary.exe decodes to a real operation" {
-    // xenia_image_corpus.txt is tools/gen_xenia_image_corpus.py's output: one
+    // guest_image_corpus.txt is tools/gen_guest_image_corpus.py's output: one
     // exemplar per (mnemonic, operand shape, encoding family) across the
     // executable's 3.9 million instructions. The JIT corpus covers what Xenia
     // generates; this covers Xenia itself, where the 2026-09-14 run died on
     // `vmovntps %ymm0, mem` in its two-byte VEX spelling.
-    const corpus = @embedFile("../../xenia_image_corpus.txt");
+    const corpus = @embedFile("../../guest_image_corpus.txt");
     // Forms that stay undecoded, each for a reason. A form that fails and is
     // not named here is a new gap.
     const known_gaps = [_]struct { form: []const u8, reason: []const u8 }{
@@ -830,7 +830,7 @@ test "every Xenia JIT VEX form decodes to the operation and width its assembler 
     // corpus is the code Halo 3 itself runs through, so it gets the image's
     // agreement check plus the width VEX.W selects wherever a general
     // register operand states it.
-    const corpus = @embedFile("../../xenia_jit_corpus.txt");
+    const corpus = @embedFile("../../guest_jit_corpus.txt");
     var failures: usize = 0;
     var checked: usize = 0;
     var width_checked: usize = 0;
@@ -2676,7 +2676,7 @@ test "VTEST sign corpus: every memory form in xenia_canary.exe keeps its base, i
     // addresses `[r13+0x168]` as the absolute 0x168 (VPERM2F128, VINSERTF128
     // and VEXTRACTF128 did). Nothing checked the registers, only the length
     // and the operation.
-    const corpus = @embedFile("../../xenia_image_corpus.txt");
+    const corpus = @embedFile("../../guest_image_corpus.txt");
     const known_gaps = [_][]const u8{ "shrx", "rdrand", "rdseed", "vhaddp", "vaddsubp", "pushfq", "popfq", "lock " };
     var failures: usize = 0;
     var first_failure: []const u8 = "";
@@ -2746,13 +2746,13 @@ test "VTEST sign corpus: every memory form in xenia_canary.exe keeps its base, i
 }
 
 test "VTEST sign operand roles: every three-register VEX form Xenia's JIT emits keeps its destination and both sources" {
-    // xenia_jit_corpus.txt holds the AT&T text of each form Xenia's x64
+    // guest_jit_corpus.txt holds the AT&T text of each form Xenia's x64
     // backend assembles. For `op [$imm,] %rm, %vvvv, %reg` the destination is
     // the last register, the first source (VEX.vvvv) the middle one and the
     // second source (ModR/M.r/m) the first. Operand numbers come from the
     // text, so a decoder that swaps or mis-extends a register field (the
     // R/X/B inversion bits reach xmm8-xmm15) disagrees with it.
-    const corpus = @embedFile("../../xenia_jit_corpus.txt");
+    const corpus = @embedFile("../../guest_jit_corpus.txt");
     var checked: usize = 0;
     var failures: usize = 0;
     var lines = std.mem.splitScalar(u8, corpus, '\n');
@@ -2810,7 +2810,7 @@ test "VTEST sign executor roles: every register-only VEX form Xenia's JIT emits 
     // Halo 3's D3D clear packs its colour in a VMX routine that keeps the
     // colour in a register across scalar FPU code; a stray write there
     // turned the HDR target's clear from black into pure red.
-    const corpus = @embedFile("../../xenia_jit_corpus.txt");
+    const corpus = @embedFile("../../guest_jit_corpus.txt");
     var checked: usize = 0;
     var failures: usize = 0;
     var lines = std.mem.splitScalar(u8, corpus, '\n');
@@ -2912,7 +2912,7 @@ test "VTEST sign executor roles: every memory VEX form Xenia's JIT emits touches
     // each form forty times both ways, and require: only the named vector
     // destination changes, and both runs leave the same registers and the
     // same memory.
-    const corpus = @embedFile("../../xenia_jit_corpus.txt");
+    const corpus = @embedFile("../../guest_jit_corpus.txt");
     const names = [_][]const u8{ "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" };
     const regNumber = struct {
         fn of(text: []const u8, table: []const []const u8) ?u4 {
@@ -3403,7 +3403,7 @@ fn checkFormSources(bytes: []const u8, decoded: DecodedInsn, operand_text: []con
 
 test "VTEST sign operand sources: every VEX form Xenia's JIT emits reads only the registers it names, and follows its source" {
     if (!block_jit.CodeMemory.available()) return error.SkipZigTest;
-    const corpus = @embedFile("../../xenia_jit_corpus.txt");
+    const corpus = @embedFile("../../guest_jit_corpus.txt");
     var checked: usize = 0;
     var failures: usize = 0;
     var lines = std.mem.splitScalar(u8, corpus, '\n');
@@ -3446,7 +3446,7 @@ test "VTEST sign operand sources: every SSE and AVX form in xenia_canary.exe rea
     if (!block_jit.CodeMemory.available()) return error.SkipZigTest;
     // Thousands of programs: `zig build render-cpu-check` sets this.
     if (std.c.getenv("ROSETTE_EXECUTOR_SWEEP") == null) return error.SkipZigTest;
-    const corpus = @embedFile("../../xenia_image_corpus.txt");
+    const corpus = @embedFile("../../guest_image_corpus.txt");
     var checked: usize = 0;
     var failures: usize = 0;
     var lines = std.mem.splitScalar(u8, corpus, '\n');
@@ -3500,8 +3500,8 @@ test "VTEST sign operand sources: every SSE and AVX form in xenia_canary.exe rea
 /// holds, per form and input, 16 result bytes and RFLAGS. Inputs come from
 /// `sseOracleInput`, the generator the native driver ran. To regenerate:
 /// `tools/x86_oracle/gen_sse_oracle.py`.
-const sse_oracle_manifest = @embedFile("../../xenia_jit_sse_oracle.txt");
-const sse_oracle_results = @embedFile("../../xenia_jit_sse_oracle.bin");
+const sse_oracle_manifest = @embedFile("../../guest_jit_sse_oracle.txt");
+const sse_oracle_results = @embedFile("../../guest_jit_sse_oracle.bin");
 const sse_oracle_inputs = 8;
 
 fn sseOracleNext(state: *u64) u64 {
@@ -3736,7 +3736,7 @@ test "VTEST sign SSE oracle: every VEX.128 register form Xenia's JIT emits match
 /// into r10: the scale vector is built with lfd/fcfid/fsubs/frsp/stfs, loaded
 /// with lvx, and the colour in v1 is multiplied, clamped, rounded, converted
 /// with vctsxs and packed with slw/or.
-const xenia_clear_packer = @embedFile("../../xenia_halo3_clear_packer.bin");
+const xenia_clear_packer = @embedFile("../../guest_halo3_clear_packer.bin");
 
 const ClearPackerRun = struct {
     packed_word: u64,
@@ -3935,7 +3935,7 @@ test "VTEST sign executor roles: every SSE and AVX form in xenia_canary.exe writ
     // misbehaves downstream. The corpus names register classes, not
     // numbers, so the decoder (verified by the corpus agreement tests)
     // supplies the destination and the base and index registers.
-    const corpus = @embedFile("../../xenia_image_corpus.txt");
+    const corpus = @embedFile("../../guest_image_corpus.txt");
     var checked: usize = 0;
     var failures: usize = 0;
     var lines = std.mem.splitScalar(u8, corpus, '\n');
@@ -4043,7 +4043,7 @@ test "VTEST sign executor roles: every integer form in xenia_canary.exe leaves t
     // and through them the code Xenia generates for the title. Flags are
     // left to the flag tests: many forms leave some architecturally
     // undefined.
-    const corpus = @embedFile("../../xenia_image_corpus.txt");
+    const corpus = @embedFile("../../guest_image_corpus.txt");
     var checked: usize = 0;
     var failures: usize = 0;
     var lines = std.mem.splitScalar(u8, corpus, '\n');
@@ -4230,7 +4230,7 @@ test "VTEST sign memory operands: every form Xenia's JIT emits keeps its exact b
     // as base or index, rsp and rbp, and the no-index encoding are the
     // classic places a decoder goes wrong, and Xenia's generated code lives in
     // r12 and r13.
-    const corpus = @embedFile("../../xenia_jit_corpus.txt");
+    const corpus = @embedFile("../../guest_jit_corpus.txt");
     const names = [_][]const u8{ "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" };
     const regNumber = struct {
         fn of(text: []const u8, table: []const []const u8) ?u8 {

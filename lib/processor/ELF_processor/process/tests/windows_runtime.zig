@@ -2736,12 +2736,12 @@ test "the precise-time fast import reads the published guest clock value" {
 }
 
 test "every instruction form Xenia's x64 JIT can emit under Rosette's CPUID decodes and executes" {
-    // xenia_jit_corpus.txt is tools/gen_xenia_jit_corpus.py's output: every
+    // guest_jit_corpus.txt is tools/gen_guest_jit_corpus.py's output: every
     // mnemonic Xenia's x64 backend calls, in every operand form an assembler
     // accepts, restricted to the extensions Rosette's `xenia` CPUID profile
     // advertises. The 2026-09-14 run died in title code at 0xa0535c03 on one
     // such form; this names all of them before a run has to find one.
-    const corpus = @embedFile("../../xenia_jit_corpus.txt");
+    const corpus = @embedFile("../../guest_jit_corpus.txt");
     var state = ElfState.init(testing.allocator);
     // One form per step: this drives the decoder and executor one
     // instruction at a time at one address, and a translated block there

@@ -3,7 +3,7 @@ const std = @import("std");
 pub const types = @import("types.zig");
 pub const monitor = @import("monitor.zig");
 pub const profiler = @import("profiler.zig");
-pub const xenia = @import("xenia.zig");
+pub const xenia = @import("guest.zig");
 pub const event_log = @import("event_log.zig");
 pub const health = @import("health.zig");
 
@@ -45,7 +45,7 @@ test "JIT profiler tests" {
 }
 
 test "JIT xenia tests" {
-    _ = @import("xenia.zig");
+    _ = @import("guest.zig");
 }
 
 test "JIT event_log tests" {

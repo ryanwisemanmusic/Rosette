@@ -1461,7 +1461,7 @@ pub fn compileBlockJit(self: *ElfState, jit: *__process_BlockJitState, rip: u64)
     while (insns.items.len < __process_BLOCK_JIT_MAX_INSTRUCTIONS) {
         // A gated loop head starts its own block, so the first iteration
         // enters through the gate too.
-        if (insns.items.len != 0 and @import("xenia_register_writes.zig").isGateAddress(self, address)) break;
+        if (insns.items.len != 0 and @import("guest_register_writes.zig").isGateAddress(self, address)) break;
         const fetch = fetchInstructionSource(self, address) orelse break;
         const fetch_bytes = fetch.contents();
         const mapped = fetch.mapped != null;
@@ -1573,7 +1573,7 @@ pub fn compileBlockJit(self: *ElfState, jit: *__process_BlockJitState, rip: u64)
         .flags_dead_at_calls = self.windows_runtime_enabled,
         .internal_edges = self.block_jit_internal_edges_enabled,
         .pause_helper_preserves_state = self.pause_options.helper_preserves_state,
-        .entry_gate = @import("xenia_register_writes.zig").gateKind(self, rip),
+        .entry_gate = @import("guest_register_writes.zig").gateKind(self, rip),
     };
     jit.last_refusal = .compile_error;
     jit.last_refusal_op = insns.items[0].decoded.op;
@@ -1624,7 +1624,7 @@ pub fn compileBlockJit(self: *ElfState, jit: *__process_BlockJitState, rip: u64)
             .interpret = __process_blockJitInterpret,
             .block = block,
             .flags = __process_blockJitFlags,
-            .entry_gate = @import("xenia_register_writes.zig").entryGate,
+            .entry_gate = @import("guest_register_writes.zig").entryGate,
         },
         .start_rip = rip,
         .end_rip = address,
@@ -3159,7 +3159,7 @@ pub fn step(self: *ElfState) bool {
         // are the same ones the decoder's opcode census reports, so the
         // gap can be looked up directly.
         var encoding_buffer: [96]u8 = undefined;
-        __process_log.err("invalid instruction at rip=0x{x} ({s}) thread={s}: encoding={s} bytes={any}; this opcode slot has no decoder entry -- see ISA/decoding/coverage.zig for the census of what does, and if the address is generated code, add the form to the Xenia JIT corpus (tools/gen_xenia_jit_corpus.py)", .{
+        __process_log.err("invalid instruction at rip=0x{x} ({s}) thread={s}: encoding={s} bytes={any}; this opcode slot has no decoder entry -- see ISA/decoding/coverage.zig for the census of what does, and if the address is generated code, add the form to the Xenia JIT corpus (tools/gen_guest_jit_corpus.py)", .{
             process_impl_lifecycle.guestContextField(self, "regs").*.rip,
             process_impl_kernel_services.describeGuestAddressOrUnnamed(self, process_impl_lifecycle.guestContextField(self, "regs").*.rip, &fault_symbol_text),
             process_impl_guest_diagnostics.guestThreadLabel(self, fault_slot_plus_one),

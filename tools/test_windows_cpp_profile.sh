@@ -23,7 +23,7 @@ if [[ -z "$llvm_dis" ]] && command -v brew >/dev/null 2>&1; then
 fi
 [[ -n "$llvm_dis" && -x "$llvm_dis" ]] || { echo "llvm-objdump not found; install LLVM or set ROSETTE_XENIA_WINDOWS_LLVM_PREFIX" >&2; exit 127; }
 fixture_dir="$(mktemp -d /tmp/rosette-windows-cpp-test.XXXXXX)"
-fixture="$repo_root/tools/xenia/windows/warning_contract_test.cc"
+fixture="$repo_root/tools/guest_runtime/windows/warning_contract_test.cc"
 profiles=(
   third_party/microprofile/microprofile.h
   src/xenia/base/threading_win.cc
@@ -41,7 +41,7 @@ for index in "${!profiles[@]}"; do
   "$transpiler" --windows-xenia-file "${profiles[$index]}" "$fixture" > "$output"
   fixture="$output"
 done
-"$compiler" -std=gnu++23 -fsyntax-only "$repo_root/tools/xenia/windows/header_contract_test.cc"
+"$compiler" -std=gnu++23 -fsyntax-only "$repo_root/tools/guest_runtime/windows/header_contract_test.cc"
 "$compiler" -std=gnu++23 -O1 -S -emit-llvm "$fixture" -o "$fixture_dir/contract.ll"
 "$compiler" -std=gnu++23 -O1 -c "$fixture" -o "$fixture_dir/contract.obj"
 "$llvm_dis" -h -s "$fixture_dir/contract.obj" > "$fixture_dir/contract-coff.txt"

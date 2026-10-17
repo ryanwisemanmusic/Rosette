@@ -1156,7 +1156,7 @@ pub const Op = enum(u16) {
     vmovss_xmm_xmm_xmm,
     vmovsd_xmm_xmm_xmm,
     // Forms xenia_canary.exe's own code contains that had no decoder entry
-    // (xenia_image_corpus.txt). SBB's memory forms were refused outright
+    // (guest_image_corpus.txt). SBB's memory forms were refused outright
     // rather than risk the enum-offset family below it.
     fisttp_mem32,
     sbb_reg16_mem16,

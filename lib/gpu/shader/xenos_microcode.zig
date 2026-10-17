@@ -11,7 +11,7 @@
 //! detectable and semantic ones mostly are not. A control-flow instruction
 //! pointing past the end of the blob, a clause that never terminates, a nesting
 //! depth beyond the hardware's stack — all of these are checkable against
-//! `pkg/common/xenia/shader-contract` and all of them mean the blob is not what
+//! `pkg/common/console/shader-contract` and all of them mean the blob is not what
 //! Rosette thinks it is. Whereas a wrongly decoded ALU op produces a shader
 //! that compiles and draws the wrong thing.
 //!

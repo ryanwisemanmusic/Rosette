@@ -3,7 +3,7 @@
 //! Which physical button is "A" is a property of the pad that happens to be
 //! connected, not of the console, so this mapping is runtime data rather than a
 //! contract. What the mapping produces — the button word, the stick ranges — is
-//! fixed by `pkg/common/xenia/input-contract`.
+//! fixed by `pkg/common/console/input-contract`.
 //!
 //! ## Why the axis conversion is the subtle part
 //!

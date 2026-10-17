@@ -1,0 +1,11 @@
+name = "xenia-x86-startup-evidence"
+version = "0.1.0-local"
+kind = "facts"
+role = "build-time"
+tooling = "src/main.zig"
+architectures = ["x86_64", "ppc64", "arm64"]
+language = "zig"
+verification = "verify.sh"
+
+# The package owns only immutable route/stage/vocabulary facts. The offline
+# CLI is tooling; its mutable log observer is lib/diagnostics/guest_startup_evidence.zig.

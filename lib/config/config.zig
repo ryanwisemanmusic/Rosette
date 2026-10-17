@@ -1,7 +1,7 @@
 //! TOML configuration loading and typed access.
 //!
 //! The schema — every key, its type, and its default — is
-//! `pkg/common/xenia/config-schema`. This file is the runtime half: it parses
+//! `pkg/common/console/config-schema`. This file is the runtime half: it parses
 //! TOML with the existing `lib/processor/TOML_processor` and binds the result
 //! onto the schema's typed structure.
 //!

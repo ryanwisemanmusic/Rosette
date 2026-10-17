@@ -7,5 +7,5 @@ pub fn report(state: anytype) void {
     @import("arithmetic_report.zig").report(state);
     @import("native_path_report.zig").report(state);
     @import("operand_report.zig").report(state);
-    @import("xenia_register_writes.zig").report(state);
+    @import("guest_register_writes.zig").report(state);
 }

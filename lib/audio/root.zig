@@ -30,7 +30,7 @@
 //! the mixer or the device.
 //!
 //! The console-side geometry these modules obey is
-//! `pkg/common/xenia/audio-contract`; the route's mix width and denormal
+//! `pkg/common/console/audio-contract`; the route's mix width and denormal
 //! controls are `pkg/{x86,ARM64}/xenia/audio-driver`.
 
 pub const audio_ring = @import("audio_ring.zig");

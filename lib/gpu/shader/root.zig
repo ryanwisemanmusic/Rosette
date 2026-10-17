@@ -22,7 +22,7 @@
 //! `xenos_microcode` checks structure before anything trusts an instruction,
 //! because structural errors are detectable and semantic ones mostly are not.
 //!
-//! Limits are `pkg/common/xenia/shader-contract`.
+//! Limits are `pkg/common/console/shader-contract`.
 
 pub const xenos_microcode = @import("xenos_microcode.zig");
 pub const microcode_to_ssa = @import("microcode_to_ssa.zig");

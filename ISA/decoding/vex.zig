@@ -2211,7 +2211,7 @@ fn decodeVex2Table(bytes: []const u8, start_pos: usize) DecodedInsn {
     // form) merge two sources: the low element from one register and the
     // rest of the lane from VEX.vvvv. Xenia's JIT emits it for scalar
     // assignment, and it decoded as invalid; see
-    // `xenia_jit_corpus.txt` in the ELF processor for every such form.
+    // `guest_jit_corpus.txt` in the ELF processor for every such form.
     if ((opcode == 0x10 or opcode == 0x11) and (prefix == 2 or prefix == 3) and
         !vector_256 and bytes[start_pos + 3] >= 0xC0)
     {

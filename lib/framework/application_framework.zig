@@ -8,9 +8,9 @@
 const std = @import("std");
 const contract = @import("application_framework_contract");
 const xenia_launch_assist_contract = @import("xenia_launch_assist_contract");
-const xenia_launch_assist = @import("xenia_launch_assist.zig");
+const xenia_launch_assist = @import("guest_launch_assist.zig");
 const xenia_host_gpu_callback_contract = @import("xenia_host_gpu_callback_contract");
-const xenia_host_gpu_callback = @import("xenia_host_gpu_callback.zig");
+const xenia_host_gpu_callback = @import("guest_host_gpu_callback.zig");
 
 pub const schema = contract;
 pub const max_events: usize = 1024;

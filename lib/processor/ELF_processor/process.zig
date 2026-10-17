@@ -80,7 +80,7 @@ const exit_diagnostics = @import("exit_diagnostics");
 const cleo_routing = @import("cleo_routing");
 const execution_history = @import("execution_history");
 const vector_helpers = @import("x86_vector_helpers");
-const xenia_accelerator = @import("xenia_accelerator.zig");
+const xenia_accelerator = @import("guest_accelerator.zig");
 const xenia_fatal_condition_map = @import("xenia_fatal_condition_map");
 const xenia_guest_frontier_map = @import("xenia_guest_frontier_map");
 const xenia_warning_severity_map = @import("xenia_warning_severity_map");
@@ -124,7 +124,7 @@ const guest_output_governor = @import("guest_output_governor.zig");
 const windows_registry_model = @import("windows_registry.zig");
 const mapped_ranges = @import("mapped_ranges.zig");
 const import_histogram = @import("import_histogram.zig");
-const xenia_clock_probe = @import("xenia_clock_probe.zig");
+const xenia_clock_probe = @import("guest_clock_probe.zig");
 const ui_draw_evidence = @import("ui_draw_evidence.zig");
 
 /// Keep the Xenia presenter chain's table lookups in one bounded comptime
@@ -5648,6 +5648,6 @@ test {
     _ = @import("process/tests/native_shader_compile.zig");
     _ = @import("process/tests/windows_mutex.zig");
     _ = @import("process/tests/windows_mutex_contract.zig");
-    _ = @import("process/tests/xenia_command_replay.zig");
+    _ = @import("process/tests/guest_command_replay.zig");
     _ = @import("block_jit/tests.zig");
 }

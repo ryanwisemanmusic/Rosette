@@ -13,7 +13,7 @@
 //! ## What this module is not
 //!
 //! * It is not a contract. It holds no Xbox 360 facts; every fact it checks
-//!   lives in the packages under `pkg/common/xenia/`.
+//!   lives in the packages under `pkg/common/console/`.
 //! * It is not a gate. A contract failure does not prevent the run from
 //!   starting — it records the violation so that later symptoms can be traced
 //!   to a precondition that was already known to be broken.

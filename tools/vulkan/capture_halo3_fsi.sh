@@ -56,4 +56,4 @@ if [[ "${ROSETTE_VULKAN_GFXR}" == 1 ]]; then
     echo "Metal validation stops at the first reported shader fault. This diagnostic run is slower."
   fi
 fi
-exec "$task_root/tools/xenia/scripts/rosette-xenia-run.sh" "$@"
+exec "$task_root/tools/guest_runtime/scripts/rosette-guest-run.sh" "$@"

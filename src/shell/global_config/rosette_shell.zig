@@ -1189,7 +1189,7 @@ fn cleanupReason(executable_path: []const u8, argv0: []const u8, argv1: []const 
     if (std.ascii.eqlIgnoreCase(process_name, "rosette_mscoree_window_helper")) return "Rosette managed window helper";
     if (std.ascii.eqlIgnoreCase(process_name, "rose") and std.mem.startsWith(u8, executable_path, "/usr/local/bin/")) return "legacy Rosette launcher";
     if (std.mem.startsWith(u8, first_argument, "xenia-rosetta.")) return "Rosette Xenia handoff script";
-    if (std.ascii.eqlIgnoreCase(first_argument, "rosette-xenia-run.sh")) return "Rosette Xenia run supervisor";
+    if (std.ascii.eqlIgnoreCase(first_argument, "rosette-guest-run.sh")) return "Rosette Xenia run supervisor";
     if (!options.include_xenia and std.ascii.eqlIgnoreCase(process_name, "xenia_canary")) return null;
     if (options.include_xenia and std.ascii.eqlIgnoreCase(process_name, "xenia_canary")) return "Rosette-launched Xenia Canary";
     return null;

@@ -178,7 +178,7 @@ pub const Population = enum {
 /// rest — which is what made the kernel-export layer unreadable and left
 /// "kernel export binding" reported as untested.
 ///
-/// `pkg/common/xenia/kernel-export-map` carries the full table transcribed
+/// `pkg/common/console/kernel-export-map` carries the full table transcribed
 /// from the console's own export tables, so every ordinal a title can import
 /// resolves here. Null still means "the kernel does not publish this", which
 /// is a real and useful answer — a fabricated `ordinal_258` would read as a

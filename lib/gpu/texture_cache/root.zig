@@ -14,7 +14,7 @@
 //! * A stale texture, from an invalidation range that is off by one at its
 //!   boundary (`texture_cache`).
 //!
-//! The format table is `pkg/common/xenia/texture-contract`; the canonical
+//! The format table is `pkg/common/console/texture-contract`; the canonical
 //! address swizzle stays in `lib/gpu/xenos_texture.zig` and is passed into the
 //! untile walk rather than re-derived here.
 

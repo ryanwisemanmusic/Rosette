@@ -67,7 +67,7 @@ PHASES = [
             "lib/audio/audio_system.zig",
             "lib/audio/xma_decoder.zig",
             "lib/runtime/guest-abi/native_window_runtime.zig",
-            "pkg/common/xenia/input-contract/src/root.zig",
+            "pkg/common/console/input-contract/src/root.zig",
             "pkg/dll/win32/ole32/src/root.zig",
             "pkg/dll/win32/wsock32/src/root.zig",
         ],

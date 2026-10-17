@@ -232,7 +232,7 @@ static int ensure_zig_lib(const char *root, const char *zig_lib, bool run_check)
     fprintf(stdout, "  → Refreshing Zig library...\n");
     char cmd[MAX_PATH_LEN];
     snprintf(cmd, sizeof(cmd),
-             "cd \"%s\" && env MACOSX_DEPLOYMENT_TARGET=13.0 ZIG_LOCAL_CACHE_DIR=.zig-cache ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build --build-file build/build.zig %sinstall",
+             "cd \"%s\" && env ZIG_LOCAL_CACHE_DIR=.zig-cache ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build --build-file build/build.zig %sinstall",
              root,
              run_check ? "check " : "");
     return system(cmd);

@@ -6,7 +6,7 @@ const format = @import("format.zig");
 /// format facts only; runtime adapter/device capabilities are overlaid from the
 /// backend's observed description and remain read-only.
 pub fn xeniaSafe(allocator: std.mem.Allocator) !schema.Tree {
-    return format.loadJson(allocator, @embedFile("profiles/xenia-safe.device-tree.json"));
+    return format.loadJson(allocator, @embedFile("profiles/guest-safe.device-tree.json"));
 }
 
 test "safe Xenia profile cannot synthesize guest GPU startup" {

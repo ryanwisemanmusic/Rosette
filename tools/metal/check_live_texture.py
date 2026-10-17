@@ -98,7 +98,7 @@ def main():
             if sha(path)!=expected or offset<0:raise RuntimeError('Loader identity not present in PE: '+name)
             identities.append({'name':name,'sha256':expected,'header_sha256':sha(header),'pe_offset':offset})
         del exe;manifest['loader_identities']=identities
-        src=ROOT/'lib/metal/textures';flat=out/'live.metal';flat.write_text((src/'block_formats.h').read_text()+'\n'+(src/'live_xenia.metal').read_text())
+        src=ROOT/'lib/metal/textures';flat=out/'live.metal';flat.write_text((src/'block_formats.h').read_text()+'\n'+(src/'live_guest.metal').read_text())
         metal=subprocess.check_output(['xcrun','--find','metal'],text=True).strip();mlib=subprocess.check_output(['xcrun','--find','metallib'],text=True).strip();clang=subprocess.check_output(['xcrun','--find','clang'],text=True).strip()
         helper=out/'rewrite';run(['zig','build-exe','-O','ReleaseFast','-lc','--dep','rect','--dep','robust','-Mroot=tools/vulkan/prepare_rect_shaders.zig','-Mrect=lib/gpu/vulkan/rect_list_expand.zig','-Mrobust=lib/gpu/vulkan/robust_access.zig','-femit-bin='+str(helper)],'rewrite-build')
         run([helper,original,hardened],'rewrite')
@@ -128,7 +128,7 @@ def main():
         if len(passed)!=len(paths):raise RuntimeError('Missing GPU result')
         manifest['checks']=[{'name':line[5:],'status':'pass'} for line in passed]
         manifest['status']='pass'
-        sources=[Path(__file__),ROOT/'tools/metal/check_support.py',ROOT/'tools/metal/probe_live_texture.c',ROOT/'tools/metal/probe_live_profile.zig',ROOT/'tools/vulkan/robust_access/probe.c',ROOT/'lib/gpu/metal/live_texture.zig',ROOT/'lib/linker/dyld/dynamic_library_forwarder.zig',ROOT/'lib/metal/textures/live_source.zig',src/'block_formats.h',src/'live_xenia.metal',ROOT/'lib/gpu/vulkan/rect_list_expand.zig',ROOT/'lib/gpu/vulkan/robust_access.zig',ROOT/'lib/gpu/vulkan/abi.zig',ROOT/'lib/gpu/vulkan/marshal.zig',ROOT/'build/build.zig',ROOT/'app/bundling/build.zig']
+        sources=[Path(__file__),ROOT/'tools/metal/check_support.py',ROOT/'tools/metal/probe_live_texture.c',ROOT/'tools/metal/probe_live_profile.zig',ROOT/'tools/vulkan/robust_access/probe.c',ROOT/'lib/gpu/metal/live_texture.zig',ROOT/'lib/linker/dyld/dynamic_library_forwarder.zig',ROOT/'lib/metal/textures/live_source.zig',src/'block_formats.h',src/'live_guest.metal',ROOT/'lib/gpu/vulkan/rect_list_expand.zig',ROOT/'lib/gpu/vulkan/robust_access.zig',ROOT/'lib/gpu/vulkan/abi.zig',ROOT/'lib/gpu/vulkan/marshal.zig',ROOT/'build/build.zig',ROOT/'app/bundling/build.zig']
         sources.append(ROOT/'lib/gpu/vulkan/fsi/pixel_frequency.zig')
         manifest['source_hashes']={str(x):sha(x) for x in sources};manifest['tools']={str(x):sha(x) for x in (Path(metal),Path(mlib),Path(clang),a.sdk/'lib/libMoltenVK.dylib',a.sdk/'bin/spirv-val',Path(shutil.which('zig')))}
         manifest['artifact_hashes']={str(x):sha(x) for x in (flat,out/'live.air',out/'live.metallib',probe,profile,helper,*original.glob('*.spv'),*hardened.glob('*.spv'),*paths)}

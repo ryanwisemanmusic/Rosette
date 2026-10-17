@@ -734,9 +734,9 @@ def main() -> int:
     phase_coverage = args.phase_coverage.resolve() if args.phase_coverage else None
     evidence_replay = args.evidence_replay.resolve() if args.evidence_replay else None
     run_system_paths = [
-        root / "tools" / "xenia" / "scripts" / "rosette_xenia_systems.py",
-        root / "tools" / "xenia" / "scripts" / "rosette-xenia-run.sh",
-        root / "tools" / "test_xenia_run_systems.py",
+        root / "tools" / "guest_runtime" / "scripts" / "rosette_guest_systems.py",
+        root / "tools" / "guest_runtime" / "scripts" / "rosette-guest-run.sh",
+        root / "tools" / "test_guest_run_systems.py",
     ]
     run_system_hash, run_system_count, run_system_missing = hash_paths(run_system_paths, root)
 

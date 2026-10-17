@@ -1,6 +1,6 @@
 const std = @import("std");
 const c_fix = @import("c_fix.zig");
-const windows_xenia_cpp = @import("windows_xenia_cpp.zig");
+const windows_xenia_cpp = @import("windows_guest_cpp.zig");
 
 pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
