@@ -1,0 +1,11 @@
+{
+  "archive_sha256": "385f0d072d466a013fef6a6ab2cbc62404d5a8c25a04e26aaa57904dff4c8e16",
+  "commit": "a077d3fd59e915b3e1f742560b3850edd5057ec7",
+  "file_count": 15,
+  "id": "avx-to-neon",
+  "license_file": "LICENSE",
+  "schema_version": 1,
+  "source_dir": "sources/rosette-reference/AvxToNeon",
+  "source_tree_sha256": "385c0e7ec972bf8acc072bdc5cee817f4e08e0f2d657dd6981a51bb882b20262",
+  "upstream": "https://github.com/kunpengcompute/AvxToNeon.git"
+}
