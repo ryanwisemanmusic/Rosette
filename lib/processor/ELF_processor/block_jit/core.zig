@@ -158,6 +158,9 @@ pub const Helpers = extern struct {
     /// the way out of a block, and by the interpret helper before the
     /// interpreter can read a flag the record still owns.
     flags: *const fn (state: *anyopaque) callconv(.c) void,
+    /// `Options.entry_gate`'s callee: entered with only the frame live.
+    /// Nonzero: it left RIP in the register file and the block leaves.
+    entry_gate: ?*const fn (state: *anyopaque, kind: u32) callconv(.c) u32 = null,
 };
 
 const helper_read_offset: u32 = @offsetOf(Helpers, "read");
@@ -173,6 +176,7 @@ const helper_x87_raw_transfer_offset: u32 = @offsetOf(Helpers, "x87_raw_transfer
 const helper_x87_memory_offset: u32 = @offsetOf(Helpers, "x87_memory");
 const helper_interpret_offset: u32 = @offsetOf(Helpers, "interpret");
 const helper_block_offset: u32 = @offsetOf(Helpers, "block");
+const helper_entry_gate_offset: u32 = @offsetOf(Helpers, "entry_gate");
 const helper_flags_offset: u32 = @offsetOf(Helpers, "flags");
 
 /// The block's view of the state it is running in, written by emitted code
@@ -889,6 +893,7 @@ pub const Compiled = struct {
     scalar_resident_ops: u32 = 0,
     arithmetic_flag_ops: u32 = 0,
     direct_scalar_ops: u32 = 0,
+    direct_operand_ops: [3]u32 = @splat(0),
     first_way_fallthrough: bool = false,
 };
 
@@ -2070,6 +2075,7 @@ const Compiler = struct {
     resident_loop: ?Label = null,
     first_way_fallthrough: bool = true,
     direct_scalar_paths: bool = true,
+    direct_register_operands: bool = true,
     exits: std.ArrayList(ExitStub),
     /// Full-probe paths of hoisted accesses, emitted after the block body so
     /// the hot path is the pointer test and the access alone.
@@ -2177,6 +2183,7 @@ const Compiler = struct {
     scalar_resident_ops: u32 = 0,
     arithmetic_flag_ops: u32 = 0,
     direct_scalar_ops: u32 = 0,
+    direct_operand_ops: [3]u32 = @splat(0),
     /// The PAUSE scheduling callback only updates the register-file RIP and
     /// flags; unlike an arbitrary interpreter escape, it leaves every guest
     /// GPR, vector register, and hoisted base untouched. Keep the old reload
@@ -4151,6 +4158,10 @@ const Compiler = struct {
             try self.emitIncDecInsn(form.inc, form.mem, incDecSize(d.op), insn, index);
             return .native;
         }
+        if (self.direct_register_operands) if (try @import("register_operands.zig").emit(self, insn, index)) |kind| {
+            self.direct_operand_ops[@intFromEnum(kind)] += 1;
+            return .native;
+        };
         switch (d.op) {
             .nop => {},
             .mov_reg8_reg8, .mov_reg16_reg16, .mov_reg32_reg32, .mov_reg64_reg64 => {
@@ -4935,7 +4946,7 @@ const Compiler = struct {
 
     /// The host register caching guest `id`, for a whole 32- or 64-bit
     /// access; null when it is not cached or the access merges.
-    fn cachedWhole(self: *const Compiler, id: RegId, high8: bool, size: Size) ?a64.Reg {
+    pub fn cachedWhole(self: *const Compiler, id: RegId, high8: bool, size: Size) ?a64.Reg {
         if (high8 or (size != .bits32 and size != .bits64)) return null;
         const slot = self.cache_slot[@intFromEnum(id)] orelse return null;
         return cache_host_regs[slot];
@@ -4943,7 +4954,7 @@ const Compiler = struct {
 
     /// The register-file effects of writing guest `id` directly in its
     /// cache register, which `storeReg` would otherwise have done.
-    fn noteDirectWrite(self: *Compiler, id: RegId) void {
+    pub fn noteDirectWrite(self: *Compiler, id: RegId) void {
         self.use_counts[@intFromEnum(id)] +|= 1;
         self.written |= @as(u16, 1) << @intFromEnum(id);
         for (&self.hoists) |*hoist| {
@@ -7526,6 +7537,7 @@ pub const Options = struct {
     resident_self_loops: bool = true,
     first_way_fallthrough: bool = true,
     direct_scalar_paths: bool = true,
+    direct_register_operands: bool = true,
     resident_vectors: bool = true,
     scalar_residency: bool = true,
     rearrangement_residency: bool = true,
@@ -7542,6 +7554,9 @@ pub const Options = struct {
     atomic_retry_yield_enabled: bool = true,
     atomic_direct_updates: bool = true,
     atomic_compare_fusion: bool = false, // offline experiment; retry timing regressed
+    /// Nonzero: call `Helpers.entry_gate(state, entry_gate)` on every entry,
+    /// before the register cache loads (process/impl/xenia_register_writes).
+    entry_gate: u32 = 0,
 };
 
 /// Whether `op` transfers into or back out of a function.
@@ -7731,6 +7746,7 @@ pub fn compileWith(allocator: std.mem.Allocator, memory: *CodeMemory, layout: La
         .scalar_resident_ops = pass.compiler.scalar_resident_ops,
         .arithmetic_flag_ops = pass.compiler.arithmetic_flag_ops,
         .direct_scalar_ops = pass.compiler.direct_scalar_ops,
+        .direct_operand_ops = pass.compiler.direct_operand_ops,
         .first_way_fallthrough = pass.compiler.first_way_fallthrough and !pass.compiler.endsIndirect(),
     };
 }
@@ -7793,6 +7809,7 @@ fn emitBlock(
     compiler.cache_written = cache_written;
     compiler.first_way_fallthrough = options.first_way_fallthrough;
     compiler.direct_scalar_paths = options.direct_scalar_paths;
+    compiler.direct_register_operands = options.direct_register_operands;
     if (cache_counts) |counts| compiler.chooseCache(counts);
     compiler.planHoist();
     if (options.resident_self_loops and compiler.cache_count != 0 and self_loops.hasEdge(insns)) compiler.resident_loop = try assembler.createLabel();
@@ -7805,6 +7822,20 @@ fn emitBlock(
     // register cache is loaded *after* this point, because a chained block
     // has to load its own cache just as an entered one does.
     const chain_entry_bytes: u32 = @intCast(assembler.words.items.len * @sizeOf(u32));
+    if (options.entry_gate != 0) {
+        // Nothing but the frame is live yet, and the register file is
+        // current: the helper may rewrite it before the cache is loaded.
+        try assembler.emit(a64.mov(.x64, 0, r_state));
+        try assembler.loadConstant(1, options.entry_gate);
+        try assembler.emit(a64.ldrImm(.doubleword, t0, r_helpers, helper_entry_gate_offset).?);
+        try assembler.emit(a64.blr(t0));
+        const stay = try assembler.createLabel();
+        try assembler.branchIfZero(.w32, 0, stay);
+        try compiler.emitCacheLoad();
+        if (compiler.uses_skip_counter) try assembler.emit(a64.mov(.x64, skip_reg, a64.xzr));
+        try assembler.branch(try compiler.exitStub(0, null));
+        assembler.placeLabel(stay);
+    }
     try compiler.emitCacheLoad();
     if (compiler.resident_loop) |loop| assembler.placeLabel(loop);
     if (compiler.uses_skip_counter) try assembler.emit(a64.mov(.x64, skip_reg, a64.xzr));

@@ -4210,6 +4210,7 @@ const BlockJitState = struct {
     arithmetic_flag_ops_compiled: u64 = 0,
     direct_chain_templates_compiled: u64 = 0,
     direct_scalar_ops_compiled: u64 = 0,
+    direct_operand_templates: [3]u64 = @splat(0),
     native_completions: bool = true, // false only in offline differential replay
     admit_failed_compare: bool = true, // false only in the offline before fixture
     failed_compare_admitted: u64 = 0,
@@ -5647,5 +5648,6 @@ test {
     _ = @import("process/tests/native_shader_compile.zig");
     _ = @import("process/tests/windows_mutex.zig");
     _ = @import("process/tests/windows_mutex_contract.zig");
+    _ = @import("process/tests/xenia_command_replay.zig");
     _ = @import("block_jit/tests.zig");
 }

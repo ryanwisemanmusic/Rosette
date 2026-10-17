@@ -645,6 +645,7 @@ pub const ElfState = struct {
     // the host-side tabulate formatter out of the PE hot path while retaining
     // its normal ownership and empty-string return contract.
     xenia_tabulate_accelerator_enabled: bool = false,
+    xenia_register_writes: @import("impl/xenia_register_writes.zig").Armed = .{},
     xenia_tabulate_target_checked: bool = false,
     xenia_tabulate_target: ?u64 = null,
     xenia_tabulate_accelerated_strings: u64 = 0,

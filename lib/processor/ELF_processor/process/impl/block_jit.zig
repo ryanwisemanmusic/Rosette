@@ -1459,6 +1459,9 @@ pub fn compileBlockJit(self: *ElfState, jit: *__process_BlockJitState, rip: u64)
     jit.last_refusal = .empty_fetch;
     jit.last_refusal_op = .invalid;
     while (insns.items.len < __process_BLOCK_JIT_MAX_INSTRUCTIONS) {
+        // A gated loop head starts its own block, so the first iteration
+        // enters through the gate too.
+        if (insns.items.len != 0 and @import("xenia_register_writes.zig").isGateAddress(self, address)) break;
         const fetch = fetchInstructionSource(self, address) orelse break;
         const fetch_bytes = fetch.contents();
         const mapped = fetch.mapped != null;
@@ -1570,6 +1573,7 @@ pub fn compileBlockJit(self: *ElfState, jit: *__process_BlockJitState, rip: u64)
         .flags_dead_at_calls = self.windows_runtime_enabled,
         .internal_edges = self.block_jit_internal_edges_enabled,
         .pause_helper_preserves_state = self.pause_options.helper_preserves_state,
+        .entry_gate = @import("xenia_register_writes.zig").gateKind(self, rip),
     };
     jit.last_refusal = .compile_error;
     jit.last_refusal_op = insns.items[0].decoded.op;
@@ -1620,6 +1624,7 @@ pub fn compileBlockJit(self: *ElfState, jit: *__process_BlockJitState, rip: u64)
             .interpret = __process_blockJitInterpret,
             .block = block,
             .flags = __process_blockJitFlags,
+            .entry_gate = @import("xenia_register_writes.zig").entryGate,
         },
         .start_rip = rip,
         .end_rip = address,
@@ -1656,6 +1661,7 @@ pub fn compileBlockJit(self: *ElfState, jit: *__process_BlockJitState, rip: u64)
     @import("scalar_cache_report.zig").compiled(jit, compiled.scalar_resident_ops);
     @import("arithmetic_report.zig").compiled(jit, compiled.arithmetic_flag_ops);
     @import("native_path_report.zig").compiled(jit, compiled.first_way_fallthrough, compiled.direct_scalar_ops);
+    @import("operand_report.zig").compiled(jit, compiled.direct_operand_ops);
     return block;
 }
 

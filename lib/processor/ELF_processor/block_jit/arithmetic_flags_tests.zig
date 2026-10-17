@@ -119,4 +119,5 @@ test {
     _ = @import("natural_scalar_lanes_tests.zig");
     _ = @import("chain_layout_tests.zig");
     _ = @import("scalar_register_path_tests.zig");
+    _ = @import("register_operands_tests.zig");
 }

@@ -10,6 +10,7 @@ const process_impl_guest_memory = @import("guest_memory.zig");
 const process_impl_instruction_decode = @import("instruction_decode.zig");
 const process_impl_lifecycle = @import("lifecycle.zig");
 const process_impl_run_reporting = @import("run_reporting.zig");
+const process_impl_file_failure_reporting = @import("file_failure_reporting.zig");
 const process_impl_windows_sync = @import("windows_sync.zig");
 const __process_DecodedInsn = __ProcessInternals._DecodedInsn;
 const __process_ElfRegs = __ProcessInternals._ElfRegs;
@@ -1188,6 +1189,11 @@ pub fn noteWindowsFileFailureDetail(self: *ElfState, error_code: u32, subject: [
 pub fn reportWindowsFileFailures(self: *const ElfState) void {
     const ledger = &self.windows_file_failure_ledger;
     if (ledger.isEmpty()) return;
+    // A missing optional Discord IPC server is the normal outcome on macOS.
+    // Keep counting it in the bounded ledger, but don't repeat the same
+    // expected probe as run-log output. Mixed ledgers still report actionable
+    // failures below.
+    if (process_impl_file_failure_reporting.suppressOnlyUnavailableIpc(ledger)) return;
     var actionable_entries: usize = 0;
     var actionable_calls: u64 = 0;
     for (ledger.entries[0..ledger.count]) |*entry| {
@@ -1201,6 +1207,7 @@ pub fn reportWindowsFileFailures(self: *const ElfState) void {
         __process_log.warn("WINDOWS FILE FAILURES: distinct={d} calls={d} actionable={d} in {d} call(s); a large not-found count against a lookup API is a guest probing for optional files, while a failure on an open or a write is a path Rosetta could not serve", .{ ledger.count, ledger.total, actionable_entries, actionable_calls });
     }
     for (ledger.entries[0..ledger.count]) |*entry| {
+        if (entry.class == .named_pipe_without_server) continue;
         var caller_text: [__process_guest_symbol_text_bytes]u8 = undefined;
         const caller = if (entry.first_caller == 0) "<not recorded>" else describeGuestAddressOrUnnamed(self, entry.first_caller, &caller_text);
         const subject = if (entry.subject_length == 0) "<none>" else entry.subject();

@@ -32,6 +32,7 @@ pub const Pulse = struct {
         std.log.info("PE64 WORKER RUNTIME PULSE: slot={d} elapsed_ms={d} native_retired={d} native_instructions_per_second={d} fallbacks={d} vunpcklpd_fallbacks={d} native_hops={d} code_mib={d} exp2_total={d} exp2f_total={d}; own-worker snapshot; wall interval includes waits/spins, not frame critical-path timing", .{
             slot, row.elapsed_ns / std.time.ns_per_ms, row.retired, rate, row.fallbacks, row.unpack, row.native_hops, jit.memory.used / (1024 * 1024), math.calls[0].load(.acquire), math.calls[1].load(.acquire),
         });
+        @import("xenia_register_writes.zig").pulse(now);
     }
 };
 
