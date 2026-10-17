@@ -4,7 +4,7 @@ set -euo pipefail
 package_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${package_dir}/../../../.." && pwd)"
 manifest="${package_dir}/source-scripts.txt"
-xenia_root="${ROSETTE_XENIA_ROOT:-/Volumes/2023 Drive/xenia/xenia}"
+xenia_root="${ROSETTE_XENIA_ROOT:-${XENIA_ROOT:-}}"
 
 zig_bin="${ZIG:-zig}"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/common-xenia-rosette-script-contract.XXXXXX")"
@@ -64,13 +64,58 @@ for template in "${windows_template_dir}"/*.sh.in; do
     bash -n "${template}"
 done
 bash "${repo_root}/tools/xenia/scripts/rosette-xenia-windows.sh" --help >/dev/null
-if rg -n '/tmp/xenia-canary|/Users/ryanwiseman' \
+if rg -n '/tmp/xenia-canary|/Users/ryanwiseman|/Volumes/2023 Drive' \
     "${windows_template_dir}" \
     "${repo_root}/tools/xenia/scripts/rosette-xenia-windows.sh"; then
     echo "ERROR: Windows build capsule contains disposable or machine-specific paths" >&2
     exit 1
 fi
+portability_sources=(
+    "${repo_root}/build/Makefile"
+    "${repo_root}/build/build.zig"
+    "${repo_root}/src/tooling/exe_parser/native_windows_graphics.zig"
+    "${repo_root}/tools/build_identity_manifest.py"
+    "${repo_root}/tools/check_vendor_libraries.py"
+    "${repo_root}/gen_batch13.py"
+    "${repo_root}/update_batch13.py"
+    "${repo_root}/tools/gen_abi_gap_batch.py"
+    "${repo_root}/tools/vulkan/check_hdr_float16.py"
+    "${repo_root}/tools/xenia/scripts/rosette-xenia-run.sh"
+)
+if rg -n '/Users/ryanwiseman|/Volumes/2023 Drive|/Applications/Xcode\.app|/opt/homebrew/opt/llvm' "${portability_sources[@]}"; then
+    echo "ERROR: Rosette build/runtime inputs contain a machine-specific development path" >&2
+    exit 1
+fi
+echo "Rosette and Xenia path portability: machine-specific path scan PASS"
 echo "rosette Xenia Windows build capsule: template coverage PASS"
+
+# The macOS compatibility entrypoints are shipped beside Xenia and resolve
+# Rosette through its install registry. Check them whenever an external Xenia
+# checkout is available, without making source-only Rosetta checks depend on
+# the removable checkout.
+if [[ -n "$xenia_root" && -d "$xenia_root/macos" ]]; then
+    for adapter in build-async.sh build-scratch-async.sh rosette-root.sh; do
+        test -f "${xenia_root}/macos/${adapter}"
+        bash -n "${xenia_root}/macos/${adapter}"
+    done
+    if rg -n '/Users/ryanwiseman|/Volumes/2023 Drive' \
+        "${xenia_root}/macos/build-async.sh" \
+        "${xenia_root}/macos/build-scratch-async.sh" \
+        "${xenia_root}/macos/rosette-root.sh"; then
+        echo "ERROR: Xenia macOS adapters contain machine-specific paths" >&2
+        exit 1
+    fi
+    fixture_home="${tmp_dir}/root-discovery-home"
+    fixture_root="${tmp_dir}/rosette-checkout"
+    mkdir -p "${fixture_home}/.rosette" "${fixture_root}/tools/xenia/scripts"
+    : > "${fixture_root}/tools/xenia/scripts/rosette-xenia-run.sh"
+    chmod +x "${fixture_root}/tools/xenia/scripts/rosette-xenia-run.sh"
+    printf '%s\n' "${fixture_root}" > "${fixture_home}/.rosette/source-root"
+    resolved_root="$(env -i HOME="${fixture_home}" PATH="${PATH}" bash -c \
+        'source "$1"; rosette_resolve_root' _ "${xenia_root}/macos/rosette-root.sh")"
+    test "${resolved_root}" = "${fixture_root}"
+    echo "Xenia macOS Rosette-root discovery: install registry PASS"
+fi
 
 # The Xenia adapter must publish the same canonical architecture fact as the
 # generic source adapter before it delegates to the shared verifier. Keep this
@@ -95,7 +140,7 @@ import sys
 
 manifest = pathlib.Path(sys.argv[1])
 repo_root = pathlib.Path(sys.argv[2])
-xenia_root = pathlib.Path(sys.argv[3])
+xenia_root = pathlib.Path(sys.argv[3]) if sys.argv[3] else None
 rows = []
 for line in manifest.read_text(encoding="utf-8").splitlines():
     if not line.strip():
@@ -121,7 +166,7 @@ for source, category, packaged in rows:
     if not (repo_root / packaged).is_file():
         raise SystemExit(f"packaged adapter is missing: {packaged}")
 
-if xenia_root.is_dir():
+if xenia_root is not None and xenia_root.is_dir():
     actual = sorted(
         path.relative_to(xenia_root).as_posix()
         for path in (xenia_root / "src/xenia/scripts").glob("*.sh")
