@@ -1,4 +1,4 @@
-name = "common-xenia-gpu-observation-contract"
+name = "common-console-gpu-observation-contract"
 version = "0.1.0-local"
 kind = "gpu-observation-boundary-contract"
 role = "build-time"

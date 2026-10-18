@@ -1,4 +1,4 @@
-name = "common-xenia-timer-contract"
+name = "common-console-timer-contract"
 version = "0.1.0-local"
 kind = "console-timer-lifecycle-contract"
 role = "build-time"

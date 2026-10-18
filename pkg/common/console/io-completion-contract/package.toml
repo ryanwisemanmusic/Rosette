@@ -1,4 +1,4 @@
-name = "common-xenia-io-completion-contract"
+name = "common-console-io-completion-contract"
 version = "0.1.0-local"
 kind = "console-io-completion-contract"
 role = "build-time"

@@ -72,7 +72,7 @@ if rg -n '/tmp/xenia-canary|/Users/ryanwiseman|/Volumes/2023 Drive' \
 fi
 portability_sources=(
     "${repo_root}/build/Makefile"
-    "${repo_root}/build/build.zig"
+    "${repo_root}/build.zig"
     "${repo_root}/src/tooling/exe_parser/native_windows_graphics.zig"
     "${repo_root}/tools/build_identity_manifest.py"
     "${repo_root}/tools/check_vendor_libraries.py"

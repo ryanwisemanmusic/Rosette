@@ -1,4 +1,4 @@
-//! Immutable build-time envelope for the Xenia GPU observation path.
+//! Immutable build-time envelope for a console GPU observation path.
 //!
 //! The mutable evidence belongs in `lib/gpu`.  This package owns the facts
 //! that must not be re-invented by a ring reader, PM4 executor, diagnostic

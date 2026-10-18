@@ -77,7 +77,7 @@ pub const AreaMask = struct {
     pub const all: u32 = 0x0000_00EF;
 };
 
-/// The notification ids Xenia names.
+/// Notification ids included in the console catalogue.
 pub const Notification = enum(u32) {
     system_title_load = 0x8000_0001,
     system_time_zone = 0x8000_0002,
@@ -316,7 +316,7 @@ test "the reserved bit does not affect routing" {
 }
 
 test "an unnamed notification still routes" {
-    // The kernel can broadcast an id Xenia does not name; a listener must
+    // The kernel can broadcast an id outside the local catalogue; a listener must
     // route it rather than trapping on a checked cast.
     const unnamed: Notification = @enumFromInt(0x0200_0099);
     try std.testing.expectEqual(@as(u32, 1), unnamed.maskIndex());

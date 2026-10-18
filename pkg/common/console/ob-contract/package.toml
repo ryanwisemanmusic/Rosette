@@ -1,4 +1,4 @@
-name = "common-xenia-ob-contract"
+name = "common-console-ob-contract"
 version = "0.1.0-local"
 kind = "console-object-manager-contract"
 role = "build-time"

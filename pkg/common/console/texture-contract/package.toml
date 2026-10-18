@@ -1,4 +1,4 @@
-name = "common-xenia-texture-contract"
+name = "common-console-texture-contract"
 version = "0.1.0-local"
 kind = "console-texture-format-contract"
 role = "build-time"

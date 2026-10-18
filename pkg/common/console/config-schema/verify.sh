@@ -3,10 +3,10 @@ set -euo pipefail
 
 package_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 zig_bin="${ZIG:-zig}"
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/common-xenia-config-schema.XXXXXX")"
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/common-console-config-schema.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 
-echo "common-xenia-config-schema: native tests"
+echo "common-console-config-schema: native tests"
 "$zig_bin" test \
     --cache-dir "$tmp_dir/native-cache" \
     --global-cache-dir "$tmp_dir/native-global-cache" \
@@ -16,7 +16,7 @@ echo "common-xenia-config-schema: native tests"
 # mirrored copy. A package that only ever built for the host it was written on
 # is how a route split starts.
 for target in aarch64-freestanding x86_64-freestanding; do
-    echo "common-xenia-config-schema: $target compile-only check"
+    echo "common-console-config-schema: $target compile-only check"
     output="$tmp_dir/$target.a"
     "$zig_bin" build-lib "$package_dir/src/root.zig" \
         --cache-dir "$tmp_dir/$target-cache" \
@@ -29,4 +29,4 @@ for target in aarch64-freestanding x86_64-freestanding; do
     echo "  verified $target"
 done
 
-echo "common-xenia-config-schema: PASS"
+echo "common-console-config-schema: PASS"

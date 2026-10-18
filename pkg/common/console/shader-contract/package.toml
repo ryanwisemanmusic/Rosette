@@ -1,4 +1,4 @@
-name = "common-xenia-shader-contract"
+name = "common-console-shader-contract"
 version = "0.1.0-local"
 kind = "console-shader-microcode-contract"
 role = "build-time"

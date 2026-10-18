@@ -85,7 +85,7 @@ pub const max_context_count: u32 = 320;
 /// Mixer voices the title may address.
 pub const max_voice_count: u32 = 256;
 
-/// Registered audio clients the APU will service. Xenia's audio system caps
+/// Registered audio clients the APU will service. The console audio system caps
 /// this; a title that opens more is a bug in the title, not a missing feature.
 pub const max_client_count: u32 = 8;
 
