@@ -16,29 +16,29 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     };
     const subsystems = [_]Subsystem{
         .{
-            .root = "../lib/audio/root.zig",
+            .root = "lib/audio/root.zig",
             .contract_name = "xenia_audio_contract",
-            .contract_root = "../pkg/common/console/audio-contract/src/root.zig",
+            .contract_root = "pkg/common/console/audio-contract/src/root.zig",
         },
         .{
-            .root = "../lib/hid/root.zig",
+            .root = "lib/hid/root.zig",
             .contract_name = "xenia_input_contract",
-            .contract_root = "../pkg/common/console/input-contract/src/root.zig",
+            .contract_root = "pkg/common/console/input-contract/src/root.zig",
         },
         .{
-            .root = "../lib/gpu/shader/root.zig",
+            .root = "lib/gpu/shader/root.zig",
             .contract_name = "xenia_shader_contract",
-            .contract_root = "../pkg/common/console/shader-contract/src/root.zig",
+            .contract_root = "pkg/common/console/shader-contract/src/root.zig",
         },
         .{
-            .root = "../lib/gpu/render_target/root.zig",
+            .root = "lib/gpu/render_target/root.zig",
             .contract_name = "xenia_render_target_contract",
-            .contract_root = "../pkg/common/console/render-target-contract/src/root.zig",
+            .contract_root = "pkg/common/console/render-target-contract/src/root.zig",
         },
         .{
-            .root = "../lib/gpu/texture_cache/root.zig",
+            .root = "lib/gpu/texture_cache/root.zig",
             .contract_name = "xenia_texture_contract",
-            .contract_root = "../pkg/common/console/texture-contract/src/root.zig",
+            .contract_root = "pkg/common/console/texture-contract/src/root.zig",
             .needs_texture_format_contract = true,
         },
     };
@@ -66,17 +66,17 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
 
     // Config needs both its schema and the existing TOML parser.
     const config_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/config/root.zig"),
+        .root_source_file = b.path("lib/config/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     config_mod.addImport("xenia_config_schema", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/console/config-schema/src/root.zig"),
+        .root_source_file = b.path("pkg/common/console/config-schema/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     config_mod.addImport("toml_processor", b.createModule(.{
-        .root_source_file = b.path("../lib/processor/TOML_processor/root.zig"),
+        .root_source_file = b.path("lib/processor/TOML_processor/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
@@ -90,7 +90,7 @@ pub fn register1(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const toml_processor_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/processor/TOML_processor/root.zig"),
+        .root_source_file = b.path("lib/processor/TOML_processor/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -98,7 +98,7 @@ pub fn register1(b: *std.Build, ctx: anytype) void {
     check_step.dependOn(&b.addRunArtifact(toml_processor_test).step);
 
     const toml_exe_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/processor/TOML_processor/main.zig"),
+        .root_source_file = b.path("lib/processor/TOML_processor/main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -116,7 +116,7 @@ pub fn register2(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const ps1_processor_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/processor/ps1_processor/root.zig"),
+        .root_source_file = b.path("lib/processor/ps1_processor/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -124,7 +124,7 @@ pub fn register2(b: *std.Build, ctx: anytype) void {
     check_step.dependOn(&b.addRunArtifact(ps1_processor_test).step);
 
     const ps1_exe_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/processor/ps1_processor/main.zig"),
+        .root_source_file = b.path("lib/processor/ps1_processor/main.zig"),
         .target = target,
         .optimize = optimize,
     });

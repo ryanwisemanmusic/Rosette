@@ -9,7 +9,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const gfx_abi_mod = b.createModule(.{
-        .root_source_file = b.path("../src/x86-ASM/graphics/abi.zig"),
+        .root_source_file = b.path("src/x86-ASM/graphics/abi.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -114,7 +114,7 @@ pub fn register12(b: *std.Build, ctx: anytype) void {
     // Xbox 360 XEX2 image reading, for running a title against the PowerPC
     // runtime without Xenia owning the module load.
     const xex_module = b.createModule(.{
-        .root_source_file = b.path("../lib/linker/xex/root.zig"),
+        .root_source_file = b.path("lib/linker/xex/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -133,7 +133,7 @@ pub fn register13(b: *std.Build, ctx: anytype) void {
     // until this existed nothing could produce one, which is the half of
     // the ISA layer that was actually missing.
     const ppc_encode_mod = b.createModule(.{
-        .root_source_file = b.path("../ISA/ppc/encode/encoder.zig"),
+        .root_source_file = b.path("ISA/ppc/encode/encoder.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -149,7 +149,7 @@ pub fn register14(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const isa_ppc_test_mod = b.createModule(.{
-        .root_source_file = b.path("../ISA/ppc_test_root.zig"),
+        .root_source_file = b.path("ISA/ppc_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -165,7 +165,7 @@ pub fn register15(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const isa_math_test_mod = b.createModule(.{
-        .root_source_file = b.path("../ISA/Math/test_root.zig"),
+        .root_source_file = b.path("ISA/Math/test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -190,7 +190,7 @@ pub fn register16(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const dos_exec_mod = b.createModule(.{
-        .root_source_file = b.path("../src/DOS/runtime_root.zig"),
+        .root_source_file = b.path("src/DOS/runtime_root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -223,7 +223,7 @@ pub fn register17(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const x64_state_mod = b.createModule(.{
-        .root_source_file = b.path("../src/x64-ASM/x64_state.zig"),
+        .root_source_file = b.path("src/x64-ASM/x64_state.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -255,7 +255,7 @@ pub fn register18(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const x64_addr_mod = b.createModule(.{
-        .root_source_file = b.path("../src/x64-ASM/addressing64.zig"),
+        .root_source_file = b.path("src/x64-ASM/addressing64.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -288,7 +288,7 @@ pub fn register19(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const arm64_trace_mod = b.createModule(.{
-        .root_source_file = b.path("../src/arm64/register-tracing/runtime.zig"),
+        .root_source_file = b.path("src/arm64/register-tracing/runtime.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -328,13 +328,13 @@ pub fn register20(b: *std.Build, ctx: anytype) void {
     const x86_asm_module = ctx.x86_asm_module;
 
     const abi_suite_mod = b.createModule(.{
-        .root_source_file = b.path("../include/win32/Zig/abi_suite.zig"),
+        .root_source_file = b.path("include/win32/Zig/abi_suite.zig"),
         .target = target,
         .optimize = optimize,
     });
-    if (is_macos) abi_suite_mod.addIncludePath(b.path("../include/shims/macos"));
-    abi_suite_mod.addIncludePath(b.path("../include/shims/win32"));
-    abi_suite_mod.addIncludePath(b.path("../include"));
+    if (is_macos) abi_suite_mod.addIncludePath(b.path("include/shims/macos"));
+    abi_suite_mod.addIncludePath(b.path("include/shims/win32"));
+    abi_suite_mod.addIncludePath(b.path("include"));
     abi_suite_mod.addImport("windows_base", windows_base_module);
     abi_suite_mod.addImport("win32_sysdefs", sysdefs_module);
     abi_suite_mod.addImport("win32_all", win32_all_module);

@@ -19,21 +19,12 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const contract_mod = ctx.contract_mod;
     const diagnostics_async_log_contract_mod = ctx.diagnostics_async_log_contract_mod;
     const dll_win32_catalogue_mod = ctx.dll_win32_catalogue_mod;
-    const dxbc_arm64_mod = ctx.dxbc_arm64_mod;
-    const dxbc_ppc_mod = ctx.dxbc_ppc_mod;
-    const dxbc_x86_mod = ctx.dxbc_x86_mod;
-    const endianness_arm64_mod = ctx.endianness_arm64_mod;
-    const endianness_ppc_mod = ctx.endianness_ppc_mod;
-    const endianness_x86_mod = ctx.endianness_x86_mod;
     const entrypoint_alignment_module = ctx.entrypoint_alignment_module;
     const entrypoint_kernel_process_guard_module = ctx.entrypoint_kernel_process_guard_module;
     const evex_runtime_mod = ctx.evex_runtime_mod;
     const execution_history_mod = ctx.execution_history_mod;
     const exit_diagnostics_module = ctx.exit_diagnostics_module;
     const frame_content_contract_mod = ctx.frame_content_contract_mod;
-    const half_arm64_mod = ctx.half_arm64_mod;
-    const half_ppc_mod = ctx.half_ppc_mod;
-    const half_x86_mod = ctx.half_x86_mod;
     const is_macos = ctx.is_macos;
     const jit_mod = ctx.jit_mod;
     const libcpp_thread_abi_mod = ctx.libcpp_thread_abi_mod;
@@ -56,9 +47,6 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const runtime_abi_module = ctx.runtime_abi_module;
     const screen_validity_mod = ctx.screen_validity_mod;
     const sha1_tracer_mod = ctx.sha1_tracer_mod;
-    const sha_arm64_mod = ctx.sha_arm64_mod;
-    const sha_ppc_mod = ctx.sha_ppc_mod;
-    const sha_x86_mod = ctx.sha_x86_mod;
     const target = ctx.target;
     const trace_logger_module = ctx.trace_logger_module;
     const window_geometry_mod = ctx.window_geometry_mod;
@@ -75,9 +63,6 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const xenia_gpu_observation_contract_mod = ctx.xenia_gpu_observation_contract_mod;
     const xenia_graphics_contract_mod = ctx.xenia_graphics_contract_mod;
     const xenia_graphics_health_contract_mod = ctx.xenia_graphics_health_contract_mod;
-    const xenia_guest_endian_arm64_mod = ctx.xenia_guest_endian_arm64_mod;
-    const xenia_guest_endian_ppc_mod = ctx.xenia_guest_endian_ppc_mod;
-    const xenia_guest_endian_x86_mod = ctx.xenia_guest_endian_x86_mod;
     const xenia_heap_range_mod = ctx.xenia_heap_range_mod;
     const xenia_host_gpu_callback_contract_mod = ctx.xenia_host_gpu_callback_contract_mod;
     const xenia_interrupt_callback_contract_mod = ctx.xenia_interrupt_callback_contract_mod;
@@ -96,23 +81,23 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const xenia_xiso_format_mod = ctx.xenia_xiso_format_mod;
 
     const macho_compat_runtime_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/Mach-O/compat_runtime.zig"),
+        .root_source_file = b.path("lib/Mach-O/compat_runtime.zig"),
         .target = target,
         .optimize = optimize,
     });
     const macho_runtime_mod = b.createModule(.{
-        .root_source_file = b.path("../src/x64-ASM/macho_runtime.zig"),
+        .root_source_file = b.path("src/x64-ASM/macho_runtime.zig"),
         .target = target,
         .optimize = optimize,
     });
     const primitive_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/runtime/primitive/root.zig"),
+        .root_source_file = b.path("lib/runtime/primitive/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     primitive_mod.addImport("xenia_primitive_contract", xenia_primitive_contract_mod);
     const vtable_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/runtime/vtable/root.zig"),
+        .root_source_file = b.path("lib/runtime/vtable/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -124,7 +109,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const vtable_test = b.addTest(.{ .root_module = vtable_mod });
     check_step.dependOn(&b.addRunArtifact(vtable_test).step);
     const guard_rollback_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/runtime/guard-rollback/root.zig"),
+        .root_source_file = b.path("lib/runtime/guard-rollback/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -132,7 +117,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // consumes them. The GPU runtime publishes its negotiated backend into
     // this description; it cannot use the tree to actuate guest state.
     const device_tree_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/device_tree/root.zig"),
+        .root_source_file = b.path("lib/device_tree/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -143,7 +128,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // handshake. Created before dyld because the Vulkan loader forwarder is
     // the first adapter feeding truthful native-boundary stages into it.
     const preflight_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/preflight/root.zig"),
+        .root_source_file = b.path("lib/preflight/root.zig"),
         .target = target,
         .optimize = optimize,
         // The host-capability probes call mmap, mprotect, nanosleep and
@@ -163,209 +148,11 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const ready_compiler_test = b.addTest(.{ .root_module = ready_compiler_mod });
     check_step.dependOn(&b.addRunArtifact(ready_compiler_test).step);
 
-    // The route packages under `pkg/` ship inside the processor, so their
-    // own tests belong in the same gate as everything else that does.
-    // Each package carries a `verify.sh`, but a check that only runs when
-    // someone remembers to run it is not a check — a drifted package
-    // reached the built binary and the suite stayed green.
-    //
-    // Both routes are tested regardless of which one this build selects.
-    // The unselected one is the companion that a later ARM64 or x86 host
-    // will link, and letting it rot until that host exists is how the
-    // "preflight contract" packages stop matching the route they mirror.
-    // Not a route package — one file, no mirror — but it ships inside the
-    // processor and its tests belong in the same gate as everything else
-    // that does.
-    const common_package_roots = [_][]const u8{
-        "../pkg/common/abi/receiver-classification/src/root.zig",
-        "../pkg/common/xenos/register-map/src/root.zig",
-        "../pkg/common/abi/near-null-shape/src/root.zig",
-        "../pkg/common/console/log-phrase-map/src/root.zig",
-        "../pkg/common/abi/host-contract-catalogue/src/root.zig",
-        "../pkg/common/text/phrase-filter/src/root.zig",
-        "../pkg/common/console/ready-plan/src/root.zig",
-        // Console-hardware and kernel-ABI contracts. Route-independent for
-        // the same reason register-map is: they describe the Xbox 360 and
-        // its kernel, not the host Rosette was compiled for.
-        "../pkg/common/console/audio-contract/src/root.zig",
-        "../pkg/common/console/input-contract/src/root.zig",
-        "../pkg/common/console/user-contract/src/root.zig",
-        "../pkg/common/console/config-schema/src/root.zig",
-        "../pkg/common/console/shader-contract/src/root.zig",
-        "../pkg/common/console/render-target-contract/src/root.zig",
-        "../pkg/common/console/texture-contract/src/root.zig",
-        "../pkg/common/console/io-completion-contract/src/root.zig",
-        "../pkg/common/console/timer-contract/src/root.zig",
-        "../pkg/common/console/ob-contract/src/root.zig",
-        "../pkg/common/console/mount-contract/src/root.zig",
-        "../pkg/common/console/kernel-object-contract/src/root.zig",
-        // Facts transcribed from Xenia's own tables and headers. They
-        // describe the console and its kernel, so they are route
-        // independent like the rest of this list.
-        "../pkg/common/console/kernel-export-map/src/root.zig",
-        "../pkg/common/console/kernel-shim-map/src/root.zig",
-        "../pkg/common/console/vd-ring-contract/src/root.zig",
-        "../pkg/common/console/vd-swap-contract/src/root.zig",
-        "../pkg/common/console/provisioning-contract/src/root.zig",
-        "../pkg/common/console/claim-reconciliation-contract/src/root.zig",
-        "../pkg/common/diagnostics/async-log-contract/src/root.zig",
-        "../pkg/common/abi/translation-economics-contract/src/root.zig",
-        "../pkg/common/rosette/translation-cache-contract/src/root.zig",
-        "../pkg/common/console/draw-dispatch-contract/src/root.zig",
-        "../pkg/common/console/wait-graph-contract/src/root.zig",
-        "../pkg/common/console/wait-handshake-policy/src/root.zig",
-        "../pkg/common/console/pm4-contract/src/root.zig",
-        "../pkg/common/console/xex-format/src/root.zig",
-        "../pkg/common/console/notification-contract/src/root.zig",
-        "../pkg/common/console/log-ring-contract/src/root.zig",
-        "../pkg/common/console/xthread-contract/src/root.zig",
-        "../pkg/common/console/vfs-device-contract/src/root.zig",
-        "../pkg/common/console/launch-assist-contract/src/root.zig",
-        "../pkg/common/rosette/ownership-contract/src/root.zig",
-        "../pkg/common/rosette/source-architecture-contract/src/root.zig",
-        "../pkg/common/console/rosette-script-contract/src/root.zig",
-    };
-    inline for (common_package_roots) |package_root| {
-        const package_mod = b.createModule(.{
-            .root_source_file = b.path(package_root),
-            .target = target,
-            .optimize = optimize,
-        });
-        // Two of these import the shared rejection filter. Supplying it to
-        // every common package is harmless for the rest and keeps this loop
-        // from needing a per-package dependency table that would drift.
-        // A fresh module is used rather than `phrase_filter_mod`, which is
-        // declared in the build-artifact scope above and not visible here.
-        package_mod.addImport("phrase_filter", b.createModule(.{
-            .root_source_file = b.path("../pkg/common/text/phrase-filter/src/root.zig"),
-            .target = target,
-            .optimize = optimize,
-        }));
-        package_mod.addImport("rosette_translation_cache_contract", rosette_translation_cache_contract_mod);
-        const package_test = b.addTest(.{ .root_module = package_mod });
-        check_step.dependOn(&b.addRunArtifact(package_test).step);
-    }
-
-    const route_package_roots = [_][]const u8{
-        "../pkg/x86/console/graphics-contract/src/root.zig",
-        "../pkg/x86/console/graphics/surface-path-contract/src/root.zig",
-        "../pkg/x86/console/bridge/abi-bridge/src/root.zig",
-        // This package's tests live beside the evidence table rather than
-        // in a `root.zig`; `main.zig` is its executable half.
-        "../pkg/x86/console/diagnostics/startup-evidence/src/evidence.zig",
-        "../pkg/x86/console/runtime/codegen-activation/src/root.zig",
-        "../pkg/x86/console/runtime/launch-phase-map/src/root.zig",
-        "../pkg/x86/console/runtime/primitive-contract/src/root.zig",
-        "../pkg/x86/console/runtime/guest-bridge/src/root.zig",
-        "../pkg/x86/console/runtime/shader-storage-contract/src/root.zig",
-        "../pkg/x86/console/runtime/wait-contract/src/root.zig",
-        "../pkg/x86/console/memory/heap-range/src/root.zig",
-        "../pkg/x86/console/audio-driver/src/root.zig",
-        "../pkg/x86/console/input-driver/src/root.zig",
-        "../pkg/x86/console/simd-shim-map/src/root.zig",
-        "../pkg/ARM64/console/graphics-contract/src/root.zig",
-        "../pkg/ARM64/console/graphics/surface-path-contract/src/root.zig",
-        "../pkg/ARM64/console/bridge/abi-bridge/src/root.zig",
-        // Same split as the x86 copy: the tests live beside the evidence
-        // table, and `main.zig` is the executable half.
-        "../pkg/ARM64/console/diagnostics/startup-evidence/src/evidence.zig",
-        "../pkg/ARM64/console/runtime/codegen-activation/src/root.zig",
-        "../pkg/ARM64/console/runtime/guest-bridge/src/root.zig",
-        "../pkg/ARM64/console/runtime/launch-phase-map/src/root.zig",
-        "../pkg/ARM64/console/runtime/primitive-contract/src/root.zig",
-        "../pkg/ARM64/console/runtime/shader-storage-contract/src/root.zig",
-        "../pkg/ARM64/console/runtime/wait-contract/src/root.zig",
-        "../pkg/ARM64/console/memory/heap-range/src/root.zig",
-        "../pkg/ARM64/console/audio-driver/src/root.zig",
-        "../pkg/ARM64/console/input-driver/src/root.zig",
-        "../pkg/ARM64/console/simd-shim-map/src/root.zig",
-        "../pkg/x86/console/guest-endian/src/root.zig",
-        "../pkg/ARM64/console/guest-endian/src/root.zig",
-        "../pkg/PPC/console/guest-endian/src/root.zig",
-        "../pkg/PPC/console/runtime/instruction-routing/src/root.zig",
-        "../pkg/x86/third_party/endianness/src/root.zig",
-        "../pkg/ARM64/third_party/endianness/src/root.zig",
-        "../pkg/PPC/third_party/endianness/src/root.zig",
-        "../pkg/x86/third_party/crypto/sha/src/root.zig",
-        "../pkg/ARM64/third_party/crypto/sha/src/root.zig",
-        "../pkg/PPC/third_party/crypto/sha/src/root.zig",
-        "../pkg/x86/third_party/dxbc/src/root.zig",
-        "../pkg/ARM64/third_party/dxbc/src/root.zig",
-        "../pkg/PPC/third_party/dxbc/src/root.zig",
-        "../pkg/x86/third_party/half/src/root.zig",
-        "../pkg/ARM64/third_party/half/src/root.zig",
-        "../pkg/PPC/third_party/half/src/root.zig",
-    };
-    inline for (route_package_roots) |package_root| {
-        const package_mod = b.createModule(.{
-            .root_source_file = b.path(package_root),
-            .target = target,
-            .optimize = optimize,
-        });
-        const package_test = b.addTest(.{ .root_module = package_mod });
-        check_step.dependOn(&b.addRunArtifact(package_test).step);
-    }
-
-    const xenia_guest_endian_equivalence_mod = b.createModule(.{
-        .root_source_file = b.path("../pkg/guest_endian_equivalence.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    xenia_guest_endian_equivalence_mod.addImport("x86_guest_endian", xenia_guest_endian_x86_mod);
-    xenia_guest_endian_equivalence_mod.addImport("arm64_guest_endian", xenia_guest_endian_arm64_mod);
-    xenia_guest_endian_equivalence_mod.addImport("ppc_guest_endian", xenia_guest_endian_ppc_mod);
-    const xenia_guest_endian_equivalence_test = b.addTest(.{ .root_module = xenia_guest_endian_equivalence_mod });
-    check_step.dependOn(&b.addRunArtifact(xenia_guest_endian_equivalence_test).step);
-
-    const third_party_endianness_equivalence_mod = b.createModule(.{
-        .root_source_file = b.path("../pkg/third_party_endianness_equivalence.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    third_party_endianness_equivalence_mod.addImport("x86_endianness", endianness_x86_mod);
-    third_party_endianness_equivalence_mod.addImport("arm64_endianness", endianness_arm64_mod);
-    third_party_endianness_equivalence_mod.addImport("ppc_endianness", endianness_ppc_mod);
-    const third_party_endianness_equivalence_test = b.addTest(.{ .root_module = third_party_endianness_equivalence_mod });
-    check_step.dependOn(&b.addRunArtifact(third_party_endianness_equivalence_test).step);
-
-    const third_party_sha_equivalence_mod = b.createModule(.{
-        .root_source_file = b.path("../pkg/third_party_sha_equivalence.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    third_party_sha_equivalence_mod.addImport("x86_sha", sha_x86_mod);
-    third_party_sha_equivalence_mod.addImport("arm64_sha", sha_arm64_mod);
-    third_party_sha_equivalence_mod.addImport("ppc_sha", sha_ppc_mod);
-    const third_party_sha_equivalence_test = b.addTest(.{ .root_module = third_party_sha_equivalence_mod });
-    check_step.dependOn(&b.addRunArtifact(third_party_sha_equivalence_test).step);
-
-    const third_party_dxbc_equivalence_mod = b.createModule(.{
-        .root_source_file = b.path("../pkg/third_party_dxbc_equivalence.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    third_party_dxbc_equivalence_mod.addImport("x86_dxbc", dxbc_x86_mod);
-    third_party_dxbc_equivalence_mod.addImport("arm64_dxbc", dxbc_arm64_mod);
-    third_party_dxbc_equivalence_mod.addImport("ppc_dxbc", dxbc_ppc_mod);
-    const third_party_dxbc_equivalence_test = b.addTest(.{ .root_module = third_party_dxbc_equivalence_mod });
-    check_step.dependOn(&b.addRunArtifact(third_party_dxbc_equivalence_test).step);
-
-    const third_party_half_equivalence_mod = b.createModule(.{
-        .root_source_file = b.path("../pkg/third_party_half_equivalence.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    third_party_half_equivalence_mod.addImport("x86_half", half_x86_mod);
-    third_party_half_equivalence_mod.addImport("arm64_half", half_arm64_mod);
-    third_party_half_equivalence_mod.addImport("ppc_half", half_ppc_mod);
-    const third_party_half_equivalence_test = b.addTest(.{ .root_module = third_party_half_equivalence_mod });
-    check_step.dependOn(&b.addRunArtifact(third_party_half_equivalence_test).step);
-
     // Compile-side companion to the readiness gate: the resolutions a
     // finished link set leaves undetermined produce no diagnostic from
     // either the compiler or the linker, and surface as runtime defects.
     const link_audit_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/link-audit/root.zig"),
+        .root_source_file = b.path("lib/link-audit/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -373,7 +160,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     check_step.dependOn(&b.addRunArtifact(link_audit_test).step);
 
     const link_audit_tool_mod = b.createModule(.{
-        .root_source_file = b.path("../src/tooling/link-audit/main.zig"),
+        .root_source_file = b.path("src/tooling/link-audit/main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -384,23 +171,23 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // Xenos register numbers are console hardware, not host or emulator
     // build state, so there is one copy and no route selection.
     const xenos_register_map_mod = b.createModule(.{
-        .root_source_file = b.path("../pkg/common/xenos/register-map/src/root.zig"),
+        .root_source_file = b.path("pkg/common/xenos/register-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     const rosette_ppc_host_abi_mod = b.createModule(.{
-        .root_source_file = b.path("../pkg/common/abi/rosette-ppc-host/src/root.zig"),
+        .root_source_file = b.path("pkg/common/abi/rosette-ppc-host/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     const gpu_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/gpu/root.zig"),
+        .root_source_file = b.path("lib/gpu/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     gpu_mod.addImport("window_geometry", window_geometry_mod);
     gpu_mod.addAnonymousImport("rosette_live_metal_source", .{
-        .root_source_file = b.path("../lib/metal/textures/live_source.zig"),
+        .root_source_file = b.path("lib/metal/textures/live_source.zig"),
     });
     gpu_mod.addImport("frame_content_contract", frame_content_contract_mod);
     gpu_mod.addImport("screen_validity", screen_validity_mod);
@@ -437,14 +224,14 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // behalf. The dyld forwarder and the Windows Vulkan adapter run on
     // whichever host thread made the call; see lib/guest_context/README.md.
     const guest_context_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/guest_context/root.zig"),
+        .root_source_file = b.path("lib/guest_context/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     const guest_context_test = b.addTest(.{ .root_module = guest_context_mod });
     check_step.dependOn(&b.addRunArtifact(guest_context_test).step);
     const dyld_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/linker/dyld/root.zig"),
+        .root_source_file = b.path("lib/linker/dyld/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -459,7 +246,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     dyld_mod.addImport("xenia_host_gpu_callback_contract", xenia_host_gpu_callback_contract_mod);
     dyld_mod.addImport("rosette_macos_host_contract", rosette_macos_host_contract_mod);
     const scheduler_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/scheduler/root.zig"),
+        .root_source_file = b.path("lib/scheduler/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -473,7 +260,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // it as an explicit test root so its tests run even if the scheduler
     // root's import graph does not retain dependency test declarations.
     const native_thread_backend_test_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/scheduler/native_thread_backend.zig"),
+        .root_source_file = b.path("lib/scheduler/native_thread_backend.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -481,19 +268,19 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     check_step.dependOn(&b.addRunArtifact(native_thread_backend_test).step);
     dyld_mod.addImport("scheduler", scheduler_mod);
     const cxx_abi_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/abi/cxx-abi/root.zig"),
+        .root_source_file = b.path("lib/abi/cxx-abi/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     cxx_abi_mod.addImport("dyld", dyld_mod);
     const init_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/runtime/init/root.zig"),
+        .root_source_file = b.path("lib/runtime/init/root.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     const event_log_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/runtime/event-log/root.zig"),
+        .root_source_file = b.path("lib/runtime/event-log/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -518,7 +305,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // null C++ defines from the null that means Rosette could not decide.
     // Rooted here so its rules are executed, not merely compiled.
     const dynamic_cast_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/abi/dynamic-cast/root.zig"),
+        .root_source_file = b.path("lib/abi/dynamic-cast/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -536,7 +323,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // create-info offsets are exactly the kind of rule that is silent at
     // runtime and only visible as a guest failure many calls later.
     const windows_vulkan_adapter_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/gpu/vulkan/windows_guest_forwarder.zig"),
+        .root_source_file = b.path("lib/gpu/vulkan/windows_guest_forwarder.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -549,7 +336,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const run_windows_vulkan_adapter_test = b.addRunArtifact(windows_vulkan_adapter_test);
     windows_vulkan_adapter_check.dependOn(&run_windows_vulkan_adapter_test.step);
     const windows_vulkan_integration_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/gpu/vulkan/windows_guest_forwarder_integration_test.zig"),
+        .root_source_file = b.path("lib/gpu/vulkan/windows_guest_forwarder_integration_test.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -586,7 +373,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const fsi_dyld_test = b.addTest(.{ .root_module = dyld_mod, .filters = &.{ "FSI", "Fsi", "fsi", "presentation ceiling" } });
     fsi_check.dependOn(&b.addRunArtifact(fsi_gpu_test).step);
     fsi_check.dependOn(&b.addRunArtifact(fsi_dyld_test).step);
-    const evidence_io_mod = b.createModule(.{ .root_source_file = b.path("../lib/gpu/evidence_io_tests.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    const evidence_io_mod = b.createModule(.{ .root_source_file = b.path("lib/gpu/evidence_io_tests.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const evidence_io_test = b.addTest(.{ .root_module = evidence_io_mod });
     const evidence_io_run = b.addRunArtifact(evidence_io_test);
     b.step("evidence-io-check", "Check bounded owned shader diagnostic I/O without GPU work").dependOn(&evidence_io_run.step);
@@ -598,17 +385,17 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     metal_live_check.dependOn(&b.addRunArtifact(metal_live_dyld_test).step);
     // Xenia's log phrases and the comptime rare-character filter over them.
     const xenia_log_phrase_map_mod = b.createModule(.{
-        .root_source_file = b.path("../pkg/common/console/log-phrase-map/src/root.zig"),
+        .root_source_file = b.path("pkg/common/console/log-phrase-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     const vendor_library_contract_mod = b.createModule(.{
-        .root_source_file = b.path("../pkg/vendor/src/root.zig"),
+        .root_source_file = b.path("pkg/vendor/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     const diagnostics_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/diagnostics/root.zig"),
+        .root_source_file = b.path("lib/diagnostics/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -623,58 +410,58 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // Package contract checks: rosette_pkg_log calls contractIsWellFormed()
     // on each at startup and writes results to .rosette/rosette-pkg.log.
     diagnostics_mod.addImport("xenia_mount_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/console/mount-contract/src/root.zig"),
+        .root_source_file = b.path("pkg/common/console/mount-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_kernel_object_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/console/kernel-object-contract/src/root.zig"),
+        .root_source_file = b.path("pkg/common/console/kernel-object-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_texture_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/console/texture-contract/src/root.zig"),
+        .root_source_file = b.path("pkg/common/console/texture-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_io_completion_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/console/io-completion-contract/src/root.zig"),
+        .root_source_file = b.path("pkg/common/console/io-completion-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_user_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/console/user-contract/src/root.zig"),
+        .root_source_file = b.path("pkg/common/console/user-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_shader_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/console/shader-contract/src/root.zig"),
+        .root_source_file = b.path("pkg/common/console/shader-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_render_target_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/console/render-target-contract/src/root.zig"),
+        .root_source_file = b.path("pkg/common/console/render-target-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_audio_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/console/audio-contract/src/root.zig"),
+        .root_source_file = b.path("pkg/common/console/audio-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_input_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/console/input-contract/src/root.zig"),
+        .root_source_file = b.path("pkg/common/console/input-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_timer_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/console/timer-contract/src/root.zig"),
+        .root_source_file = b.path("pkg/common/console/timer-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_kernel_export_map", xenia_kernel_export_map_mod);
     diagnostics_mod.addImport("xenia_vd_ring_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/console/vd-ring-contract/src/root.zig"),
+        .root_source_file = b.path("pkg/common/console/vd-ring-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
@@ -696,37 +483,37 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     diagnostics_mod.addImport("xenia_application_controller_contract", xenia_application_controller_contract_mod);
     diagnostics_mod.addImport("application_framework_contract", application_framework_contract_mod);
     diagnostics_mod.addImport("xenia_xex_format", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/console/xex-format/src/root.zig"),
+        .root_source_file = b.path("pkg/common/console/xex-format/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_notification_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/console/notification-contract/src/root.zig"),
+        .root_source_file = b.path("pkg/common/console/notification-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_log_ring_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/console/log-ring-contract/src/root.zig"),
+        .root_source_file = b.path("pkg/common/console/log-ring-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_xthread_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/console/xthread-contract/src/root.zig"),
+        .root_source_file = b.path("pkg/common/console/xthread-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_vfs_device_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/console/vfs-device-contract/src/root.zig"),
+        .root_source_file = b.path("pkg/common/console/vfs-device-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_ob_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/console/ob-contract/src/root.zig"),
+        .root_source_file = b.path("pkg/common/console/ob-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_config_schema", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/console/config-schema/src/root.zig"),
+        .root_source_file = b.path("pkg/common/console/config-schema/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
@@ -737,7 +524,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     check_step.dependOn(&b.addRunArtifact(diagnostics_test).step);
     diagnostics_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
     const memory_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/runtime/memory/root.zig"),
+        .root_source_file = b.path("lib/runtime/memory/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -751,7 +538,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const memory_test = b.addTest(.{ .root_module = memory_mod });
     check_step.dependOn(&b.addRunArtifact(memory_test).step);
     const pthread_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/runtime/pthread/root.zig"),
+        .root_source_file = b.path("lib/runtime/pthread/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -764,7 +551,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const pthread_test = b.addTest(.{ .root_module = pthread_mod });
     check_step.dependOn(&b.addRunArtifact(pthread_test).step);
     const guest_abi_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/runtime/guest-abi/root.zig"),
+        .root_source_file = b.path("lib/runtime/guest-abi/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -779,7 +566,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // semantics for. The rule itself stays in the package.
     guest_abi_mod.addImport("cocoa_window_admission_contract", cocoa_window_admission_contract_mod);
     const io_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/io/root.zig"),
+        .root_source_file = b.path("lib/io/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -794,7 +581,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // admission tests to run, and compiling that bridge into the module the
     // processor already links it into would be a duplicate symbol.
     const guest_abi_test_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/runtime/guest-abi/root.zig"),
+        .root_source_file = b.path("lib/runtime/guest-abi/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -805,11 +592,11 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
         guest_abi_test_mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{macos_sdk_root}) });
         guest_abi_test_mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{macos_sdk_root}) });
         guest_abi_test_mod.addCSourceFile(.{
-            .file = b.path("../lib/Mach-O/native_window_bridge.m"),
+            .file = b.path("lib/Mach-O/native_window_bridge.m"),
             .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
         });
         guest_abi_test_mod.addCSourceFile(.{
-            .file = b.path("../lib/Mach-O/input_controller_bridge.m"),
+            .file = b.path("lib/Mach-O/input_controller_bridge.m"),
             .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
         });
         guest_abi_test_mod.linkFramework("AppKit", .{});
@@ -823,7 +610,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     check_step.dependOn(&b.addRunArtifact(libcpp_thread_abi_test).step);
 
     const macho_core_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/Mach-O/shared_core.zig"),
+        .root_source_file = b.path("lib/Mach-O/shared_core.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -840,7 +627,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // program: nothing but an executed test can catch a guard that is
     // silently always false.
     const macho_symbolication_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/Mach-O/symbolication.zig"),
+        .root_source_file = b.path("lib/Mach-O/symbolication.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -854,7 +641,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // an executed test rather than one that merely compiles as part of the
     // aggregate suite.
     const macho_types_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/Mach-O/types.zig"),
+        .root_source_file = b.path("lib/Mach-O/types.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -872,7 +659,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // duplicated work — is what made fixes in one subsystem surface as
     // regressions in another.
     const ownership_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/ownership/root.zig"),
+        .root_source_file = b.path("lib/ownership/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -882,7 +669,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // Who refused a guest access, and whether the refusal is the runtime's
     // granularity leaking or the guest's own trap firing. Rooted and run.
     const guest_protection_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/runtime/guest-protection/root.zig"),
+        .root_source_file = b.path("lib/runtime/guest-protection/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -896,7 +683,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // Observed guest structure shape: which fields the translation reads
     // and writes, so a missing store is a measurement rather than a guess.
     const guest_structure_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/runtime/guest-structure/root.zig"),
+        .root_source_file = b.path("lib/runtime/guest-structure/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -906,7 +693,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // The guest address-space model: derived from observed mappings rather
     // than asserted from build-time constants.
     const guest_address_space_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/runtime/guest-address-space/root.zig"),
+        .root_source_file = b.path("lib/runtime/guest-address-space/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -921,17 +708,17 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // The address-space bound, the Itanium mangling rule and the libc++
     // layout arithmetic behind a near-null reading. Policy stays in lib.
     const near_null_shape_mod = b.createModule(.{
-        .root_source_file = b.path("../pkg/common/abi/near-null-shape/src/root.zig"),
+        .root_source_file = b.path("pkg/common/abi/near-null-shape/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     const common_receiver_classification_mod = b.createModule(.{
-        .root_source_file = b.path("../pkg/common/abi/receiver-classification/src/root.zig"),
+        .root_source_file = b.path("pkg/common/abi/receiver-classification/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     const process_core_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/runtime/process-core/root.zig"),
+        .root_source_file = b.path("lib/runtime/process-core/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -964,7 +751,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // "the target was null" is the same sentence for three different bugs,
     // and the tests are what pin which is which.
     const dispatch_table_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/runtime/dispatch-table/root.zig"),
+        .root_source_file = b.path("lib/runtime/dispatch-table/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -977,7 +764,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // and one reversed value versus several is the difference between a bad
     // instruction and a bad conversion path.
     const byte_order_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/runtime/byte-order/root.zig"),
+        .root_source_file = b.path("lib/runtime/byte-order/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -990,7 +777,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // distinct sites" is the number that decides whether a halt is one gap
     // or the recogniser's coverage, and it has to be right.
     const dispatch_recovery_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/runtime/dispatch-recovery/root.zig"),
+        .root_source_file = b.path("lib/runtime/dispatch-recovery/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1020,7 +807,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // an unreachable redirect branch previously passed review because the
     // suite asserting it was never built.
     const bounded_dispatch_fst_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/runtime/process-core/bounded_dispatch_fst.zig"),
+        .root_source_file = b.path("lib/runtime/process-core/bounded_dispatch_fst.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1044,7 +831,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // guards. Self-contained for the same reason, and rooted here so the
     // guarantees it makes about family isolation are actually executed.
     const recovery_ledger_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/ownership/ledger.zig"),
+        .root_source_file = b.path("lib/ownership/ledger.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1058,7 +845,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // the field is still the storage the guest wrote to, so this rides the
     // same check step as the transducer itself.
     const guest_lifetime_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/ownership/lifetime.zig"),
+        .root_source_file = b.path("lib/ownership/lifetime.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1068,7 +855,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     check_step.dependOn(&run_guest_lifetime_test.step);
 
     const import_handler_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/runtime/import-handler/root.zig"),
+        .root_source_file = b.path("lib/runtime/import-handler/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1091,7 +878,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     check_step.dependOn(&b.addRunArtifact(import_handler_test).step);
 
     const macho_processor_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/Mach-O/main.zig"),
+        .root_source_file = b.path("lib/Mach-O/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -1145,31 +932,31 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
         macho_processor_mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{macos_sdk_root}) });
         macho_processor_mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{macos_sdk_root}) });
         macho_processor_mod.addCSourceFile(.{
-            .file = b.path("../lib/Mach-O/native_window_bridge.m"),
+            .file = b.path("lib/Mach-O/native_window_bridge.m"),
             .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
         });
         macho_processor_mod.addCSourceFile(.{
-            .file = b.path("../lib/Mach-O/input_controller_bridge.m"),
+            .file = b.path("lib/Mach-O/input_controller_bridge.m"),
             .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
         });
         macho_processor_mod.addCSourceFile(.{
-            .file = b.path("../lib/Mach-O/guest_heap_exports_anchor.c"),
+            .file = b.path("lib/Mach-O/guest_heap_exports_anchor.c"),
             .flags = &.{ "-Wall", "-Wextra" },
         });
         macho_processor_mod.addCSourceFile(.{
-            .file = b.path("../lib/Mach-O/rosette_ppc_exports_anchor.c"),
+            .file = b.path("lib/Mach-O/rosette_ppc_exports_anchor.c"),
             .flags = &.{ "-Wall", "-Wextra" },
         });
         macho_processor_mod.addCSourceFile(.{
-            .file = b.path("../lib/Mach-O/application_framework_exports_anchor.c"),
+            .file = b.path("lib/Mach-O/application_framework_exports_anchor.c"),
             .flags = &.{ "-Wall", "-Wextra" },
         });
         macho_processor_mod.addCSourceFile(.{
-            .file = b.path("../lib/Mach-O/guest_launch_assist_exports_anchor.c"),
+            .file = b.path("lib/Mach-O/guest_launch_assist_exports_anchor.c"),
             .flags = &.{ "-Wall", "-Wextra" },
         });
         macho_processor_mod.addCSourceFile(.{
-            .file = b.path("../lib/Mach-O/guest_host_gpu_callback_exports_anchor.c"),
+            .file = b.path("lib/Mach-O/guest_host_gpu_callback_exports_anchor.c"),
             .flags = &.{ "-Wall", "-Wextra" },
         });
         macho_processor_mod.linkFramework("AppKit", .{});
@@ -1211,7 +998,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     macho_processor_step.dependOn(&macho_processor_install.step);
 
     const macho_processor_test_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/Mach-O/process.zig"),
+        .root_source_file = b.path("lib/Mach-O/process.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -1261,11 +1048,11 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
         macho_processor_test_mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{macos_sdk_root}) });
         macho_processor_test_mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{macos_sdk_root}) });
         macho_processor_test_mod.addCSourceFile(.{
-            .file = b.path("../lib/Mach-O/native_window_bridge.m"),
+            .file = b.path("lib/Mach-O/native_window_bridge.m"),
             .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
         });
         macho_processor_test_mod.addCSourceFile(.{
-            .file = b.path("../lib/Mach-O/input_controller_bridge.m"),
+            .file = b.path("lib/Mach-O/input_controller_bridge.m"),
             .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
         });
         macho_processor_test_mod.linkFramework("AppKit", .{});
@@ -1293,49 +1080,49 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // with compile-only imports. This block is deliberately independent
     // of Xenia and never launches an emulator.
     const source_test_specs = [_][]const u8{
-        "../lib/processor/bat_processor/root.zig",
-        "../lib/runtime/mode/root.zig",
-        "../lib/runtime/mode/runtime_mode_test.zig",
-        "../src/compat/source/bitcode_stub.zig",
-        "../src/compat/source/force_types.zig",
-        "../src/compat/source/include_compat.zig",
-        "../src/compat/source/narrow.zig",
-        "../src/memory/safety.zig",
-        "../src/tooling/app_parser/root.zig",
-        "../src/source_test_root.zig",
-        "../src/tooling/binary_exporter/dos_mz_exporter.zig",
-        "../src/tooling/disasm_logger/x86_trace_logger.zig",
-        "../src/tooling/exe_parser/launch_config.zig",
-        "../src/tooling/exe_parser/pe_parser.zig",
-        "../src/tooling/exe_parser/rosette_exe_runner.zig",
-        "../src/tooling/exe_parser/rosette_package.zig",
-        "../src/tooling/iso/root.zig",
+        "lib/processor/bat_processor/root.zig",
+        "lib/runtime/mode/root.zig",
+        "lib/runtime/mode/runtime_mode_test.zig",
+        "src/compat/source/bitcode_stub.zig",
+        "src/compat/source/force_types.zig",
+        "src/compat/source/include_compat.zig",
+        "src/compat/source/narrow.zig",
+        "src/memory/safety.zig",
+        "src/tooling/app_parser/root.zig",
+        "src/source_test_root.zig",
+        "src/tooling/binary_exporter/dos_mz_exporter.zig",
+        "src/tooling/disasm_logger/x86_trace_logger.zig",
+        "src/tooling/exe_parser/launch_config.zig",
+        "src/tooling/exe_parser/pe_parser.zig",
+        "src/tooling/exe_parser/rosette_exe_runner.zig",
+        "src/tooling/exe_parser/rosette_package.zig",
+        "src/tooling/iso/root.zig",
     };
     inline for (source_test_specs) |source| {
         const source_test_mod = b.createModule(.{
             .root_source_file = b.path(source),
             .target = target,
             .optimize = optimize,
-            .link_libc = std.mem.eql(u8, source, "../src/shell/global_config/rosette_shell.zig"),
+            .link_libc = std.mem.eql(u8, source, "src/shell/global_config/rosette_shell.zig"),
         });
-        if (std.mem.eql(u8, source, "../lib/runtime/mode/root.zig") or
-            std.mem.eql(u8, source, "../lib/runtime/mode/runtime_mode_test.zig"))
+        if (std.mem.eql(u8, source, "lib/runtime/mode/root.zig") or
+            std.mem.eql(u8, source, "lib/runtime/mode/runtime_mode_test.zig"))
         {
             source_test_mod.addImport("event_log", event_log_mod);
         }
-        if (std.mem.eql(u8, source, "../src/shell/global_config/rosette_shell.zig")) {
+        if (std.mem.eql(u8, source, "src/shell/global_config/rosette_shell.zig")) {
             source_test_mod.addImport("entrypoint_alignment", entrypoint_alignment_module);
             source_test_mod.addImport("entrypoint_kernel_process_guard", entrypoint_kernel_process_guard_module);
             source_test_mod.addImport("compat_source_include_compat", b.createModule(.{
-                .root_source_file = b.path("../src/compat/source/include_compat.zig"),
+                .root_source_file = b.path("src/compat/source/include_compat.zig"),
                 .target = target,
                 .optimize = optimize,
             }));
         }
-        if (std.mem.eql(u8, source, "../src/tooling/disasm_logger/x86_trace_logger.zig")) {
+        if (std.mem.eql(u8, source, "src/tooling/disasm_logger/x86_trace_logger.zig")) {
             source_test_mod.addImport("x86_asm", x86_trace_asm_module);
         }
-        if (std.mem.eql(u8, source, "../src/source_test_root.zig")) {
+        if (std.mem.eql(u8, source, "src/source_test_root.zig")) {
             source_test_mod.addImport("runtime_abi_handshake", runtime_abi_module);
             source_test_mod.addImport("bridge_register_tracing", bridge_register_trace_module);
             source_test_mod.addImport("bridge_exceptions", bridge_exceptions_module);

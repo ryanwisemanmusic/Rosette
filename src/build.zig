@@ -8,7 +8,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const transpiler_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/transpiler/root.zig"),
+        .root_source_file = b.path("lib/transpiler/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -16,7 +16,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     check_step.dependOn(&b.addRunArtifact(transpiler_test).step);
 
     const transpiler_cli_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/transpiler/main.zig"),
+        .root_source_file = b.path("lib/transpiler/main.zig"),
         .target = target,
         .optimize = optimize,
     });

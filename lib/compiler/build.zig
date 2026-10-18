@@ -9,7 +9,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const fasm_mod = b.createModule(.{
-        .root_source_file = b.path("../src/Assemblers/FASM/Zig/root.zig"),
+        .root_source_file = b.path("src/Assemblers/FASM/Zig/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -25,7 +25,7 @@ pub fn register1(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const nasm_mod = b.createModule(.{
-        .root_source_file = b.path("../src/Assemblers/NASM/Zig/root.zig"),
+        .root_source_file = b.path("src/Assemblers/NASM/Zig/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -41,7 +41,7 @@ pub fn register2(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const yasm_mod = b.createModule(.{
-        .root_source_file = b.path("../src/Assemblers/YASM/Zig/root.zig"),
+        .root_source_file = b.path("src/Assemblers/YASM/Zig/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -57,7 +57,7 @@ pub fn register3(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const jwasm_mod = b.createModule(.{
-        .root_source_file = b.path("../src/Assemblers/JWASM/Zig/root.zig"),
+        .root_source_file = b.path("src/Assemblers/JWASM/Zig/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -73,7 +73,7 @@ pub fn register4(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const fasm_handshake_mod = b.createModule(.{
-        .root_source_file = b.path("../src/Assemblers/FASM/Zig/abi_handshake.zig"),
+        .root_source_file = b.path("src/Assemblers/FASM/Zig/abi_handshake.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -89,7 +89,7 @@ pub fn register5(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const nasm_handshake_mod = b.createModule(.{
-        .root_source_file = b.path("../src/Assemblers/NASM/Zig/abi_handshake.zig"),
+        .root_source_file = b.path("src/Assemblers/NASM/Zig/abi_handshake.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -105,7 +105,7 @@ pub fn register6(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const yasm_handshake_mod = b.createModule(.{
-        .root_source_file = b.path("../src/Assemblers/YASM/Zig/abi_handshake.zig"),
+        .root_source_file = b.path("src/Assemblers/YASM/Zig/abi_handshake.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -121,7 +121,7 @@ pub fn register7(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const jwasm_handshake_mod = b.createModule(.{
-        .root_source_file = b.path("../src/Assemblers/JWASM/Zig/abi_handshake.zig"),
+        .root_source_file = b.path("src/Assemblers/JWASM/Zig/abi_handshake.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -137,7 +137,7 @@ pub fn register8(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const assembler_abi_suite_mod = b.createModule(.{
-        .root_source_file = b.path("../src/Assemblers/abi_suite.zig"),
+        .root_source_file = b.path("src/Assemblers/abi_suite.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -153,7 +153,7 @@ pub fn register9(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const lib866d_mod = b.createModule(.{
-        .root_source_file = b.path("../src/DOS/Real_Mode/lib866d/Zig/root.zig"),
+        .root_source_file = b.path("src/DOS/Real_Mode/lib866d/Zig/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -169,7 +169,7 @@ pub fn register10(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const compat_router_mod = b.createModule(.{
-        .root_source_file = b.path("../src/compat/rosetta2/main.zig"),
+        .root_source_file = b.path("src/compat/rosetta2/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -183,7 +183,7 @@ pub fn register10(b: *std.Build, ctx: anytype) void {
     b.installArtifact(compat_router);
 
     const compat_router_test_mod = b.createModule(.{
-        .root_source_file = b.path("../src/compat/rosetta2/root.zig"),
+        .root_source_file = b.path("src/compat/rosetta2/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -210,7 +210,7 @@ pub fn register12(b: *std.Build, ctx: anytype) void {
     const target = ctx.target;
 
     const assembler_runner_mod = b.createModule(.{
-        .root_source_file = b.path("../src/Assemblers/runner.zig"),
+        .root_source_file = b.path("src/Assemblers/runner.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,

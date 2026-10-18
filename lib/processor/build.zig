@@ -34,24 +34,24 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const xenia_warning_severity_map_mod = ctx.xenia_warning_severity_map_mod;
 
     const x64_linux_runtime_mod = b.createModule(.{
-        .root_source_file = b.path("../src/x64-ASM/linux_runtime.zig"),
+        .root_source_file = b.path("src/x64-ASM/linux_runtime.zig"),
         .target = target,
         .optimize = optimize,
     });
     const x64_syscalls_mod = b.createModule(.{
-        .root_source_file = b.path("../src/x64-ASM/syscalls.zig"),
+        .root_source_file = b.path("src/x64-ASM/syscalls.zig"),
         .target = target,
         .optimize = optimize,
     });
     const x64_guest_abi_mod = b.createModule(.{
-        .root_source_file = b.path("../src/x64-ASM/guest_abi.zig"),
+        .root_source_file = b.path("src/x64-ASM/guest_abi.zig"),
         .target = target,
         .optimize = optimize,
     });
     x64_linux_runtime_mod.addImport("x64_syscalls", x64_syscalls_mod);
     x64_linux_runtime_mod.addImport("windows_runtime", windows_runtime_mod);
     const elf_processor_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/processor/ELF_processor/main.zig"),
+        .root_source_file = b.path("lib/processor/ELF_processor/main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -86,7 +86,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     b.installArtifact(elf_processor);
 
     const elf_processor_test_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/processor/ELF_processor/process.zig"),
+        .root_source_file = b.path("lib/processor/ELF_processor/process.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -118,7 +118,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // share the production implementation module but do not need to compile
     // the full PE process graph when only block-jit files change.
     const block_jit_test_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/processor/ELF_processor/block_jit.zig"),
+        .root_source_file = b.path("lib/processor/ELF_processor/block_jit.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -214,7 +214,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const register_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "registered import tail", "fast math", "NT zero-delay" } });
     register_check.dependOn(&b.addRunArtifact(register_test).step);
     const worker_yield_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/processor/ELF_processor/process/impl/worker_yield_bench.zig"),
+        .root_source_file = b.path("lib/processor/ELF_processor/process/impl/worker_yield_bench.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -226,7 +226,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     worker_yield_check.dependOn(&b.addRunArtifact(worker_yield_test).step);
     check_step.dependOn(&b.addRunArtifact(worker_yield_test).step);
     const retirement_check = b.step("retirement-flush-check", "Check indexed FSI recycling and TLB invalidation filters without GPU work");
-    for ([_][]const u8{ "../lib/gpu/retirement_tests.zig", "../lib/processor/ELF_processor/block_jit/tlb_invalidation_tests.zig" }, 0..) |path, index| {
+    for ([_][]const u8{ "lib/gpu/retirement_tests.zig", "lib/processor/ELF_processor/block_jit/tlb_invalidation_tests.zig" }, 0..) |path, index| {
         const module = b.createModule(.{ .root_source_file = b.path(path), .target = target, .optimize = optimize, .link_libc = true });
         const run = b.addRunArtifact(b.addTest(.{ .root_module = module }));
         const focused = b.step(if (index == 0) "recycling-check" else "tlb-flush-check", if (index == 0) "Check FSI continuation recycling and recording retirement offline" else "Check cross-executor TLB invalidation and fill costs offline");
@@ -284,7 +284,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const throughput_check = b.step("throughput-check", "Check page hoists, ordered memory, block chaining and Halo clear semantics without the full suite");
     throughput_check.dependOn(&b.addRunArtifact(throughput_test).step);
     const graphics_ledger_mod = b.createModule(.{
-        .root_source_file = b.path("../lib/processor/ELF_processor/windows_graphics.zig"),
+        .root_source_file = b.path("lib/processor/ELF_processor/windows_graphics.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -296,7 +296,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     graphics_ledger_check.dependOn(&run_graphics_ledger_test.step);
     check_step.dependOn(&run_graphics_ledger_test.step);
     const pe64_runtime_test_mod = b.createModule(.{
-        .root_source_file = b.path("../src/tooling/exe_parser/pe64_runtime.zig"),
+        .root_source_file = b.path("src/tooling/exe_parser/pe64_runtime.zig"),
         .target = target,
         .optimize = optimize,
     });

@@ -837,7 +837,7 @@ pub fn build(b: *std.Build) void {
     windows_guest_forwarder_module.addImport("dll_win32_catalogue", dll_win32_catalogue_module);
     native_windows_graphics_module.addImport("gpu", windows_gpu_module);
     native_windows_graphics_module.addImport("windows_guest_forwarder", windows_guest_forwarder_module);
-    // The full Mach-O processor is assembled by build/build.zig. This app
+    // The full Mach-O processor is assembled by build.zig. This app
     // build used to carry a second, incomplete dependency graph here; as the
     // processor gained its GPU/runtime modules that copy stopped compiling and
     // could also leave the app bundle with a different processor than the
