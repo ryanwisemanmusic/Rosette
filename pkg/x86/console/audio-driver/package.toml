@@ -1,4 +1,4 @@
-name = "xenia-x86-audio-driver"
+name = "host-x86-audio-driver"
 version = "0.1.0-local"
 kind = "host-audio-driver-contract"
 role = "build-time"
