@@ -29,6 +29,14 @@ ROSETTE_SIGNING_ENV ?= $(ROOT_DIR)/.rosette/signing.env
 empty :=
 space := $(empty) $(empty)
 make_escape_spaces = $(subst $(space),\$(space),$(1))
+# The checked-in policy in .rosette carries Rosette's macOS ABI floor into
+# every Make-driven Zig/C build. It records the development SDK for context,
+# but only the deployment target is enforced; a newer installed SDK is valid.
+ROSETTE_BUILD_ENVIRONMENT ?= $(ROOT_DIR)/.rosette/build-environment.mk
+-include $(call make_escape_spaces,$(ROSETTE_BUILD_ENVIRONMENT))
+ROSETTE_MACOS_DEPLOYMENT_TARGET ?= 13.0
+MACOSX_DEPLOYMENT_TARGET := $(ROSETTE_MACOS_DEPLOYMENT_TARGET)
+export MACOSX_DEPLOYMENT_TARGET
 -include $(call make_escape_spaces,$(ROSETTE_SIGNING_ENV))
 export
 
@@ -64,6 +72,7 @@ ELF_PROCESSOR_BIN := $(ZIG_OUT_DIR)/bin/elf_processor
 ELF_PROCESSOR_SRC := $(ROOT_DIR)/lib/processor/ELF_processor/main.zig
 MACHO_PROCESSOR_BIN := $(ZIG_OUT_DIR)/bin/macho_processor
 MACHO_PROCESSOR_SRC := $(ROOT_DIR)/lib/Mach-O/main.zig
+ROSETTE_PACKAGE_MANAGER := $(ROOT_DIR)/pkg/registry/rosette-package-manager.sh
 # The Makefile path is also used by shell-update, outside build/build.zig.
 # Keep its route package selection aligned with the native host that is
 # compiling Rosette. The package contributes facts only; it is not executable
@@ -74,80 +83,80 @@ MACHO_PROCESSOR_SRC := $(ROOT_DIR)/lib/Mach-O/main.zig
 COMMON_RECEIVER_CLASSIFICATION_SRC := pkg/common/abi/receiver-classification/src/root.zig
 XENOS_REGISTER_MAP_SRC := pkg/common/xenos/register-map/src/root.zig
 NEAR_NULL_SHAPE_SRC := pkg/common/abi/near-null-shape/src/root.zig
-XENIA_LOG_PHRASE_MAP_SRC := pkg/common/xenia/log-phrase-map/src/root.zig
+XENIA_LOG_PHRASE_MAP_SRC := pkg/common/console/log-phrase-map/src/root.zig
 HOST_CONTRACT_CATALOGUE_SRC := pkg/common/abi/host-contract-catalogue/src/root.zig
 LIBCPP_THREAD_ABI_SRC := pkg/common/abi/libcpp-thread-struct/src/root.zig
 PHRASE_FILTER_SRC := pkg/common/text/phrase-filter/src/root.zig
-XENIA_READY_PLAN_SRC := pkg/common/xenia/ready-plan/src/root.zig
+XENIA_READY_PLAN_SRC := pkg/common/console/ready-plan/src/root.zig
 # Console-hardware and kernel-ABI contracts. Route-independent: they describe
 # the Xbox 360 and its kernel, not the host Rosette is compiled for, so they
 # have no entry in the `uname -m` block below.
-XENIA_AUDIO_CONTRACT_SRC := pkg/common/xenia/audio-contract/src/root.zig
-XENIA_INPUT_CONTRACT_SRC := pkg/common/xenia/input-contract/src/root.zig
-XENIA_USER_CONTRACT_SRC := pkg/common/xenia/user-contract/src/root.zig
-XENIA_CONFIG_SCHEMA_SRC := pkg/common/xenia/config-schema/src/root.zig
-XENIA_SHADER_CONTRACT_SRC := pkg/common/xenia/shader-contract/src/root.zig
-XENIA_RENDER_TARGET_CONTRACT_SRC := pkg/common/xenia/render-target-contract/src/root.zig
-XENIA_TEXTURE_CONTRACT_SRC := pkg/common/xenia/texture-contract/src/root.zig
-XENIA_IO_COMPLETION_CONTRACT_SRC := pkg/common/xenia/io-completion-contract/src/root.zig
-XENIA_TIMER_CONTRACT_SRC := pkg/common/xenia/timer-contract/src/root.zig
-XENIA_OB_CONTRACT_SRC := pkg/common/xenia/ob-contract/src/root.zig
-XENIA_MOUNT_CONTRACT_SRC := pkg/common/xenia/mount-contract/src/root.zig
-XENIA_KERNEL_OBJECT_CONTRACT_SRC := pkg/common/xenia/kernel-object-contract/src/root.zig
+XENIA_AUDIO_CONTRACT_SRC := pkg/common/console/audio-contract/src/root.zig
+XENIA_INPUT_CONTRACT_SRC := pkg/common/console/input-contract/src/root.zig
+XENIA_USER_CONTRACT_SRC := pkg/common/console/user-contract/src/root.zig
+XENIA_CONFIG_SCHEMA_SRC := pkg/common/console/config-schema/src/root.zig
+XENIA_SHADER_CONTRACT_SRC := pkg/common/console/shader-contract/src/root.zig
+XENIA_RENDER_TARGET_CONTRACT_SRC := pkg/common/console/render-target-contract/src/root.zig
+XENIA_TEXTURE_CONTRACT_SRC := pkg/common/console/texture-contract/src/root.zig
+XENIA_IO_COMPLETION_CONTRACT_SRC := pkg/common/console/io-completion-contract/src/root.zig
+XENIA_TIMER_CONTRACT_SRC := pkg/common/console/timer-contract/src/root.zig
+XENIA_OB_CONTRACT_SRC := pkg/common/console/ob-contract/src/root.zig
+XENIA_MOUNT_CONTRACT_SRC := pkg/common/console/mount-contract/src/root.zig
+XENIA_KERNEL_OBJECT_CONTRACT_SRC := pkg/common/console/kernel-object-contract/src/root.zig
 # Transcribed from Xenia's own export tables, packet enums and container
 # headers. Console/kernel facts, so route independent like the rest above.
-XENIA_KERNEL_EXPORT_MAP_SRC := pkg/common/xenia/kernel-export-map/src/root.zig
-XENIA_VD_RING_CONTRACT_SRC := pkg/common/xenia/vd-ring-contract/src/root.zig
-XENIA_PM4_CONTRACT_SRC := pkg/common/xenia/pm4-contract/src/root.zig
-XENIA_XEX_FORMAT_SRC := pkg/common/xenia/xex-format/src/root.zig
-XENIA_NOTIFICATION_CONTRACT_SRC := pkg/common/xenia/notification-contract/src/root.zig
-XENIA_LOG_RING_CONTRACT_SRC := pkg/common/xenia/log-ring-contract/src/root.zig
-XENIA_XTHREAD_CONTRACT_SRC := pkg/common/xenia/xthread-contract/src/root.zig
-XENIA_VFS_DEVICE_CONTRACT_SRC := pkg/common/xenia/vfs-device-contract/src/root.zig
-XENIA_GRAPHICS_CONTRACT_SRC := pkg/x86/xenia/graphics-contract/src/root.zig
-XENIA_SURFACE_PATH_CONTRACT_SRC := pkg/x86/xenia/graphics/surface-path-contract/src/root.zig
-XENIA_SHADER_STORAGE_CONTRACT_SRC := pkg/x86/xenia/runtime/shader-storage-contract/src/root.zig
-XENIA_PRIMITIVE_CONTRACT_SRC := pkg/x86/xenia/runtime/primitive-contract/src/root.zig
-XENIA_LAUNCH_PHASE_MAP_SRC := pkg/x86/xenia/runtime/launch-phase-map/src/root.zig
-XENIA_ABI_BRIDGE_SRC := pkg/x86/xenia/bridge/abi-bridge/src/root.zig
-XENIA_GUEST_BRIDGE_SRC := pkg/x86/xenia/runtime/guest-bridge/src/root.zig
-XENIA_CODEGEN_ACTIVATION_SRC := pkg/x86/xenia/runtime/codegen-activation/src/root.zig
-XENIA_WAIT_CONTRACT_SRC := pkg/x86/xenia/runtime/wait-contract/src/root.zig
-XENIA_TRANSLATION_PROGRESS_SRC := pkg/x86/xenia/runtime/translation-progress/src/root.zig
-XENIA_HEAP_RANGE_SRC := pkg/x86/xenia/memory/heap-range/src/root.zig
+XENIA_KERNEL_EXPORT_MAP_SRC := pkg/common/console/kernel-export-map/src/root.zig
+XENIA_VD_RING_CONTRACT_SRC := pkg/common/console/vd-ring-contract/src/root.zig
+XENIA_PM4_CONTRACT_SRC := pkg/common/console/pm4-contract/src/root.zig
+XENIA_XEX_FORMAT_SRC := pkg/common/console/xex-format/src/root.zig
+XENIA_NOTIFICATION_CONTRACT_SRC := pkg/common/console/notification-contract/src/root.zig
+XENIA_LOG_RING_CONTRACT_SRC := pkg/common/console/log-ring-contract/src/root.zig
+XENIA_XTHREAD_CONTRACT_SRC := pkg/common/console/xthread-contract/src/root.zig
+XENIA_VFS_DEVICE_CONTRACT_SRC := pkg/common/console/vfs-device-contract/src/root.zig
+XENIA_GRAPHICS_CONTRACT_SRC := pkg/x86/console/graphics-contract/src/root.zig
+XENIA_SURFACE_PATH_CONTRACT_SRC := pkg/x86/console/graphics/surface-path-contract/src/root.zig
+XENIA_SHADER_STORAGE_CONTRACT_SRC := pkg/x86/console/runtime/shader-storage-contract/src/root.zig
+XENIA_PRIMITIVE_CONTRACT_SRC := pkg/x86/console/runtime/primitive-contract/src/root.zig
+XENIA_LAUNCH_PHASE_MAP_SRC := pkg/x86/console/runtime/launch-phase-map/src/root.zig
+XENIA_ABI_BRIDGE_SRC := pkg/x86/console/bridge/abi-bridge/src/root.zig
+XENIA_GUEST_BRIDGE_SRC := pkg/x86/console/runtime/guest-bridge/src/root.zig
+XENIA_CODEGEN_ACTIVATION_SRC := pkg/x86/console/runtime/codegen-activation/src/root.zig
+XENIA_WAIT_CONTRACT_SRC := pkg/x86/console/runtime/wait-contract/src/root.zig
+XENIA_TRANSLATION_PROGRESS_SRC := pkg/x86/console/runtime/translation-progress/src/root.zig
+XENIA_HEAP_RANGE_SRC := pkg/x86/console/memory/heap-range/src/root.zig
 # This package's module root is the evidence table, not a `root.zig`; the
 # `main.zig` beside it is the standalone CLI and is not linked here.
-XENIA_STARTUP_EVIDENCE_SRC := pkg/x86/xenia/diagnostics/startup-evidence/src/evidence.zig
-XENIA_AUDIO_DRIVER_SRC := pkg/x86/xenia/audio-driver/src/root.zig
-XENIA_INPUT_DRIVER_SRC := pkg/x86/xenia/input-driver/src/root.zig
-XENIA_SIMD_SHIM_MAP_SRC := pkg/x86/xenia/simd-shim-map/src/root.zig
+XENIA_STARTUP_EVIDENCE_SRC := pkg/x86/console/diagnostics/startup-evidence/src/evidence.zig
+XENIA_AUDIO_DRIVER_SRC := pkg/x86/console/audio-driver/src/root.zig
+XENIA_INPUT_DRIVER_SRC := pkg/x86/console/input-driver/src/root.zig
+XENIA_SIMD_SHIM_MAP_SRC := pkg/x86/console/simd-shim-map/src/root.zig
 ifeq ($(shell uname -m),arm64)
-XENIA_GRAPHICS_CONTRACT_SRC := pkg/ARM64/xenia/graphics-contract/src/root.zig
-XENIA_SURFACE_PATH_CONTRACT_SRC := pkg/ARM64/xenia/graphics/surface-path-contract/src/root.zig
-XENIA_SHADER_STORAGE_CONTRACT_SRC := pkg/ARM64/xenia/runtime/shader-storage-contract/src/root.zig
-XENIA_PRIMITIVE_CONTRACT_SRC := pkg/ARM64/xenia/runtime/primitive-contract/src/root.zig
-XENIA_LAUNCH_PHASE_MAP_SRC := pkg/ARM64/xenia/runtime/launch-phase-map/src/root.zig
-XENIA_ABI_BRIDGE_SRC := pkg/ARM64/xenia/bridge/abi-bridge/src/root.zig
-XENIA_GUEST_BRIDGE_SRC := pkg/ARM64/xenia/runtime/guest-bridge/src/root.zig
-XENIA_CODEGEN_ACTIVATION_SRC := pkg/ARM64/xenia/runtime/codegen-activation/src/root.zig
-XENIA_WAIT_CONTRACT_SRC := pkg/ARM64/xenia/runtime/wait-contract/src/root.zig
-XENIA_TRANSLATION_PROGRESS_SRC := pkg/ARM64/xenia/runtime/translation-progress/src/root.zig
-XENIA_HEAP_RANGE_SRC := pkg/ARM64/xenia/memory/heap-range/src/root.zig
-XENIA_STARTUP_EVIDENCE_SRC := pkg/ARM64/xenia/diagnostics/startup-evidence/src/evidence.zig
-XENIA_AUDIO_DRIVER_SRC := pkg/ARM64/xenia/audio-driver/src/root.zig
-XENIA_INPUT_DRIVER_SRC := pkg/ARM64/xenia/input-driver/src/root.zig
-XENIA_SIMD_SHIM_MAP_SRC := pkg/ARM64/xenia/simd-shim-map/src/root.zig
+XENIA_GRAPHICS_CONTRACT_SRC := pkg/ARM64/console/graphics-contract/src/root.zig
+XENIA_SURFACE_PATH_CONTRACT_SRC := pkg/ARM64/console/graphics/surface-path-contract/src/root.zig
+XENIA_SHADER_STORAGE_CONTRACT_SRC := pkg/ARM64/console/runtime/shader-storage-contract/src/root.zig
+XENIA_PRIMITIVE_CONTRACT_SRC := pkg/ARM64/console/runtime/primitive-contract/src/root.zig
+XENIA_LAUNCH_PHASE_MAP_SRC := pkg/ARM64/console/runtime/launch-phase-map/src/root.zig
+XENIA_ABI_BRIDGE_SRC := pkg/ARM64/console/bridge/abi-bridge/src/root.zig
+XENIA_GUEST_BRIDGE_SRC := pkg/ARM64/console/runtime/guest-bridge/src/root.zig
+XENIA_CODEGEN_ACTIVATION_SRC := pkg/ARM64/console/runtime/codegen-activation/src/root.zig
+XENIA_WAIT_CONTRACT_SRC := pkg/ARM64/console/runtime/wait-contract/src/root.zig
+XENIA_TRANSLATION_PROGRESS_SRC := pkg/ARM64/console/runtime/translation-progress/src/root.zig
+XENIA_HEAP_RANGE_SRC := pkg/ARM64/console/memory/heap-range/src/root.zig
+XENIA_STARTUP_EVIDENCE_SRC := pkg/ARM64/console/diagnostics/startup-evidence/src/evidence.zig
+XENIA_AUDIO_DRIVER_SRC := pkg/ARM64/console/audio-driver/src/root.zig
+XENIA_INPUT_DRIVER_SRC := pkg/ARM64/console/input-driver/src/root.zig
+XENIA_SIMD_SHIM_MAP_SRC := pkg/ARM64/console/simd-shim-map/src/root.zig
 endif
 MACHO_NATIVE_WINDOW_OBJ := $(ROOT_DIR)/$(BP)macho_native_window_bridge.o
-XENIA_HEAP_ANCHOR_OBJ := $(ROOT_DIR)/$(BP)xenia_heap_exports_anchor.o
+XENIA_HEAP_ANCHOR_OBJ := $(ROOT_DIR)/$(BP)guest_heap_exports_anchor.o
 ROSETTE_PPC_ANCHOR_OBJ := $(ROOT_DIR)/$(BP)rosette_ppc_exports_anchor.o
 DYLD_DYLIB := $(ZIG_OUT_DIR)/lib/rosette-exec.dylib
 SHELL_HELPER_SRC := $(ROOT_DIR)/src/shell/global_config/rosette_shell.zig
 SHELL_HELPER_BIN := $(ZIG_OUT_DIR)/bin/rosette-shell
 TEST_CENSUS_SCRIPT := $(ROOT_DIR)/tools/test_census.py
 TEST_CENSUS_OUT := $(ROOT_DIR)/.rosette/test-census.json
-XENIA_RUN_SYSTEMS_TEST := $(ROOT_DIR)/tools/test_xenia_run_systems.py
-XENIA_RUN_LAUNCHER := $(ROOT_DIR)/tools/xenia/scripts/rosette-xenia-run.sh
+XENIA_RUN_SYSTEMS_TEST := $(ROOT_DIR)/tools/test_guest_run_systems.py
+XENIA_RUN_LAUNCHER := $(ROOT_DIR)/tools/guest_runtime/scripts/rosette-guest-run.sh
 SHELL_UPDATE_RECORD_SCRIPT := $(ROOT_DIR)/tools/record_shell_update.py
 SHELL_UPDATE_RECORD_OUT := $(ROOT_DIR)/.rosette/shell-update.json
 SHELL_UPDATE_SMART_SCRIPT := $(ROOT_DIR)/tools/smart_shell_update.py
@@ -156,9 +165,9 @@ BUILD_IDENTITY_SCRIPT := $(ROOT_DIR)/tools/build_identity_manifest.py
 BUILD_IDENTITY_OUT := $(ROOT_DIR)/.rosette/build-identity.json
 AUDIT_PHASE_COVERAGE_SCRIPT := $(ROOT_DIR)/tools/audit_phase_coverage.py
 AUDIT_PHASE_COVERAGE_OUT := $(ROOT_DIR)/.rosette/audit-phase-coverage.json
-XENIA_FORK_MANIFEST_SCRIPT := $(ROOT_DIR)/tools/build_xenia_fork_manifest.py
+XENIA_FORK_MANIFEST_SCRIPT := $(ROOT_DIR)/tools/build_guest_fork_manifest.py
 XENIA_FORK_MANIFEST_OUT := $(ROOT_DIR)/.rosette/xenia-fork-manifest.json
-# The run script (tools/xenia/scripts/rosette-xenia-run.sh) writes the run
+# The run script (tools/guest_runtime/scripts/rosette-guest-run.sh) writes the run
 # log under .rosette/xenia-runs/; the older location is kept as the fallback
 # so a log from before that change is still audited.
 XENIA_SOURCE_LOG = $(shell if [ -f "$(XENIA_ROOT)/.rosette/xenia-runs/rosette-xenia.log" ]; then printf '%s' "$(XENIA_ROOT)/.rosette/xenia-runs/rosette-xenia.log"; else printf '%s' "$(XENIA_ROOT)/.rosette/rosette-xenia.log"; fi)
@@ -171,9 +180,9 @@ GENERATED_TRACE_OUT := $(ROOT_DIR)/.rosette/generated-code-trace.json
 # The absent-source sentinel is project-relative and lets shell refreshes record
 # that Xenia was unavailable without confusing the Rosetta tree for Xenia.
 XENIA_ROOT ?= $(if $(strip $(ROSETTE_XENIA_ROOT)),$(ROSETTE_XENIA_ROOT),$(ROOT_DIR)/.rosette/xenia-source-unavailable)
-XENIA_WINDOWS_BUILD_SCRIPT := $(ROOT_DIR)/tools/xenia/scripts/rosette-xenia-windows.sh
+XENIA_WINDOWS_BUILD_SCRIPT := $(ROOT_DIR)/tools/guest_runtime/scripts/rosette-guest-windows.sh
 XENIA_WINDOWS_SOURCE_ROOT ?= $(XENIA_ROOT)
-XENIA_WINDOWS_BUILD_DIR ?= $(ROOT_DIR)/.rosette/xenia-windows
+XENIA_WINDOWS_BUILD_DIR ?= $(ROOT_DIR)/build/xenia-windows
 XENIA_WINDOWS_BUNDLE_DIR ?= $(XENIA_WINDOWS_BUILD_DIR)/bundle
 XENIA_WINDOWS_CONFIG ?= Release
 XENIA_WINDOWS_TARGET ?= xenia-app
@@ -221,6 +230,31 @@ endef
 EXE_GATE_RUNNER_SRC := src/tooling/exe_parser/rosette_exe_runner.zig
 EXE_GATE_RUNNER_BIN := zig-out/bin/rosette_exe_runner
 
+# Prefer an explicitly configured Developer ID. When it is absent, discover
+# the sole valid Developer ID Application certificate in the macOS keychain.
+# This lets the normal `make app-all` path select release signing without a
+# per-shell export, while avoiding an arbitrary choice when several identities
+# are installed.
+APPLE_KEYCHAIN_DEVELOPER_ID_COUNT := 0
+ifeq ($(shell uname -s),Darwin)
+APPLE_KEYCHAIN_DEVELOPER_ID_COUNT := $(shell /usr/bin/security find-identity -v -p codesigning 2>/dev/null | /usr/bin/awk -F '"' '/Developer ID Application:/ { count++ } END { print count + 0 }')
+ifeq ($(strip $(APPLE_DEVELOPER_ID)),)
+ifeq ($(APPLE_KEYCHAIN_DEVELOPER_ID_COUNT),1)
+APPLE_DEVELOPER_ID := $(shell /usr/bin/security find-identity -v -p codesigning 2>/dev/null | /usr/bin/awk -F '"' '/Developer ID Application:/ { print $$2 }')
+endif
+endif
+endif
+
+# Do not silently make a local ad-hoc build when multiple release identities
+# could be selected. The caller can resolve that ambiguity explicitly.
+ifneq ($(filter app-all release notarize-app-all notarize-installer notarize-uninstaller,$(MAKECMDGOALS)),)
+ifeq ($(strip $(APPLE_DEVELOPER_ID)$(CODESIGN_IDENTITY)),)
+ifneq ($(APPLE_KEYCHAIN_DEVELOPER_ID_COUNT),0)
+$(error Found $(APPLE_KEYCHAIN_DEVELOPER_ID_COUNT) valid Developer ID Application identities; set APPLE_DEVELOPER_ID or CODESIGN_IDENTITY explicitly)
+endif
+endif
+endif
+
 # Entitlements for codesigning (JIT, unsigned-executable-memory, etc.)
 ifneq ($(APPLE_DEVELOPER_ID),)
     CODESIGN_IDENTITY ?= $(APPLE_DEVELOPER_ID)
@@ -244,8 +278,8 @@ CODESIGN_IDENTITY := $(subst ",,$(CODESIGN_IDENTITY))
 RELEASE_BUILD ?= 0
 DMG_CODESIGN_FLAGS := $(if $(filter 1,$(RELEASE_BUILD)),--timestamp,)
 
-RELEASE_ENTITLEMENTS := build/rosette-release.entitlements
-ADHOC_ENTITLEMENTS := build/rosette-adhoc.entitlements
+RELEASE_ENTITLEMENTS := $(BP)rosette-release.entitlements
+ADHOC_ENTITLEMENTS := $(BP)rosette-adhoc.entitlements
 ENTITLEMENTS := $(if $(filter -,$(CODESIGN_IDENTITY)),$(ADHOC_ENTITLEMENTS),$(RELEASE_ENTITLEMENTS))
 NOTARY_PROFILE ?= rosette-notary
 NOTARYTOOL ?= xcrun notarytool
@@ -296,7 +330,7 @@ ISO_BIN := $(ZIG_OUT_DIR)/bin/rosette-iso
 ISO_SRC := $(ROOT_DIR)/src/tooling/iso/main.zig
 XBOX360_MEDIA_TOOL := $(ROOT_DIR)/tools/xbox360_media.py
 
-.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build dyld-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build link-audit-build pkg-boundary-audit isa-execution-audit build-routes-audit dll-coverage-audit guest-context-audit vendor-library-audit vendor-audit diagnostic-audit shell-helper-build test-census xenia-run-systems-check shell-update-system-check source-budget-check audit-phase-coverage xenia-fork-manifest xenia-fork-manifest-shell-update xenia-windows-prepare xenia-windows-build build-identity evidence-fixture replay-evidence shell shell-update shell-update-all shell-update-relink shell-update-elf-processor shell-update-elf-processor-process-impl shell-update-elf-processor-windows-runtime shell-update-elf-processor-block-jit shell-update-macho-processor shell-update-dyld-forwarder shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse iso-build iso-run app-wrapper installer uninstaller app-all release notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
+.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build dyld-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build link-audit-build pkg-boundary-audit isa-execution-audit build-routes-audit dll-coverage-audit guest-context-audit vendor-library-audit xenia-vendor-source-audit vendor-audit diagnostic-audit shell-helper-build test-census xenia-run-systems-check shell-update-system-check source-budget-check audit-phase-coverage xenia-fork-manifest xenia-fork-manifest-shell-update xenia-windows-prepare xenia-windows-build build-identity evidence-fixture replay-evidence shell shell-update shell-update-all shell-update-relink shell-update-elf-processor shell-update-elf-processor-process-impl shell-update-elf-processor-windows-runtime shell-update-elf-processor-block-jit shell-update-macho-processor shell-update-dyld-forwarder shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse iso-build iso-run app-wrapper installer uninstaller app-all release notarize-installer notarize-uninstaller notarize-app-all install-packages install-packages-all c-fix c-fix-build
 
 all: headers-check zig-build test-run
 
@@ -340,6 +374,8 @@ help:
 		'  make diagnostic-audit Run bounded disassembly, warning-ledger, and generated-code checks' \
 		'  make shell-uninstall Remove Rosette shell integration' \
 		'  make shell-clean-state Kill stale Rosette shell/ELF helper processes' \
+		'  make install-packages  Choose optional packages from the Rosette release catalog' \
+		'  make install-packages-all  Install every package in the Rosette release catalog' \
 		'  make c-fix        Run C transpiler on C sources to fix implicit narrowing conversions' \
 		'  make c-fix-build Build the C transpiler tool' \
 		'  make iso-build       Build the ISO 9660 file inspector tool\n' \
@@ -416,7 +452,7 @@ clean: exe-runner-cleanup
 
 elf-processor-build:
 	@mkdir -p "$(ZIG_CACHE_DIR)/global"
-	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build-exe -O "$(ROSETTE_RUNTIME_OPTIMIZE)" --dep x64_decoder --dep x64_interpreter --dep x64_linux_runtime --dep x64_syscalls --dep x64_guest_abi --dep exit_diagnostics --dep cleo_routing --dep guard_rollback --dep execution_history --dep evex_runtime --dep x86_vector_helpers --dep xenia_fatal_condition_map --dep xenia_guest_frontier_map --dep xenia_warning_severity_map --dep xenia_guest_milestone_map --dep xenia_guest_address_map --dep frame_content_contract --dep screen_validity --dep address_region_map --dep xenia_kernel_shim_map --dep xenia_kernel_export_map --dep arm64_encode --dep tso_memory --dep concurrency --dep parallelism -Mroot="$(ELF_PROCESSOR_SRC)" --dep isa_highway --dep isa_registry --dep isa_decode --dep runtime_abi_handshake --dep flags --dep cpu_state --dep bit_test --dep capabilities -Mx64_decoder=ISA/decoding/root.zig --dep flags -Mcpu_state=src/x64-ASM/cpu_state.zig --dep flags -Mbit_test=src/x64-ASM/bit_test.zig -Mflags=src/x64-ASM/flags.zig -Mcapabilities=src/x64-ASM/capabilities.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig --dep windows_runtime --dep x64_syscalls -Mx64_linux_runtime=src/x64-ASM/linux_runtime.zig -Mx64_syscalls=src/x64-ASM/syscalls.zig --dep dll_win32_return_contract --dep dll_win32_library_inventory --dep windows_bsearch --dep tso_memory --dep utf8_codec -Mwindows_runtime=src/x64-ASM/windows_runtime.zig -Mwindows_bsearch=src/x64-ASM/windows_bsearch.zig -Mdll_win32_return_contract=pkg/dll/win32/return-contract/src/root.zig --dep dll_win32_catalogue --dep dll_win32_capability_gap -Mdll_win32_library_inventory=pkg/dll/win32/library-inventory/src/root.zig --dep dll_win32_advapi32 --dep dll_win32_api_ms_win_crt_convert_l1_1_0 --dep dll_win32_api_ms_win_crt_environment_l1_1_0 --dep dll_win32_api_ms_win_crt_filesystem_l1_1_0 --dep dll_win32_api_ms_win_crt_heap_l1_1_0 --dep dll_win32_api_ms_win_crt_locale_l1_1_0 --dep dll_win32_api_ms_win_crt_math_l1_1_0 --dep dll_win32_api_ms_win_crt_private_l1_1_0 --dep dll_win32_api_ms_win_crt_runtime_l1_1_0 --dep dll_win32_api_ms_win_crt_stdio_l1_1_0 --dep dll_win32_api_ms_win_crt_string_l1_1_0 --dep dll_win32_api_ms_win_crt_time_l1_1_0 --dep dll_win32_api_ms_win_crt_utility_l1_1_0 --dep dll_win32_bcrypt --dep dll_win32_cfgmgr32 --dep dll_win32_dwmapi --dep dll_win32_dxgi --dep dll_win32_vulkan_1 --dep dll_win32_dynamic --dep dll_win32_gdi32 --dep dll_win32_hid --dep dll_win32_imm32 --dep dll_win32_libusbk --dep dll_win32_kernel32 --dep dll_win32_msvcrt --dep dll_win32_ole32 --dep dll_win32_oleaut32 --dep dll_win32_setupapi --dep dll_win32_shcore --dep dll_win32_shell32 --dep dll_win32_shlwapi --dep dll_win32_user32 --dep dll_win32_version --dep dll_win32_winmm --dep dll_win32_winusb --dep dll_win32_wsock32 --dep dll_win32_export_contract -Mdll_win32_catalogue=pkg/dll/win32/catalogue/src/root.zig --dep dll_win32_export_contract -Mdll_win32_advapi32=pkg/dll/win32/advapi32/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_convert_l1_1_0=pkg/dll/win32/api-ms-win-crt-convert-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_environment_l1_1_0=pkg/dll/win32/api-ms-win-crt-environment-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_filesystem_l1_1_0=pkg/dll/win32/api-ms-win-crt-filesystem-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_heap_l1_1_0=pkg/dll/win32/api-ms-win-crt-heap-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_locale_l1_1_0=pkg/dll/win32/api-ms-win-crt-locale-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_math_l1_1_0=pkg/dll/win32/api-ms-win-crt-math-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_private_l1_1_0=pkg/dll/win32/api-ms-win-crt-private-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_runtime_l1_1_0=pkg/dll/win32/api-ms-win-crt-runtime-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_stdio_l1_1_0=pkg/dll/win32/api-ms-win-crt-stdio-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_string_l1_1_0=pkg/dll/win32/api-ms-win-crt-string-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_time_l1_1_0=pkg/dll/win32/api-ms-win-crt-time-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_utility_l1_1_0=pkg/dll/win32/api-ms-win-crt-utility-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_bcrypt=pkg/dll/win32/bcrypt/src/root.zig -Mdll_win32_cfgmgr32=pkg/dll/win32/cfgmgr32/src/root.zig --dep dll_win32_export_contract -Mdll_win32_dwmapi=pkg/dll/win32/dwmapi/src/root.zig --dep dll_win32_export_contract -Mdll_win32_dxgi=pkg/dll/win32/dxgi/src/root.zig -Mdll_win32_vulkan_1=pkg/dll/win32/vulkan-1/src/root.zig -Mdll_win32_dynamic=pkg/dll/win32/dynamic/src/root.zig --dep dll_win32_export_contract -Mdll_win32_gdi32=pkg/dll/win32/gdi32/src/root.zig -Mdll_win32_hid=pkg/dll/win32/hid/src/root.zig --dep dll_win32_export_contract -Mdll_win32_imm32=pkg/dll/win32/imm32/src/root.zig -Mdll_win32_libusbk=pkg/dll/win32/libusbk/src/root.zig --dep dll_win32_export_contract -Mdll_win32_kernel32=pkg/dll/win32/kernel32/src/root.zig --dep dll_win32_export_contract -Mdll_win32_msvcrt=pkg/dll/win32/msvcrt/src/root.zig --dep dll_win32_export_contract -Mdll_win32_ole32=pkg/dll/win32/ole32/src/root.zig --dep dll_win32_export_contract -Mdll_win32_oleaut32=pkg/dll/win32/oleaut32/src/root.zig --dep dll_win32_export_contract -Mdll_win32_setupapi=pkg/dll/win32/setupapi/src/root.zig -Mdll_win32_shcore=pkg/dll/win32/shcore/src/root.zig --dep dll_win32_export_contract -Mdll_win32_shell32=pkg/dll/win32/shell32/src/root.zig --dep dll_win32_export_contract -Mdll_win32_shlwapi=pkg/dll/win32/shlwapi/src/root.zig --dep dll_win32_export_contract -Mdll_win32_user32=pkg/dll/win32/user32/src/root.zig --dep dll_win32_export_contract -Mdll_win32_version=pkg/dll/win32/version/src/root.zig --dep dll_win32_export_contract -Mdll_win32_winmm=pkg/dll/win32/winmm/src/root.zig -Mdll_win32_winusb=pkg/dll/win32/winusb/src/root.zig --dep dll_win32_export_contract -Mdll_win32_wsock32=pkg/dll/win32/wsock32/src/root.zig -Mx64_guest_abi=src/x64-ASM/guest_abi.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -Misa_highway=ISA/highway.zig -Misa_registry=ISA/root.zig -Misa_decode=ISA/decode/root.zig -Mruntime_abi_handshake=src/tooling/runtime-abi-handshake/runtime.zig -Mguard_rollback=lib/runtime/guard-rollback/root.zig -Mcleo_routing=lib/CLEO/cleo_routing.zig -Mexecution_history=lib/runtime/execution-history/root.zig --dep x64_decoder --dep exit_diagnostics -Mevex_runtime=lib/runtime/process-core/evex.zig --dep x64_decoder --dep phrase_filter -Mxenia_fatal_condition_map=pkg/common/xenia/fatal-condition-map/src/root.zig -Mxenia_guest_frontier_map=pkg/common/xenia/guest-frontier-map/src/root.zig -Mxenia_guest_milestone_map=pkg/common/xenia/guest-milestone-map/src/root.zig -Mxenia_guest_address_map=pkg/common/xenia/guest-address-map/src/root.zig -Mframe_content_contract=pkg/common/rosette/frame-content-contract/src/root.zig -Mscreen_validity=lib/gpu/screen_validity.zig -Maddress_region_map=pkg/common/rosette/address-region-map/src/root.zig --dep phrase_filter -Mxenia_warning_severity_map=pkg/common/xenia/warning-severity-map/src/root.zig -Mphrase_filter=pkg/common/text/phrase-filter/src/root.zig --dep x64_decoder -Mx86_vector_helpers=lib/Mach-O/execution_helpers.zig --dep dll_win32_return_contract -Mdll_win32_export_contract=pkg/dll/win32/export-contract/src/root.zig -Mdll_win32_capability_gap=pkg/dll/win32/capability-gap/src/root.zig -Mxenia_kernel_shim_map=pkg/common/xenia/kernel-shim-map/src/root.zig -Mxenia_kernel_export_map=pkg/common/xenia/kernel-export-map/src/root.zig -Marm64_encode=lib/compiler/arm64/encode.zig -Mtso_memory=lib/processor/ELF_processor/tso_memory.zig -Mutf8_codec=lib/text/utf8/root.zig -Mconcurrency=lib/concurrency/root.zig --dep concurrency -Mparallelism=lib/processor/ELF_processor/parallelism/root.zig -femit-bin="$(ELF_PROCESSOR_BIN)"
+	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build-exe -O "$(ROSETTE_RUNTIME_OPTIMIZE)" --dep x64_decoder --dep x64_interpreter --dep x64_linux_runtime --dep x64_syscalls --dep x64_guest_abi --dep exit_diagnostics --dep cleo_routing --dep guard_rollback --dep execution_history --dep evex_runtime --dep x86_vector_helpers --dep xenia_fatal_condition_map --dep xenia_guest_frontier_map --dep xenia_warning_severity_map --dep xenia_guest_milestone_map --dep xenia_guest_address_map --dep frame_content_contract --dep screen_validity --dep address_region_map --dep xenia_kernel_shim_map --dep xenia_kernel_export_map --dep arm64_encode --dep tso_memory --dep concurrency --dep parallelism -Mroot="$(ELF_PROCESSOR_SRC)" --dep isa_highway --dep isa_registry --dep isa_decode --dep runtime_abi_handshake --dep flags --dep cpu_state --dep bit_test --dep capabilities -Mx64_decoder=ISA/decoding/root.zig --dep flags -Mcpu_state=src/x64-ASM/cpu_state.zig --dep flags -Mbit_test=src/x64-ASM/bit_test.zig -Mflags=src/x64-ASM/flags.zig -Mcapabilities=src/x64-ASM/capabilities.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig --dep windows_runtime --dep x64_syscalls -Mx64_linux_runtime=src/x64-ASM/linux_runtime.zig -Mx64_syscalls=src/x64-ASM/syscalls.zig --dep dll_win32_return_contract --dep dll_win32_library_inventory --dep windows_bsearch --dep tso_memory --dep utf8_codec -Mwindows_runtime=src/x64-ASM/windows_runtime.zig -Mwindows_bsearch=src/x64-ASM/windows_bsearch.zig -Mdll_win32_return_contract=pkg/dll/win32/return-contract/src/root.zig --dep dll_win32_catalogue --dep dll_win32_capability_gap -Mdll_win32_library_inventory=pkg/dll/win32/library-inventory/src/root.zig --dep dll_win32_advapi32 --dep dll_win32_api_ms_win_crt_convert_l1_1_0 --dep dll_win32_api_ms_win_crt_environment_l1_1_0 --dep dll_win32_api_ms_win_crt_filesystem_l1_1_0 --dep dll_win32_api_ms_win_crt_heap_l1_1_0 --dep dll_win32_api_ms_win_crt_locale_l1_1_0 --dep dll_win32_api_ms_win_crt_math_l1_1_0 --dep dll_win32_api_ms_win_crt_private_l1_1_0 --dep dll_win32_api_ms_win_crt_runtime_l1_1_0 --dep dll_win32_api_ms_win_crt_stdio_l1_1_0 --dep dll_win32_api_ms_win_crt_string_l1_1_0 --dep dll_win32_api_ms_win_crt_time_l1_1_0 --dep dll_win32_api_ms_win_crt_utility_l1_1_0 --dep dll_win32_bcrypt --dep dll_win32_cfgmgr32 --dep dll_win32_dwmapi --dep dll_win32_dxgi --dep dll_win32_vulkan_1 --dep dll_win32_dynamic --dep dll_win32_gdi32 --dep dll_win32_hid --dep dll_win32_imm32 --dep dll_win32_libusbk --dep dll_win32_kernel32 --dep dll_win32_msvcrt --dep dll_win32_ole32 --dep dll_win32_oleaut32 --dep dll_win32_setupapi --dep dll_win32_shcore --dep dll_win32_shell32 --dep dll_win32_shlwapi --dep dll_win32_user32 --dep dll_win32_version --dep dll_win32_winmm --dep dll_win32_winusb --dep dll_win32_wsock32 --dep dll_win32_export_contract -Mdll_win32_catalogue=pkg/dll/win32/catalogue/src/root.zig --dep dll_win32_export_contract -Mdll_win32_advapi32=pkg/dll/win32/advapi32/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_convert_l1_1_0=pkg/dll/win32/api-ms-win-crt-convert-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_environment_l1_1_0=pkg/dll/win32/api-ms-win-crt-environment-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_filesystem_l1_1_0=pkg/dll/win32/api-ms-win-crt-filesystem-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_heap_l1_1_0=pkg/dll/win32/api-ms-win-crt-heap-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_locale_l1_1_0=pkg/dll/win32/api-ms-win-crt-locale-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_math_l1_1_0=pkg/dll/win32/api-ms-win-crt-math-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_private_l1_1_0=pkg/dll/win32/api-ms-win-crt-private-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_runtime_l1_1_0=pkg/dll/win32/api-ms-win-crt-runtime-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_stdio_l1_1_0=pkg/dll/win32/api-ms-win-crt-stdio-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_string_l1_1_0=pkg/dll/win32/api-ms-win-crt-string-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_time_l1_1_0=pkg/dll/win32/api-ms-win-crt-time-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_api_ms_win_crt_utility_l1_1_0=pkg/dll/win32/api-ms-win-crt-utility-l1-1-0/src/root.zig --dep dll_win32_export_contract -Mdll_win32_bcrypt=pkg/dll/win32/bcrypt/src/root.zig -Mdll_win32_cfgmgr32=pkg/dll/win32/cfgmgr32/src/root.zig --dep dll_win32_export_contract -Mdll_win32_dwmapi=pkg/dll/win32/dwmapi/src/root.zig --dep dll_win32_export_contract -Mdll_win32_dxgi=pkg/dll/win32/dxgi/src/root.zig -Mdll_win32_vulkan_1=pkg/dll/win32/vulkan-1/src/root.zig -Mdll_win32_dynamic=pkg/dll/win32/dynamic/src/root.zig --dep dll_win32_export_contract -Mdll_win32_gdi32=pkg/dll/win32/gdi32/src/root.zig -Mdll_win32_hid=pkg/dll/win32/hid/src/root.zig --dep dll_win32_export_contract -Mdll_win32_imm32=pkg/dll/win32/imm32/src/root.zig -Mdll_win32_libusbk=pkg/dll/win32/libusbk/src/root.zig --dep dll_win32_export_contract -Mdll_win32_kernel32=pkg/dll/win32/kernel32/src/root.zig --dep dll_win32_export_contract -Mdll_win32_msvcrt=pkg/dll/win32/msvcrt/src/root.zig --dep dll_win32_export_contract -Mdll_win32_ole32=pkg/dll/win32/ole32/src/root.zig --dep dll_win32_export_contract -Mdll_win32_oleaut32=pkg/dll/win32/oleaut32/src/root.zig --dep dll_win32_export_contract -Mdll_win32_setupapi=pkg/dll/win32/setupapi/src/root.zig -Mdll_win32_shcore=pkg/dll/win32/shcore/src/root.zig --dep dll_win32_export_contract -Mdll_win32_shell32=pkg/dll/win32/shell32/src/root.zig --dep dll_win32_export_contract -Mdll_win32_shlwapi=pkg/dll/win32/shlwapi/src/root.zig --dep dll_win32_export_contract -Mdll_win32_user32=pkg/dll/win32/user32/src/root.zig --dep dll_win32_export_contract -Mdll_win32_version=pkg/dll/win32/version/src/root.zig --dep dll_win32_export_contract -Mdll_win32_winmm=pkg/dll/win32/winmm/src/root.zig -Mdll_win32_winusb=pkg/dll/win32/winusb/src/root.zig --dep dll_win32_export_contract -Mdll_win32_wsock32=pkg/dll/win32/wsock32/src/root.zig -Mx64_guest_abi=src/x64-ASM/guest_abi.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -Misa_highway=ISA/highway.zig -Misa_registry=ISA/root.zig -Misa_decode=ISA/decode/root.zig -Mruntime_abi_handshake=src/tooling/runtime-abi-handshake/runtime.zig -Mguard_rollback=lib/runtime/guard-rollback/root.zig -Mcleo_routing=lib/CLEO/cleo_routing.zig -Mexecution_history=lib/runtime/execution-history/root.zig --dep x64_decoder --dep exit_diagnostics -Mevex_runtime=lib/runtime/process-core/evex.zig --dep x64_decoder --dep phrase_filter -Mxenia_fatal_condition_map=pkg/common/console/fatal-condition-map/src/root.zig -Mxenia_guest_frontier_map=pkg/common/console/guest-frontier-map/src/root.zig -Mxenia_guest_milestone_map=pkg/common/console/guest-milestone-map/src/root.zig -Mxenia_guest_address_map=pkg/common/console/guest-address-map/src/root.zig -Mframe_content_contract=pkg/common/rosette/frame-content-contract/src/root.zig -Mscreen_validity=lib/gpu/screen_validity.zig -Maddress_region_map=pkg/common/rosette/address-region-map/src/root.zig --dep phrase_filter -Mxenia_warning_severity_map=pkg/common/console/warning-severity-map/src/root.zig -Mphrase_filter=pkg/common/text/phrase-filter/src/root.zig --dep x64_decoder -Mx86_vector_helpers=lib/Mach-O/execution_helpers.zig --dep dll_win32_return_contract -Mdll_win32_export_contract=pkg/dll/win32/export-contract/src/root.zig -Mdll_win32_capability_gap=pkg/dll/win32/capability-gap/src/root.zig -Mxenia_kernel_shim_map=pkg/common/console/kernel-shim-map/src/root.zig -Mxenia_kernel_export_map=pkg/common/console/kernel-export-map/src/root.zig -Marm64_encode=lib/compiler/arm64/encode.zig -Mtso_memory=lib/processor/ELF_processor/tso_memory.zig -Mutf8_codec=lib/text/utf8/root.zig -Mconcurrency=lib/concurrency/root.zig --dep concurrency -Mparallelism=lib/processor/ELF_processor/parallelism/root.zig -femit-bin="$(ELF_PROCESSOR_BIN)"
 
 macho-processor-build:
 	@mkdir -p "$(ZIG_CACHE_DIR)/global"
@@ -495,7 +531,10 @@ dll-coverage-audit:
 guest-context-audit:
 	@cd "$(ROOT_DIR)" && python3 tools/audit_guest_context_access.py
 
-vendor-library-audit:
+xenia-vendor-source-audit:
+	@cd "$(ROOT_DIR)" && python3 tools/check_guest_vendor.py
+
+vendor-library-audit: xenia-vendor-source-audit
 	@if [ -d "$(XENIA_ROOT)" ]; then \
 		cd "$(ROOT_DIR)" && python3 tools/check_vendor_libraries.py --xenia-root "$(XENIA_ROOT)"; \
 	else \
@@ -660,138 +699,158 @@ shell-clean-state: shell-helper-build
 # ---------------------------------------------------------------------------
 # Rosette macOS .app bundle, DMG installer, and system uninstaller
 # Outputs land in program/ tree at the project root.
+# Keep repository-relative package paths under ASSET_PREFIX because this
+# Makefile supports invocation from either the repository root or build/.
 # ---------------------------------------------------------------------------
+ROSETTE_APP_BUNDLE := $(ASSET_PREFIX)app/bundling/zig-out/Rosette.app
+ROSETTE_APP_OUTPUT := $(ASSET_PREFIX)program/app/Rosette.app
+ROSETTE_INSTALLER_BUNDLE := $(ASSET_PREFIX)app/dmg/installer/zig-out/Rosette Installer.app
+ROSETTE_INSTALLER_DMG := $(ASSET_PREFIX)program/installer/RosetteInstaller.dmg
+ROSETTE_UNINSTALLER_BUNDLE := $(ASSET_PREFIX)app/dmg/uninstaller/zig-out/Rosette Uninstaller.app
+ROSETTE_UNINSTALLER_DMG := $(ASSET_PREFIX)program/uninstaller/RosetteUninstaller.dmg
+
+# Package archives are fetched from the HTTPS release index and installed in
+# ~/.rosette/packages after checksum and archive-path validation. The same
+# manager is bundled into Rosette.app for the graphical installer. Override
+# ROSETTE_PACKAGE_INDEX_URL for a staging HTTPS registry.
+.PHONY: install-packages install-packages-all
+install-packages:
+	@ROSETTE_PACKAGE_INDEX_URL="$(ROSETTE_PACKAGE_INDEX_URL)" /bin/bash "$(ROSETTE_PACKAGE_MANAGER)" install
+
+install-packages-all:
+	@ROSETTE_PACKAGE_INDEX_URL="$(ROSETTE_PACKAGE_INDEX_URL)" /bin/bash "$(ROSETTE_PACKAGE_MANAGER)" install-all
+
 .PHONY: app-wrapper
 app-wrapper: mscoree-native shell-helper-build
-	@mkdir -p program/app
+	@mkdir -p "$(ASSET_PREFIX)program/app"
 	@echo "Building Rosette.app bundle..."
 	@mkdir -p "$(ZIG_GLOBAL_CACHE_DIR)"
 	@$(ZIG_BUILD_ENV) zig build bundle --build-file $(APP_BP)app/bundling/build.zig $(APP_BUNDLE_RELEASE_FLAG) 2>&1
 	@rm -rf \
-		"app/bundling/zig-out/Rosette.app/Contents/Resources/rosette-runtime/app_testing" \
-		"app/bundling/zig-out/Rosette.app/Contents/Resources/rosette-runtime/assets/exe_examples" \
-		"app/bundling/zig-out/Rosette.app/Contents/Resources/rosette-runtime/include/assets/exe_examples" \
-		"app/bundling/zig-out/Rosette.app/Contents/Resources/rosette-runtime/tools/test_prodder"
-	@if find "app/bundling/zig-out/Rosette.app" \( -type d -name app_testing -o -type d -path '*/assets/exe_examples' \) -print -quit | grep -q .; then \
+		"$(ROSETTE_APP_BUNDLE)/Contents/Resources/rosette-runtime/app_testing" \
+		"$(ROSETTE_APP_BUNDLE)/Contents/Resources/rosette-runtime/assets/exe_examples" \
+		"$(ROSETTE_APP_BUNDLE)/Contents/Resources/rosette-runtime/include/assets/exe_examples" \
+		"$(ROSETTE_APP_BUNDLE)/Contents/Resources/rosette-runtime/tools/test_prodder"
+	@if find "$(ROSETTE_APP_BUNDLE)" \( -type d -name app_testing -o -type d -path '*/assets/exe_examples' \) -print -quit | grep -q .; then \
 		echo "error: app_testing or bundled example payload entered Rosette.app"; \
 		exit 1; \
 	fi
-	@rm -rf program/app/Rosette.app
-	@cp -R app/bundling/zig-out/Rosette.app program/app/
+	@rm -rf "$(ROSETTE_APP_OUTPUT)"
+	@cp -R "$(ROSETTE_APP_BUNDLE)" "$(ASSET_PREFIX)program/app/"
 	@rm -rf \
-		"program/app/Rosette.app/Contents/Resources/rosette-runtime/app_testing" \
-		"program/app/Rosette.app/Contents/Resources/rosette-runtime/assets/exe_examples" \
-		"program/app/Rosette.app/Contents/Resources/rosette-runtime/include/assets/exe_examples" \
-		"program/app/Rosette.app/Contents/Resources/rosette-runtime/tools/test_prodder"
-	@if find "program/app/Rosette.app" \( -type d -name app_testing -o -type d -path '*/assets/exe_examples' \) -print -quit | grep -q .; then \
+		"$(ROSETTE_APP_OUTPUT)/Contents/Resources/rosette-runtime/app_testing" \
+		"$(ROSETTE_APP_OUTPUT)/Contents/Resources/rosette-runtime/assets/exe_examples" \
+		"$(ROSETTE_APP_OUTPUT)/Contents/Resources/rosette-runtime/include/assets/exe_examples" \
+		"$(ROSETTE_APP_OUTPUT)/Contents/Resources/rosette-runtime/tools/test_prodder"
+	@if find "$(ROSETTE_APP_OUTPUT)" \( -type d -name app_testing -o -type d -path '*/assets/exe_examples' \) -print -quit | grep -q .; then \
 		 echo "error: app_testing or bundled example payload entered the distributable Rosette.app"; \
 		 exit 1; \
 	fi
-	@if [ -e "program/app/Rosette.app/Contents/Resources/rosette-runtime/tools/test_prodder" ]; then \
+	@if [ -e "$(ROSETTE_APP_OUTPUT)/Contents/Resources/rosette-runtime/tools/test_prodder" ]; then \
 		echo "error: development test helper entered the distributable Rosette.app"; \
 		exit 1; \
 	fi
-	@rm -rf "program/app/Rosette.app/Contents/MacOS/RosetteMscoreeWindow.app"
-	@cp -R "$(MSCOREE_NATIVE_HELPER_APP)" "program/app/Rosette.app/Contents/MacOS/"
-	@cp "$(ELF_PROCESSOR_BIN)" "program/app/Rosette.app/Contents/MacOS/elf_processor"
-	@cp "$(MACHO_PROCESSOR_BIN)" "program/app/Rosette.app/Contents/MacOS/macho_processor"
-	@cp "$(DYLD_DYLIB)" "program/app/Rosette.app/Contents/MacOS/rosette-exec.dylib"
+	@rm -rf "$(ROSETTE_APP_OUTPUT)/Contents/MacOS/RosetteMscoreeWindow.app"
+	@cp -R "$(MSCOREE_NATIVE_HELPER_APP)" "$(ROSETTE_APP_OUTPUT)/Contents/MacOS/"
+	@cp "$(ELF_PROCESSOR_BIN)" "$(ROSETTE_APP_OUTPUT)/Contents/MacOS/elf_processor"
+	@cp "$(MACHO_PROCESSOR_BIN)" "$(ROSETTE_APP_OUTPUT)/Contents/MacOS/macho_processor"
+	@cp "$(DYLD_DYLIB)" "$(ROSETTE_APP_OUTPUT)/Contents/MacOS/rosette-exec.dylib"
 	@echo "Signing Rosette.app..."
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/RosetteMscoreeWindow.app/Contents/MacOS/rosette_mscoree_window_helper"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/RosetteMscoreeWindow.app"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/rosette-cli"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/rosette_assembler_runner"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/rosette_exe_runner"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/rosette-shell"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/rosette-router"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/elf_processor"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/macho_processor"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/rosette-exec.dylib"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_APP_OUTPUT)/Contents/MacOS/RosetteMscoreeWindow.app/Contents/MacOS/rosette_mscoree_window_helper"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_APP_OUTPUT)/Contents/MacOS/RosetteMscoreeWindow.app"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_APP_OUTPUT)/Contents/MacOS/rosette-cli"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_APP_OUTPUT)/Contents/MacOS/rosette_assembler_runner"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_APP_OUTPUT)/Contents/MacOS/rosette_exe_runner"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_APP_OUTPUT)/Contents/MacOS/rosette-shell"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_APP_OUTPUT)/Contents/MacOS/rosette-router"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_APP_OUTPUT)/Contents/MacOS/elf_processor"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_APP_OUTPUT)/Contents/MacOS/macho_processor"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_APP_OUTPUT)/Contents/MacOS/rosette-exec.dylib"
 	@# zig cc links the x86_64 AVX shim unsigned; the bundle signature below
 	@# refuses any unsigned subcomponent, so sign it with the rest.
-	@if [ -f "program/app/Rosette.app/Contents/MacOS/avx-shim.dylib" ]; then codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "program/app/Rosette.app/Contents/MacOS/avx-shim.dylib"; fi
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/rosette"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app"
-	@codesign --verify --deep --strict --verbose=2 "program/app/Rosette.app"
-	@echo "Created: program/app/Rosette.app"
+	@if [ -f "$(ROSETTE_APP_OUTPUT)/Contents/MacOS/avx-shim.dylib" ]; then codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "$(ROSETTE_APP_OUTPUT)/Contents/MacOS/avx-shim.dylib"; fi
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_APP_OUTPUT)/Contents/MacOS/rosette"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_APP_OUTPUT)"
+	@codesign --verify --deep --strict --verbose=2 "$(ROSETTE_APP_OUTPUT)"
+	@echo "Created: $(ROSETTE_APP_OUTPUT)"
 
 .PHONY: installer
 installer: app-wrapper
-	@mkdir -p program/installer
+	@mkdir -p $(ASSET_PREFIX)program/installer
 	@echo "Building Rosette Installer.app..."
 	@mkdir -p "$(ZIG_GLOBAL_CACHE_DIR)"
-	@rm -rf "app/dmg/installer/zig-out/Rosette Installer.app"
-	@$(ZIG_BUILD_ENV) zig build bundle --build-file $(APP_BP)app/dmg/installer/build.zig -Dpayload-app=program/app/Rosette.app 2>&1
-	@if find "app/dmg/installer/zig-out/Rosette Installer.app" \( -type d -name app_testing -o -type d -path '*/assets/exe_examples' \) -print -quit | grep -q .; then \
+	@rm -rf "$(ROSETTE_INSTALLER_BUNDLE)"
+	@$(ZIG_BUILD_ENV) zig build bundle --build-file $(APP_BP)app/dmg/installer/build.zig -Dpayload-app="$(ROOT_DIR)/program/app/Rosette.app" 2>&1
+	@if find "$(ROSETTE_INSTALLER_BUNDLE)" \( -type d -name app_testing -o -type d -path '*/assets/exe_examples' \) -print -quit | grep -q .; then \
 		echo "error: app_testing or bundled example payload entered Rosette Installer.app"; \
 		exit 1; \
 	fi
-	@if [ -e "app/dmg/installer/zig-out/Rosette Installer.app/Contents/Resources/Rosette.app/Contents/Resources/rosette-runtime/tools/test_prodder" ]; then \
+	@if [ -e "$(ROSETTE_INSTALLER_BUNDLE)/Contents/Resources/Rosette.app/Contents/Resources/rosette-runtime/tools/test_prodder" ]; then \
 		echo "error: development test helper entered Rosette Installer.app"; \
 		exit 1; \
 	fi
 	@echo "Signing Rosette Installer.app..."
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "app/dmg/installer/zig-out/Rosette Installer.app/Contents/MacOS/rosette-install-helper"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "app/dmg/installer/zig-out/Rosette Installer.app/Contents/MacOS/rosette-installer"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "app/dmg/installer/zig-out/Rosette Installer.app/Contents/Resources/Rosette.app/Contents/MacOS/RosetteMscoreeWindow.app/Contents/MacOS/rosette_mscoree_window_helper"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "app/dmg/installer/zig-out/Rosette Installer.app/Contents/Resources/Rosette.app/Contents/MacOS/RosetteMscoreeWindow.app"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "app/dmg/installer/zig-out/Rosette Installer.app/Contents/Resources/Rosette.app/Contents/MacOS/rosette-cli"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "app/dmg/installer/zig-out/Rosette Installer.app/Contents/Resources/Rosette.app/Contents/MacOS/rosette_assembler_runner"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "app/dmg/installer/zig-out/Rosette Installer.app/Contents/Resources/Rosette.app/Contents/MacOS/rosette_exe_runner"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "app/dmg/installer/zig-out/Rosette Installer.app/Contents/Resources/Rosette.app/Contents/MacOS/rosette-shell"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "app/dmg/installer/zig-out/Rosette Installer.app/Contents/Resources/Rosette.app/Contents/MacOS/rosette-router"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "app/dmg/installer/zig-out/Rosette Installer.app/Contents/Resources/Rosette.app/Contents/MacOS/elf_processor"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "app/dmg/installer/zig-out/Rosette Installer.app/Contents/Resources/Rosette.app/Contents/MacOS/macho_processor"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "app/dmg/installer/zig-out/Rosette Installer.app/Contents/Resources/Rosette.app/Contents/MacOS/rosette-exec.dylib"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "app/dmg/installer/zig-out/Rosette Installer.app/Contents/Resources/Rosette.app/Contents/MacOS/rosette"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "app/dmg/installer/zig-out/Rosette Installer.app/Contents/Resources/Rosette.app"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "app/dmg/installer/zig-out/Rosette Installer.app"
-	@codesign --verify --deep --strict --verbose=2 "app/dmg/installer/zig-out/Rosette Installer.app"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "$(ROSETTE_INSTALLER_BUNDLE)/Contents/MacOS/rosette-install-helper"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "$(ROSETTE_INSTALLER_BUNDLE)/Contents/MacOS/rosette-installer"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_INSTALLER_BUNDLE)/Contents/Resources/Rosette.app/Contents/MacOS/RosetteMscoreeWindow.app/Contents/MacOS/rosette_mscoree_window_helper"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_INSTALLER_BUNDLE)/Contents/Resources/Rosette.app/Contents/MacOS/RosetteMscoreeWindow.app"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_INSTALLER_BUNDLE)/Contents/Resources/Rosette.app/Contents/MacOS/rosette-cli"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_INSTALLER_BUNDLE)/Contents/Resources/Rosette.app/Contents/MacOS/rosette_assembler_runner"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_INSTALLER_BUNDLE)/Contents/Resources/Rosette.app/Contents/MacOS/rosette_exe_runner"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_INSTALLER_BUNDLE)/Contents/Resources/Rosette.app/Contents/MacOS/rosette-shell"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_INSTALLER_BUNDLE)/Contents/Resources/Rosette.app/Contents/MacOS/rosette-router"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_INSTALLER_BUNDLE)/Contents/Resources/Rosette.app/Contents/MacOS/elf_processor"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_INSTALLER_BUNDLE)/Contents/Resources/Rosette.app/Contents/MacOS/macho_processor"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_INSTALLER_BUNDLE)/Contents/Resources/Rosette.app/Contents/MacOS/rosette-exec.dylib"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_INSTALLER_BUNDLE)/Contents/Resources/Rosette.app/Contents/MacOS/rosette"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "$(ROSETTE_INSTALLER_BUNDLE)/Contents/Resources/Rosette.app"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "$(ROSETTE_INSTALLER_BUNDLE)"
+	@codesign --verify --deep --strict --verbose=2 "$(ROSETTE_INSTALLER_BUNDLE)"
 	@rm -rf /tmp/rosette-installer-dmg
 	@mkdir -p /tmp/rosette-installer-dmg
-	@cp -R "app/dmg/installer/zig-out/Rosette Installer.app" /tmp/rosette-installer-dmg/
+	@cp -R "$(ROSETTE_INSTALLER_BUNDLE)" /tmp/rosette-installer-dmg/
 	@echo "Building Rosette DMG installer..."
-	@rm -f program/installer/RosetteInstaller.dmg
+	@rm -f "$(ROSETTE_INSTALLER_DMG)"
 	@hdiutil create -srcfolder /tmp/rosette-installer-dmg \
 		-volname "Rosette Installer" \
 		-fs HFS+ -format UDZO \
-		-o program/installer/RosetteInstaller.dmg 2>&1
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(DMG_CODESIGN_FLAGS) "program/installer/RosetteInstaller.dmg"
-	@codesign --verify --verbose=2 "program/installer/RosetteInstaller.dmg"
-	@if [ "$(RELEASE_BUILD)" = "1" ] && ! codesign -dv --verbose=4 "program/installer/RosetteInstaller.dmg" 2>&1 | grep -q '^Timestamp='; then \
+		-o "$(ROSETTE_INSTALLER_DMG)" 2>&1
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(DMG_CODESIGN_FLAGS) "$(ROSETTE_INSTALLER_DMG)"
+	@codesign --verify --verbose=2 "$(ROSETTE_INSTALLER_DMG)"
+	@if [ "$(RELEASE_BUILD)" = "1" ] && ! codesign -dv --verbose=4 "$(ROSETTE_INSTALLER_DMG)" 2>&1 | grep -q '^Timestamp='; then \
 		echo "error: release DMG was signed without a secure timestamp"; \
 		exit 1; \
 	fi
 	@rm -rf /tmp/rosette-installer-dmg
-	@echo "Created: program/installer/RosetteInstaller.dmg"
+	@echo "Created: $(ROSETTE_INSTALLER_DMG)"
 
 .PHONY: uninstaller
 uninstaller:
-	@mkdir -p program/uninstaller
+	@mkdir -p $(ASSET_PREFIX)program/uninstaller
 	@echo "Building Rosette Uninstaller.app..."
 	@mkdir -p "$(ZIG_GLOBAL_CACHE_DIR)"
 	@$(ZIG_BUILD_ENV) zig build bundle --build-file $(APP_BP)app/dmg/uninstaller/build.zig 2>&1
 	@echo "Signing Rosette Uninstaller.app..."
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "app/dmg/uninstaller/zig-out/Rosette Uninstaller.app/Contents/MacOS/rosette-uninstall-helper"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "app/dmg/uninstaller/zig-out/Rosette Uninstaller.app/Contents/MacOS/rosette-uninstaller"
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "app/dmg/uninstaller/zig-out/Rosette Uninstaller.app"
-	@codesign --verify --deep --strict --verbose=2 "app/dmg/uninstaller/zig-out/Rosette Uninstaller.app"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "$(ROSETTE_UNINSTALLER_BUNDLE)/Contents/MacOS/rosette-uninstall-helper"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "$(ROSETTE_UNINSTALLER_BUNDLE)/Contents/MacOS/rosette-uninstaller"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "$(ROSETTE_UNINSTALLER_BUNDLE)"
+	@codesign --verify --deep --strict --verbose=2 "$(ROSETTE_UNINSTALLER_BUNDLE)"
 	@rm -rf /tmp/rosette-uninstaller-dmg
 	@mkdir -p /tmp/rosette-uninstaller-dmg
-	@cp -R "app/dmg/uninstaller/zig-out/Rosette Uninstaller.app" /tmp/rosette-uninstaller-dmg/
-	@rm -f program/uninstaller/RosetteUninstaller.dmg
+	@cp -R "$(ROSETTE_UNINSTALLER_BUNDLE)" /tmp/rosette-uninstaller-dmg/
+	@rm -f "$(ROSETTE_UNINSTALLER_DMG)"
 	@hdiutil create -srcfolder /tmp/rosette-uninstaller-dmg \
 		-volname "Rosette Uninstaller" \
 		-fs HFS+ -format UDZO \
-		-o program/uninstaller/RosetteUninstaller.dmg 2>&1
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(DMG_CODESIGN_FLAGS) "program/uninstaller/RosetteUninstaller.dmg"
-	@codesign --verify --verbose=2 "program/uninstaller/RosetteUninstaller.dmg"
-	@if [ "$(RELEASE_BUILD)" = "1" ] && ! codesign -dv --verbose=4 "program/uninstaller/RosetteUninstaller.dmg" 2>&1 | grep -q '^Timestamp='; then \
+		-o "$(ROSETTE_UNINSTALLER_DMG)" 2>&1
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(DMG_CODESIGN_FLAGS) "$(ROSETTE_UNINSTALLER_DMG)"
+	@codesign --verify --verbose=2 "$(ROSETTE_UNINSTALLER_DMG)"
+	@if [ "$(RELEASE_BUILD)" = "1" ] && ! codesign -dv --verbose=4 "$(ROSETTE_UNINSTALLER_DMG)" 2>&1 | grep -q '^Timestamp='; then \
 		echo "error: release DMG was signed without a secure timestamp"; \
 		exit 1; \
 	fi
 	@rm -rf /tmp/rosette-uninstaller-dmg
-	@echo "Created: program/uninstaller/RosetteUninstaller.dmg"
+	@echo "Created: $(ROSETTE_UNINSTALLER_DMG)"
 
 # Developer-ID builds are notarized and stapled as part of the normal app-all
 # workflow. Ad-hoc source builds remain local-only and do not contact Apple.
@@ -806,41 +865,52 @@ endif
 # Compatibility alias for release automation.
 release: app-all
 
-notarize-installer:
+
+# Check release signing and notarization access before either DMG is rebuilt.
+# `history` is a read-only API request; it validates the keychain profile and
+# account access without submitting an artifact.
+.PHONY: notarize-preflight
+notarize-preflight:
 	@if [ "$(CODESIGN_IDENTITY)" = "-" ]; then \
 		echo "Set CODESIGN_IDENTITY to your Developer ID Application identity for release downloads."; \
-		echo "Example: make notarize-installer CODESIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' CODESIGN_EXTRA_FLAGS='--timestamp --options runtime' NOTARY_PROFILE=rosette-notary"; \
+		echo "A valid identity can be selected automatically from the macOS keychain when exactly one is installed."; \
 		exit 1; \
 	fi
 	@if [ -z "$(NOTARY_PROFILE)" ]; then \
 		echo "Set NOTARY_PROFILE to an xcrun notarytool keychain profile for release downloads."; \
-		echo "Example: make notarize-installer CODESIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' CODESIGN_EXTRA_FLAGS='--timestamp --options runtime' NOTARY_PROFILE=rosette-notary"; \
 		exit 1; \
 	fi
+	@echo "Checking Apple notarization access with profile '$(NOTARY_PROFILE)'..."
+	@notary_log=$$(mktemp "$${TMPDIR:-/tmp}/rosette-notary-preflight.XXXXXX"); \
+	if ! $(NOTARYTOOL) history --keychain-profile "$(NOTARY_PROFILE)" --output-format json >"$$notary_log" 2>&1; then \
+		if grep -qi "A required agreement is missing or has expired" "$$notary_log"; then \
+			echo "error: Apple blocked notarization because a required Developer Program agreement is missing or expired."; \
+			echo "The Account Holder must review and accept current terms at https://developer.apple.com/account/"; \
+		else \
+			cat "$$notary_log"; \
+			echo "error: Apple notarization preflight failed; check the keychain profile and developer account status."; \
+		fi; \
+		rm -f "$$notary_log"; \
+		exit 1; \
+	fi; \
+	rm -f "$$notary_log"; \
+	echo "Apple notarization access: ready."
+
+notarize-installer: notarize-preflight
 	@$(MAKE) installer RELEASE_BUILD=1 CODESIGN_IDENTITY="$(CODESIGN_IDENTITY)" CODESIGN_EXTRA_FLAGS="$(CODESIGN_EXTRA_FLAGS)"
 	@echo "Submitting RosetteInstaller.dmg for notarization..."
-	@$(NOTARYTOOL) submit "program/installer/RosetteInstaller.dmg" --keychain-profile "$(NOTARY_PROFILE)" --wait
-	@$(STAPLER) staple "program/installer/RosetteInstaller.dmg"
-	@$(STAPLER) validate "program/installer/RosetteInstaller.dmg"
-	@spctl --assess --type open --context context:primary-signature --verbose=2 "program/installer/RosetteInstaller.dmg"
+	@$(NOTARYTOOL) submit "$(ROSETTE_INSTALLER_DMG)" --keychain-profile "$(NOTARY_PROFILE)" --wait
+	@$(STAPLER) staple "$(ROSETTE_INSTALLER_DMG)"
+	@$(STAPLER) validate "$(ROSETTE_INSTALLER_DMG)"
+	@spctl --assess --type open --context context:primary-signature --verbose=2 "$(ROSETTE_INSTALLER_DMG)"
 
-notarize-uninstaller:
-	@if [ "$(CODESIGN_IDENTITY)" = "-" ]; then \
-		echo "Set CODESIGN_IDENTITY to your Developer ID Application identity for release downloads."; \
-		echo "Example: make notarize-uninstaller CODESIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' CODESIGN_EXTRA_FLAGS='--timestamp --options runtime' NOTARY_PROFILE=rosette-notary"; \
-		exit 1; \
-	fi
-	@if [ -z "$(NOTARY_PROFILE)" ]; then \
-		echo "Set NOTARY_PROFILE to an xcrun notarytool keychain profile for release downloads."; \
-		echo "Example: make notarize-uninstaller CODESIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' CODESIGN_EXTRA_FLAGS='--timestamp --options runtime' NOTARY_PROFILE=rosette-notary"; \
-		exit 1; \
-	fi
+notarize-uninstaller: notarize-preflight
 	@$(MAKE) uninstaller RELEASE_BUILD=1 CODESIGN_IDENTITY="$(CODESIGN_IDENTITY)" CODESIGN_EXTRA_FLAGS="$(CODESIGN_EXTRA_FLAGS)"
 	@echo "Submitting RosetteUninstaller.dmg for notarization..."
-	@$(NOTARYTOOL) submit "program/uninstaller/RosetteUninstaller.dmg" --keychain-profile "$(NOTARY_PROFILE)" --wait
-	@$(STAPLER) staple "program/uninstaller/RosetteUninstaller.dmg"
-	@$(STAPLER) validate "program/uninstaller/RosetteUninstaller.dmg"
-	@spctl --assess --type open --context context:primary-signature --verbose=2 "program/uninstaller/RosetteUninstaller.dmg"
+	@$(NOTARYTOOL) submit "$(ROSETTE_UNINSTALLER_DMG)" --keychain-profile "$(NOTARY_PROFILE)" --wait
+	@$(STAPLER) staple "$(ROSETTE_UNINSTALLER_DMG)"
+	@$(STAPLER) validate "$(ROSETTE_UNINSTALLER_DMG)"
+	@spctl --assess --type open --context context:primary-signature --verbose=2 "$(ROSETTE_UNINSTALLER_DMG)"
 
 notarize-app-all: notarize-installer notarize-uninstaller
 	@echo "Rosette DMG artifacts are signed, notarized, stapled, and ready for upload."
@@ -964,9 +1034,9 @@ exe-list:
 	@find "$(EXE_EXAMPLES_DIR)" -maxdepth 1 -type f \( -name '*.exe' -o -name '*.EXE' \) | sort
 
 MSCOREE_NATIVE_DIR := $(DLL_ASSETS_DIR)/mscoree
-MSCOREE_NATIVE_LIB := zig-out/bin/libmscoree_native.dylib
-MSCOREE_NATIVE_HELPER := zig-out/bin/rosette_mscoree_window_helper
-MSCOREE_NATIVE_HELPER_APP := zig-out/bin/RosetteMscoreeWindow.app
+MSCOREE_NATIVE_LIB := $(ASSET_PREFIX)zig-out/bin/libmscoree_native.dylib
+MSCOREE_NATIVE_HELPER := $(ASSET_PREFIX)zig-out/bin/rosette_mscoree_window_helper
+MSCOREE_NATIVE_HELPER_APP := $(ASSET_PREFIX)zig-out/bin/RosetteMscoreeWindow.app
 MSCOREE_NATIVE_HELPER_APP_BIN := $(MSCOREE_NATIVE_HELPER_APP)/Contents/MacOS/rosette_mscoree_window_helper
 MSCOREE_NATIVE_WINDOW_SRC := $(MSCOREE_NATIVE_DIR)/mscoree_window.m
 MSCOREE_NATIVE_HELPER_SRC := $(MSCOREE_NATIVE_DIR)/mscoree_window_helper.m
@@ -978,7 +1048,7 @@ MSCOREE_FRAMEWORKS := -framework Cocoa -framework Foundation
 mscoree-native: $(MSCOREE_NATIVE_LIB) $(MSCOREE_NATIVE_HELPER) $(MSCOREE_NATIVE_HELPER_APP)
 
 $(MSCOREE_NATIVE_LIB): $(MSCOREE_NATIVE_DIR)/mscoree_main.c $(MSCOREE_NATIVE_DIR)/mscoree_stubs.c $(MSCOREE_NATIVE_WINDOW_SRC) $(TRACE_WINDOW_SRC)
-	@mkdir -p zig-out/bin
+	@mkdir -p "$(ASSET_PREFIX)zig-out/bin"
 	@"$(CC)" $(MSCOREE_CFLAGS) -c "$(MSCOREE_NATIVE_DIR)/mscoree_main.c" -o /tmp/mscoree_main.o
 	@"$(CC)" $(MSCOREE_CFLAGS) -c "$(MSCOREE_NATIVE_DIR)/mscoree_stubs.c" -o /tmp/mscoree_stubs.o
 	@"$(CC)" $(MSCOREE_OBJC_FLAGS) -c "$(MSCOREE_NATIVE_WINDOW_SRC)" -o /tmp/mscoree_window.o
@@ -987,7 +1057,7 @@ $(MSCOREE_NATIVE_LIB): $(MSCOREE_NATIVE_DIR)/mscoree_main.c $(MSCOREE_NATIVE_DIR
 	@echo "Built $(MSCOREE_NATIVE_LIB)"
 
 $(MSCOREE_NATIVE_HELPER): $(MSCOREE_NATIVE_WINDOW_SRC) $(MSCOREE_NATIVE_HELPER_SRC) $(TRACE_WINDOW_SRC)
-	@mkdir -p zig-out/bin
+	@mkdir -p "$(ASSET_PREFIX)zig-out/bin"
 	@"$(CC)" $(MSCOREE_OBJC_FLAGS) "$(MSCOREE_NATIVE_WINDOW_SRC)" "$(TRACE_WINDOW_SRC)" "$(MSCOREE_NATIVE_HELPER_SRC)" $(MSCOREE_FRAMEWORKS) -o "$@"
 	@echo "Built $(MSCOREE_NATIVE_HELPER)"
 
