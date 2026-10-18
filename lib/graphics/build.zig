@@ -6,7 +6,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const check_step = ctx.check_step;
     const optimize = ctx.optimize;
     const target = ctx.target;
-    const xenia_texture_format_contract_mod = ctx.xenia_texture_format_contract_mod;
+    const console_texture_format_contract_mod = ctx.console_texture_format_contract_mod;
 
     const Subsystem = struct {
         root: []const u8,
@@ -58,7 +58,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
             // addition to the cache's existing tiling/format contract.
             // Keep both imports on the standalone subsystem test; the
             // aggregate GPU module already receives this import below.
-            subsystem_mod.addImport("xenia_texture_format_contract", xenia_texture_format_contract_mod);
+            subsystem_mod.addImport("console_texture_format_contract", console_texture_format_contract_mod);
         }
         const subsystem_test = b.addTest(.{ .root_module = subsystem_mod });
         check_step.dependOn(&b.addRunArtifact(subsystem_test).step);

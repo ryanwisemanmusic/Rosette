@@ -7,9 +7,9 @@ pub fn register(b: *std.Build, ctx: anytype) void {
     const optimize = ctx.optimize;
     const target = ctx.target;
     const rosette_translation_cache_contract_mod = ctx.rosette_translation_cache_contract_mod;
-    const xenia_guest_endian_x86_mod = ctx.xenia_guest_endian_x86_mod;
-    const xenia_guest_endian_arm64_mod = ctx.xenia_guest_endian_arm64_mod;
-    const xenia_guest_endian_ppc_mod = ctx.xenia_guest_endian_ppc_mod;
+    const host_x86_guest_endian_mod = ctx.host_x86_guest_endian_mod;
+    const host_arm64_guest_endian_mod = ctx.host_arm64_guest_endian_mod;
+    const host_ppc64_guest_endian_mod = ctx.host_ppc64_guest_endian_mod;
     const endianness_x86_mod = ctx.endianness_x86_mod;
     const endianness_arm64_mod = ctx.endianness_arm64_mod;
     const endianness_ppc_mod = ctx.endianness_ppc_mod;
@@ -121,6 +121,7 @@ pub fn register(b: *std.Build, ctx: anytype) void {
         "pkg/x86/console/runtime/guest-bridge/src/root.zig",
         "pkg/x86/console/runtime/shader-storage-contract/src/root.zig",
         "pkg/x86/console/runtime/wait-contract/src/root.zig",
+        "pkg/x86/console/runtime/translation-progress/src/root.zig",
         "pkg/x86/console/memory/heap-range/src/root.zig",
         "pkg/x86/console/audio-driver/src/root.zig",
         "pkg/x86/console/input-driver/src/root.zig",
@@ -137,6 +138,7 @@ pub fn register(b: *std.Build, ctx: anytype) void {
         "pkg/ARM64/console/runtime/primitive-contract/src/root.zig",
         "pkg/ARM64/console/runtime/shader-storage-contract/src/root.zig",
         "pkg/ARM64/console/runtime/wait-contract/src/root.zig",
+        "pkg/ARM64/console/runtime/translation-progress/src/root.zig",
         "pkg/ARM64/console/memory/heap-range/src/root.zig",
         "pkg/ARM64/console/audio-driver/src/root.zig",
         "pkg/ARM64/console/input-driver/src/root.zig",
@@ -173,9 +175,9 @@ pub fn register(b: *std.Build, ctx: anytype) void {
         .target = target,
         .optimize = optimize,
     });
-    guest_endian_equivalence_mod.addImport("x86_guest_endian", xenia_guest_endian_x86_mod);
-    guest_endian_equivalence_mod.addImport("arm64_guest_endian", xenia_guest_endian_arm64_mod);
-    guest_endian_equivalence_mod.addImport("ppc_guest_endian", xenia_guest_endian_ppc_mod);
+    guest_endian_equivalence_mod.addImport("x86_guest_endian", host_x86_guest_endian_mod);
+    guest_endian_equivalence_mod.addImport("arm64_guest_endian", host_arm64_guest_endian_mod);
+    guest_endian_equivalence_mod.addImport("ppc_guest_endian", host_ppc64_guest_endian_mod);
     const guest_endian_equivalence_test = b.addTest(.{ .root_module = guest_endian_equivalence_mod });
     check_step.dependOn(&b.addRunArtifact(guest_endian_equivalence_test).step);
 

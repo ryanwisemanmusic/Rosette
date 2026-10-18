@@ -56,29 +56,29 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const x86_asm_module = ctx.x86_asm_module;
     const x86_trace_asm_module = ctx.x86_trace_asm_module;
     const xenia_application_controller_contract_mod = ctx.xenia_application_controller_contract_mod;
-    const xenia_claim_reconciliation_contract_mod = ctx.xenia_claim_reconciliation_contract_mod;
-    const xenia_draw_dispatch_contract_mod = ctx.xenia_draw_dispatch_contract_mod;
-    const xenia_fatal_condition_map_mod = ctx.xenia_fatal_condition_map_mod;
-    const xenia_gpu_bringup_contract_mod = ctx.xenia_gpu_bringup_contract_mod;
-    const xenia_gpu_observation_contract_mod = ctx.xenia_gpu_observation_contract_mod;
+    const console_claim_reconciliation_contract_mod = ctx.console_claim_reconciliation_contract_mod;
+    const console_draw_dispatch_contract_mod = ctx.console_draw_dispatch_contract_mod;
+    const console_fatal_condition_map_mod = ctx.console_fatal_condition_map_mod;
+    const console_gpu_bringup_contract_mod = ctx.console_gpu_bringup_contract_mod;
+    const console_gpu_observation_contract_mod = ctx.console_gpu_observation_contract_mod;
     const xenia_graphics_contract_mod = ctx.xenia_graphics_contract_mod;
     const xenia_graphics_health_contract_mod = ctx.xenia_graphics_health_contract_mod;
-    const xenia_heap_range_mod = ctx.xenia_heap_range_mod;
+    const host_page_range_selection_abi_mod = ctx.host_page_range_selection_abi_mod;
     const xenia_host_gpu_callback_contract_mod = ctx.xenia_host_gpu_callback_contract_mod;
-    const xenia_interrupt_callback_contract_mod = ctx.xenia_interrupt_callback_contract_mod;
-    const xenia_kernel_export_map_mod = ctx.xenia_kernel_export_map_mod;
-    const xenia_launch_assist_contract_mod = ctx.xenia_launch_assist_contract_mod;
-    const xenia_pm4_contract_mod = ctx.xenia_pm4_contract_mod;
-    const xenia_prelaunch_audit_contract_mod = ctx.xenia_prelaunch_audit_contract_mod;
-    const xenia_primitive_contract_mod = ctx.xenia_primitive_contract_mod;
-    const xenia_provisioning_contract_mod = ctx.xenia_provisioning_contract_mod;
-    const xenia_shader_storage_contract_mod = ctx.xenia_shader_storage_contract_mod;
-    const xenia_surface_path_contract_mod = ctx.xenia_surface_path_contract_mod;
-    const xenia_texture_format_contract_mod = ctx.xenia_texture_format_contract_mod;
-    const xenia_vd_swap_contract_mod = ctx.xenia_vd_swap_contract_mod;
-    const xenia_wait_graph_contract_mod = ctx.xenia_wait_graph_contract_mod;
+    const console_interrupt_callback_contract_mod = ctx.console_interrupt_callback_contract_mod;
+    const console_kernel_export_map_mod = ctx.console_kernel_export_map_mod;
+    const console_launch_assist_contract_mod = ctx.console_launch_assist_contract_mod;
+    const console_pm4_contract_mod = ctx.console_pm4_contract_mod;
+    const console_prelaunch_audit_contract_mod = ctx.console_prelaunch_audit_contract_mod;
+    const host_primitive_route_contract_mod = ctx.host_primitive_route_contract_mod;
+    const console_provisioning_contract_mod = ctx.console_provisioning_contract_mod;
+    const guest_shader_storage_contract_mod = ctx.guest_shader_storage_contract_mod;
+    const host_surface_path_contract_mod = ctx.host_surface_path_contract_mod;
+    const console_texture_format_contract_mod = ctx.console_texture_format_contract_mod;
+    const console_vd_swap_contract_mod = ctx.console_vd_swap_contract_mod;
+    const console_wait_graph_contract_mod = ctx.console_wait_graph_contract_mod;
     const xenia_wait_handshake_policy_mod = ctx.xenia_wait_handshake_policy_mod;
-    const xenia_xiso_format_mod = ctx.xenia_xiso_format_mod;
+    const console_xiso_format_mod = ctx.console_xiso_format_mod;
 
     const macho_compat_runtime_mod = b.createModule(.{
         .root_source_file = b.path("lib/Mach-O/compat_runtime.zig"),
@@ -95,7 +95,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
         .target = target,
         .optimize = optimize,
     });
-    primitive_mod.addImport("xenia_primitive_contract", xenia_primitive_contract_mod);
+    primitive_mod.addImport("host_primitive_route_contract", host_primitive_route_contract_mod);
     const vtable_mod = b.createModule(.{
         .root_source_file = b.path("lib/runtime/vtable/root.zig"),
         .target = target,
@@ -137,8 +137,8 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
         // wrapper would be measuring the wrapper.
         .link_libc = true,
     });
-    preflight_mod.addImport("xenia_prelaunch_audit_contract", xenia_prelaunch_audit_contract_mod);
-    preflight_mod.addImport("xenia_gpu_bringup_contract", xenia_gpu_bringup_contract_mod);
+    preflight_mod.addImport("console_prelaunch_audit_contract", console_prelaunch_audit_contract_mod);
+    preflight_mod.addImport("console_gpu_bringup_contract", console_gpu_bringup_contract_mod);
     preflight_mod.addImport("xenia_graphics_health_contract", xenia_graphics_health_contract_mod);
     preflight_mod.addImport("rosette_host_capability_contract", rosette_host_capability_contract_mod);
     preflight_mod.addImport("rosette_component_readiness_contract", rosette_component_readiness_contract_mod);
@@ -201,23 +201,23 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     check_step.dependOn(&b.addRunArtifact(address_region_map_test).step);
     gpu_mod.addImport("device_tree", device_tree_mod);
     gpu_mod.addImport("xenos_register_map", xenos_register_map_mod);
-    gpu_mod.addImport("xenia_vd_swap_contract", xenia_vd_swap_contract_mod);
-    gpu_mod.addImport("xenia_gpu_bringup_contract", xenia_gpu_bringup_contract_mod);
-    gpu_mod.addImport("xenia_gpu_observation_contract", xenia_gpu_observation_contract_mod);
-    gpu_mod.addImport("xenia_pm4_contract", xenia_pm4_contract_mod);
+    gpu_mod.addImport("console_vd_swap_contract", console_vd_swap_contract_mod);
+    gpu_mod.addImport("console_gpu_bringup_contract", console_gpu_bringup_contract_mod);
+    gpu_mod.addImport("console_gpu_observation_contract", console_gpu_observation_contract_mod);
+    gpu_mod.addImport("console_pm4_contract", console_pm4_contract_mod);
     gpu_mod.addImport("rosette_root", rosette_root_mod);
-    gpu_mod.addImport("xenia_provisioning_contract", xenia_provisioning_contract_mod);
-    gpu_mod.addImport("xenia_draw_dispatch_contract", xenia_draw_dispatch_contract_mod);
+    gpu_mod.addImport("console_provisioning_contract", console_provisioning_contract_mod);
+    gpu_mod.addImport("console_draw_dispatch_contract", console_draw_dispatch_contract_mod);
     gpu_mod.addImport("cocoa_graphics_control_contract", cocoa_graphics_control_contract_mod);
     gpu_mod.addImport("cocoa_window_admission_contract", cocoa_window_admission_contract_mod);
     gpu_mod.addImport("rosette_ownership_contract", rosette_ownership_contract_mod);
-    gpu_mod.addImport("xenia_texture_format_contract", xenia_texture_format_contract_mod);
+    gpu_mod.addImport("console_texture_format_contract", console_texture_format_contract_mod);
     gpu_mod.addImport("rosette_graphics_bridge", rosette_graphics_bridge_mod);
     // The full kernel export table, so lib/gpu/kernel_surface.zig can name
     // any ordinal a title imports rather than only the sixteen video ones
     // it models. Declared once and shared: two copies of 2913 entries in
     // one binary would be a pointless size cost.
-    gpu_mod.addImport("xenia_kernel_export_map", xenia_kernel_export_map_mod);
+    gpu_mod.addImport("console_kernel_export_map", console_kernel_export_map_mod);
     const gpu_test = b.addTest(.{ .root_module = gpu_mod });
     check_step.dependOn(&b.addRunArtifact(gpu_test).step);
     // The executing guest thread's registers for code that runs on its
@@ -238,11 +238,11 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     dyld_mod.addImport("guest_context", guest_context_mod);
     dyld_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
     dyld_mod.addImport("gpu", gpu_mod);
-    dyld_mod.addImport("xenia_heap_range", xenia_heap_range_mod);
+    dyld_mod.addImport("host_page_range_selection_abi", host_page_range_selection_abi_mod);
     dyld_mod.addImport("rosette_ppc_host_abi", rosette_ppc_host_abi_mod);
     dyld_mod.addImport("ppc_runtime", ppc_runtime_module);
     dyld_mod.addImport("application_framework", application_framework_mod);
-    dyld_mod.addImport("xenia_launch_assist_contract", xenia_launch_assist_contract_mod);
+    dyld_mod.addImport("console_launch_assist_contract", console_launch_assist_contract_mod);
     dyld_mod.addImport("xenia_host_gpu_callback_contract", xenia_host_gpu_callback_contract_mod);
     dyld_mod.addImport("rosette_macos_host_contract", rosette_macos_host_contract_mod);
     const scheduler_mod = b.createModule(.{
@@ -400,13 +400,13 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
         .optimize = optimize,
     });
     diagnostics_mod.addImport("event_log", event_log_mod);
-    diagnostics_mod.addImport("xenia_shader_storage_contract", xenia_shader_storage_contract_mod);
+    diagnostics_mod.addImport("guest_shader_storage_contract", guest_shader_storage_contract_mod);
     xenia_log_phrase_map_mod.addImport("phrase_filter", phrase_filter_mod);
     diagnostics_mod.addImport("xenia_log_phrase_map", xenia_log_phrase_map_mod);
     diagnostics_mod.addImport("rosette_run_integrity_contract", rosette_run_integrity_contract_mod);
     diagnostics_mod.addImport("rosette_substantiation_contract", rosette_substantiation_contract_mod);
     diagnostics_mod.addImport("vendor_library_contract", vendor_library_contract_mod);
-    diagnostics_mod.addImport("xenia_gpu_observation_contract", xenia_gpu_observation_contract_mod);
+    diagnostics_mod.addImport("console_gpu_observation_contract", console_gpu_observation_contract_mod);
     // Package contract checks: rosette_pkg_log calls contractIsWellFormed()
     // on each at startup and writes results to .rosette/rosette-pkg.log.
     diagnostics_mod.addImport("xenia_mount_contract", b.createModule(.{
@@ -459,25 +459,25 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
         .target = target,
         .optimize = optimize,
     }));
-    diagnostics_mod.addImport("xenia_kernel_export_map", xenia_kernel_export_map_mod);
+    diagnostics_mod.addImport("console_kernel_export_map", console_kernel_export_map_mod);
     diagnostics_mod.addImport("xenia_vd_ring_contract", b.createModule(.{
         .root_source_file = b.path("pkg/common/console/vd-ring-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
-    diagnostics_mod.addImport("xenia_pm4_contract", xenia_pm4_contract_mod);
+    diagnostics_mod.addImport("console_pm4_contract", console_pm4_contract_mod);
     diagnostics_mod.addImport("rosette_mandatory_order_contract", rosette_mandatory_order_contract_mod);
     diagnostics_mod.addImport("rosette_monotone_witness_contract", rosette_monotone_witness_contract_mod);
     diagnostics_mod.addImport("rosette_graphics_bridge", rosette_graphics_bridge_mod);
-    diagnostics_mod.addImport("xenia_vd_swap_contract", xenia_vd_swap_contract_mod);
-    diagnostics_mod.addImport("xenia_xiso_format", xenia_xiso_format_mod);
-    diagnostics_mod.addImport("xenia_fatal_condition_map", xenia_fatal_condition_map_mod);
-    diagnostics_mod.addImport("xenia_claim_reconciliation_contract", xenia_claim_reconciliation_contract_mod);
-    diagnostics_mod.addImport("xenia_interrupt_callback_contract", xenia_interrupt_callback_contract_mod);
+    diagnostics_mod.addImport("console_vd_swap_contract", console_vd_swap_contract_mod);
+    diagnostics_mod.addImport("console_xiso_format", console_xiso_format_mod);
+    diagnostics_mod.addImport("console_fatal_condition_map", console_fatal_condition_map_mod);
+    diagnostics_mod.addImport("console_claim_reconciliation_contract", console_claim_reconciliation_contract_mod);
+    diagnostics_mod.addImport("console_interrupt_callback_contract", console_interrupt_callback_contract_mod);
     diagnostics_mod.addImport("xenia_host_gpu_callback_contract", xenia_host_gpu_callback_contract_mod);
     diagnostics_mod.addImport("diagnostics_async_log_contract", diagnostics_async_log_contract_mod);
     diagnostics_mod.addImport("abi_translation_economics_contract", abi_translation_economics_contract_mod);
-    diagnostics_mod.addImport("xenia_wait_graph_contract", xenia_wait_graph_contract_mod);
+    diagnostics_mod.addImport("console_wait_graph_contract", console_wait_graph_contract_mod);
     diagnostics_mod.addImport("xenia_wait_handshake_policy", xenia_wait_handshake_policy_mod);
     diagnostics_mod.addImport("xenia_graphics_health_contract", xenia_graphics_health_contract_mod);
     diagnostics_mod.addImport("xenia_application_controller_contract", xenia_application_controller_contract_mod);
@@ -519,7 +519,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     }));
     diagnostics_mod.addImport("xenos_register_map", xenos_register_map_mod);
     diagnostics_mod.addImport("xenia_graphics_contract", xenia_graphics_contract_mod);
-    diagnostics_mod.addImport("xenia_surface_path_contract", xenia_surface_path_contract_mod);
+    diagnostics_mod.addImport("host_surface_path_contract", host_surface_path_contract_mod);
     const diagnostics_test = b.addTest(.{ .root_module = diagnostics_mod });
     check_step.dependOn(&b.addRunArtifact(diagnostics_test).step);
     diagnostics_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
@@ -908,13 +908,13 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     macho_processor_mod.addImport("preflight", preflight_mod);
     macho_processor_mod.addImport("rosette_macos_host_contract", rosette_macos_host_contract_mod);
     macho_processor_mod.addImport("ready_compiler", ready_compiler_mod);
-    macho_processor_mod.addImport("xenia_heap_range", xenia_heap_range_mod);
+    macho_processor_mod.addImport("host_page_range_selection_abi", host_page_range_selection_abi_mod);
     macho_processor_mod.addImport("ppc_runtime", ppc_runtime_module);
     macho_processor_mod.addImport("application_framework", application_framework_mod);
-    macho_processor_mod.addImport("xenia_launch_assist_contract", xenia_launch_assist_contract_mod);
+    macho_processor_mod.addImport("console_launch_assist_contract", console_launch_assist_contract_mod);
     macho_processor_mod.addImport("xenia_host_gpu_callback_contract", xenia_host_gpu_callback_contract_mod);
     macho_processor_mod.addImport("diagnostics", diagnostics_mod);
-    macho_processor_mod.addImport("xenia_xiso_format", xenia_xiso_format_mod);
+    macho_processor_mod.addImport("console_xiso_format", console_xiso_format_mod);
     macho_processor_mod.addImport("memory", memory_mod);
     macho_processor_mod.addImport("io", io_mod);
     macho_processor_mod.addImport("guest_abi", guest_abi_mod);
@@ -1027,11 +1027,11 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     macho_processor_test_mod.addImport("preflight", preflight_mod);
     macho_processor_test_mod.addImport("rosette_macos_host_contract", rosette_macos_host_contract_mod);
     macho_processor_test_mod.addImport("ready_compiler", ready_compiler_mod);
-    macho_processor_test_mod.addImport("xenia_heap_range", xenia_heap_range_mod);
+    macho_processor_test_mod.addImport("host_page_range_selection_abi", host_page_range_selection_abi_mod);
     macho_processor_test_mod.addImport("application_framework", application_framework_mod);
     macho_processor_test_mod.addImport("xenia_host_gpu_callback_contract", xenia_host_gpu_callback_contract_mod);
     macho_processor_test_mod.addImport("diagnostics", diagnostics_mod);
-    macho_processor_test_mod.addImport("xenia_xiso_format", xenia_xiso_format_mod);
+    macho_processor_test_mod.addImport("console_xiso_format", console_xiso_format_mod);
     macho_processor_test_mod.addImport("memory", memory_mod);
     macho_processor_test_mod.addImport("io", io_mod);
     macho_processor_test_mod.addImport("guest_abi", guest_abi_mod);

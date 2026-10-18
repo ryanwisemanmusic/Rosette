@@ -124,22 +124,22 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const xenia_fatal_condition_map_module = b.createModule(.{
+    const console_fatal_condition_map_module = b.createModule(.{
         .root_source_file = b.path("../../pkg/common/console/fatal-condition-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    xenia_fatal_condition_map_module.addImport("phrase_filter", phrase_filter_module);
+    console_fatal_condition_map_module.addImport("phrase_filter", phrase_filter_module);
     // Whether a Xenia warning-level line is a finding at all.
-    const xenia_warning_severity_map_module = b.createModule(.{
+    const console_warning_severity_map_module = b.createModule(.{
         .root_source_file = b.path("../../pkg/common/console/warning-severity-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    xenia_warning_severity_map_module.addImport("phrase_filter", phrase_filter_module);
+    console_warning_severity_map_module.addImport("phrase_filter", phrase_filter_module);
     // What a Xenia symbol name means, so a report can say what the guest is
     // doing at an address rather than only where it is.
-    const xenia_guest_frontier_map_module = b.createModule(.{
+    const console_guest_frontier_map_module = b.createModule(.{
         .root_source_file = b.path("../../pkg/common/console/guest-frontier-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -172,19 +172,19 @@ pub fn build(b: *std.Build) void {
     });
     // The Xenia functions whose first entry answers a question no counter of
     // Rosette's own surface can: whether the title ever produced a frame.
-    const xenia_guest_milestone_map_module = b.createModule(.{
+    const console_guest_milestone_map_module = b.createModule(.{
         .root_source_file = b.path("../../pkg/common/console/guest-milestone-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     // Xenia's kernel export shims, and the console's export tables they are
     // joined against. See pkg/common/console/kernel-shim-map.
-    const xenia_kernel_shim_map_module = b.createModule(.{
+    const console_kernel_shim_map_module = b.createModule(.{
         .root_source_file = b.path("../../pkg/common/console/kernel-shim-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const xenia_kernel_export_map_module = b.createModule(.{
+    const console_kernel_export_map_module = b.createModule(.{
         .root_source_file = b.path("../../pkg/common/console/kernel-export-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -533,12 +533,12 @@ pub fn build(b: *std.Build) void {
     pe_elf_state_module.addImport("execution_history", pe_execution_history_module);
     pe_elf_state_module.addImport("evex_runtime", pe_evex_runtime_module);
     pe_elf_state_module.addImport("x86_vector_helpers", pe_x86_vector_helpers_module);
-    pe_elf_state_module.addImport("xenia_fatal_condition_map", xenia_fatal_condition_map_module);
-    pe_elf_state_module.addImport("xenia_guest_frontier_map", xenia_guest_frontier_map_module);
-    pe_elf_state_module.addImport("xenia_warning_severity_map", xenia_warning_severity_map_module);
-    pe_elf_state_module.addImport("xenia_guest_milestone_map", xenia_guest_milestone_map_module);
-    pe_elf_state_module.addImport("xenia_kernel_shim_map", xenia_kernel_shim_map_module);
-    pe_elf_state_module.addImport("xenia_kernel_export_map", xenia_kernel_export_map_module);
+    pe_elf_state_module.addImport("console_fatal_condition_map", console_fatal_condition_map_module);
+    pe_elf_state_module.addImport("console_guest_frontier_map", console_guest_frontier_map_module);
+    pe_elf_state_module.addImport("console_warning_severity_map", console_warning_severity_map_module);
+    pe_elf_state_module.addImport("console_guest_milestone_map", console_guest_milestone_map_module);
+    pe_elf_state_module.addImport("console_kernel_shim_map", console_kernel_shim_map_module);
+    pe_elf_state_module.addImport("console_kernel_export_map", console_kernel_export_map_module);
     pe_elf_state_module.addImport("xenia_guest_address_map", xenia_guest_address_map_module);
     pe_elf_state_module.addImport("frame_content_contract", windows_frame_content_contract_module);
     pe_elf_state_module.addImport("screen_validity", windows_screen_validity_module);
@@ -798,7 +798,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     windows_application_framework_module.addImport("application_framework_contract", windows_application_framework_contract_module);
-    windows_application_framework_module.addImport("xenia_launch_assist_contract", windows_launch_assist_contract_module);
+    windows_application_framework_module.addImport("console_launch_assist_contract", windows_launch_assist_contract_module);
     windows_application_framework_module.addImport("xenia_host_gpu_callback_contract", windows_host_gpu_callback_contract_module);
 
     // The executing guest thread's registers for code that runs on its
@@ -818,11 +818,11 @@ pub fn build(b: *std.Build) void {
     windows_dyld_module.addImport("gpu", windows_gpu_module);
     windows_dyld_module.addImport("event_log", windows_event_log_module);
     windows_dyld_module.addImport("scheduler", scheduler_module);
-    windows_dyld_module.addImport("xenia_heap_range", windows_heap_range_module);
+    windows_dyld_module.addImport("host_page_range_selection_abi", windows_heap_range_module);
     windows_dyld_module.addImport("rosette_ppc_host_abi", windows_ppc_host_abi_module);
     windows_dyld_module.addImport("ppc_runtime", windows_ppc_runtime_module);
     windows_dyld_module.addImport("application_framework", windows_application_framework_module);
-    windows_dyld_module.addImport("xenia_launch_assist_contract", windows_launch_assist_contract_module);
+    windows_dyld_module.addImport("console_launch_assist_contract", windows_launch_assist_contract_module);
     windows_dyld_module.addImport("xenia_host_gpu_callback_contract", windows_host_gpu_callback_contract_module);
     windows_dyld_module.addImport("rosette_macos_host_contract", windows_macos_host_contract_module);
 

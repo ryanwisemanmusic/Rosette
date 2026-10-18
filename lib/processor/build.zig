@@ -25,13 +25,13 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const x64_decoder_mod = ctx.x64_decoder_mod;
     const x64_interpreter_mod = ctx.x64_interpreter_mod;
     const x86_vector_helpers_mod = ctx.x86_vector_helpers_mod;
-    const xenia_fatal_condition_map_mod = ctx.xenia_fatal_condition_map_mod;
+    const console_fatal_condition_map_mod = ctx.console_fatal_condition_map_mod;
     const xenia_guest_address_map_mod = ctx.xenia_guest_address_map_mod;
-    const xenia_guest_frontier_map_mod = ctx.xenia_guest_frontier_map_mod;
-    const xenia_guest_milestone_map_mod = ctx.xenia_guest_milestone_map_mod;
-    const xenia_kernel_export_map_mod = ctx.xenia_kernel_export_map_mod;
-    const xenia_kernel_shim_map_mod = ctx.xenia_kernel_shim_map_mod;
-    const xenia_warning_severity_map_mod = ctx.xenia_warning_severity_map_mod;
+    const console_guest_frontier_map_mod = ctx.console_guest_frontier_map_mod;
+    const console_guest_milestone_map_mod = ctx.console_guest_milestone_map_mod;
+    const console_kernel_export_map_mod = ctx.console_kernel_export_map_mod;
+    const console_kernel_shim_map_mod = ctx.console_kernel_shim_map_mod;
+    const console_warning_severity_map_mod = ctx.console_warning_severity_map_mod;
 
     const x64_linux_runtime_mod = b.createModule(.{
         .root_source_file = b.path("src/x64-ASM/linux_runtime.zig"),
@@ -65,12 +65,12 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     elf_processor_mod.addImport("execution_history", execution_history_mod);
     elf_processor_mod.addImport("evex_runtime", evex_runtime_mod);
     elf_processor_mod.addImport("x86_vector_helpers", x86_vector_helpers_mod);
-    elf_processor_mod.addImport("xenia_fatal_condition_map", xenia_fatal_condition_map_mod);
-    elf_processor_mod.addImport("xenia_guest_frontier_map", xenia_guest_frontier_map_mod);
-    elf_processor_mod.addImport("xenia_warning_severity_map", xenia_warning_severity_map_mod);
-    elf_processor_mod.addImport("xenia_guest_milestone_map", xenia_guest_milestone_map_mod);
-    elf_processor_mod.addImport("xenia_kernel_shim_map", xenia_kernel_shim_map_mod);
-    elf_processor_mod.addImport("xenia_kernel_export_map", xenia_kernel_export_map_mod);
+    elf_processor_mod.addImport("console_fatal_condition_map", console_fatal_condition_map_mod);
+    elf_processor_mod.addImport("console_guest_frontier_map", console_guest_frontier_map_mod);
+    elf_processor_mod.addImport("console_warning_severity_map", console_warning_severity_map_mod);
+    elf_processor_mod.addImport("console_guest_milestone_map", console_guest_milestone_map_mod);
+    elf_processor_mod.addImport("console_kernel_shim_map", console_kernel_shim_map_mod);
+    elf_processor_mod.addImport("console_kernel_export_map", console_kernel_export_map_mod);
     elf_processor_mod.addImport("xenia_guest_address_map", xenia_guest_address_map_mod);
     elf_processor_mod.addImport("frame_content_contract", frame_content_contract_mod);
     elf_processor_mod.addImport("screen_validity", screen_validity_mod);
@@ -100,12 +100,12 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     elf_processor_test_mod.addImport("execution_history", execution_history_mod);
     elf_processor_test_mod.addImport("evex_runtime", evex_runtime_mod);
     elf_processor_test_mod.addImport("x86_vector_helpers", x86_vector_helpers_mod);
-    elf_processor_test_mod.addImport("xenia_fatal_condition_map", xenia_fatal_condition_map_mod);
-    elf_processor_test_mod.addImport("xenia_guest_frontier_map", xenia_guest_frontier_map_mod);
-    elf_processor_test_mod.addImport("xenia_warning_severity_map", xenia_warning_severity_map_mod);
-    elf_processor_test_mod.addImport("xenia_guest_milestone_map", xenia_guest_milestone_map_mod);
-    elf_processor_test_mod.addImport("xenia_kernel_shim_map", xenia_kernel_shim_map_mod);
-    elf_processor_test_mod.addImport("xenia_kernel_export_map", xenia_kernel_export_map_mod);
+    elf_processor_test_mod.addImport("console_fatal_condition_map", console_fatal_condition_map_mod);
+    elf_processor_test_mod.addImport("console_guest_frontier_map", console_guest_frontier_map_mod);
+    elf_processor_test_mod.addImport("console_warning_severity_map", console_warning_severity_map_mod);
+    elf_processor_test_mod.addImport("console_guest_milestone_map", console_guest_milestone_map_mod);
+    elf_processor_test_mod.addImport("console_kernel_shim_map", console_kernel_shim_map_mod);
+    elf_processor_test_mod.addImport("console_kernel_export_map", console_kernel_export_map_mod);
     elf_processor_test_mod.addImport("xenia_guest_address_map", xenia_guest_address_map_mod);
     elf_processor_test_mod.addImport("frame_content_contract", frame_content_contract_mod);
     elf_processor_test_mod.addImport("screen_validity", screen_validity_mod);
@@ -130,12 +130,12 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // Rooted so the frontier classification rules execute rather than
     // only compile as the ELF processor's dependency. A shadowed rule is
     // invisible at runtime and only shows up as a workload nobody names.
-    const xenia_guest_frontier_map_test = b.addTest(.{ .root_module = xenia_guest_frontier_map_mod });
-    check_step.dependOn(&b.addRunArtifact(xenia_guest_frontier_map_test).step);
-    const xenia_warning_severity_map_test = b.addTest(.{ .root_module = xenia_warning_severity_map_mod });
-    check_step.dependOn(&b.addRunArtifact(xenia_warning_severity_map_test).step);
-    const xenia_guest_milestone_map_test = b.addTest(.{ .root_module = xenia_guest_milestone_map_mod });
-    check_step.dependOn(&b.addRunArtifact(xenia_guest_milestone_map_test).step);
+    const console_guest_frontier_map_test = b.addTest(.{ .root_module = console_guest_frontier_map_mod });
+    check_step.dependOn(&b.addRunArtifact(console_guest_frontier_map_test).step);
+    const console_warning_severity_map_test = b.addTest(.{ .root_module = console_warning_severity_map_mod });
+    check_step.dependOn(&b.addRunArtifact(console_warning_severity_map_test).step);
+    const console_guest_milestone_map_test = b.addTest(.{ .root_module = console_guest_milestone_map_mod });
+    check_step.dependOn(&b.addRunArtifact(console_guest_milestone_map_test).step);
     ctx.windows_graphics_state_test_mod.* = elf_processor_test_mod;
     const windows_graphics_contract_test = b.addTest(.{
         .root_module = elf_processor_test_mod,

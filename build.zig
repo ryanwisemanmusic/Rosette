@@ -538,12 +538,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const xenia_ready_plan_mod = b.createModule(.{
+    const console_ready_plan_mod = b.createModule(.{
         .root_source_file = b.path("pkg/common/console/ready-plan/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    ready_compiler_mod.addImport("xenia_ready_plan", xenia_ready_plan_mod);
+    ready_compiler_mod.addImport("console_ready_plan", console_ready_plan_mod);
     // The graphics handoff package is deliberately selected by the host ISA.
     // It contributes immutable ABI/ordering facts only; it cannot provide a
     // guest pointer, command buffer, or presentation event.
@@ -561,7 +561,7 @@ pub fn build(b: *std.Build) void {
     // VdSwap/PM4 handoff facts are route-independent.  The live ledger is in
     // lib/gpu; this package owns only the immutable stage vocabulary, packet
     // shape and provenance rules shared by every host route.
-    const xenia_vd_swap_contract_mod = b.createModule(.{
+    const console_vd_swap_contract_mod = b.createModule(.{
         .root_source_file = b.path("pkg/common/console/vd-swap-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -570,7 +570,7 @@ pub fn build(b: *std.Build) void {
     // The disc image container's layout, and what a damaged region of one
     // costs. An offset alone cannot say whether a hole is fatal or merely
     // unfortunate; this is what tells them apart.
-    const xenia_xiso_format_mod = b.createModule(.{
+    const console_xiso_format_mod = b.createModule(.{
         .root_source_file = b.path("pkg/common/console/xiso-format/src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -579,23 +579,23 @@ pub fn build(b: *std.Build) void {
     // Which subsystems an emulator image must contain for a run to be worth
     // starting. Read before the first guest instruction, so a build that could
     // never reach a frame is refused in milliseconds instead of minutes.
-    const xenia_prelaunch_audit_contract_mod = b.createModule(.{
+    const console_prelaunch_audit_contract_mod = b.createModule(.{
         .root_source_file = b.path("pkg/common/console/prelaunch-audit-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     // Log lines whose presence means the run's outcome is already decided.
-    const xenia_fatal_condition_map_mod = b.createModule(.{
+    const console_fatal_condition_map_mod = b.createModule(.{
         .root_source_file = b.path("pkg/common/console/fatal-condition-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    xenia_fatal_condition_map_mod.addImport("phrase_filter", phrase_filter_mod);
+    console_fatal_condition_map_mod.addImport("phrase_filter", phrase_filter_mod);
 
     // What a Xenia symbol name means, so a report can say what the guest is
     // doing at an address rather than only where it is.
-    const xenia_guest_frontier_map_mod = b.createModule(.{
+    const console_guest_frontier_map_mod = b.createModule(.{
         .root_source_file = b.path("pkg/common/console/guest-frontier-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -604,7 +604,7 @@ pub fn build(b: *std.Build) void {
     // The Xenia functions whose first entry answers a question no counter of
     // Rosette's own surface can: whether the title ever produced a frame,
     // ever asked for a swap, ever registered an audio client.
-    const xenia_guest_milestone_map_mod = b.createModule(.{
+    const console_guest_milestone_map_mod = b.createModule(.{
         .root_source_file = b.path("pkg/common/console/guest-milestone-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -614,7 +614,7 @@ pub fn build(b: *std.Build) void {
     // and its 691 siblings. Entry into one is the translated PowerPC asking
     // the emulated kernel for something, which is the only event in the whole
     // program that proves the title acted.
-    const xenia_kernel_shim_map_mod = b.createModule(.{
+    const console_kernel_shim_map_mod = b.createModule(.{
         .root_source_file = b.path("pkg/common/console/kernel-shim-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -622,7 +622,7 @@ pub fn build(b: *std.Build) void {
 
     // The console's own export ordinal tables, joined against the shims above
     // to say what this Xenia build does not implement.
-    const xenia_kernel_export_map_mod = b.createModule(.{
+    const console_kernel_export_map_mod = b.createModule(.{
         .root_source_file = b.path("pkg/common/console/kernel-export-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -638,12 +638,12 @@ pub fn build(b: *std.Build) void {
     });
 
     // Whether a Xenia warning-level line is a finding at all.
-    const xenia_warning_severity_map_mod = b.createModule(.{
+    const console_warning_severity_map_mod = b.createModule(.{
         .root_source_file = b.path("pkg/common/console/warning-severity-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    xenia_warning_severity_map_mod.addImport("phrase_filter", phrase_filter_mod);
+    console_warning_severity_map_mod.addImport("phrase_filter", phrase_filter_mod);
 
     // The host operations the emulator's behaviour rests on, and the
     // cross-subsystem orderings that break under translation. Both are
@@ -702,7 +702,7 @@ pub fn build(b: *std.Build) void {
     // conclude. Route-independent — it describes the console and the emulator's
     // own symbol names, neither of which changes with the host Rosette is
     // compiled for.
-    const xenia_gpu_bringup_contract_mod = b.createModule(.{
+    const console_gpu_bringup_contract_mod = b.createModule(.{
         .root_source_file = b.path("pkg/common/console/gpu-bringup-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -712,7 +712,7 @@ pub fn build(b: *std.Build) void {
     // earliest Rosette root and the live PM4 runtime. Keeping it as one module
     // prevents the ring limits and causal-boundary vocabulary from drifting
     // between diagnostics and execution.
-    const xenia_gpu_observation_contract_mod = b.createModule(.{
+    const console_gpu_observation_contract_mod = b.createModule(.{
         .root_source_file = b.path("pkg/common/console/gpu-observation-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -721,7 +721,7 @@ pub fn build(b: *std.Build) void {
     // The common PM4 package already owns packet arithmetic/classification.
     // Make the GPU executor consume that same build-time table instead of
     // growing a second semantic vocabulary in lib.
-    const xenia_pm4_contract_mod = b.createModule(.{
+    const console_pm4_contract_mod = b.createModule(.{
         .root_source_file = b.path("pkg/common/console/pm4-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -809,7 +809,7 @@ pub fn build(b: *std.Build) void {
     // and what each substitution costs. Metal has no signed 2_10_10_10; the
     // question this answers is whether the emulator's fallback preserves the
     // values or reinterprets them.
-    const xenia_texture_format_contract_mod = b.createModule(.{
+    const console_texture_format_contract_mod = b.createModule(.{
         .root_source_file = b.path("pkg/common/console/texture-format-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -824,7 +824,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    rosette_gpu_root_mod.addImport("xenia_gpu_observation_contract", xenia_gpu_observation_contract_mod);
+    rosette_gpu_root_mod.addImport("console_gpu_observation_contract", console_gpu_observation_contract_mod);
     const rosette_root_mod = b.createModule(.{
         .root_source_file = b.path("rosette_root/root.zig"),
         .target = target,
@@ -842,7 +842,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const xenia_launch_assist_contract_mod = b.createModule(.{
+    const console_launch_assist_contract_mod = b.createModule(.{
         .root_source_file = b.path("pkg/common/console/launch-assist-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -858,13 +858,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     application_framework_mod.addImport("application_framework_contract", application_framework_contract_mod);
-    application_framework_mod.addImport("xenia_launch_assist_contract", xenia_launch_assist_contract_mod);
+    application_framework_mod.addImport("console_launch_assist_contract", console_launch_assist_contract_mod);
     application_framework_mod.addImport("xenia_host_gpu_callback_contract", xenia_host_gpu_callback_contract_mod);
 
     // Who owns a piece of console platform state, when they took it, and
     // whether the handoff between the harness and the emulator held. Console
     // facts, so route-independent like the contracts above.
-    const xenia_provisioning_contract_mod = b.createModule(.{
+    const console_provisioning_contract_mod = b.createModule(.{
         .root_source_file = b.path("pkg/common/console/provisioning-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -873,7 +873,7 @@ pub fn build(b: *std.Build) void {
     // Which of several disagreeing statements about the same fact is current.
     // The emulator states the same facts from many code paths and never
     // retracts a snapshot, so the loudest claim in the log is not the truest.
-    const xenia_claim_reconciliation_contract_mod = b.createModule(.{
+    const console_claim_reconciliation_contract_mod = b.createModule(.{
         .root_source_file = b.path("pkg/common/console/claim-reconciliation-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -882,7 +882,7 @@ pub fn build(b: *std.Build) void {
     // Xenia's PowerPC graphics callback and Rosette's model callback are
     // separate execution domains. This contract names the registration ->
     // dispatch -> return transaction without comparing their counters.
-    const xenia_interrupt_callback_contract_mod = b.createModule(.{
+    const console_interrupt_callback_contract_mod = b.createModule(.{
         .root_source_file = b.path("pkg/common/console/interrupt-callback-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -912,7 +912,7 @@ pub fn build(b: *std.Build) void {
 
     // Delivering a queued GPU completion to a guest callback, and knowing how
     // much was assumed to do it. Console/ownership facts, route independent.
-    const xenia_draw_dispatch_contract_mod = b.createModule(.{
+    const console_draw_dispatch_contract_mod = b.createModule(.{
         .root_source_file = b.path("pkg/common/console/draw-dispatch-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -920,7 +920,7 @@ pub fn build(b: *std.Build) void {
 
     // Who waits on what, who signals it, and whether the handshake between
     // them is going anywhere. Console/ownership facts, route independent.
-    const xenia_wait_graph_contract_mod = b.createModule(.{
+    const console_wait_graph_contract_mod = b.createModule(.{
         .root_source_file = b.path("pkg/common/console/wait-graph-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -940,24 +940,24 @@ pub fn build(b: *std.Build) void {
     // These are immutable source-derived values: the PPC guest word order is
     // identical on every route, while host codegen and host byte order remain
     // explicit route facts.
-    const xenia_guest_endian_x86_mod = b.createModule(.{
+    const host_x86_guest_endian_mod = b.createModule(.{
         .root_source_file = b.path("pkg/x86/console/guest-endian/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const xenia_guest_endian_arm64_mod = b.createModule(.{
+    const host_arm64_guest_endian_mod = b.createModule(.{
         .root_source_file = b.path("pkg/ARM64/console/guest-endian/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const xenia_guest_endian_ppc_mod = b.createModule(.{
+    const host_ppc64_guest_endian_mod = b.createModule(.{
         .root_source_file = b.path("pkg/PPC/console/guest-endian/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    ready_compiler_mod.addImport("xenia_guest_endian_x86", xenia_guest_endian_x86_mod);
-    ready_compiler_mod.addImport("xenia_guest_endian_arm64", xenia_guest_endian_arm64_mod);
-    ready_compiler_mod.addImport("xenia_guest_endian_ppc", xenia_guest_endian_ppc_mod);
+    ready_compiler_mod.addImport("host_x86_guest_endian", host_x86_guest_endian_mod);
+    ready_compiler_mod.addImport("host_arm64_guest_endian", host_arm64_guest_endian_mod);
+    ready_compiler_mod.addImport("host_ppc64_guest_endian", host_ppc64_guest_endian_mod);
 
     // Third-party endianness is a source mirror, not a runtime wrapper. Keep
     // one route-local implementation per host architecture and compare their
@@ -1041,68 +1041,68 @@ pub fn build(b: *std.Build) void {
     // The surface-path package separates Xenia's FBO render-target label from
     // the actual Vulkan-to-Metal WSI chain. It is compile-time evidence only;
     // native surface creation and presentation still require runtime events.
-    const xenia_surface_path_contract_root = if (target.result.cpu.arch == .aarch64)
+    const host_surface_path_contract_root = if (target.result.cpu.arch == .aarch64)
         b.path("pkg/ARM64/console/graphics/surface-path-contract/src/root.zig")
     else
         b.path("pkg/x86/console/graphics/surface-path-contract/src/root.zig");
-    const xenia_surface_path_contract_mod = b.createModule(.{
-        .root_source_file = xenia_surface_path_contract_root,
+    const host_surface_path_contract_mod = b.createModule(.{
+        .root_source_file = host_surface_path_contract_root,
         .target = target,
         .optimize = optimize,
     });
-    ready_compiler_mod.addImport("xenia_surface_path_contract", xenia_surface_path_contract_mod);
+    ready_compiler_mod.addImport("host_surface_path_contract", host_surface_path_contract_mod);
     // The shader-storage package records the Xenia macOS command-processor
     // handoff. It distinguishes explicit completion from the five-second
     // blocking-timeout continuation; it cannot synthesize either event.
-    const xenia_shader_storage_contract_root = if (target.result.cpu.arch == .aarch64)
+    const guest_shader_storage_contract_root = if (target.result.cpu.arch == .aarch64)
         b.path("pkg/ARM64/console/runtime/shader-storage-contract/src/root.zig")
     else
         b.path("pkg/x86/console/runtime/shader-storage-contract/src/root.zig");
-    const xenia_shader_storage_contract_mod = b.createModule(.{
-        .root_source_file = xenia_shader_storage_contract_root,
+    const guest_shader_storage_contract_mod = b.createModule(.{
+        .root_source_file = guest_shader_storage_contract_root,
         .target = target,
         .optimize = optimize,
     });
-    ready_compiler_mod.addImport("xenia_shader_storage_contract", xenia_shader_storage_contract_mod);
+    ready_compiler_mod.addImport("guest_shader_storage_contract", guest_shader_storage_contract_mod);
     // Which Xenia subsystem owns a Mach-O symbol is fixed when Xenia is
     // compiled, so the readiness gate looks it up instead of deriving it. The
     // package supplies only the mapping; deciding whether executing inside a
     // subsystem counts as progress stays in the runtime, which is the only
     // place that knows what else has happened.
-    const xenia_launch_phase_map_root = if (target.result.cpu.arch == .aarch64)
+    const guest_launch_phase_map_root = if (target.result.cpu.arch == .aarch64)
         b.path("pkg/ARM64/console/runtime/launch-phase-map/src/root.zig")
     else
         b.path("pkg/x86/console/runtime/launch-phase-map/src/root.zig");
-    const xenia_launch_phase_map_mod = b.createModule(.{
-        .root_source_file = xenia_launch_phase_map_root,
+    const guest_launch_phase_map_mod = b.createModule(.{
+        .root_source_file = guest_launch_phase_map_root,
         .target = target,
         .optimize = optimize,
     });
-    ready_compiler_mod.addImport("xenia_launch_phase_map", xenia_launch_phase_map_mod);
+    ready_compiler_mod.addImport("guest_launch_phase_map", guest_launch_phase_map_mod);
     // Successful PPC translation is a stronger external-progress witness than
     // a host heartbeat: Xenia emits it only after a guest function assembled
     // into host code. The route package owns the text ABI and monotonicity
     // tests; the runtime decides whether the event keeps its quiet window open.
-    const xenia_translation_progress_root = if (target.result.cpu.arch == .aarch64)
+    const guest_translation_progress_root = if (target.result.cpu.arch == .aarch64)
         b.path("pkg/ARM64/console/runtime/translation-progress/src/root.zig")
     else
         b.path("pkg/x86/console/runtime/translation-progress/src/root.zig");
-    const xenia_translation_progress_mod = b.createModule(.{
-        .root_source_file = xenia_translation_progress_root,
+    const guest_translation_progress_mod = b.createModule(.{
+        .root_source_file = guest_translation_progress_root,
         .target = target,
         .optimize = optimize,
     });
-    ready_compiler_mod.addImport("xenia_translation_progress", xenia_translation_progress_mod);
+    ready_compiler_mod.addImport("guest_translation_progress", guest_translation_progress_mod);
     // The page-range package is a real optional boundary provider, not a
     // readiness-only fact: its exported selector is included in the Mach-O
     // process image and Xenia may resolve it with dlsym at runtime. Xenia
     // retains the reference scan when the symbol is absent.
-    const xenia_heap_range_root = if (target.result.cpu.arch == .aarch64)
+    const host_page_range_selection_abi_root = if (target.result.cpu.arch == .aarch64)
         b.path("pkg/ARM64/console/memory/heap-range/src/root.zig")
     else
         b.path("pkg/x86/console/memory/heap-range/src/root.zig");
-    const xenia_heap_range_mod = b.createModule(.{
-        .root_source_file = xenia_heap_range_root,
+    const host_page_range_selection_abi_mod = b.createModule(.{
+        .root_source_file = host_page_range_selection_abi_root,
         .target = target,
         .optimize = optimize,
     });
@@ -1142,22 +1142,22 @@ pub fn build(b: *std.Build) void {
     // refuses to call a code buffer ready with an unbound label, which is the
     // exception the earlier evidence carried; the classifier separates
     // precompile progress from a silent graphics owner.
-    const xenia_codegen_activation_root = if (target.result.cpu.arch == .aarch64)
+    const host_codegen_activation_contract_root = if (target.result.cpu.arch == .aarch64)
         b.path("pkg/ARM64/console/runtime/codegen-activation/src/root.zig")
     else
         b.path("pkg/x86/console/runtime/codegen-activation/src/root.zig");
-    const xenia_codegen_activation_mod = b.createModule(.{
-        .root_source_file = xenia_codegen_activation_root,
+    const host_codegen_activation_contract_mod = b.createModule(.{
+        .root_source_file = host_codegen_activation_contract_root,
         .target = target,
         .optimize = optimize,
     });
-    ready_compiler_mod.addImport("xenia_codegen_activation", xenia_codegen_activation_mod);
+    ready_compiler_mod.addImport("host_codegen_activation_contract", host_codegen_activation_contract_mod);
     const jit_label_ledger_mod = b.createModule(.{
         .root_source_file = b.path("lib/compiler/JIT/label_ledger.zig"),
         .target = target,
         .optimize = optimize,
     });
-    jit_label_ledger_mod.addImport("xenia_codegen_activation", xenia_codegen_activation_mod);
+    jit_label_ledger_mod.addImport("host_codegen_activation_contract", host_codegen_activation_contract_mod);
     ready_compiler_mod.addImport("jit_label_ledger", jit_label_ledger_mod);
     // The wait boundary: a consuming wait cannot succeed without consuming a
     // pending signal. The package models the invariant; the live pthread and
@@ -1207,12 +1207,12 @@ pub fn build(b: *std.Build) void {
     // Primitive dispatch is a Mach-O hot path. The package supplies only a
     // family lookup; the existing primitive handlers and fallback definitions
     // remain in charge of behavior.
-    const xenia_primitive_contract_root = if (target.result.cpu.arch == .aarch64)
+    const host_primitive_route_contract_root = if (target.result.cpu.arch == .aarch64)
         b.path("pkg/ARM64/console/runtime/primitive-contract/src/root.zig")
     else
         b.path("pkg/x86/console/runtime/primitive-contract/src/root.zig");
-    const xenia_primitive_contract_mod = b.createModule(.{
-        .root_source_file = xenia_primitive_contract_root,
+    const host_primitive_route_contract_mod = b.createModule(.{
+        .root_source_file = host_primitive_route_contract_root,
         .target = target,
         .optimize = optimize,
     });
@@ -1488,7 +1488,7 @@ pub fn build(b: *std.Build) void {
 
     const check_step = b.step("check", "Check Rosette Zig sources");
     const source_budget = b.addSystemCommand(&.{ "python3", "tools/audit_source_size.py" });
-    source_budget.setCwd(b.path(".."));
+    source_budget.setCwd(b.path("."));
     check_step.dependOn(&source_budget.step);
     const startup_evidence_runtime_test = b.addTest(.{ .root_module = startup_evidence_runtime_mod });
     check_step.dependOn(&b.addRunArtifact(startup_evidence_runtime_test).step);
@@ -1506,8 +1506,8 @@ pub fn build(b: *std.Build) void {
     // The boundary surface is a `pub const` import inside lib/gpu, and a
     // `pub const @import` does not root a module's tests. Without its own test
     // target the contract's fifteen tests would compile and never run.
-    const xenia_gpu_bringup_contract_test = b.addTest(.{ .root_module = xenia_gpu_bringup_contract_mod });
-    check_step.dependOn(&b.addRunArtifact(xenia_gpu_bringup_contract_test).step);
+    const console_gpu_bringup_contract_test = b.addTest(.{ .root_module = console_gpu_bringup_contract_mod });
+    check_step.dependOn(&b.addRunArtifact(console_gpu_bringup_contract_test).step);
     const rosette_host_capability_contract_test = b.addTest(.{ .root_module = rosette_host_capability_contract_mod });
     check_step.dependOn(&b.addRunArtifact(rosette_host_capability_contract_test).step);
     const rosette_macos_host_contract_test = b.addTest(.{ .root_module = rosette_macos_host_contract_mod });
@@ -1516,12 +1516,12 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&b.addRunArtifact(rosette_mandatory_order_contract_test).step);
     const rosette_monotone_witness_contract_test = b.addTest(.{ .root_module = rosette_monotone_witness_contract_mod });
     check_step.dependOn(&b.addRunArtifact(rosette_monotone_witness_contract_test).step);
-    const xenia_xiso_format_test = b.addTest(.{ .root_module = xenia_xiso_format_mod });
-    check_step.dependOn(&b.addRunArtifact(xenia_xiso_format_test).step);
-    const xenia_prelaunch_audit_contract_test = b.addTest(.{ .root_module = xenia_prelaunch_audit_contract_mod });
-    check_step.dependOn(&b.addRunArtifact(xenia_prelaunch_audit_contract_test).step);
-    const xenia_fatal_condition_map_test = b.addTest(.{ .root_module = xenia_fatal_condition_map_mod });
-    check_step.dependOn(&b.addRunArtifact(xenia_fatal_condition_map_test).step);
+    const console_xiso_format_test = b.addTest(.{ .root_module = console_xiso_format_mod });
+    check_step.dependOn(&b.addRunArtifact(console_xiso_format_test).step);
+    const console_prelaunch_audit_contract_test = b.addTest(.{ .root_module = console_prelaunch_audit_contract_mod });
+    check_step.dependOn(&b.addRunArtifact(console_prelaunch_audit_contract_test).step);
+    const console_fatal_condition_map_test = b.addTest(.{ .root_module = console_fatal_condition_map_mod });
+    check_step.dependOn(&b.addRunArtifact(console_fatal_condition_map_test).step);
     const xenia_guest_address_map_test = b.addTest(.{ .root_module = xenia_guest_address_map_mod });
     check_step.dependOn(&b.addRunArtifact(xenia_guest_address_map_test).step);
     const rosette_graphics_bridge_test = b.addTest(.{ .root_module = rosette_graphics_bridge_mod });
@@ -2146,13 +2146,13 @@ pub fn build(b: *std.Build) void {
         .x64_decoder_mod = x64_decoder_mod,
         .x64_interpreter_mod = x64_interpreter_mod,
         .x86_vector_helpers_mod = x86_vector_helpers_mod,
-        .xenia_fatal_condition_map_mod = xenia_fatal_condition_map_mod,
+        .console_fatal_condition_map_mod = console_fatal_condition_map_mod,
         .xenia_guest_address_map_mod = xenia_guest_address_map_mod,
-        .xenia_guest_frontier_map_mod = xenia_guest_frontier_map_mod,
-        .xenia_guest_milestone_map_mod = xenia_guest_milestone_map_mod,
-        .xenia_kernel_export_map_mod = xenia_kernel_export_map_mod,
-        .xenia_kernel_shim_map_mod = xenia_kernel_shim_map_mod,
-        .xenia_warning_severity_map_mod = xenia_warning_severity_map_mod,
+        .console_guest_frontier_map_mod = console_guest_frontier_map_mod,
+        .console_guest_milestone_map_mod = console_guest_milestone_map_mod,
+        .console_kernel_export_map_mod = console_kernel_export_map_mod,
+        .console_kernel_shim_map_mod = console_kernel_shim_map_mod,
+        .console_warning_severity_map_mod = console_warning_severity_map_mod,
     });
 
     // Console subsystem libraries: audio, HID, config, and the three GPU
@@ -2164,7 +2164,7 @@ pub fn build(b: *std.Build) void {
         .check_step = check_step,
         .optimize = optimize,
         .target = target,
-        .xenia_texture_format_contract_mod = xenia_texture_format_contract_mod,
+        .console_texture_format_contract_mod = console_texture_format_contract_mod,
     });
 
     // TOML processor (patch file format parser)
@@ -2236,29 +2236,29 @@ pub fn build(b: *std.Build) void {
         .x86_asm_module = x86_asm_module,
         .x86_trace_asm_module = x86_trace_asm_module,
         .xenia_application_controller_contract_mod = xenia_application_controller_contract_mod,
-        .xenia_claim_reconciliation_contract_mod = xenia_claim_reconciliation_contract_mod,
-        .xenia_draw_dispatch_contract_mod = xenia_draw_dispatch_contract_mod,
-        .xenia_fatal_condition_map_mod = xenia_fatal_condition_map_mod,
-        .xenia_gpu_bringup_contract_mod = xenia_gpu_bringup_contract_mod,
-        .xenia_gpu_observation_contract_mod = xenia_gpu_observation_contract_mod,
+        .console_claim_reconciliation_contract_mod = console_claim_reconciliation_contract_mod,
+        .console_draw_dispatch_contract_mod = console_draw_dispatch_contract_mod,
+        .console_fatal_condition_map_mod = console_fatal_condition_map_mod,
+        .console_gpu_bringup_contract_mod = console_gpu_bringup_contract_mod,
+        .console_gpu_observation_contract_mod = console_gpu_observation_contract_mod,
         .xenia_graphics_contract_mod = xenia_graphics_contract_mod,
         .xenia_graphics_health_contract_mod = xenia_graphics_health_contract_mod,
-        .xenia_heap_range_mod = xenia_heap_range_mod,
+        .host_page_range_selection_abi_mod = host_page_range_selection_abi_mod,
         .xenia_host_gpu_callback_contract_mod = xenia_host_gpu_callback_contract_mod,
-        .xenia_interrupt_callback_contract_mod = xenia_interrupt_callback_contract_mod,
-        .xenia_kernel_export_map_mod = xenia_kernel_export_map_mod,
-        .xenia_launch_assist_contract_mod = xenia_launch_assist_contract_mod,
-        .xenia_pm4_contract_mod = xenia_pm4_contract_mod,
-        .xenia_prelaunch_audit_contract_mod = xenia_prelaunch_audit_contract_mod,
-        .xenia_primitive_contract_mod = xenia_primitive_contract_mod,
-        .xenia_provisioning_contract_mod = xenia_provisioning_contract_mod,
-        .xenia_shader_storage_contract_mod = xenia_shader_storage_contract_mod,
-        .xenia_surface_path_contract_mod = xenia_surface_path_contract_mod,
-        .xenia_texture_format_contract_mod = xenia_texture_format_contract_mod,
-        .xenia_vd_swap_contract_mod = xenia_vd_swap_contract_mod,
-        .xenia_wait_graph_contract_mod = xenia_wait_graph_contract_mod,
+        .console_interrupt_callback_contract_mod = console_interrupt_callback_contract_mod,
+        .console_kernel_export_map_mod = console_kernel_export_map_mod,
+        .console_launch_assist_contract_mod = console_launch_assist_contract_mod,
+        .console_pm4_contract_mod = console_pm4_contract_mod,
+        .console_prelaunch_audit_contract_mod = console_prelaunch_audit_contract_mod,
+        .host_primitive_route_contract_mod = host_primitive_route_contract_mod,
+        .console_provisioning_contract_mod = console_provisioning_contract_mod,
+        .guest_shader_storage_contract_mod = guest_shader_storage_contract_mod,
+        .host_surface_path_contract_mod = host_surface_path_contract_mod,
+        .console_texture_format_contract_mod = console_texture_format_contract_mod,
+        .console_vd_swap_contract_mod = console_vd_swap_contract_mod,
+        .console_wait_graph_contract_mod = console_wait_graph_contract_mod,
         .xenia_wait_handshake_policy_mod = xenia_wait_handshake_policy_mod,
-        .xenia_xiso_format_mod = xenia_xiso_format_mod,
+        .console_xiso_format_mod = console_xiso_format_mod,
     });
 
     // Aggregate Win32 ABI handshake suite
@@ -2311,9 +2311,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .target = target,
         .rosette_translation_cache_contract_mod = rosette_translation_cache_contract_mod,
-        .xenia_guest_endian_x86_mod = xenia_guest_endian_x86_mod,
-        .xenia_guest_endian_arm64_mod = xenia_guest_endian_arm64_mod,
-        .xenia_guest_endian_ppc_mod = xenia_guest_endian_ppc_mod,
+        .host_x86_guest_endian_mod = host_x86_guest_endian_mod,
+        .host_arm64_guest_endian_mod = host_arm64_guest_endian_mod,
+        .host_ppc64_guest_endian_mod = host_ppc64_guest_endian_mod,
         .endianness_x86_mod = endianness_x86_mod,
         .endianness_arm64_mod = endianness_arm64_mod,
         .endianness_ppc_mod = endianness_ppc_mod,
