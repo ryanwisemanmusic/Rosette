@@ -4,7 +4,7 @@
 //! place where the framework selects the immutable observation envelope before
 //! Mach-O state, Xenia adapters, or the PM4 executor are constructed.
 
-const contract = @import("xenia_gpu_observation_contract");
+const contract = @import("console_gpu_observation_contract");
 
 pub const profile = struct {
     pub const schema_version = contract.schema_version;
