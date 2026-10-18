@@ -3,16 +3,16 @@ set -euo pipefail
 
 package_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 zig_bin="${ZIG:-zig}"
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/xenia-x86-wait-contract.XXXXXX")"
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/host-x86-wait-contract.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 
-echo "xenia-x86-wait-contract: native tests"
+echo "host-x86-wait-contract: native tests"
 "$zig_bin" test \
     --cache-dir "$tmp_dir/native-cache" \
     --global-cache-dir "$tmp_dir/global-cache" \
     "$package_dir/src/root.zig"
 
-echo "xenia-x86-wait-contract: compile-only target matrix"
+echo "host-x86-wait-contract: compile-only target matrix"
 for target_name in x86_64-freestanding powerpc64-freestanding aarch64-freestanding; do
     output="$tmp_dir/${target_name}.a"
     "$zig_bin" build-lib "$package_dir/src/root.zig" \
@@ -26,4 +26,4 @@ for target_name in x86_64-freestanding powerpc64-freestanding aarch64-freestandi
     echo "  verified $target_name"
 done
 
-echo "xenia-x86-wait-contract: PASS"
+echo "host-x86-wait-contract: PASS"
