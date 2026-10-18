@@ -1,6 +1,8 @@
-//! Immutable Xenia graphics handoff facts for the ARM64 host route.
+//! Immutable graphics handoff facts for the ARM64 host route, plus reusable
+//! validation for argument masks and ordered event dependencies.
 
 const std = @import("std");
+const handoff_policy = @import("handoff_policy.zig");
 
 pub const host_architecture = "arm64";
 pub const guest_pointer_bits: u8 = 32;
@@ -29,8 +31,13 @@ pub const required_argument_mask: u8 = argumentBit(.buffer_ptr) |
     argumentBit(.width) |
     argumentBit(.height);
 
+/// Check that a caller-provided bit set contains every required field.
+pub fn requiredBitsPresent(observed: u64, required: u64) bool {
+    return handoff_policy.requiredBitsPresent(observed, required);
+}
+
 pub fn requiredArgumentsPresent(observed: u8) bool {
-    return observed & required_argument_mask == required_argument_mask;
+    return requiredBitsPresent(observed, required_argument_mask);
 }
 
 pub const HandoffStage = enum(u8) {
@@ -75,6 +82,12 @@ fn stageBit(stage: HandoffStage) u16 {
     return @as(u16, 1) << @as(u4, @intCast(@intFromEnum(stage)));
 }
 
+/// Validate a partial order over any enum-backed event chain. An observed
+/// successor requires its predecessor; unrelated events remain independent.
+pub fn dependenciesPreserved(observed: u16, edges: anytype) bool {
+    return handoff_policy.dependenciesPreserved(observed, edges);
+}
+
 pub fn classifyHandoff(observed: u16) HandoffVerdict {
     if (!handoffOrderValid(observed)) return .ordering_violation;
     if (observed & stageBit(.guest_vdswap_entered) == 0) return .guest_vdswap_missing;
@@ -89,10 +102,7 @@ pub fn classifyHandoff(observed: u16) HandoffVerdict {
 }
 
 pub fn handoffOrderValid(observed: u16) bool {
-    for (handoff_edges) |edge| {
-        if (observed & stageBit(edge.to) != 0 and observed & stageBit(edge.from) == 0) return false;
-    }
-    return true;
+    return dependenciesPreserved(observed, handoff_edges);
 }
 
 pub fn contractIsWellFormed() bool {
