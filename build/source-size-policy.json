@@ -7,7 +7,7 @@
     "ISA/Math/x86/Zig/root.zig": 3655,
     "ISA/decoding/vex.zig": 5021,
     "ISA/x86/Zig/root.zig": 3348,
-    "build/build.zig": 2500,
+    "build.zig": 2500,
     "lib/Mach-O/process.zig": 9610,
     "lib/Mach-O/process/graphics_health.zig": 3519,
     "lib/linker/dyld/dynamic_library_forwarder.zig": 7556,
