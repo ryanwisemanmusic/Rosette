@@ -1,4 +1,4 @@
-name = "xenia-x86-input-driver"
+name = "host-x86-input-driver"
 version = "0.1.0-local"
 kind = "host-input-driver-contract"
 role = "build-time"
