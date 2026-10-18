@@ -10,7 +10,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--install")) {
         if (args.len < 4) return usage(args[0]);
-        try installApp(init.io, allocator, args[2], args[3]);
+        try installApp(init.io, allocator, args[2], args[3], args[4..]);
         return;
     }
 
@@ -22,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--configure")) {
         if (args.len < 3) return usage(args[0]);
-        try configureInstall(init.io, allocator, args[2]);
+        try configureInstall(init.io, allocator, args[2], args[3..]);
         return;
     }
 
@@ -40,17 +40,23 @@ fn usage(exe_name: []const u8) void {
         \\Rosette installer helper
         \\
         \\Usage:
-        \\  {s} --install <payload-Rosette.app> <destination-directory>
+        \\  {s} --install <payload-Rosette.app> <destination-directory> [id:version:sha256 ...]
         \\  {s} --copy <payload-Rosette.app> <destination-directory>
-        \\  {s} --configure <installed-Rosette.app>
+        \\  {s} --configure <installed-Rosette.app> [id:version:sha256 ...]
         \\  {s} --register <installed-Rosette.app>
         \\
     , .{ exe_name, exe_name, exe_name, exe_name });
 }
 
-fn installApp(io: std.Io, allocator: std.mem.Allocator, payload_app: []const u8, destination_dir: []const u8) !void {
+fn installApp(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    payload_app: []const u8,
+    destination_dir: []const u8,
+    package_specs: []const []const u8,
+) !void {
     const target_app = try copyPayload(io, allocator, payload_app, destination_dir);
-    try configureInstall(io, allocator, target_app);
+    try configureInstall(io, allocator, target_app, package_specs);
     std.debug.print("Installation complete: {s}\n", .{target_app});
     std.debug.print("Try from an assignment folder: make run or ./program\n", .{});
 }
@@ -76,7 +82,12 @@ fn copyPayload(io: std.Io, allocator: std.mem.Allocator, payload_app: []const u8
     return target_app;
 }
 
-fn configureInstall(io: std.Io, allocator: std.mem.Allocator, target_app: []const u8) !void {
+fn configureInstall(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    target_app: []const u8,
+    package_specs: []const []const u8,
+) !void {
     std.debug.print("Registering file associations...\n", .{});
     registerApp(io, target_app) catch |err| {
         std.debug.print("Finder registration skipped: {s}\n", .{@errorName(err)});
@@ -89,6 +100,37 @@ fn configureInstall(io: std.Io, allocator: std.mem.Allocator, target_app: []cons
     std.debug.print("  installing ~/.rosette/bin/rosette-router for traced Rosetta 2 fallback routing\n", .{});
     std.debug.print("  installing default ~/.rosette/config.toml with dump_results=\"auto\"\n", .{});
     try installShell(io, allocator, target_app);
+    installOptionalPackages(io, allocator, target_app, package_specs) catch |err| {
+        std.debug.print("Optional package installation did not complete: {s}\n", .{@errorName(err)});
+    };
+}
+
+fn installOptionalPackages(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    app_path: []const u8,
+    package_specs: []const []const u8,
+) !void {
+    if (package_specs.len == 0) return;
+
+    const manager = try std.fs.path.join(allocator, &.{
+        app_path,
+        "Contents",
+        "Resources",
+        "rosette-runtime",
+        "pkg",
+        "registry",
+        "rosette-package-manager.sh",
+    });
+    if (!pathExists(allocator, manager)) return error.MissingPackageManager;
+
+    const argv = try allocator.alloc([]const u8, package_specs.len + 3);
+    argv[0] = "/bin/bash";
+    argv[1] = manager;
+    argv[2] = "install-selected";
+    @memcpy(argv[3..], package_specs);
+    std.debug.print("Installing {d} selected Rosette package(s)...\n", .{package_specs.len});
+    try runCmd(io, argv);
 }
 
 fn installShell(io: std.Io, allocator: std.mem.Allocator, app_path: []const u8) !void {
@@ -112,6 +154,8 @@ fn verifyPayload(payload_app: []const u8, allocator: std.mem.Allocator) !void {
         "Contents/Resources/rosette-runtime/GNUmakefile",
         "Contents/Resources/rosette-runtime/src/shell/global_config/rosette_shell.zig",
         "Contents/Resources/rosette-runtime/ELF_processor/process.zig",
+        "Contents/Resources/rosette-runtime/pkg/registry/rosette-package-manager.sh",
+        "Contents/Resources/rosette-runtime/pkg/registry/package-index-url.txt",
     };
 
     for (required) |relative| {

@@ -2,9 +2,10 @@
 
 typedef NS_ENUM(NSInteger, InstallerStep) {
     InstallerStepDestination = 0,
-    InstallerStepSummary = 1,
-    InstallerStepInstalling = 2,
-    InstallerStepDone = 3,
+    InstallerStepPackages = 1,
+    InstallerStepSummary = 2,
+    InstallerStepInstalling = 3,
+    InstallerStepDone = 4,
 };
 
 @interface InstallerDelegate : NSObject <NSApplicationDelegate>
@@ -14,6 +15,11 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
 @property(nonatomic, strong) NSTextField *destinationLabel;
 @property(nonatomic, strong) NSTextField *destinationField;
 @property(nonatomic, strong) NSButton *chooseButton;
+@property(nonatomic, strong) NSScrollView *packageScroll;
+@property(nonatomic, strong) NSTextField *packageStatus;
+@property(nonatomic, strong) NSButton *packageRefreshButton;
+@property(nonatomic, strong) NSMutableArray<NSDictionary *> *packageCatalog;
+@property(nonatomic, strong) NSMutableArray<NSButton *> *packageCheckboxes;
 @property(nonatomic, strong) NSTextField *summaryText;
 @property(nonatomic, strong) NSTextField *statusText;
 @property(nonatomic, strong) NSProgressIndicator *progress;
@@ -23,12 +29,16 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
 @property(nonatomic, strong) NSTimer *progressTimer;
 @property(nonatomic) InstallerStep step;
 @property(nonatomic) double progressTarget;
+@property(nonatomic) BOOL packageCatalogLoaded;
+@property(nonatomic) BOOL packageCatalogLoading;
 @end
 
 @implementation InstallerDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     (void)notification;
+    self.packageCatalog = [NSMutableArray array];
+    self.packageCheckboxes = [NSMutableArray array];
     [self buildMenuBar];
     [self buildWindow];
     [self showDestinationStep];
@@ -81,6 +91,24 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
     [self.chooseButton setTarget:self];
     [self.chooseButton setAction:@selector(chooseDestination:)];
     [content addSubview:self.chooseButton];
+
+    self.packageScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(32, 82, 534, 178)];
+    [self.packageScroll setHasVerticalScroller:YES];
+    [self.packageScroll setBorderType:NSBezelBorder];
+    [self.packageScroll setHidden:YES];
+    [content addSubview:self.packageScroll];
+
+    self.packageStatus = [self label:@"Loading optional package catalog..." frame:NSMakeRect(32, 266, 410, 22) fontSize:12.0 bold:NO];
+    [self.packageStatus setHidden:YES];
+    [content addSubview:self.packageStatus];
+
+    self.packageRefreshButton = [[NSButton alloc] initWithFrame:NSMakeRect(450, 262, 116, 28)];
+    [self.packageRefreshButton setTitle:@"Refresh List"];
+    [self.packageRefreshButton setBezelStyle:NSBezelStyleRounded];
+    [self.packageRefreshButton setTarget:self];
+    [self.packageRefreshButton setAction:@selector(refreshPackageCatalog:)];
+    [self.packageRefreshButton setHidden:YES];
+    [content addSubview:self.packageRefreshButton];
 
     self.summaryText = [self label:@"" frame:NSMakeRect(32, 112, 534, 150) fontSize:13.0 bold:NO];
     [self.summaryText setLineBreakMode:NSLineBreakByWordWrapping];
@@ -147,12 +175,42 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
     [self.destinationField setEnabled:YES];
     [self.chooseButton setHidden:NO];
     [self.chooseButton setEnabled:YES];
+    [self.packageScroll setHidden:YES];
+    [self.packageStatus setHidden:YES];
+    [self.packageRefreshButton setHidden:YES];
     [self.backButton setHidden:YES];
     [self.cancelButton setHidden:NO];
     [self.nextButton setHidden:NO];
     [self.nextButton setEnabled:YES];
     [self.nextButton setTitle:@"Next"];
     [self.nextButton setAction:@selector(goNext:)];
+}
+
+- (void)showPackagesStep {
+    self.step = InstallerStepPackages;
+    [self.titleLabel setStringValue:@"Optional Packages"];
+    [self.subtitleLabel setStringValue:@"Choose any published Rosette packages to install alongside the core app."];
+    [self.summaryText setHidden:YES];
+    [self.statusText setHidden:YES];
+    [self.progress setHidden:YES];
+    [self.destinationLabel setHidden:YES];
+    [self.destinationField setHidden:YES];
+    [self.chooseButton setHidden:YES];
+    [self.packageScroll setHidden:NO];
+    [self.packageStatus setHidden:NO];
+    [self.packageRefreshButton setHidden:NO];
+    [self.packageRefreshButton setEnabled:!self.packageCatalogLoading];
+    [self.backButton setHidden:NO];
+    [self.backButton setEnabled:YES];
+    [self.cancelButton setHidden:NO];
+    [self.nextButton setHidden:NO];
+    [self.nextButton setEnabled:YES];
+    [self.nextButton setTitle:@"Next"];
+    [self.nextButton setAction:@selector(goNext:)];
+
+    if (!self.packageCatalogLoaded && !self.packageCatalogLoading) {
+        [self loadPackageCatalog];
+    }
 }
 
 - (void)showSummaryStep {
@@ -164,21 +222,29 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
     NSString *authLine = [self shouldUseAuthorizationForDestination:destination]
         ? @"macOS will ask for an administrator password before files are copied."
         : @"This location appears writable, so administrator authorization may not be needed.";
+    NSArray<NSString *> *selectedPackages = [self selectedPackageIDs];
+    NSString *packageLine = selectedPackages.count > 0
+        ? [NSString stringWithFormat:@"Optional packages: %@", [selectedPackages componentsJoinedByString:@", "]]
+        : @"Optional packages: none selected (the core app installs by itself).";
 
     [self.titleLabel setStringValue:@"Installation Summary"];
     [self.subtitleLabel setStringValue:@"Rosette is ready to install."];
     [self.summaryText setStringValue:[NSString stringWithFormat:
-        @"Rosette will be installed at:\n%@\n\nSpace required: %@\nAvailable space: %@\n\n%@\n\nThe installer will also enable Rosette's global shell integration: the rosette command, make-time x86-64 ELF handling, direct ./program launches, automatic assignment result summaries, and traced Rosetta 2 fallback routing.",
+        @"Rosette will be installed at:\n%@\n\nSpace required: %@\nAvailable space: %@\n\n%@\n%@\n\nThe installer will also enable Rosette's global shell integration: the rosette command, make-time x86-64 ELF handling, direct ./program launches, automatic assignment result summaries, and traced Rosetta 2 fallback routing.",
         target,
         [self formatBytes:required],
         available == 0 ? @"Unknown" : [self formatBytes:available],
-        authLine]];
+        authLine,
+        packageLine]];
     [self.summaryText setHidden:NO];
     [self.statusText setHidden:YES];
     [self.progress setHidden:YES];
     [self.destinationLabel setHidden:YES];
     [self.destinationField setHidden:YES];
     [self.chooseButton setHidden:YES];
+    [self.packageScroll setHidden:YES];
+    [self.packageStatus setHidden:YES];
+    [self.packageRefreshButton setHidden:YES];
     [self.backButton setHidden:NO];
     [self.backButton setEnabled:YES];
     [self.cancelButton setHidden:NO];
@@ -198,6 +264,9 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
     [self.destinationLabel setHidden:YES];
     [self.destinationField setHidden:YES];
     [self.chooseButton setHidden:YES];
+    [self.packageScroll setHidden:YES];
+    [self.packageStatus setHidden:YES];
+    [self.packageRefreshButton setHidden:YES];
     [self.progress setDoubleValue:0.0];
     [self.progress setHidden:NO];
     [self.backButton setHidden:YES];
@@ -216,6 +285,9 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
     [self.statusText setStringValue:message.length > 0 ? message : @"Rosette is ready to use from Finder's Open With menu."];
     [self.statusText setHidden:NO];
     [self.summaryText setHidden:YES];
+    [self.packageScroll setHidden:YES];
+    [self.packageStatus setHidden:YES];
+    [self.packageRefreshButton setHidden:YES];
     [self.progress setHidden:NO];
     [self.backButton setHidden:YES];
     [self.cancelButton setHidden:YES];
@@ -229,6 +301,9 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
     [self.progressTimer invalidate];
     self.progressTimer = nil;
     [self.progress setHidden:YES];
+    [self.packageScroll setHidden:YES];
+    [self.packageStatus setHidden:YES];
+    [self.packageRefreshButton setHidden:YES];
     [self.statusText setHidden:NO];
     [self.statusText setStringValue:message.length > 0 ? message : @"Installation failed."];
     [self.titleLabel setStringValue:@"Installation Failed"];
@@ -254,17 +329,194 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
     }];
 }
 
+- (void)refreshPackageCatalog:(id)sender {
+    (void)sender;
+    self.packageCatalogLoaded = NO;
+    [self.packageCatalog removeAllObjects];
+    [self rebuildPackageCheckboxes];
+    [self loadPackageCatalog];
+}
+
+- (NSURL *)packageIndexURL {
+    NSString *payload = [self payloadPath];
+    NSString *indexPath = [payload stringByAppendingPathComponent:
+        @"Contents/Resources/rosette-runtime/pkg/registry/package-index-url.txt"];
+    NSString *configured = [NSString stringWithContentsOfFile:indexPath
+                                                      encoding:NSUTF8StringEncoding
+                                                         error:nil];
+    NSString *value = [configured stringByTrimmingCharactersInSet:
+        [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSURL *url = value.length > 0 ? [NSURL URLWithString:value] : nil;
+    if (url == nil || url.host.length == 0) return nil;
+    return [[url scheme] caseInsensitiveCompare:@"https"] == NSOrderedSame ? url : nil;
+}
+
+- (void)loadPackageCatalog {
+    if (self.packageCatalogLoading) return;
+    NSURL *url = [self packageIndexURL];
+    if (url == nil) {
+        self.packageCatalogLoaded = YES;
+        [self.packageStatus setStringValue:@"No valid HTTPS package catalog is configured. The core install is ready."];
+        [self rebuildPackageCheckboxes];
+        return;
+    }
+
+    self.packageCatalogLoading = YES;
+    [self.packageRefreshButton setEnabled:NO];
+    [self.packageStatus setStringValue:@"Checking the Rosette release catalog..."];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url
+        cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+        timeoutInterval:20.0];
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession]
+        dataTaskWithRequest:request
+        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            NSMutableArray<NSDictionary *> *rows = [NSMutableArray array];
+            NSString *message = nil;
+            if (error != nil) {
+                message = [NSString stringWithFormat:
+                    @"Could not load optional packages (%@). The core install is still available; use Refresh List to retry.",
+                    error.localizedDescription];
+            } else if (![response isKindOfClass:[NSHTTPURLResponse class]]) {
+                message = @"The package catalog returned an invalid response. The core install is still available.";
+            } else if ([response URL].host.length == 0 ||
+                       [[[response URL] scheme] caseInsensitiveCompare:@"https"] != NSOrderedSame) {
+                message = @"The package catalog redirected to a non-HTTPS address and was rejected.";
+            } else {
+                NSInteger status = [(NSHTTPURLResponse *)response statusCode];
+                if (status == 404) {
+                    message = @"No optional packages have been published yet. The core Rosette install is ready.";
+                } else if (status != 200) {
+                    message = [NSString stringWithFormat:
+                        @"The package catalog returned HTTP %ld. The core install is still available; use Refresh List to retry.",
+                        (long)status];
+                } else if (data.length > 1024 * 1024) {
+                    message = @"The package catalog is larger than 1 MiB and was rejected.";
+                } else {
+                    NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                    if (text == nil) {
+                        message = @"The package catalog is not UTF-8 text. The core install is still available.";
+                    } else {
+                        NSMutableSet<NSString *> *seen = [NSMutableSet set];
+                        NSCharacterSet *hex = [NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdefABCDEF"];
+                        NSPredicate *idPattern = [NSPredicate predicateWithFormat:
+                            @"SELF MATCHES %@", @"[a-z0-9][a-z0-9._-]{0,127}"];
+                        NSPredicate *versionPattern = [NSPredicate predicateWithFormat:
+                            @"SELF MATCHES %@", @"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"];
+                        for (NSString *rawLine in [text componentsSeparatedByCharactersInSet:
+                            [NSCharacterSet newlineCharacterSet]]) {
+                            NSString *line = [rawLine stringByTrimmingCharactersInSet:
+                                [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                            if (line.length == 0 || [line hasPrefix:@"#"]) continue;
+                            NSArray<NSString *> *fields = [line componentsSeparatedByString:@"\t"];
+                            if (fields.count != 5 || ![idPattern evaluateWithObject:fields[0]] ||
+                                ![versionPattern evaluateWithObject:fields[1]] ||
+                                fields[2].length != 64 || [fields[2] rangeOfCharacterFromSet:
+                                    [hex invertedSet]].location != NSNotFound ||
+                                fields[3].length == 0) {
+                                message = @"The package catalog contains a malformed row and was rejected.";
+                                [rows removeAllObjects];
+                                break;
+                            }
+                            NSURL *assetURL = [NSURL URLWithString:fields[3]];
+                            if (assetURL == nil || assetURL.host.length == 0 ||
+                                [[assetURL scheme] caseInsensitiveCompare:@"https"] != NSOrderedSame ||
+                                [seen containsObject:fields[0]]) {
+                                message = @"The package catalog contains a duplicate ID or non-HTTPS asset and was rejected.";
+                                [rows removeAllObjects];
+                                break;
+                            }
+                            [seen addObject:fields[0]];
+                            [rows addObject:@{
+                                @"id": fields[0],
+                                @"version": fields[1],
+                                @"sha256": fields[2],
+                                @"url": fields[3],
+                                @"description": fields[4].length > 0 ? fields[4] : fields[0],
+                            }];
+                            if (rows.count > 200) {
+                                message = @"The package catalog exceeds the 200 package limit and was rejected.";
+                                [rows removeAllObjects];
+                                break;
+                            }
+                        }
+                        if (message == nil) {
+                            message = rows.count > 0
+                                ? @"Select optional packages to install. Checksums are verified before extraction."
+                                : @"No optional packages have been published yet. The core Rosette install is ready.";
+                        }
+                    }
+                }
+            }
+
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self.packageCatalog removeAllObjects];
+                [self.packageCatalog addObjectsFromArray:rows];
+                self.packageCatalogLoading = NO;
+                self.packageCatalogLoaded = YES;
+                [self.packageRefreshButton setEnabled:YES];
+                [self.packageStatus setStringValue:message ?: @"The core Rosette install is ready."];
+                [self rebuildPackageCheckboxes];
+            });
+        }];
+    [task resume];
+}
+
+- (void)rebuildPackageCheckboxes {
+    [self.packageCheckboxes removeAllObjects];
+    CGFloat rowHeight = 34.0;
+    CGFloat contentHeight = MAX(rowHeight, self.packageCatalog.count * rowHeight);
+    NSView *document = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 510, contentHeight)];
+    for (NSUInteger index = 0; index < self.packageCatalog.count; index++) {
+        NSDictionary *package = self.packageCatalog[index];
+        CGFloat y = contentHeight - ((index + 1) * rowHeight);
+        NSButton *checkbox = [[NSButton alloc] initWithFrame:NSMakeRect(8, y, 486, 28)];
+        [checkbox setButtonType:NSButtonTypeSwitch];
+        [checkbox setTitle:[NSString stringWithFormat:@"%@ %@ — %@",
+            package[@"id"], package[@"version"], package[@"description"]]];
+        [checkbox setState:NSControlStateValueOff];
+        [document addSubview:checkbox];
+        [self.packageCheckboxes addObject:checkbox];
+    }
+    [self.packageScroll setDocumentView:document];
+}
+
+- (NSArray<NSString *> *)selectedPackageIDs {
+    NSMutableArray<NSString *> *selected = [NSMutableArray array];
+    for (NSUInteger index = 0; index < self.packageCheckboxes.count && index < self.packageCatalog.count; index++) {
+        if ([self.packageCheckboxes[index] state] == NSControlStateValueOn) {
+            [selected addObject:self.packageCatalog[index][@"id"]];
+        }
+    }
+    return selected;
+}
+
+- (NSArray<NSString *> *)selectedPackageSpecs {
+    NSMutableArray<NSString *> *selected = [NSMutableArray array];
+    for (NSUInteger index = 0; index < self.packageCheckboxes.count && index < self.packageCatalog.count; index++) {
+        if ([self.packageCheckboxes[index] state] == NSControlStateValueOn) {
+            NSDictionary *package = self.packageCatalog[index];
+            [selected addObject:[NSString stringWithFormat:@"%@:%@:%@",
+                package[@"id"], package[@"version"], package[@"sha256"]]];
+        }
+    }
+    return selected;
+}
+
 - (void)goNext:(id)sender {
     (void)sender;
     if (self.step == InstallerStepDestination) {
+        [self showPackagesStep];
+    } else if (self.step == InstallerStepPackages) {
         [self showSummaryStep];
     }
 }
 
 - (void)goBack:(id)sender {
     (void)sender;
-    if (self.step == InstallerStepSummary) {
+    if (self.step == InstallerStepPackages) {
         [self showDestinationStep];
+    } else if (self.step == InstallerStepSummary) {
+        [self showPackagesStep];
     } else {
         [self showSummaryStep];
     }
@@ -302,10 +554,11 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
 }
 
 - (void)runDirectInstallWithHelper:(NSString *)helper payload:(NSString *)payload destination:(NSString *)destination {
+    NSArray<NSString *> *packageSpecs = [self selectedPackageSpecs];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSTask *task = [[NSTask alloc] init];
         [task setExecutableURL:[NSURL fileURLWithPath:helper]];
-        [task setArguments:@[ @"--install", payload, destination ]];
+        [task setArguments:[[ @[ @"--install", payload, destination ] arrayByAddingObjectsFromArray:packageSpecs ] copy]];
         NSPipe *pipe = [NSPipe pipe];
         [task setStandardOutput:pipe];
         [task setStandardError:pipe];
@@ -372,7 +625,7 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
             [[NSFileManager defaultManager] removeItemAtPath:marker error:nil];
             if (status == 0) {
                 [self.statusText setStringValue:@"Copy complete. Registering Rosette and installing per-user shell integration..."];
-                [self runDirectConfigureWithHelper:helper destination:destination copyOutput:output];
+                [self runDirectConfigureWithHelper:helper destination:destination copyOutput:output packageSpecs:[self selectedPackageSpecs]];
             } else {
                 [self showError:output.length > 0 ? output : @"Administrator authorization was cancelled or failed."];
             }
@@ -380,12 +633,12 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
     });
 }
 
-- (void)runDirectConfigureWithHelper:(NSString *)helper destination:(NSString *)destination copyOutput:(NSString *)copyOutput {
+- (void)runDirectConfigureWithHelper:(NSString *)helper destination:(NSString *)destination copyOutput:(NSString *)copyOutput packageSpecs:(NSArray<NSString *> *)packageSpecs {
     NSString *target = [destination stringByAppendingPathComponent:@"Rosette.app"];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSTask *task = [[NSTask alloc] init];
         [task setExecutableURL:[NSURL fileURLWithPath:helper]];
-        [task setArguments:@[ @"--configure", target ]];
+        [task setArguments:[[ @[ @"--configure", target ] arrayByAddingObjectsFromArray:packageSpecs ] copy]];
         NSPipe *pipe = [NSPipe pipe];
         [task setStandardOutput:pipe];
         [task setStandardError:pipe];

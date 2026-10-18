@@ -125,14 +125,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const xenia_fatal_condition_map_module = b.createModule(.{
-        .root_source_file = b.path("../../pkg/common/xenia/fatal-condition-map/src/root.zig"),
+        .root_source_file = b.path("../../pkg/common/console/fatal-condition-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     xenia_fatal_condition_map_module.addImport("phrase_filter", phrase_filter_module);
     // Whether a Xenia warning-level line is a finding at all.
     const xenia_warning_severity_map_module = b.createModule(.{
-        .root_source_file = b.path("../../pkg/common/xenia/warning-severity-map/src/root.zig"),
+        .root_source_file = b.path("../../pkg/common/console/warning-severity-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -140,7 +140,7 @@ pub fn build(b: *std.Build) void {
     // What a Xenia symbol name means, so a report can say what the guest is
     // doing at an address rather than only where it is.
     const xenia_guest_frontier_map_module = b.createModule(.{
-        .root_source_file = b.path("../../pkg/common/xenia/guest-frontier-map/src/root.zig"),
+        .root_source_file = b.path("../../pkg/common/console/guest-frontier-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -166,26 +166,26 @@ pub fn build(b: *std.Build) void {
     });
     // What a guest address is, independent of the route that reached it.
     const xenia_guest_address_map_module = b.createModule(.{
-        .root_source_file = b.path("../../pkg/common/xenia/guest-address-map/src/root.zig"),
+        .root_source_file = b.path("../../pkg/common/console/guest-address-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     // The Xenia functions whose first entry answers a question no counter of
     // Rosette's own surface can: whether the title ever produced a frame.
     const xenia_guest_milestone_map_module = b.createModule(.{
-        .root_source_file = b.path("../../pkg/common/xenia/guest-milestone-map/src/root.zig"),
+        .root_source_file = b.path("../../pkg/common/console/guest-milestone-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     // Xenia's kernel export shims, and the console's export tables they are
-    // joined against. See pkg/common/xenia/kernel-shim-map.
+    // joined against. See pkg/common/console/kernel-shim-map.
     const xenia_kernel_shim_map_module = b.createModule(.{
-        .root_source_file = b.path("../../pkg/common/xenia/kernel-shim-map/src/root.zig"),
+        .root_source_file = b.path("../../pkg/common/console/kernel-shim-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     const xenia_kernel_export_map_module = b.createModule(.{
-        .root_source_file = b.path("../../pkg/common/xenia/kernel-export-map/src/root.zig"),
+        .root_source_file = b.path("../../pkg/common/console/kernel-export-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -744,7 +744,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const windows_ppc_routing_module = b.createModule(.{
-        .root_source_file = b.path("../../pkg/PPC/xenia/runtime/instruction-routing/src/root.zig"),
+        .root_source_file = b.path("../../pkg/PPC/console/runtime/instruction-routing/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -768,7 +768,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const windows_heap_range_module = b.createModule(.{
-        .root_source_file = b.path("../../pkg/ARM64/xenia/memory/heap-range/src/root.zig"),
+        .root_source_file = b.path("../../pkg/ARM64/console/memory/heap-range/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -778,12 +778,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const windows_launch_assist_contract_module = b.createModule(.{
-        .root_source_file = b.path("../../pkg/common/xenia/launch-assist-contract/src/root.zig"),
+        .root_source_file = b.path("../../pkg/common/console/launch-assist-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     const windows_host_gpu_callback_contract_module = b.createModule(.{
-        .root_source_file = b.path("../../pkg/common/xenia/host-gpu-callback-contract/src/root.zig"),
+        .root_source_file = b.path("../../pkg/common/console/host-gpu-callback-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1015,6 +1015,7 @@ pub fn build(b: *std.Build) void {
         .{ .source = "../../lib/processor/bat_processor", .destination = "bat_processor" },
         .{ .source = "../../include", .destination = "include" },
         .{ .source = "../../lib/processor/ps1_processor", .destination = "ps1_processor" },
+        .{ .source = "../../pkg/registry", .destination = "pkg/registry" },
         .{ .source = "../../include/scripts", .destination = "scripts" },
         .{ .source = "../../src", .destination = "src" },
         .{ .source = "../../test", .destination = "test" },
