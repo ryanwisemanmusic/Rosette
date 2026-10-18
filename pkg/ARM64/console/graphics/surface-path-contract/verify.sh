@@ -3,13 +3,13 @@ set -euo pipefail
 
 package_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 zig_bin="${ZIG:-zig}"
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/xenia-arm64-surface-path-contract.XXXXXX")"
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/host-arm64-surface-path-contract.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 
-echo "xenia-arm64-surface-path-contract: native tests"
+echo "host-arm64-surface-path-contract: native tests"
 "$zig_bin" test --cache-dir "$tmp_dir/native-cache" --global-cache-dir "$tmp_dir/native-global-cache" "$package_dir/src/root.zig"
-echo "xenia-arm64-surface-path-contract: arm64 compile-only check"
+echo "host-arm64-surface-path-contract: arm64 compile-only check"
 output="$tmp_dir/arm64-freestanding.a"
 "$zig_bin" build-lib "$package_dir/src/root.zig" --cache-dir "$tmp_dir/target-cache" --global-cache-dir "$tmp_dir/target-global-cache" -target aarch64-freestanding -O Debug -femit-bin="$output" >/dev/null
 test -s "$output"
-echo "xenia-arm64-surface-path-contract: PASS"
+echo "host-arm64-surface-path-contract: PASS"

@@ -4,7 +4,7 @@
 //! definitions are effects of the current JIT buffer and therefore belong to
 //! the runtime library.
 
-const codegen = @import("xenia_codegen_activation");
+const codegen = @import("host_codegen_activation_contract");
 
 pub const max_labels = codegen.max_labels;
 pub const LabelId = codegen.LabelId;

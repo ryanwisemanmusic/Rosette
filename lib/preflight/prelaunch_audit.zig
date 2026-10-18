@@ -25,7 +25,7 @@
 //! names, so its decisions are testable without a seventy-megabyte binary.
 
 const std = @import("std");
-const contract = @import("xenia_prelaunch_audit_contract");
+const contract = @import("console_prelaunch_audit_contract");
 
 pub const Stage = contract.Stage;
 pub const StageFacts = contract.StageFacts;
@@ -180,7 +180,7 @@ test "stage fingerprints separate two builds that differ in one subsystem" {
     // like a command-processor method and is deliberately classified as
     // `swap`, because the swap boundary is asked before the command processor
     // — so using it here would measure the wrong stage's fingerprint.
-    try std.testing.expectEqual(Stage.swap, @import("xenia_prelaunch_audit_contract").classify("xe::gpu::CommandProcessor::IssueSwap"));
+    try std.testing.expectEqual(Stage.swap, @import("console_prelaunch_audit_contract").classify("xe::gpu::CommandProcessor::IssueSwap"));
 
     var first = Auditor.init();
     first.observe("xe::gpu::CommandProcessor::ExecutePacket", 0x3000);

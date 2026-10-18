@@ -103,9 +103,9 @@ const vulkanNameHash = __ForwarderInternals._vulkanNameHash;
 const writeApiVersion = __ForwarderInternals._writeApiVersion;
 const writeExtensionPropertiesArray = __ForwarderInternals._writeExtensionPropertiesArray;
 const writeSurfaceCapabilities = __ForwarderInternals._writeSurfaceCapabilities;
-const xenia_heap_range = __ForwarderInternals._xenia_heap_range;
+const host_page_range_selection_abi = __ForwarderInternals._host_page_range_selection_abi;
 const xenia_host_gpu_callback_contract = __ForwarderInternals._xenia_host_gpu_callback_contract;
-const xenia_launch_assist_contract = __ForwarderInternals._xenia_launch_assist_contract;
+const console_launch_assist_contract = __ForwarderInternals._console_launch_assist_contract;
 const SpecializationScratch = __ForwarderInternals._SpecializationScratch;
 
 pub const TestState = @import("test_state.zig").TestState;
@@ -1798,7 +1798,7 @@ test "Rosette heap selector maps guest PageEntry vectors before reading them" {
     // The selector receives a guest address in RDI. Rosetta must translate
     // that address to a host slice before the ARM64 package reads it.
     const entries_address: u64 = 0x2000;
-    state.write64(entries_address + 14 * 8, @as(u64, 1) << xenia_heap_range.page_state_shift);
+    state.write64(entries_address + 14 * 8, @as(u64, 1) << host_page_range_selection_abi.page_state_shift);
     state.regs.rdi = entries_address;
     state.regs.rsi = 16;
     state.regs.rdx = 0;
@@ -1807,7 +1807,7 @@ test "Rosette heap selector maps guest PageEntry vectors before reading them" {
     state.regs.r9 = 1;
     state.regs.rsp = 0x1000;
     state.write64(0x1008, 1); // top_down
-    state.write64(0x1010, xenia_heap_range.no_page);
+    state.write64(0x1010, host_page_range_selection_abi.no_page);
 
     try std.testing.expect(forwarder.dispatchGuestSymbol(&state, selector));
     try std.testing.expectEqual(@as(u64, 13), state.regs.rax);
@@ -1818,7 +1818,7 @@ test "Rosette heap selector maps guest PageEntry vectors before reading them" {
     state.regs.rdi = state.mem.len - 8;
     state.regs.rsi = 16;
     try std.testing.expect(forwarder.dispatchGuestSymbol(&state, selector));
-    try std.testing.expectEqual(@as(u64, xenia_heap_range.no_page), state.regs.rax);
+    try std.testing.expectEqual(@as(u64, host_page_range_selection_abi.no_page), state.regs.rax);
 }
 
 test "RTLD_DEFAULT exposes and marshals the checked Xenia framework ABI" {
@@ -1873,9 +1873,9 @@ test "RTLD_DEFAULT exposes and marshals the checked Xenia framework ABI" {
 
     state.regs.rax = 0;
     try std.testing.expect(forwarder.dispatchGuestSymbol(&state, launch_abi));
-    try std.testing.expectEqual(@as(u64, xenia_launch_assist_contract.abi_version), state.regs.rax);
+    try std.testing.expectEqual(@as(u64, console_launch_assist_contract.abi_version), state.regs.rax);
     try std.testing.expect(forwarder.dispatchGuestSymbol(&state, launch_schema));
-    try std.testing.expectEqual(@as(u64, xenia_launch_assist_contract.schema_version), state.regs.rax);
+    try std.testing.expectEqual(@as(u64, console_launch_assist_contract.schema_version), state.regs.rax);
     try std.testing.expect(forwarder.dispatchGuestSymbol(&state, callback_abi));
     try std.testing.expectEqual(@as(u64, xenia_host_gpu_callback_contract.abi_version), state.regs.rax);
     try std.testing.expect(forwarder.dispatchGuestSymbol(&state, callback_schema));
@@ -1883,14 +1883,14 @@ test "RTLD_DEFAULT exposes and marshals the checked Xenia framework ABI" {
 
     const launch_request_address: u64 = 256;
     const launch_response_address: u64 = 320;
-    const launch_request = xenia_launch_assist_contract.Request.init(
+    const launch_request = console_launch_assist_contract.Request.init(
         0x4D53_07E6,
         0x8258_2A98,
         0,
         3,
     );
     @memcpy(
-        state.mem[@intCast(launch_request_address)..][0..@sizeOf(xenia_launch_assist_contract.Request)],
+        state.mem[@intCast(launch_request_address)..][0..@sizeOf(console_launch_assist_contract.Request)],
         std.mem.asBytes(&launch_request),
     );
     state.regs.rdi = launch_request_address;
@@ -1898,14 +1898,14 @@ test "RTLD_DEFAULT exposes and marshals the checked Xenia framework ABI" {
     try std.testing.expect(forwarder.dispatchGuestSymbol(&state, launch_query));
     try std.testing.expectEqual(@as(u64, 1), state.regs.rax);
 
-    var launch_response: xenia_launch_assist_contract.Response = undefined;
+    var launch_response: console_launch_assist_contract.Response = undefined;
     @memcpy(
         std.mem.asBytes(&launch_response),
-        state.mem[@intCast(launch_response_address)..][0..@sizeOf(xenia_launch_assist_contract.Response)],
+        state.mem[@intCast(launch_response_address)..][0..@sizeOf(console_launch_assist_contract.Response)],
     );
-    try std.testing.expect(xenia_launch_assist_contract.responseIsCompatible(launch_response));
+    try std.testing.expect(console_launch_assist_contract.responseIsCompatible(launch_response));
     state.regs.rdx = 0;
-    state.regs.rcx = @intFromEnum(xenia_launch_assist_contract.ApplyStatus.not_applied);
+    state.regs.rcx = @intFromEnum(console_launch_assist_contract.ApplyStatus.not_applied);
     try std.testing.expect(forwarder.dispatchGuestSymbol(&state, launch_report));
     try std.testing.expectEqual(@as(u64, 1), state.regs.rax);
 

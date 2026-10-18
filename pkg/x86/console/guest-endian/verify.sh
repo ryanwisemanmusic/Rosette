@@ -3,7 +3,7 @@ set -euo pipefail
 
 package_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 zig_bin="${ZIG:-zig}"
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/xenia-x86-guest-endian.XXXXXX")"
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/host-x86-guest-endian.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 "$zig_bin" test "$package_dir/src/root.zig" \
@@ -18,4 +18,4 @@ for target_name in x86_64-freestanding aarch64-freestanding powerpc64-freestandi
         -femit-bin="$output" >/dev/null
     test -s "$output"
 done
-printf '%s\n' 'xenia-x86-guest-endian: PASS'
+printf '%s\n' 'host-x86-guest-endian: PASS'

@@ -1,4 +1,4 @@
-name = "common-xenia-vd-swap-contract"
+name = "common-console-vd-swap-contract"
 version = "0.1.0-local"
 kind = "console-present-handoff-contract"
 role = "build-time"

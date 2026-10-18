@@ -33,7 +33,7 @@ const tso_memory_policy = __ProcessInternals._tso_memory_policy;
 const windows_srw_owner_stack_depth = __ProcessInternals._windows_srw_owner_stack_depth;
 const x64_linux_runtime = __ProcessInternals._x64_linux_runtime;
 const xenia_event_audit = __ProcessInternals._xenia_event_audit;
-const xenia_guest_milestone_map = __ProcessInternals._xenia_guest_milestone_map;
+const console_guest_milestone_map = __ProcessInternals._console_guest_milestone_map;
 const ElfState = process.ElfState;
 const decodeInsn = __ProcessInternals._decodeInsn;
 const envU64 = __ProcessInternals._envU64;
@@ -833,7 +833,7 @@ test "a host profile trims function offsets and reports a run it sampled" {
 }
 
 test "an observation-only milestone saturates into counting, and one with a hook never does" {
-    const map = xenia_guest_milestone_map;
+    const map = console_guest_milestone_map;
     const execute_packet = comptime map.indexOf("_ZN2xe3gpu6vulkan22VulkanCommandProcessor13ExecutePacketEv").?;
     const update_write_pointer = comptime map.indexOf("_ZN2xe3gpu16CommandProcessor18UpdateWritePointerEj").?;
     try testing.expect(guestMilestoneSaturable(execute_packet));

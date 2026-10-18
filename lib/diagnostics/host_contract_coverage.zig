@@ -40,7 +40,7 @@
 //! coverage and shows a blue screen.
 
 const std = @import("std");
-const observation_contract = @import("xenia_gpu_observation_contract");
+const observation_contract = @import("console_gpu_observation_contract");
 
 pub const GuestOutputEvidence = observation_contract.GuestOutputEvidence;
 

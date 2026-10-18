@@ -17,7 +17,7 @@
 
 const std = @import("std");
 const contract = @import("xenia_texture_contract");
-const texture_format_contract = @import("xenia_texture_format_contract");
+const texture_format_contract = @import("console_texture_format_contract");
 
 pub const Error = error{
     UnsupportedConversion,

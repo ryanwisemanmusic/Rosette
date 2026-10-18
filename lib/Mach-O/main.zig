@@ -1,6 +1,6 @@
 const std = @import("std");
 const process = @import("process.zig");
-const xenia_heap_range = @import("xenia_heap_range");
+const host_page_range_selection_abi = @import("host_page_range_selection_abi");
 const _ = @import("sha1_tracer");
 const _constants = @import("macho_core").constants;
 const _types = @import("macho_core").types;
@@ -10,7 +10,7 @@ const ppc_runtime = @import("ppc_runtime");
 const ppc_host_abi = ppc_runtime.host_abi;
 const application_framework = @import("application_framework");
 const application_framework_contract = application_framework.contract;
-const xenia_launch_assist_contract = @import("xenia_launch_assist_contract");
+const console_launch_assist_contract = @import("console_launch_assist_contract");
 const xenia_host_gpu_callback_contract = @import("xenia_host_gpu_callback_contract");
 
 // Xenia resolves this optional provider with dlsym while it is hosted by the
@@ -18,7 +18,7 @@ const xenia_host_gpu_callback_contract = @import("xenia_host_gpu_callback_contra
 // intentional: exports from a merely imported child module are not guaranteed
 // to become dynamic symbols in the final process image.
 pub export fn rosette_xenia_heap_allocator_abi_version() callconv(.c) u32 {
-    return xenia_heap_range.abiVersion();
+    return host_page_range_selection_abi.abiVersion();
 }
 
 pub export fn rosette_xenia_heap_select(
@@ -31,7 +31,7 @@ pub export fn rosette_xenia_heap_select(
     top_down: u32,
     hint_page: u32,
 ) callconv(.c) u32 {
-    return xenia_heap_range.selectC(
+    return host_page_range_selection_abi.selectC(
         entries,
         total_page_count,
         low_page,
@@ -278,16 +278,16 @@ pub export fn rosette_application_framework_snapshot(
 /// proof-bearing host-startup record; the response can authorize only the
 /// package-defined host operations and never guest execution or GPU output.
 pub export fn rosette_xenia_launch_assist_abi_version() callconv(.c) u32 {
-    return xenia_launch_assist_contract.abi_version;
+    return console_launch_assist_contract.abi_version;
 }
 
 pub export fn rosette_xenia_launch_assist_schema_version() callconv(.c) u16 {
-    return xenia_launch_assist_contract.schema_version;
+    return console_launch_assist_contract.schema_version;
 }
 
 pub export fn rosette_xenia_launch_assist_query(
-    request: *const xenia_launch_assist_contract.Request,
-    response: *xenia_launch_assist_contract.Response,
+    request: *const console_launch_assist_contract.Request,
+    response: *console_launch_assist_contract.Response,
 ) callconv(.c) i32 {
     if (@intFromPtr(request) == 0 or @intFromPtr(response) == 0) return 0;
     response.* = application_framework.defaultHandle().queryXeniaLaunchAssist(request.*);
@@ -295,13 +295,13 @@ pub export fn rosette_xenia_launch_assist_query(
 }
 
 pub export fn rosette_xenia_launch_assist_report(
-    request: *const xenia_launch_assist_contract.Request,
-    response: *const xenia_launch_assist_contract.Response,
+    request: *const console_launch_assist_contract.Request,
+    response: *const console_launch_assist_contract.Response,
     applied_actions: u32,
     status_raw: u8,
 ) callconv(.c) i32 {
     if (@intFromPtr(request) == 0 or @intFromPtr(response) == 0) return 0;
-    const status = enumFromRaw(xenia_launch_assist_contract.ApplyStatus, status_raw) orelse return 0;
+    const status = enumFromRaw(console_launch_assist_contract.ApplyStatus, status_raw) orelse return 0;
     return @intFromBool(application_framework.defaultHandle().reportXeniaLaunchAssist(
         request.*,
         response.*,

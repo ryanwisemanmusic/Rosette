@@ -41,12 +41,12 @@ const audio_contract = @import("xenia_audio_contract");
 const input_contract = @import("xenia_input_contract");
 const timer_contract = @import("xenia_timer_contract");
 const register_map = @import("xenos_register_map");
-const kernel_export_map = @import("xenia_kernel_export_map");
+const kernel_export_map = @import("console_kernel_export_map");
 const vd_ring_contract = @import("xenia_vd_ring_contract");
-const pm4_contract = @import("xenia_pm4_contract");
-const vd_swap_contract = @import("xenia_vd_swap_contract");
-const claim_reconciliation_contract = @import("xenia_claim_reconciliation_contract");
-const interrupt_callback_contract = @import("xenia_interrupt_callback_contract");
+const pm4_contract = @import("console_pm4_contract");
+const vd_swap_contract = @import("console_vd_swap_contract");
+const claim_reconciliation_contract = @import("console_claim_reconciliation_contract");
+const interrupt_callback_contract = @import("console_interrupt_callback_contract");
 const host_gpu_callback_contract = @import("xenia_host_gpu_callback_contract");
 const graphics_health_contract = @import("xenia_graphics_health_contract");
 const application_controller_contract = @import("xenia_application_controller_contract");
@@ -63,7 +63,7 @@ const wait_handshake_policy = @import("xenia_wait_handshake_policy");
 
 // ── Route-specific contract imports ────────────────────────────────────────
 const graphics_contract = @import("xenia_graphics_contract");
-const surface_path_contract = @import("xenia_surface_path_contract");
+const surface_path_contract = @import("host_surface_path_contract");
 
 // ── Contract registry ──────────────────────────────────────────────────────
 

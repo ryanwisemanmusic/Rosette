@@ -30,7 +30,7 @@
 //! there because relying on that would be relying on wording.
 
 const std = @import("std");
-const map = @import("xenia_fatal_condition_map");
+const map = @import("console_fatal_condition_map");
 const event_log = @import("event_log");
 const machoCapturePrint = event_log.machoCapturePrint;
 const async_log = @import("async_log.zig");

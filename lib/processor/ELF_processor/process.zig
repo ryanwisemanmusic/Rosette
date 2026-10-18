@@ -81,10 +81,10 @@ const cleo_routing = @import("cleo_routing");
 const execution_history = @import("execution_history");
 const vector_helpers = @import("x86_vector_helpers");
 const xenia_accelerator = @import("guest_accelerator.zig");
-const xenia_fatal_condition_map = @import("xenia_fatal_condition_map");
-const xenia_guest_frontier_map = @import("xenia_guest_frontier_map");
-const xenia_warning_severity_map = @import("xenia_warning_severity_map");
-const xenia_guest_milestone_map = @import("xenia_guest_milestone_map");
+const console_fatal_condition_map = @import("console_fatal_condition_map");
+const console_guest_frontier_map = @import("console_guest_frontier_map");
+const console_warning_severity_map = @import("console_warning_severity_map");
+const console_guest_milestone_map = @import("console_guest_milestone_map");
 const xenia_guest_address_map = @import("xenia_guest_address_map");
 const frame_content_contract = @import("frame_content_contract");
 const screen_validity = @import("screen_validity");
@@ -134,21 +134,21 @@ const ui_draw_evidence = @import("ui_draw_evidence.zig");
 const xenia_presenter_attach_milestones = blk: {
     @setEvalBranchQuota(400_000);
     break :blk .{
-        .emulator_thread = xenia_guest_milestone_map.indexOf("_ZN2xe3app11EmulatorApp14EmulatorThreadEv").?,
-        .emulator_setup = xenia_guest_milestone_map.indexOf("_ZN2xe8Emulator5SetupEPNS_2ui6WindowEPNS1_11ImGuiDrawerEbSt8functionIFSt10unique_ptrINS_3apu11AudioSystemESt14default_deleteIS9_EEPNS_3cpu9ProcessorEEES6_IFS7_INS_3gpu14GraphicsSystemESA_ISJ_EEvEES6_IFSt6vectorIS7_INS_3hid11InputDriverESA_ISQ_EESaISS_EES3_EE").?,
-        .call_in_ui_thread = xenia_guest_milestone_map.indexOf("_ZN2xe2ui18WindowedAppContext14CallInUIThreadESt8functionIFvvEE").?,
-        .call_in_ui_thread_deferred = xenia_guest_milestone_map.indexOf("_ZN2xe2ui18WindowedAppContext22CallInUIThreadDeferredESt8functionIFvvEE").?,
-        .setup = xenia_guest_milestone_map.indexOf("_ZN2xe3app14EmulatorWindow36SetupGraphicsSystemPresenterPaintingEv").?,
-        .get_presenter = xenia_guest_milestone_map.indexOf("_ZNK2xe3app14EmulatorWindow26GetGraphicsSystemPresenterEv").?,
-        .set_presenter = xenia_guest_milestone_map.indexOf("_ZN2xe2ui6Window12SetPresenterEPNS0_9PresenterE").?,
-        .create_surface = xenia_guest_milestone_map.indexOf("_ZN2xe2ui11Win32Window17CreateSurfaceImplEj").?,
-        .attach_surface = xenia_guest_milestone_map.indexOf("_ZN2xe2ui9Presenter28SetWindowSurfaceFromUIThreadEPNS0_6WindowEPNS0_7SurfaceE").?,
-        .vulkan_connect = xenia_guest_milestone_map.indexOf("_ZN2xe2ui6vulkan15VulkanPresenter47ConnectOrReconnectPaintingToSurfaceFromUIThreadERNS0_7SurfaceEjjbRb").?,
-        .font_rgba = xenia_guest_milestone_map.indexOf(ui_draw_evidence.font_rgba_symbol).?,
-        .lists = xenia_guest_milestone_map.indexOf(ui_draw_evidence.lists_symbol).?,
-        .draw = xenia_guest_milestone_map.indexOf(ui_draw_evidence.draw_symbol).?,
-        .scissor = xenia_guest_milestone_map.indexOf(ui_draw_evidence.scissor_symbol).?,
-        .pipelines = xenia_guest_milestone_map.indexOf(ui_draw_evidence.pipelines_symbol).?,
+        .emulator_thread = console_guest_milestone_map.indexOf("_ZN2xe3app11EmulatorApp14EmulatorThreadEv").?,
+        .emulator_setup = console_guest_milestone_map.indexOf("_ZN2xe8Emulator5SetupEPNS_2ui6WindowEPNS1_11ImGuiDrawerEbSt8functionIFSt10unique_ptrINS_3apu11AudioSystemESt14default_deleteIS9_EEPNS_3cpu9ProcessorEEES6_IFS7_INS_3gpu14GraphicsSystemESA_ISJ_EEvEES6_IFSt6vectorIS7_INS_3hid11InputDriverESA_ISQ_EESaISS_EES3_EE").?,
+        .call_in_ui_thread = console_guest_milestone_map.indexOf("_ZN2xe2ui18WindowedAppContext14CallInUIThreadESt8functionIFvvEE").?,
+        .call_in_ui_thread_deferred = console_guest_milestone_map.indexOf("_ZN2xe2ui18WindowedAppContext22CallInUIThreadDeferredESt8functionIFvvEE").?,
+        .setup = console_guest_milestone_map.indexOf("_ZN2xe3app14EmulatorWindow36SetupGraphicsSystemPresenterPaintingEv").?,
+        .get_presenter = console_guest_milestone_map.indexOf("_ZNK2xe3app14EmulatorWindow26GetGraphicsSystemPresenterEv").?,
+        .set_presenter = console_guest_milestone_map.indexOf("_ZN2xe2ui6Window12SetPresenterEPNS0_9PresenterE").?,
+        .create_surface = console_guest_milestone_map.indexOf("_ZN2xe2ui11Win32Window17CreateSurfaceImplEj").?,
+        .attach_surface = console_guest_milestone_map.indexOf("_ZN2xe2ui9Presenter28SetWindowSurfaceFromUIThreadEPNS0_6WindowEPNS0_7SurfaceE").?,
+        .vulkan_connect = console_guest_milestone_map.indexOf("_ZN2xe2ui6vulkan15VulkanPresenter47ConnectOrReconnectPaintingToSurfaceFromUIThreadERNS0_7SurfaceEjjbRb").?,
+        .font_rgba = console_guest_milestone_map.indexOf(ui_draw_evidence.font_rgba_symbol).?,
+        .lists = console_guest_milestone_map.indexOf(ui_draw_evidence.lists_symbol).?,
+        .draw = console_guest_milestone_map.indexOf(ui_draw_evidence.draw_symbol).?,
+        .scissor = console_guest_milestone_map.indexOf(ui_draw_evidence.scissor_symbol).?,
+        .pipelines = console_guest_milestone_map.indexOf(ui_draw_evidence.pipelines_symbol).?,
     };
 };
 
@@ -187,7 +187,7 @@ test {
 /// The armed set of Xenia kernel export shims, and what the title called.
 /// See `kernel_call_census.zig`.
 const kernel_call_census = @import("kernel_call_census.zig");
-const xenia_kernel_shim_map = @import("xenia_kernel_shim_map");
+const console_kernel_shim_map = @import("console_kernel_shim_map");
 /// The performance counter Rosette publishes to the guest, and what it counts.
 const guest_clock = @import("guest_clock.zig");
 const wait_cost = @import("wait_cost.zig");
@@ -413,7 +413,7 @@ pub const AUDIO_STAGE_COUNT: usize = 11;
 pub const GUEST_OUTPUT_STAGE_COUNT: usize = 15;
 
 /// One entry per row of the milestone table.
-pub const GUEST_MILESTONE_COUNT: usize = xenia_guest_milestone_map.count();
+pub const GUEST_MILESTONE_COUNT: usize = console_guest_milestone_map.count();
 
 /// How many recorded entries make a milestone established. After that, a
 /// milestone that is only an observation stops costing its callers an
@@ -427,7 +427,7 @@ const GUEST_MILESTONE_TRANSLATOR_SATURATION: u64 = 4096;
 /// Every index `recordGuestMilestone` and `noteGuestMilestoneArguments`
 /// special-case is listed here, and a test holds the two in step.
 fn guestMilestoneSaturable(index: usize) bool {
-    const map = xenia_guest_milestone_map;
+    const map = console_guest_milestone_map;
     const functional = comptime blk: {
         @setEvalBranchQuota(400_000);
         break :blk [_]?usize{
@@ -559,7 +559,7 @@ fn guestMilestoneFilterBit(address: u64) u8 {
 /// the guest finishes it in microseconds and the interception is pure risk.
 const XENIA_SHA1_FEED_MINIMUM: u64 = 4096;
 
-const WORKLOAD_COUNT: usize = @typeInfo(xenia_guest_frontier_map.Workload).@"enum".fields.len;
+const WORKLOAD_COUNT: usize = @typeInfo(console_guest_frontier_map.Workload).@"enum".fields.len;
 const WINDOWS_ALLOCATION_DISPOSITION_COUNT: usize = @typeInfo(WindowsAllocationDisposition).@"enum".fields.len;
 
 /// Bounded because a run must not be able to grow this by calling
@@ -5251,14 +5251,14 @@ pub const __ProcessInternals = struct {
     pub const _xenia_accelerator = xenia_accelerator;
     pub const _xenia_clock_probe = xenia_clock_probe;
     pub const _xenia_event_audit = xenia_event_audit;
-    pub const _xenia_fatal_condition_map = xenia_fatal_condition_map;
+    pub const _console_fatal_condition_map = console_fatal_condition_map;
     pub const _xenia_guest_address_map = xenia_guest_address_map;
-    pub const _xenia_guest_frontier_map = xenia_guest_frontier_map;
-    pub const _xenia_guest_milestone_map = xenia_guest_milestone_map;
-    pub const _xenia_kernel_shim_map = xenia_kernel_shim_map;
+    pub const _console_guest_frontier_map = console_guest_frontier_map;
+    pub const _console_guest_milestone_map = console_guest_milestone_map;
+    pub const _console_kernel_shim_map = console_kernel_shim_map;
     pub const _xenia_presenter_attach_milestones = xenia_presenter_attach_milestones;
     pub const _xenia_sha1_kernel_feed_body = xenia_sha1_kernel_feed_body;
-    pub const _xenia_warning_severity_map = xenia_warning_severity_map;
+    pub const _console_warning_severity_map = console_warning_severity_map;
     pub const _xmutant_release_compat = xmutant_release_compat;
     pub const _xmutant_teardown_compat = xmutant_teardown_compat;
     pub const _BLOCK_JIT_DEFAULT_HOT_THRESHOLD = BLOCK_JIT_DEFAULT_HOT_THRESHOLD;

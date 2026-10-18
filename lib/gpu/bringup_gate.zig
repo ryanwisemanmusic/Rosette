@@ -45,7 +45,7 @@
 //! turn the one unforgeable signal in the graphics stack into another claim.
 
 const std = @import("std");
-const contract = @import("xenia_gpu_bringup_contract");
+const contract = @import("console_gpu_bringup_contract");
 
 pub const Boundary = contract.Boundary;
 pub const Phase = contract.Phase;

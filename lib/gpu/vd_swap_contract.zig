@@ -9,7 +9,7 @@
 const std = @import("std");
 const pm4 = @import("pm4.zig");
 const probe_ledger = @import("vd_swap_probe.zig");
-const contract = @import("xenia_vd_swap_contract");
+const contract = @import("console_vd_swap_contract");
 
 pub const Stage = contract.Stage;
 pub const Chain = contract.Chain;

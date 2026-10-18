@@ -3,10 +3,10 @@ set -euo pipefail
 
 package_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 zig_bin="${ZIG:-zig}"
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/xenia-x86-simd-shim-map.XXXXXX")"
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/host-x86-simd-translation-shim-map.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 
-echo "xenia-x86-simd-shim-map: native tests"
+echo "host-x86-simd-translation-shim-map: native tests"
 "$zig_bin" test \
     --cache-dir "$tmp_dir/native-cache" \
     --global-cache-dir "$tmp_dir/native-global-cache" \
@@ -16,7 +16,7 @@ echo "xenia-x86-simd-shim-map: native tests"
 # mirrored copy. A package that only ever built for the host it was written on
 # is how a route split starts.
 for target in aarch64-freestanding x86_64-freestanding; do
-    echo "xenia-x86-simd-shim-map: $target compile-only check"
+    echo "host-x86-simd-translation-shim-map: $target compile-only check"
     output="$tmp_dir/$target.a"
     "$zig_bin" build-lib "$package_dir/src/root.zig" \
         --cache-dir "$tmp_dir/$target-cache" \
@@ -29,4 +29,4 @@ for target in aarch64-freestanding x86_64-freestanding; do
     echo "  verified $target"
 done
 
-echo "xenia-x86-simd-shim-map: PASS"
+echo "host-x86-simd-translation-shim-map: PASS"

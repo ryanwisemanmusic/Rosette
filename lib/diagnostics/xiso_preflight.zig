@@ -19,7 +19,7 @@
 //! hand — which is not a thing that can be manufactured on demand.
 
 const std = @import("std");
-const xiso = @import("xenia_xiso_format");
+const xiso = @import("console_xiso_format");
 
 /// A refusal is a refusal whatever produced it: the pre-flight cares that the
 /// bytes did not arrive, not which layer said no.

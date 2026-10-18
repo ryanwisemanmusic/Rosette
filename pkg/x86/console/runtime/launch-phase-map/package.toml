@@ -1,4 +1,4 @@
-name = "xenia-x86-launch-phase-map"
+name = "guest-x86-launch-phase-map"
 version = "0.1.0-local"
 kind = "startup-symbol-attribution"
 role = "build-time"

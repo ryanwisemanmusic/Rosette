@@ -1,4 +1,4 @@
-name = "common-xenia-wait-graph-contract"
+name = "common-console-wait-graph-contract"
 version = "0.1.0-local"
 kind = "guest-wait-signal-attribution-contract"
 role = "build-time"

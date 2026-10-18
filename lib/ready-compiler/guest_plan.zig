@@ -16,7 +16,7 @@ const plan = @import("plan.zig");
 const xenia = @import("guest.zig");
 const cache = @import("cache.zig");
 const ready_package = @import("package.zig");
-const static_plan = @import("xenia_ready_plan");
+const static_plan = @import("console_ready_plan");
 
 pub const symbol_prefix = static_plan.symbol_prefix;
 pub const SymbolUnit = static_plan.SymbolUnit;

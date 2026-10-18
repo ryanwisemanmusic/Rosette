@@ -6,7 +6,7 @@
 //! operation.
 
 const std = @import("std");
-const contract = @import("xenia_launch_assist_contract");
+const contract = @import("console_launch_assist_contract");
 
 pub const Audit = struct {
     queries: u64 = 0,

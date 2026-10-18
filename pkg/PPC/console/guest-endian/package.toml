@@ -1,4 +1,4 @@
-name = "xenia-ppc-guest-endian"
+name = "host-ppc64-guest-endian"
 version = "0.1.0-local"
 kind = "guest-endian-source-mirror"
 role = "build-time"

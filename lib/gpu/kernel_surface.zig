@@ -37,7 +37,7 @@
 //! reported separately so it cannot be mistaken for a cause.
 
 const std = @import("std");
-const kernel_export_map = @import("xenia_kernel_export_map");
+const kernel_export_map = @import("console_kernel_export_map");
 
 /// The GPU-facing kernel exports, function and variable alike, in the order a
 /// title's display bring-up touches them.

@@ -2,7 +2,7 @@ const std = @import("std");
 const evidence = @import("startup_evidence_runtime");
 
 const usage =
-    \\usage: xenia-x86-startup-evidence <ready-compiler.log> <runtime.log>
+    \\usage: console-x86-startup-evidence <ready-compiler.log> <runtime.log>
     \\
     \\Reads route-local evidence and prints the activation frontier. It never
     \\changes the log or modifies runtime state.

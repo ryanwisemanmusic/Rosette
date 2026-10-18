@@ -1,6 +1,6 @@
-name = "common-xenia-guest-frontier-map"
+name = "common-console-guest-frontier-map"
 version = "0.1.0-local"
-kind = "xenia-guest-frontier-workload-map"
+kind = "console-guest-frontier-workload-map"
 role = "build-time"
 # Route-independent: Xenia's function names do not change with the
 # architecture Rosette was compiled for.

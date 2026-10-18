@@ -4,16 +4,16 @@ set -euo pipefail
 package_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd "$package_dir/../../../../.." && pwd)"
 zig_bin="${ZIG:-zig}"
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/xenia-arm64-startup-evidence.XXXXXX")"
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/console-arm64-startup-evidence.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 
-echo "xenia-arm64-startup-evidence: native tests"
+echo "console-arm64-startup-evidence: native tests"
 "$zig_bin" test \
     --cache-dir "$tmp_dir/native-cache" \
     --global-cache-dir "$tmp_dir/global-cache" \
     "$package_dir/src/evidence.zig"
 
-echo "xenia-arm64-startup-evidence: runtime observer tests"
+echo "console-arm64-startup-evidence: runtime observer tests"
 "$zig_bin" test \
     --cache-dir "$tmp_dir/runtime-cache" \
     --global-cache-dir "$tmp_dir/runtime-global-cache" \
@@ -21,7 +21,7 @@ echo "xenia-arm64-startup-evidence: runtime observer tests"
     -Mroot="$repo_dir/lib/diagnostics/guest_startup_evidence.zig" \
     -Mxenia_startup_evidence="$package_dir/src/evidence.zig"
 
-echo "xenia-arm64-startup-evidence: native CLI compile"
+echo "console-arm64-startup-evidence: native CLI compile"
 "$zig_bin" build-exe \
     --cache-dir "$tmp_dir/cli-cache" \
     --global-cache-dir "$tmp_dir/cli-global-cache" \
@@ -30,11 +30,11 @@ echo "xenia-arm64-startup-evidence: native CLI compile"
     --dep xenia_startup_evidence \
     -Mstartup_evidence_runtime="$repo_dir/lib/diagnostics/guest_startup_evidence.zig" \
     -Mxenia_startup_evidence="$package_dir/src/evidence.zig" \
-    -femit-bin="$tmp_dir/xenia-arm64-startup-evidence"
+    -femit-bin="$tmp_dir/console-arm64-startup-evidence"
 
 if [[ "$#" -eq 2 ]]; then
-    echo "xenia-arm64-startup-evidence: supplied log pair"
-    output="$($tmp_dir/xenia-arm64-startup-evidence "$1" "$2")"
+    echo "console-arm64-startup-evidence: supplied log pair"
+    output="$($tmp_dir/console-arm64-startup-evidence "$1" "$2")"
     printf '%s\n' "$output"
     # Deliberately no expected frontier, tracepoint count, or verdict here.
     # The x86 package asserts the values its own run produced; asserting them
@@ -46,4 +46,4 @@ if [[ "$#" -eq 2 ]]; then
     printf '%s\n' "$output" | rg -q '^verdict=[a-z_]+$'
 fi
 
-echo "xenia-arm64-startup-evidence: PASS"
+echo "console-arm64-startup-evidence: PASS"

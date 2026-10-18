@@ -96,12 +96,12 @@ const __process_windows_srw_owner_stack_depth = __ProcessInternals._windows_srw_
 const __process_x64_linux_runtime = __ProcessInternals._x64_linux_runtime;
 const __process_xbox_critical_section = __ProcessInternals._xbox_critical_section;
 const __process_xenia_clock_probe = __ProcessInternals._xenia_clock_probe;
-const __process_xenia_fatal_condition_map = __ProcessInternals._xenia_fatal_condition_map;
-const __process_xenia_guest_frontier_map = __ProcessInternals._xenia_guest_frontier_map;
-const __process_xenia_guest_milestone_map = __ProcessInternals._xenia_guest_milestone_map;
-const __process_xenia_kernel_shim_map = __ProcessInternals._xenia_kernel_shim_map;
+const __process_console_fatal_condition_map = __ProcessInternals._console_fatal_condition_map;
+const __process_console_guest_frontier_map = __ProcessInternals._console_guest_frontier_map;
+const __process_console_guest_milestone_map = __ProcessInternals._console_guest_milestone_map;
+const __process_console_kernel_shim_map = __ProcessInternals._console_kernel_shim_map;
 const __process_xenia_presenter_attach_milestones = __ProcessInternals._xenia_presenter_attach_milestones;
-const __process_xenia_warning_severity_map = __ProcessInternals._xenia_warning_severity_map;
+const __process_console_warning_severity_map = __ProcessInternals._console_warning_severity_map;
 const __state_GpuRingSource = __StateInternals._GpuRingSource;
 const __state_GuestOutputHostSink = __StateInternals._GuestOutputHostSink;
 const __state_HostQos = __StateInternals._HostQos;
@@ -310,7 +310,7 @@ pub fn terminateForWindowsCapabilityGap(self: *ElfState, dll_name: []const u8, f
     return true;
 }
 
-pub fn noteWindowsGuestCondition(self: *ElfState, condition: __process_xenia_fatal_condition_map.Condition, line: []const u8) void {
+pub fn noteWindowsGuestCondition(self: *ElfState, condition: __process_console_fatal_condition_map.Condition, line: []const u8) void {
     var entry: ?*__process_WindowsGuestFailurePoint = null;
     for (self.windows_guest_failure_points[0..self.windows_guest_failure_point_count]) |*candidate| {
         if (__process_std.mem.eql(u8, candidate.labelText(), condition.label)) {
@@ -382,7 +382,7 @@ pub fn noteWindowsGuestCondition(self: *ElfState, condition: __process_xenia_fat
 }
 
 pub fn substantiateGuestAdvisory(self: *const ElfState, line: []const u8) void {
-    switch (__process_xenia_warning_severity_map.evidenceFor(line)) {
+    switch (__process_console_warning_severity_map.evidenceFor(line)) {
         .none => {},
         .dxgi_factory => substantiateFromImportLedger(
             self,
@@ -508,7 +508,7 @@ pub fn describeGuestLogLineOrigin(self: *const ElfState, line: []const u8, buffe
 }
 
 pub fn isConfirmedEmptyResolvePathProbe(line: []const u8, origin: []const u8) bool {
-    if (!__process_xenia_warning_severity_map.isEmptyResolvePath(line)) return false;
+    if (!__process_console_warning_severity_map.isEmptyResolvePath(line)) return false;
     return __process_std.mem.indexOf(u8, origin, "last_kernel_call=xboxkrnl.exe!NtCreateFile") != null or
         __process_std.mem.indexOf(u8, origin, "last_kernel_call=xboxkrnl.exe!RtlNtStatusToDosError") != null or
         __process_std.mem.indexOf(u8, origin, "last_kernel_call=xboxkrnl.exe!RtlImageXexHeaderField") != null;
@@ -637,23 +637,23 @@ pub fn noteWindowsGuestWarning(self: *ElfState, line: []const u8) void {
     // `log.err` trains a reader to skim the block that also holds the real
     // ones, so an informational line is noted once, quietly, and never
     // enters the failure-point ledger.
-    if (__process_xenia_warning_severity_map.isUnresolvedImport(line)) self.windows_guest_unresolved_import_lines +|= 1;
+    if (__process_console_warning_severity_map.isUnresolvedImport(line)) self.windows_guest_unresolved_import_lines +|= 1;
     var origin_text: [192]u8 = undefined;
     // An empty path is joined to the VFS ledger first: that record was
     // taken synchronously inside the call that asked, while the thread's
     // last kernel call is only what it had reached by the time Xenia's
     // asynchronous logger printed the line.
     var ledger_text: [384]u8 = undefined;
-    const ledger_origin = if (__process_xenia_warning_severity_map.isEmptyResolvePath(line))
+    const ledger_origin = if (__process_console_warning_severity_map.isEmptyResolvePath(line))
         describeVfsResolveFor(self, "", &ledger_text)
     else
         "";
     const origin = if (ledger_origin.len != 0) ledger_origin else describeGuestLogLineOrigin(self, line, &origin_text);
     const empty_path_probe = isConfirmedEmptyResolvePathProbe(line, origin) or ledger_origin.len != 0;
-    const severity = if (empty_path_probe) .advisory else __process_xenia_warning_severity_map.classify(line);
+    const severity = if (empty_path_probe) .advisory else __process_console_warning_severity_map.classify(line);
     if (severity == .informational) {
         self.windows_guest_informational_lines +|= 1;
-        if (__process_xenia_warning_severity_map.bareModuleLookupName(line)) |module| {
+        if (__process_console_warning_severity_map.bareModuleLookupName(line)) |module| {
             const occurrence = noteGuestModuleLookupLine(self, module);
             if (shouldReportWindowsPointOccurrence(occurrence)) {
                 var resolve_text: [384]u8 = undefined;
@@ -662,7 +662,7 @@ pub fn noteWindowsGuestWarning(self: *ElfState, line: []const u8) void {
                     occurrence,
                     self.windows_guest_unresolved_import_lines,
                     describeVfsResolveFor(self, module, &resolve_text),
-                    if (occurrence == 1) __process_xenia_warning_severity_map.bare_module_lookup_reason else "PE64 GUEST MODULE LOOKUPS at exit carries the total",
+                    if (occurrence == 1) __process_console_warning_severity_map.bare_module_lookup_reason else "PE64 GUEST MODULE LOOKUPS at exit carries the total",
                 });
             }
         } else {
@@ -673,7 +673,7 @@ pub fn noteWindowsGuestWarning(self: *ElfState, line: []const u8) void {
     const advisory = severity == .advisory;
     const reason: []const u8 = if (empty_path_probe)
         "the asynchronous echo of the synchronous vfs-empty-object-name fatal point, which stopped the run or was stepped past by ROSETTE_XENIA_FATAL_POINT_ALLOW; that line carries the NtCreateFile request behind the empty name"
-    else if (__process_xenia_warning_severity_map.entryFor(line)) |entry|
+    else if (__process_console_warning_severity_map.entryFor(line)) |entry|
         entry.reason
     else
         "";
@@ -692,7 +692,7 @@ pub fn noteWindowsGuestWarning(self: *ElfState, line: []const u8) void {
                 });
             } else {
                 __process_log.err("PE64 FATAL POINT: guest-warning label={s} occurrence={d} step={d} rip=0x{x} line={s}{s}{s}{s}", .{
-                    __process_xenia_warning_severity_map.labelFor(line),
+                    __process_console_warning_severity_map.labelFor(line),
                     entry.occurrences,
                     process_impl_lifecycle.observedExecutionSteps(self),
                     process_impl_lifecycle.guestContextField(self, "regs").*.rip,
@@ -733,8 +733,8 @@ pub fn noteWindowsGuestWarning(self: *ElfState, line: []const u8) void {
         // An empty resolve already had its synchronous fatal point; its
         // echo is not a second one.
         const echoed = empty_path_probe and self.guest_vfs_empty_name_faults != 0;
-        if (!echoed and !__process_xenia_warning_severity_map.continuationFor(line).continues()) {
-            const label = __process_xenia_warning_severity_map.labelFor(line);
+        if (!echoed and !__process_console_warning_severity_map.continuationFor(line).continues()) {
+            const label = __process_console_warning_severity_map.labelFor(line);
             self.windows_fatal_point_events +|= 1;
             if (comptime !@import("builtin").is_test) {
                 __process_log.err("PE64 FATAL POINT: guest-advisory label={s} step={d} rip=0x{x} line={s}; a degradation is survivable only on a named ground - a Rosette policy decision or the emulator's documented design - and this row has neither, so the run treats it as the error it probably is{s}", .{
@@ -750,7 +750,7 @@ pub fn noteWindowsGuestWarning(self: *ElfState, line: []const u8) void {
         return;
     }
     self.windows_fatal_point_events +|= 1;
-    const label = __process_xenia_warning_severity_map.labelFor(line);
+    const label = __process_console_warning_severity_map.labelFor(line);
     __process_log.err("PE64 FATAL POINT: guest-warning label={s} occurrence=1 step={d} rip=0x{x} line={s}{s}{s}{s}", .{
         label,
         process_impl_lifecycle.observedExecutionSteps(self),
@@ -866,7 +866,7 @@ pub fn reportGuestModuleLookups(self: *const ElfState) void {
 
 pub fn processWindowsGuestOutputLine(self: *ElfState, line: []const u8, truncated: bool) void {
     if (line.len == 0) return;
-    if (__process_xenia_fatal_condition_map.match(line)) |condition| {
+    if (__process_console_fatal_condition_map.match(line)) |condition| {
         noteWindowsGuestCondition(self, condition, line);
         if (truncated) self.windows_guest_output_truncated_lines +|= 1;
         return;
@@ -921,7 +921,7 @@ pub fn logWindowsGuestFailurePointSummary(self: *const ElfState) void {
     // POINT SUMMARY ENTRY made Xenia's documented behaviour read as the
     // run's defect.
     for (self.windows_guest_failure_points[0..self.windows_guest_failure_point_count]) |entry| {
-        const repeats: u64 = if (__process_xenia_fatal_condition_map.conditionForLabel(entry.labelText())) |condition| condition.repeats else 1;
+        const repeats: u64 = if (__process_console_fatal_condition_map.conditionForLabel(entry.labelText())) |condition| condition.repeats else 1;
         if (entry.occurrences >= repeats) continue;
         __process_log.info("PE64 EMULATOR DESIGN EVENTS: label={s} owner={s} occurrences={d} of the {d} that would make it a fatal point first_step={d} last_step={d} line={s}; below its threshold this is the emulator's documented behaviour, so it is reported here and not counted as a fatal point", .{
             entry.labelText(),
@@ -950,7 +950,7 @@ pub fn logWindowsGuestFailurePointSummary(self: *const ElfState) void {
         self.guest_vfs_empty_name_faults,
     });
     for (self.windows_guest_failure_points[0..self.windows_guest_failure_point_count]) |entry| {
-        const entry_repeats: u64 = if (__process_xenia_fatal_condition_map.conditionForLabel(entry.labelText())) |condition| condition.repeats else 1;
+        const entry_repeats: u64 = if (__process_console_fatal_condition_map.conditionForLabel(entry.labelText())) |condition| condition.repeats else 1;
         if (entry.occurrences < entry_repeats) continue;
         __process_log.err("PE64 FATAL POINT SUMMARY ENTRY: label={s} owner={s} occurrences={d} first_step={d} last_step={d} first_rip=0x{x} last_rip=0x{x} line={s}", .{
             entry.labelText(),
@@ -1416,8 +1416,8 @@ pub fn reportFirstFrameChain(self: *const ElfState) void {
     });
     if (self.guest_frontier_samples != 0) {
         __process_log.info("PE64 FIRST FRAME CHAIN:   frontier histogram over {d} checkpoint sample(s):", .{self.guest_frontier_samples});
-        inline for (@typeInfo(__process_xenia_guest_frontier_map.Workload).@"enum".fields) |field| {
-            const workload: __process_xenia_guest_frontier_map.Workload = @enumFromInt(field.value);
+        inline for (@typeInfo(__process_console_guest_frontier_map.Workload).@"enum".fields) |field| {
+            const workload: __process_console_guest_frontier_map.Workload = @enumFromInt(field.value);
             const samples = process_impl_kernel_services.frontierSamplesFor(self, workload);
             if (samples != 0) {
                 __process_log.info("PE64 FIRST FRAME CHAIN:     {s:<26} {d} sample(s) ({d}%) bounded={}", .{
@@ -1494,7 +1494,7 @@ pub fn reportUiDrawEvidence(self: *const ElfState) void {
 pub fn witnessLabel(comptime milestone: []const u8) []const u8 {
     return comptime blk: {
         var label: []const u8 = "";
-        for (__process_xenia_kernel_shim_map.witnesses) |witness| {
+        for (__process_console_kernel_shim_map.witnesses) |witness| {
             if (!__process_std.mem.eql(u8, witness.milestone, milestone)) continue;
             label = if (label.len == 0)
                 witness.export_name
@@ -1966,7 +1966,7 @@ pub fn vblankWitnessName(self: *const ElfState) []const u8 {
     const vblank = "_ZN2xe3gpu14GraphicsSystem10MarkVblankEv";
     if (!process_impl_kernel_services.guestMilestoneArmed(self, vblank)) return "no witness: this image names neither symbol";
     if (!process_impl_kernel_services.guestMilestoneInlinedAway(self, vblank)) return "GraphicsSystem::MarkVblank";
-    const proxy = __process_xenia_guest_milestone_map.inlineProxyOf(vblank);
+    const proxy = __process_console_guest_milestone_map.inlineProxyOf(vblank);
     if (proxy.len != 0 and process_impl_kernel_services.guestMilestoneArmed(self, proxy)) {
         return "KernelState::EmulateCPInterruptDPC, because MarkVblank was inlined into the frame limiter";
     }
@@ -2152,7 +2152,7 @@ pub fn reportGuestThreadSpin(self: *const ElfState, index: usize) void {
         __process_log.info("PE64 SPIN ANATOMY:   this thread has never called a Windows import, so nothing it does crosses a boundary Rosette can name. Its whole life is inside code the guest generated", .{});
     }
     if (thread.last_milestone != 0) {
-        const milestone = __process_xenia_guest_milestone_map.milestones[thread.last_milestone - 1];
+        const milestone = __process_console_guest_milestone_map.milestones[thread.last_milestone - 1];
         __process_log.info("PE64 SPIN ANATOMY:   the last named guest function it entered was {s} at step {d}", .{ milestone.readable, thread.last_milestone_step });
     }
     __process_log.info("PE64 SPIN ANATOMY:   registers: rax=0x{x} rbx=0x{x} rcx=0x{x} rdx=0x{x} rsi=0x{x} rdi=0x{x} rbp=0x{x} rsp=0x{x} r12=0x{x} r13=0x{x} r14=0x{x} r15=0x{x}", .{
@@ -3651,7 +3651,7 @@ pub fn reportGuestTitleThreadForWall(self: *const ElfState) void {
 }
 
 pub fn guestMilestoneActivity(self: *const ElfState, mangled: []const u8) __process_GuestMilestoneActivity {
-    const index = __process_xenia_guest_milestone_map.indexOf(mangled) orelse
+    const index = __process_console_guest_milestone_map.indexOf(mangled) orelse
         return .{ .hits = 0, .last_step = 0, .armed = false };
     return .{
         .hits = self.guest_milestone_hits[index],
@@ -4032,7 +4032,7 @@ pub fn reportGuestKernelCalls(self: *const ElfState) void {
     });
     if (census.distinct_entered == 0) {
         __process_log.info("PE64 GUEST KERNEL CALLS:   the title has not made one kernel call. {s}", .{
-            __process_xenia_kernel_shim_map.BootPhase.no_kernel_contact.advice(),
+            __process_console_kernel_shim_map.BootPhase.no_kernel_contact.advice(),
         });
         // The one way this whole census could be silently wrong, said out
         // loud so the next run settles it rather than inheriting it.
@@ -4083,7 +4083,7 @@ pub fn reportGuestKernelCalls(self: *const ElfState) void {
             });
         }
         __process_log.info("PE64 GUEST KERNEL CALLS:   {s}", .{phase.advice()});
-        if (__process_xenia_kernel_shim_map.nextPhase(phase)) |next| {
+        if (__process_console_kernel_shim_map.nextPhase(phase)) |next| {
             const progress = census.phaseProgress(next);
             __process_log.info("PE64 GUEST KERNEL CALLS:   the next phase is '{s}' and the title has called {d} of its {d} marker export(s) ({d} of them armed in this image); that phase is the one to make happen", .{
                 next.label(),
@@ -4126,8 +4126,8 @@ pub fn reportGuestKernelCalls(self: *const ElfState) void {
         }
     }
     const totals = census.subsystemTotals();
-    inline for (@typeInfo(__process_xenia_kernel_shim_map.Subsystem).@"enum".fields) |field| {
-        const subsystem: __process_xenia_kernel_shim_map.Subsystem = @enumFromInt(field.value);
+    inline for (@typeInfo(__process_console_kernel_shim_map.Subsystem).@"enum".fields) |field| {
+        const subsystem: __process_console_kernel_shim_map.Subsystem = @enumFromInt(field.value);
         const total = totals[field.value];
         // A subsystem with nothing armed is not a fact about the title,
         // and one with no calls is only worth a row when the chain
@@ -4288,7 +4288,7 @@ pub fn reportGuestKernelCoverage(self: *const ElfState) void {
     const census = &self.guest_kernel_calls;
     var published_total: u32 = 0;
     var implemented_total: u32 = 0;
-    inline for (__process_xenia_kernel_shim_map.modules) |module| {
+    inline for (__process_console_kernel_shim_map.modules) |module| {
         const row = __process_kernel_call_census.coverageForModule(census, module);
         published_total += row.published;
         implemented_total += row.implemented;
@@ -4302,7 +4302,7 @@ pub fn reportGuestKernelCoverage(self: *const ElfState) void {
     // Only the subsystems a chain depends on get a row of their own. The
     // rest are in the total above and a reader looking for a picture does
     // not need to walk them.
-    inline for ([_]__process_xenia_kernel_shim_map.Subsystem{ .video, .audio, .memory, .scheduling }) |subsystem| {
+    inline for ([_]__process_console_kernel_shim_map.Subsystem{ .video, .audio, .memory, .scheduling }) |subsystem| {
         const row = __process_kernel_call_census.coverageFor(census, .xboxkrnl, subsystem);
         if (row.published != 0) {
             __process_log.info("PE64 KERNEL EXPORT COVERAGE:   xboxkrnl {s:<12} published={d:<4} implemented={d:<4} missing={d}", .{
@@ -4348,7 +4348,7 @@ pub fn reportGuestMilestones(self: *const ElfState) void {
         self.guest_milestone_filter_misses,
     });
     var inlined_away: usize = 0;
-    inline for (__process_xenia_guest_milestone_map.milestones, 0..) |milestone, index| {
+    inline for (__process_console_guest_milestone_map.milestones, 0..) |milestone, index| {
         if (self.guest_milestone_addresses[index] == 0) {
             __process_log.info("PE64 GUEST MILESTONES:   {s:<40} unresolved (this image does not contain the symbol; its stage cannot be observed)", .{milestone.readable});
         } else {
@@ -4605,7 +4605,7 @@ pub fn armGuestMilestones(self: *ElfState) void {
     const resolver = self.guest_symbol_resolver orelse return;
     const address_of = resolver.address_of orelse return;
     var resolved: u32 = 0;
-    inline for (__process_xenia_guest_milestone_map.milestones, 0..) |milestone, index| {
+    inline for (__process_console_guest_milestone_map.milestones, 0..) |milestone, index| {
         if (address_of(resolver.context, milestone.mangled)) |address| {
             self.guest_milestone_addresses[index] = address;
             const bit = __process_guestMilestoneFilterBit(address);
@@ -4796,7 +4796,7 @@ pub fn recordGuestMilestone(self: *ElfState, index: usize, target: u64) void {
     }
     if (!placed) self.guest_milestone_caller_overflow[index] +|= 1;
     if (process_impl_lifecycle.guestContextField(self, "windows_active_guest_thread_slot").*) |slot| {
-        if (index == comptime __process_xenia_guest_milestone_map.indexOf("_ZN2xe6kernel7XThread7ExecuteEv").?) {
+        if (index == comptime __process_console_guest_milestone_map.indexOf("_ZN2xe6kernel7XThread7ExecuteEv").?) {
             self.windows_guest_threads[slot].entered_xenia_title = true;
         }
         self.windows_guest_threads[slot].last_milestone = @intCast(index + 1);
@@ -4804,7 +4804,7 @@ pub fn recordGuestMilestone(self: *ElfState, index: usize, target: u64) void {
     }
     if (self.guest_milestone_hits[index] == 0) {
         self.guest_milestone_first_step[index] = accounting_step;
-        const milestone = __process_xenia_guest_milestone_map.milestones[index];
+        const milestone = __process_console_guest_milestone_map.milestones[index];
         // Which guest thread got here and when, by the wall clock: with
         // every guest thread on its own host thread, the milestones are
         // a cross-thread timeline only if each says whose it was.
@@ -4829,25 +4829,25 @@ pub fn recordGuestMilestone(self: *ElfState, index: usize, target: u64) void {
     {
         self.guest_milestone_saturated[index] = 1;
         __process_log.info("PE64 GUEST MILESTONE: {s} saturated after {d} recorded entries; translated direct calls now only count it (hits stay exact, caller/step fields freeze here)", .{
-            __process_xenia_guest_milestone_map.milestones[index].readable,
+            __process_console_guest_milestone_map.milestones[index].readable,
             __process_GUEST_MILESTONE_TRANSLATOR_SATURATION,
         });
     }
-    if (index == comptime __process_xenia_guest_milestone_map.indexOf("_ZN2xe3gpu6vulkan22VulkanCommandProcessor9IssueSwapEjjj").?) {
+    if (index == comptime __process_console_guest_milestone_map.indexOf("_ZN2xe3gpu6vulkan22VulkanCommandProcessor9IssueSwapEjjj").?) {
         noteFrameCostSwap(self, accounting_step);
     }
     // Arguments first: the wake repair below signals objects and must not
     // be what a ring decode reads its write pointer from.
     if (self.windows_runtime_enabled) noteGuestMilestoneArguments(self, index);
     if (self.windows_runtime_enabled and
-        index == comptime __process_xenia_guest_milestone_map.indexOf("_ZN2xe3gpu16CommandProcessor18UpdateWritePointerEj").?)
+        index == comptime __process_console_guest_milestone_map.indexOf("_ZN2xe3gpu16CommandProcessor18UpdateWritePointerEj").?)
     {
         repairXeniaGpuWritePointerWake(self);
     }
 }
 
 pub fn noteGuestMilestoneArguments(self: *ElfState, index: usize) void {
-    const map = __process_xenia_guest_milestone_map;
+    const map = __process_console_guest_milestone_map;
     if (index == comptime map.indexOf("_ZN2xe3gpu14GraphicsSystem18WriteRegisterThunkEPvPS1_jj").?) {
         // WriteRegisterThunk(ppc_context, graphics_system, addr, value)
         _ = noteGpuRegisterAccess(self, @truncate(process_impl_lifecycle.guestContextField(self, "regs").*.r8), true, @truncate(process_impl_lifecycle.guestContextField(self, "regs").*.r9));

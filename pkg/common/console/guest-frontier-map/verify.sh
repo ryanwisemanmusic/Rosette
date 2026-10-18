@@ -3,10 +3,10 @@ set -euo pipefail
 
 package_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 zig_bin="${ZIG:-zig}"
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/common-xenia-guest-frontier-map.XXXXXX")"
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/common-console-guest-frontier-map.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 
-echo "common-xenia-guest-frontier-map: native tests"
+echo "common-console-guest-frontier-map: native tests"
 "$zig_bin" test \
     --cache-dir "$tmp_dir/native-cache" \
     --global-cache-dir "$tmp_dir/native-global-cache" \
@@ -15,7 +15,7 @@ echo "common-xenia-guest-frontier-map: native tests"
 # Both routes compile the same file. A package that only ever built for the
 # host it was written on is how a route split starts.
 for target in aarch64-freestanding x86_64-freestanding; do
-    echo "common-xenia-guest-frontier-map: $target compile-only check"
+    echo "common-console-guest-frontier-map: $target compile-only check"
     output="$tmp_dir/$target.a"
     "$zig_bin" build-lib \
         --cache-dir "$tmp_dir/$target-cache" \
@@ -29,4 +29,4 @@ for target in aarch64-freestanding x86_64-freestanding; do
     echo "  verified $target"
 done
 
-echo "common-xenia-guest-frontier-map: PASS"
+echo "common-console-guest-frontier-map: PASS"

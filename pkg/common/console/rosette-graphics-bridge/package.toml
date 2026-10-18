@@ -1,4 +1,4 @@
-name = "common-xenia-rosette-graphics-bridge"
+name = "common-console-rosette-graphics-bridge"
 version = "0.1.0-local"
 kind = "cross-process-graphics-evidence-abi"
 role = "build-time"

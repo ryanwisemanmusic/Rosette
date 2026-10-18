@@ -1,4 +1,4 @@
-name = "xenia-x86-codegen-activation"
+name = "host-x86-codegen-activation-contract"
 version = "0.1.0-local"
 kind = "x86-64-codegen-and-activation-contract"
 role = "build-time"

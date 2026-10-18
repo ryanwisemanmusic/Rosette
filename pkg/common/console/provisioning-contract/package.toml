@@ -1,4 +1,4 @@
-name = "common-xenia-provisioning-contract"
+name = "common-console-provisioning-contract"
 version = "0.1.0-local"
 kind = "console-platform-provisioning-custody-contract"
 role = "build-time"

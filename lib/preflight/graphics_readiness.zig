@@ -15,7 +15,7 @@
 //! substantiate.
 
 const std = @import("std");
-const contract = @import("xenia_gpu_bringup_contract");
+const contract = @import("console_gpu_bringup_contract");
 const health_schema = @import("xenia_graphics_health_contract");
 const host_capability = @import("host_capability.zig");
 const prelaunch_audit = @import("prelaunch_audit.zig");

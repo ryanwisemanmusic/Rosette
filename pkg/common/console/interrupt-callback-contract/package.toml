@@ -1,6 +1,6 @@
-name = "common-xenia-interrupt-callback-contract"
+name = "common-console-interrupt-callback-contract"
 version = "0.1.0-local"
-kind = "emulator-interrupt-callback-contract"
+kind = "console-interrupt-callback-contract"
 role = "build-time"
 architectures = ["any"]
 language = "zig"

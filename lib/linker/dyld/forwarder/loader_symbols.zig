@@ -83,9 +83,9 @@ const writePhysicalDeviceProperties2 = __ForwarderInternals._writePhysicalDevice
 const writePhysicalDevicePropertiesPNext = __ForwarderInternals._writePhysicalDevicePropertiesPNext;
 const writeQueueFamilies = __ForwarderInternals._writeQueueFamilies;
 const writeSurfaceCapabilities = __ForwarderInternals._writeSurfaceCapabilities;
-const xenia_heap_range = __ForwarderInternals._xenia_heap_range;
+const host_page_range_selection_abi = __ForwarderInternals._host_page_range_selection_abi;
 const xenia_host_gpu_callback_contract = __ForwarderInternals._xenia_host_gpu_callback_contract;
-const xenia_launch_assist_contract = __ForwarderInternals._xenia_launch_assist_contract;
+const console_launch_assist_contract = __ForwarderInternals._console_launch_assist_contract;
 const PipelineMarshalFailure = __ForwarderInternals._PipelineMarshalFailure;
 const RectExpansion = __ForwarderInternals._RectExpansion;
 const RobustHardening = __ForwarderInternals._RobustHardening;
@@ -485,7 +485,7 @@ pub fn noteSuppressedVulkanLoaderLookup(self: anytype) void {
 
 pub fn readHostAbiStackWord(state: anytype, offset: u64) u64 {
     const address = guest_context.registers(state).rsp +| offset;
-    if (state.guestMemoryConst(address, 8) == null) return xenia_heap_range.no_page;
+    if (state.guestMemoryConst(address, 8) == null) return host_page_range_selection_abi.no_page;
     return state.read64(address);
 }
 
@@ -612,7 +612,7 @@ pub fn dispatchXeniaLaunchAssistQuery(_: *Forwarder, state: anytype) u64 {
     const request = readGuestRecord(
         state,
         guest_context.registers(state).rdi,
-        xenia_launch_assist_contract.Request,
+        console_launch_assist_contract.Request,
     ) orelse {
         machoCapturePrint(
             "macho-processor: Rosette host ABI: launch-assist query rejected unreadable request=0x{x}\n",
@@ -621,7 +621,7 @@ pub fn dispatchXeniaLaunchAssistQuery(_: *Forwarder, state: anytype) u64 {
         return 0;
     };
     if (guest_context.registers(state).rsi == 0 or
-        state.guestMemory(guest_context.registers(state).rsi, @sizeOf(xenia_launch_assist_contract.Response)) == null)
+        state.guestMemory(guest_context.registers(state).rsi, @sizeOf(console_launch_assist_contract.Response)) == null)
     {
         machoCapturePrint(
             "macho-processor: Rosette host ABI: launch-assist query rejected unwritable response=0x{x}\n",
@@ -648,15 +648,15 @@ pub fn dispatchXeniaLaunchAssistReport(_: *Forwarder, state: anytype) u64 {
     const request = readGuestRecord(
         state,
         guest_context.registers(state).rdi,
-        xenia_launch_assist_contract.Request,
+        console_launch_assist_contract.Request,
     ) orelse return 0;
     const response = readGuestRecord(
         state,
         guest_context.registers(state).rsi,
-        xenia_launch_assist_contract.Response,
+        console_launch_assist_contract.Response,
     ) orelse return 0;
     const status = enumFromRaw(
-        xenia_launch_assist_contract.ApplyStatus,
+        console_launch_assist_contract.ApplyStatus,
         @truncate(guest_context.registers(state).rcx),
     ) orelse return 0;
     const coherent = application_framework.defaultHandle().reportXeniaLaunchAssist(
@@ -767,16 +767,16 @@ pub fn dispatchGuestSymbol(self: anytype, state: anytype, token: u64) bool {
     if (is_rosette_host_abi) {
         switch (entry.kind) {
             .rosette_heap_allocator_abi_version => {
-                guest_context.registers(state).rax = xenia_heap_range.abiVersion();
+                guest_context.registers(state).rax = host_page_range_selection_abi.abiVersion();
             },
             .rosette_heap_select => {
                 if (guest_context.registers(state).rsi > std.math.maxInt(u32)) {
-                    guest_context.registers(state).rax = xenia_heap_range.no_page;
+                    guest_context.registers(state).rax = host_page_range_selection_abi.no_page;
                 } else {
                     const total_page_count: u32 = @intCast(guest_context.registers(state).rsi);
                     const entries = guestHeapEntries(state, guest_context.registers(state).rdi, total_page_count);
                     guest_context.registers(state).rax = if (entries) |page_entries|
-                        xenia_heap_range.selectC(
+                        host_page_range_selection_abi.selectC(
                             page_entries,
                             total_page_count,
                             @truncate(guest_context.registers(state).rdx),
@@ -787,7 +787,7 @@ pub fn dispatchGuestSymbol(self: anytype, state: anytype, token: u64) bool {
                             @truncate(readHostAbiStackWord(state, 16)),
                         )
                     else
-                        xenia_heap_range.no_page;
+                        host_page_range_selection_abi.no_page;
                 }
             },
             .rosette_ppc_host_available => {
@@ -849,10 +849,10 @@ pub fn dispatchGuestSymbol(self: anytype, state: anytype, token: u64) bool {
                 ));
             },
             .rosette_xenia_launch_assist_abi_version => {
-                guest_context.registers(state).rax = xenia_launch_assist_contract.abi_version;
+                guest_context.registers(state).rax = console_launch_assist_contract.abi_version;
             },
             .rosette_xenia_launch_assist_schema_version => {
-                guest_context.registers(state).rax = xenia_launch_assist_contract.schema_version;
+                guest_context.registers(state).rax = console_launch_assist_contract.schema_version;
             },
             .rosette_xenia_launch_assist_query => {
                 guest_context.registers(state).rax = self.dispatchXeniaLaunchAssistQuery(state);

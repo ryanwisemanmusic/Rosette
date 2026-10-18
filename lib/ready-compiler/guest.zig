@@ -8,25 +8,25 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const types = @import("types.zig");
-const xenia_ready_plan = @import("xenia_ready_plan");
+const console_ready_plan = @import("console_ready_plan");
 const graphics_contract = @import("xenia_graphics_contract");
-const surface_path_contract = @import("xenia_surface_path_contract");
-const shader_storage_contract = @import("xenia_shader_storage_contract");
-const launch_phase_map = @import("xenia_launch_phase_map");
+const surface_path_contract = @import("host_surface_path_contract");
+const shader_storage_contract = @import("guest_shader_storage_contract");
+const launch_phase_map = @import("guest_launch_phase_map");
 const abi_bridge = @import("xenia_abi_bridge");
 const guest_bridge = @import("xenia_guest_bridge");
-const codegen_activation = @import("xenia_codegen_activation");
+const codegen_activation = @import("host_codegen_activation_contract");
 const wait_contract = @import("xenia_wait_contract");
 const startup_evidence = @import("xenia_startup_evidence");
 const startup_evidence_runtime = @import("startup_evidence_runtime");
-const translation_progress = @import("xenia_translation_progress");
+const translation_progress = @import("guest_translation_progress");
 const wait_runtime = @import("wait_runtime");
 const jit_label_ledger = @import("jit_label_ledger");
 const rosette_root = @import("rosette_root");
 
 /// The package owns the stage vocabulary; this alias keeps the existing
 /// Ready Compiler API stable for runtime observers and Mach-O adapters.
-pub const Stage = xenia_ready_plan.Stage;
+pub const Stage = console_ready_plan.Stage;
 
 /// Parse the route package's structured successful-translation event. Keeping
 /// this adapter beside the Xenia contract makes a schema change fail in the
@@ -35,13 +35,13 @@ pub fn translationProgressFromText(line: []const u8) ?translation_progress.Event
     return translation_progress.parse(line);
 }
 
-const graphics_handoff_stage_names = xenia_ready_plan.graphics_handoff_stage_names;
-const shader_storage_stage_names = xenia_ready_plan.shader_storage_stage_names;
-const surface_path_stage_names = xenia_ready_plan.surface_path_stage_names;
+const graphics_handoff_stage_names = console_ready_plan.graphics_handoff_stage_names;
+const shader_storage_stage_names = console_ready_plan.shader_storage_stage_names;
+const surface_path_stage_names = console_ready_plan.surface_path_stage_names;
 
-fn makeRuntimeSpecs() [xenia_ready_plan.specs.len]types.StageSpec {
-    var result: [xenia_ready_plan.specs.len]types.StageSpec = undefined;
-    for (xenia_ready_plan.specs, 0..) |spec, index| {
+fn makeRuntimeSpecs() [console_ready_plan.specs.len]types.StageSpec {
+    var result: [console_ready_plan.specs.len]types.StageSpec = undefined;
+    for (console_ready_plan.specs, 0..) |spec, index| {
         result[index] = .{
             .id = spec.id,
             .name = spec.name,
@@ -178,7 +178,7 @@ fn assertRouteSelected(comptime package: []const u8, comptime declared: []const 
 /// package uses `authentic_present` as shorthand for the terminal edge; every
 /// other tag has to be a stage this file declares, or the classifier is
 /// deciding about something the contract cannot report.
-const codegen_frontier_aliases = xenia_ready_plan.codegen_frontier_aliases;
+const codegen_frontier_aliases = console_ready_plan.codegen_frontier_aliases;
 
 comptime {
     // Each of these two cross-checks walks the 36-stage table once per name it
@@ -328,7 +328,7 @@ comptime {
 /// could only ever be reached by symbol attribution, and a stage that can only
 /// be reached by a heuristic is not the same kind of thing as the rest of this
 /// table. That decision is deliberately not being made here.
-pub const unstaged_owners = xenia_ready_plan.unstaged_owners;
+pub const unstaged_owners = console_ready_plan.unstaged_owners;
 
 pub const LaunchPhase = launch_phase_map.Phase;
 pub const LaunchAttribution = launch_phase_map.Attribution;
@@ -384,15 +384,15 @@ pub fn launchPhaseIsSilent(phase: LaunchPhase) bool {
     return launch_phase_map.isSilentInXenia(phase);
 }
 
-pub const pipeline_stages = xenia_ready_plan.pipeline_stages;
-pub const pipeline_stage_count = xenia_ready_plan.pipeline_stage_count;
+pub const pipeline_stages = console_ready_plan.pipeline_stages;
+pub const pipeline_stage_count = console_ready_plan.pipeline_stage_count;
 
 fn bit(stage: Stage) u64 {
     return @as(u64, 1) << @as(u6, @intCast(@intFromEnum(stage)));
 }
 
 pub fn contract() types.Contract {
-    const package_contract = xenia_ready_plan.contract();
+    const package_contract = console_ready_plan.contract();
     return .{
         .name = package_contract.name,
         .stages = &specs,
@@ -402,15 +402,15 @@ pub fn contract() types.Contract {
 }
 
 pub fn pipelineStage(raw_stage: u8) ?Stage {
-    return xenia_ready_plan.pipelineStage(raw_stage);
+    return console_ready_plan.pipelineStage(raw_stage);
 }
 
 pub fn workUnitStage(line: []const u8) ?Stage {
-    return xenia_ready_plan.workUnitStage(line);
+    return console_ready_plan.workUnitStage(line);
 }
 
 pub fn handoffPhase(raw_phase: u8) ?Stage {
-    return xenia_ready_plan.handoffPhase(raw_phase);
+    return console_ready_plan.handoffPhase(raw_phase);
 }
 
 test "Xenia contract ends at authentic native presentation" {

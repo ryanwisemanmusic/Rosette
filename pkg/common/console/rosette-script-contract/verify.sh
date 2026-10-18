@@ -7,7 +7,7 @@ manifest="${package_dir}/source-scripts.txt"
 xenia_root="${ROSETTE_XENIA_ROOT:-${XENIA_ROOT:-}}"
 
 zig_bin="${ZIG:-zig}"
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/common-xenia-rosette-script-contract.XXXXXX")"
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/common-console-rosette-script-contract.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 "${zig_bin}" test \
@@ -194,4 +194,4 @@ if rg -n -i \
     exit 1
 fi
 
-echo "common-xenia-rosette-script-contract: PASS"
+echo "common-console-rosette-script-contract: PASS"

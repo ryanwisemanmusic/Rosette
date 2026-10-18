@@ -1,4 +1,4 @@
-name = "xenia-arm64-guest-endian"
+name = "host-arm64-guest-endian"
 version = "0.1.0-local"
 kind = "guest-endian-source-mirror"
 role = "build-time"

@@ -1,4 +1,4 @@
-name = "xenia-x86-abi-bridge"
+name = "console-x86-abi-bridge"
 version = "0.1.0-local"
 kind = "cross-architecture-zero-trust"
 role = "build-time"

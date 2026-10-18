@@ -1,11 +1,11 @@
 //! Runtime evidence ledger for the earliest GPU handoff boundaries.
 //!
-//! `xenia_gpu_observation_contract` defines what the boundaries mean and which
+//! `console_gpu_observation_contract` defines what the boundaries mean and which
 //! facts precede them. This module records what actually happened during one
 //! run. It is intentionally silent and allocation-free: the Mach-O process
 //! decides whether a changed frontier deserves a log line.
 
-const contract = @import("xenia_gpu_observation_contract");
+const contract = @import("console_gpu_observation_contract");
 
 pub const Boundary = contract.Boundary;
 

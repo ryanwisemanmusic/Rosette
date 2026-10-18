@@ -1,6 +1,6 @@
-name = "common-xenia-texture-format-contract"
+name = "common-console-texture-format-contract"
 version = "0.1.0-local"
-kind = "xenia-texture-format-contract"
+kind = "console-texture-format-contract"
 role = "build-time"
 architectures = ["any"]
 language = "zig"

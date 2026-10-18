@@ -38,7 +38,7 @@ const testing = std.testing;
 const tso_memory = __ProcessInternals._tso_memory;
 const x64_linux_runtime = __ProcessInternals._x64_linux_runtime;
 const xbox_critical_section = __ProcessInternals._xbox_critical_section;
-const xenia_guest_milestone_map = __ProcessInternals._xenia_guest_milestone_map;
+const console_guest_milestone_map = __ProcessInternals._console_guest_milestone_map;
 const sleepForTest = @import("support.zig").sleepForTest;
 const ElfState = process.ElfState;
 const decodeInsn = __ProcessInternals._decodeInsn;
@@ -1068,7 +1068,7 @@ test "title worker code-cache execution closes the owner-only first-frame eviden
     state.windows_active_guest_thread_slot = 0;
     state.noteWindowsTitleCodeFetch(0xa0026b6a);
     try testing.expectEqual(@as(u64, 0), state.windows_title_code_fetches);
-    state.recordGuestMilestone(comptime xenia_guest_milestone_map.indexOf("_ZN2xe6kernel7XThread7ExecuteEv").?, 0x1402333b0);
+    state.recordGuestMilestone(comptime console_guest_milestone_map.indexOf("_ZN2xe6kernel7XThread7ExecuteEv").?, 0x1402333b0);
     try testing.expect(state.windows_guest_threads[0].entered_xenia_title);
     state.noteWindowsTitleCodeFetch(0x14312eef0); // heap helper, not title code cache
     try testing.expectEqual(@as(u64, 0), state.windows_title_code_fetches);

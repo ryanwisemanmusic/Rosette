@@ -1,6 +1,6 @@
-name = "common-xenia-kernel-shim-map"
+name = "common-console-kernel-shim-map"
 version = "0.1.0-local"
-kind = "xenia-kernel-export-shim-recognition"
+kind = "console-kernel-export-shim-recognition"
 role = "build-time"
 # Route-independent: the shape of a mangled C++ name and the console's export
 # naming are both properties of Xenia and the Xbox 360, not of the machine

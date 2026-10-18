@@ -1,4 +1,4 @@
-name = "xenia-x86-simd-shim-map"
+name = "host-x86-simd-translation-shim-map"
 version = "0.1.0-local"
 kind = "host-simd-translation-shim-map"
 role = "build-time"

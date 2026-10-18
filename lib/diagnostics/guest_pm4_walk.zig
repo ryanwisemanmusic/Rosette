@@ -13,7 +13,7 @@
 //! what was readable.
 
 const std = @import("std");
-const pm4 = @import("xenia_pm4_contract");
+const pm4 = @import("console_pm4_contract");
 const register_map = @import("xenos_register_map");
 
 pub const MemoryReadCallback = *const fn (context: *anyopaque, address: u32) ?u32;

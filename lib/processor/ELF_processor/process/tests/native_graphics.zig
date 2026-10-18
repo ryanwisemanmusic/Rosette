@@ -34,7 +34,7 @@ const tso_memory = __ProcessInternals._tso_memory;
 const windowsFileErrorLabel = __ProcessInternals._windowsFileErrorLabel;
 const windows_guest_abi = __ProcessInternals._windows_guest_abi;
 const x64_linux_runtime = __ProcessInternals._x64_linux_runtime;
-const xenia_guest_milestone_map = __ProcessInternals._xenia_guest_milestone_map;
+const console_guest_milestone_map = __ProcessInternals._console_guest_milestone_map;
 const ElfState = process.ElfState;
 
 const NativeGraphicsTestHarness = struct {
@@ -459,8 +459,8 @@ test "GPU register reads are counted by index with the value each returned" {
     var state = ElfState.init(testing.allocator);
     defer state.deinit();
     state.windows_runtime_enabled = true;
-    const read_index = comptime xenia_guest_milestone_map.indexOf("_ZN2xe3gpu14GraphicsSystem17ReadRegisterThunkEPvPS1_j").?;
-    const write_index = comptime xenia_guest_milestone_map.indexOf("_ZN2xe3gpu14GraphicsSystem18WriteRegisterThunkEPvPS1_jj").?;
+    const read_index = comptime console_guest_milestone_map.indexOf("_ZN2xe3gpu14GraphicsSystem17ReadRegisterThunkEPvPS1_j").?;
+    const write_index = comptime console_guest_milestone_map.indexOf("_ZN2xe3gpu14GraphicsSystem18WriteRegisterThunkEPvPS1_jj").?;
 
     for (0..3) |_| {
         state.regs.r8 = 0x7FC8_0710; // CP_RB_RPTR, index 0x01C4
@@ -965,7 +965,7 @@ test "an indirect buffer the ring names is decoded for the draws and swaps it ca
 test "the ring carried type 3 work when its opcode handlers ran with the dispatcher inlined" {
     var state = ElfState.init(testing.allocator);
     defer state.deinit();
-    const me_init = xenia_guest_milestone_map.indexOf("_ZN2xe3gpu6vulkan22VulkanCommandProcessor26ExecutePacketType3_ME_INITEjj") orelse return error.MissingMilestone;
+    const me_init = console_guest_milestone_map.indexOf("_ZN2xe3gpu6vulkan22VulkanCommandProcessor26ExecutePacketType3_ME_INITEjj") orelse return error.MissingMilestone;
     state.guest_milestone_hits[me_init] = 1;
     try testing.expectEqual(@as(u64, 1), state.gpuType3HandlerEntries());
     var found = false;

@@ -6,7 +6,7 @@
 //! monotonic class counters. It performs no logging and never allocates; the
 //! process decides when a changed summary is worth printing.
 
-const contract = @import("xenia_pm4_contract");
+const contract = @import("console_pm4_contract");
 const pm4 = @import("pm4.zig");
 
 pub const Source = enum(u8) {
@@ -111,7 +111,7 @@ pub const Snapshot = struct {
 };
 
 pub const Timeline = struct {
-    recent: [@import("xenia_gpu_observation_contract").packet_timeline_capacity]Observation = undefined,
+    recent: [@import("console_gpu_observation_contract").packet_timeline_capacity]Observation = undefined,
     recent_count: usize = 0,
     next_recent: usize = 0,
     packets: u64 = 0,

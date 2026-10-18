@@ -22,7 +22,7 @@
 //! state object and is written from ring-scan checkpoints.
 
 const std = @import("std");
-const contract = @import("xenia_vd_swap_contract");
+const contract = @import("console_vd_swap_contract");
 
 pub const Stage = contract.Stage;
 pub const Probe = contract.Probe;

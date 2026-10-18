@@ -2,7 +2,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const table = @import("table.zig");
 const handlers = @import("handlers.zig");
-const xenia_primitive_contract = @import("xenia_primitive_contract");
+const host_primitive_route_contract = @import("host_primitive_route_contract");
 
 const Handler = types.Handler;
 
@@ -30,7 +30,7 @@ pub const PrimitiveRegistry = struct {
         // is one of the existing definitions below, and the general scan stays
         // authoritative for symbols outside the package's narrow families.
         if (self.package_fast_path) {
-            if (xenia_primitive_contract.lookup(symbol_name)) |family| {
+            if (host_primitive_route_contract.lookup(symbol_name)) |family| {
                 return switch (family) {
                     .strlen => handlers.strlen,
                     .strchr => handlers.strchr,
@@ -194,7 +194,7 @@ test "registry: empty defs list matches nothing" {
 
 test "registry: package fast families retain the existing handler route" {
     const reg = builtin();
-    try std.testing.expect(xenia_primitive_contract.contractIsWellFormed());
+    try std.testing.expect(host_primitive_route_contract.contractIsWellFormed());
     try std.testing.expect(reg.matchSymbol("_strlen") != null);
     try std.testing.expect(reg.matchSymbol("_memcmp") != null);
     try std.testing.expect(reg.matchSymbol("_memcpy") != null);

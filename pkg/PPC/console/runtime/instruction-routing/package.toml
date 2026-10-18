@@ -1,4 +1,4 @@
-name = "xenia-ppc-instruction-routing"
+name = "guest-ppc32-xenon-instruction-routing"
 version = "0.1.0"
 kind = "facts"
 role = "build-time"

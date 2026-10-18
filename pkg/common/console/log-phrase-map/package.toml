@@ -1,6 +1,6 @@
-name = "common-xenia-log-phrase-map"
+name = "common-console-log-phrase-map"
 version = "0.1.0-local"
-kind = "xenia-log-phrase-stage-map"
+kind = "console-log-phrase-stage-map"
 role = "build-time"
 # Route-independent: Xenia's log strings do not change with the architecture
 # Rosette was compiled for.

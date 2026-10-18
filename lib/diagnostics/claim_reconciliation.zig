@@ -28,7 +28,7 @@
 //! so the log's loudest statement about a fact is not its truest one.
 
 const std = @import("std");
-const contract = @import("xenia_claim_reconciliation_contract");
+const contract = @import("console_claim_reconciliation_contract");
 
 pub const Claim = contract.Claim;
 pub const Source = contract.Source;

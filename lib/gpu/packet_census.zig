@@ -34,7 +34,7 @@
 //! a delivery with no request means something other than the title caused it.
 
 const std = @import("std");
-const pm4 = @import("xenia_pm4_contract");
+const pm4 = @import("console_pm4_contract");
 
 pub const Type3Opcode = pm4.Type3Opcode;
 

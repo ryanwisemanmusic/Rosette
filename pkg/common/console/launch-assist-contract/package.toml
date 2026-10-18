@@ -1,6 +1,6 @@
-name = "common-xenia-launch-assist-contract"
+name = "common-console-launch-assist-contract"
 version = "0.1.0-local"
-kind = "xenia-rosette-launch-assist-abi-contract"
+kind = "console-rosette-launch-assist-abi-contract"
 role = "build-time"
 architectures = ["any"]
 language = "zig"

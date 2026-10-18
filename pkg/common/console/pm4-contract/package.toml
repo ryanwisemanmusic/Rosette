@@ -1,4 +1,4 @@
-name = "common-xenia-pm4-contract"
+name = "common-console-pm4-contract"
 version = "0.1.0-local"
 kind = "console-pm4-packet-contract"
 role = "build-time"

@@ -1,6 +1,6 @@
-name = "common-xenia-guest-milestone-map"
+name = "common-console-guest-milestone-map"
 version = "0.1.0-local"
-kind = "xenia-guest-milestone-symbol-map"
+kind = "console-guest-milestone-symbol-map"
 role = "build-time"
 # Route-independent: Xenia's own function names do not change with the
 # architecture Rosette was compiled for.

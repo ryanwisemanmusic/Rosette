@@ -21,8 +21,8 @@ const ui_draw_evidence = __ProcessInternals._ui_draw_evidence;
 const x64_linux_runtime = __ProcessInternals._x64_linux_runtime;
 const xenia_accelerator = __ProcessInternals._xenia_accelerator;
 const xenia_clock_probe = __ProcessInternals._xenia_clock_probe;
-const xenia_guest_milestone_map = __ProcessInternals._xenia_guest_milestone_map;
-const xenia_kernel_shim_map = __ProcessInternals._xenia_kernel_shim_map;
+const console_guest_milestone_map = __ProcessInternals._console_guest_milestone_map;
+const console_kernel_shim_map = __ProcessInternals._console_kernel_shim_map;
 const xenia_sha1_kernel_feed_body = __ProcessInternals._xenia_sha1_kernel_feed_body;
 const ElfState = process.ElfState;
 
@@ -194,7 +194,7 @@ test "a milestone is counted when the guest calls its entry point" {
     state.noteGuestMilestoneEntry(0x140001000);
     try testing.expectEqual(@as(u64, 2), state.guestMilestoneHitsNamed(MILESTONE_REFRESH));
     try testing.expectEqual(@as(u64, 1234), state.guest_milestone_first_step[
-        xenia_guest_milestone_map.indexOf(MILESTONE_REFRESH).?
+        console_guest_milestone_map.indexOf(MILESTONE_REFRESH).?
     ]);
 
     // The middle of a function is not its entry: a milestone counts calls,
@@ -302,7 +302,7 @@ test "the kernel census counts what the title asked the kernel for, and nothing 
     try testing.expectEqualStrings("VdQueryVideoMode", last.export_name);
     // One graphics call places the title in display-query and no further.
     try testing.expectEqual(
-        xenia_kernel_shim_map.BootPhase.display_query,
+        console_kernel_shim_map.BootPhase.display_query,
         state.guest_kernel_calls.furthest_phase,
     );
 }
@@ -507,7 +507,7 @@ test "an inlined-away milestone is unobservable, not unmet" {
 
     var counts = [_]u32{0} ** GUEST_MILESTONE_COUNT;
     // The witness is called; the vblank body is not.
-    counts[xenia_guest_milestone_map.indexOf(dpc).?] = 2;
+    counts[console_guest_milestone_map.indexOf(dpc).?] = 2;
     state.noteGuestMilestoneCallSites(&counts);
 
     try testing.expect(state.guestMilestoneInlinedAway(vblank));
@@ -572,7 +572,7 @@ test "a virtual function has no call site either, and its zero is the guest" {
     try testing.expectEqual(ElfState.MilestoneReach.unreachable_inlined, state.guestMilestoneReach(ring));
 
     var data_refs = [_]u32{0} ** GUEST_MILESTONE_COUNT;
-    data_refs[xenia_guest_milestone_map.indexOf(ring).?] = 4;
+    data_refs[console_guest_milestone_map.indexOf(ring).?] = 4;
     state.noteGuestMilestoneDataReferences(&data_refs);
 
     // With the vtable column it is an indirect target that was never called,
@@ -764,7 +764,7 @@ test "a witness milestone's entries are split by the call site they came from" {
     var state = ElfState.init(testing.allocator);
     defer state.deinit();
     state.installGuestSymbolResolver(table.addressableResolver(), 1, 99);
-    const index = xenia_guest_milestone_map.indexOf(dpc).?;
+    const index = console_guest_milestone_map.indexOf(dpc).?;
 
     // The frame limiter's inlined vblank.
     state.last_instruction_rip = 0x1401b82e4;
@@ -1196,7 +1196,7 @@ test "the first-frame chain names the earliest unmet precondition and its owner"
 
     // A callable atlas-output witness is present. No samples (including
     // cold zero samples) can stand in for its returned bytes.
-    const font_index = comptime xenia_guest_milestone_map.indexOf(ui_draw_evidence.font_rgba_symbol).?;
+    const font_index = comptime console_guest_milestone_map.indexOf(ui_draw_evidence.font_rgba_symbol).?;
     var table = TestSymbolTable{ .entries = &.{
         .{ .address = 0x140001000, .name = "stbtt__run_charstring" },
     } };
@@ -1247,7 +1247,7 @@ test "UI return evidence follows the actual return and keeps pending pointers th
     state.regs.rdx = outputs;
     state.regs.r8 = outputs + 8;
     state.regs.r9 = outputs + 12;
-    state.noteGuestMilestoneArguments(comptime xenia_guest_milestone_map.indexOf(ui_draw_evidence.font_rgba_symbol).?);
+    state.noteGuestMilestoneArguments(comptime console_guest_milestone_map.indexOf(ui_draw_evidence.font_rgba_symbol).?);
     state.write64(outputs, pixels);
     state.write32(outputs + 8, 8);
     state.write32(outputs + 12, 8);
@@ -1258,7 +1258,7 @@ test "UI return evidence follows the actual return and keeps pending pointers th
     // Another cooperative thread captures its own pipeline result.
     state.windows_active_guest_thread_slot = 0;
     state.regs.rsp = MEM_BASE + 0x31000;
-    state.noteGuestMilestoneArguments(comptime xenia_guest_milestone_map.indexOf(ui_draw_evidence.pipelines_symbol).?);
+    state.noteGuestMilestoneArguments(comptime console_guest_milestone_map.indexOf(ui_draw_evidence.pipelines_symbol).?);
     state.regs.rax = 0x100; // only AL holds a C++ bool result
     state.completeGuestReturnCapture();
     try testing.expectEqual(@as(u64, 1), state.ui_evidence.pipeline_false);
@@ -1276,12 +1276,12 @@ test "UI return evidence follows the actual return and keeps pending pointers th
     state.write64(state.regs.rsp + 32, outputs + 8);
     state.write64(state.regs.rsp + 40, outputs + 12);
     inline for (0..4) |i| state.write32(outputs + i * 4, 10 + i);
-    state.noteGuestMilestoneArguments(comptime xenia_guest_milestone_map.indexOf(ui_draw_evidence.scissor_symbol).?);
+    state.noteGuestMilestoneArguments(comptime console_guest_milestone_map.indexOf(ui_draw_evidence.scissor_symbol).?);
     state.regs.rax = 1;
     state.completeGuestReturnCapture();
     try testing.expectEqual([4]u32{ 10, 11, 12, 13 }, state.ui_evidence.scissor_rect);
     state.regs.rdx = 0xffff_ffff_ffff_f000; // inaccessible, not fabricated zero geometry
-    state.noteGuestMilestoneArguments(comptime xenia_guest_milestone_map.indexOf(ui_draw_evidence.lists_symbol).?);
+    state.noteGuestMilestoneArguments(comptime console_guest_milestone_map.indexOf(ui_draw_evidence.lists_symbol).?);
     try testing.expectEqual(@as(u64, 1), state.ui_evidence.lists_unreadable);
     try testing.expect(!state.faulted);
 }

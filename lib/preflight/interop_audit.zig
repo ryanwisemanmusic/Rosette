@@ -37,7 +37,7 @@
 //! refusal.
 
 const std = @import("std");
-const contract = @import("xenia_prelaunch_audit_contract");
+const contract = @import("console_prelaunch_audit_contract");
 
 pub const Stage = contract.Stage;
 /// The links a working build had, for a reader that wants them in order.

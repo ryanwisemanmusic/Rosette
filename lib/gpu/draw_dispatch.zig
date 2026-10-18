@@ -37,7 +37,7 @@
 //!      never be counted as guest output.
 
 const std = @import("std");
-const contract = @import("xenia_draw_dispatch_contract");
+const contract = @import("console_draw_dispatch_contract");
 const pm4 = @import("pm4.zig");
 
 pub const Provenance = contract.Provenance;

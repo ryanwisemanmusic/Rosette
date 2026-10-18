@@ -1,6 +1,6 @@
-name = "common-xenia-warning-severity-map"
+name = "common-console-warning-severity-map"
 version = "0.1.0-local"
-kind = "xenia-warning-severity-map"
+kind = "console-warning-severity-map"
 role = "build-time"
 # Route-independent: Xenia's log text does not change with the architecture
 # Rosette was compiled for.

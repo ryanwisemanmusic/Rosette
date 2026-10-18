@@ -37,7 +37,7 @@
 //! canonical form and counts how often it had to.
 
 const std = @import("std");
-const contract = @import("xenia_wait_graph_contract");
+const contract = @import("console_wait_graph_contract");
 const wait_policy = @import("xenia_wait_handshake_policy");
 
 pub const Role = contract.Role;

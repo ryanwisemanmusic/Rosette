@@ -1,4 +1,4 @@
-name = "xenia-arm64-shader-storage-contract"
+name = "guest-arm64-shader-storage-contract"
 version = "0.1.0-local"
 kind = "shader-storage-handoff-contract"
 role = "build-time"

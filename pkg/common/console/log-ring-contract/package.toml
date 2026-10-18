@@ -1,6 +1,6 @@
-name = "common-xenia-log-ring-contract"
+name = "common-console-log-ring-contract"
 version = "0.1.0-local"
-kind = "emulator-log-ring-sequence-contract"
+kind = "guest-log-ring-sequence-contract"
 role = "build-time"
 architectures = ["any"]
 language = "zig"

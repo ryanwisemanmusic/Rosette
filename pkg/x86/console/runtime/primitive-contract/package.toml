@@ -1,4 +1,4 @@
-name = "xenia-x86-primitive-contract"
+name = "host-x86-primitive-route-contract"
 version = "0.1.0-local"
 kind = "mach-o-primitive-route-contract"
 role = "build-time"

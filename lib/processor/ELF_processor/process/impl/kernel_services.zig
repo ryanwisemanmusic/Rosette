@@ -53,8 +53,8 @@ const __process_x64_decoder = __ProcessInternals._x64_decoder;
 const __process_x64_linux_runtime = __ProcessInternals._x64_linux_runtime;
 const __process_xbox_critical_section = __ProcessInternals._xbox_critical_section;
 const __process_xenia_event_audit = __ProcessInternals._xenia_event_audit;
-const __process_xenia_guest_frontier_map = __ProcessInternals._xenia_guest_frontier_map;
-const __process_xenia_guest_milestone_map = __ProcessInternals._xenia_guest_milestone_map;
+const __process_console_guest_frontier_map = __ProcessInternals._console_guest_frontier_map;
+const __process_console_guest_milestone_map = __ProcessInternals._console_guest_milestone_map;
 const __process_xmutant_release_compat = __ProcessInternals._xmutant_release_compat;
 const __process_xmutant_teardown_compat = __ProcessInternals._xmutant_teardown_compat;
 const __state_MilestoneReach = __StateInternals._MilestoneReach;
@@ -615,7 +615,7 @@ pub fn guestMilestoneHits(self: *const ElfState, index: usize) u64 {
 }
 
 pub fn guestMilestoneHitsNamed(self: *const ElfState, mangled: []const u8) u64 {
-    const index = __process_xenia_guest_milestone_map.indexOf(mangled) orelse return 0;
+    const index = __process_console_guest_milestone_map.indexOf(mangled) orelse return 0;
     return self.guest_milestone_hits[index];
 }
 
@@ -648,7 +648,7 @@ pub fn guestMilestoneUnobservableReason(self: *const ElfState, mangled: []const 
 }
 
 pub fn guestMilestoneReach(self: *const ElfState, mangled: []const u8) __state_MilestoneReach {
-    const index = __process_xenia_guest_milestone_map.indexOf(mangled) orelse return .unresolved;
+    const index = __process_console_guest_milestone_map.indexOf(mangled) orelse return .unresolved;
     if (self.guest_milestone_addresses[index] == 0) return .unresolved;
     if (!self.guest_milestone_call_sites_counted) return .uncounted;
     if (self.guest_milestone_call_sites[index] != 0) return .direct;
@@ -666,19 +666,19 @@ pub fn guestMilestoneInlinedAway(self: *const ElfState, mangled: []const u8) boo
 
 pub fn guestMilestoneStageHits(self: *const ElfState, mangled: []const u8) u64 {
     const own = guestMilestoneHitsNamed(self, mangled);
-    const proxy = __process_xenia_guest_milestone_map.inlineProxyOf(mangled);
+    const proxy = __process_console_guest_milestone_map.inlineProxyOf(mangled);
     if (proxy.len == 0) return own;
     return @max(own, guestMilestoneHitsNamed(self, proxy));
 }
 
 pub fn guestMilestoneStageObservable(self: *const ElfState, mangled: []const u8) bool {
-    const proxy = __process_xenia_guest_milestone_map.inlineProxyOf(mangled);
+    const proxy = __process_console_guest_milestone_map.inlineProxyOf(mangled);
     if (proxy.len != 0 and guestMilestoneArmed(self, proxy) and !guestMilestoneInlinedAway(self, proxy)) return true;
     return guestMilestoneArmed(self, mangled) and !guestMilestoneInlinedAway(self, mangled);
 }
 
 pub fn guestMilestoneArmed(self: *const ElfState, mangled: []const u8) bool {
-    const index = __process_xenia_guest_milestone_map.indexOf(mangled) orelse return false;
+    const index = __process_console_guest_milestone_map.indexOf(mangled) orelse return false;
     return self.guest_milestone_addresses[index] != 0;
 }
 
@@ -873,11 +873,11 @@ pub fn describeGuestAddressOrUnnamed(self: *const ElfState, address: u64, buffer
     return if (described.len == 0) "<unmapped>" else described;
 }
 
-pub fn classifyGuestFrontier(self: *const ElfState, address: u64) __process_xenia_guest_frontier_map.Classification {
+pub fn classifyGuestFrontier(self: *const ElfState, address: u64) __process_console_guest_frontier_map.Classification {
     var name_storage: [__process_guest_symbol_text_bytes]u8 = undefined;
     const symbol = guestSymbolAt(self, address, &name_storage) orelse
-        return __process_xenia_guest_frontier_map.classify("");
-    return __process_xenia_guest_frontier_map.classify(symbol.name);
+        return __process_console_guest_frontier_map.classify("");
+    return __process_console_guest_frontier_map.classify(symbol.name);
 }
 
 pub fn guestFrontierIsBoundedComputation(self: *const ElfState) bool {
@@ -890,7 +890,7 @@ pub fn sampleGuestFrontier(self: *ElfState) void {
     self.guest_frontier_workload_samples[@intFromEnum(classification.workload)] +|= 1;
 }
 
-pub fn frontierSamplesFor(self: *const ElfState, workload: __process_xenia_guest_frontier_map.Workload) u64 {
+pub fn frontierSamplesFor(self: *const ElfState, workload: __process_console_guest_frontier_map.Workload) u64 {
     return self.guest_frontier_workload_samples[@intFromEnum(workload)];
 }
 

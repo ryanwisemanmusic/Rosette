@@ -3,7 +3,7 @@ set -euo pipefail
 
 package_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 zig_bin="${ZIG:-zig}"
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/common-xenia-texture-format-contract.XXXXXX")"
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/common-console-texture-format-contract.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 "$zig_bin" test \
@@ -20,4 +20,4 @@ for target in aarch64-freestanding x86_64-freestanding; do
     test -s "$output"
 done
 
-echo "common-xenia-texture-format-contract: PASS"
+echo "common-console-texture-format-contract: PASS"

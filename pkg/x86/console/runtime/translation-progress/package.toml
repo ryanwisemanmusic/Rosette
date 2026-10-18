@@ -1,4 +1,4 @@
-name = "xenia-x86-translation-progress"
+name = "guest-x86-translation-progress"
 version = "0.1.0-local"
 kind = "successful-guest-translation-progress"
 role = "build-time"

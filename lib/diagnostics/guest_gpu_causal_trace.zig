@@ -13,7 +13,7 @@
 const std = @import("std");
 const event_log = @import("event_log");
 const vd_ring = @import("xenia_vd_ring_contract");
-const pm4 = @import("xenia_pm4_contract");
+const pm4 = @import("console_pm4_contract");
 const pm4_walk = @import("guest_pm4_walk.zig");
 
 const machoCapturePrint = event_log.machoCapturePrint;

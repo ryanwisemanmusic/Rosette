@@ -7,7 +7,7 @@
 const std = @import("std");
 const event_log = @import("event_log");
 const contracts = @import("guest_pipeline_contracts.zig");
-const shader_storage_contract = @import("xenia_shader_storage_contract");
+const shader_storage_contract = @import("guest_shader_storage_contract");
 /// Which phrase witnesses which stage is fixed when Xenia is compiled, so the
 /// table and its rare-character filter are resolved at build time rather than
 /// re-walked per log line. What stays here is the part that needs the run:

@@ -1,7 +1,7 @@
 //! Stateful Xenia PowerPC graphics-callback transaction evidence.
 
 const std = @import("std");
-const contract = @import("xenia_interrupt_callback_contract");
+const contract = @import("console_interrupt_callback_contract");
 
 pub const Stage = contract.Stage;
 pub const Effect = contract.Effect;

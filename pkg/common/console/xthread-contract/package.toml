@@ -1,4 +1,4 @@
-name = "common-xenia-xthread-contract"
+name = "common-console-xthread-contract"
 version = "0.1.0-local"
 kind = "console-guest-thread-contract"
 role = "build-time"

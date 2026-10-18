@@ -7,7 +7,7 @@
 
 const std = @import("std");
 const contract = @import("application_framework_contract");
-const xenia_launch_assist_contract = @import("xenia_launch_assist_contract");
+const console_launch_assist_contract = @import("console_launch_assist_contract");
 const xenia_launch_assist = @import("guest_launch_assist.zig");
 const xenia_host_gpu_callback_contract = @import("xenia_host_gpu_callback_contract");
 const xenia_host_gpu_callback = @import("guest_host_gpu_callback.zig");
@@ -473,8 +473,8 @@ pub const Framework = struct {
 
     pub fn queryXeniaLaunchAssist(
         self: *Framework,
-        assist_request: xenia_launch_assist_contract.Request,
-    ) xenia_launch_assist_contract.Response {
+        assist_request: console_launch_assist_contract.Request,
+    ) console_launch_assist_contract.Response {
         self.lock.lock();
         defer self.lock.unlock();
 
@@ -485,7 +485,7 @@ pub const Framework = struct {
             const attribution = contract.attribute(.xenia_kernel);
             self.emitNamedUnlocked(.{
                 .kind = @intFromEnum(contract.EventKind.state_observation),
-                .truth = @intFromEnum(if (response.decision == @intFromEnum(xenia_launch_assist_contract.Decision.allow))
+                .truth = @intFromEnum(if (response.decision == @intFromEnum(console_launch_assist_contract.Decision.allow))
                     contract.Truth.requested
                 else
                     contract.Truth.rejected),
@@ -506,10 +506,10 @@ pub const Framework = struct {
 
     pub fn reportXeniaLaunchAssist(
         self: *Framework,
-        assist_request: xenia_launch_assist_contract.Request,
-        response: xenia_launch_assist_contract.Response,
+        assist_request: console_launch_assist_contract.Request,
+        response: console_launch_assist_contract.Response,
         applied_actions: u32,
-        status: xenia_launch_assist_contract.ApplyStatus,
+        status: console_launch_assist_contract.ApplyStatus,
     ) bool {
         self.lock.lock();
         defer self.lock.unlock();

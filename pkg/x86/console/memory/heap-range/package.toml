@@ -1,4 +1,4 @@
-name = "xenia-x86-heap-range"
+name = "host-x86-page-range-selection-abi"
 version = "0.1.0-local"
 kind = "page-range-selection-abi"
 role = "hybrid"

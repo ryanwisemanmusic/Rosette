@@ -241,10 +241,10 @@ const x64_linux_runtime = __ProcessInternals._x64_linux_runtime;
 const xbox_critical_section = __ProcessInternals._xbox_critical_section;
 const xenia_clock_probe = __ProcessInternals._xenia_clock_probe;
 const xenia_event_audit = __ProcessInternals._xenia_event_audit;
-const xenia_fatal_condition_map = __ProcessInternals._xenia_fatal_condition_map;
-const xenia_guest_frontier_map = __ProcessInternals._xenia_guest_frontier_map;
-const xenia_guest_milestone_map = __ProcessInternals._xenia_guest_milestone_map;
-const xenia_warning_severity_map = __ProcessInternals._xenia_warning_severity_map;
+const console_fatal_condition_map = __ProcessInternals._console_fatal_condition_map;
+const console_guest_frontier_map = __ProcessInternals._console_guest_frontier_map;
+const console_guest_milestone_map = __ProcessInternals._console_guest_milestone_map;
+const console_warning_severity_map = __ProcessInternals._console_warning_severity_map;
 const envEquals = __ProcessInternals._envEquals;
 const envFlag = __ProcessInternals._envFlag;
 const envPresentAndFalse = __ProcessInternals._envPresentAndFalse;
@@ -699,7 +699,7 @@ pub const ElfState = struct {
     /// Warning-level lines Xenia prints while nothing is wrong.
     windows_guest_informational_lines: u64 = 0,
     /// Bare module names Xenia's module lookup printed `device not found`
-    /// for, by name. See `xenia_warning_severity_map.bareModuleLookupName`.
+    /// for, by name. See `console_warning_severity_map.bareModuleLookupName`.
     windows_guest_module_lookups: [GUEST_MODULE_LOOKUP_CAPACITY]GuestModuleLookup = [_]GuestModuleLookup{.{}} ** GUEST_MODULE_LOOKUP_CAPACITY,
     windows_guest_module_lookup_count: usize = 0,
     windows_guest_module_lookup_lines: u64 = 0,
@@ -933,7 +933,7 @@ pub const ElfState = struct {
     /// See `guest_address_space.zig`.
     guest_regions: guest_address_space.Map = .{},
     /// Resolved entry addresses for the milestone table, parallel to
-    /// `xenia_guest_milestone_map.milestones`. Zero means the image does not
+    /// `console_guest_milestone_map.milestones`. Zero means the image does not
     /// contain that symbol, which is reported as `unresolved` rather than as
     /// "never reached".
     guest_milestone_addresses: [GUEST_MILESTONE_COUNT]u64 = [_]u64{0} ** GUEST_MILESTONE_COUNT,
@@ -5077,7 +5077,7 @@ pub const ElfState = struct {
         return process_impl_guest_diagnostics.terminateForWindowsCapabilityGap(self, dll_name, function_name);
     }
 
-    fn noteWindowsGuestCondition(self: *ElfState, condition: xenia_fatal_condition_map.Condition, line: []const u8) void {
+    fn noteWindowsGuestCondition(self: *ElfState, condition: console_fatal_condition_map.Condition, line: []const u8) void {
         return process_impl_guest_diagnostics.noteWindowsGuestCondition(self, condition, line);
     }
 
@@ -6801,7 +6801,7 @@ pub const ElfState = struct {
     }
 
     /// What the guest is doing at an address, from its symbol.
-    pub fn classifyGuestFrontier(self: *const ElfState, address: u64) xenia_guest_frontier_map.Classification {
+    pub fn classifyGuestFrontier(self: *const ElfState, address: u64) console_guest_frontier_map.Classification {
         return process_impl_kernel_services.classifyGuestFrontier(self, address);
     }
 
@@ -6824,7 +6824,7 @@ pub const ElfState = struct {
         return process_impl_kernel_services.sampleGuestFrontier(self);
     }
 
-    pub fn frontierSamplesFor(self: *const ElfState, workload: xenia_guest_frontier_map.Workload) u64 {
+    pub fn frontierSamplesFor(self: *const ElfState, workload: console_guest_frontier_map.Workload) u64 {
         return process_impl_kernel_services.frontierSamplesFor(self, workload);
     }
 

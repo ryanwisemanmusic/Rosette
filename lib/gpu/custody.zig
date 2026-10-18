@@ -21,7 +21,7 @@
 //! second copy of the custody logic.
 
 const std = @import("std");
-const contract = @import("xenia_provisioning_contract");
+const contract = @import("console_provisioning_contract");
 
 pub const Owner = contract.Owner;
 pub const Custody = contract.Custody;

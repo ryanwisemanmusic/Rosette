@@ -45,8 +45,8 @@
 //! required to say so.
 
 const std = @import("std");
-const shim_map = @import("xenia_kernel_shim_map");
-const export_map = @import("xenia_kernel_export_map");
+const shim_map = @import("console_kernel_shim_map");
+const export_map = @import("console_kernel_export_map");
 
 /// Slots in the open-addressed table.
 ///

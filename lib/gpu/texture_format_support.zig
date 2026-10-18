@@ -20,7 +20,7 @@
 //! names the format that should have been used.
 
 const std = @import("std");
-const contract = @import("xenia_texture_format_contract");
+const contract = @import("console_texture_format_contract");
 const abi = @import("vulkan/abi.zig");
 
 pub const TextureFormat = contract.TextureFormat;
