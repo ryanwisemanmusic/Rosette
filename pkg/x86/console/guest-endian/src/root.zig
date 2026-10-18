@@ -1,9 +1,13 @@
-//! Immutable Xenon guest-endian facts for the x86-64 host route.
+//! Generic integer byte-order helpers plus the PPC guest facts used by the
+//! x86-64 route.
 //!
-//! The guest is 32-bit big-endian PowerPC. Host byte order and host codegen
-//! differ by route, but these guest vectors must not drift.
+//! The compatibility constants describe Xenia's current 32-bit big-endian
+//! PowerPC guest. The conversion and alignment helpers accept caller-selected
+//! formats so they can be reused by other binary and guest-memory readers.
 
 const std = @import("std");
+
+pub const ByteOrder = enum { big, little };
 
 pub const host_architecture = "x86_64";
 pub const host_codegen = "xbyak-x86_64";
@@ -16,18 +20,37 @@ pub const ppc_nop_bytes = [_]u8{ 0x60, 0x00, 0x00, 0x00 };
 pub const ppc_nop_word: u32 = 0x6000_0000;
 pub const guest_instruction_width: u8 = 4;
 
-pub fn decodeGuestWord(bytes: *const [4]u8) u32 {
-    return std.mem.readInt(u32, bytes, .big);
+pub fn decodeInteger(comptime Int: type, bytes: *const [@sizeOf(Int)]u8, order: ByteOrder) Int {
+    return switch (order) {
+        .big => std.mem.readInt(Int, bytes, .big),
+        .little => std.mem.readInt(Int, bytes, .little),
+    };
 }
 
-pub fn encodeGuestWord(word: u32) [4]u8 {
-    var bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &bytes, word, .big);
+pub fn encodeInteger(comptime Int: type, value: Int, order: ByteOrder) [@sizeOf(Int)]u8 {
+    var bytes: [@sizeOf(Int)]u8 = undefined;
+    switch (order) {
+        .big => std.mem.writeInt(Int, &bytes, value, .big),
+        .little => std.mem.writeInt(Int, &bytes, value, .little),
+    }
     return bytes;
 }
 
+pub fn addressAligned(address: u64, alignment: u8) bool {
+    if (alignment == 0 or (alignment & (alignment - 1)) != 0) return false;
+    return address & (@as(u64, alignment) - 1) == 0;
+}
+
+pub fn decodeGuestWord(bytes: *const [4]u8) u32 {
+    return decodeInteger(u32, bytes, .big);
+}
+
+pub fn encodeGuestWord(word: u32) [4]u8 {
+    return encodeInteger(u32, word, .big);
+}
+
 pub fn guestInstructionAligned(address: u32) bool {
-    return address & (guest_instruction_width - 1) == 0;
+    return addressAligned(address, guest_instruction_width);
 }
 
 pub fn routeFingerprint() u64 {
@@ -41,6 +64,26 @@ test "guest word vectors are big-endian" {
     try std.testing.expectEqual(ppc_nop_word, decodeGuestWord(&ppc_nop_bytes));
     try std.testing.expectEqualSlices(u8, &ppc_nop_bytes, &encodeGuestWord(ppc_nop_word));
     try std.testing.expectEqual(@as(u8, 4), guest_instruction_width);
+}
+
+test "integer helpers support caller-selected widths and byte orders" {
+    const big = encodeInteger(u32, 0x1234_5678, .big);
+    const little = encodeInteger(u32, 0x1234_5678, .little);
+    try std.testing.expectEqualSlices(u8, &.{ 0x12, 0x34, 0x56, 0x78 }, &big);
+    try std.testing.expectEqualSlices(u8, &.{ 0x78, 0x56, 0x34, 0x12 }, &little);
+    try std.testing.expectEqual(@as(u32, 0x1234_5678), decodeInteger(u32, &big, .big));
+    try std.testing.expectEqual(@as(u32, 0x1234_5678), decodeInteger(u32, &little, .little));
+
+    const short = encodeInteger(u16, 0xabcd, .little);
+    try std.testing.expectEqualSlices(u8, &.{ 0xcd, 0xab }, &short);
+    try std.testing.expectEqual(@as(u16, 0xabcd), decodeInteger(u16, &short, .little));
+}
+
+test "alignment helper accepts power-of-two byte alignments only" {
+    try std.testing.expect(addressAligned(0x1010, 16));
+    try std.testing.expect(!addressAligned(0x1011, 16));
+    try std.testing.expect(!addressAligned(0x1010, 0));
+    try std.testing.expect(!addressAligned(0x1010, 3));
 }
 
 test "x86 route keeps host and guest facts distinct" {
