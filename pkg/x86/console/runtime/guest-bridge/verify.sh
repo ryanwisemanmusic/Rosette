@@ -3,16 +3,16 @@ set -euo pipefail
 
 package_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 zig_bin="${ZIG:-zig}"
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/xenia-x86-guest-bridge.XXXXXX")"
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/host-x86-guest-bridge.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 
-echo "xenia-x86-guest-bridge: native tests"
+echo "host-x86-guest-bridge: native tests"
 "$zig_bin" test \
     --cache-dir "$tmp_dir/native-cache" \
     --global-cache-dir "$tmp_dir/global-cache" \
     "$package_dir/src/root.zig"
 
-echo "xenia-x86-guest-bridge: x86_64 compile-only check"
+echo "host-x86-guest-bridge: x86_64 compile-only check"
 output="$tmp_dir/x86_64-freestanding.a"
 "$zig_bin" build-lib "$package_dir/src/root.zig" \
     --cache-dir "$tmp_dir/target-cache" \
@@ -24,4 +24,4 @@ output="$tmp_dir/x86_64-freestanding.a"
 test -s "$output"
 echo "  verified x86_64-freestanding"
 
-echo "xenia-x86-guest-bridge: PASS"
+echo "host-x86-guest-bridge: PASS"

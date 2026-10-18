@@ -1,6 +1,8 @@
-//! x86-64 host-side facts for the PPC guest bridge.
+//! x86-64 route facts for a guest-to-host bridge, with generic branch-range
+//! validation shared by runtime emitters.
 
 const std = @import("std");
+const branch_range = @import("branch_range.zig");
 
 pub const host_architecture = "x86_64";
 pub const host_codegen = "xbyak-x86_64";
@@ -19,16 +21,20 @@ pub fn guestInstructionAligned(address: GuestAddress) bool {
     return address & 3 == 0;
 }
 
-pub fn hostBranchDisplacement(from_end: u64, target: u64) ?i64 {
-    if (target >= from_end) {
-        const distance = target - from_end;
-        if (distance > 0x7fff_ffff) return null;
-        return @intCast(distance);
-    }
+pub const BranchRange = branch_range.BranchRange;
 
-    const distance = from_end - target;
-    if (distance > 0x8000_0000) return null;
-    return -@as(i64, @intCast(distance));
+pub fn branchDisplacement(origin: u64, target: u64, range: BranchRange) ?i64 {
+    return branch_range.displacement(origin, target, range);
+}
+
+pub const host_branch_range = BranchRange{
+    .minimum = -0x8000_0000,
+    .maximum = 0x7fff_ffff,
+    .alignment = 1,
+};
+
+pub fn hostBranchDisplacement(from_end: u64, target: u64) ?i64 {
+    return branchDisplacement(from_end, target, host_branch_range);
 }
 
 pub fn fitsHostBranch(from_end: u64, target: u64) bool {

@@ -1,6 +1,6 @@
-name = "xenia-x86-guest-bridge"
+name = "host-x86-guest-bridge"
 version = "0.1.0-local"
-kind = "x86-64-guest-bridge-contract"
+kind = "guest-bridge-contract"
 role = "build-time"
 architectures = ["x86_64"]
 language = "zig"
