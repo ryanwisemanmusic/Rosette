@@ -1,6 +1,8 @@
-//! ARM64 host-side facts for the PPC guest bridge.
+//! ARM64 route facts for a guest-to-host bridge, with generic branch-range
+//! validation shared by runtime emitters.
 
 const std = @import("std");
+const branch_range = @import("branch_range.zig");
 
 pub const host_architecture = "arm64";
 pub const host_codegen = "arm64-native-bridge";
@@ -19,17 +21,20 @@ pub fn guestInstructionAligned(address: GuestAddress) bool {
     return address & 3 == 0;
 }
 
-pub fn hostBranchDisplacement(from: u64, target: u64) ?i64 {
-    if ((from & 3) != 0 or (target & 3) != 0) return null;
-    if (target >= from) {
-        const distance = target - from;
-        if (distance > 0x07ff_fffc) return null;
-        return @intCast(distance);
-    }
+pub const BranchRange = branch_range.BranchRange;
 
-    const distance = from - target;
-    if (distance > 0x0800_0000) return null;
-    return -@as(i64, @intCast(distance));
+pub fn branchDisplacement(origin: u64, target: u64, range: BranchRange) ?i64 {
+    return branch_range.displacement(origin, target, range);
+}
+
+pub const host_branch_range = BranchRange{
+    .minimum = -0x0800_0000,
+    .maximum = 0x07ff_fffc,
+    .alignment = 4,
+};
+
+pub fn hostBranchDisplacement(from: u64, target: u64) ?i64 {
+    return branchDisplacement(from, target, host_branch_range);
 }
 
 pub fn fitsHostBranch(from: u64, target: u64) bool {
