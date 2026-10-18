@@ -1,4 +1,4 @@
-//! ARM64 host-side facts for the audio mixer and its callback.
+//! ARM64 audio-route facts and reusable buffer/stack layout checks.
 //!
 //! The console-side geometry — frame sizes, channel counts, XMA structure — is
 //! `pkg/common/console/audio-contract` and does not change with the host. What
@@ -24,6 +24,7 @@
 //!   value is stated here so `lib/audio/` can apply it in one place.
 
 const std = @import("std");
+const buffer_policy = @import("buffer_policy.zig");
 
 pub const host_architecture = "arm64";
 pub const host_audio_backend = "coreaudio";
@@ -52,14 +53,27 @@ pub const denormal_control_bits: u32 = 0x1000000;
 /// vector store, which is nowhere near the callback that misaligned it.
 pub const callback_stack_alignment: u32 = 16;
 
+/// Return whether a non-empty byte span contains whole SIMD vectors for the
+/// supplied sample and vector layout. This helper is independent of the
+/// current console mixer geometry; the route constants below remain the
+/// compatibility defaults used by lib/audio.
+pub fn isVectorSizedMixFor(bytes: u32, sample_bytes: u32, vector_bytes: u32) bool {
+    return buffer_policy.isVectorSized(bytes, sample_bytes, vector_bytes);
+}
+
 /// Whether a mix buffer of `bytes` can be processed as whole vectors.
 pub fn isVectorSizedMix(bytes: u32) bool {
-    return bytes != 0 and bytes % mix_vector_bytes == 0;
+    return isVectorSizedMixFor(bytes, mix_sample_bytes, mix_vector_bytes);
+}
+
+/// Check an ABI or callback stack boundary with a caller-supplied alignment.
+pub fn isStackAligned(stack_pointer: u64, alignment: u32) bool {
+    return buffer_policy.isAligned(stack_pointer, alignment);
 }
 
 /// Whether a stack pointer is acceptable at a callback entry.
 pub fn isCallbackStackAligned(stack_pointer: u64) bool {
-    return stack_pointer % callback_stack_alignment == 0;
+    return isStackAligned(stack_pointer, callback_stack_alignment);
 }
 
 test "package identity is the ARM64 audio route" {
