@@ -7,7 +7,8 @@ three files that each name its modules independently:
   * ``build.zig``              - the check/test route, via ``lib/processor/build.zig``
   * ``app/bundling/build.zig`` - the shipped runner and the .app
                                  (``pe_elf_state_module``)
-  * ``build/Makefile``         - one ``zig build-exe`` command line
+  * ``build/Makefile`` plus ``lib/processor/Makefile`` - one ``zig build-exe``
+    command line, with the recipe beside the processor source
 
 A module added to the source and wired into one route compiles for the author
 who ran that route and fails in the others. That has now happened three times.
@@ -35,7 +36,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "lib" / "processor" / "ELF_processor" / "process.zig"
 BUILD_ZIG = ROOT / "build.zig"
 BUNDLE_ZIG = ROOT / "app" / "bundling" / "build.zig"
-MAKEFILE = ROOT / "build" / "Makefile"
+MAKEFILE_COORDINATOR = ROOT / "build" / "Makefile"
+MAKEFILE_PROCESSOR = ROOT / "lib" / "processor" / "Makefile"
 
 IMPORT = re.compile(r'@import\("([^"]+)"\)')
 ADD_IMPORT = re.compile(r'(?:^|\W)([A-Za-z_][A-Za-z0-9_]*)\.addImport\("([^"]+)"')
@@ -62,13 +64,21 @@ def zig_route(path: Path, module_variable: str) -> set[str]:
 
 
 def makefile_route() -> set[str]:
-    """Every module the Makefile's build-exe line defines.
+    """Every module the folder-owned processor Makefile's build-exe line defines.
 
-    The command line is one long string, so a defined module is available to
-    whichever module declared it as a dependency; defining it is the part that
+    Also require the shared Makefile coordinator to include that folder module.
+    The command line is one long string, so defining a module is the part that
     is forgotten, and the part this audit is for.
     """
-    text = MAKEFILE.read_text(encoding="utf-8")
+    coordinator = MAKEFILE_COORDINATOR.read_text(encoding="utf-8")
+    included = re.search(
+        r"^include\s+\$\(ASSET_PREFIX\)lib/processor/Makefile\s*$",
+        coordinator,
+        re.MULTILINE,
+    )
+    if not included:
+        return set()
+    text = MAKEFILE_PROCESSOR.read_text(encoding="utf-8")
     return set(MAKEFILE_DEFINE.findall(text))
 
 
@@ -77,7 +87,7 @@ def main() -> int:
     routes = {
         "build.zig": zig_route(BUILD_ZIG, "elf_processor_mod"),
         "app/bundling/build.zig": zig_route(BUNDLE_ZIG, "pe_elf_state_module"),
-        "build/Makefile": makefile_route(),
+        "build/Makefile + lib/processor/Makefile": makefile_route(),
     }
 
     errors: list[str] = []

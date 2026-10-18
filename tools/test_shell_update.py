@@ -218,6 +218,9 @@ class ShellUpdatePolicyTests(unittest.TestCase):
             directory = Path(temporary)
             root = directory / "rosette"
             root.mkdir()
+            (root / "build.zig").write_text("// minimal coordinator fixture\n", encoding="utf-8")
+            (root / "build").mkdir()
+            (root / "build" / "Makefile").write_text("# minimal build fixture\n", encoding="utf-8")
             missing_xenia = directory / "unmounted" / "xenia"
             output = directory / "identity.json"
             script = REPO_ROOT / "tools/build_identity_manifest.py"
