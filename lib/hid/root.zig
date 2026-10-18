@@ -14,7 +14,7 @@
 //! stage that reports a problem owns it.
 //!
 //! The console-side layout is `pkg/common/console/input-contract`; the route's
-//! atomic publish width is `pkg/{x86,ARM64}/xenia/input-driver`.
+//! atomic publish width is `pkg/{x86,ARM64}/console/input-driver`.
 
 pub const controller_map = @import("controller_map.zig");
 pub const input_system = @import("input_system.zig");
