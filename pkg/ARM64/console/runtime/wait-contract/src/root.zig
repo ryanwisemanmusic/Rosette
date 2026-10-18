@@ -1,46 +1,33 @@
-//! Static wait/signal semantics for the ARM64 Xenia route.
+//! Static wait/signal policies for host routes.
 
 const std = @import("std");
+const wait_policy = @import("wait_policy.zig");
 
 pub const host_architecture = "arm64";
 pub const host_codegen = "arm64-native-bridge";
 
-pub const EventMode = enum {
-    consume_one,
-    manual_reset,
-};
-
-pub const WaitResult = enum {
-    blocked,
-    signaled,
-};
+pub const EventMode = wait_policy.EventMode;
+pub const WaitResult = wait_policy.WaitResult;
+pub const WaitContract = wait_policy.WaitContract;
 
 pub fn waitResult(mode: EventMode, pending_signals: u64) WaitResult {
-    _ = mode;
-    return if (pending_signals == 0) .blocked else .signaled;
+    return (WaitContract{ .mode = mode }).result(pending_signals);
 }
 
 pub fn signalPending(mode: EventMode, pending_signals: u64) u64 {
-    return switch (mode) {
-        .consume_one => pending_signals +| 1,
-        .manual_reset => 1,
-    };
+    return (WaitContract{ .mode = mode }).signal(pending_signals);
 }
 
 pub fn broadcastPending(mode: EventMode, pending_signals: u64, waiter_count: u64) u64 {
-    return switch (mode) {
-        .consume_one => pending_signals +| waiter_count,
-        .manual_reset => 1,
-    };
+    return (WaitContract{ .mode = mode }).broadcast(pending_signals, waiter_count);
 }
 
 pub fn resetPending(pending_signals: u64) u64 {
-    _ = pending_signals;
-    return 0;
+    return (WaitContract{ .mode = .consume_one }).reset(pending_signals);
 }
 
 pub fn consumesOnSuccess(mode: EventMode) bool {
-    return mode == .consume_one;
+    return (WaitContract{ .mode = mode }).consumes();
 }
 
 pub fn invariantHolds(
@@ -49,8 +36,11 @@ pub fn invariantHolds(
     consumed_signal_count: u64,
     invalid_success_count: u64,
 ) bool {
-    if (invalid_success_count != 0) return false;
-    return mode == .manual_reset or successful_wait_count == consumed_signal_count;
+    return (WaitContract{ .mode = mode }).invariantHolds(
+        successful_wait_count,
+        consumed_signal_count,
+        invalid_success_count,
+    );
 }
 
 test "package identity is the ARM64 native bridge route" {

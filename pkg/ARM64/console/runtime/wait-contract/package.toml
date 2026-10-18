@@ -1,4 +1,4 @@
-name = "xenia-arm64-wait-contract"
+name = "host-arm64-wait-contract"
 version = "0.1.0-local"
 kind = "runtime-synchronization-contract"
 role = "build-time"
