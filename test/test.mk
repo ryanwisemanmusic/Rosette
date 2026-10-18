@@ -4,7 +4,7 @@ ZIG_LIB := zig-out/lib/librosette_zig.a
 .PHONY: zig-lib
 zig-lib:
 	@if ! command -v zig >/dev/null 2>&1; then echo "zig not found in PATH"; exit 1; fi
-	@zig build --build-file build/build.zig install || exit $$?
+	@zig build --build-file build.zig install || exit $$?
 
 .PHONY: test-run
 test-run: zig-lib

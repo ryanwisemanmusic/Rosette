@@ -1,10 +1,11 @@
 ROOT_DIR := $(CURDIR)
+COORD_BUILD_FILE = $(ROOT_DIR)/build.zig
 
 # Detect invocation directory to support both
 #   cd build && make  (from build/ dir) and
 #   make              (from repo root)
 # NB: $(abspath) splits on spaces, so we use suffix substitution instead.
-ifneq ($(wildcard build.zig),)
+ifneq ($(shell test -f "$(CURDIR)/../build.zig" && echo build-subdirectory),)
 # CWD is the build/ directory: strip final /build, no BP prefix needed
 ROOT_DIR := $(ROOT_DIR:/build=)
 BP :=
@@ -73,7 +74,7 @@ ELF_PROCESSOR_SRC := $(ROOT_DIR)/lib/processor/ELF_processor/main.zig
 MACHO_PROCESSOR_BIN := $(ZIG_OUT_DIR)/bin/macho_processor
 MACHO_PROCESSOR_SRC := $(ROOT_DIR)/lib/Mach-O/main.zig
 ROSETTE_PACKAGE_MANAGER := $(ROOT_DIR)/pkg/registry/rosette-package-manager.sh
-# The Makefile path is also used by shell-update, outside build/build.zig.
+# The Makefile path is also used by shell-update, outside build.zig.
 # Keep its route package selection aligned with the native host that is
 # compiling Rosette. The package contributes facts only; it is not executable
 # Xenia code.
@@ -427,7 +428,7 @@ C_SOURCES := $(shell find $(ROOT_DIR)/src -name "*.c" -type f 2>/dev/null)
 
 c-fix-build:
 	@mkdir -p "$(ZIG_CACHE_DIR)/global"
-	@ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build c-fix --build-file $(BP)build.zig --prefix "$(ZIG_OUT_DIR)" 2>&1
+	@ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build c-fix --build-file "$(COORD_BUILD_FILE)" --prefix "$(ZIG_OUT_DIR)" 2>&1
 	@echo "Built $(C_FIX_BIN)"
 
 c-fix: c-fix-build
@@ -456,7 +457,7 @@ elf-processor-build:
 
 macho-processor-build:
 	@mkdir -p "$(ZIG_CACHE_DIR)/global"
-	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build --build-file build/build.zig --prefix "$(ZIG_OUT_DIR)" -Doptimize="$(ROSETTE_RUNTIME_OPTIMIZE)" macho-processor
+	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build --build-file "$(COORD_BUILD_FILE)" --prefix "$(ZIG_OUT_DIR)" -Doptimize="$(ROSETTE_RUNTIME_OPTIMIZE)" macho-processor
 
 # The dyld forwarder is shared by ELF and Mach-O processor roots. Rebuild both
 # consumers after its focused test so either installed processor sees the same
