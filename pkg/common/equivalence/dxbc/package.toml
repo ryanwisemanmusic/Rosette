@@ -1,0 +1,7 @@
+name = "common-dxbc-equivalence"
+version = "0.1.0-local"
+kind = "cross-route-equivalence"
+role = "build-time"
+architectures = ["x86_64", "arm64", "ppc64"]
+language = "zig"
+verification = "verify.sh"
