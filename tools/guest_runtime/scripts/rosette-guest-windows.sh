@@ -317,7 +317,7 @@ generate_support() {
     # Token-aware C++ ABI adaptation lives in Rosette, not in source patches
     # or warning filters. Build its small CLI in a Rosette-owned prefix and
     # expose immutable translated inputs through Clang's virtual filesystem.
-    zig build c-fix --build-file "$repo_root/build/build.zig" \
+    zig build c-fix --build-file "$repo_root/build.zig" \
         --prefix "$cpp_tool_prefix" >&2
     cpp_overlay="$("$cpp_tool_prefix/bin/rosette-c-fix" \
         --windows-xenia-overlay "$source_mirror" "$support_dir/cpp-overlay")"

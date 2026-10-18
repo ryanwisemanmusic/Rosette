@@ -380,7 +380,7 @@ def current_tree_hash(root: pathlib.Path, directories: tuple[str, ...], label: s
 
 
 def current_build_graph_hash(root: pathlib.Path) -> str | None:
-    paths = (pathlib.Path("build/build.zig"), pathlib.Path("build/Makefile"))
+    paths = (pathlib.Path("build.zig"), pathlib.Path("build/Makefile"))
     existing = [path for path in paths if (root / path).is_file()]
     if not existing:
         return ZERO_SHA256

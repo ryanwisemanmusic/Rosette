@@ -21,7 +21,7 @@ SOURCES = [
     "lib/processor/ELF_processor/process/tests/windows_fast_math.zig",
     "lib/processor/ELF_processor/process/tests/vector_extract.zig",
     "lib/processor/ELF_processor/block_jit/core.zig",
-    "build/folders/lib/processor.zig",
+    "lib/processor/build.zig",
     "tools/benchmarks/report_math_imports.py",
 ]
 

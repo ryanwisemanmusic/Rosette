@@ -27,13 +27,13 @@ class BuildOrganizationTests(unittest.TestCase):
             (root / "new.zig").write_text("// note\n" * 3001)
             self.assertEqual(1, len(size.violations(root, ["new.zig"], {"default_max_lines": 3000, "limits": {}})))
 
-    def test_folder_registration_is_read_in_call_order_and_missing_owner_fails(self):
+    def test_owner_module_registration_is_read_in_call_order_and_missing_owner_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "folders").mkdir()
+            owner = root / "lib" / "processor" / "build.zig"
+            owner.parent.mkdir(parents=True)
             master = root / "build.zig"
-            master.write_text('@import("folders/unit.zig").register0(b, .{});\n')
-            owner = root / "folders/unit.zig"
+            master.write_text('@import("lib/processor/build.zig").register0(b, .{});\n')
             owner.write_text('pub fn register0(b: *std.Build, ctx: anytype) void {\n    const first = b.step("unit", "test");\n}\n')
             text, inputs = graph_source(master)
             self.assertIn('b.step("unit"', text)

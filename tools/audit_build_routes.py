@@ -4,7 +4,7 @@
 Rosette builds `lib/processor/ELF_processor/process.zig` three times, from
 three files that each name its modules independently:
 
-  * ``build/build.zig``        - the check/test route (``elf_processor_mod``)
+  * ``build.zig``              - the check/test route, via ``lib/processor/build.zig``
   * ``app/bundling/build.zig`` - the shipped runner and the .app
                                  (``pe_elf_state_module``)
   * ``build/Makefile``         - one ``zig build-exe`` command line
@@ -33,7 +33,7 @@ from build_graph_sources import graph_source
 ROOT = Path(__file__).resolve().parents[1]
 
 SOURCE = ROOT / "lib" / "processor" / "ELF_processor" / "process.zig"
-BUILD_ZIG = ROOT / "build" / "build.zig"
+BUILD_ZIG = ROOT / "build.zig"
 BUNDLE_ZIG = ROOT / "app" / "bundling" / "build.zig"
 MAKEFILE = ROOT / "build" / "Makefile"
 
@@ -75,7 +75,7 @@ def makefile_route() -> set[str]:
 def main() -> int:
     required = source_imports()
     routes = {
-        "build/build.zig": zig_route(BUILD_ZIG, "elf_processor_mod"),
+        "build.zig": zig_route(BUILD_ZIG, "elf_processor_mod"),
         "app/bundling/build.zig": zig_route(BUNDLE_ZIG, "pe_elf_state_module"),
         "build/Makefile": makefile_route(),
     }
@@ -90,7 +90,7 @@ def main() -> int:
     test_route = zig_route(BUILD_ZIG, "elf_processor_test_mod")
     for name in sorted(required - test_route):
         errors.append(
-            f"build/build.zig's elf_processor_test_mod does not provide '{name}', "
+            f"build.zig's elf_processor_test_mod does not provide '{name}', "
             f"so the gate does not compile what the runner does"
         )
 

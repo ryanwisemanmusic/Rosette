@@ -1,0 +1,141 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Rosette · Critical path to 30 FPS</title><style>
+:root{color-scheme:dark;font-family:system-ui;background:#101722;color:#e7eef8}body{margin:0;background:#101722}main{max-width:1240px;margin:auto;padding:30px 24px 70px}h1{font-size:clamp(28px,4.5vw,42px);margin-bottom:12px}h2{margin-top:40px}h3{margin-top:26px;color:#d6e2f0}p,li{line-height:1.6;color:#b9c7d8}a{color:#88dece}nav{display:flex;gap:18px;flex-wrap:wrap;margin:12px 0}.badge{border:1px solid #836a3f;padding:7px 10px;border-radius:7px;color:#edcc89;font-size:13px;display:inline-block}.panel,.card{background:#1b2737;border:1px solid #314157;border-radius:14px;padding:18px;margin-top:18px}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.value{font-size:32px;font-weight:700;color:#89dccc}.value.warn{color:#edcc89}.note{border-left:4px solid #e4bd7c;padding:12px 16px;background:#202733;margin-top:14px}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}th,td{padding:9px;border-bottom:1px solid #344357;text-align:left;vertical-align:top;white-space:nowrap}td.wrap,th.wrap{white-space:normal}th{color:#8dd8cc;font-size:13px}details{margin:12px 0}summary{cursor:pointer;color:#cfe0f1}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;color:#bfcee0}input,select{background:#25384e;color:#eef3fa;border:1px solid #5b6d85;border-radius:6px;padding:7px;margin:6px 12px 6px 0}input[type=range]{width:220px;padding:0}label{display:inline-block;margin:8px 14px 8px 0}svg{width:100%;background:#121e2b;border-radius:10px}.small{font-size:13px}.math{font-family:ui-monospace,Menlo,monospace;background:#152130;border:1px solid #2c3d52;border-radius:8px;padding:12px 14px;color:#dfe9f5;overflow:auto}.good{color:#89dccc}.bad{color:#e79b9b}.legend span{display:inline-block;margin-right:16px;font-size:13px}.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:middle}@media(max-width:900px){.cards{grid-template-columns:1fr 1fr}}@media(max-width:600px){main{padding:22px 16px}.cards{grid-template-columns:1fr}}
+</style><main>
+<span class="badge">Source change · offline proofs · full Zig suite and shell update deferred</span>
+<h1>Critical path to 30 FPS: GPU register writes</h1>
+<p>October 16, 2026 · CPU path measurements and live-run frame model · Xenia, ISO and vendor source read only; nothing launched, no GPU work dispatched.</p>
+<nav><a href="#model">Frame model</a><a href="#writes">Register writes</a><a href="#vulkan">Vulkan path</a><a href="#calculator">How close to 30</a><a href="#evidence">Live evidence</a><a href="#next">Next run</a></nav>
+<div class="cards">
+ <div class="card"><div class="value" id="c-small"></div><p>Halo-shaped register packets<br><span id="c-small-detail"></span></p></div>
+ <div class="card"><div class="value" id="c-large"></div><p>64-register packets<br><span id="c-large-detail"></span></p></div>
+ <div class="card"><div class="value" id="c-live"></div><p>Heavy title screen, same draw load<br><span id="c-live-detail"></span></p></div>
+ <div class="card"><div class="value warn" id="c-budget"></div><p>GPU Commands cost per draw for 30 FPS<br><span id="c-budget-detail"></span></p></div>
+</div>
+
+<h2 id="model">Where the frame goes</h2>
+<p>Each point is one five-second report window of a Custom Games run: presented frames per second against the descriptor updates Xenia's GPU Commands thread issued per frame (about one per draw). The slow windows (5–8 FPS) are the ones with 1,800–2,300 updates per frame; the 20 FPS windows have 150–300.</p>
+<div class="legend"><span><i class="dot" style="background:#d88383"></i>Before (previous build)</span><span><i class="dot" style="background:#78cebd"></i>After (current build)</span></div>
+<svg id="scatter" viewBox="0 0 900 330" role="img" aria-label="FPS against draw work per frame"></svg>
+<div class="panel">
+<h3>The model</h3>
+<p>Translated instructions are a property of Xenia's work, not of Rosette's speed, and GPU Commands' per-frame count is almost exactly linear in draw work. Its busy time follows from its translated-instruction rate relative to its saturated rate in the same window.</p>
+<div class="math" id="fits"></div>
+<p id="regimes"></p>
+</div>
+
+<h2 id="writes">Offline proof: Xenia's GPU register writes</h2>
+<p>Every PM4 register write Xenia performs is a loop iteration around a virtual <code>VulkanCommandProcessor::WriteRegister</code>, which calls the base <code>CommandProcessor::WriteRegister</code> and updates a dirty bit: type-0 packets (<code>ExecutePacketType0</code>), SET_CONSTANT ranges (<code>WriteRegisterRangeFromRing</code>) and LOAD_ALU_CONSTANT (<code>WriteRegistersFromMem</code>). Translated, one register is 48–61 instructions in five to eight blocks, and the block hops dominate.</p>
+<p><strong>Change:</strong> a translated block starting at one of those three loop heads calls a native gate before loading its register cache. At a loop head every caller-saved register and flag is dead, so the gate runs the iterations natively through this executor's own TLB (the translator's admission rules, acquire/release lanes), then leaves exactly the registers, stack slots and loop exit the final iteration would. It stops at an iteration boundary, before any side effect, on a special or logged register, an unadmitted page, a different virtual <code>WriteRegister</code> or a changed image; Xenia's own code then runs that iteration. All five functions must match the shipped bytes before any gate is compiled.</p>
+<p>The replay below runs those five functions' real bytes (copied read only from xenia_canary.exe) through the production translator. Seven alternating ReleaseFast pairs per profile, thread CPU, same seeds; "before" is the same translator with the gate disabled.</p>
+<div class="scroll"><table id="replay"></table></div>
+<label>Profile <select id="replay-pick"></select></label>
+<svg id="replay-chart" viewBox="0 0 900 150" role="img" aria-label="Before and after nanoseconds per register write"></svg>
+<details><summary>Every paired sample</summary><pre id="replay-pairs"></pre></details>
+<div class="note" id="correctness"></div>
+
+<h2 id="vulkan">Offline proof: the Vulkan command path (previous pass, now live)</h2>
+<p>Xenia's per-draw Vulkan call stream, replayed through the whole PE route to a stub driver. The changes (spin-then-park FIFO handoff, pipeline lookup memo, cached trace setting, scratch-stack slots, cheaper duration clocks, Vulkan stub early-out) were source-only last pass; the current run carries them.</p>
+<div class="scroll"><table id="vulkan-table"></table></div>
+<h3>Each change's own saving (everything on vs everything on except it)</h3>
+<div class="scroll"><table id="ablation"></table></div>
+<h3>The same entry points in the two live runs</h3>
+<p>Outermost bridge time per call, including native work and waits; the runs are different sessions, so totals differ but per-call means are comparable.</p>
+<div class="scroll"><table id="entries"></table></div>
+
+<h2 id="calculator">How close to a locked 30 FPS?</h2>
+<p>A frame takes the longer of GPU Commands' busy time and the floor set elsewhere (MAIN is 94% busy in every window; the light windows sit at that floor). The calculator applies the measured per-write saving to GPU Commands' busy-time fit. Registers written per draw are not yet measured live; the default (≈230, 90% through small type-0 packets) is derived from this run: Xenia executed 91.04M packets for 3.44M native draws, the sampled indirect buffer is 77% type-0 packets carrying ~9.6 registers each (about 23.6 packets and 230 registers per descriptor update). That type-0 figure is an upper estimate (inline shader loads in the same sample would lower it); constants loaded from memory add to the total. The next run's <code>PE64 XENIA REGISTER WRITES</code> counters replace this estimate.</p>
+<div class="panel">
+<label>Draw updates per frame <input id="u" type="range" min="100" max="3000" step="50"><span id="u-label"></span></label>
+<label>Registers written per draw <input id="r" type="range" min="50" max="400" step="10"><span id="r-label"></span></label>
+<label>Share through small type-0 packets <input id="mix" type="range" min="0" max="100" step="5"><span id="mix-label"></span></label>
+<label>Floor elsewhere (ms) <input id="floor" type="number" min="10" max="80" step="0.5"></label>
+<p class="value" id="projection"></p>
+<div class="math" id="projection-math"></div>
+<p id="thirty"></p>
+</div>
+
+<h2 id="evidence">Live evidence</h2>
+<p>Exact lines from both runs, and the per-window data behind the chart.</p>
+<label>Run <select id="run-pick"></select></label>
+<p id="run-identity" class="small"></p>
+<div id="run-evidence"></div>
+<details><summary>Every report window</summary><div class="scroll"><table id="windows"></table></div></details>
+<details><summary>Worker CPU (THREAD_CPUTIME_ID)</summary><div class="scroll"><table id="cpu"></table></div></details>
+
+<h2 id="next">Delivery and the next ordinary run</h2>
+<p id="gates"></p>
+<p>The installed application is unchanged until the full Zig suite and a bare root <code>make shell-update</code> run. Then an ordinary Custom Games run, same map and camera. Read <code>PE64 XENIA REGISTER WRITES</code>: <code>native_registers</code> divided by presented frames gives registers per frame (this page's unknown), <code>loop_exits</code> how many loops finished natively, and <code>stops</code> why any did not. The windows' FPS against draw updates per frame should move up on the chart above. No FPS floor, locked 30 or weekend promise follows from these offline ratios.</p>
+<p>Audio, Fast Path, TSO, GPU containment/depth 2 and the 30 FPS ceiling are retained.</p>
+<p class="small"><a href="../bench-replay-final.log">Raw register-write timings</a> · <a href="../bench-results.json">Paired data</a> · <a href="../live-model.json">Frame model</a> · <a href="../manifest.json">Source and evidence hashes</a></p>
+</main><script>
+const d=__REPORT_DATA__, $=s=>document.getElementById(s);
+const e=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const n=(x,p=2)=>x==null?'unknown':Number(x).toLocaleString(undefined,{maximumFractionDigits:p,minimumFractionDigits:0});
+const [before,after]=d.runs, small=d.replay[3], large=d.replay[0], bulk=d.replay[2];
+
+$('c-small').textContent=small.ratio.toFixed(2)+'×';
+$('c-small-detail').textContent=`${n(small.before_ns_per_write)} → ${n(small.after_ns_per_write)} ns per register`;
+$('c-large').textContent=large.ratio.toFixed(2)+'×';
+$('c-large-detail').textContent=`${n(large.before_ns_per_write)} → ${n(large.after_ns_per_write)} ns per register`;
+$('c-live').textContent=`+${((after.heavy.fps/before.heavy.fps-1)*100).toFixed(0)}%`;
+$('c-live-detail').textContent=`${n(before.heavy.fps)} → ${n(after.heavy.fps)} FPS at ~${n(after.heavy.updates,0)} updates/frame (previous pass + Codex)`;
+const budget=(33.333-after.busy_fit.intercept)/2300*1000;
+$('c-budget').textContent=`${n(after.busy_fit.slope*1000,1)} → ${n(budget,1)} µs`;
+$('c-budget-detail').textContent=`at 2,300 updates/frame: ${(after.busy_fit.slope*1000/budget).toFixed(1)}× less`;
+
+// Scatter: FPS against updates per frame, both runs, with the fitted frame-time curves.
+(function(){const W=900,H=330,L=50,B=290,T=20,R=880,xmax=2600,ymax=31;
+ const X=u=>L+(R-L)*Math.min(u,xmax)/xmax, Y=f=>B-(B-T)*Math.min(f,ymax)/ymax;
+ let s=`<text x="10" y="16" fill="#9caec6" font-size="12">FPS</text><text x="${R-170}" y="${H-8}" fill="#9caec6" font-size="12">descriptor updates per frame</text>`;
+ for(const f of [5,10,15,20,25,30]) s+=`<line x1="${L}" y1="${Y(f)}" x2="${R}" y2="${Y(f)}" stroke="${f==30?'#836a3f':'#2a3a4f'}"/><text x="18" y="${Y(f)+4}" fill="#9caec6" font-size="12">${f}</text>`;
+ for(const u of [0,500,1000,1500,2000,2500]) s+=`<text x="${X(u)-12}" y="${B+16}" fill="#9caec6" font-size="12">${u}</text>`;
+ for(const [run,colour] of [[before,'#d88383'],[after,'#78cebd']]){
+  for(const w of run.windows) if(w.updates>100&&w.gpu>0) s+=`<circle cx="${X(w.updates)}" cy="${Y(w.fps)}" r="3.5" fill="${colour}" opacity="0.8"><title>line ${w.line}: ${n(w.fps)} FPS, ${n(w.updates,0)} updates/frame</title></circle>`;
+  let pts=[];for(let u=100;u<=xmax;u+=50){const ms=run.frame_fit.intercept+run.frame_fit.slope*u;pts.push(`${X(u)},${Y(1000/ms)}`);}
+  s+=`<polyline fill="none" stroke="${colour}" stroke-width="2" stroke-dasharray="5 4" points="${pts.join(' ')}"/>`;}
+ $('scatter').innerHTML=s;})();
+
+$('fits').innerHTML=d.runs.map(r=>`${e(r.name)}<br>&nbsp; GPU Commands instructions/frame = ${n(r.work_fit.intercept,2)}M + ${n(r.work_fit.slope*1000,1)}K × U &nbsp; (R² ${r.work_fit.r2.toFixed(3)}, ${r.work_fit.n} windows)<br>&nbsp; GPU Commands busy ms/frame = ${n(r.busy_fit.intercept,1)} + ${n(r.busy_fit.slope*1000,1)} µs × U &nbsp; (saturated ${n(r.saturated_gpu,0)}M instr/s, R² ${r.busy_fit.r2.toFixed(3)})<br>&nbsp; frame ms ≈ ${n(r.frame_fit.intercept,1)} + ${n(r.frame_fit.slope*1000,1)} µs × U &nbsp; (all regimes, R² ${r.frame_fit.r2.toFixed(3)})`).join('<br><br>')+`<br><br>U = descriptor updates per frame (≈ draws). Heavy windows (U &gt; 1800): ${before.heavy.count} before at ${n(before.heavy.fps)} FPS, ${after.heavy.count} after at ${n(after.heavy.fps)} FPS, same mean draw load (${n(before.heavy.updates,0)} vs ${n(after.heavy.updates,0)}).`;
+$('regimes').innerHTML=`Two regimes. In the light windows (U &lt; 400, mean ${n(after.light.fps,1)} FPS, ${n(after.light.frame_ms,1)} ms) GPU Commands runs at ${n(after.light.gpu,0)}M instr/s, about ${(after.light.gpu/after.saturated_gpu*100).toFixed(0)}% of its saturated rate, while MAIN stays at ${n(after.light.main,0)}M instr/s: <strong>those frames are bounded elsewhere</strong>, and 30 FPS there needs that floor to fall from ~${n(after.light.frame_ms,0)} to 33.3 ms (${(after.light.frame_ms/33.333).toFixed(2)}× faster). In the heavy windows GPU Commands is saturated and <strong>is the critical thread</strong>: ${n(after.work_fit.slope*1000,1)}K translated instructions per draw.`;
+
+// Register-write replay.
+$('replay').innerHTML='<tr><th class="wrap">Profile</th><th>Before ns/write</th><th>After ns/write</th><th>Ratio</th><th>Native</th><th>Retired before → after</th><th>Blocks before → after</th></tr>'+d.replay.map(g=>{const p=g.pairs[0];return `<tr><td class="wrap">${e(g.name.replaceAll('_',' '))}</td><td>${n(g.before_ns_per_write)}</td><td>${n(g.after_ns_per_write)}</td><td>${g.ratio.toFixed(2)}×</td><td>${(g.native_fraction*100).toFixed(1)}%</td><td>${n(p.before_retired/1e6,1)}M → ${n(p.after_retired/1e6,2)}M</td><td>${n(p.before_blocks/1e6,2)}M → ${n(p.after_blocks/1e6,3)}M</td></tr>`}).join('');
+for(let i=0;i<d.replay.length;i++) $('replay-pick').add(new Option(d.replay[i].name.replaceAll('_',' '),i));
+function replayChart(){const g=d.replay[$('replay-pick').value],m=g.before_ns_per_write;
+ $('replay-chart').innerHTML=`<text x="20" y="25" fill="#d3deea">Before ${n(g.before_ns_per_write)} ns per register write</text><rect x="20" y="34" width="${840*g.before_ns_per_write/m}" height="24" fill="#d88383"/><text x="20" y="92" fill="#d3deea">After ${n(g.after_ns_per_write)} ns per register write</text><rect x="20" y="101" width="${840*g.after_ns_per_write/m}" height="24" fill="#78cebd"/>`;
+ $('replay-pairs').textContent=JSON.stringify(g.pairs,null,2);}
+$('replay-pick').onchange=replayChart;$('replay-pick').value='3';replayChart();
+$('correctness').innerHTML=d.correctness;
+
+// Vulkan path.
+const v=d.vulkan;
+$('vulkan-table').innerHTML='<tr><th class="wrap">Profile</th><th>Before µs/call</th><th>After µs/call</th><th>Ratio</th><th class="wrap">Notes</th></tr>'+
+ `<tr><td class="wrap">Warm caches</td><td>${n(v.hot.before_us,3)}</td><td>${n(v.hot.after_us,3)}</td><td>${v.hot.ratio.toFixed(2)}×</td><td class="wrap">${n(v.hot.calls,0)} calls per sample, ${v.hot.pairs} pairs</td></tr>`+
+ `<tr><td class="wrap">Cache-evicting (gross)</td><td>${n(v.cold.before_us,3)}</td><td>${n(v.cold.after_us,3)}</td><td>${v.cold.ratio.toFixed(2)}×</td><td class="wrap">includes a ${n(v.scrub_us,3)} µs/call eviction loop both sides pay; net ${n(v.cold.before_us-v.scrub_us,3)} → ${n(v.cold.after_us-v.scrub_us,3)} µs</td></tr>`;
+$('ablation').innerHTML='<tr><th>Change</th><th>Saves per call</th></tr>'+v.ablation.map(a=>`<tr><td>${e(a.control.replaceAll('_',' '))}</td><td>${n(a.saves_ns,0)} ns</td></tr>`).join('');
+const names=[...new Set([...Object.keys(before.entries),...Object.keys(after.entries)])].filter(k=>before.entries[k]&&after.entries[k]).sort((a,b)=>after.entries[b].host_ms-after.entries[a].host_ms);
+$('entries').innerHTML='<tr><th>Entry point</th><th>Before µs/call</th><th>After µs/call</th><th>Ratio</th></tr>'+names.map(k=>`<tr><td>${e(k)}</td><td>${n(before.entries[k].mean_us)}</td><td>${n(after.entries[k].mean_us)}</td><td>${(before.entries[k].mean_us/after.entries[k].mean_us).toFixed(2)}×</td></tr>`).join('')+`<tr><td>All Vulkan calls</td><td>${n(before.total.mean_ns/1000)}</td><td>${n(after.total.mean_ns/1000)}</td><td>${(before.total.mean_ns/after.total.mean_ns).toFixed(2)}×</td></tr>`;
+
+// Calculator.
+$('u').value=Math.round(after.heavy.updates/50)*50;$('r').value=230;$('mix').value=90;$('floor').value=after.light.frame_ms.toFixed(1);
+function calculate(){const u=+$('u').value,r=+$('r').value,mix=+$('mix').value/100,floor=+$('floor').value;
+ $('u-label').textContent=' '+u;$('r-label').textContent=' '+r;$('mix-label').textContent=' '+(mix*100).toFixed(0)+'%';
+ const saved=mix*(small.before_ns_per_write-small.after_ns_per_write)+(1-mix)*(bulk.before_ns_per_write-bulk.after_ns_per_write);
+ const busy=after.busy_fit.intercept+after.busy_fit.slope*u, busyNew=busy-u*r*saved/1e6;
+ const now=Math.max(busy,floor), next=Math.max(busyNew,floor), fpsNow=Math.min(30,1000/now), fpsNext=Math.min(30,1000/next);
+ $('projection').textContent=`${fpsNow.toFixed(2)} → ${fpsNext.toFixed(2)} FPS (${(fpsNext/fpsNow).toFixed(2)}×)`;
+ $('projection-math').innerHTML=`busy(U) = ${n(after.busy_fit.intercept,1)} + ${n(after.busy_fit.slope*1000,1)} µs × ${u} = ${n(busy,1)} ms<br>saved per register = ${(mix*100).toFixed(0)}% × ${n(small.before_ns_per_write-small.after_ns_per_write)} + ${((1-mix)*100).toFixed(0)}% × ${n(bulk.before_ns_per_write-bulk.after_ns_per_write)} = ${n(saved)} ns<br>busy' = ${n(busy,1)} − ${u} × ${r} × ${n(saved)} ns = ${n(busyNew,1)} ms<br>frame = max(busy', floor ${n(floor,1)} ms) = ${n(next,1)} ms → ${fpsNext.toFixed(2)} FPS`;
+ const need=(33.333-after.busy_fit.intercept)/u*1000;
+ $('thirty').innerHTML=`<strong>30 FPS at ${u} updates/frame</strong> needs GPU Commands at or below ${n(need,1)} µs per update (now ${n(after.busy_fit.slope*1000,1)} µs; with this change ≈ ${n(after.busy_fit.slope*1000-r*saved/1000,1)} µs): <span class="${need>=after.busy_fit.slope*1000-r*saved/1000?'good':'bad'}">${need>=after.busy_fit.slope*1000-r*saved/1000?'met':(((after.busy_fit.slope*1000-r*saved/1000)/need).toFixed(1)+'× still to remove')}</span>; and the floor elsewhere at or below 33.3 ms (now ${n(floor,1)} ms): <span class="${floor<=33.333?'good':'bad'}">${floor<=33.333?'met':((floor/33.333).toFixed(2)+'× still to remove')}</span>. Both must hold for a locked 30.`;}
+for(const id of ['u','r','mix','floor'])$(id).oninput=calculate;calculate();
+
+// Live evidence.
+d.runs.forEach((r,i)=>$('run-pick').add(new Option(r.name,i)));
+function showRun(){const r=d.runs[$('run-pick').value];
+ $('run-identity').textContent=`run ${r.run} · build ${r.build} · ${r.gameplay_windows} gameplay windows · peak window ${n(r.peak_fps,1)} FPS`;
+ $('run-evidence').innerHTML=r.evidence.map(x=>`<details><summary>Line ${x.line}: ${e(x.raw.slice(0,110))}…</summary><pre>${e(x.raw)}</pre></details>`).join('');
+ $('windows').innerHTML='<tr><th>Line</th><th>Frames</th><th>FPS</th><th>Updates/frame</th><th>Binds/frame</th><th>GPU Commands M/s</th><th>MAIN M/s</th><th>RENDER M/s</th><th>Native registers/frame</th></tr>'+r.windows.map(w=>`<tr><td>${w.line}</td><td>${w.frames}</td><td>${n(w.fps,1)}</td><td>${n(w.updates,0)}</td><td>${n(w.binds,0)}</td><td>${n(w.gpu,1)}</td><td>${n(w.main,1)}</td><td>${n(w.render,1)}</td><td>${w.native_registers==null?'not logged':n(w.native_registers,0)}</td></tr>`).join('');
+ $('cpu').innerHTML='<tr><th>Worker</th><th>CPU s</th><th>Elapsed s</th><th>Busy</th></tr>'+Object.entries(r.cpu).sort((a,b)=>b[1].cpu_s-a[1].cpu_s).slice(0,14).map(([k,c])=>`<tr><td>${e(k)}</td><td>${n(c.cpu_s,1)}</td><td>${n(c.elapsed_s,1)}</td><td>${(c.cpu_s/c.elapsed_s*100).toFixed(1)}%</td></tr>`).join('');}
+$('run-pick').onchange=showRun;$('run-pick').value='1';showRun();
+$('gates').innerHTML=d.gates;
+</script></html>

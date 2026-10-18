@@ -138,7 +138,7 @@ ensure_zig_lib() {
                 MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}" \
                 ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-${ZIG_LOCAL_CACHE_DIR_DEFAULT}}" \
                 ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-${ZIG_GLOBAL_CACHE_DIR_DEFAULT}}" \
-                zig build --build-file build/build.zig install --prefix "${ROOT_DIR}/zig-out"
+                zig build --build-file build.zig install --prefix "${ROOT_DIR}/zig-out"
     )
 }
 

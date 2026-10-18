@@ -211,7 +211,7 @@ ensure_zig_lib() {
                 env \
                     ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-build/.zig-cache}" \
                     ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-build/.zig-cache/global}" \
-                    zig build --build-file build/build.zig install
+                    zig build --build-file build.zig install
         ) || return 1
     fi
 }

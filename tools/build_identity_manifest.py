@@ -26,6 +26,8 @@ import subprocess
 from pathlib import Path
 from typing import Iterable
 
+from build_graph_sources import graph_source
+
 
 SCHEMA_VERSION = 2
 HEX_ZERO = "0" * 64
@@ -628,8 +630,9 @@ def tree_identity(root: Path) -> dict:
     if generated_count == 0 and generated_missing:
         generated_hash = value_hash("rosette-generated-tree", "empty")
         generated_missing = []
+    _, build_registration_files = graph_source(root / "build.zig")
     graph_hash, graph_count, graph_missing = hash_paths(
-        [root / "build" / "build.zig", root / "build" / "Makefile"], root
+        [*build_registration_files, root / "build" / "Makefile"], root
     )
     vendor_hash, vendor_count, vendor_missing = hash_tree([root / "third_party"], "rosette-vendor")
     return {

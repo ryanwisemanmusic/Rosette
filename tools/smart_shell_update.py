@@ -450,7 +450,7 @@ def focused_update(root: Path, xenia_root: Path, scope: str) -> None:
         shutil.which("zig") or "zig",
         "build",
         "--build-file",
-        "build/build.zig",
+        "build.zig",
         "--prefix",
         "zig-out",
         "-Doptimize=ReleaseFast",

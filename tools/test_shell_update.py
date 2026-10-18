@@ -68,7 +68,7 @@ class ShellUpdatePolicyTests(unittest.TestCase):
             "dyld-forwarder",
             updater.target_scope_for_paths(["lib/linker/dyld/forwarder/fsi_submission.zig"]),
         )
-        self.assertIsNone(updater.target_scope_for_paths(["build/build.zig"]))
+        self.assertIsNone(updater.target_scope_for_paths(["build.zig"]))
         self.assertIsNone(
             updater.target_scope_for_paths(
                 ["lib/processor/ELF_processor/process/impl/execution.zig", "build/Makefile"]
@@ -76,7 +76,7 @@ class ShellUpdatePolicyTests(unittest.TestCase):
         )
         self.assertIsNone(
             updater.target_scope_for_paths(
-                ["src/x64-ASM/windows_runtime/core_imports.zig", "build/build.zig"]
+                ["src/x64-ASM/windows_runtime/core_imports.zig", "build.zig"]
             )
         )
 

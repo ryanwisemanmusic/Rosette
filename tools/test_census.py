@@ -266,7 +266,7 @@ def parse_artifacts(root: Path, text: str, modules: dict[str, str | None]) -> li
     # `block-jit-check`) are intentional test artifacts, but they do not run
     # as part of the repository-wide `check` census. Record them explicitly
     # so they are not mistaken for either default-check tests or unconnected
-    # tests. The default check variable is `check_step` in build/build.zig.
+    # tests. The default check variable is `check_step` in build.zig.
     focused_artifacts: set[str] = set()
     for step_name, inline_artifact, dependency in ANY_DEPENDENCY_RE.findall(text):
         if step_name == "check_step":
@@ -349,7 +349,7 @@ def parse_artifacts(root: Path, text: str, modules: dict[str, str | None]) -> li
 
 
 def build_graph(root: Path) -> dict:
-    path = root / "build" / "build.zig"
+    path = root / "build.zig"
     text, registration_inputs = graph_source(path)
     module_roots = parse_modules(root, text)
     artifacts = parse_artifacts(root, text, module_roots)

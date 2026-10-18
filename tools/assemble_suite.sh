@@ -139,7 +139,7 @@ run_native_assembler() {
         env MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}" \
             ZIG_LOCAL_CACHE_DIR="${ROOT_DIR}/.zig-cache" \
             ZIG_GLOBAL_CACHE_DIR="${ROOT_DIR}/.zig-global-cache" \
-            zig build --build-file build/build.zig install --prefix "${ROOT_DIR}/zig-out" >/dev/null
+            zig build --build-file build.zig install --prefix "${ROOT_DIR}/zig-out" >/dev/null
         "${ASSEMBLER_RUNNER_BIN}" \
             "${tool}" \
             "${source_path}" \

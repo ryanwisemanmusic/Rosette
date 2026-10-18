@@ -12,7 +12,7 @@ SOURCES = [
     "lib/processor/ELF_processor/block_jit/vector_permute.zig", "lib/processor/ELF_processor/block_jit/wide_unpacks.zig",
     "lib/processor/ELF_processor/block_jit/vector_expansion_tests.zig", "lib/processor/ELF_processor/process.zig",
     "lib/processor/ELF_processor/process/impl/windows_sync.zig", "lib/processor/ELF_processor/process/impl/worker_runtime_pulse.zig",
-    "lib/processor/ELF_processor/process/tests/vector_expansion.zig", "build/folders/lib/processor.zig",
+    "lib/processor/ELF_processor/process/tests/vector_expansion.zig", "lib/processor/build.zig",
     "tools/benchmarks/compare_vector_expansion.py", "tools/benchmarks/report_vector_expansion.py",
 ]
 

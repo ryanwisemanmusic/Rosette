@@ -12,6 +12,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from build_graph_sources import graph_source
+
 
 def digest(path: Path) -> str | None:
     if not path.is_file():
@@ -47,7 +49,8 @@ def main() -> int:
         if home:
             installed = Path(home) / ".rosette" / "bin" / "rosette-shell"
 
-    build_files = [root / "build" / "build.zig", root / "build" / "Makefile", args.source.resolve()]
+    _, build_registration_files = graph_source(root / "build.zig")
+    build_files = [*build_registration_files, root / "build" / "Makefile", args.source.resolve()]
     tree_hash = hashlib.sha256()
     for path in build_files:
         tree_hash.update(str(path.relative_to(root)).encode())
