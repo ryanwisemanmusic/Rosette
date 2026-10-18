@@ -26,7 +26,7 @@
     "lib/runtime/process-core/guest_log.zig": 5671,
     "lib/runtime/process-core/memory_access.zig": 6581,
     "pkg/common/rosette/run-integrity-contract/src/root.zig": 3242,
-    "pkg/common/xenia/kernel-export-map/src/root.zig": 3229,
+    "pkg/common/console/kernel-export-map/src/root.zig": 3229,
     "src/shell/global_config/rosette_shell.zig": 5350,
     "src/x64-ASM/windows_runtime.zig": 9718,
     "src/x64-ASM/windows_runtime/core_imports.zig": 4650

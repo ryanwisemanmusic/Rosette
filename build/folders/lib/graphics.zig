@@ -18,27 +18,27 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
         .{
             .root = "../lib/audio/root.zig",
             .contract_name = "xenia_audio_contract",
-            .contract_root = "../pkg/common/xenia/audio-contract/src/root.zig",
+            .contract_root = "../pkg/common/console/audio-contract/src/root.zig",
         },
         .{
             .root = "../lib/hid/root.zig",
             .contract_name = "xenia_input_contract",
-            .contract_root = "../pkg/common/xenia/input-contract/src/root.zig",
+            .contract_root = "../pkg/common/console/input-contract/src/root.zig",
         },
         .{
             .root = "../lib/gpu/shader/root.zig",
             .contract_name = "xenia_shader_contract",
-            .contract_root = "../pkg/common/xenia/shader-contract/src/root.zig",
+            .contract_root = "../pkg/common/console/shader-contract/src/root.zig",
         },
         .{
             .root = "../lib/gpu/render_target/root.zig",
             .contract_name = "xenia_render_target_contract",
-            .contract_root = "../pkg/common/xenia/render-target-contract/src/root.zig",
+            .contract_root = "../pkg/common/console/render-target-contract/src/root.zig",
         },
         .{
             .root = "../lib/gpu/texture_cache/root.zig",
             .contract_name = "xenia_texture_contract",
-            .contract_root = "../pkg/common/xenia/texture-contract/src/root.zig",
+            .contract_root = "../pkg/common/console/texture-contract/src/root.zig",
             .needs_texture_format_contract = true,
         },
     };
@@ -71,7 +71,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
         .optimize = optimize,
     });
     config_mod.addImport("xenia_config_schema", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/xenia/config-schema/src/root.zig"),
+        .root_source_file = b.path("../pkg/common/console/config-schema/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));

@@ -180,50 +180,50 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
         "../pkg/common/abi/receiver-classification/src/root.zig",
         "../pkg/common/xenos/register-map/src/root.zig",
         "../pkg/common/abi/near-null-shape/src/root.zig",
-        "../pkg/common/xenia/log-phrase-map/src/root.zig",
+        "../pkg/common/console/log-phrase-map/src/root.zig",
         "../pkg/common/abi/host-contract-catalogue/src/root.zig",
         "../pkg/common/text/phrase-filter/src/root.zig",
-        "../pkg/common/xenia/ready-plan/src/root.zig",
+        "../pkg/common/console/ready-plan/src/root.zig",
         // Console-hardware and kernel-ABI contracts. Route-independent for
         // the same reason register-map is: they describe the Xbox 360 and
         // its kernel, not the host Rosette was compiled for.
-        "../pkg/common/xenia/audio-contract/src/root.zig",
-        "../pkg/common/xenia/input-contract/src/root.zig",
-        "../pkg/common/xenia/user-contract/src/root.zig",
-        "../pkg/common/xenia/config-schema/src/root.zig",
-        "../pkg/common/xenia/shader-contract/src/root.zig",
-        "../pkg/common/xenia/render-target-contract/src/root.zig",
-        "../pkg/common/xenia/texture-contract/src/root.zig",
-        "../pkg/common/xenia/io-completion-contract/src/root.zig",
-        "../pkg/common/xenia/timer-contract/src/root.zig",
-        "../pkg/common/xenia/ob-contract/src/root.zig",
-        "../pkg/common/xenia/mount-contract/src/root.zig",
-        "../pkg/common/xenia/kernel-object-contract/src/root.zig",
+        "../pkg/common/console/audio-contract/src/root.zig",
+        "../pkg/common/console/input-contract/src/root.zig",
+        "../pkg/common/console/user-contract/src/root.zig",
+        "../pkg/common/console/config-schema/src/root.zig",
+        "../pkg/common/console/shader-contract/src/root.zig",
+        "../pkg/common/console/render-target-contract/src/root.zig",
+        "../pkg/common/console/texture-contract/src/root.zig",
+        "../pkg/common/console/io-completion-contract/src/root.zig",
+        "../pkg/common/console/timer-contract/src/root.zig",
+        "../pkg/common/console/ob-contract/src/root.zig",
+        "../pkg/common/console/mount-contract/src/root.zig",
+        "../pkg/common/console/kernel-object-contract/src/root.zig",
         // Facts transcribed from Xenia's own tables and headers. They
         // describe the console and its kernel, so they are route
         // independent like the rest of this list.
-        "../pkg/common/xenia/kernel-export-map/src/root.zig",
-        "../pkg/common/xenia/kernel-shim-map/src/root.zig",
-        "../pkg/common/xenia/vd-ring-contract/src/root.zig",
-        "../pkg/common/xenia/vd-swap-contract/src/root.zig",
-        "../pkg/common/xenia/provisioning-contract/src/root.zig",
-        "../pkg/common/xenia/claim-reconciliation-contract/src/root.zig",
+        "../pkg/common/console/kernel-export-map/src/root.zig",
+        "../pkg/common/console/kernel-shim-map/src/root.zig",
+        "../pkg/common/console/vd-ring-contract/src/root.zig",
+        "../pkg/common/console/vd-swap-contract/src/root.zig",
+        "../pkg/common/console/provisioning-contract/src/root.zig",
+        "../pkg/common/console/claim-reconciliation-contract/src/root.zig",
         "../pkg/common/diagnostics/async-log-contract/src/root.zig",
         "../pkg/common/abi/translation-economics-contract/src/root.zig",
         "../pkg/common/rosette/translation-cache-contract/src/root.zig",
-        "../pkg/common/xenia/draw-dispatch-contract/src/root.zig",
-        "../pkg/common/xenia/wait-graph-contract/src/root.zig",
-        "../pkg/common/xenia/wait-handshake-policy/src/root.zig",
-        "../pkg/common/xenia/pm4-contract/src/root.zig",
-        "../pkg/common/xenia/xex-format/src/root.zig",
-        "../pkg/common/xenia/notification-contract/src/root.zig",
-        "../pkg/common/xenia/log-ring-contract/src/root.zig",
-        "../pkg/common/xenia/xthread-contract/src/root.zig",
-        "../pkg/common/xenia/vfs-device-contract/src/root.zig",
-        "../pkg/common/xenia/launch-assist-contract/src/root.zig",
+        "../pkg/common/console/draw-dispatch-contract/src/root.zig",
+        "../pkg/common/console/wait-graph-contract/src/root.zig",
+        "../pkg/common/console/wait-handshake-policy/src/root.zig",
+        "../pkg/common/console/pm4-contract/src/root.zig",
+        "../pkg/common/console/xex-format/src/root.zig",
+        "../pkg/common/console/notification-contract/src/root.zig",
+        "../pkg/common/console/log-ring-contract/src/root.zig",
+        "../pkg/common/console/xthread-contract/src/root.zig",
+        "../pkg/common/console/vfs-device-contract/src/root.zig",
+        "../pkg/common/console/launch-assist-contract/src/root.zig",
         "../pkg/common/rosette/ownership-contract/src/root.zig",
         "../pkg/common/rosette/source-architecture-contract/src/root.zig",
-        "../pkg/common/xenia/rosette-script-contract/src/root.zig",
+        "../pkg/common/console/rosette-script-contract/src/root.zig",
     };
     inline for (common_package_roots) |package_root| {
         const package_mod = b.createModule(.{
@@ -247,42 +247,42 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     }
 
     const route_package_roots = [_][]const u8{
-        "../pkg/x86/xenia/graphics-contract/src/root.zig",
-        "../pkg/x86/xenia/graphics/surface-path-contract/src/root.zig",
-        "../pkg/x86/xenia/bridge/abi-bridge/src/root.zig",
+        "../pkg/x86/console/graphics-contract/src/root.zig",
+        "../pkg/x86/console/graphics/surface-path-contract/src/root.zig",
+        "../pkg/x86/console/bridge/abi-bridge/src/root.zig",
         // This package's tests live beside the evidence table rather than
         // in a `root.zig`; `main.zig` is its executable half.
-        "../pkg/x86/xenia/diagnostics/startup-evidence/src/evidence.zig",
-        "../pkg/x86/xenia/runtime/codegen-activation/src/root.zig",
-        "../pkg/x86/xenia/runtime/launch-phase-map/src/root.zig",
-        "../pkg/x86/xenia/runtime/primitive-contract/src/root.zig",
-        "../pkg/x86/xenia/runtime/guest-bridge/src/root.zig",
-        "../pkg/x86/xenia/runtime/shader-storage-contract/src/root.zig",
-        "../pkg/x86/xenia/runtime/wait-contract/src/root.zig",
-        "../pkg/x86/xenia/memory/heap-range/src/root.zig",
-        "../pkg/x86/xenia/audio-driver/src/root.zig",
-        "../pkg/x86/xenia/input-driver/src/root.zig",
-        "../pkg/x86/xenia/simd-shim-map/src/root.zig",
-        "../pkg/ARM64/xenia/graphics-contract/src/root.zig",
-        "../pkg/ARM64/xenia/graphics/surface-path-contract/src/root.zig",
-        "../pkg/ARM64/xenia/bridge/abi-bridge/src/root.zig",
+        "../pkg/x86/console/diagnostics/startup-evidence/src/evidence.zig",
+        "../pkg/x86/console/runtime/codegen-activation/src/root.zig",
+        "../pkg/x86/console/runtime/launch-phase-map/src/root.zig",
+        "../pkg/x86/console/runtime/primitive-contract/src/root.zig",
+        "../pkg/x86/console/runtime/guest-bridge/src/root.zig",
+        "../pkg/x86/console/runtime/shader-storage-contract/src/root.zig",
+        "../pkg/x86/console/runtime/wait-contract/src/root.zig",
+        "../pkg/x86/console/memory/heap-range/src/root.zig",
+        "../pkg/x86/console/audio-driver/src/root.zig",
+        "../pkg/x86/console/input-driver/src/root.zig",
+        "../pkg/x86/console/simd-shim-map/src/root.zig",
+        "../pkg/ARM64/console/graphics-contract/src/root.zig",
+        "../pkg/ARM64/console/graphics/surface-path-contract/src/root.zig",
+        "../pkg/ARM64/console/bridge/abi-bridge/src/root.zig",
         // Same split as the x86 copy: the tests live beside the evidence
         // table, and `main.zig` is the executable half.
-        "../pkg/ARM64/xenia/diagnostics/startup-evidence/src/evidence.zig",
-        "../pkg/ARM64/xenia/runtime/codegen-activation/src/root.zig",
-        "../pkg/ARM64/xenia/runtime/guest-bridge/src/root.zig",
-        "../pkg/ARM64/xenia/runtime/launch-phase-map/src/root.zig",
-        "../pkg/ARM64/xenia/runtime/primitive-contract/src/root.zig",
-        "../pkg/ARM64/xenia/runtime/shader-storage-contract/src/root.zig",
-        "../pkg/ARM64/xenia/runtime/wait-contract/src/root.zig",
-        "../pkg/ARM64/xenia/memory/heap-range/src/root.zig",
-        "../pkg/ARM64/xenia/audio-driver/src/root.zig",
-        "../pkg/ARM64/xenia/input-driver/src/root.zig",
-        "../pkg/ARM64/xenia/simd-shim-map/src/root.zig",
-        "../pkg/x86/xenia/guest-endian/src/root.zig",
-        "../pkg/ARM64/xenia/guest-endian/src/root.zig",
-        "../pkg/PPC/xenia/guest-endian/src/root.zig",
-        "../pkg/PPC/xenia/runtime/instruction-routing/src/root.zig",
+        "../pkg/ARM64/console/diagnostics/startup-evidence/src/evidence.zig",
+        "../pkg/ARM64/console/runtime/codegen-activation/src/root.zig",
+        "../pkg/ARM64/console/runtime/guest-bridge/src/root.zig",
+        "../pkg/ARM64/console/runtime/launch-phase-map/src/root.zig",
+        "../pkg/ARM64/console/runtime/primitive-contract/src/root.zig",
+        "../pkg/ARM64/console/runtime/shader-storage-contract/src/root.zig",
+        "../pkg/ARM64/console/runtime/wait-contract/src/root.zig",
+        "../pkg/ARM64/console/memory/heap-range/src/root.zig",
+        "../pkg/ARM64/console/audio-driver/src/root.zig",
+        "../pkg/ARM64/console/input-driver/src/root.zig",
+        "../pkg/ARM64/console/simd-shim-map/src/root.zig",
+        "../pkg/x86/console/guest-endian/src/root.zig",
+        "../pkg/ARM64/console/guest-endian/src/root.zig",
+        "../pkg/PPC/console/guest-endian/src/root.zig",
+        "../pkg/PPC/console/runtime/instruction-routing/src/root.zig",
         "../pkg/x86/third_party/endianness/src/root.zig",
         "../pkg/ARM64/third_party/endianness/src/root.zig",
         "../pkg/PPC/third_party/endianness/src/root.zig",
@@ -307,7 +307,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     }
 
     const xenia_guest_endian_equivalence_mod = b.createModule(.{
-        .root_source_file = b.path("../pkg/xenia_guest_endian_equivalence.zig"),
+        .root_source_file = b.path("../pkg/guest_endian_equivalence.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -598,7 +598,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     metal_live_check.dependOn(&b.addRunArtifact(metal_live_dyld_test).step);
     // Xenia's log phrases and the comptime rare-character filter over them.
     const xenia_log_phrase_map_mod = b.createModule(.{
-        .root_source_file = b.path("../pkg/common/xenia/log-phrase-map/src/root.zig"),
+        .root_source_file = b.path("../pkg/common/console/log-phrase-map/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -623,58 +623,58 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     // Package contract checks: rosette_pkg_log calls contractIsWellFormed()
     // on each at startup and writes results to .rosette/rosette-pkg.log.
     diagnostics_mod.addImport("xenia_mount_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/xenia/mount-contract/src/root.zig"),
+        .root_source_file = b.path("../pkg/common/console/mount-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_kernel_object_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/xenia/kernel-object-contract/src/root.zig"),
+        .root_source_file = b.path("../pkg/common/console/kernel-object-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_texture_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/xenia/texture-contract/src/root.zig"),
+        .root_source_file = b.path("../pkg/common/console/texture-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_io_completion_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/xenia/io-completion-contract/src/root.zig"),
+        .root_source_file = b.path("../pkg/common/console/io-completion-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_user_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/xenia/user-contract/src/root.zig"),
+        .root_source_file = b.path("../pkg/common/console/user-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_shader_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/xenia/shader-contract/src/root.zig"),
+        .root_source_file = b.path("../pkg/common/console/shader-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_render_target_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/xenia/render-target-contract/src/root.zig"),
+        .root_source_file = b.path("../pkg/common/console/render-target-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_audio_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/xenia/audio-contract/src/root.zig"),
+        .root_source_file = b.path("../pkg/common/console/audio-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_input_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/xenia/input-contract/src/root.zig"),
+        .root_source_file = b.path("../pkg/common/console/input-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_timer_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/xenia/timer-contract/src/root.zig"),
+        .root_source_file = b.path("../pkg/common/console/timer-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_kernel_export_map", xenia_kernel_export_map_mod);
     diagnostics_mod.addImport("xenia_vd_ring_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/xenia/vd-ring-contract/src/root.zig"),
+        .root_source_file = b.path("../pkg/common/console/vd-ring-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
@@ -696,37 +696,37 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     diagnostics_mod.addImport("xenia_application_controller_contract", xenia_application_controller_contract_mod);
     diagnostics_mod.addImport("application_framework_contract", application_framework_contract_mod);
     diagnostics_mod.addImport("xenia_xex_format", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/xenia/xex-format/src/root.zig"),
+        .root_source_file = b.path("../pkg/common/console/xex-format/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_notification_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/xenia/notification-contract/src/root.zig"),
+        .root_source_file = b.path("../pkg/common/console/notification-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_log_ring_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/xenia/log-ring-contract/src/root.zig"),
+        .root_source_file = b.path("../pkg/common/console/log-ring-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_xthread_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/xenia/xthread-contract/src/root.zig"),
+        .root_source_file = b.path("../pkg/common/console/xthread-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_vfs_device_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/xenia/vfs-device-contract/src/root.zig"),
+        .root_source_file = b.path("../pkg/common/console/vfs-device-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_ob_contract", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/xenia/ob-contract/src/root.zig"),
+        .root_source_file = b.path("../pkg/common/console/ob-contract/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
     diagnostics_mod.addImport("xenia_config_schema", b.createModule(.{
-        .root_source_file = b.path("../pkg/common/xenia/config-schema/src/root.zig"),
+        .root_source_file = b.path("../pkg/common/console/config-schema/src/root.zig"),
         .target = target,
         .optimize = optimize,
     }));
@@ -1153,7 +1153,7 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
             .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
         });
         macho_processor_mod.addCSourceFile(.{
-            .file = b.path("../lib/Mach-O/xenia_heap_exports_anchor.c"),
+            .file = b.path("../lib/Mach-O/guest_heap_exports_anchor.c"),
             .flags = &.{ "-Wall", "-Wextra" },
         });
         macho_processor_mod.addCSourceFile(.{
@@ -1165,11 +1165,11 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
             .flags = &.{ "-Wall", "-Wextra" },
         });
         macho_processor_mod.addCSourceFile(.{
-            .file = b.path("../lib/Mach-O/xenia_launch_assist_exports_anchor.c"),
+            .file = b.path("../lib/Mach-O/guest_launch_assist_exports_anchor.c"),
             .flags = &.{ "-Wall", "-Wextra" },
         });
         macho_processor_mod.addCSourceFile(.{
-            .file = b.path("../lib/Mach-O/xenia_host_gpu_callback_exports_anchor.c"),
+            .file = b.path("../lib/Mach-O/guest_host_gpu_callback_exports_anchor.c"),
             .flags = &.{ "-Wall", "-Wextra" },
         });
         macho_processor_mod.linkFramework("AppKit", .{});
