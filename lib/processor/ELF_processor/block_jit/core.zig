@@ -75,6 +75,8 @@ const vector_permute = @import("vector_permute.zig");
 const wide_unpacks = @import("wide_unpacks.zig");
 const ordered_lanes = @import("ordered_lanes.zig");
 const self_loops = @import("self_loops.zig");
+const direct_links = @import("direct_links.zig");
+const chain_layout = @import("chain_layout.zig");
 const register_cache = @import("register_cache.zig");
 const atomic_retry = @import("atomic_retry_yield.zig");
 const std = @import("std");
@@ -378,6 +380,8 @@ const ColdMemory = struct {
     /// The access is inside a fused flag run: the probe and the helper
     /// must leave NZCV as they found it.
     nzcv_live: bool,
+    /// Its instruction's last effect: the helper path checks `abort`.
+    abort_exit: ?ColdAbortExit = null,
 };
 
 /// An operand whose address depends on at most one guest register. Indexed,
@@ -801,6 +805,8 @@ pub const Block = struct {
     /// (`block_recycler.zig`): links name blocks, so a block's memory only
     /// ever holds a block.
     recycler: ?*anyopaque = null,
+    /// Header, direct entry and patchable exits in `code` (`direct_links.zig`).
+    links: direct_links.BlockLinks = .{},
 
     pub fn entry(self: *const Block) BlockFn {
         return @ptrCast(self.code.ptr);
@@ -812,6 +818,7 @@ pub const Block = struct {
         self.hop.generation = generation;
         self.hop.entry = @intFromPtr(self.code.ptr) + self.chain_entry;
         @atomicStore(*const u64, &self.hop.gen_ptr, word, .release);
+        direct_links.arm(self, word, generation);
     }
 
     /// No hop may enter this block: its proof loads `chain_never_word`,
@@ -822,6 +829,7 @@ pub const Block = struct {
         @atomicStore(*const u64, &self.hop.gen_ptr, &chain_never_word, .release);
         self.hop.rip = self.start_rip;
         self.hop.entry = @intFromPtr(self.code.ptr) + self.chain_entry;
+        direct_links.disarm(self);
     }
 };
 
@@ -893,6 +901,7 @@ pub const Compiled = struct {
     cold_code: []const u32 = &.{},
     /// Byte offset of the entry that skips the prologue.
     chain_entry: u32,
+    links: direct_links.BlockLinks = .{},
     native_count: u32,
     fallback_count: u32,
     register_only: bool,
@@ -2113,6 +2122,7 @@ const Compiler = struct {
     direct_scalar_paths: bool = true,
     direct_register_operands: bool = true,
     exits: std.ArrayList(ExitStub),
+    links: direct_links.Plan = .{},
     /// Full-probe paths of hoisted accesses, emitted after the block body so
     /// the hot path is the pointer test and the access alone.
     cold_accesses: std.ArrayList(ColdAccess) = .empty,
@@ -2374,7 +2384,7 @@ const Compiler = struct {
                 try self.emitChecked(a64.ldrImm(.doubleword, r_exit_rip, r_regs, rip_offset));
             }
             try self.a.loadConstant(0, stub.completed);
-            try self.a.branch(self.exit_path);
+            try self.links.emitTransfer(self.a, stub.rip, self.exit_path);
         }
     }
 
@@ -2587,6 +2597,21 @@ const Compiler = struct {
     /// carries the generation its bytes were proven at.
     fn emitChainAttempt(self: *Compiler) Error!void {
         self.a.placeLabel(self.exit_path);
+        if (self.links.sites_enabled) {
+            // The checks are shared with every site (`direct_links.zig`).
+            try self.a.call(self.links.checks);
+            self.a.placeLabel(self.links.dispatch);
+        } else try self.emitExitChecks();
+        try self.emitDispatch();
+        if (!self.links.sites_enabled) return;
+        self.a.placeLabel(self.links.checks);
+        try self.emitExitChecks();
+        try self.emit(a64.ret());
+    }
+
+    /// Write-back, accounting, break flag and budget: what runs before any
+    /// successor is looked for.
+    fn emitExitChecks(self: *Compiler) Error!void {
         // The stub's count assumes every instruction before the exit ran;
         // internal edges jumped over `skip_reg` of them.
         if (self.uses_skip_counter) try self.emit(a64.sub(.x64, 0, 0, skip_reg));
@@ -2618,6 +2643,10 @@ const Compiler = struct {
         try self.emitChecked(a64.ldrImm(.doubleword, t3, r_scratch, scratch_chain_budget_offset));
         try self.emit(a64.cmp(.x64, t1, t3));
         try self.a.branchCond(.hs, leave);
+    }
+
+    fn emitDispatch(self: *Compiler) Error!void {
+        const leave = self.epilogue_path;
         // t4 = the successor's guest address, t2 = this block.
         try self.emit(a64.mov(.x64, t4, r_exit_rip));
         // The helper table is inside the executing block.
@@ -2632,15 +2661,15 @@ const Compiler = struct {
         const fallthrough = self.first_way_fallthrough and !indirect;
         if (indirect) {
             const ways = try self.a.createLabel();
-            try self.emitJumpCacheProbe(prove, ways);
+            try chain_layout.jumpCacheProbe(self, prove, ways);
             self.a.placeLabel(ways);
-            try self.emitWayScan(0, prove);
+            try chain_layout.wayScan(self, 0, prove);
             try self.a.branch(leave);
         } else if (fallthrough) {
-            try @import("chain_layout.zig").first(self.a, later);
+            try chain_layout.first(self.a, later);
         } else {
-            try self.emitWayScan(0, prove);
-            try self.emitJumpCacheProbe(prove, leave);
+            try chain_layout.wayScan(self, 0, prove);
+            try chain_layout.staticMiss(self, prove, leave, self.links.ownsAllTargets());
         }
         // t6 = the link, t5 = the block it names: its hop line has the
         // address it was compiled for, the generation word and value its
@@ -2668,8 +2697,8 @@ const Compiler = struct {
         try self.emit(a64.br(t3));
         self.a.placeLabel(later);
         if (fallthrough) {
-            try self.emitWayScan(1, prove);
-            try self.emitJumpCacheProbe(prove, leave);
+            try chain_layout.wayScan(self, 1, prove);
+            try chain_layout.staticMiss(self, prove, leave, self.links.ownsAllTargets());
         }
     }
 
@@ -2681,36 +2710,6 @@ const Compiler = struct {
             .ret, .jmp_reg64, .jmp_mem64, .call_reg64, .call_mem64 => true,
             else => false,
         };
-    }
-
-    /// Branch to `prove` with t6 = the way whose address is t4. Each way
-    /// costs only its address compare; the way that matches is proved once.
-    fn emitWayScan(self: *Compiler, first: usize, prove: Label) Error!void {
-        for (first..link_ways) |way| {
-            const base: u32 = @intCast(hop_offset + @offsetOf(Hop, "links") + way * @sizeOf(Link));
-            const next_way = try self.a.createLabel();
-            try self.emitChecked(a64.ldrImm(.doubleword, t3, t2, base + @offsetOf(Link, "rip")));
-            try self.emit(a64.cmp(.x64, t3, t4));
-            try self.a.branchCond(.ne, next_way);
-            try self.emitStateOffsetAddress(t6, t2, base);
-            try self.a.branch(prove);
-            self.a.placeLabel(next_way);
-        }
-    }
-
-    /// Branch to `prove` with t6 = the jump-cache entry for t4 when it names
-    /// t4, else to `miss`.
-    fn emitJumpCacheProbe(self: *Compiler, prove: Label, miss: Label) Error!void {
-        try self.emitChecked(a64.ldrImm(.doubleword, t3, r_scratch, scratch_jump_cache_offset));
-        try self.a.branchIfZero(.x64, t3, miss);
-        try self.emit(a64.lsrImm(.x64, t5, t4, jump_cache_shift));
-        try self.emit(a64.eorReg(.x64, t5, t5, t4));
-        try self.emit(a64.logicalImmediate(.x64, .andop, t5, t5, jump_cache_entries - 1).?);
-        try self.emit(a64.addSubShifted(.x64, .add, false, t6, t3, t5, std.math.log2_int(usize, @sizeOf(Link))));
-        try self.emitChecked(a64.ldrImm(.doubleword, t5, t6, @offsetOf(Link, "rip")));
-        try self.emit(a64.cmp(.x64, t5, t4));
-        try self.a.branchCond(.ne, miss);
-        try self.a.branch(prove);
     }
 
     /// `dst = base + offset`, whatever the offset's size.
@@ -2729,6 +2728,7 @@ const Compiler = struct {
     fn emitFlagCompletion(self: *Compiler) Error!void {
         self.a.placeLabel(self.epilogue_path);
         if (self.resident_loop != null) try self.emitCacheWriteBack();
+        if (self.links.entry_enabled) self.a.placeLabel(self.links.unloaded);
         // Leaving for the glue: now the register file needs the RIP.
         try self.emitChecked(a64.strImm(.doubleword, r_exit_rip, r_regs, rip_offset));
         try self.emitChecked(a64.ldrImm(.byte, t0, r_scratch, scratch_flag_kind_offset));
@@ -3155,19 +3155,25 @@ const Compiler = struct {
     /// The read into `dest`: straight from the host page on a TLB hit, from
     /// the helper's x0 otherwise. Zero-extended at 32 bits either way.
     fn emitReadInto(self: *Compiler, size: Size, index: u32, dest: a64.Reg) Error!void {
-        return self.emitProbedScalar(false, size, index, dest);
+        return self.emitProbedScalar(false, size, index, dest, null);
     }
 
     /// write(state, x1, size, x3), on behalf of instruction `index`.
     fn emitWrite(self: *Compiler, size: Size, index: u32) Error!void {
-        return self.emitProbedScalar(true, size, index, 3);
+        return self.emitProbedScalar(true, size, index, 3, null);
+    }
+
+    /// The exit an access that ends instruction `index` takes on `abort`.
+    fn lastEffectExit(self: *const Compiler, index: u32) ColdAbortExit {
+        const insn = self.insns[index];
+        return .{ .completed = index + 1, .next_rip = insn.rip +% insn.len, .fused = self.fused };
     }
 
     /// The hot path of a probed scalar access - alignment test, TLB probe,
     /// one ordered access - falling through on a hit; the unaligned and the
     /// helper paths go out of line (`ColdMemory`). The guest address is in
     /// x1, a store's value in x3.
-    fn emitProbedScalar(self: *Compiler, is_write: bool, size: Size, index: u32, data: a64.Reg) Error!void {
+    fn emitProbedScalar(self: *Compiler, is_write: bool, size: Size, index: u32, data: a64.Reg, abort_exit: ?ColdAbortExit) Error!void {
         self.touches_memory = true;
         const access_bytes = bits(size) / 8;
         const slow = try self.a.createLabel();
@@ -3191,10 +3197,11 @@ const Compiler = struct {
             .is_write = is_write,
             .dest = if (is_write) 0 else data,
             .nzcv_live = self.nzcv_live,
+            .abort_exit = abort_exit,
         });
-        // The helper the miss calls may set `abort`; the instruction's own
-        // check stays on the hot path, as it was when the call was inline.
-        self.abort_unchecked = true;
+        // The helper the miss calls may set `abort`: checked on the helper
+        // path when nothing of the instruction remains, else on the hot path.
+        if (abort_exit == null) self.abort_unchecked = true;
     }
 
     /// Every probed access's unaligned path and helper call
@@ -3223,6 +3230,7 @@ const Compiler = struct {
             try self.a.loadConstant(2, @intFromEnum(cold.size));
             try self.emitCallHelper(if (cold.is_write) helper_write_offset else helper_read_offset);
             if (!cold.is_write and cold.dest != 0) try self.emit(a64.mov(.x64, cold.dest, 0));
+            if (cold.abort_exit) |exit| try self.emitColdAbortCheck(exit);
             try self.a.branch(cold.done);
         }
     }
@@ -3966,18 +3974,22 @@ const Compiler = struct {
                 if (cold.is_write) try self.emitWrite(cold.size, cold.index) else try self.emitRead(cold.size, cold.index);
                 if (!cold.is_write and cold.dest != 0) try self.emit(a64.mov(.x64, cold.dest, 0));
             }
-            if (cold.abort_exit) |exit| {
-                const stub = try self.coldExitStub(exit.completed, exit.next_rip);
-                const target = if (exit.fused) |fused| blk: {
-                    const path = try self.a.createLabel();
-                    try self.fused_exits.append(self.allocator, .{ .label = path, .fused = fused, .owed = fused.writes, .stub = stub });
-                    break :blk path;
-                } else stub;
-                try self.emitChecked(a64.ldrImm(.byte, t0, r_scratch, scratch_abort_offset));
-                try self.a.branchIfNonZero(.w32, t0, target);
-            }
+            if (cold.abort_exit) |exit| try self.emitColdAbortCheck(exit);
             try self.a.branch(cold.resume_at);
         }
+    }
+
+    /// Leave after the instruction an out-of-line access ended, when its
+    /// helper asked to stop.
+    fn emitColdAbortCheck(self: *Compiler, exit: ColdAbortExit) Error!void {
+        const stub = try self.coldExitStub(exit.completed, exit.next_rip);
+        const target = if (exit.fused) |fused| blk: {
+            const path = try self.a.createLabel();
+            try self.fused_exits.append(self.allocator, .{ .label = path, .fused = fused, .owed = fused.writes, .stub = stub });
+            break :blk path;
+        } else stub;
+        try self.emitChecked(a64.ldrImm(.byte, t0, r_scratch, scratch_abort_offset));
+        try self.a.branchIfNonZero(.w32, t0, target);
     }
 
     /// A 128-bit access through the hoisted pointer, with the ordinary one
@@ -4030,13 +4042,13 @@ const Compiler = struct {
 
     /// A load straight into `dest` (a guest register's cache): no trip
     /// through x0 and back.
-    fn emitLoadOperandInto(self: *Compiler, insn: Insn, size: Size, index: u32, dest: a64.Reg) Error!void {
+    fn emitLoadOperandInto(self: *Compiler, insn: Insn, size: Size, index: u32, dest: a64.Reg, last_effect: bool) Error!void {
         if (self.hoistedOffset(insn, size)) |offset| {
-            try self.emitHoistedAccessWith(insn, size, index, offset, false, false, dest);
+            try self.emitHoistedAccessWith(insn, size, index, offset, false, last_effect, dest);
             return;
         }
         try self.emitEffectiveAddress(1, insn);
-        try self.emitReadInto(size, index, dest);
+        try self.emitProbedScalar(false, size, index, dest, if (last_effect) self.lastEffectExit(index) else null);
     }
 
     /// A store of `value`, the instruction's last effect when `last_effect`:
@@ -4051,7 +4063,7 @@ const Compiler = struct {
         }
         if (value != 3) try self.emit(a64.mov(.x64, 3, value));
         try self.emitEffectiveAddress(1, insn);
-        try self.emitWrite(size, index);
+        try self.emitProbedScalar(true, size, index, 3, if (last_effect) self.lastEffectExit(index) else null);
     }
 
     /// Move the MXCSR value in w0 onto the host FPCR, as
@@ -4119,7 +4131,7 @@ const Compiler = struct {
             }
         }
         try self.emitEffectiveAddress(1, insn);
-        try self.emitWrite(size, index);
+        try self.emitProbedScalar(true, size, index, 3, if (last_effect) self.lastEffectExit(index) else null);
     }
 
     fn emitInsn(self: *Compiler, index: u32) Error!Emitted {
@@ -4247,7 +4259,7 @@ const Compiler = struct {
                 if (self.cachedWhole(d.dst_reg, d.dst_high8, size)) |host| {
                     // Straight into the cache register: a 32-bit load
                     // zero-extends on both machines.
-                    try self.emitLoadOperandInto(insn, size, index, host);
+                    try self.emitLoadOperandInto(insn, size, index, host, true);
                     self.noteDirectWrite(d.dst_reg);
                 } else {
                     try self.emitLoadOperand(insn, size, index);
@@ -7602,6 +7614,8 @@ pub const Options = struct {
     entry_gate: u32 = 0,
     /// Place out-of-line paths apart from the hot code (`code_layout.zig`).
     split_cold: bool = false,
+    /// Direct entries and patchable exits (`direct_links.zig`).
+    direct_links: bool = true,
 };
 
 /// Whether `op` transfers into or back out of a function.
@@ -7766,6 +7780,7 @@ pub fn compileWith(allocator: std.mem.Allocator, memory: *CodeMemory, layout: La
         .code = code.hot,
         .cold_code = code.cold,
         .chain_entry = pass.chain_entry_bytes,
+        .links = pass.compiler.links.finish(&assembler),
         .native_count = pass.compiler.native_count,
         .fallback_count = pass.compiler.fallback_count,
         .register_only = !pass.compiler.touches_memory and !pass.compiler.touches_vectors and !pass.compiler.touches_x87 and pass.compiler.fallback_count == 0,
@@ -7856,8 +7871,10 @@ fn emitBlock(
     if (options.resident_self_loops and compiler.cache_count != 0 and self_loops.hasEdge(insns)) compiler.resident_loop = try assembler.createLabel();
     try compiler.planInternalEdges(allow_internal);
     errdefer compiler.freeInternalEdges();
+    compiler.links = try direct_links.Plan.init(assembler, options.direct_links, compiler.resident_loop == null);
 
     try compiler.emitPrologue();
+    try compiler.links.emitEntry(assembler, .{ .helpers = r_helpers, .scratch = r_scratch, .t1 = t1, .t2 = t2, .t3 = t3, .t5 = t5, .helpers_offset = @offsetOf(Block, "helpers"), .block_offset = scratch_block_offset, .previous_offset = scratch_chain_previous_offset });
     // Where a chained block enters: the frame is already established and
     // every cached pointer but `helpers` is already right. The guest
     // register cache is loaded *after* this point, because a chained block

@@ -51,6 +51,8 @@ pub fn Recycler(comptime Block: type) type {
         pub fn give(self: *Self, allocator: std.mem.Allocator, block: *Block) void {
             block.disarmChain();
             @atomicStore(u64, &block.hop.rip, 0, .release);
+            // Its code's header is disarmed: the next life writes its own.
+            if (@hasField(Block, "links")) block.links = .{};
             self.acquire();
             defer self.release();
             self.free.append(allocator, block) catch {

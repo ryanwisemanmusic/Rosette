@@ -8,6 +8,10 @@ const ids = [_]core.RegId{
 };
 const t = std.testing;
 
+/// These graphs test the shared exit path's ways and jump-cache proofs, so
+/// their blocks compile without direct links unless a test asks for them.
+var graph_direct_links = false;
+
 const Graph = struct {
     h: [4]f.TestHarness = undefined,
     generation: [4]u64 = @splat(17),
@@ -67,7 +71,7 @@ const Graph = struct {
             _ = try h.run(warm);
             var layout = f.TestState.layout;
             if (pointers) layout.register_files = .pointers_in_scratch;
-            const c = try core.compileWith(t.allocator, &h.memory, layout, h.insns.items, rip, .{ .ledger = ledger, .first_way_fallthrough = enabled, .direct_scalar_paths = if (profile == 6) enabled else true });
+            const c = try core.compileWith(t.allocator, &h.memory, layout, h.insns.items, rip, .{ .ledger = ledger, .first_way_fallthrough = enabled, .direct_scalar_paths = if (profile == 6) enabled else true, .direct_links = graph_direct_links });
             h.block.code = c.code;
             h.block.chain_entry = c.chain_entry;
             h.block.helpers.block = &h.block;
@@ -354,5 +358,33 @@ test "native first successor retains every later way and jump-cache proof" {
         try t.expectEqual(old.run(a, 2048), retired);
         try equal(a, b);
         if (route < 4) try t.expect(retired >= 2048) else try t.expectEqual(@as(u64, 17), retired);
+    }
+}
+
+test "native first successor: with direct links a static exit found only in the jump cache leaves for the glue" {
+    // A successor another block linked is in the jump cache; a block whose
+    // exits all have sites leaves instead of hopping through it, so the glue
+    // links its way and patches its site (`chain_layout.staticMiss`).
+    graph_direct_links = true;
+    defer graph_direct_links = false;
+    const s = try allocate();
+    defer t.allocator.destroy(s);
+    const cache = try t.allocator.alloc(core.Link, core.jump_cache_entries);
+    defer t.allocator.free(cache);
+    for ([_]bool{ false, true }) |first_way| {
+        const g = try Graph.create(first_way, 4, 0, true);
+        defer g.destroy();
+        seed(s, false);
+        @memset(cache, .{});
+        const link = g.h[0].block.hop.links[0];
+        g.h[0].block.hop.links[0] = .{};
+        cache[core.jumpCacheIndex(g.h[1].block.start_rip)] = link;
+        s.scratch.jump_cache = cache.ptr;
+        // One block ran and left; with its way linked it chains on.
+        try t.expectEqual(@as(u64, 17), g.run(s, 2048));
+        g.h[0].block.hop.links[0] = link;
+        seed(s, false);
+        s.scratch.jump_cache = cache.ptr;
+        try t.expect(g.run(s, 2048) >= 2048);
     }
 }

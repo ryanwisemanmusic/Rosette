@@ -21,6 +21,7 @@ const MEM_BASE = I._MEM_BASE;
 /// where neither the layout control nor `cold_code` exists.
 const has_layout = @hasDecl(I._block_jit, "code_layout");
 const has_cold = @hasField(I._block_jit.Block, "cold_code");
+const has_direct = @hasDecl(I._block_jit, "direct_links");
 
 const code: usize = 0x100000;
 const stride: usize = 128;
@@ -64,6 +65,61 @@ const register_body = [_]u8{
     0x31, 0xC2, // xor edx, eax
 };
 
+/// Shuffled order: block i's code sits at address i, but the ring runs a
+/// fixed random permutation. Each block ends `test r9,r9 ; jnz <next in the
+/// permutation> ; jmp <next address>`. The first pass runs r9 = 0, so
+/// blocks compile - and their ARM64 lands - in address order; the timed
+/// passes run r9 = 1. Live, the order code runs in is not the order it was
+/// compiled in, and a ring that runs in placement order lets sequential
+/// prefetch hide what a hop costs. A head block picks the order and a
+/// tail block counts r8 down.
+fn emitShuffled(mem: []u8, count: usize, repeat: usize, registers_only: bool) usize {
+    const shape: []const u8 = if (registers_only) &register_body else &body;
+    std.debug.assert(repeat * shape.len + 14 <= stride);
+    const order = t.allocator.alloc(usize, count) catch unreachable;
+    defer t.allocator.free(order);
+    const position = t.allocator.alloc(usize, count) catch unreachable;
+    defer t.allocator.free(position);
+    for (order, 0..) |*slot, index| slot.* = index;
+    var prng = std.Random.DefaultPrng.init(0x5eed_0000 + count);
+    prng.random().shuffle(usize, order);
+    for (order, 0..) |block, at| position[block] = at;
+    const head = code + count * stride;
+    const tail = head + stride;
+    const address = struct {
+        fn of(index: usize) usize {
+            return code + index * stride;
+        }
+    }.of;
+    for (0..count) |index| {
+        var at = address(index);
+        for (0..repeat) |_| {
+            @memcpy(mem[at..][0..shape.len], shape);
+            at += shape.len;
+        }
+        const shuffled_next = if (position[index] + 1 < count) address(order[position[index] + 1]) else tail;
+        const sequential_next = if (index + 1 < count) address(index + 1) else tail;
+        mem[at..][0..3].* = .{ 0x4D, 0x85, 0xC9 }; // test r9, r9
+        mem[at + 3 ..][0..2].* = .{ 0x0F, 0x85 }; // jnz shuffled next
+        mem[at + 5 ..][0..4].* = rel32(at + 9, shuffled_next);
+        mem[at + 9] = 0xE9; // jmp sequential next
+        mem[at + 10 ..][0..4].* = rel32(at + 14, sequential_next);
+    }
+    // head: test r9,r9 ; jnz first-in-permutation ; jmp block 0
+    mem[head..][0..3].* = .{ 0x4D, 0x85, 0xC9 };
+    mem[head + 3 ..][0..2].* = .{ 0x0F, 0x85 };
+    mem[head + 5 ..][0..4].* = rel32(head + 9, address(order[0]));
+    mem[head + 9] = 0xE9;
+    mem[head + 10 ..][0..4].* = rel32(head + 14, address(0));
+    // tail: dec r8 ; jnz head ; cmp rsp,rsp ; jmp $
+    mem[tail..][0..3].* = .{ 0x49, 0xFF, 0xC8 };
+    mem[tail + 3 ..][0..2].* = .{ 0x0F, 0x85 };
+    mem[tail + 5 ..][0..4].* = rel32(tail + 9, head);
+    mem[tail + 9 ..][0..3].* = .{ 0x48, 0x39, 0xE4 };
+    mem[tail + 12 ..][0..2].* = .{ 0xEB, 0xFE };
+    return tail + 12;
+}
+
 /// Writes `count` blocks of `repeat` bodies each, block i jumping to block
 /// i+1 and the last one counting r8 down to block 0. Returns the exit rip, a
 /// `jmp $` after the loop.
@@ -101,11 +157,18 @@ pub const Result = struct {
     cold_bytes: u64,
     context_value: u32,
     guest_value: u32,
+    /// Over the timed passes: hops made natively and returns to the glue.
+    native_hops: u64 = 0,
+    dispatch_entries: u64 = 0,
 };
 
 /// Runs `passes` passes over `count` blocks after one warm-up pass that
 /// compiles them all; only the timed passes are measured.
 pub fn run(count: usize, repeat: usize, passes: u64, parallel: bool, registers_only: bool, split: bool) !Result {
+    return runOrdered(count, repeat, passes, parallel, registers_only, split, false);
+}
+
+pub fn runOrdered(count: usize, repeat: usize, passes: u64, parallel: bool, registers_only: bool, split: bool, shuffled: bool) !Result {
     const saved = if (has_layout) I._block_jit.code_layout.split_all else false;
     defer if (has_layout) {
         I._block_jit.code_layout.split_all = saved;
@@ -119,9 +182,11 @@ pub fn run(count: usize, repeat: usize, passes: u64, parallel: bool, registers_o
     if (parallel) state.setParallelGuestExecution(true);
     defer if (parallel) state.setParallelGuestExecution(false);
     state.image_low = MEM_BASE + code;
-    state.image_high = MEM_BASE + code + count * stride;
-    state.configureWindowsExecutableRanges(&[_]I._WindowsExecutableRange{.{ .guest_base = MEM_BASE + code, .length = count * stride }});
-    const exit = emit(state.mem, count, repeat, registers_only);
+    const span = (count + 2) * stride;
+    state.image_high = MEM_BASE + code + span;
+    state.configureWindowsExecutableRanges(&[_]I._WindowsExecutableRange{.{ .guest_base = MEM_BASE + code, .length = span }});
+    const exit = if (shuffled) emitShuffled(state.mem, count, repeat, registers_only) else emit(state.mem, count, repeat, registers_only);
+    const start = MEM_BASE + code + if (shuffled) count * stride else 0;
     @memset(state.mem[context..][0..0x100], 0);
     std.mem.writeInt(u32, state.mem[context + 0x40 ..][0..4], 3, .little);
     std.mem.writeInt(u32, state.mem[context + 0x44 ..][0..4], 4, .little);
@@ -140,13 +205,18 @@ pub fn run(count: usize, repeat: usize, passes: u64, parallel: bool, registers_o
     var cpu_ns: u64 = 0;
     var executions: u64 = 0;
     var retired: u64 = 0;
+    var native_hops: u64 = 0;
+    var dispatch_entries: u64 = 0;
     // Pass 0 interprets and compiles; pass 1 warms the chains; then timing.
     for ([_]u64{ 2, 1, passes }, 0..) |rounds, phase| {
-        state.regs.rip = MEM_BASE + code;
+        state.regs.rip = start;
         state.regs.r8 = rounds;
+        state.regs.r9 = @intFromBool(phase != 0);
         const jit = state.block_jit orelse null;
         const executions_before = if (jit) |j| j.executions else 0;
         const retired_before = if (jit) |j| j.instructions_retired else 0;
+        const hops_before = if (jit) |j| j.native_chain_hops else 0;
+        const entries_before = if (jit) |j| j.dispatch_entries else 0;
         const started = threadCpu();
         while (state.regs.rip != MEM_BASE + exit and !state.terminated) _ = state.step();
         const elapsed = threadCpu() - started;
@@ -155,6 +225,8 @@ pub fn run(count: usize, repeat: usize, passes: u64, parallel: bool, registers_o
             cpu_ns = elapsed;
             executions = state.block_jit.?.executions - executions_before;
             retired = state.block_jit.?.instructions_retired - retired_before;
+            native_hops = state.block_jit.?.native_chain_hops - hops_before;
+            dispatch_entries = state.block_jit.?.dispatch_entries - entries_before;
         }
     }
     const jit = state.block_jit.?;
@@ -186,6 +258,8 @@ pub fn run(count: usize, repeat: usize, passes: u64, parallel: bool, registers_o
         .cold_bytes = cold_bytes,
         .context_value = std.mem.readInt(u32, state.mem[context + 0x50 ..][0..4], .little),
         .guest_value = std.mem.readInt(u32, state.mem[guest + 0x10 ..][0..4], .big),
+        .native_hops = native_hops,
+        .dispatch_entries = dispatch_entries,
     };
 }
 
@@ -203,10 +277,21 @@ test "code working set: distinct blocks compile once and keep exact guest result
             try t.expectEqual(result.guest_value, result.context_value);
             try t.expect(result.compiled >= count);
             try t.expectEqual(passes * count, result.block_executions);
-            // Split: the hot part is a fraction of the block; contiguous:
-            // nothing is placed apart.
-            if (split and has_layout) try t.expect(result.cold_bytes > 2 * result.hot_bytes) else try t.expectEqual(@as(u64, 0), result.cold_bytes);
+            // Split: the out-of-line paths outweigh the hot part, which
+            // also holds the direct entry and the shared exit checks
+            // (`direct_links.zig`); contiguous: nothing is placed apart.
+            if (split and has_layout) {
+                if (result.cold_bytes <= result.hot_bytes) std.debug.print("split layout: hot={d} cold={d}\n", .{ result.hot_bytes, result.cold_bytes });
+                try t.expect(result.cold_bytes > result.hot_bytes);
+            } else try t.expectEqual(@as(u64, 0), result.cold_bytes);
         }
+        // Shuffled: compiled in address order, run in a permutation; the
+        // head and tail blocks run once per pass.
+        const count: usize = 64;
+        const passes: u64 = 5;
+        const result = try runOrdered(count, repeat, passes, true, false, false, true);
+        try t.expectEqual(@as(u32, @intCast(7 * (2 + 1 + passes) * count * repeat)), result.guest_value);
+        try t.expectEqual(passes * (count + 2), result.block_executions);
     }
 }
 
@@ -219,24 +304,34 @@ test "code working set: per-block CPU as the number of hot blocks grows (ROSETTE
         const repeat = shape.repeat;
         // `ROSETTE_CODE_WORKING_SET_ONLY=<repeat>:<registers_only 0/1>:<blocks>` runs one point.
         const only = std.c.getenv("ROSETTE_CODE_WORKING_SET_ONLY");
-        for ([_]usize{ 16, 256, 512, 1024, 2048, 4096, 8192, 32768 }) |count| {
-            if (only == null and (count == 512 or count == 1024 or count == 4096) and std.c.getenv("ROSETTE_CODE_WORKING_SET_DENSE") == null) continue;
+        for ([_]usize{ 16, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768 }) |count| {
+            if (only == null and (count == 512 or count == 32768) and std.c.getenv("ROSETTE_CODE_WORKING_SET_DENSE") == null) continue;
             if (only) |raw| {
                 var buffer: [64]u8 = undefined;
                 const want = std.fmt.bufPrint(&buffer, "{d}:{d}:{d}", .{ repeat, @intFromBool(shape.registers_only), count }) catch continue;
                 if (!std.mem.eql(u8, std.mem.sliceTo(raw, 0), want)) continue;
             }
             const passes = @max(total / count, 4);
-            for (0..pairs) |pair| for ([_]bool{ false, true }) |split| {
+            // `ROSETTE_CODE_WORKING_SET_ORDER=sequential|shuffled` keeps one
+            // order; `..._SPLIT=1` adds the offline split layout;
+            // `..._DIRECT=0` turns direct links off (`direct_links.zig`).
+            const order_filter = if (std.c.getenv("ROSETTE_CODE_WORKING_SET_ORDER")) |raw| std.mem.sliceTo(raw, 0) else "";
+            if (has_direct) {
+                if (std.c.getenv("ROSETTE_CODE_WORKING_SET_DIRECT")) |raw| I._block_jit.direct_links.enabled = raw[0] != '0';
+            }
+            for (0..pairs) |pair| for ([_]bool{ false, true }) |shuffled| for ([_]bool{ false, true }) |split| {
+                if (order_filter.len != 0 and !std.mem.eql(u8, order_filter, if (shuffled) "shuffled" else "sequential")) continue;
                 // The frozen tree has one layout; its split rows would repeat it.
-                if (split and !has_layout) continue;
-                const result = try run(count, repeat, passes, true, shape.registers_only, split);
-                std.debug.print("code_working_set tree={s} registers_only={} repeat={d} blocks={d} pair={d} split={} passes={d} cpu_ns={d} block_executions={d} retired={d} ns_per_block={d}.{d:0>2} code_bytes_per_block={d} hot_bytes_per_block={d} cold_bytes_per_block={d}\n", .{
+                if (split and (!has_layout or std.c.getenv("ROSETTE_CODE_WORKING_SET_SPLIT") == null)) continue;
+                const result = try runOrdered(count, repeat, passes, true, shape.registers_only, split, shuffled);
+                std.debug.print("code_working_set tree={s} registers_only={} repeat={d} blocks={d} pair={d} order={s} direct={} split={} passes={d} cpu_ns={d} block_executions={d} retired={d} ns_per_block={d}.{d:0>2} code_bytes_per_block={d} hot_bytes_per_block={d} cold_bytes_per_block={d} compiled={d} native_hops={d} dispatch_entries={d}\n", .{
                     if (has_layout) "current" else "before",
                     shape.registers_only,
                     repeat,
                     count,
                     pair,
+                    if (shuffled) "shuffled" else "sequential",
+                    has_direct and I._block_jit.direct_links.active(),
                     split,
                     passes,
                     result.cpu_ns,
@@ -247,6 +342,9 @@ test "code working set: per-block CPU as the number of hot blocks grows (ROSETTE
                     result.code_bytes / @max(result.compiled, 1),
                     result.hot_bytes / @max(result.compiled, 1),
                     result.cold_bytes / @max(result.compiled, 1),
+                    result.compiled,
+                    result.native_hops,
+                    result.dispatch_entries,
                 });
             };
         }

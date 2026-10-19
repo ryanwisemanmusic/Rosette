@@ -4190,6 +4190,9 @@ const BlockJitState = struct {
     chain_exits_break: u64 = 0,
     chain_exits_miss: u64 = 0,
     links_armed: u64 = 0,
+    /// Exits patched to branch into their successor (`direct_links.zig`).
+    direct_patches: u64 = 0,
+    direct_far: u64 = 0,
     /// Guest registers held in host registers, summed over compiled blocks.
     cached_registers: u64 = 0,
     /// Memory accesses compiled to go through a hoisted base pointer.
@@ -4432,6 +4435,8 @@ fn freeTranslatedBlock(allocator: std.mem.Allocator, block: *block_jit.Block) vo
     block.bytes = &.{};
     // A chain link may name this block: its memory stays a block.
     if (block.recycler) |owner| return @as(*BlockRecycler, @ptrCast(@alignCast(owner))).give(allocator, block);
+    // No direct entry may pass into code whose block is gone.
+    block.disarmChain();
     allocator.destroy(block);
 }
 
@@ -5669,5 +5674,6 @@ test {
     _ = @import("process/tests/guest_command_replay.zig");
     _ = @import("process/tests/code_working_set.zig");
     _ = @import("process/tests/chain_recycling.zig");
+    _ = @import("process/tests/direct_links.zig");
     _ = @import("block_jit/tests.zig");
 }

@@ -37,8 +37,10 @@ pub const Section = enum { hot, cold };
 const cold_tag: usize = 1 << (@bitSizeOf(usize) - 1);
 
 const FixupKind = enum {
-    /// b / bl: 26-bit signed displacement in instructions.
+    /// b: 26-bit signed displacement in instructions.
     branch26,
+    /// bl: the same displacement, keeping the link.
+    call26,
     /// b.cond / cbz / cbnz: 19-bit signed displacement in instructions.
     branch19,
 };
@@ -120,6 +122,33 @@ pub const Assembler = struct {
         try self.emit(a64.b(0));
     }
 
+    /// `bl label`.
+    pub fn call(self: *Assembler, label: Label) Error!void {
+        try self.fixups.append(self.allocator, .{
+            .at = self.here(),
+            .label = label.id,
+            .kind = .call26,
+        });
+        try self.emit(a64.bl(0));
+    }
+
+    /// `ldr rt, label` (64-bit literal): the label names the doubleword.
+    pub fn loadLiteral(self: *Assembler, rt: Reg, label: Label) Error!void {
+        try self.fixups.append(self.allocator, .{
+            .at = self.here(),
+            .label = label.id,
+            .kind = .branch19,
+        });
+        try self.emit(0x5800_0000 | @as(u32, rt));
+    }
+
+    /// The word offset of a label placed in the hot section, from the hot
+    /// section's start; null for one in the cold section or never placed.
+    pub fn hotWord(self: *const Assembler, label: Label) ?usize {
+        const position = self.labels.items[label.id] orelse return null;
+        return if (position & cold_tag != 0) null else position;
+    }
+
     pub fn branchCond(self: *Assembler, cond: Cond, label: Label) Error!void {
         try self.fixups.append(self.allocator, .{
             .at = self.here(),
@@ -185,11 +214,11 @@ pub const Assembler = struct {
             const delta = @divExact(address(target, hot_address, cold_address) - address(fixup.at, hot_address, cold_address), @sizeOf(u32));
             const word = if (fixup.at & cold_tag != 0) &self.cold_words.items[fixup.at & ~cold_tag] else &self.words.items[fixup.at];
             switch (fixup.kind) {
-                .branch26 => {
+                .branch26, .call26 => {
                     if (delta < -(1 << 25) or delta >= (1 << 25)) {
                         return Error.DisplacementTooFar;
                     }
-                    word.* = a64.b(@intCast(delta));
+                    word.* = if (fixup.kind == .call26) a64.bl(@intCast(delta)) else a64.b(@intCast(delta));
                 },
                 .branch19 => {
                     if (delta < -(1 << 18) or delta >= (1 << 18)) {
@@ -226,6 +255,30 @@ test "a forward branch is patched to the label's final position" {
     const code = try asm_.finish();
     // Three instructions forward from the branch itself.
     try testing.expectEqual(a64.b(3), code[0]);
+}
+
+test "a call keeps its link, and a literal load and a hot label resolve to their words" {
+    var asm_ = Assembler.init(testing.allocator);
+    defer asm_.deinit();
+    const target = try asm_.createLabel();
+    const literal = try asm_.createLabel();
+    try asm_.call(target);
+    try asm_.loadLiteral(12, literal);
+    asm_.placeLabel(target);
+    try asm_.emit(a64.ret());
+    asm_.placeLabel(literal);
+    try asm_.emit(0x1234_5678);
+    try asm_.emit(0);
+    asm_.section = .cold;
+    const cold = try asm_.createLabel();
+    asm_.placeLabel(cold);
+    try asm_.emit(a64.nop());
+    try testing.expectEqual(@as(?usize, 2), asm_.hotWord(target));
+    try testing.expectEqual(@as(?usize, null), asm_.hotWord(cold));
+    const code = try asm_.finish();
+    try testing.expectEqual(a64.bl(2), code[0]);
+    // ldr x12, #+8: imm19 = 2 words.
+    try testing.expectEqual(@as(u32, 0x5800_0000 | (2 << 5) | 12), code[1]);
 }
 
 test "a backward branch gets a negative displacement" {

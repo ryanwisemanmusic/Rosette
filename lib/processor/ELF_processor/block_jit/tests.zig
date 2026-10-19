@@ -4668,8 +4668,10 @@ test "emitted code size per instruction, and a trace costing less than its basic
     const overhead = try Sizes.single(&h, 0x1000, 3, regReg(.mov_reg64_reg64, .bits64, .al_ax_eax_rax, .bl_bx_ebx_rbx)) - 2;
     // The chain attempt lives here too: a block's exit records what it ran
     // and decides whether to jump straight into its successor. Four link
-    // ways cost five words each before the one shared proof.
-    try testing.expect(overhead >= 15 and overhead <= 110);
+    // ways cost five words each before the one shared proof. The direct
+    // entry and its header (`direct_links.zig`) add about 20 words, run
+    // only when a patched exit branches in; 115 since.
+    try testing.expect(overhead >= 15 and overhead <= 140);
 
     // Flags dominate arithmetic: an `add` is one instruction of arithmetic
     // and about thirty of flag materialisation. This is the largest single
