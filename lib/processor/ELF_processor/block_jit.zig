@@ -39,6 +39,7 @@ pub const jumpCacheIndex = core.jumpCacheIndex;
 pub const Compiled = core.Compiled;
 pub const code_layout = @import("block_jit/code_layout.zig");
 pub const direct_links = @import("block_jit/direct_links.zig");
+pub const indirect_links = @import("block_jit/indirect_links.zig");
 pub const Hop = core.Hop;
 pub const chain_never_word = core.chain_never_word;
 pub const isNative = core.isNative;

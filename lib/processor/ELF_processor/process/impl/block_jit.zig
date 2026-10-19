@@ -1755,17 +1755,13 @@ pub fn blockJitLink(self: *ElfState, jit: *__process_BlockJitState, from: *__pro
     // has ways, or an indirect call through a table, finds its
     // successor there instead of coming back here.
     if (jit.jump_cache.len != 0) jit.jump_cache[__process_block_jit.jumpCacheIndex(rip)] = link;
-    // Re-arm the way that already names this address; otherwise take
-    // the round-robin victim.
-    var way: usize = from.link_victim;
-    for (from.hop.links, 0..) |existing, index| {
-        if (existing.rip == rip) {
-            way = index;
-            break;
-        }
-    } else from.link_victim = @intCast((way + 1) % __process_block_jit.link_ways);
-    from.hop.links[way] = link;
-    jit.links_armed +|= 1;
+    // The way that already names this address, else the round-robin
+    // victim; its own branch follows it (`indirect_links.zig`).
+    if (__process_block_jit.indirect_links.chooseWay(from, rip)) |way| {
+        from.hop.links[way] = link;
+        jit.links_armed +|= 1;
+        jit.indirect_patches +|= __process_block_jit.indirect_links.linkWay(from, way, to, &jit.memory).patched;
+    }
     const direct = __process_block_jit.direct_links.link(from, rip, to, &jit.memory);
     jit.direct_patches +|= direct.patched;
     jit.direct_far +|= direct.far;
@@ -2685,7 +2681,7 @@ pub fn reportParallelWorkerBlockJitThreads(self: *ElfState) void {
         const slot = maybe_slot orelse break;
         const thread = &self.windows_guest_threads[slot];
         const jit = thread.parallel_block_jit.?;
-        __process_log.info("PE64 BLOCK JIT WORKER THREAD: slot={d} name='{s}' table={d} growths={d} live={d} compiled={d} evictions={d} hotness_replacements={d} resets={d} code_mib(used/reserved)={d}/{d} executions={d} retired={d} interpreted(cold/refused/reset_pending)={d}/{d}/{d} fallback_calls={d} revalidations={d} dropped_stale={d} dispatch(entries/relinks/native_hops)={d}/{d}/{d} retired_per_dispatch={d} chain_exits(budget/break/miss)={d}/{d}/{d} direct_links(patched/far)={d}/{d} far_veneers={d} tlb_fills={d} fpcr_writes={d}; an interpreted step costs about a hundred translated instructions: cold means the address had not run hot_threshold times since it took its hotness entry, and hotness_replacements beside it is the table thrashing; a dispatch entry is a return through step, a relink is a hop made in Zig, a native hop never left translated code; direct patches include far veneers; far counts out-of-range attempts, far_veneers counts patched destinations, neither counts executions; a chain exit on miss is a successor neither the block's ways nor the jump cache could prove; fpcr_writes counts translated MXCSR loads that changed FZ or RMode, about 12 ns each", .{
+        __process_log.info("PE64 BLOCK JIT WORKER THREAD: slot={d} name='{s}' table={d} growths={d} live={d} compiled={d} evictions={d} hotness_replacements={d} resets={d} code_mib(used/reserved)={d}/{d} executions={d} retired={d} interpreted(cold/refused/reset_pending)={d}/{d}/{d} fallback_calls={d} revalidations={d} dropped_stale={d} dispatch(entries/relinks/native_hops)={d}/{d}/{d} retired_per_dispatch={d} chain_exits(budget/break/miss)={d}/{d}/{d} direct_links(patched/far)={d}/{d} far_veneers={d} indirect_links(patched)={d} tlb_fills={d} fpcr_writes={d}; an interpreted step costs about a hundred translated instructions: cold means the address had not run hot_threshold times since it took its hotness entry, and hotness_replacements beside it is the table thrashing; a dispatch entry is a return through step, a relink is a hop made in Zig, a native hop never left translated code; direct patches include far veneers; far counts out-of-range attempts, far_veneers counts patched destinations, neither counts executions; indirect_links counts way branches pointed at a successor for exits known only at run time (ret, call through a table); a chain exit on miss is a successor neither the block's ways nor the jump cache could prove; fpcr_writes counts translated MXCSR loads that changed FZ or RMode, about 12 ns each", .{
             slot,
             if (thread.name_len != 0) thread.nameText() else "<unnamed>",
             jit.blocks.len,
@@ -2715,6 +2711,7 @@ pub fn reportParallelWorkerBlockJitThreads(self: *ElfState) void {
             jit.direct_patches,
             jit.direct_far,
             jit.direct_veneers,
+            jit.indirect_patches,
             jit.tlb_fills,
             jit.fpcr_writes,
         });

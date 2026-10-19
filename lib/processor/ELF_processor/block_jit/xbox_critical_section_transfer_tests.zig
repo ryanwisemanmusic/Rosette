@@ -21,7 +21,7 @@ test "pinned Xbox critical-section indirect transfers preserve call behavior" {
         state.image_high = 0x1_5000_0000;
         state.image_targets_hooked = 0;
         state.xbox_critical_section_enter = 0x1_4000_2000;
-        state.xbox_transfer_allowed = true;
+        state.xbox_transfer_result = 1;
         core.hookFilterAdd(&state.hook_filter, 0x1_4000_2000);
         h.insns.clearRetainingCapacity();
         try h.add(0xC000, 2, .{ .op = .call_reg64, .dst_reg = .bl_bx_ebx_rbx });
@@ -46,7 +46,7 @@ test "pinned Xbox critical-section indirect transfers preserve call behavior" {
         state.image_high = 0x1_5000_0000;
         state.image_targets_hooked = 0;
         state.xbox_critical_section_enter = 0x1_4000_2000;
-        state.xbox_transfer_allowed = true;
+        state.xbox_transfer_result = 1;
         core.hookFilterAdd(&state.hook_filter, 0x1_4000_2000);
         h.insns.clearRetainingCapacity();
         try h.add(0xC000, 2, .{ .op = .call_reg64, .dst_reg = .bl_bx_ebx_rbx });
@@ -88,7 +88,7 @@ test "pinned Xbox critical-section indirect transfers preserve call behavior" {
         state.code_cache_low = 0xA000_0000;
         state.code_cache_high = 0xB000_0000;
         state.xbox_critical_section_leave = 0x1_6000_2000;
-        state.xbox_transfer_allowed = true;
+        state.xbox_transfer_result = 1;
         h.insns.clearRetainingCapacity();
         try h.add(0xC000, 2, .{ .op = .call_reg64, .dst_reg = .bl_bx_ebx_rbx });
         _ = try h.run(&state);
@@ -96,5 +96,34 @@ test "pinned Xbox critical-section indirect transfers preserve call behavior" {
         try testing.expectEqual(@as(u32, 0), state.interprets);
         try testing.expectEqual(@as(u64, 0x1_6000_2000), state.regs.rip);
         try testing.expectEqual(stack - 8, state.regs.rsp);
+    }
+}
+
+test "a completed Xbox critical-section call goes on at its return address without a frame or an exit" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+    const stack: u64 = 0x200;
+    for ([_]bool{ true, false }) |is_enter| {
+        var state = TestState{};
+        state.admitMemory(true, true);
+        state.regs.rsp = stack;
+        state.regs.rbx = 0x1_4000_2000;
+        state.image_low = 0x1_4000_0000;
+        state.image_high = 0x1_5000_0000;
+        state.image_targets_hooked = 0;
+        if (is_enter) state.xbox_critical_section_enter = 0x1_4000_2000 else state.xbox_critical_section_leave = 0x1_4000_2000;
+        state.xbox_transfer_result = 2;
+        core.hookFilterAdd(&state.hook_filter, 0x1_4000_2000);
+        h.insns.clearRetainingCapacity();
+        try h.add(0xC000, 2, .{ .op = .call_reg64, .dst_reg = .bl_bx_ebx_rbx });
+        _ = try h.run(&state);
+        try testing.expectEqual(@as(u32, 0), state.interprets);
+        try testing.expectEqual(@as(u32, 1), state.xbox_transfer_calls);
+        try testing.expectEqual(@as(u64, 0xC002), state.xbox_transfer_return_rip);
+        // As if the trampoline had returned: no return address left on the
+        // stack, the next instruction next, nothing for the interpreter.
+        try testing.expectEqual(@as(u64, 0xC002), state.regs.rip);
+        try testing.expectEqual(stack, state.regs.rsp);
+        try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, state.memory[@intCast(stack - 8)..][0..8], .little));
     }
 }

@@ -57,6 +57,12 @@ pub const BlockLinks = struct {
     entry: u32 = 0,
     count: u8 = 0,
     site_list: [max_sites]Site = undefined,
+    /// Byte offsets of the patchable `b` each link way falls into when an
+    /// exit known only at run time matches it (`indirect_links.zig`); 0
+    /// when the block has none.
+    ways: [core.link_ways]u32 = @splat(0),
+    /// Where each way site branches while unlinked: the way's proof.
+    way_proofs: [core.link_ways]u32 = @splat(0),
 
     pub fn sites(self: *const BlockLinks) []const Site {
         return self.site_list[0..self.count];
@@ -118,6 +124,10 @@ pub const Plan = struct {
     sites: [max_sites]SiteLabel = undefined,
     /// Some exit's address is known only at run time, or did not get a site.
     unlinkable: bool = false,
+    /// The way sites `indirect_links.emitDispatch` placed (0 or link_ways).
+    way_count: u8 = 0,
+    way_sites: [core.link_ways]Label = undefined,
+    way_proofs: [core.link_ways]Label = undefined,
 
     pub fn init(a: anytype, entry_enabled: bool, sites_enabled: bool) !Plan {
         var plan: Plan = .{ .entry_enabled = entry_enabled, .sites_enabled = entry_enabled and sites_enabled };
@@ -195,6 +205,8 @@ pub const Plan = struct {
         if (!self.entry_enabled) return .{};
         var links: BlockLinks = .{ .header = @intCast(a.hotWord(self.header).? * 4), .entry = @intCast(a.hotWord(self.entry).? * 4), .count = self.count };
         for (self.sites[0..self.count], links.site_list[0..self.count]) |site, *out| out.* = .{ .rip = site.rip, .offset = @intCast(a.hotWord(site.label).? * 4) };
+        for (self.way_sites[0..self.way_count], links.ways[0..self.way_count]) |site, *out| out.* = @intCast(a.hotWord(site).? * 4);
+        for (self.way_proofs[0..self.way_count], links.way_proofs[0..self.way_count]) |proof, *out| out.* = @intCast(a.hotWord(proof).? * 4);
         return links;
     }
 };
@@ -257,36 +269,51 @@ pub fn link(from: anytype, rip: u64, to: anytype, memory: anytype) LinkResult {
     const target: i64 = @intCast(@intFromPtr(to.code.ptr) + to.links.entry);
     for (from.links.sites()) |site| {
         if (site.rip != rip) continue;
-        const at = @intFromPtr(from.code.ptr) + site.offset;
-        const delta = @divExact(target - @as(i64, @intCast(at)), 4);
-        if (delta < -(1 << 25) or delta >= (1 << 25)) {
-            result.far += 1;
-            if (!far_links.link_enabled) continue;
-            if (far_links.pointsTo(memory, at, @intCast(target))) continue;
-            const p = far_links.plan(memory, at, @intCast(target)) orelse continue;
-            const slot: *u32 = @ptrFromInt(at);
-            beginWrite();
-            for (p.code, p.instructions) |*word, value| @atomicStore(u32, word, value, .release);
-            @atomicStore(u32, slot, p.word, .release);
-            endWrite();
-            if (jit_host) {
-                sys_icache_invalidate(@ptrCast(p.code), 16);
-                sys_icache_invalidate(@ptrCast(slot), 4);
-            }
-            result.patched += 1;
-            result.veneers += 1;
-            continue;
-        }
-        const word = a64.b(@intCast(delta));
-        const slot: *u32 = @ptrFromInt(at);
-        if (@atomicLoad(u32, slot, .monotonic) == word) continue;
-        beginWrite();
-        @atomicStore(u32, slot, word, .release);
-        endWrite();
-        if (jit_host) sys_icache_invalidate(@ptrCast(slot), 4);
-        result.patched += 1;
+        patchAt(&result, @intFromPtr(from.code.ptr) + site.offset, target, memory);
     }
     return result;
+}
+
+/// Point the `b` at `at` at `target`, through a far veneer when it does not
+/// reach. Owner thread, no translated code running.
+pub fn patchAt(result: *LinkResult, at: usize, target: i64, memory: anytype) void {
+    const delta = @divExact(target - @as(i64, @intCast(at)), 4);
+    if (delta < -(1 << 25) or delta >= (1 << 25)) {
+        result.far += 1;
+        if (!far_links.link_enabled) return;
+        if (far_links.pointsTo(memory, at, @intCast(target))) return;
+        const p = far_links.plan(memory, at, @intCast(target)) orelse return;
+        const slot: *u32 = @ptrFromInt(at);
+        beginWrite();
+        for (p.code, p.instructions) |*word, value| @atomicStore(u32, word, value, .release);
+        @atomicStore(u32, slot, p.word, .release);
+        endWrite();
+        if (jit_host) {
+            sys_icache_invalidate(@ptrCast(p.code), 16);
+            sys_icache_invalidate(@ptrCast(slot), 4);
+        }
+        result.patched += 1;
+        result.veneers += 1;
+        return;
+    }
+    const word = a64.b(@intCast(delta));
+    const slot: *u32 = @ptrFromInt(at);
+    if (@atomicLoad(u32, slot, .monotonic) == word) return;
+    beginWrite();
+    @atomicStore(u32, slot, word, .release);
+    endWrite();
+    if (jit_host) sys_icache_invalidate(@ptrCast(slot), 4);
+    result.patched += 1;
+}
+
+/// Whether the `b` at `at`, directly or through its far veneer, lands at
+/// `target`.
+pub fn branchesTo(at: usize, target: i64, memory: anytype) bool {
+    if (far_links.pointsTo(memory, at, @intCast(target))) return true;
+    const word = @as(*const u32, @ptrFromInt(at)).*;
+    if (word >> 26 != 0b000101) return false;
+    const imm: i32 = @bitCast(word << 6);
+    return @as(i64, @intCast(at)) + @as(i64, imm >> 6) * 4 == target;
 }
 
 /// Whether `from`'s site for `rip` currently branches into `to`.
@@ -295,12 +322,7 @@ pub fn linked(from: anytype, rip: u64, to: anytype, memory: anytype) bool {
     const target: i64 = @intCast(@intFromPtr(to.code.ptr) + to.links.entry);
     for (from.links.sites()) |site| {
         if (site.rip != rip) continue;
-        const at = @intFromPtr(from.code.ptr) + site.offset;
-        if (far_links.pointsTo(memory, at, @intCast(target))) return true;
-        const word = @as(*const u32, @ptrFromInt(at)).*;
-        if (word >> 26 != 0b000101) continue;
-        const imm: i32 = @bitCast(word << 6);
-        if (@as(i64, @intCast(at)) + @as(i64, imm >> 6) * 4 == target) return true;
+        if (branchesTo(@intFromPtr(from.code.ptr) + site.offset, target, memory)) return true;
     }
     return false;
 }

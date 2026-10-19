@@ -149,6 +149,57 @@ pub fn enter(access: anytype, me: u32) Entry {
     return .counted;
 }
 
+/// `enter` when it does not wait: a recursion, or a claim of a free section.
+/// Null leaves the section exactly as it was: the caller would have spun
+/// and counted itself, which the caller then does through `enter`. An
+/// extra claim before `enter`'s own spin is one more iteration of it.
+pub fn enterUncontended(access: anytype, me: u32) ?Entry {
+    access.fence();
+    if (access.loadBig(Offset.owner) == me) {
+        _ = access.lockFetchAdd(1);
+        access.storeBig(Offset.recursion, access.loadBig(Offset.recursion) +% 1);
+        access.fence();
+        return .recursed;
+    }
+    if (access.loadLock() == free_lock_count and access.lockCompareExchange(free_lock_count, 0)) {
+        take(access, me);
+        return .acquired;
+    }
+    return null;
+}
+
+/// `leave` when no waiter is counted. Null leaves the section exactly as it
+/// was, for `leave` and its wake. The last release clears the owner first,
+/// as `leave` does, and moves the lock word from 0 (the owner alone) to
+/// free only if no waiter counted itself meanwhile; if one did, owner and
+/// recursion go back before anyone could claim the section, since a claim
+/// needs a free lock word.
+pub fn leaveUncontended(access: anytype, me: u32) ?LeaveResult {
+    access.fence();
+    const recursion_before: i32 = @bitCast(access.loadBig(Offset.recursion));
+    const owner = access.loadBig(Offset.owner);
+    const owner_matched = owner == me and recursion_before > 0;
+    if (recursion_before != 1) {
+        if (!owner_matched) return null;
+        access.storeBig(Offset.recursion, @bitCast(recursion_before -% 1));
+        _ = access.lockFetchAdd(-1);
+        access.fence();
+        return .{ .release = .held, .owner_matched = true };
+    }
+    if (access.loadLock() != 0) return null;
+    access.storeBig(Offset.recursion, 0);
+    access.storeBig(Offset.owner, 0);
+    access.fence();
+    if (access.lockCompareExchange(0, free_lock_count)) {
+        access.fence();
+        return .{ .release = .released, .owner_matched = owner_matched };
+    }
+    access.storeBig(Offset.owner, owner);
+    access.storeBig(Offset.recursion, 1);
+    access.fence();
+    return null;
+}
+
 /// `RtlTryEnterCriticalSection`: claim a free section or recurse; never count.
 pub fn tryEnter(access: anytype, me: u32) bool {
     access.fence();
@@ -298,6 +349,7 @@ pub const Hooks = struct {
     calls: [Export.count]u64 = @splat(0),
     fallbacks: [Export.count]u64 = @splat(0),
     jit_direct_calls: [Export.count]u64 = @splat(0),
+    jit_completed_calls: [Export.count]u64 = @splat(0),
 
     pub fn arm(self: *Hooks, export_name: []const u8, address: u64) bool {
         const api = Export.fromName(export_name) orelse return false;
@@ -325,6 +377,12 @@ pub const Hooks = struct {
 
     pub fn noteJitDirect(self: *Hooks, api: Export) void {
         Stats.bump(&self.jit_direct_calls[@intFromEnum(api)]);
+    }
+
+    /// A translated call that ran the export in place and went on to its
+    /// return address (`xbox_critical_section_transfer.zig`).
+    pub fn noteJitCompleted(self: *Hooks, api: Export) void {
+        Stats.bump(&self.jit_completed_calls[@intFromEnum(api)]);
     }
 };
 
@@ -494,4 +552,95 @@ test "only the armed Xbox critical section export entry points are hooked" {
     hooks.noteFallback(.enter);
     try std.testing.expectEqual(@as(u64, 1), Stats.read(&hooks.calls[@intFromEnum(Export.enter)]));
     try std.testing.expectEqual(@as(u64, 1), Stats.read(&hooks.fallbacks[@intFromEnum(Export.enter)]));
+}
+
+test "the uncontended enter and leave agree with enter and leave wherever they act, and change nothing where they decline" {
+    const me: u32 = 0x7000_0100;
+    const other: u32 = 0x7000_0200;
+    var acted: [2]usize = .{ 0, 0 };
+    var declined: [2]usize = .{ 0, 0 };
+    for ([_]u32{ 0, me, other }) |owner| for ([_]i32{ -1, 0, 1, 2, 3 }) |recursion| for ([_]i32{ -2, -1, 0, 1, 2, 3 }) |lock| for ([_]u8{ 0, 1 }) |spin| {
+        var start: TestSection = .{};
+        initialize(start.access(), @as(u32, spin) * 256);
+        start.access().storeBig(Offset.owner, owner);
+        start.access().storeBig(Offset.recursion, @bitCast(recursion));
+        start.access().storeLock(lock);
+
+        var fast = start;
+        var full = start;
+        if (enterUncontended(fast.access(), me)) |entry| {
+            try std.testing.expectEqual(enter(full.access(), me), entry);
+            try std.testing.expectEqualSlices(u8, &full.bytes, &fast.bytes);
+            acted[0] += 1;
+        } else {
+            try std.testing.expectEqualSlices(u8, &start.bytes, &fast.bytes);
+            try std.testing.expectEqual(Entry.counted, enter(full.access(), me));
+            declined[0] += 1;
+        }
+
+        fast = start;
+        full = start;
+        if (leaveUncontended(fast.access(), me)) |result| {
+            try std.testing.expectEqual(leave(full.access(), me), result);
+            try std.testing.expectEqualSlices(u8, &full.bytes, &fast.bytes);
+            acted[1] += 1;
+        } else {
+            try std.testing.expectEqualSlices(u8, &start.bytes, &fast.bytes);
+            const result = leave(full.access(), me);
+            try std.testing.expect(result.release == .waiters or !result.owner_matched);
+            declined[1] += 1;
+        }
+    };
+    // Both outcomes were exercised for both exports.
+    for (acted, declined) |a, d| try std.testing.expect(a != 0 and d != 0);
+}
+
+test "Xbox critical-section protocol: the uncontended leave puts owner and recursion back when a waiter counts itself before the release" {
+    // A section whose lock word gains a waiter between the leave's check
+    // and its compare-exchange, as another thread's Enter would.
+    const Racing = struct {
+        inner: TestSection.Access,
+        raced: *bool,
+
+        pub fn fence(_: @This()) void {}
+        pub fn loadByte(self: @This(), offset: u8) u8 {
+            return self.inner.loadByte(offset);
+        }
+        pub fn loadBig(self: @This(), offset: u8) u32 {
+            return self.inner.loadBig(offset);
+        }
+        pub fn storeBig(self: @This(), offset: u8, value: u32) void {
+            self.inner.storeBig(offset, value);
+        }
+        pub fn loadLock(self: @This()) i32 {
+            return self.inner.loadLock();
+        }
+        pub fn lockFetchAdd(self: @This(), delta: i32) i32 {
+            return self.inner.lockFetchAdd(delta);
+        }
+        pub fn lockCompareExchange(self: @This(), expected: i32, desired: i32) bool {
+            if (!self.raced.*) {
+                self.raced.* = true;
+                // The other thread's Enter: owner check fails, claim fails,
+                // it counts itself.
+                std.debug.assert(self.inner.loadBig(Offset.owner) == 0);
+                _ = self.inner.lockFetchAdd(1);
+            }
+            return self.inner.lockCompareExchange(expected, desired);
+        }
+    };
+    const me: u32 = 0x7000_0100;
+    var section: TestSection = .{};
+    initialize(section.access(), 0);
+    try std.testing.expectEqual(Entry.acquired, enter(section.access(), me));
+    var raced = false;
+    const racing: Racing = .{ .inner = section.access(), .raced = &raced };
+    try std.testing.expectEqual(@as(?LeaveResult, null), leaveUncontended(racing, me));
+    try std.testing.expect(raced);
+    // Still ours, with the waiter counted: the full leave releases it to them.
+    const state = section.snapshot();
+    try std.testing.expectEqual(me, state.owner);
+    try std.testing.expectEqual(@as(i32, 1), state.recursion);
+    try std.testing.expectEqual(@as(i32, 1), state.lock_count);
+    try std.testing.expectEqual(Release.waiters, leave(section.access(), me).release);
 }

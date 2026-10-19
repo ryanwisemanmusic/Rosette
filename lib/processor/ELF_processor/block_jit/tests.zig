@@ -252,7 +252,7 @@ pub const TestState = struct {
     mapped_transfer_allowed: bool = false,
     mapped_transfer_calls: u32 = 0,
     hooked_transfer_calls: u32 = 0,
-    xbox_transfer_allowed: bool = false,
+    xbox_transfer_result: u32 = 0,
     xbox_transfer_calls: u32 = 0,
     xbox_transfer_target: u64 = 0,
     xbox_transfer_return_rip: u64 = 0,
@@ -395,7 +395,7 @@ pub const TestState = struct {
         state.xbox_transfer_calls += 1;
         state.xbox_transfer_target = target;
         state.xbox_transfer_return_rip = return_rip;
-        return @intFromBool(state.xbox_transfer_allowed);
+        return state.xbox_transfer_result;
     }
 
     fn x87RawTransfer(state_ptr: *anyopaque, block: *const Block, index: u32) callconv(.c) u32 {

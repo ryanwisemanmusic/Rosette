@@ -76,6 +76,7 @@ const wide_unpacks = @import("wide_unpacks.zig");
 const ordered_lanes = @import("ordered_lanes.zig");
 const self_loops = @import("self_loops.zig");
 const direct_links = @import("direct_links.zig");
+const indirect_links = @import("indirect_links.zig");
 const chain_layout = @import("chain_layout.zig");
 const register_cache = @import("register_cache.zig");
 const atomic_retry = @import("atomic_retry_yield.zig");
@@ -2659,7 +2660,9 @@ const Compiler = struct {
         const indirect = self.endsIndirect();
         const later = try self.a.createLabel();
         const fallthrough = self.first_way_fallthrough and !indirect;
-        if (indirect) {
+        if (indirect and try indirect_links.emitDispatch(self, prove, leave)) {
+            // Ways first, each falling into its own patchable branch.
+        } else if (indirect) {
             const ways = try self.a.createLabel();
             try chain_layout.jumpCacheProbe(self, prove, ways);
             self.a.placeLabel(ways);
@@ -3333,7 +3336,7 @@ const Compiler = struct {
     /// proven Xenia code-cache address may take the native transfer template;
     /// every other out-of-image target remains classified by the interpreter.
     /// Clobbers x0-x1 and t0-t4; the original target is preserved in scratch.
-    fn emitHookedTargetCheck(self: *Compiler, reg: a64.Reg, slow: Label, call_return_rip: ?u64) Error!void {
+    fn emitHookedTargetCheck(self: *Compiler, reg: a64.Reg, slow: Label, call_return_rip: ?u64, completed: ?Label) Error!void {
         const external = try self.a.createLabel();
         const external_unmapped = try self.a.createLabel();
         const external_outside_published_range = try self.a.createLabel();
@@ -3449,6 +3452,9 @@ const Compiler = struct {
             try self.emitCallHelper(helper_xbox_critical_section_transfer_offset);
             try self.emitCacheLoad();
             try self.a.branchIfZero(.w32, 0, slow);
+            // 2: the export ran in place; the call goes on at its return.
+            if (completed != null) try self.emitChecked(a64.cmpImm(.w32, 0, 2));
+            if (completed) |done| try self.a.branchCond(.eq, done);
             try self.emitChecked(a64.ldrImm(.doubleword, reg, r_scratch, scratch_transfer_target_offset));
             try self.a.branch(continue_checked);
         } else {
@@ -4780,7 +4786,8 @@ const Compiler = struct {
                     try self.loadReg(0, d.dst_reg, false, .bits64);
                 }
                 try self.a.branchIfZero(.x64, 0, slow);
-                try self.emitHookedTargetCheck(0, slow, if (is_call) next_rip else null);
+                const completed = if (is_call and self.xbox_critical_section_transfer_enabled) try self.exitStub(index + 1, next_rip) else null;
+                try self.emitHookedTargetCheck(0, slow, if (is_call) next_rip else null, completed);
                 if (is_call) {
                     try self.emitChecked(a64.strImm(.doubleword, 0, r_scratch, scratch_transfer_target_offset));
                     // push(next_rip), exactly as the `call_rel32` template does.

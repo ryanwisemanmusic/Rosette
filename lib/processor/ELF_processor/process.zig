@@ -4195,6 +4195,8 @@ const BlockJitState = struct {
     direct_patches: u64 = 0,
     direct_far: u64 = 0,
     direct_veneers: u64 = 0,
+    /// Way branches of run-time exits patched (`indirect_links.zig`).
+    indirect_patches: u64 = 0,
     /// Guest registers held in host registers, summed over compiled blocks.
     cached_registers: u64 = 0,
     /// Memory accesses compiled to go through a hoisted base pointer.
@@ -5678,5 +5680,8 @@ test {
     _ = @import("process/tests/chain_recycling.zig");
     _ = @import("process/tests/direct_links.zig");
     _ = @import("process/tests/far_chain_links.zig");
+    _ = @import("process/tests/call_return.zig");
+    _ = @import("process/tests/indirect_links.zig");
+    _ = @import("process/tests/xbox_cs_completion.zig");
     _ = @import("block_jit/tests.zig");
 }

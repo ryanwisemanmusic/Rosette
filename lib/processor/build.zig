@@ -176,6 +176,11 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     b.step("far-links-check", "Check distant native branch veneers and data-bearing shuffled translator loops offline").dependOn(&b.addRunArtifact(far_link_test).step);
     const working_set_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "code working set", "chain recycling", "direct links", "native hops", "native first successor", "internal edge", "chain", "a call keeps its link" } });
     b.step("code-working-set-check", "Check split code layout and block-named chain links, and measure block cost against distinct hot blocks").dependOn(&b.addRunArtifact(working_set_test).step);
+    // Calls and returns through `call rel32`, Xenia's indirection table and
+    // `ret`. Timing: ROSETTE_CALL_RETURN_BENCH=1 zig build call-return-check
+    // -Doptimize=ReleaseFast
+    const call_return_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "call return", "indirect links", "uncontended enter", "critical-section completion", "Xbox critical-section" } });
+    b.step("call-return-check", "Check translated calls, returns and Xbox critical sections exactly against the interpreter, and measure their cost against hot functions").dependOn(&b.addRunArtifact(call_return_test).step);
     // Win32 mutex ownership in the wait model, the semantics Xenia's
     // XMutant hands every Xbox 360 mutant to. Run 20261012T000703Z stopped
     // on a recursive acquisition the model could not express.
