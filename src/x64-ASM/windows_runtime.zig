@@ -27,6 +27,7 @@ const tso_memory = @import("tso_memory");
 const utf8_codec = @import("utf8_codec");
 const crt_math = @import("windows_runtime/crt_math.zig");
 const crt_time = @import("windows_runtime/crt_time.zig");
+const stdio_flush = @import("windows_runtime/stdio_flush.zig");
 const io_integrity = @import("windows_runtime/io_integrity.zig");
 const fast_imports = @import("windows_runtime/fast_imports.zig");
 const fast_math = @import("windows_runtime/fast_math.zig");
@@ -36,6 +37,7 @@ const log = std.log.scoped(.windows_runtime);
 
 const _core_import_api = struct {
     pub const _std = std;
+    pub const _stdio_flush = stdio_flush;
     pub const _import_contract = import_contract;
     pub const _log = log;
     pub const _ModuleAvailability = ModuleAvailability;
@@ -5199,6 +5201,7 @@ fn openWindowsStdio(state: anytype, name: []const u8, direct_return_rip: ?u64) b
         return true;
     };
     rememberWindowsFilePath(state, handle, path);
+    stdio_flush.applyMode(state, windowsFileSlot(state, handle).?, mode);
     if (media_authorized and state.windows_media_io_trace_events < 16) {
         state.windows_media_io_trace_events += 1;
         log.info("Windows media stdio handle: api={s} handle=0x{x} mode={s} readable={} writable={}", .{
@@ -5436,10 +5439,11 @@ fn openWindowsDescriptorAsStdio(state: anytype, direct_return_rip: ?u64) bool {
         failWindowsDescriptorCall(state, direct_return_rip, 9); // EBADF
         return true;
     };
-    if (guestCString(state, arg(state, 1, direct_return_rip)) == null) {
+    const mode = guestCString(state, arg(state, 1, direct_return_rip)) orelse {
         failWindowsDescriptorCall(state, direct_return_rip, 22); // EINVAL
         return true;
-    }
+    };
+    stdio_flush.applyMode(state, slot, mode);
     guestStateField(state, "windows_last_error").* = 0;
     guestStateField(state, "regs").*.rax = slot.guest_handle;
     finish(state, direct_return_rip);
@@ -5892,34 +5896,7 @@ fn seekWindowsStdio(state: anytype, direct_return_rip: ?u64) bool {
 }
 
 fn flushWindowsStdio(state: anytype, direct_return_rip: ?u64) bool {
-    const handle = arg(state, 0, direct_return_rip);
-    const io = state.windows_host_io orelse unreachable;
-    var ok = true;
-    if (handle == 0) {
-        for (&state.windows_files) |*slot| {
-            if (slot.standard_stream != null) continue;
-            if (slot.file) |file| {
-                file.sync(io) catch {
-                    ok = false;
-                };
-            }
-        }
-    } else if (windowsFileSlot(state, handle)) |slot| {
-        if (slot.standard_stream == null) {
-            slot.file.?.sync(io) catch {
-                ok = false;
-            };
-        }
-    } else {
-        ok = false;
-    }
-    if (!ok) {
-        failWindowsFileCall(state, direct_return_rip, 1117);
-        return true;
-    }
-    guestStateField(state, "regs").*.rax = 0; // CRT success
-    finish(state, direct_return_rip);
-    return true;
+    return stdio_flush.call(state, direct_return_rip, _core_import_api);
 }
 
 fn stdioFileInfo(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
@@ -7490,6 +7467,7 @@ fn openWindowsStdioSecure(state: anytype, name: []const u8, direct_return_rip: ?
         finish(state, direct_return_rip);
         return true;
     };
+    stdio_flush.applyMode(state, windowsFileSlot(state, handle).?, selected_mode);
     if (selected_mode[0] == 'a') {
         const slot = windowsFileSlot(state, handle).?;
         const io = state.windows_host_io orelse unreachable;
@@ -9695,4 +9673,8 @@ test "import-class memo supports concurrent misses and hits" {
     }
     for (&threads) |*thread| thread.join();
     try std.testing.expect(!invalid.load(.acquire));
+}
+
+test {
+    _ = @import("windows_runtime/stdio_flush_tests.zig").Tests(_core_import_api);
 }

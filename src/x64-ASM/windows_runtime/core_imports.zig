@@ -436,8 +436,7 @@ pub fn handleCore(comptime api: type, state: anytype, dll_name: []const u8, name
             &state.windows_fmode_storage
         else
             &state.windows_commode_storage;
-        if (storage.* == 0) storage.* = state.guestAlloc(4, 4) orelse 0;
-        if (storage.* != 0) state.write32(storage.*, 0);
+        api._stdio_flush.initStorage(state, storage);
         guestStateField(state, "regs").*.rax = storage.*;
         finish(state, direct_return_rip);
         return true;
