@@ -761,14 +761,29 @@ def parse_log(log_path: pathlib.Path, manifest: dict[str, Any] | None = None) ->
                     "retired_per_dispatch": int(dispatch.group(4)),
                 }
             )
-        exits = re.search(r"chain_exits\(budget/break/miss\)=(\d+)/(\d+)/(\d+) tlb_fills=(\d+)", rest)
-        if exits:
+        # Fields between chain_exits and tlb_fills grow with the translator
+        # (direct links, far veneers, indirect links): read each by name.
+        exits = re.search(r"chain_exits\(budget/break/miss\)=(\d+)/(\d+)/(\d+)", rest)
+        fills = re.search(r"\btlb_fills=(\d+)", rest)
+        if exits and fills:
             worker_translators[slot].update(
                 {
                     "chain_exits_budget": int(exits.group(1)),
                     "chain_exits_break": int(exits.group(2)),
                     "chain_exits_miss": int(exits.group(3)),
-                    "tlb_fills": int(exits.group(4)),
+                    "tlb_fills": int(fills.group(1)),
+                }
+            )
+        links = re.search(r"direct_links\(patched/far\)=(\d+)/(\d+)", rest)
+        if links:
+            veneers = re.search(r"\bfar_veneers=(\d+)", rest)
+            indirect = re.search(r"indirect_links\(patched\)=(\d+)", rest)
+            worker_translators[slot].update(
+                {
+                    "direct_patches": int(links.group(1)),
+                    "direct_far": int(links.group(2)),
+                    "far_veneers": int(veneers.group(1)) if veneers else None,
+                    "indirect_patches": int(indirect.group(1)) if indirect else None,
                 }
             )
 
@@ -1095,6 +1110,13 @@ def render_summary(manifest: dict[str, Any], evidence: dict[str, Any]) -> str:
                 f" chain_exits(budget/break/miss)={row['chain_exits_budget']}/{row['chain_exits_break']}/{row['chain_exits_miss']} "
                 f"tlb_fills={row['tlb_fills']}"
                 if "chain_exits_budget" in row
+                else ""
+            )
+            + (
+                f" direct_links(patched/far)={row['direct_patches']}/{row['direct_far']}"
+                + (f" far_veneers={row['far_veneers']}" if row.get("far_veneers") is not None else "")
+                + (f" indirect_links(patched)={row['indirect_patches']}" if row.get("indirect_patches") is not None else "")
+                if "direct_patches" in row
                 else ""
             )
             for row in sorted(

@@ -472,7 +472,7 @@ Annotations:
                     "PE64 BLOCK JIT WORKER TLB: direct_route=true fills=77 refused=3 cross_thread_invalidations=5 raced_fills_retired=0; with the direct route",
                     "PE64 WINDOWS FAST IMPORTS: crt memcpy=500 memmove=20 memset=300 shared_runtime_lock_bypassed=true; each ran through copyGuestRange/fillGuestMemory",
                     "PE64 WINDOWS FAST IMPORTS: GetSystemTimePreciseAsFileTime calls=1234 QueryPerformanceCounter=9000 QueryPerformanceFrequency=3 new_since_report=4 shared_runtime_lock_bypassed=true",
-                    "PE64 BLOCK JIT WORKER THREAD: slot=23 name='MAIN_THREAD (F8000014)' table=262144 growths=1 live=60000 compiled=90000 evictions=4000 hotness_replacements=9000 resets=0 code_mib(used/reserved)=140/1024 executions=5000000 retired=90000000 interpreted(cold/refused/reset_pending)=3000000/1000/0 fallback_calls=10 revalidations=0 dropped_stale=0 dispatch(entries/relinks/native_hops)=40000/9000/4000000 retired_per_dispatch=2250 chain_exits(budget/break/miss)=30000/2000/7000 tlb_fills=123; an interpreted step",
+                    "PE64 BLOCK JIT WORKER THREAD: slot=23 name='MAIN_THREAD (F8000014)' table=262144 growths=1 live=60000 compiled=90000 evictions=4000 hotness_replacements=9000 resets=0 code_mib(used/reserved)=140/1024 executions=5000000 retired=90000000 interpreted(cold/refused/reset_pending)=3000000/1000/0 fallback_calls=10 revalidations=0 dropped_stale=0 dispatch(entries/relinks/native_hops)=40000/9000/4000000 retired_per_dispatch=2250 chain_exits(budget/break/miss)=30000/2000/7000 direct_links(patched/far)=4000/300 far_veneers=250 indirect_links(patched)=900 tlb_fills=123 fpcr_writes=7; an interpreted step",
                     "PE64 BLOCK JIT WORKER THREAD:   slot=23 interpreted rank=1 region=0xa0a67d00 at=generated-code:x samples=10..12 of 50 (one per 64 cold steps)",
                     "PE64 HOST PROFILE THREAD slot=4 'Main XThread (F8000008)': samples=500 over 1000ms (interval 1000us, failures=0, dropped=0, distinct_pcs=9); this worker's wall time: translated_title=40.0% translated_xenia=20.5% translated_unattributed=0.0% rosette=9.5% vulkan_driver=0.0% metal=0.0% system_and_waits=30.0% other=0.0% unknown=0.0%; sampled from a second thread",
                     "PE64 HOST PROFILE THREAD slot=4 'Main XThread (F8000008)' HOST: rank=1 share=9.5% samples=47 at=rosette!blockJitRead",
@@ -516,6 +516,7 @@ Annotations:
             self.assertEqual(("MAIN_THREAD (F8000014)", 262144, 1, 3000000), (main_translator["name"], main_translator["table"], main_translator["growths"], main_translator["interpreted_cold"]))
             self.assertEqual((40000, 9000, 4000000, 2250), (main_translator["dispatch_entries"], main_translator["dispatch_relinks"], main_translator["native_hops"], main_translator["retired_per_dispatch"]))
             self.assertEqual((30000, 2000, 7000, 123), (main_translator["chain_exits_budget"], main_translator["chain_exits_break"], main_translator["chain_exits_miss"], main_translator["tlb_fills"]))
+            self.assertEqual((4000, 300, 250, 900), (main_translator["direct_patches"], main_translator["direct_far"], main_translator["far_veneers"], main_translator["indirect_patches"]))
             self.assertTrue(any("worker 'MAIN_THREAD (F8000014)' interpreted 3.2%" in finding for finding in evidence["findings"]))
             self.assertEqual(1, len(metrics["worker_profiles"]))
             self.assertEqual("Main XThread (F8000008)", metrics["worker_profiles"][0]["name"])
@@ -529,6 +530,7 @@ Annotations:
             self.assertIn("slot 4 'Main XThread (F8000008)' translated=60.5%", summary)
             self.assertIn("Worker translator: slot 23 'MAIN_THREAD (F8000014)' table=262144 growths=1", summary)
             self.assertIn("chain_exits(budget/break/miss)=30000/2000/7000 tlb_fills=123", summary)
+            self.assertIn("direct_links(patched/far)=4000/300 far_veneers=250 indirect_links(patched)=900", summary)
             self.assertIn('"memcpy": 500', summary)
             # The last driver line wins; a spaced Mesa info string still parses.
             self.assertEqual({"name": "MoltenVK", "info": "1.2.7", "id": "MOLTENVK", "api": "1.2.275"}, metrics["vulkan_driver"])
