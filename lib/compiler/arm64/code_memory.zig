@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const branch_islands = @import("branch_islands.zig");
 
 pub const Error = error{
     /// The host refused an executable mapping. On macOS this is usually a
@@ -48,6 +49,8 @@ extern "c" fn sys_icache_invalidate(start: ?*anyopaque, len: usize) void;
 pub const CodeCache = struct {
     memory: []align(std.heap.page_size_min) u8,
     used: usize = 0,
+    branch_islands_enabled: bool = false,
+    branch_islands: branch_islands.State = .{},
     /// Bumped on every reset so a stale block handle can be recognised rather
     /// than followed into memory that now holds something else.
     generation: u64 = 0,
@@ -119,8 +122,11 @@ pub const CodeCache = struct {
         // Every block starts on a 16-byte boundary: it keeps a block from
         // straddling a cache line it did not need to, and it makes a code
         // address printable without a modulo in the reader's head.
-        const aligned = std.mem.alignForward(usize, self.used, 16);
         const bytes = count * @sizeOf(u32);
+        const aligned = if (self.branch_islands_enabled and self.memory.len >= branch_islands.minimum_capacity)
+            try self.branch_islands.place(self.memory.len, self.used, bytes)
+        else
+            std.mem.alignForward(usize, self.used, 16);
         if (aligned + bytes > self.memory.len) return Error.OutOfCodeSpace;
         const start = aligned;
         self.used = aligned + bytes;
@@ -187,6 +193,7 @@ pub const CodeCache = struct {
     /// harmless.
     pub fn reset(self: *CodeCache) void {
         self.used = 0;
+        self.branch_islands = .{};
         self.window_start = 0;
         self.window_end = 0;
         self.window_next = 0;
@@ -387,4 +394,8 @@ test "split code runs: a hot path branches to a cold part most of a window away 
     cache.endWrite(parts.cold);
     const fn_ptr: *const fn () callconv(.c) u64 = @ptrCast(parts.hot.ptr);
     try testing.expectEqual(@as(u64, 42), fn_ptr());
+}
+
+test {
+    _ = @import("branch_islands.zig");
 }

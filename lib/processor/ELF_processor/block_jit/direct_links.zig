@@ -40,6 +40,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const a64 = @import("arm64_encode");
 const core = @import("core.zig");
+pub const far_links = @import("far_links.zig");
 
 /// One exit whose target is known: the guest address it leaves to and the
 /// byte offset of its patchable `b` from the block's code.
@@ -246,11 +247,11 @@ pub fn disarm(block: anytype) void {
     @atomicStore(u64, &h.gen_ptr, never, .release);
 }
 
-pub const LinkResult = struct { patched: u32 = 0, far: u32 = 0 };
+pub const LinkResult = struct { patched: u32 = 0, far: u32 = 0, veneers: u32 = 0 };
 
 /// Point every site of `from` that leaves to `rip` at `to`'s direct entry,
 /// when the branch reaches. Owner thread, no translated code running.
-pub fn link(from: anytype, rip: u64, to: anytype) LinkResult {
+pub fn link(from: anytype, rip: u64, to: anytype, memory: anytype) LinkResult {
     var result: LinkResult = .{};
     if (!active() or to.links.entry == 0 or to.code.len == 0) return result;
     const target: i64 = @intCast(@intFromPtr(to.code.ptr) + to.links.entry);
@@ -260,6 +261,20 @@ pub fn link(from: anytype, rip: u64, to: anytype) LinkResult {
         const delta = @divExact(target - @as(i64, @intCast(at)), 4);
         if (delta < -(1 << 25) or delta >= (1 << 25)) {
             result.far += 1;
+            if (!far_links.link_enabled) continue;
+            if (far_links.pointsTo(memory, at, @intCast(target))) continue;
+            const p = far_links.plan(memory, at, @intCast(target)) orelse continue;
+            const slot: *u32 = @ptrFromInt(at);
+            beginWrite();
+            for (p.code, p.instructions) |*word, value| @atomicStore(u32, word, value, .release);
+            @atomicStore(u32, slot, p.word, .release);
+            endWrite();
+            if (jit_host) {
+                sys_icache_invalidate(@ptrCast(p.code), 16);
+                sys_icache_invalidate(@ptrCast(slot), 4);
+            }
+            result.patched += 1;
+            result.veneers += 1;
             continue;
         }
         const word = a64.b(@intCast(delta));
@@ -275,12 +290,13 @@ pub fn link(from: anytype, rip: u64, to: anytype) LinkResult {
 }
 
 /// Whether `from`'s site for `rip` currently branches into `to`.
-pub fn linked(from: anytype, rip: u64, to: anytype) bool {
+pub fn linked(from: anytype, rip: u64, to: anytype, memory: anytype) bool {
     if (to.links.entry == 0) return false;
     const target: i64 = @intCast(@intFromPtr(to.code.ptr) + to.links.entry);
     for (from.links.sites()) |site| {
         if (site.rip != rip) continue;
         const at = @intFromPtr(from.code.ptr) + site.offset;
+        if (far_links.pointsTo(memory, at, @intCast(target))) return true;
         const word = @as(*const u32, @ptrFromInt(at)).*;
         if (word >> 26 != 0b000101) continue;
         const imm: i32 = @bitCast(word << 6);

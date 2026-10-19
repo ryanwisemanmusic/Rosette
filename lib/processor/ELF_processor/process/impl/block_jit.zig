@@ -1766,9 +1766,10 @@ pub fn blockJitLink(self: *ElfState, jit: *__process_BlockJitState, from: *__pro
     } else from.link_victim = @intCast((way + 1) % __process_block_jit.link_ways);
     from.hop.links[way] = link;
     jit.links_armed +|= 1;
-    const direct = __process_block_jit.direct_links.link(from, rip, to);
+    const direct = __process_block_jit.direct_links.link(from, rip, to, &jit.memory);
     jit.direct_patches +|= direct.patched;
     jit.direct_far +|= direct.far;
+    jit.direct_veneers +|= direct.veneers;
 }
 
 pub fn logHotspotBytes(self: *const ElfState, handle: u64, address: u64) void {
@@ -2684,7 +2685,7 @@ pub fn reportParallelWorkerBlockJitThreads(self: *ElfState) void {
         const slot = maybe_slot orelse break;
         const thread = &self.windows_guest_threads[slot];
         const jit = thread.parallel_block_jit.?;
-        __process_log.info("PE64 BLOCK JIT WORKER THREAD: slot={d} name='{s}' table={d} growths={d} live={d} compiled={d} evictions={d} hotness_replacements={d} resets={d} code_mib(used/reserved)={d}/{d} executions={d} retired={d} interpreted(cold/refused/reset_pending)={d}/{d}/{d} fallback_calls={d} revalidations={d} dropped_stale={d} dispatch(entries/relinks/native_hops)={d}/{d}/{d} retired_per_dispatch={d} chain_exits(budget/break/miss)={d}/{d}/{d} direct_links(patched/far)={d}/{d} tlb_fills={d} fpcr_writes={d}; an interpreted step costs about a hundred translated instructions: cold means the address had not run hot_threshold times since it took its hotness entry, and hotness_replacements beside it is the table thrashing; a dispatch entry is a return through step, a relink is a hop made in Zig, a native hop never left translated code; a direct link is an exit patched to branch straight into its successor, far when the branch cannot reach; a chain exit on miss is a successor neither the block's ways nor the jump cache could prove; fpcr_writes counts translated MXCSR loads that changed FZ or RMode, about 12 ns each", .{
+        __process_log.info("PE64 BLOCK JIT WORKER THREAD: slot={d} name='{s}' table={d} growths={d} live={d} compiled={d} evictions={d} hotness_replacements={d} resets={d} code_mib(used/reserved)={d}/{d} executions={d} retired={d} interpreted(cold/refused/reset_pending)={d}/{d}/{d} fallback_calls={d} revalidations={d} dropped_stale={d} dispatch(entries/relinks/native_hops)={d}/{d}/{d} retired_per_dispatch={d} chain_exits(budget/break/miss)={d}/{d}/{d} direct_links(patched/far)={d}/{d} far_veneers={d} tlb_fills={d} fpcr_writes={d}; an interpreted step costs about a hundred translated instructions: cold means the address had not run hot_threshold times since it took its hotness entry, and hotness_replacements beside it is the table thrashing; a dispatch entry is a return through step, a relink is a hop made in Zig, a native hop never left translated code; direct patches include far veneers; far counts out-of-range attempts, far_veneers counts patched destinations, neither counts executions; a chain exit on miss is a successor neither the block's ways nor the jump cache could prove; fpcr_writes counts translated MXCSR loads that changed FZ or RMode, about 12 ns each", .{
             slot,
             if (thread.name_len != 0) thread.nameText() else "<unnamed>",
             jit.blocks.len,
@@ -2713,6 +2714,7 @@ pub fn reportParallelWorkerBlockJitThreads(self: *ElfState) void {
             jit.chain_exits_miss,
             jit.direct_patches,
             jit.direct_far,
+            jit.direct_veneers,
             jit.tlb_fills,
             jit.fpcr_writes,
         });

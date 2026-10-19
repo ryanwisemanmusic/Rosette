@@ -16,11 +16,11 @@ const jit_glue = @import("../impl/block_jit.zig");
 const guest_memory = @import("../impl/guest_memory.zig");
 
 const code: usize = 0x100000;
-const a_rip = MEM_BASE + code;
-const b_rip = MEM_BASE + code + 0x40;
-const c_rip = MEM_BASE + code + 0x80;
+pub const a_rip = MEM_BASE + code;
+pub const b_rip = MEM_BASE + code + 0x40;
+pub const c_rip = MEM_BASE + code + 0x80;
 const d_rip = MEM_BASE + code + 0xC0;
-const exit_rip = b_rip + 3 + 3 + 6 + 3;
+pub const exit_rip = b_rip + 3 + 3 + 6 + 3;
 
 fn rel32(from: u64, to: u64) [4]u8 {
     return @bitCast(@as(i32, @intCast(@as(i64, @intCast(to)) - @as(i64, @intCast(from)))));
@@ -63,7 +63,7 @@ fn setup(state: *ElfState) void {
     state.regs.rflags = 0x2;
 }
 
-fn runPasses(state: *ElfState, passes: u64) !void {
+pub fn runPasses(state: *ElfState, passes: u64) !void {
     state.regs.rip = a_rip;
     state.regs.r8 = passes;
     var steps: usize = 0;
@@ -74,10 +74,10 @@ fn runPasses(state: *ElfState, passes: u64) !void {
     try t.expectEqual(exit_rip, state.regs.rip);
 }
 
-const Fixture = struct {
+pub const Fixture = struct {
     state: *ElfState,
 
-    fn init() !Fixture {
+    pub fn init() !Fixture {
         const state = try t.allocator.create(ElfState);
         state.* = ElfState.init(t.allocator);
         state.setParallelGuestExecution(true);
@@ -85,16 +85,20 @@ const Fixture = struct {
         return .{ .state = state };
     }
 
-    fn deinit(self: Fixture) void {
+    pub fn deinit(self: Fixture) void {
         self.state.setParallelGuestExecution(false);
         self.state.deinit();
         t.allocator.destroy(self.state);
     }
 
-    fn block(self: Fixture, rip: u64) *block_jit.Block {
+    pub fn block(self: Fixture, rip: u64) *block_jit.Block {
         return self.state.blockJitFindValidSlot(self.state.block_jit.?, rip).?.block;
     }
 };
+
+fn isLinked(fixture: Fixture, from: *block_jit.Block, rip: u64, to: *block_jit.Block) bool {
+    return direct_links.linked(from, rip, to, &fixture.state.block_jit.?.memory);
+}
 
 fn headerOf(code_ptr: [*]const u32, offset: u32) *const direct_links.Header {
     return @ptrFromInt(@intFromPtr(code_ptr) + offset);
@@ -120,8 +124,8 @@ test "direct links: a two-block loop runs through patched branches with exact re
     const b = f.block(b_rip);
     // A's jmp and B's taken jnz both branch straight into their successor.
     try t.expect(jit.direct_patches >= 2);
-    try t.expect(direct_links.linked(a, b_rip, b));
-    try t.expect(direct_links.linked(b, a_rip, a));
+    try t.expect(isLinked(f, a, b_rip, b));
+    try t.expect(isLinked(f, b, a_rip, a));
     try t.expect(a.links.count >= 1 and b.links.count >= 2);
     // Armed headers name their blocks and the generation they were proven at.
     const hb = headerOf(b.code.ptr, b.links.header);
@@ -150,7 +154,7 @@ test "direct links: switched off, exits stay on the shared path with the same re
     try t.expectEqual(@as(u64, 300), f.state.regs.rbx);
     const jit = f.state.block_jit.?;
     try t.expectEqual(@as(u64, 0), jit.direct_patches);
-    try t.expect(!direct_links.linked(f.block(a_rip), b_rip, f.block(b_rip)));
+    try t.expect(!isLinked(f, f.block(a_rip), b_rip, f.block(b_rip)));
     try t.expect(jit.native_chain_hops > 500);
 }
 
@@ -164,7 +168,7 @@ test "direct links: a dropped successor's code is never entered through a patche
     const jit = f.state.block_jit.?;
     const a = f.block(a_rip);
     const found_b = f.state.blockJitFindValidSlot(jit, b_rip).?;
-    try t.expect(direct_links.linked(a, b_rip, found_b.block));
+    try t.expect(isLinked(f, a, b_rip, found_b.block));
     const old_code = found_b.block.code.ptr;
     const old_header = found_b.block.links.header;
     jit_glue.dropBlockJitSlot(f.state, jit, found_b.slot);
@@ -185,7 +189,7 @@ test "direct links: a dropped successor's code is never entered through a patche
     try t.expectEqual(@as(u64, 0), f.state.regs.rcx);
     const b_again = f.block(b_rip);
     try t.expect(b_again != c);
-    try t.expect(direct_links.linked(a, b_rip, b_again));
+    try t.expect(isLinked(f, a, b_rip, b_again));
     I._freeTranslatedBlock(f.state.allocator, c);
 }
 
@@ -196,7 +200,7 @@ test "direct links: rewritten successor bytes are what the next hop runs" {
     const f = try Fixture.init();
     defer f.deinit();
     try runPasses(f.state, 64);
-    try t.expect(direct_links.linked(f.block(a_rip), b_rip, f.block(b_rip)));
+    try t.expect(isLinked(f, f.block(a_rip), b_rip, f.block(b_rip)));
     // B's `add ebx,1` becomes `add ebx,2`, through the same generation bump
     // a guest store to executable image code makes.
     f.state.mem[code + 0x40 + 2] = 0x02;
@@ -207,7 +211,7 @@ test "direct links: rewritten successor bytes are what the next hop runs" {
     // And again directly linked to the new translation.
     const a = f.block(a_rip);
     const b = f.block(b_rip);
-    try t.expect(direct_links.linked(a, b_rip, b));
+    try t.expect(isLinked(f, a, b_rip, b));
     try runPasses(f.state, 10);
     try t.expectEqual(@as(u64, 64 + 128 + 20), f.state.regs.rbx);
 }
@@ -222,7 +226,7 @@ test "direct links: the step budget still returns a directly linked loop to the 
     try t.expectEqual(@as(u64, 100_000), f.state.regs.rax);
     try t.expectEqual(@as(u64, 100_000), f.state.regs.rbx);
     const jit = f.state.block_jit.?;
-    try t.expect(direct_links.linked(f.block(a_rip), b_rip, f.block(b_rip)));
+    try t.expect(isLinked(f, f.block(a_rip), b_rip, f.block(b_rip)));
     // 600,000 instructions against a per-step budget of a few thousand.
     try t.expect(jit.chain_exits_budget >= 10);
 }
@@ -235,7 +239,7 @@ test "direct links: a disarm from another thread stops the direct entry" {
     defer f.deinit();
     try runPasses(f.state, 64);
     const b = f.block(b_rip);
-    try t.expect(direct_links.linked(f.block(a_rip), b_rip, b));
+    try t.expect(isLinked(f, f.block(a_rip), b_rip, b));
     const thread = try std.Thread.spawn(.{}, struct {
         fn run(block: *block_jit.Block) void {
             block.disarmChain();
@@ -252,7 +256,9 @@ test "direct links: a disarm from another thread stops the direct entry" {
     try t.expect(jit.dispatch_relinks >= relinks + 50);
 }
 
-test "direct links: a successor beyond a branch's reach keeps the shared path" {
+test "direct links: disabled far veneers retain the shared path beyond branch reach" {
+    direct_links.far_links.enabled = false;
+    defer direct_links.far_links.enabled = true;
     if (!block_jit.CodeMemory.available()) return error.SkipZigTest;
     direct_links.enabled = true;
     defer direct_links.enabled = null;
@@ -268,7 +274,7 @@ test "direct links: a successor beyond a branch's reach keeps the shared path" {
     const far_code: [*]const u32 = @ptrFromInt(@intFromPtr(a.code.ptr) + (512 << 20));
     const far = .{ .links = direct_links.BlockLinks{ .header = 8, .entry = 64 }, .code = far_code[0..32] };
     for (a.links.sites()) |each| {
-        const result = direct_links.link(a, each.rip, far);
+        const result = direct_links.link(a, each.rip, far, &f.state.block_jit.?.memory);
         try t.expectEqual(@as(u32, 0), result.patched);
         try t.expect(result.far >= 1);
     }
@@ -298,5 +304,5 @@ test "direct links: a second predecessor of a linked block gets its own patched 
     try t.expectEqual(@as(u64, 4), f.state.regs.rdx);
     try t.expectEqual(@as(u64, 64 + 32), f.state.regs.rbx);
     const d = f.block(d_rip);
-    try t.expect(direct_links.linked(d, b_rip, b));
+    try t.expect(isLinked(f, d, b_rip, b));
 }

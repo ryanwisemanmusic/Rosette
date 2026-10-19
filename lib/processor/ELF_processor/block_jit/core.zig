@@ -7775,6 +7775,7 @@ pub fn compileWith(allocator: std.mem.Allocator, memory: *CodeMemory, layout: La
     defer pass.compiler.cold_memory.deinit(allocator);
     defer pass.compiler.fused_exits.deinit(allocator);
     defer pass.compiler.freeInternalEdges();
+    if (options.direct_links and direct_links.far_links.enabled) memory.branch_islands_enabled = true;
     const code = try @import("code_layout.zig").install(memory, &assembler, options.split_cold);
     return .{
         .code = code.hot,

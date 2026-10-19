@@ -2015,6 +2015,7 @@ pub const WindowsFileSlot = struct {
     readable: bool = false,
     writable: bool = false,
     media_authorized: bool = false,
+    stdio_commit_on_flush: bool = false,
     /// A CRT standard stream borrows the process's native descriptor.  It is
     /// still represented by a normal synthetic FILE* slot so f{read,write},
     /// fflush, and _fileno all share one ownership table, but deinit/fclose
@@ -4193,6 +4194,7 @@ const BlockJitState = struct {
     /// Exits patched to branch into their successor (`direct_links.zig`).
     direct_patches: u64 = 0,
     direct_far: u64 = 0,
+    direct_veneers: u64 = 0,
     /// Guest registers held in host registers, summed over compiled blocks.
     cached_registers: u64 = 0,
     /// Memory accesses compiled to go through a hoisted base pointer.
@@ -5675,5 +5677,6 @@ test {
     _ = @import("process/tests/code_working_set.zig");
     _ = @import("process/tests/chain_recycling.zig");
     _ = @import("process/tests/direct_links.zig");
+    _ = @import("process/tests/far_chain_links.zig");
     _ = @import("block_jit/tests.zig");
 }
