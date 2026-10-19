@@ -26,6 +26,16 @@ pub const Error = error{
 
 pub const Label = struct { id: usize };
 
+/// Where `emit` appends. A block's out-of-line paths go to `.cold`, so the
+/// code a block runs every time it executes stays contiguous with the next
+/// block's instead of sitting between kilobytes of paths that almost never
+/// run; `finish` lays cold code out after hot code, `finishSplit` places the
+/// two apart.
+pub const Section = enum { hot, cold };
+
+/// A position in the cold section, tagged so labels and fixups hold either.
+const cold_tag: usize = 1 << (@bitSizeOf(usize) - 1);
+
 const FixupKind = enum {
     /// b / bl: 26-bit signed displacement in instructions.
     branch26,
@@ -44,6 +54,8 @@ pub const Assembler = struct {
     labels: std.ArrayList(?usize),
     fixups: std.ArrayList(Fixup),
     allocator: std.mem.Allocator,
+    cold_words: std.ArrayList(u32) = .empty,
+    section: Section = .hot,
 
     pub fn init(allocator: std.mem.Allocator) Assembler {
         return .{
@@ -56,16 +68,27 @@ pub const Assembler = struct {
 
     pub fn deinit(self: *Assembler) void {
         self.words.deinit(self.allocator);
+        self.cold_words.deinit(self.allocator);
         self.labels.deinit(self.allocator);
         self.fixups.deinit(self.allocator);
     }
 
+    /// Words in the section being emitted into.
     pub fn len(self: *const Assembler) usize {
-        return self.words.items.len;
+        return if (self.section == .cold) self.cold_words.items.len else self.words.items.len;
+    }
+
+    /// The next word's position, tagged with its section.
+    fn here(self: *const Assembler) usize {
+        return if (self.section == .cold) cold_tag | self.cold_words.items.len else self.words.items.len;
     }
 
     pub fn emit(self: *Assembler, word: u32) Error!void {
-        try self.words.append(self.allocator, word);
+        if (self.section == .cold) {
+            try self.cold_words.append(self.allocator, word);
+        } else {
+            try self.words.append(self.allocator, word);
+        }
     }
 
     /// Emit an instruction the encoder may refuse. A null means the operands
@@ -85,12 +108,12 @@ pub const Assembler = struct {
     }
 
     pub fn placeLabel(self: *Assembler, label: Label) void {
-        self.labels.items[label.id] = self.words.items.len;
+        self.labels.items[label.id] = self.here();
     }
 
     pub fn branch(self: *Assembler, label: Label) Error!void {
         try self.fixups.append(self.allocator, .{
-            .at = self.words.items.len,
+            .at = self.here(),
             .label = label.id,
             .kind = .branch26,
         });
@@ -99,7 +122,7 @@ pub const Assembler = struct {
 
     pub fn branchCond(self: *Assembler, cond: Cond, label: Label) Error!void {
         try self.fixups.append(self.allocator, .{
-            .at = self.words.items.len,
+            .at = self.here(),
             .label = label.id,
             .kind = .branch19,
         });
@@ -108,7 +131,7 @@ pub const Assembler = struct {
 
     pub fn branchIfZero(self: *Assembler, width: a64.Width, rt: Reg, label: Label) Error!void {
         try self.fixups.append(self.allocator, .{
-            .at = self.words.items.len,
+            .at = self.here(),
             .label = label.id,
             .kind = .branch19,
         });
@@ -117,7 +140,7 @@ pub const Assembler = struct {
 
     pub fn branchIfNonZero(self: *Assembler, width: a64.Width, rt: Reg, label: Label) Error!void {
         try self.fixups.append(self.allocator, .{
-            .at = self.words.items.len,
+            .at = self.here(),
             .label = label.id,
             .kind = .branch19,
         });
@@ -131,31 +154,55 @@ pub const Assembler = struct {
         for (buffer[0..count]) |word| try self.emit(word);
     }
 
-    /// Resolve every branch and return the finished instruction stream.
+    /// Resolve every branch and return the finished instruction stream, the
+    /// cold section laid out right after the hot one.
     pub fn finish(self: *Assembler) Error![]const u32 {
+        const hot_words = self.words.items.len;
+        try self.resolve(0, hot_words * @sizeOf(u32));
+        try self.words.appendSlice(self.allocator, self.cold_words.items);
+        self.cold_words.clearRetainingCapacity();
+        return self.words.items;
+    }
+
+    pub const Split = struct { hot: []const u32, cold: []const u32 };
+
+    /// Resolve every branch for the hot section placed at `hot_address` and
+    /// the cold one at `cold_address`. A branch between them that does not
+    /// reach is `DisplacementTooFar`, as within one section.
+    pub fn finishSplit(self: *Assembler, hot_address: usize, cold_address: usize) Error!Split {
+        try self.resolve(hot_address, cold_address);
+        return .{ .hot = self.words.items, .cold = self.cold_words.items };
+    }
+
+    fn address(position: usize, hot_address: usize, cold_address: usize) i64 {
+        const base = if (position & cold_tag != 0) cold_address else hot_address;
+        return @as(i64, @intCast(base)) + @as(i64, @intCast((position & ~cold_tag) * @sizeOf(u32)));
+    }
+
+    fn resolve(self: *Assembler, hot_address: usize, cold_address: usize) Error!void {
         for (self.fixups.items) |fixup| {
             const target = self.labels.items[fixup.label] orelse return Error.UnboundLabel;
-            const delta = @as(i64, @intCast(target)) - @as(i64, @intCast(fixup.at));
+            const delta = @divExact(address(target, hot_address, cold_address) - address(fixup.at, hot_address, cold_address), @sizeOf(u32));
+            const word = if (fixup.at & cold_tag != 0) &self.cold_words.items[fixup.at & ~cold_tag] else &self.words.items[fixup.at];
             switch (fixup.kind) {
                 .branch26 => {
                     if (delta < -(1 << 25) or delta >= (1 << 25)) {
                         return Error.DisplacementTooFar;
                     }
-                    self.words.items[fixup.at] = a64.b(@intCast(delta));
+                    word.* = a64.b(@intCast(delta));
                 },
                 .branch19 => {
                     if (delta < -(1 << 18) or delta >= (1 << 18)) {
                         return Error.DisplacementTooFar;
                     }
                     // Keep the opcode and condition, replace the displacement.
-                    const original = self.words.items[fixup.at];
+                    const original = word.*;
                     const cleared = original & ~@as(u32, 0x00FF_FFE0);
                     const imm19: u32 = @as(u32, @bitCast(@as(i32, @intCast(delta)))) & 0x7FFFF;
-                    self.words.items[fixup.at] = cleared | (imm19 << 5);
+                    word.* = cleared | (imm19 << 5);
                 },
             }
         }
-        return self.words.items;
     }
 };
 
@@ -242,4 +289,48 @@ test "constant materialisation goes through the shortest sequence" {
     try testing.expectEqual(@as(usize, 1), asm_.len());
     try asm_.loadConstant(6, 0x1111_2222_3333_4444);
     try testing.expectEqual(@as(usize, 5), asm_.len());
+}
+
+test "cold code is laid out after hot code and branches between them resolve" {
+    var asm_ = Assembler.init(testing.allocator);
+    defer asm_.deinit();
+    const slow = try asm_.createLabel();
+    const back = try asm_.createLabel();
+    try asm_.branchIfNonZero(.x64, 3, slow); // hot 0
+    asm_.placeLabel(back);
+    try asm_.emit(a64.ret()); // hot 1
+    asm_.section = .cold;
+    asm_.placeLabel(slow);
+    try asm_.emit(a64.nop()); // cold 0
+    try asm_.branch(back); // cold 1
+    asm_.section = .hot;
+    const code = try asm_.finish();
+    try testing.expectEqual(@as(usize, 4), code.len);
+    try testing.expectEqual(a64.cbnz(.x64, 3, 2), code[0]);
+    try testing.expectEqual(a64.b(-2), code[3]);
+}
+
+test "split sections resolve by address and refuse a branch that cannot reach" {
+    var asm_ = Assembler.init(testing.allocator);
+    defer asm_.deinit();
+    const slow = try asm_.createLabel();
+    const back = try asm_.createLabel();
+    try asm_.branchIfNonZero(.x64, 3, slow);
+    asm_.placeLabel(back);
+    try asm_.emit(a64.ret());
+    asm_.section = .cold;
+    asm_.placeLabel(slow);
+    try asm_.branch(back);
+    asm_.section = .hot;
+    const parts = try asm_.finishSplit(0x10_0000, 0x10_0000 + 0x8000);
+    try testing.expectEqual(a64.cbnz(.x64, 3, 0x8000 / 4), parts.hot[0]);
+    try testing.expectEqual(a64.b(-(0x8000 / 4) + 1), parts.cold[0]);
+    var far = Assembler.init(testing.allocator);
+    defer far.deinit();
+    const target = try far.createLabel();
+    try far.branchIfZero(.x64, 1, target);
+    far.section = .cold;
+    far.placeLabel(target);
+    try far.emit(a64.ret());
+    try testing.expectError(Error.DisplacementTooFar, far.finishSplit(0, 1 << 20));
 }

@@ -176,6 +176,11 @@ const helper_x87_raw_transfer_offset: u32 = @offsetOf(Helpers, "x87_raw_transfer
 const helper_x87_memory_offset: u32 = @offsetOf(Helpers, "x87_memory");
 const helper_interpret_offset: u32 = @offsetOf(Helpers, "interpret");
 const helper_block_offset: u32 = @offsetOf(Helpers, "block");
+/// The hop line inside a block: within `ldp`'s reach.
+pub const hop_offset: u32 = @offsetOf(Block, "hop");
+comptime {
+    std.debug.assert(hop_offset <= 504 and hop_offset % hop_line == 0);
+}
 const helper_entry_gate_offset: u32 = @offsetOf(Helpers, "entry_gate");
 const helper_flags_offset: u32 = @offsetOf(Helpers, "flags");
 
@@ -745,6 +750,7 @@ pub const Block = struct {
     /// after the source's generation moves.
     bytes: []u8,
     code: []const u32,
+    cold_code: []const u32 = &.{},
     native_count: u32,
     fallback_count: u32,
     /// No memory access, no fallback and no vector state: the block can be
@@ -787,25 +793,14 @@ pub const Block = struct {
     /// stable; that is what lets the native chain validate a successor
     /// without calling back into the glue.
     generation_ptr: ?*const u64 = null,
-    /// What a hop into this block proves, read by the native chain from
-    /// the block itself rather than from the link that names it: the word
-    /// to load (`generation_ptr`, or `chain_never` while the block may not
-    /// be entered by a hop), the value it must hold, and where to enter.
-    /// The glue arms these (`armChain`) once the block's bytes are proven
-    /// at a generation, and re-arms them at every revalidation.
-    chain_gen_ptr: u64 = 0,
-    chain_generation: u64 = 0,
-    chain_entry_address: u64 = 0,
-    chain_never: u64 = 1,
-    /// The last `link_ways` distinct successors this block went to. One
-    /// link was not enough: a block ending in a branch alternates between
-    /// its two successors, and on 2026-09-21 64% of chain exits were a
-    /// successor the single link did not name - native chains averaged 4.6
-    /// blocks. A `ret` that returns to more callers than there are ways
-    /// falls through to the thread's jump cache.
-    links: [link_ways]Link = @splat(.{}),
+    /// Everything a native hop reads, in one cache line (`Hop`).
+    hop: Hop align(hop_line) = .{},
     /// The way the next new successor replaces: round robin.
     link_victim: u8 = 0,
+    /// Where `freeTranslatedBlock` puts this block instead of freeing it
+    /// (`block_recycler.zig`): links name blocks, so a block's memory only
+    /// ever holds a block.
+    recycler: ?*anyopaque = null,
 
     pub fn entry(self: *const Block) BlockFn {
         return @ptrCast(self.code.ptr);
@@ -813,34 +808,71 @@ pub const Block = struct {
 
     /// Let hops enter this block while `word` holds `generation`.
     pub fn armChain(self: *Block, word: *const u64, generation: u64) void {
-        self.chain_gen_ptr = @intFromPtr(word);
-        self.chain_generation = generation;
-        self.chain_entry_address = @intFromPtr(self.code.ptr) + self.chain_entry;
+        self.hop.rip = self.start_rip;
+        self.hop.generation = generation;
+        self.hop.entry = @intFromPtr(self.code.ptr) + self.chain_entry;
+        @atomicStore(*const u64, &self.hop.gen_ptr, word, .release);
     }
 
-    /// No hop may enter this block: its proof loads `chain_never` (1) and
-    /// expects 0.
+    /// No hop may enter this block: its proof loads `chain_never_word`,
+    /// which no generation equals. Only the pointer changes, so a hop that
+    /// races a disarm from another thread sees the armed block or a failed
+    /// proof, never a mix.
     pub fn disarmChain(self: *Block) void {
-        self.chain_gen_ptr = @intFromPtr(&self.chain_never);
-        self.chain_generation = 0;
-        self.chain_entry_address = @intFromPtr(self.code.ptr) + self.chain_entry;
+        @atomicStore(*const u64, &self.hop.gen_ptr, &chain_never_word, .release);
+        self.hop.rip = self.start_rip;
+        self.hop.entry = @intFromPtr(self.code.ptr) + self.chain_entry;
     }
 };
+
+/// The generation word of a block no hop may enter: no source generation
+/// reaches it.
+pub const chain_never_word: u64 = std.math.maxInt(u64);
+
+/// What a native hop reads, in one cache line: into a block (`rip`,
+/// `gen_ptr`, `generation`, `entry`) and out of it (`links`). A hop used to
+/// load the link from one line of the block it left, the table slot the link
+/// named from an 8 MiB table, then the successor's guest address and its
+/// generation fields from two more lines; with thousands of blocks hot each
+/// was a miss on the path to the next block's first instruction. Now it reads
+/// the link, the successor's hop line, and the generation word, and the
+/// successor's own links are in the line it just loaded.
+pub const Hop = extern struct {
+    rip: u64 = 0,
+    gen_ptr: *const u64 = &chain_never_word,
+    generation: u64 = 0,
+    entry: u64 = 0,
+    /// The last `link_ways` distinct successors this block went to. One
+    /// link was not enough: a block ending in a branch alternates between
+    /// its two successors, and on 2026-09-21 64% of chain exits were a
+    /// successor the single link did not name - native chains averaged 4.6
+    /// blocks. A `ret` that returns to more callers than there are ways
+    /// falls through to the thread's jump cache.
+    links: [link_ways]Link = @splat(.{}),
+
+    comptime {
+        std.debug.assert(@sizeOf(Hop) <= hop_line);
+    }
+};
+
+/// Apple silicon's cache line.
+pub const hop_line: usize = 128;
 
 /// Ways in a block's successor cache.
 pub const link_ways: usize = 4;
 
 /// One successor a block chained to, or one jump-cache entry: the guest
-/// address, and the table slot the block for it was in. Everything else a
-/// hop needs is read from the block that occupies that slot now, which is
-/// also what makes a link safe against the slot being refilled: a block
-/// for another address fails the `start_rip` comparison, and an unarmed or
-/// rewritten one fails its generation. A link that recorded the block's
-/// own pointer could be satisfied by a different block allocated at a
-/// freed one's address.
+/// address and the block compiled for it. Everything else a hop needs is
+/// read from that block's `hop` line. A block that left the table is never
+/// freed while a link can name it: its memory goes to its translator's
+/// recycler and only ever holds a block again (`block_recycler.zig`), with
+/// `hop.rip` cleared and the chain disarmed in between. So a stale link reads
+/// a block for another address, which fails the `rip` comparison, a disarmed
+/// or rewritten one, which fails its generation, or a block compiled for the
+/// same address since, which is the one the hop should enter.
 pub const Link = extern struct {
     rip: u64 = 0,
-    slot: usize = 0,
+    block: usize = 0,
 };
 
 /// A thread's jump cache: the successors of every block, direct-mapped by
@@ -857,6 +889,8 @@ pub fn jumpCacheIndex(rip: u64) usize {
 
 pub const Compiled = struct {
     code: []const u32,
+    /// The out-of-line paths, when placed apart from `code` (`split_cold`).
+    cold_code: []const u32 = &.{},
     /// Byte offset of the entry that skips the prologue.
     chain_entry: u32,
     native_count: u32,
@@ -2049,6 +2083,8 @@ const ExitStub = struct {
     rip: ?u64,
     /// The RIP is already in `r_exit_rip` (an indirect transfer's target).
     rip_in_register: bool = false,
+    /// Only a helper's `abort` reaches it: placed with the cold paths.
+    cold: bool = false,
 };
 
 /// Where an exit hands its RIP to the chain. Only the leave path writes it
@@ -2322,8 +2358,15 @@ const Compiler = struct {
         return label;
     }
 
-    fn emitExitStubs(self: *Compiler) Error!void {
+    fn coldExitStub(self: *Compiler, completed: u32, rip: ?u64) Error!Label {
+        const label = try self.exitStub(completed, rip);
+        self.exits.items[self.exits.items.len - 1].cold = true;
+        return label;
+    }
+
+    fn emitExitStubs(self: *Compiler, cold: bool) Error!void {
         for (self.exits.items) |stub| {
+            if (stub.cold != cold) continue;
             self.a.placeLabel(stub.label);
             if (stub.rip) |rip| {
                 try self.a.loadConstant(r_exit_rip, rip);
@@ -2577,7 +2620,8 @@ const Compiler = struct {
         try self.a.branchCond(.hs, leave);
         // t4 = the successor's guest address, t2 = this block.
         try self.emit(a64.mov(.x64, t4, r_exit_rip));
-        try self.emitChecked(a64.ldrImm(.doubleword, t2, r_helpers, helper_block_offset));
+        // The helper table is inside the executing block.
+        try self.emitChecked(a64.subImm(.x64, t2, r_helpers, @offsetOf(Block, "helpers")));
         if (self.resident_loop) |loop| try self_loops.emit(self.a, t2, t4, r_scratch, loop, leave);
         const prove = try self.a.createLabel();
         // A block that leaves through `ret` or an indirect transfer has more
@@ -2598,21 +2642,20 @@ const Compiler = struct {
             try self.emitWayScan(0, prove);
             try self.emitJumpCacheProbe(prove, leave);
         }
-        // t6 = the link. t5 = the block in its slot now, acquired: a slot
-        // is published after the block in it is complete.
+        // t6 = the link, t5 = the block it names: its hop line has the
+        // address it was compiled for, the generation word and value its
+        // bytes were proven at, and its entry.
         self.a.placeLabel(prove);
-        try self.emitChecked(a64.ldrImm(.doubleword, t3, t6, @offsetOf(Link, "slot")));
-        try self.emit(a64.ldar(.doubleword, t5, t3));
+        try self.emitChecked(a64.ldrImm(.doubleword, t5, t6, @offsetOf(Link, "block")));
         try self.a.branchIfZero(.x64, t5, leave);
-        try self.emitChecked(a64.ldrImm(.doubleword, t3, t5, @offsetOf(Block, "start_rip")));
+        try self.emitChecked(a64.ldp(.signed_offset, t3, t1, t5, hop_offset));
         try self.emit(a64.cmp(.x64, t3, t4));
         try self.a.branchCond(.ne, leave);
         // Mapped code generations are release-published by any guest worker
         // that writes code; the block's armed generation is the one its
         // bytes were proven at.
-        try self.emitChecked(a64.ldrImm(.doubleword, t3, t5, @offsetOf(Block, "chain_gen_ptr")));
-        try self.emitChecked(a64.ldrImm(.doubleword, t3, t3, 0));
-        try self.emitChecked(a64.ldrImm(.doubleword, t1, t5, @offsetOf(Block, "chain_generation")));
+        try self.emitChecked(a64.ldrImm(.doubleword, t3, t1, 0));
+        try self.emitChecked(a64.ldrImm(.doubleword, t1, t5, hop_offset + @offsetOf(Hop, "generation")));
         try self.emit(a64.cmp(.x64, t3, t1));
         try self.a.branchCond(.ne, leave);
         if (self.resident_loop != null) try self.emitCacheWriteBack();
@@ -2621,7 +2664,7 @@ const Compiler = struct {
         try self.emitChecked(a64.strImm(.doubleword, t2, r_scratch, scratch_chain_previous_offset));
         try self.emitChecked(a64.strImm(.doubleword, t5, r_scratch, scratch_block_offset));
         try self.emitStateOffsetAddress(r_helpers, t5, @offsetOf(Block, "helpers"));
-        try self.emitChecked(a64.ldrImm(.doubleword, t3, t5, @offsetOf(Block, "chain_entry_address")));
+        try self.emitChecked(a64.ldrImm(.doubleword, t3, t5, hop_offset + @offsetOf(Hop, "entry")));
         try self.emit(a64.br(t3));
         self.a.placeLabel(later);
         if (fallthrough) {
@@ -2644,7 +2687,7 @@ const Compiler = struct {
     /// costs only its address compare; the way that matches is proved once.
     fn emitWayScan(self: *Compiler, first: usize, prove: Label) Error!void {
         for (first..link_ways) |way| {
-            const base: u32 = @intCast(@offsetOf(Block, "links") + way * @sizeOf(Link));
+            const base: u32 = @intCast(hop_offset + @offsetOf(Hop, "links") + way * @sizeOf(Link));
             const next_way = try self.a.createLabel();
             try self.emitChecked(a64.ldrImm(.doubleword, t3, t2, base + @offsetOf(Link, "rip")));
             try self.emit(a64.cmp(.x64, t3, t4));
@@ -3201,14 +3244,14 @@ const Compiler = struct {
                 .label = abort_path,
                 .fused = fused,
                 .owed = fused.writes,
-                .stub = try self.exitStub(index + 1, next),
+                .stub = try self.coldExitStub(index + 1, next),
             });
             try self.emitChecked(a64.ldrImm(.byte, t0, r_scratch, scratch_abort_offset));
             try self.a.branchIfNonZero(.w32, t0, abort_path);
             return;
         }
         const next_rip = self.insns[index].rip +% self.insns[index].len;
-        const stub = try self.exitStub(index + 1, next_rip);
+        const stub = try self.coldExitStub(index + 1, next_rip);
         try self.emitChecked(a64.ldrImm(.byte, t0, r_scratch, scratch_abort_offset));
         try self.a.branchIfNonZero(.w32, t0, stub);
     }
@@ -3924,7 +3967,7 @@ const Compiler = struct {
                 if (!cold.is_write and cold.dest != 0) try self.emit(a64.mov(.x64, cold.dest, 0));
             }
             if (cold.abort_exit) |exit| {
-                const stub = try self.exitStub(exit.completed, exit.next_rip);
+                const stub = try self.coldExitStub(exit.completed, exit.next_rip);
                 const target = if (exit.fused) |fused| blk: {
                     const path = try self.a.createLabel();
                     try self.fused_exits.append(self.allocator, .{ .label = path, .fused = fused, .owed = fused.writes, .stub = stub });
@@ -7557,6 +7600,8 @@ pub const Options = struct {
     /// Nonzero: call `Helpers.entry_gate(state, entry_gate)` on every entry,
     /// before the register cache loads (process/impl/xenia_register_writes).
     entry_gate: u32 = 0,
+    /// Place out-of-line paths apart from the hot code (`code_layout.zig`).
+    split_cold: bool = false,
 };
 
 /// Whether `op` transfers into or back out of a function.
@@ -7716,14 +7761,10 @@ pub fn compileWith(allocator: std.mem.Allocator, memory: *CodeMemory, layout: La
     defer pass.compiler.cold_memory.deinit(allocator);
     defer pass.compiler.fused_exits.deinit(allocator);
     defer pass.compiler.freeInternalEdges();
-    const words = try assembler.finish();
-
-    const code = try memory.reserve(words.len);
-    memory.beginWrite();
-    @memcpy(code, words);
-    memory.endWrite(code);
+    const code = try @import("code_layout.zig").install(memory, &assembler, options.split_cold);
     return .{
-        .code = code,
+        .code = code.hot,
+        .cold_code = code.cold,
         .chain_entry = pass.chain_entry_bytes,
         .native_count = pass.compiler.native_count,
         .fallback_count = pass.compiler.fallback_count,
@@ -7869,10 +7910,15 @@ fn emitBlock(
         const stub = try compiler.exitStub(@intCast(insns.len), end_rip);
         try assembler.branch(stub);
     }
+    // Paths a block almost never runs, apart from the ones it runs every
+    // time (`Options.split_cold`, `code_layout.zig`).
+    assembler.section = .cold;
     try compiler.emitColdAccesses();
     try compiler.emitColdMemory();
+    try compiler.emitExitStubs(true);
+    assembler.section = .hot;
     try compiler.emitFusedExits();
-    try compiler.emitExitStubs();
+    try compiler.emitExitStubs(false);
     try compiler.emitChainAttempt();
     try compiler.emitFlagCompletion();
     try compiler.emitEpilogue();

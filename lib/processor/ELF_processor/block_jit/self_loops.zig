@@ -23,12 +23,12 @@ pub fn hasEdge(insns: []const core.Insn) bool {
 /// as an input to the next iteration. A non-self successor falls through.
 pub fn emit(a: *core.Assembler, block: a64.Reg, target: a64.Reg, scratch: a64.Reg, loop: core.Label, leave: core.Label) !void {
     const other = try a.createLabel();
-    try a.emit(a64.ldrImm(.doubleword, 12, block, @offsetOf(core.Block, "start_rip")).?);
+    try a.emit(a64.ldrImm(.doubleword, 12, block, core.hop_offset + @offsetOf(core.Hop, "rip")).?);
     try a.emit(a64.cmp(.x64, 12, target));
     try a.branchCond(.ne, other);
-    try a.emit(a64.ldrImm(.doubleword, 12, block, @offsetOf(core.Block, "chain_gen_ptr")).?);
+    try a.emit(a64.ldrImm(.doubleword, 12, block, core.hop_offset + @offsetOf(core.Hop, "gen_ptr")).?);
     try a.emit(a64.ldrImm(.doubleword, 12, 12, 0).?);
-    try a.emit(a64.ldrImm(.doubleword, 10, block, @offsetOf(core.Block, "chain_generation")).?);
+    try a.emit(a64.ldrImm(.doubleword, 10, block, core.hop_offset + @offsetOf(core.Hop, "generation")).?);
     try a.emit(a64.cmp(.x64, 12, 10));
     try a.branchCond(.ne, leave);
     try a.emit(a64.strImm(.doubleword, block, scratch, @offsetOf(core.Scratch, "chain_previous")).?);

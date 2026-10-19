@@ -17,10 +17,10 @@
 //! outermost execution returns, the first point where nothing translated
 //! is running.
 //!
-//! A retired block also cannot be entered by mistake. Chain links check
-//! that the slot they name still holds the block they recorded, and a
-//! retired block stays allocated, so no newer block can take its address
-//! and pass that check in its place.
+//! A retired block also cannot be entered by mistake. Chain links name the
+//! block itself and a hop proves its `hop` line, and a block that is freed
+//! goes to its translator's recycler (`block_recycler.zig`), disarmed, so
+//! its memory only ever holds a block again.
 
 const std = @import("std");
 

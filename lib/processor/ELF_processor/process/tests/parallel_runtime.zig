@@ -1434,6 +1434,11 @@ test "block jit benchmark: code expansion of RENDER's hot 2026-10-02 function (R
     const jit = state.blockJitActive() orelse return error.NoJit;
     state.setParallelGuestExecution(true);
     defer state.setParallelGuestExecution(false);
+    // `ROSETTE_BLOCK_JIT_BENCH_SPLIT=1`: place the out-of-line paths apart,
+    // so `arm64_words` is what runs every execution and `cold_words` the rest.
+    const saved_split = block_jit.code_layout.split_all;
+    defer block_jit.code_layout.split_all = saved_split;
+    block_jit.code_layout.split_all = std.c.getenv("ROSETTE_BLOCK_JIT_BENCH_SPLIT") != null;
     var offset: u64 = 0;
     var total_insns: usize = 0;
     var total_words: usize = 0;
@@ -1442,7 +1447,7 @@ test "block jit benchmark: code expansion of RENDER's hot 2026-10-02 function (R
         defer freeTranslatedBlock(testing.allocator, compiled);
         total_insns += compiled.insns.len;
         total_words += compiled.code.len;
-        std.debug.print("BLOCK JIT EXPANSION: rip=0x{x} x86={d} arm64_words={d} per_insn={d}\n", .{ base + offset, compiled.insns.len, compiled.code.len, compiled.code.len / @max(compiled.insns.len, 1) });
+        std.debug.print("BLOCK JIT EXPANSION: rip=0x{x} x86={d} arm64_words={d} cold_words={d} per_insn={d}\n", .{ base + offset, compiled.insns.len, compiled.code.len, compiled.cold_code.len, compiled.code.len / @max(compiled.insns.len, 1) });
         if (std.c.getenv("ROSETTE_BLOCK_JIT_BENCH_DUMP") != null) {
             std.debug.print("BLOCK JIT BENCH CODE: rip=0x{x} words=", .{base + offset});
             for (compiled.code) |word| std.debug.print("{x:0>8} ", .{word});

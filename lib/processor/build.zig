@@ -167,6 +167,11 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
     const command_replay_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{"Xenia command replay"} });
     // Timing: ROSETTE_COMMAND_REPLAY_BENCH=1 zig build xenia-command-replay-check -Doptimize=ReleaseFast
     b.step("xenia-command-replay-check", "Replay Xenia's command-processor register writes interpreted and translated").dependOn(&b.addRunArtifact(command_replay_test).step);
+    // Translated-code working set: per-block cost as the number of distinct
+    // hot blocks grows. Timing: ROSETTE_CODE_WORKING_SET_BENCH=1 zig build
+    // code-working-set-check -Doptimize=ReleaseFast
+    const working_set_test = b.addTest(.{ .root_module = elf_processor_test_mod, .filters = &.{ "code working set", "chain recycling", "native hops", "native first successor", "internal edge", "chain" } });
+    b.step("code-working-set-check", "Check split code layout and block-named chain links, and measure block cost against distinct hot blocks").dependOn(&b.addRunArtifact(working_set_test).step);
     // Win32 mutex ownership in the wait model, the semantics Xenia's
     // XMutant hands every Xbox 360 mutant to. Run 20261012T000703Z stopped
     // on a recursive acquisition the model could not express.

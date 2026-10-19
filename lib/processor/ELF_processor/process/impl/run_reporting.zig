@@ -645,6 +645,8 @@ pub fn reportHostProfileSamples(
             const block = maybe orelse continue;
             const low = @intFromPtr(block.code.ptr);
             spans.append(arena, .{ .low = low, .high = low + block.code.len * @sizeOf(u32), .block = block }) catch break;
+            const cold = @intFromPtr(block.cold_code.ptr);
+            if (block.cold_code.len != 0) spans.append(arena, .{ .low = cold, .high = cold + block.cold_code.len * @sizeOf(u32), .block = block }) catch break;
         }
         __process_std.mem.sort(Span, spans.items, {}, struct {
             fn lessThan(_: void, a: Span, b: Span) bool {

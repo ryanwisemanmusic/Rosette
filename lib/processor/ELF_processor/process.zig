@@ -4124,6 +4124,8 @@ const BlockJitState = struct {
     /// whether a reset is waiting for the outermost one to return
     /// (`block_jit/lifetime.zig`).
     lifetime: BlockLifetime = .{},
+    /// Memory of blocks that left the table, kept as blocks for links.
+    recycler: BlockRecycler = .{},
     verified: u64 = 0,
     mismatches: u64 = 0,
     /// The memory-aware cross-check: blocks it compared, found different,
@@ -4327,6 +4329,7 @@ const BlockJitState = struct {
             slot.* = null;
         }
         self.lifetime.deinit(allocator);
+        self.recycler.deinit(allocator);
         allocator.free(self.blocks);
         allocator.free(self.hotness);
         if (self.jump_cache.len != 0) allocator.free(self.jump_cache);
@@ -4392,8 +4395,8 @@ const BlockJitState = struct {
                 }
             } else unreachable;
         }
-        // Every link into the old table now reads null and falls back to the
-        // dispatcher, which re-arms it against the new slot.
+        // Links name blocks, not slots, so the moved blocks keep theirs; the
+        // old table is emptied and kept only for what still holds its address.
         @memset(old_blocks, null);
         self.retired_tables.appendAssumeCapacity(old_blocks);
         allocator.free(old_hotness);
@@ -4411,13 +4414,28 @@ const BlockJitState = struct {
     }
 
     pub const freeBlock = freeTranslatedBlock;
+
+    /// Memory for a new block: a recycled one, or a fresh one in the
+    /// state a recycled one has.
+    pub fn newBlock(self: *BlockJitState, allocator: std.mem.Allocator) ?*block_jit.Block {
+        if (self.recycler.take()) |block| return block;
+        const block = allocator.create(block_jit.Block) catch return null;
+        block.* = .{ .helpers = undefined, .start_rip = 0, .end_rip = 0, .insns = &.{}, .bytes = &.{}, .code = &.{}, .native_count = 0, .fallback_count = 0, .register_only = false };
+        return block;
+    }
 };
 
 fn freeTranslatedBlock(allocator: std.mem.Allocator, block: *block_jit.Block) void {
     allocator.free(block.insns);
     allocator.free(block.bytes);
+    block.insns = &.{};
+    block.bytes = &.{};
+    // A chain link may name this block: its memory stays a block.
+    if (block.recycler) |owner| return @as(*BlockRecycler, @ptrCast(@alignCast(owner))).give(allocator, block);
     allocator.destroy(block);
 }
+
+const BlockRecycler = @import("block_jit/block_recycler.zig").Recycler(block_jit.Block);
 
 const BlockLifetime = block_lifetime.Lifetime(block_jit.Block, freeTranslatedBlock);
 
@@ -5649,5 +5667,7 @@ test {
     _ = @import("process/tests/windows_mutex.zig");
     _ = @import("process/tests/windows_mutex_contract.zig");
     _ = @import("process/tests/guest_command_replay.zig");
+    _ = @import("process/tests/code_working_set.zig");
+    _ = @import("process/tests/chain_recycling.zig");
     _ = @import("block_jit/tests.zig");
 }

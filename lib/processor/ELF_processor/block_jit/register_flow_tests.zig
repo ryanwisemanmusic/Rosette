@@ -124,8 +124,7 @@ test "native hops retain self-loop registers and publish on budget break and gen
             h.block.chain_entry = metadata.chain_entry;
             var generation: u64 = 17;
             h.block.armChain(&generation, generation);
-            var slot: ?*core.Block = &h.block;
-            h.block.links[0] = .{ .rip = 0x1000, .slot = @intFromPtr(&slot) };
+            h.block.hop.links[0] = .{ .rip = 0x1000, .block = @intFromPtr(&h.block) };
             state.regs.rax = 0;
             state.regs.rcx = 100;
             state.scratch.chain_count = 0;

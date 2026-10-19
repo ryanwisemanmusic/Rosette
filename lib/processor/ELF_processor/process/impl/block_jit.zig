@@ -1598,14 +1598,14 @@ pub fn compileBlockJit(self: *ElfState, jit: *__process_BlockJitState, rip: u64)
         },
     };
     jit.last_refusal = .allocation;
-    const block = self.allocator.create(__process_block_jit.Block) catch return null;
+    const block = jit.newBlock(self.allocator) orelse return null;
     const owned_insns = insns.toOwnedSlice(self.allocator) catch {
-        self.allocator.destroy(block);
+        jit.recycler.give(self.allocator, block);
         return null;
     };
     const owned_bytes = bytes.toOwnedSlice(self.allocator) catch {
         self.allocator.free(owned_insns);
-        self.allocator.destroy(block);
+        jit.recycler.give(self.allocator, block);
         return null;
     };
     block.* = .{
@@ -1631,6 +1631,7 @@ pub fn compileBlockJit(self: *ElfState, jit: *__process_BlockJitState, rip: u64)
         .insns = owned_insns,
         .bytes = owned_bytes,
         .code = compiled.code,
+        .cold_code = compiled.cold_code,
         .native_count = compiled.native_count,
         .fallback_count = compiled.fallback_count,
         .register_only = compiled.register_only,
@@ -1644,6 +1645,7 @@ pub fn compileBlockJit(self: *ElfState, jit: *__process_BlockJitState, rip: u64)
         .source_index = source_index,
         .source_generation = source_generation,
         .chain_entry = compiled.chain_entry,
+        .recycler = &jit.recycler,
         .generation_ptr = if (page_word) |word| word else blockJitGenerationPointer(self, source_mapped, source_kind, source_index),
     };
     blockJitArmChain(block);
@@ -1746,7 +1748,8 @@ pub fn blockJitFindValidSlot(self: *ElfState, jit: *__process_BlockJitState, rip
 pub fn blockJitLink(self: *ElfState, jit: *__process_BlockJitState, from: *__process_block_jit.Block, rip: u64, to: *__process_block_jit.Block, slot: usize) void {
     if (!self.block_jit_chain_enabled) return;
     if (to.generation_ptr == null) return;
-    const link: __process_block_jit.Link = .{ .rip = rip, .slot = @intFromPtr(&jit.blocks[slot]) };
+    _ = slot;
+    const link: __process_block_jit.Link = .{ .rip = rip, .block = @intFromPtr(to) };
     // The thread's jump cache too: a `ret` to more callers than `from`
     // has ways, or an indirect call through a table, finds its
     // successor there instead of coming back here.
@@ -1754,13 +1757,13 @@ pub fn blockJitLink(self: *ElfState, jit: *__process_BlockJitState, from: *__pro
     // Re-arm the way that already names this address; otherwise take
     // the round-robin victim.
     var way: usize = from.link_victim;
-    for (from.links, 0..) |existing, index| {
+    for (from.hop.links, 0..) |existing, index| {
         if (existing.rip == rip) {
             way = index;
             break;
         }
     } else from.link_victim = @intCast((way + 1) % __process_block_jit.link_ways);
-    from.links[way] = link;
+    from.hop.links[way] = link;
     jit.links_armed +|= 1;
 }
 

@@ -10,7 +10,6 @@ const t = std.testing;
 
 const Graph = struct {
     h: [4]f.TestHarness = undefined,
-    slots: [4]?*core.Block = @splat(null),
     generation: [4]u64 = @splat(17),
     count: usize = 0,
     block_insns: [4]usize = @splat(0),
@@ -73,10 +72,9 @@ const Graph = struct {
             h.block.chain_entry = c.chain_entry;
             h.block.helpers.block = &h.block;
             h.block.armChain(&g.generation[index], g.generation[index]);
-            g.slots[index] = &h.block;
             g.block_insns[index] = h.insns.items.len;
         }
-        for (&g.h, 0..) |*h, index| h.block.links[0] = .{ .rip = g.h[(index + 1) % 4].block.start_rip, .slot = @intFromPtr(&g.slots[(index + 1) % 4]) };
+        for (&g.h, 0..) |*h, index| h.block.hop.links[0] = .{ .rip = g.h[(index + 1) % 4].block.start_rip, .block = @intFromPtr(&g.h[(index + 1) % 4].block) };
         return g;
     }
     fn destroy(g: *@This()) void {
@@ -147,16 +145,17 @@ test "native first successor keeps guards budgets mixed entries and context stat
                 new.h[1].block.disarmChain();
             }
             if (route == 3) {
-                old.slots[1] = null;
-                new.slots[1] = null;
+                // The block left the table: its recycled memory reads no address.
+                old.h[1].block.hop.rip = 0;
+                new.h[1].block.hop.rip = 0;
             }
             if (route == 4) {
                 a.scratch.chain_break = 1;
                 b.scratch.chain_break = 1;
             }
             if (route == 5) {
-                old.h[0].block.links[0].rip += 1;
-                new.h[0].block.links[0].rip += 1;
+                old.h[0].block.hop.links[0].rip += 1;
+                new.h[0].block.hop.links[0].rip += 1;
             }
             try t.expectEqual(old.run(a, if (route == 6) 1 else 2048), new.run(b, if (route == 6) 1 else 2048));
             try equal(a, b);
@@ -164,10 +163,8 @@ test "native first successor keeps guards budgets mixed entries and context stat
             for (&old.h, &new.h, 0..) |*x, *y, index| {
                 x.block.armChain(&old.generation[index], old.generation[index]);
                 y.block.armChain(&new.generation[index], new.generation[index]);
-                old.slots[index] = &x.block;
-                new.slots[index] = &y.block;
-                x.block.links[0].rip = old.h[(index + 1) % 4].block.start_rip;
-                y.block.links[0].rip = new.h[(index + 1) % 4].block.start_rip;
+                x.block.hop.links[0].rip = old.h[(index + 1) % 4].block.start_rip;
+                y.block.hop.links[0].rip = new.h[(index + 1) % 4].block.start_rip;
             }
         }
     };
@@ -326,13 +323,13 @@ test "native first successor retains every later way and jump-cache proof" {
         @memset(ac, .{});
         @memset(bc, .{});
         const target = old.h[1].block.start_rip;
-        const al = old.h[0].block.links[0];
-        const bl = new.h[0].block.links[0];
-        old.h[0].block.links[0] = .{};
-        new.h[0].block.links[0] = .{};
+        const al = old.h[0].block.hop.links[0];
+        const bl = new.h[0].block.hop.links[0];
+        old.h[0].block.hop.links[0] = .{};
+        new.h[0].block.hop.links[0] = .{};
         if (route < 3) {
-            old.h[0].block.links[1 + route] = al;
-            new.h[0].block.links[1 + route] = bl;
+            old.h[0].block.hop.links[1 + route] = al;
+            new.h[0].block.hop.links[1 + route] = bl;
         } else {
             const slot = core.jumpCacheIndex(target);
             ac[slot] = al;
@@ -340,8 +337,9 @@ test "native first successor retains every later way and jump-cache proof" {
             a.scratch.jump_cache = ac.ptr;
             b.scratch.jump_cache = bc.ptr;
             if (route == 4) {
-                old.slots[1] = &old.h[2].block;
-                new.slots[1] = &new.h[2].block;
+                // The entry names a block compiled for another address.
+                ac[slot].block = @intFromPtr(&old.h[2].block);
+                bc[slot].block = @intFromPtr(&new.h[2].block);
             }
             if (route == 5) {
                 old.generation[1] += 1;
