@@ -378,7 +378,9 @@ fn logical(width: Width, wide: u64) IntegerResult {
     var flags = sizeParityFlags(width, value);
     flags.cf = .clear;
     flags.of = .clear;
-    flags.af = .undefined;
+    // Architecturally undefined; cleared, as `flags.applyLogic` does, so
+    // every executor and the translator agree on all six flags.
+    flags.af = .clear;
     return .{ .dest = value, .flags = flags };
 }
 

@@ -120,6 +120,11 @@ pub fn applyIncDec(rflags: *u32, input: u64, result: u64, size: OperandSize, is_
     setOrClear(rflags, RFL_AF, if (is_inc) (input_masked & 0xF) == 0xF else (input_masked & 0xF) == 0);
 }
 
+/// AND/OR/XOR/TEST: CF and OF clear, ZF/SF/PF from the result, and AF -
+/// which the architecture leaves undefined - clear as well. Clearing rather
+/// than keeping it makes a logic operation overwrite all six flags, so the
+/// translator owes nothing for the `add`/`cmp` before Xenia's `test ; jcc`
+/// (2026-10-19); every executor shares this definition.
 pub fn applyLogic(rflags: *u32, result: u64, size: OperandSize) void {
     const mask = maskForSize(size);
     const sign = signBitForSize(size);
@@ -127,6 +132,7 @@ pub fn applyLogic(rflags: *u32, result: u64, size: OperandSize) void {
 
     setOrClear(rflags, RFL_CF, false);
     setOrClear(rflags, RFL_OF, false);
+    setOrClear(rflags, RFL_AF, false);
     setSizeParityFlags(rflags, r, sign);
 }
 

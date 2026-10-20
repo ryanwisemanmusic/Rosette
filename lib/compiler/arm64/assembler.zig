@@ -58,6 +58,9 @@ pub const Assembler = struct {
     allocator: std.mem.Allocator,
     cold_words: std.ArrayList(u32) = .empty,
     section: Section = .hot,
+    /// Where the most recent label was placed (tagged): a branch some label
+    /// names is a patch site or a jump target and is never dropped.
+    last_label_at: usize = std.math.maxInt(usize),
 
     pub fn init(allocator: std.mem.Allocator) Assembler {
         return .{
@@ -110,7 +113,17 @@ pub const Assembler = struct {
     }
 
     pub fn placeLabel(self: *Assembler, label: Label) void {
+        // `b label` right before `label`: the branch goes where execution
+        // already falls, so it is dropped - unless another label names it.
+        if (self.fixups.items.len != 0) {
+            const last = self.fixups.items[self.fixups.items.len - 1];
+            if (last.kind == .branch26 and last.label == label.id and last.at + 1 == self.here() and self.last_label_at != last.at) {
+                _ = self.fixups.pop();
+                if (self.section == .cold) self.cold_words.items.len -= 1 else self.words.items.len -= 1;
+            }
+        }
         self.labels.items[label.id] = self.here();
+        self.last_label_at = self.here();
     }
 
     pub fn branch(self: *Assembler, label: Label) Error!void {
@@ -386,4 +399,30 @@ test "split sections resolve by address and refuse a branch that cannot reach" {
     far.placeLabel(target);
     try far.emit(a64.ret());
     try testing.expectError(Error.DisplacementTooFar, far.finishSplit(0, 1 << 20));
+}
+
+test "a branch to the label placed right after it is dropped unless a label names it" {
+    var asm_ = Assembler.init(std.testing.allocator);
+    defer asm_.deinit();
+    const next = try asm_.createLabel();
+    try asm_.emit(a64.nop());
+    try asm_.branch(next);
+    asm_.placeLabel(next);
+    try std.testing.expectEqual(@as(usize, 1), asm_.words.items.len);
+    try std.testing.expectEqual(@as(usize, 0), asm_.fixups.items.len);
+    // A named branch (a patch site) stays.
+    const site = try asm_.createLabel();
+    const after = try asm_.createLabel();
+    asm_.placeLabel(site);
+    try asm_.branch(after);
+    asm_.placeLabel(after);
+    try std.testing.expectEqual(@as(usize, 2), asm_.words.items.len);
+    // So does a branch over code to a later label.
+    const elsewhere = try asm_.createLabel();
+    try asm_.branch(elsewhere);
+    try asm_.emit(a64.nop());
+    asm_.placeLabel(elsewhere);
+    try std.testing.expectEqual(@as(usize, 4), asm_.words.items.len);
+    const words = try asm_.finish();
+    try std.testing.expectEqual(a64.b(2), words[2]);
 }
