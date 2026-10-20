@@ -1534,24 +1534,6 @@ test "a branch that ends a block keeps every flag live across it" {
     try testing.expectEqual(F_ALL, live[1]);
 }
 
-test "flag liveness keeps a flag its writer does not kill" {
-    // `and` leaves the auxiliary carry undefined, so it does not kill it and
-    // the earlier `add` must still compute it.
-    var insns: [2]Insn = undefined;
-    var add_insn = regReg(.add_reg64_reg64, .bits64, .al_ax_eax_rax, .bl_bx_ebx_rbx);
-    add_insn.len = 3;
-    insns[0] = .{ .rip = 0x2000, .len = 3, .decoded = add_insn, .segment = .ds };
-    var and_insn = regReg(.and_reg64_reg64, .bits64, .cl_cx_ecx_rcx, .dl_dx_edx_rdx);
-    and_insn.len = 3;
-    insns[1] = .{ .rip = 0x2003, .len = 3, .decoded = and_insn, .segment = .ds };
-
-    var wants: [2]bool = undefined;
-    var live: [2]u8 = undefined;
-    _ = flagLiveness(&insns, &wants, &live);
-    try testing.expectEqual(F_AF, live[0] & F_AF);
-    try testing.expectEqual(F_ALL, live[1]);
-}
-
 test "setcc to memory and the fences are translated, not interpreted" {
     var h = try TestHarness.init();
     defer h.deinit();

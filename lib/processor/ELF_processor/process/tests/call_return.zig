@@ -45,6 +45,15 @@ pub const Shape = struct {
     indirect_percent: u8,
 };
 
+/// Host instructions retired and cycles of the calling thread, from the
+/// kernel's fixed counters (no privilege needed): the IPC of translated code.
+extern "c" fn thread_selfcounts(kind: c_int, buffer: *[2]u64, bytes: usize) c_int;
+fn hostCounts() [2]u64 {
+    var counts: [2]u64 = .{ 0, 0 };
+    if (thread_selfcounts(1, &counts, @sizeOf([2]u64)) != 0) return .{ 0, 0 };
+    return counts;
+}
+
 fn threadCpu() u64 {
     var stamp: std.c.timespec = undefined;
     std.debug.assert(std.c.clock_gettime(.THREAD_CPUTIME_ID, &stamp) == 0);
@@ -191,6 +200,8 @@ fn expectedValue(program: *const Program, iterations: u64) u32 {
 
 pub const Result = struct {
     cpu_ns: u64 = 0,
+    host_instructions: u64 = 0,
+    host_cycles: u64 = 0,
     block_executions: u64 = 0,
     retired: u64 = 0,
     compiled: u64 = 0,
@@ -242,6 +253,37 @@ pub fn run(shape: Shape, passes: u64) !Result {
     state.setParallelGuestExecution(true);
     defer state.setParallelGuestExecution(false);
     const program = prepare(&state, shape, true);
+    // `ROSETTE_CALL_RETURN_FASTMEM_BOUND=1`: the offline upper bound of a
+    // fixed host offset for guest memory (`block_jit/fastmem_bound.zig`).
+    const has_bound = @hasDecl(I._block_jit, "fastmem_bound");
+    if (has_bound) if (std.c.getenv("ROSETTE_CALL_RETURN_FASTMEM_BOUND")) |raw| {
+        if (raw[0] == '1') I._block_jit.fastmem_bound.delta = @intFromPtr(state.mem.ptr) -% MEM_BASE;
+    };
+    defer if (has_bound) {
+        I._block_jit.fastmem_bound.delta = null;
+    };
+    // `ROSETTE_CALL_RETURN_LEAN=0`: the general memory templates
+    // (`block_jit/lean_memory.zig`) for an in-tree comparison.
+    const has_lean = @hasDecl(I._block_jit, "lean_memory");
+    if (has_lean) if (std.c.getenv("ROSETTE_CALL_RETURN_LEAN")) |raw| {
+        I._block_jit.lean_memory.enabled = raw[0] != '0';
+    };
+    defer if (has_lean) {
+        I._block_jit.lean_memory.enabled = true;
+    };
+    // `ROSETTE_CALL_RETURN_EXIT_FLAGS=0`: every exit materialises its flags
+    // (`block_jit/exit_flags.zig` off).
+    const has_exit_flags = @hasDecl(I._block_jit, "exit_flags");
+    if (has_exit_flags) if (std.c.getenv("ROSETTE_CALL_RETURN_EXIT_FLAGS")) |raw| {
+        I._block_jit.exit_flags.enabled = raw[0] != '0';
+    };
+    defer if (has_exit_flags) {
+        I._block_jit.exit_flags.enabled = true;
+    };
+    // `ROSETTE_CALL_RETURN_SPLIT=1`: every block's cold paths placed apart
+    // (`block_jit/code_layout.zig`, an offline layout).
+    if (std.c.getenv("ROSETTE_CALL_RETURN_SPLIT")) |raw| I._block_jit.code_layout.split_all = raw[0] == '1';
+    defer I._block_jit.code_layout.split_all = false;
     var result: Result = .{};
     for ([_]u64{ 2 * order_len, order_len, passes }, 0..) |rounds, phase| {
         state.regs.rip = MEM_BASE + program.start;
@@ -252,12 +294,16 @@ pub fn run(shape: Shape, passes: u64) !Result {
         const hops_before = if (jit) |j| j.native_chain_hops else 0;
         const entries_before = if (jit) |j| j.dispatch_entries else 0;
         const misses_before = if (jit) |j| j.chain_exits_miss else 0;
+        const counts_before = hostCounts();
         const started = threadCpu();
         try runTo(&state, program.exit);
         const elapsed = threadCpu() - started;
+        const counts_after = hostCounts();
         if (phase == 2) {
             const j = state.block_jit.?;
             result.cpu_ns = elapsed;
+            result.host_instructions = counts_after[0] -% counts_before[0];
+            result.host_cycles = counts_after[1] -% counts_before[1];
             result.block_executions = j.executions - executions_before;
             result.retired = j.instructions_retired - retired_before;
             result.native_hops = j.native_chain_hops - hops_before;
@@ -345,12 +391,13 @@ test "call return: per-block CPU as hot functions grow (ROSETTE_CALL_RETURN_BENC
             if (utilities * 2 > count) continue;
             const shape: Shape = .{ .functions = count, .depth = 8, .utilities = utilities, .repeat = 1, .indirect_percent = indirect };
             const r = try run(shape, 20_000);
-            std.debug.print("call_return series_pair={s} binary={s} functions={d} depth={d} utilities={d} repeat={d} indirect={d} compiled={d} block_executions={d} retired={d} cpu_ns={d} native_hops={d} dispatch_entries={d} chain_misses={d} direct_patches={d} indirect_patches={d} hot_bytes_per_block={d} context_value={d} guest_value={d} ns_per_block={d:.2}\n", .{
-                pair,                              label,           count,            shape.depth,
-                shape.utilities,                   shape.repeat,    indirect,         r.compiled,
-                r.block_executions,                r.retired,       r.cpu_ns,         r.native_hops,
-                r.dispatch_entries,                r.chain_misses,  r.direct_patches, r.indirect_patches,
-                r.hot_bytes / @max(r.compiled, 1), r.context_value, r.guest_value,    @as(f64, @floatFromInt(r.cpu_ns)) / @as(f64, @floatFromInt(@max(r.block_executions, 1))),
+            std.debug.print("call_return series_pair={s} binary={s} functions={d} depth={d} utilities={d} repeat={d} indirect={d} compiled={d} block_executions={d} retired={d} cpu_ns={d} native_hops={d} dispatch_entries={d} chain_misses={d} direct_patches={d} indirect_patches={d} hot_bytes_per_block={d} context_value={d} guest_value={d} ns_per_block={d:.2} host_per_x86={d:.2} ipc={d:.2}\n", .{
+                pair,                                                                                       label,                                                                                          count,            shape.depth,
+                shape.utilities,                                                                            shape.repeat,                                                                                   indirect,         r.compiled,
+                r.block_executions,                                                                         r.retired,                                                                                      r.cpu_ns,         r.native_hops,
+                r.dispatch_entries,                                                                         r.chain_misses,                                                                                 r.direct_patches, r.indirect_patches,
+                r.hot_bytes / @max(r.compiled, 1),                                                          r.context_value,                                                                                r.guest_value,    @as(f64, @floatFromInt(r.cpu_ns)) / @as(f64, @floatFromInt(@max(r.block_executions, 1))),
+                @as(f64, @floatFromInt(r.host_instructions)) / @as(f64, @floatFromInt(@max(r.retired, 1))), @as(f64, @floatFromInt(r.host_instructions)) / @as(f64, @floatFromInt(@max(r.host_cycles, 1))),
             });
         }
     }

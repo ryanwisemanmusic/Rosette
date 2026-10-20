@@ -29,6 +29,13 @@ const context: usize = 0x20000;
 const guest: usize = 0x30000;
 const stack_top: usize = 0x7f000;
 
+extern "c" fn thread_selfcounts(kind: c_int, buffer: *[2]u64, bytes: usize) c_int;
+fn hostCounts() [2]u64 {
+    var counts: [2]u64 = .{ 0, 0 };
+    if (thread_selfcounts(1, &counts, @sizeOf([2]u64)) != 0) return .{ 0, 0 };
+    return counts;
+}
+
 fn threadCpu() u64 {
     var stamp: std.c.timespec = undefined;
     std.debug.assert(std.c.clock_gettime(.THREAD_CPUTIME_ID, &stamp) == 0);
@@ -160,6 +167,8 @@ pub const Result = struct {
     /// Over the timed passes: hops made natively and returns to the glue.
     native_hops: u64 = 0,
     dispatch_entries: u64 = 0,
+    host_instructions: u64 = 0,
+    host_cycles: u64 = 0,
 };
 
 /// Runs `passes` passes over `count` blocks after one warm-up pass that
@@ -207,6 +216,8 @@ pub fn runOrdered(count: usize, repeat: usize, passes: u64, parallel: bool, regi
     var retired: u64 = 0;
     var native_hops: u64 = 0;
     var dispatch_entries: u64 = 0;
+    var host_instructions: u64 = 0;
+    var host_cycles: u64 = 0;
     // Pass 0 interprets and compiles; pass 1 warms the chains; then timing.
     for ([_]u64{ 2, 1, passes }, 0..) |rounds, phase| {
         state.regs.rip = start;
@@ -217,12 +228,16 @@ pub fn runOrdered(count: usize, repeat: usize, passes: u64, parallel: bool, regi
         const retired_before = if (jit) |j| j.instructions_retired else 0;
         const hops_before = if (jit) |j| j.native_chain_hops else 0;
         const entries_before = if (jit) |j| j.dispatch_entries else 0;
+        const counts_before = hostCounts();
         const started = threadCpu();
         while (state.regs.rip != MEM_BASE + exit and !state.terminated) _ = state.step();
         const elapsed = threadCpu() - started;
+        const counts_after = hostCounts();
         try t.expectEqual(@as(u64, MEM_BASE + exit), state.regs.rip);
         if (phase == 2) {
             cpu_ns = elapsed;
+            host_instructions = counts_after[0] -% counts_before[0];
+            host_cycles = counts_after[1] -% counts_before[1];
             executions = state.block_jit.?.executions - executions_before;
             retired = state.block_jit.?.instructions_retired - retired_before;
             native_hops = state.block_jit.?.native_chain_hops - hops_before;
@@ -260,6 +275,8 @@ pub fn runOrdered(count: usize, repeat: usize, passes: u64, parallel: bool, regi
         .guest_value = std.mem.readInt(u32, state.mem[guest + 0x10 ..][0..4], .big),
         .native_hops = native_hops,
         .dispatch_entries = dispatch_entries,
+        .host_instructions = host_instructions,
+        .host_cycles = host_cycles,
     };
 }
 
@@ -319,12 +336,19 @@ test "code working set: per-block CPU as the number of hot blocks grows (ROSETTE
             if (has_direct) {
                 if (std.c.getenv("ROSETTE_CODE_WORKING_SET_DIRECT")) |raw| I._block_jit.direct_links.enabled = raw[0] != '0';
             }
+            // `..._LEAN=0` / `..._EXIT_FLAGS=0`: this pass's controls off.
+            if (@hasDecl(I._block_jit, "lean_memory")) {
+                if (std.c.getenv("ROSETTE_CODE_WORKING_SET_LEAN")) |raw| I._block_jit.lean_memory.enabled = raw[0] != '0';
+            }
+            if (@hasDecl(I._block_jit, "exit_flags")) {
+                if (std.c.getenv("ROSETTE_CODE_WORKING_SET_EXIT_FLAGS")) |raw| I._block_jit.exit_flags.enabled = raw[0] != '0';
+            }
             for (0..pairs) |pair| for ([_]bool{ false, true }) |shuffled| for ([_]bool{ false, true }) |split| {
                 if (order_filter.len != 0 and !std.mem.eql(u8, order_filter, if (shuffled) "shuffled" else "sequential")) continue;
                 // The frozen tree has one layout; its split rows would repeat it.
                 if (split and (!has_layout or std.c.getenv("ROSETTE_CODE_WORKING_SET_SPLIT") == null)) continue;
                 const result = try runOrdered(count, repeat, passes, true, shape.registers_only, split, shuffled);
-                std.debug.print("code_working_set tree={s} registers_only={} repeat={d} blocks={d} pair={d} order={s} direct={} split={} passes={d} cpu_ns={d} block_executions={d} retired={d} ns_per_block={d}.{d:0>2} code_bytes_per_block={d} hot_bytes_per_block={d} cold_bytes_per_block={d} compiled={d} native_hops={d} dispatch_entries={d}\n", .{
+                std.debug.print("code_working_set tree={s} registers_only={} repeat={d} blocks={d} pair={d} order={s} direct={} split={} passes={d} cpu_ns={d} block_executions={d} retired={d} ns_per_block={d}.{d:0>2} code_bytes_per_block={d} hot_bytes_per_block={d} cold_bytes_per_block={d} compiled={d} native_hops={d} dispatch_entries={d} host_per_block={d} ipc_x100={d}\n", .{
                     if (has_layout) "current" else "before",
                     shape.registers_only,
                     repeat,
@@ -345,6 +369,8 @@ test "code working set: per-block CPU as the number of hot blocks grows (ROSETTE
                     result.compiled,
                     result.native_hops,
                     result.dispatch_entries,
+                    result.host_instructions / @max(result.block_executions, 1),
+                    result.host_instructions * 100 / @max(result.host_cycles, 1),
                 });
             };
         }

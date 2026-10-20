@@ -5683,5 +5683,8 @@ test {
     _ = @import("process/tests/call_return.zig");
     _ = @import("process/tests/indirect_links.zig");
     _ = @import("process/tests/xbox_cs_completion.zig");
+    _ = @import("process/impl/worker_runtime_pulse.zig");
+    _ = @import("process/impl/host_counters.zig");
+    _ = @import("process/tests/exit_flags.zig");
     _ = @import("block_jit/tests.zig");
 }

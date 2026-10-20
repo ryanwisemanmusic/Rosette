@@ -77,6 +77,10 @@ const ordered_lanes = @import("ordered_lanes.zig");
 const self_loops = @import("self_loops.zig");
 const direct_links = @import("direct_links.zig");
 const indirect_links = @import("indirect_links.zig");
+const fastmem_bound = @import("fastmem_bound.zig");
+const lean_memory = @import("lean_memory.zig");
+const exit_flags = @import("exit_flags.zig");
+const exit_flag_offsets: exit_flags.Offsets = .{ .kind = scratch_flag_kind_offset, .a = scratch_flag_a_offset, .r = scratch_flag_r_offset, .helper = helper_flags_offset, .scratch = r_scratch, .helpers = r_helpers, .state = r_state };
 const chain_layout = @import("chain_layout.zig");
 const register_cache = @import("register_cache.zig");
 const atomic_retry = @import("atomic_retry_yield.zig");
@@ -1237,7 +1241,7 @@ const RFL_ZF: u32 = x64_decoder.RFL_ZF;
 const RFL_SF: u32 = x64_decoder.RFL_SF;
 const RFL_OF: u32 = x64_decoder.RFL_OF;
 
-fn bits(size: Size) u7 {
+pub fn bits(size: Size) u7 {
     return switch (size) {
         .bits8 => 8,
         .bits16 => 16,
@@ -1246,7 +1250,7 @@ fn bits(size: Size) u7 {
     };
 }
 
-fn maskFor(size: Size) u64 {
+pub fn maskFor(size: Size) u64 {
     return switch (size) {
         .bits8 => 0xFF,
         .bits16 => 0xFFFF,
@@ -1255,7 +1259,7 @@ fn maskFor(size: Size) u64 {
     };
 }
 
-fn arm(size: Size) a64.Width {
+pub fn arm(size: Size) a64.Width {
     return if (size == .bits64) .x64 else .w32;
 }
 
@@ -1307,10 +1311,10 @@ const ArithKind = enum { add, sub, logic };
 /// Until then the eager path is both faster and simpler, and everything the
 /// deferred path needs is still here behind this.
 const defer_flags = false;
-const BinaryOp = enum { add, sub, bit_and, bit_or, bit_xor, cmp, tst, adc, sbb };
+pub const BinaryOp = enum { add, sub, bit_and, bit_or, bit_xor, cmp, tst, adc, sbb };
 
 /// Where a Group-1 instruction's operands live.
-const BinaryShape = enum {
+pub const BinaryShape = enum {
     /// dst register, src register.
     reg_reg,
     /// dst register, immediate.
@@ -1323,7 +1327,7 @@ const BinaryShape = enum {
     mem_imm,
 };
 
-fn binaryOpOf(op: Op) ?BinaryOp {
+pub fn binaryOpOf(op: Op) ?BinaryOp {
     return switch (op) {
         .add_reg8_reg8, .add_reg16_reg16, .add_reg32_reg32, .add_reg64_reg64, .add_reg8_imm8, .add_reg16_imm8, .add_reg32_imm8, .add_reg64_imm8, .add_reg16_imm32, .add_reg32_imm32, .add_reg64_imm32, .add_accum_imm => .add,
         .add_reg8_mem8, .add_reg16_mem16, .add_reg32_mem32, .add_reg64_mem64, .add_mem8_reg8, .add_mem16_reg16, .add_mem32_reg32, .add_mem64_reg64, .add_mem8_imm8, .add_mem16_imm8, .add_mem32_imm8, .add_mem64_imm8, .add_mem16_imm32, .add_mem32_imm32, .add_mem64_imm32 => .add,
@@ -1347,7 +1351,7 @@ fn binaryOpOf(op: Op) ?BinaryOp {
     };
 }
 
-fn binaryShapeOf(op: Op) BinaryShape {
+pub fn binaryShapeOf(op: Op) BinaryShape {
     return switch (op) {
         .add_reg8_mem8, .add_reg16_mem16, .add_reg32_mem32, .add_reg64_mem64, .sub_reg8_mem8, .sub_reg16_mem16, .sub_reg32_mem32, .sub_reg64_mem64, .and_reg8_mem8, .and_reg16_mem16, .and_reg32_mem32, .and_reg64_mem64, .or_reg8_mem8, .or_reg16_mem16, .or_reg32_mem32, .or_reg64_mem64, .xor_reg8_mem8, .xor_reg16_mem16, .xor_reg32_mem32, .xor_reg64_mem64, .cmp_reg8_mem8, .cmp_reg16_mem16, .cmp_reg32_mem32, .cmp_reg64_mem64, .adc_reg8_mem8, .adc_reg16_mem16, .adc_reg32_mem32, .adc_reg64_mem64, .sbb_reg8_mem8, .sbb_reg16_mem16, .sbb_reg32_mem32, .sbb_reg64_mem64 => .reg_mem,
         .add_mem8_reg8, .add_mem16_reg16, .add_mem32_reg32, .add_mem64_reg64, .sub_mem8_reg8, .sub_mem16_reg16, .sub_mem32_reg32, .sub_mem64_reg64, .and_mem8_reg8, .and_mem16_reg16, .and_mem32_reg32, .and_mem64_reg64, .or_mem8_reg8, .or_mem16_reg16, .or_mem32_reg32, .or_mem64_reg64, .xor_mem8_reg8, .xor_mem16_reg16, .xor_mem32_reg32, .xor_mem64_reg64, .cmp_mem8_reg8, .cmp_mem16_reg16, .cmp_mem32_reg32, .cmp_mem64_reg64, .test_mem8_reg8, .test_mem16_reg16, .test_mem32_reg32, .test_mem64_reg64, .adc_mem8_reg8, .adc_mem16_reg16, .adc_mem32_reg32, .adc_mem64_reg64, .sbb_mem8_reg8, .sbb_mem16_reg16, .sbb_mem32_reg32, .sbb_mem64_reg64 => .mem_reg,
@@ -1381,7 +1385,7 @@ fn immediateShapeOf(op: Op) ImmediateShape {
 }
 
 /// The immediate as the interpreter arm sees it.
-fn immediateValue(d: DecodedInsn) u64 {
+pub fn immediateValue(d: DecodedInsn) u64 {
     return switch (immediateShapeOf(d.op)) {
         .imm8 => if (d.size == .bits8) d.imm & 0xFF else signExtendImm8(d.imm),
         .imm32, .test_imm => immForSize(d.imm, d.size),
@@ -1389,7 +1393,7 @@ fn immediateValue(d: DecodedInsn) u64 {
     };
 }
 
-fn isIncDec(op: Op) ?struct { inc: bool, mem: bool } {
+pub fn isIncDec(op: Op) ?struct { inc: bool, mem: bool } {
     return switch (op) {
         .inc_reg8, .inc_reg16, .inc_reg32, .inc_reg64 => .{ .inc = true, .mem = false },
         .dec_reg8, .dec_reg16, .dec_reg32, .dec_reg64 => .{ .inc = false, .mem = false },
@@ -1399,7 +1403,7 @@ fn isIncDec(op: Op) ?struct { inc: bool, mem: bool } {
     };
 }
 
-fn incDecSize(op: Op) Size {
+pub fn incDecSize(op: Op) Size {
     return switch (op) {
         .inc_reg8, .dec_reg8, .inc_mem8, .dec_mem8 => .bits8,
         .inc_reg16, .dec_reg16, .inc_mem16, .dec_mem16 => .bits16,
@@ -1478,7 +1482,7 @@ pub fn flagEffects(insn: Insn) FlagEffects {
         return switch (op) {
             .add, .sub, .cmp => .{ .writes = F_ALL, .kills = F_ALL },
             .adc, .sbb => .{ .reads = F_CF, .writes = F_ALL, .kills = F_ALL },
-            .bit_and, .bit_or, .bit_xor, .tst => .{ .writes = F_ALL & ~F_AF, .kills = F_ALL & ~F_AF },
+            .bit_and, .bit_or, .bit_xor, .tst => .{ .writes = F_ALL, .kills = F_ALL },
         };
     }
     if (isIncDec(d.op)) |_| return .{ .writes = F_ALL & ~F_CF, .kills = F_ALL & ~F_CF };
@@ -2530,7 +2534,8 @@ const Compiler = struct {
     /// re-arms it *after* calling this.
     fn storeFlags(self: *Compiler, src: a64.Reg) Error!void {
         try self.emitChecked(a64.strImm(.word, src, r_regs, rflags_offset));
-        try self.emitChecked(a64.strImm(.byte, a64.wzr, r_scratch, scratch_flag_kind_offset));
+        // Only a deferring compiler ever arms the record; otherwise it is never pending.
+        if (defer_flags) try self.emitChecked(a64.strImm(.byte, a64.wzr, r_scratch, scratch_flag_kind_offset));
         self.pending_record = 0;
     }
 
@@ -2540,8 +2545,8 @@ const Compiler = struct {
         const owned: u8 = switch (kind) {
             .none => 0,
             .add, .sub => F_ALL,
-            // `applyLogic` leaves AF alone, so the record does not own it.
-            .logic => F_ALL & ~F_AF,
+            // `applyLogic` clears AF, so the record owns all six.
+            .logic => F_ALL,
         };
         // Whatever was computed eagerly is already right in `rflags`, so the
         // record only owes the rest. Without this every reader of a flag the
@@ -2741,7 +2746,9 @@ const Compiler = struct {
         // epilogue is about to reload anyway.
         try self.emit(a64.mov(.x64, r_spare, 0));
         try self.emit(a64.mov(.x64, 0, r_state));
-        try self.emitCallHelper(helper_flags_offset);
+        // Bare: a failed direct entry (`unloaded`) never loaded this block's cache (`exit_flags.zig`).
+        try self.emitChecked(a64.ldrImm(.doubleword, t0, r_helpers, helper_flags_offset));
+        try self.emit(a64.blr(t0));
         try self.emit(a64.mov(.x64, 0, r_spare));
     }
 
@@ -2842,7 +2849,7 @@ const Compiler = struct {
         const w = bits(size);
         const written: u32 = switch (kind) {
             .add, .sub => RFL_CF | RFL_PF | RFL_AF | RFL_ZF | RFL_SF | RFL_OF,
-            .logic => RFL_CF | RFL_PF | RFL_ZF | RFL_SF | RFL_OF,
+            .logic => RFL_CF | RFL_PF | RFL_AF | RFL_ZF | RFL_SF | RFL_OF,
         };
         const mask: u32 = written & liveFlagBits(live);
         if (mask == 0) return;
@@ -2906,6 +2913,7 @@ const Compiler = struct {
     /// `dst = ` the effective address of the instruction's memory operand,
     /// as `resolveMemoryAddress` computes it from the live register file.
     fn emitEffectiveAddress(self: *Compiler, dst: a64.Reg, insn: Insn) Error!void {
+        if (try lean_memory.effectiveAddress(self, dst, insn)) return;
         const d = insn.decoded;
         var displacement: u64 = d.addr;
         if (d.rip_relative) displacement +%= insn.rip +% d.len;
@@ -2946,7 +2954,7 @@ const Compiler = struct {
     }
 
     /// The host register caching guest `id` whole, for an address.
-    fn cachedRegister(self: *const Compiler, id: RegId) ?a64.Reg {
+    pub fn cachedRegister(self: *const Compiler, id: RegId) ?a64.Reg {
         const slot = self.cache_slot[@intFromEnum(id)] orelse return null;
         return cache_host_regs[slot];
     }
@@ -3029,6 +3037,7 @@ const Compiler = struct {
     /// writes a delta - other threads only retire tags - so the pair read is
     /// either the entry's valid tag with its valid delta, or a miss.
     fn emitTlbProbe(self: *Compiler, is_write: bool, access_bytes: u64, alignment_guarded: bool, slow: Label) Error!void {
+        if (fastmem_bound.delta != null) return fastmem_bound.emit(self, t2, t4, r_tlb, slow);
         try self.emit(a64.lsrImm(.x64, t2, 1, Tlb.page_shift));
         try self.emit(a64.logicalShifted(.x64, .eor, t3, t2, t2, Tlb.fold_shift) | (0b01 << 22)); // eor t3, t2, t2, lsr #fold
         try self.emit(a64.logicalImmediate(.x64, .andop, t3, t3, Tlb.entries - 1).?);
@@ -3657,9 +3666,13 @@ const Compiler = struct {
                 try self.a.branchIfNonZero(.x64, t5, miss);
             }
             try self.emit(a64.mov(.x64, hoist_hosts[slot], t4));
-            try self.a.branch(done);
+            // A miss is out of line: the hot path runs straight on.
+            const section = self.a.section;
+            self.a.section = .cold;
             self.a.placeLabel(miss);
             try self.emit(a64.mov(.x64, hoist_hosts[slot], 31));
+            try self.a.branch(done);
+            self.a.section = section;
             self.a.placeLabel(done);
             hoist.live = true;
         }
@@ -3957,7 +3970,7 @@ const Compiler = struct {
         for (self.fused_exits.items) |exit| {
             self.a.placeLabel(exit.label);
             if (exit.retry_yield) try self.emit(a64.yieldHint());
-            try self.emitFusedFlags(exit.fused, exit.owed);
+            if (exit_flags.deferrable(self, exit.fused, exit.owed)) try exit_flags.emitRecord(self, exit.fused, exit_flag_offsets) else try self.emitFusedFlags(exit.fused, exit.owed);
             try self.a.branch(exit.stub);
         }
     }
@@ -4124,12 +4137,12 @@ const Compiler = struct {
     /// form comes here, so a block that hoisted `rsi` for its context
     /// stores through it too; `mov [rsi+d], reg` and `setcc [rsi+d]` used to
     /// probe the write TLB again each time.
-    fn emitStoreX3(self: *Compiler, insn: Insn, size: Size, index: u32) Error!void {
+    pub fn emitStoreX3(self: *Compiler, insn: Insn, size: Size, index: u32) Error!void {
         return self.emitStoreX3Last(insn, size, index, false);
     }
 
     /// `emitStoreX3` for a store that is its instruction's last effect.
-    fn emitStoreX3Last(self: *Compiler, insn: Insn, size: Size, index: u32, last_effect: bool) Error!void {
+    pub fn emitStoreX3Last(self: *Compiler, insn: Insn, size: Size, index: u32, last_effect: bool) Error!void {
         if (self.hoistedOffset(insn, size)) |offset| {
             if (self.hoists[offset.slot].write) {
                 try self.emitHoistedAccessAborting(insn, size, index, offset, true, last_effect);
@@ -4211,6 +4224,7 @@ const Compiler = struct {
                 return .native;
             }
         }
+        if (try lean_memory.emit(self, insn, index)) return .native;
         if (binaryOpOf(d.op)) |op| {
             try self.emitGroup1(op, insn, index);
             return .native;
@@ -4693,7 +4707,8 @@ const Compiler = struct {
                     if (fused.remaining == 1) {
                         self.fused = null;
                         self.nzcv_live = false;
-                        try self.emitFusedFlags(fused, fused.writes & self.flag_live_fall[index]);
+                        const owed_fall = fused.writes & self.flag_live_fall[index];
+                        if (exit_flags.finalEdge(self.insns, index) and exit_flags.deferrable(self, fused, owed_fall)) try exit_flags.emitRecord(self, fused, exit_flag_offsets) else try self.emitFusedFlags(fused, owed_fall);
                     } else {
                         var rest = fused;
                         rest.remaining -= 1;
@@ -7888,6 +7903,7 @@ fn emitBlock(
     // register cache is loaded *after* this point, because a chained block
     // has to load its own cache just as an entered one does.
     const chain_entry_bytes: u32 = @intCast(assembler.words.items.len * @sizeOf(u32));
+    try exit_flags.emitEntry(assembler, if (live_in.len != 0) live_in[0] else F_ALL, exit_flag_offsets);
     if (options.entry_gate != 0) {
         // Nothing but the frame is live yet, and the register file is
         // current: the helper may rewrite it before the cache is loaded.

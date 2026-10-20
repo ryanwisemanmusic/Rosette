@@ -1805,7 +1805,7 @@ pub fn bindBlockJitRegisterFile(self: *ElfState) *__process_block_jit.Scratch {
     scratch.xmm_file = @intFromPtr(process_impl_lifecycle.guestContextField(self, "xmm"));
     scratch.ymm_hi_file = @intFromPtr(process_impl_lifecycle.guestContextField(self, "ymm_hi"));
     scratch.zmm_hi_file = @intFromPtr(process_impl_lifecycle.guestContextField(self, "zmm_hi"));
-    scratch.tlb_file = @intFromPtr(activeBlockJitTlb(self));
+    scratch.tlb_file = __process_block_jit.fastmem_bound.delta orelse @intFromPtr(activeBlockJitTlb(self));
     return scratch;
 }
 

@@ -3,6 +3,14 @@ const f = @import("tests.zig");
 const std = @import("std");
 const t = std.testing;
 const decoder = core._test_api._x64_decoder;
+const Insn = core._test_api._Insn;
+const DecodedInsn = core._test_api._DecodedInsn;
+const flagLiveness = core._test_api._flagLiveness;
+const F_CF = core._test_api._F_CF;
+const F_AF = core._test_api._F_AF;
+const F_ALL = core._test_api._F_ALL;
+const RFL_AF = core._test_api._RFL_AF;
+const RFL_CF = core._test_api._RFL_CF;
 
 fn equal(a: *f.TestState, b: *f.TestState) !void {
     try t.expectEqualDeep(a.regs, b.regs);
@@ -19,6 +27,49 @@ const forms = [_]core.Op{ .add_reg32_reg32, .add_reg64_reg64, .sub_reg32_reg32, 
 fn insn(op: core.Op, dst: core.RegId, src: core.RegId) core.DecodedInsn {
     return .{ .op = op, .size = if (op == .add_reg32_reg32 or op == .sub_reg32_reg32 or op == .cmp_reg32_reg32) .bits32 else .bits64, .dst_reg = dst, .src_reg = src };
 }
+fn regReg(op: core.Op, size: core.Size, dst: core.RegId, src: core.RegId) core.DecodedInsn {
+    return .{ .op = op, .size = size, .dst_reg = dst, .src_reg = src, .is_reg_form = true };
+}
+
+test "flag liveness keeps a flag its writer does not kill" {
+    // `inc` leaves CF alone, so the earlier `add` must still compute it.
+    var insns: [2]Insn = undefined;
+    var add_insn = regReg(.add_reg64_reg64, .bits64, .al_ax_eax_rax, .bl_bx_ebx_rbx);
+    add_insn.len = 3;
+    insns[0] = .{ .rip = 0x2000, .len = 3, .decoded = add_insn, .segment = .ds };
+    var inc_insn = DecodedInsn{ .op = .inc_reg64, .size = .bits64, .dst_reg = .cl_cx_ecx_rcx, .is_reg_form = true };
+    inc_insn.len = 3;
+    insns[1] = .{ .rip = 0x2003, .len = 3, .decoded = inc_insn, .segment = .ds };
+
+    var wants: [2]bool = undefined;
+    var live: [2]u8 = undefined;
+    _ = flagLiveness(&insns, &wants, &live);
+    try t.expectEqual(F_CF, live[0] & F_CF);
+    try t.expectEqual(@as(u8, 0), live[0] & F_AF);
+    try t.expectEqual(F_ALL, live[1]);
+}
+
+test "flag liveness: a logic operation writes all six flags and clears AF" {
+    // `and` clears the auxiliary carry (architecturally undefined), so it
+    // kills every flag and the `add` before it owes none.
+    var insns: [2]Insn = undefined;
+    var add_insn = regReg(.add_reg64_reg64, .bits64, .al_ax_eax_rax, .bl_bx_ebx_rbx);
+    add_insn.len = 3;
+    insns[0] = .{ .rip = 0x2000, .len = 3, .decoded = add_insn, .segment = .ds };
+    var and_insn = regReg(.and_reg64_reg64, .bits64, .cl_cx_ecx_rcx, .dl_dx_edx_rdx);
+    and_insn.len = 3;
+    insns[1] = .{ .rip = 0x2003, .len = 3, .decoded = and_insn, .segment = .ds };
+
+    var wants: [2]bool = undefined;
+    var live: [2]u8 = undefined;
+    _ = flagLiveness(&insns, &wants, &live);
+    try t.expectEqual(@as(u8, 0), live[0]);
+    try t.expectEqual(F_ALL, live[1]);
+    var flags: u32 = 0x2 | RFL_AF | RFL_CF;
+    decoder.applyLogic(&flags, 0x10, .bits64);
+    try t.expectEqual(@as(u32, 0), flags & (RFL_AF | RFL_CF));
+}
+
 test "arithmetic throughput agrees with decoder oracle for edge random aliases and untouched flags" {
     const values = [_]u64{ 0, 1, 15, 16, 127, 128, 255, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 0x7FFFFFFFFFFFFFFF, 0x8000000000000000, 0xFFFFFFFFFFFFFFFF };
     var rng = std.Random.DefaultPrng.init(0xADDF1A6);
