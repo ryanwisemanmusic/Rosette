@@ -37,7 +37,9 @@ pub fn observe(state_ptr: *anyopaque, target: u64, return_rip: u64) callconv(.c)
     if (!self.parallel_guest_execution or !self.windows_runtime_enabled or
         self.trace_calls or self.block_jit_transfer_traced or tracingActive(self) or
         self.call_probes.armed()) return @intFromEnum(Outcome.decline);
-    const api = self.xbox_critical_section_hooks.at(target) orelse return @intFromEnum(Outcome.decline);
+    // Every call to a target outside Xenia's code cache asks here, so a
+    // Vulkan command thunk can be answered in place too.
+    const api = self.xbox_critical_section_hooks.at(target) orelse return @import("vulkan_call_lane.zig").transfer(self, target, return_rip);
     if (api != .enter and api != .leave) return @intFromEnum(Outcome.decline);
 
     if (guest_diagnostics.isGuestMilestoneAddress(self, target)) {

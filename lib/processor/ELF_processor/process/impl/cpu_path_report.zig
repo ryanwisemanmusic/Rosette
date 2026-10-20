@@ -9,4 +9,5 @@ pub fn report(state: anytype) void {
     @import("operand_report.zig").report(state);
     @import("guest_register_writes.zig").report(state);
     @import("stdio_flush_report.zig").report(state);
+    @import("vulkan_call_lane.zig").report(state);
 }

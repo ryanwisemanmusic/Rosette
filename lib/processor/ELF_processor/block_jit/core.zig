@@ -132,10 +132,9 @@ pub const Helpers = extern struct {
     /// not force a hot indirect transfer through the interpreter forever.
     /// Returns 1 only when the current runtime still owns this exact target.
     hooked_transfer: *const fn (state: *anyopaque, target: u64) callconv(.c) u8,
-    /// Observe a call into a pinned Xbox critical-section trampoline without
-    /// running the general instruction interpreter. Returns 1 only when
-    /// call-side observations were recorded and the normal step hook may
-    /// consume the transfer.
+    /// A call to a target outside Xenia's code cache: 1 when an Xbox
+    /// critical-section call was observed for the step hook, 2 when the call
+    /// (that or a Vulkan command thunk) ran in place, 0 to interpret it.
     xbox_critical_section_transfer: *const fn (state: *anyopaque, target: u64, return_rip: u64) callconv(.c) u32,
     /// A `call [slot]` or `jmp [slot]` through an import address table slot,
     /// answered on one of the runtime's lock-free import lanes without
@@ -3423,28 +3422,26 @@ const Compiler = struct {
         // bootstrap/unpublished case; a known out-of-range target can go
         // straight to the interpreter-owned transfer path.
         self.a.placeLabel(external_outside_published_range);
-        // Kernel trampolines are outside Xenia's generated-code cache. Keep
-        // this exact check on that cold range-refusal edge so the common
-        // code-cache transfer path pays no additional comparisons.
-        if (self.xbox_critical_section_transfer_enabled) {
-            try self.emitStateScalar(.doubleword, t0, self.layout.xbox_critical_section_enter_offset);
-            try self.emit(a64.cmp(.x64, reg, t0));
-            try self.a.branchCond(.eq, xbox_critical_section);
-            try self.emitStateScalar(.doubleword, t0, self.layout.xbox_critical_section_leave_offset);
-            try self.emit(a64.cmp(.x64, reg, t0));
-            try self.a.branchCond(.eq, xbox_critical_section);
-        }
-        try self.a.branch(slow);
+        // Kernel trampolines and Vulkan proc thunks are outside Xenia's
+        // generated-code cache: on this cold edge a call asks the transfer
+        // helper, which completes critical sections and command recording
+        // in place (`vulkan_call_lane.zig`) and declines the rest unchanged.
+        try self.a.branch(if (self.xbox_critical_section_transfer_enabled and call_return_rip != null) xbox_critical_section else slow);
 
         self.a.placeLabel(external_unmapped);
         try self.emitChecked(a64.strImm(.doubleword, reg, r_scratch, scratch_transfer_target_offset));
         try self.emit(a64.mov(.x64, 0, r_state));
         try self.emitChecked(a64.ldrImm(.doubleword, 1, r_scratch, scratch_transfer_target_offset));
         try self.emitCallHelper(helper_mapped_transfer_offset);
-        try self.a.branchIfZero(.w32, 0, slow);
+        const refused = try self.a.createLabel();
+        try self.a.branchIfZero(.w32, 0, refused);
         try self.emitChecked(a64.ldrImm(.doubleword, reg, r_scratch, scratch_transfer_target_offset));
         self.a.placeLabel(checked);
         try self.a.branch(continue_checked);
+        // Not Xenia's code: a call asks the transfer helper, as above.
+        self.a.placeLabel(refused);
+        try self.emitChecked(a64.ldrImm(.doubleword, reg, r_scratch, scratch_transfer_target_offset));
+        try self.a.branch(if (self.xbox_critical_section_transfer_enabled and call_return_rip != null) xbox_critical_section else slow);
 
         self.a.placeLabel(xbox_critical_section);
         if (call_return_rip) |return_rip| {

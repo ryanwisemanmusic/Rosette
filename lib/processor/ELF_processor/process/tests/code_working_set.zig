@@ -29,6 +29,9 @@ const context: usize = 0x20000;
 const guest: usize = 0x30000;
 const stack_top: usize = 0x7f000;
 
+/// See `emitShuffled`.
+var jitter = false;
+
 extern "c" fn thread_selfcounts(kind: c_int, buffer: *[2]u64, bytes: usize) c_int;
 fn hostCounts() [2]u64 {
     var counts: [2]u64 = .{ 0, 0 };
@@ -103,6 +106,18 @@ fn emitShuffled(mem: []u8, count: usize, repeat: usize, registers_only: bool) us
         for (0..repeat) |_| {
             @memcpy(mem[at..][0..shape.len], shape);
             at += shape.len;
+        }
+        // `ROSETTE_CODE_WORKING_SET_JITTER=1`: 0-8 `lea r11,[r11+1]` per
+        // block, so blocks differ in size as live ones do. Identical blocks
+        // sit at one stride, and every structure indexed by low address
+        // bits then sees the same bits in every block.
+        if (jitter) {
+            const fillers = (index *% 0x9E3779B1 >> 11) % 9;
+            for (0..fillers) |_| {
+                std.debug.assert(at + 4 + 14 <= address(index) + stride);
+                mem[at..][0..4].* = .{ 0x4D, 0x8D, 0x5B, 0x01 };
+                at += 4;
+            }
         }
         const shuffled_next = if (position[index] + 1 < count) address(order[position[index] + 1]) else tail;
         const sequential_next = if (index + 1 < count) address(index + 1) else tail;
@@ -332,6 +347,7 @@ test "code working set: per-block CPU as the number of hot blocks grows (ROSETTE
             // `ROSETTE_CODE_WORKING_SET_ORDER=sequential|shuffled` keeps one
             // order; `..._SPLIT=1` adds the offline split layout;
             // `..._DIRECT=0` turns direct links off (`direct_links.zig`).
+            jitter = std.c.getenv("ROSETTE_CODE_WORKING_SET_JITTER") != null;
             const order_filter = if (std.c.getenv("ROSETTE_CODE_WORKING_SET_ORDER")) |raw| std.mem.sliceTo(raw, 0) else "";
             if (has_direct) {
                 if (std.c.getenv("ROSETTE_CODE_WORKING_SET_DIRECT")) |raw| I._block_jit.direct_links.enabled = raw[0] != '0';
@@ -348,8 +364,9 @@ test "code working set: per-block CPU as the number of hot blocks grows (ROSETTE
                 // The frozen tree has one layout; its split rows would repeat it.
                 if (split and (!has_layout or std.c.getenv("ROSETTE_CODE_WORKING_SET_SPLIT") == null)) continue;
                 const result = try runOrdered(count, repeat, passes, true, shape.registers_only, split, shuffled);
-                std.debug.print("code_working_set tree={s} registers_only={} repeat={d} blocks={d} pair={d} order={s} direct={} split={} passes={d} cpu_ns={d} block_executions={d} retired={d} ns_per_block={d}.{d:0>2} code_bytes_per_block={d} hot_bytes_per_block={d} cold_bytes_per_block={d} compiled={d} native_hops={d} dispatch_entries={d} host_per_block={d} ipc_x100={d}\n", .{
+                std.debug.print("code_working_set tree={s} jitter={} registers_only={} repeat={d} blocks={d} pair={d} order={s} direct={} split={} passes={d} cpu_ns={d} block_executions={d} retired={d} ns_per_block={d}.{d:0>2} code_bytes_per_block={d} hot_bytes_per_block={d} cold_bytes_per_block={d} compiled={d} native_hops={d} dispatch_entries={d} host_per_block={d} ipc_x100={d}\n", .{
                     if (has_layout) "current" else "before",
+                    jitter,
                     shape.registers_only,
                     repeat,
                     count,

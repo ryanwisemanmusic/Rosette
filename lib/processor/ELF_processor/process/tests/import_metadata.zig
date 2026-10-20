@@ -171,11 +171,18 @@ const Sink = struct {
     fn dispatch(context: ?*anyopaque, state_ptr: *anyopaque, name: [*]const u8, length: usize, direct: u64, is_direct: c_int) callconv(.c) c_int {
         const sink: *Sink = @ptrCast(@alignCast(context.?));
         const s: *process.ElfState = @ptrCast(@alignCast(state_ptr));
-        std.debug.assert(std.mem.eql(u8, name[0..length], "vkCmdDraw") and is_direct == 0 and direct == 0);
+        std.debug.assert(std.mem.eql(u8, name[0..length], "vkCmdDraw"));
+        const return_rip = if (is_direct != 0) blk: {
+            std.debug.assert(direct == code + 3 or direct == code + 6);
+            break :blk direct;
+        } else blk: {
+            std.debug.assert(direct == 0);
+            break :blk s.pop();
+        };
         const regs = life.guestContextField(s, "regs");
         sink.calls += 1;
         sink.checksum +%= regs.rcx ^ regs.rdx ^ regs.r8 ^ regs.r9;
-        regs.rip = s.pop();
+        regs.rip = return_rip;
         return 1;
     }
 };
@@ -208,7 +215,12 @@ fn run(s: *process.ElfState, target: u64, memory: bool, count: u64, sink: *Sink)
     try t.expectEqual(base + 0x80000, s.regs.rsp);
     try t.expectEqual(@as(u64, 0), s.regs.rbx);
     try t.expectEqual(@as(u64, 0x246), s.regs.rflags);
-    try t.expectEqual(@as(u64, 4) * count + 1, retired); // final compiled JMP self
+    // The translated Vulkan call lane completes some calls in place, so
+    // those iterations do not step the synthetic import-thunk return. The
+    // ordinary thunk route retires that additional step.
+    const minimum_retired = 3 * count + 1;
+    const maximum_retired = 4 * count + 1;
+    try t.expect(retired >= minimum_retired and retired <= maximum_retired);
     try t.expectEqual(xmm, s.xmm);
     try t.expectEqual(ymm, s.ymm_hi);
     try t.expectEqual(zmm, s.zmm_hi);

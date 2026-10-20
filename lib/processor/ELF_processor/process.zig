@@ -4934,6 +4934,7 @@ const GuestMilestoneActivity = struct { hits: u64, last_step: u64, armed: bool }
 /// Narrow bridge for the split process implementation modules.
 pub const __ProcessInternals = struct {
     pub const _register_import = @import("process/impl/register_import.zig");
+    pub const _vulkan_call_lane = @import("process/impl/vulkan_call_lane.zig");
     pub const _PauseOptions = @import("process/pause_options.zig").Options;
     pub const _AUDIO_STAGE_COUNT = AUDIO_STAGE_COUNT;
     pub const _BLOCK_JIT_CHAIN_BLOCKS = BLOCK_JIT_CHAIN_BLOCKS;
@@ -5685,6 +5686,7 @@ test {
     _ = @import("process/tests/xbox_cs_completion.zig");
     _ = @import("process/impl/worker_runtime_pulse.zig");
     _ = @import("process/impl/host_counters.zig");
+    _ = @import("process/impl/vulkan_call_lane.zig");
     _ = @import("process/tests/exit_flags.zig");
     _ = @import("block_jit/tests.zig");
 }
