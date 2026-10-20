@@ -3,7 +3,7 @@ const std = @import("std");
 const P = @import("elf_processor_state");
 const State = P.ElfState;
 const Bridge = @import("windows_guest_forwarder").Bridge;
-const route = @import("windows_guest_forwarder").route_metadata;
+const route = @import("windows_guest_forwarder").route_memo;
 const t = std.testing;
 fn cpu() u64 {
     var value: std.c.timespec = undefined;
@@ -67,7 +67,8 @@ test "PE Vulkan immutable route comparison through full adapter (ROSETTE_VULKAN_
             try t.expectEqual(stack, s.regs.rsp);
             try t.expectEqual(@as(u64, 0xA47), s.regs.rflags);
             try t.expectEqual(@as(u64, 0x9876), s.regs.rip);
-            try t.expectEqual(if (enabled and update) n else 0, bridge.route_facts.hits);
+            // Commands too: every name derives its route once (`route_memo.zig`).
+            try t.expectEqual(if (enabled) n else 0, bridge.route_facts.hits);
             if (bench) std.debug.print("routing kind=route_{s} pair={d} enabled={} operations={d} cpu_ns={d} hits={d}\n", .{ if (update) "update" else "draw", pair, enabled, n, ns, bridge.route_facts.hits });
         };
     }

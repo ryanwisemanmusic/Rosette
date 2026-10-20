@@ -274,6 +274,12 @@ fn native(group: u64, index: u64) u64 {
 
 /// Build the PE state, the bridge and the forwarder's native identities, and
 /// lay out `draws` draws of the eight-draw pattern as guest command records.
+/// Publish a Xenia code-cache interval, as a live run does once Xenia has
+/// mapped its code cache: calls to the thunks then leave through the
+/// published-range edge of the translated call (`block_jit/core.zig`)
+/// rather than the bootstrap one.
+var publish_code_cache = false;
+
 pub fn create(draws: usize) !Fixture {
     const s = try t.allocator.create(State);
     s.* = State.init(t.allocator);
@@ -285,6 +291,10 @@ pub fn create(draws: usize) !Fixture {
     s.guest_clock.source = .host_monotonic;
     s.image_low = base;
     s.image_high = code + 0x400;
+    if (publish_code_cache) {
+        s.block_jit_code_cache_guest_low = base + 0x7000_0000;
+        s.block_jit_code_cache_guest_high = base + 0x7001_0000;
+    }
 
     const bridge = try t.allocator.create(Bridge);
     bridge.* = .{};
@@ -293,7 +303,9 @@ pub fn create(draws: usize) !Fixture {
     f.guest_libraries[0] = .{ .token = 1, .virtual_vulkan = true };
     f.real_vulkan.device = @ptrFromInt(device);
     f.vulkan_async_command_worker_decided = true;
-    f.vulkan_async_command_worker_enabled = true;
+    // `ROSETTE_DRAW_STREAM_SYNC=1`: every command runs on the calling thread,
+    // so a timing is the caller's route alone, not its race with the worker.
+    f.vulkan_async_command_worker_enabled = std.c.getenv("ROSETTE_DRAW_STREAM_SYNC") == null;
     const rv = &f.real_vulkan;
     rv.command_buffer_map[0] = .{ .synthetic = command_buffer, .real = native_command_buffer };
     for (0..pipeline_count + compute_count) |i| rv.pipeline_map[i] = .{ .synthetic = handle(1, i), .real = native(1, i) };
@@ -460,7 +472,7 @@ pub fn run(fixture: *Fixture, passes: u64) !Run {
 
 /// The internal controls this replay compares; `false` is the original
 /// implementation of each.
-pub const Control = enum { fifo_handoff, pipeline_memo, trace_setting, scratch_slots, duration_clocks, vulkan_stub_early_out };
+pub const Control = enum { fifo_handoff, pipeline_memo, trace_setting, scratch_slots, duration_clocks, vulkan_stub_early_out, vulkan_call_lane, route_memo };
 
 pub fn setControl(control: Control, on: bool) void {
     switch (control) {
@@ -473,6 +485,8 @@ pub fn setControl(control: Control, on: bool) void {
             P.__ProcessInternals._concurrency.duration_clock.enabled = on;
         },
         .vulkan_stub_early_out => P.__ProcessInternals._register_import.vulkan_stub_early_out = on,
+        .vulkan_call_lane => P.__ProcessInternals._vulkan_call_lane.enabled = on,
+        .route_memo => forwarder_module.route_memo.enabled = on,
     }
 }
 
@@ -491,12 +505,38 @@ test "Xenia draw stream reaches the stub driver through the production PE Vulkan
         setControls(on);
         var fixture = try create(64);
         defer fixture.deinit();
+        const lane = P.__ProcessInternals._vulkan_call_lane;
+        const lane_before = lane.completedCalls();
         const first = try run(&fixture, 2);
         const checksum = Driver.checksum;
         _ = try run(&fixture, 2);
         try t.expectEqual(checksum, Driver.checksum);
         try t.expect(first.calls == 2 * fixture.records);
+        // Every call in the stream records commands: on, the translated
+        // calls complete in place once the loop is hot; off, none do.
+        const lane_calls = lane.completedCalls() - lane_before;
+        if (on) try t.expect(lane_calls > 3 * fixture.records) else try t.expectEqual(@as(u64, 0), lane_calls);
     }
+}
+
+test "Xenia draw stream with a published code cache completes every thunk call in place, exactly as interpreted" {
+    defer setControls(true);
+    publish_code_cache = true;
+    defer publish_code_cache = false;
+    const lane = P.__ProcessInternals._vulkan_call_lane;
+    var checksums: [2]u64 = undefined;
+    for ([_]bool{ false, true }, 0..) |on, index| {
+        setControl(.vulkan_call_lane, on);
+        var fixture = try create(64);
+        defer fixture.deinit();
+        const before = lane.completedCalls();
+        const result = try run(&fixture, 3);
+        checksums[index] = Driver.checksum;
+        try t.expectEqual(3 * fixture.records, result.calls);
+        const completed = lane.completedCalls() - before;
+        if (on) try t.expect(completed > 2 * fixture.records) else try t.expectEqual(@as(u64, 0), completed);
+    }
+    try t.expectEqual(checksums[0], checksums[1]);
 }
 
 test "Xenia draw stream leaves the scratch stack byte-identical with every control off and on" {
@@ -525,8 +565,14 @@ test "Xenia draw stream CPU comparison (ROSETTE_DRAW_STREAM_BENCH=1)" {
     if (std.c.getenv("ROSETTE_DRAW_STREAM_PROFILE")) |mode| {
         // A long single-mode replay for an external sampling profiler.
         setControls(std.mem.eql(u8, std.mem.span(mode), "on"));
-        const result = try run(&fixture, 6000);
-        std.debug.print("draw_stream profile_run calls={d} cpu_ns={d}\n", .{ result.calls, result.cpu_ns });
+        // `ROSETTE_DRAW_STREAM_COLD=1`: the cold profile's scrub on every
+        // fourth call, the same on either side of a comparison.
+        @memset(&scrub_buffer, 1);
+        scrub_enabled = std.c.getenv("ROSETTE_DRAW_STREAM_COLD") != null;
+        defer scrub_enabled = false;
+        const passes: u64 = if (std.c.getenv("ROSETTE_DRAW_STREAM_PASSES")) |raw| std.fmt.parseInt(u64, std.mem.span(raw), 10) catch 6000 else 6000;
+        const result = try run(&fixture, if (scrub_enabled) passes / 4 else passes);
+        std.debug.print("draw_stream profile_run calls={d} cpu_ns={d} cold={}\n", .{ result.calls, result.cpu_ns, scrub_enabled });
         return;
     }
     var references: [2]?u64 = .{ null, null };
@@ -549,15 +595,15 @@ test "Xenia draw stream CPU comparison (ROSETTE_DRAW_STREAM_BENCH=1)" {
             const after = workerStats(&fixture);
             const reference = &references[@intFromBool(cold)];
             if (reference.*) |value| try t.expectEqual(value, Driver.checksum) else reference.* = Driver.checksum;
-            std.debug.print("draw_stream profile={s} pair={d} enabled={} calls={d} cpu_ns={d} wall_ns={d} process_cpu_ns={d} steps={d} signals={d} parks={d} broadcasts={d} drain_spin_hits={d} spin_pickups={d} batches={d} checksum={d}\n", .{
-                if (cold) "cold" else "hot",                      pair,
-                on,                                               result.calls,
-                result.cpu_ns,                                    result.wall_ns,
-                result.process_cpu_ns,                            result.steps,
-                after.work_signals - before.work_signals,         after.parks - before.parks,
-                after.drain_broadcasts - before.drain_broadcasts, after.drain_spin_hits - before.drain_spin_hits,
-                after.spin_pickups - before.spin_pickups,         after.batches - before.batches,
-                Driver.checksum,
+            std.debug.print("draw_stream profile={s} pair={d} enabled={} calls={d} cpu_ns={d} wall_ns={d} process_cpu_ns={d} steps={d} signals={d} parks={d} broadcasts={d} drain_spin_hits={d} spin_pickups={d} batches={d} saturated={d} checksum={d}\n", .{
+                if (cold) "cold" else "hot",                                pair,
+                on,                                                         result.calls,
+                result.cpu_ns,                                              result.wall_ns,
+                result.process_cpu_ns,                                      result.steps,
+                after.work_signals - before.work_signals,                   after.parks - before.parks,
+                after.drain_broadcasts - before.drain_broadcasts,           after.drain_spin_hits - before.drain_spin_hits,
+                after.spin_pickups - before.spin_pickups,                   after.batches - before.batches,
+                after.saturated_submissions - before.saturated_submissions, Driver.checksum,
             });
         }
     };
@@ -574,17 +620,21 @@ test "Xenia draw stream per-change CPU breakdown (ROSETTE_DRAW_STREAM_ABLATION=1
     setControls(true);
     _ = try run(&fixture, 50);
     var reference: ?u64 = null;
+    // `ROSETTE_DRAW_STREAM_ONLY=<control>` measures one change.
+    const only: ?[]const u8 = if (std.c.getenv("ROSETTE_DRAW_STREAM_ONLY")) |raw| std.mem.span(raw) else null;
     inline for (std.meta.fields(Control)) |field| {
         const control: Control = @enumFromInt(field.value);
-        for (0..7) |pair| {
+        if (only == null or std.mem.eql(u8, only.?, field.name)) for (0..7) |pair| {
             for (if (pair % 2 == 0) [_]bool{ false, true } else [_]bool{ true, false }) |without| {
                 setControls(true);
                 setControl(control, !without);
                 _ = try run(&fixture, 20);
+                const before = workerStats(&fixture);
                 const result = try run(&fixture, 300);
+                const after = workerStats(&fixture);
                 if (reference) |value| try t.expectEqual(value, Driver.checksum) else reference = Driver.checksum;
-                std.debug.print("draw_stream ablation={s} pair={d} without={} calls={d} cpu_ns={d} wall_ns={d} process_cpu_ns={d} checksum={d}\n", .{ field.name, pair, without, result.calls, result.cpu_ns, result.wall_ns, result.process_cpu_ns, Driver.checksum });
+                std.debug.print("draw_stream ablation={s} pair={d} without={} calls={d} cpu_ns={d} wall_ns={d} process_cpu_ns={d} saturated={d} drain_spin_hits={d} parks={d} checksum={d}\n", .{ field.name, pair, without, result.calls, result.cpu_ns, result.wall_ns, result.process_cpu_ns, after.saturated_submissions - before.saturated_submissions, after.drain_spin_hits - before.drain_spin_hits, after.parks - before.parks, Driver.checksum });
             }
-        }
+        };
     }
 }

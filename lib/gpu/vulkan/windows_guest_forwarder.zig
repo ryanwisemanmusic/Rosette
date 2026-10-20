@@ -15,6 +15,7 @@ const dynamic_forwarder = @import("dyld").dynamic_library_forwarder;
 const register_file = @import("windows_guest_forwarder/context/register_file.zig");
 const windows_abi = @import("windows_guest_forwarder/abi/microsoft_to_sysv.zig");
 pub const route_metadata = @import("windows_guest_forwarder/abi/route_metadata.zig");
+pub const route_memo = @import("windows_guest_forwarder/abi/route_memo.zig");
 const surface_calls_module = @import("windows_guest_forwarder/diagnostics/surface_calls.zig");
 pub const bridge_route = @import("windows_guest_forwarder/abi/bridge_route.zig");
 
@@ -100,6 +101,8 @@ pub const Bridge = struct {
     scratch_stack_reuses: u64 = 0,
     scratch_stack_overflow_allocations: u64 = 0,
     route_facts: route_metadata.Counts = .{},
+    /// This adapter's number for the loader tokens `route_memo` keeps.
+    route_instance: u64 = 0,
 
     /// Hand out the scratch stack for the dispatch that is about to run, and
     /// leave it owned until `releaseScratchStack`.
@@ -459,9 +462,12 @@ pub const Bridge = struct {
     pub fn dispatch(self: *Bridge, state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
         if (vulkan_contract.isProcLookup(name)) return self.lookupWindowsProc(state, direct_return_rip);
         if (!std.mem.startsWith(u8, name, "vk")) return false;
-        const facts = if (std.mem.startsWith(u8, name, "vkCmd")) classifyRoute(name) else route_metadata.lookup(classifyRoute, name, &self.route_facts);
+        // Copied: a nested dispatch on this thread may reuse the slot.
+        const route_slot = route_memo.lookup(deriveRoute, name, &self.route_facts);
+        const route = route_slot.*;
+        const facts = route.facts;
         if (!facts.owned) return false;
-        const is_surface_call = std.mem.eql(u8, name, "vkCreateWin32SurfaceKHR");
+        const is_surface_call = route.surface;
         var surface_dispatch_completed = false;
         defer if (is_surface_call and !surface_dispatch_completed) self.surface_calls.noteDispatchRefusal();
         if (is_surface_call) self.surface_calls.noteDispatchAttempt();
@@ -500,10 +506,7 @@ pub const Bridge = struct {
             trace_outcome = "library_unavailable";
             return false;
         };
-        const forward_name = if (std.mem.eql(u8, name, "vkCreateWin32SurfaceKHR"))
-            "vkCreateMetalSurfaceEXT"
-        else
-            name;
+        const forward_name = if (is_surface_call) "vkCreateMetalSurfaceEXT" else name;
         // `owns(name)` already checked every ordinary Vulkan spelling. Only
         // the Win32-to-Metal surface alias needs validation after substitution.
         if (is_surface_call and !dynamic_forwarder.isForwardableVulkanSymbol(forward_name)) {
@@ -511,14 +514,23 @@ pub const Bridge = struct {
             trace_outcome = "symbol_not_forwardable";
             return false;
         }
-        const symbol_token = self.forwarder.lookupGuest(library_token, forward_name);
+        const device = if (self.forwarder.real_vulkan.device) |handle| @intFromPtr(handle) else 0;
+        if (self.route_instance == 0) self.route_instance = route_memo.newOwner();
+        const symbol_token = route_memo.token(&route, self.route_instance, library_token, device) orelse looked_up: {
+            const looked_up = self.forwarder.lookupGuest(library_token, forward_name);
+            route_memo.keepToken(route_slot, looked_up, self.route_instance, library_token, device);
+            break :looked_up looked_up;
+        };
         if (symbol_token == 0) {
             self.dispatch_failures +|= 1;
             trace_outcome = "symbol_lookup_failed";
             return false;
         }
 
-        const original_regs = register_file.field(state, "regs").*;
+        // The bound context's files, resolved once: the thread's binding does
+        // not change during its own call.
+        const regs = register_file.field(state, "regs");
+        const original_regs = regs.*;
         const signature = facts.signature orelse {
             self.dispatch_failures +|= 1;
             trace_outcome = "argument_signature_missing";
@@ -584,17 +596,17 @@ pub const Bridge = struct {
             arguments[4],
             arguments[5],
         );
-        register_file.field(state, "regs").*.rdi = mapped.rdi;
-        register_file.field(state, "regs").*.rsi = mapped.rsi;
-        register_file.field(state, "regs").*.rdx = mapped.rdx;
-        register_file.field(state, "regs").*.rcx = mapped.rcx;
-        register_file.field(state, "regs").*.r8 = mapped.r8;
-        register_file.field(state, "regs").*.r9 = mapped.r9;
-        register_file.field(state, "regs").*.rsp = scratch_stack;
+        regs.rdi = mapped.rdi;
+        regs.rsi = mapped.rsi;
+        regs.rdx = mapped.rdx;
+        regs.rcx = mapped.rcx;
+        regs.r8 = mapped.r8;
+        regs.r9 = mapped.r9;
+        regs.rsp = scratch_stack;
 
-        if (std.mem.eql(u8, name, "vkCreateWin32SurfaceKHR")) {
+        if (is_surface_call) {
             const metal_info = state.guestAlloc(metal_surface_create_info_bytes, 8) orelse {
-                register_file.field(state, "regs").* = original_regs;
+                regs.* = original_regs;
                 self.dispatch_failures +|= 1;
                 trace_outcome = "surface_info_unavailable";
                 return false;
@@ -605,23 +617,29 @@ pub const Bridge = struct {
             state.write64(metal_info + 24, native_metal_layer_token);
             // SysV's second argument is pCreateInfo; the Windows allocator
             // remains SysV rdx and the output pointer remains SysV rcx.
-            register_file.field(state, "regs").*.rsi = metal_info;
+            regs.rsi = metal_info;
             self.surface_calls.noteNameRemap();
         }
 
-        const original_xmm = register_file.field(state, "xmm").*;
-        defer register_file.field(state, "xmm").* = original_xmm;
-        windows_abi.mapScalarFloatArguments(
-            register_file.field(state, "xmm"),
-            facts.float_count,
-        );
-        const command = std.mem.startsWith(u8, name, "vkCmd");
+        // Only the float-argument shift writes the vector file (the
+        // forwarder reads it), so only a call with scalar floats saves and
+        // restores its 512 bytes.
+        const xmm = register_file.field(state, "xmm");
+        var original_xmm: @TypeOf(xmm.*) = undefined;
+        if (facts.float_count != 0) {
+            original_xmm = xmm.*;
+            windows_abi.mapScalarFloatArguments(xmm, facts.float_count);
+        }
+        defer if (facts.float_count != 0) {
+            xmm.* = original_xmm;
+        };
+        const command = route.command;
         const native_commands_before = self.forwarder.vulkan_real_command_calls;
         const dispatched = register_file.dispatchWithActiveRegisterFile(&self.forwarder, state, symbol_token);
-        const result = register_file.field(state, "regs").*.rax;
+        const result = regs.rax;
         const native_objects_ready = self.forwarder.guestVulkanInstanceReady() or
             self.forwarder.guestVulkanDeviceReady();
-        register_file.field(state, "regs").* = original_regs;
+        regs.* = original_regs;
         if (!dispatched) {
             self.dispatch_failures +|= 1;
             trace_outcome = "forwarder_rejected";
@@ -636,7 +654,7 @@ pub const Bridge = struct {
             const vk_result: i32 = @bitCast(@as(u32, @truncate(result)));
             self.surface_calls.noteAdapterInvocation(vk_result, output_surface);
         }
-        register_file.field(state, "regs").*.rax = result;
+        regs.rax = result;
         self.dispatches +|= 1;
         // Every void command has an actual native-call admission ledger.
         // Handling a thunk is not proof that its native marshaller accepted
@@ -646,9 +664,9 @@ pub const Bridge = struct {
             self.forwarder.vulkan_real_command_calls != native_commands_before;
         if (reached_native_command) {
             noteNativeForwarding(state, name, native_objects_ready);
-            noteLogicalContract(state, name, result);
+            noteContract(state, route.contract, name, result);
         }
-        if (isForwarderFrameEvidenceBoundary(name)) noteForwarderFrameEvidence(self, state);
+        if (route.frame_evidence) noteForwarderFrameEvidence(self, state);
         finishWindowsCall(state, direct_return_rip);
         trace_outcome = if (reached_native_command) "forwarded" else "handled_native_refused";
         return true;
@@ -707,6 +725,17 @@ fn owns(name: []const u8) bool {
 fn classifyRoute(name: []const u8) route_metadata.Facts {
     return .{ .owned = owns(name), .signature = vulkan_contract.argument_widths.lookup(name), .float_count = vulkan_contract.scalarFloatCount(name) };
 }
+
+/// Everything `dispatch` derives from a name, once per name (`route_memo.zig`).
+fn deriveRoute(name: []const u8) route_memo.Route {
+    return .{
+        .facts = classifyRoute(name),
+        .command = std.mem.startsWith(u8, name, "vkCmd"),
+        .surface = std.mem.eql(u8, name, "vkCreateWin32SurfaceKHR"),
+        .frame_evidence = isForwarderFrameEvidenceBoundary(name),
+        .contract = contractOf(name),
+    };
+}
 test "Windows Vulkan route facts keep mutable names aliases widths and cold results" {
     var counts: route_metadata.Counts = .{};
     var mutable: [20]u8 = undefined;
@@ -747,9 +776,30 @@ fn noteNativeForwarding(state: anytype, name: []const u8, host_objects_ready: bo
     }
 }
 
-fn noteLogicalContract(state: anytype, name: []const u8, result: u64) void {
+/// The logical contract a call to `name` completes, by its name: derived
+/// once per name (`deriveRoute`).
+fn contractOf(name: []const u8) route_memo.Contract {
+    if (std.mem.eql(u8, name, "vkCreateInstance")) return .create_instance;
+    if (std.mem.eql(u8, name, "vkCreateWin32SurfaceKHR")) return .create_surface;
+    if (std.mem.eql(u8, name, "vkCreateDevice")) return .create_device;
+    if (std.mem.eql(u8, name, "vkGetDeviceQueue") or std.mem.eql(u8, name, "vkGetDeviceQueue2")) return .get_queue;
+    if (std.mem.eql(u8, name, "vkCreateSwapchainKHR")) return .create_swapchain;
+    if (std.mem.eql(u8, name, "vkGetSwapchainImagesKHR")) return .swapchain_images;
+    if (vulkan_contract.isAcquire(name)) return .acquire;
+    if (std.mem.eql(u8, name, "vkQueueSubmit") or std.mem.eql(u8, name, "vkQueueSubmit2") or std.mem.eql(u8, name, "vkQueueSubmit2KHR")) return .submit;
+    if (std.mem.eql(u8, name, "vkQueuePresentKHR")) return .present;
+    if (std.mem.startsWith(u8, name, "vkCmd")) return .command;
+    return .observed;
+}
+
+fn noteContract(state: anytype, contract: route_memo.Contract, name: []const u8, result: u64) void {
     const State = @TypeOf(state.*);
     if (comptime !@hasField(State, "windows_graphics")) return;
+    switch (contract) {
+        .command => return state.windows_graphics.noteCommand(name),
+        .observed => return state.windows_graphics.noteObservedCall(name),
+        else => {},
+    }
     // VkResult reserves negative values for failures; positive values such as
     // VK_SUBOPTIMAL_KHR, VK_TIMEOUT, and VK_NOT_READY are still valid driver
     // outcomes and must not inflate the native-failure ledger.
@@ -758,44 +808,45 @@ fn noteLogicalContract(state: anytype, name: []const u8, result: u64) void {
     // Only these entry points return VkResult.  Void commands leave rax
     // unspecified, so treating its stale value as an error turns ordinary
     // command traffic into a false native-failure count.
-    const result_bearing = std.mem.eql(u8, name, "vkCreateInstance") or
-        std.mem.eql(u8, name, "vkCreateWin32SurfaceKHR") or
-        std.mem.eql(u8, name, "vkCreateDevice") or
-        std.mem.eql(u8, name, "vkCreateSwapchainKHR") or
-        std.mem.eql(u8, name, "vkGetSwapchainImagesKHR") or
-        vulkan_contract.isAcquire(name) or
-        std.mem.eql(u8, name, "vkQueueSubmit") or
-        (std.mem.eql(u8, name, "vkQueueSubmit2") or std.mem.eql(u8, name, "vkQueueSubmit2KHR")) or
-        std.mem.eql(u8, name, "vkQueuePresentKHR");
-    if (result_bearing) state.windows_graphics.noteNativeVulkanResult(name, vk_result >= 0);
-    if (std.mem.eql(u8, name, "vkCreateInstance")) {
-        _ = state.windows_graphics.noteCreateInstance(ok);
-    } else if (std.mem.eql(u8, name, "vkCreateWin32SurfaceKHR")) {
-        _ = state.windows_graphics.noteCreateSurface(ok);
-    } else if (std.mem.eql(u8, name, "vkCreateDevice")) {
-        _ = state.windows_graphics.noteCreateDevice(ok);
-    } else if (std.mem.eql(u8, name, "vkGetDeviceQueue") or
-        std.mem.eql(u8, name, "vkGetDeviceQueue2"))
-    {
-        _ = state.windows_graphics.noteGetQueue(true);
-    } else if (std.mem.eql(u8, name, "vkCreateSwapchainKHR")) {
-        _ = state.windows_graphics.noteCreateSwapchain(ok);
-    } else if (std.mem.eql(u8, name, "vkGetSwapchainImagesKHR")) {
-        _ = state.windows_graphics.noteSwapchainImages(ok);
-    } else if (vulkan_contract.isAcquire(name)) {
+    if (contract.resultBearing()) state.windows_graphics.noteNativeVulkanResult(name, vk_result >= 0);
+    switch (contract) {
+        .create_instance => _ = state.windows_graphics.noteCreateInstance(ok),
+        .create_surface => _ = state.windows_graphics.noteCreateSurface(ok),
+        .create_device => _ = state.windows_graphics.noteCreateDevice(ok),
+        .get_queue => _ = state.windows_graphics.noteGetQueue(true),
+        .create_swapchain => _ = state.windows_graphics.noteCreateSwapchain(ok),
+        .swapchain_images => _ = state.windows_graphics.noteSwapchainImages(ok),
         // Timeout/not-ready is neither a failure nor an acquired frame.
-        if (ok) _ = state.windows_graphics.noteAcquire(true);
-    } else if (std.mem.eql(u8, name, "vkQueueSubmit") or
-        (std.mem.eql(u8, name, "vkQueueSubmit2") or std.mem.eql(u8, name, "vkQueueSubmit2KHR")))
-    {
-        _ = state.windows_graphics.noteQueueSubmit(ok);
-    } else if (std.mem.eql(u8, name, "vkQueuePresentKHR")) {
-        _ = state.windows_graphics.notePresent(ok);
-    } else if (std.mem.startsWith(u8, name, "vkCmd")) {
-        state.windows_graphics.noteCommand(name);
-    } else {
-        state.windows_graphics.noteObservedCall(name);
+        .acquire => if (ok) {
+            _ = state.windows_graphics.noteAcquire(true);
+        },
+        .submit => _ = state.windows_graphics.noteQueueSubmit(ok),
+        .present => _ = state.windows_graphics.notePresent(ok),
+        .command, .observed => unreachable,
     }
+}
+
+test "every logical contract is the one the name-by-name chain chose" {
+    const Expect = struct { name: []const u8, contract: route_memo.Contract };
+    for ([_]Expect{
+        .{ .name = "vkCreateInstance", .contract = .create_instance },
+        .{ .name = "vkCreateWin32SurfaceKHR", .contract = .create_surface },
+        .{ .name = "vkCreateDevice", .contract = .create_device },
+        .{ .name = "vkGetDeviceQueue", .contract = .get_queue },
+        .{ .name = "vkGetDeviceQueue2", .contract = .get_queue },
+        .{ .name = "vkCreateSwapchainKHR", .contract = .create_swapchain },
+        .{ .name = "vkGetSwapchainImagesKHR", .contract = .swapchain_images },
+        .{ .name = "vkAcquireNextImageKHR", .contract = .acquire },
+        .{ .name = "vkAcquireNextImage2KHR", .contract = .acquire },
+        .{ .name = "vkQueueSubmit", .contract = .submit },
+        .{ .name = "vkQueueSubmit2KHR", .contract = .submit },
+        .{ .name = "vkQueuePresentKHR", .contract = .present },
+        .{ .name = "vkCmdDrawIndexed", .contract = .command },
+        .{ .name = "vkUpdateDescriptorSets", .contract = .observed },
+    }) |case| try std.testing.expectEqual(case.contract, contractOf(case.name));
+    try std.testing.expect(!route_memo.Contract.get_queue.resultBearing());
+    try std.testing.expect(route_memo.Contract.present.resultBearing());
+    try std.testing.expect(!route_memo.Contract.command.resultBearing());
 }
 
 fn noteForwarderFrameEvidence(self: *const Bridge, state: anytype) void {
@@ -854,6 +905,7 @@ test "Xenia Windows GPU and UI entry points have a bridge dispatch contract" {
 test {
     _ = windows_abi;
     _ = bridge_route;
+    _ = route_memo;
 }
 
 test "Windows proc lookup keeps absent commands null and returns Windows thunks" {
