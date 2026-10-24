@@ -123,8 +123,9 @@ if [[ -n "$runner_binary" ]]; then
     cp -p "$runner_binary" "${stage}/zig-out/bin/rosette_exe_runner"
 fi
 
+launcher="tools/guest_runtime/scripts/rosette-guest-run.sh"
 launcher_present=false
-[[ ! -x "${stage}/tools/xenia/scripts/rosette-xenia-run.sh" ]] || launcher_present=true
+[[ ! -x "${stage}/${launcher}" ]] || launcher_present=true
 
 python3 - "$stage/.rosette-import.json" "$source_kind" "$source_tag" "$source_commit" "$archive_sha256" "$launcher_present" <<'PY'
 import json, sys
@@ -142,7 +143,7 @@ Path(path).write_text(json.dumps({
     "source_revision": commit or None,
     "source_archive_sha256": archive_sha or None,
     "runner": runner,
-    "launcher": "tools/xenia/scripts/rosette-xenia-run.sh",
+    "launcher": "tools/guest_runtime/scripts/rosette-guest-run.sh",
     "launcher_present": launcher_present == "true",
     "static_xenia_ready": launcher_present == "true" and runner is not None
 }, indent=2, sort_keys=True) + "\n")
@@ -167,5 +168,5 @@ else
     echo "standalone runner: absent (use --runner-binary or --build-runner before selecting static mode)"
 fi
 if [[ "$launcher_present" != true ]]; then
-    echo "warning: this release predates the Xenia launcher; it is source-importable but cannot be selected by the Xenia macOS adapter" >&2
+    echo "warning: this release lacks the Rosette guest-runtime launcher required by the Xenia macOS adapter" >&2
 fi
