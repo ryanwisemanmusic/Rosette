@@ -3,7 +3,7 @@
 
 Covers the 21 tables surfaced by the decoder ISA ABI contract audit
 (tools/audit_abi_contracts.py): the CMPXCHG family and VEX-only SIMD ops.
-Mirrors the proven gen_batch13.py format exactly.
+Mirrors the proven tools/isa/batch13/gen_batch13.py format exactly.
 """
 
 import os
