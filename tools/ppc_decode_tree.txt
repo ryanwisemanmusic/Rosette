@@ -1,0 +1,552 @@
+# Rosette PPC decode tree.
+#
+# The Xenon PowerPC decoder is a two-level decision tree: the 6-bit primary
+# opcode selects a case, and each case runs one or more switches over a
+# concatenation of extended-opcode bit ranges. VMX128 shares primary opcodes 4,
+# 5, and 6 with AltiVec, so the order of the switches inside a primary is part
+# of the contract - the more specific VMX128 switch must run first.
+#
+# Grammar:
+#   primary <n>              open the case for primary opcode n
+#   hit <mnemonic>           the whole primary decodes to one instruction
+#   switch a:b:s[,a:b:s...]  switch over concat(bits[a..b] << s, ...)
+#     <binary> <mnemonic>    one case of the switch just opened
+#
+# Bit numbering is PowerPC's: bit 0 is the most significant bit of the 32-bit
+# instruction word. Transcribed from the Xenon decode tables. Consumed by
+# tools/gen_ppc_decoder.py.
+primary 2
+hit tdi
+primary 3
+hit twi
+primary 4
+switch 21:27:4,30:31:0
+  00000000011 lvsl128
+  00001000011 lvsr128
+  00010000011 lvewx128
+  00011000011 lvx128
+  00110000011 stvewx128
+  00111000011 stvx128
+  01011000011 lvxl128
+  01111000011 stvxl128
+  10000000011 lvlx128
+  10001000011 lvrx128
+  10100000011 stvlx128
+  10101000011 stvrx128
+  11000000011 lvlxl128
+  11001000011 lvrxl128
+  11100000011 stvlxl128
+  11101000011 stvrxl128
+switch 21:31:0
+  00000000000 vaddubm
+  00000000010 vmaxub
+  00000000100 vrlb
+  00000001000 vmuloub
+  00000001010 vaddfp
+  00000001100 vmrghb
+  00000001110 vpkuhum
+  00001000000 vadduhm
+  00001000010 vmaxuh
+  00001000100 vrlh
+  00001001000 vmulouh
+  00001001010 vsubfp
+  00001001100 vmrghh
+  00001001110 vpkuwum
+  00010000000 vadduwm
+  00010000010 vmaxuw
+  00010000100 vrlw
+  00010001100 vmrghw
+  00010001110 vpkuhus
+  00011001110 vpkuwus
+  00100000010 vmaxsb
+  00100000100 vslb
+  00100001000 vmulosb
+  00100001010 vrefp
+  00100001100 vmrglb
+  00100001110 vpkshus
+  00101000010 vmaxsh
+  00101000100 vslh
+  00101001000 vmulosh
+  00101001010 vrsqrtefp
+  00101001100 vmrglh
+  00101001110 vpkswus
+  00110000000 vaddcuw
+  00110000010 vmaxsw
+  00110000100 vslw
+  00110001010 vexptefp
+  00110001100 vmrglw
+  00110001110 vpkshss
+  00111000100 vsl
+  00111001010 vlogefp
+  00111001110 vpkswss
+  01000000000 vaddubs
+  01000000010 vminub
+  01000000100 vsrb
+  01000001000 vmuleub
+  01000001010 vrfin
+  01000001100 vspltb
+  01000001110 vupkhsb
+  01001000000 vadduhs
+  01001000010 vminuh
+  01001000100 vsrh
+  01001001000 vmuleuh
+  01001001010 vrfiz
+  01001001100 vsplth
+  01001001110 vupkhsh
+  01010000000 vadduws
+  01010000010 vminuw
+  01010000100 vsrw
+  01010001010 vrfip
+  01010001100 vspltw
+  01010001110 vupklsb
+  01011000100 vsr
+  01011001010 vrfim
+  01011001110 vupklsh
+  01100000000 vaddsbs
+  01100000010 vminsb
+  01100000100 vsrab
+  01100001000 vmulesb
+  01100001010 vcfux
+  01100001100 vspltisb
+  01100001110 vpkpx
+  01101000000 vaddshs
+  01101000010 vminsh
+  01101000100 vsrah
+  01101001000 vmulesh
+  01101001010 vcfsx
+  01101001100 vspltish
+  01101001110 vupkhpx
+  01110000000 vaddsws
+  01110000010 vminsw
+  01110000100 vsraw
+  01110001010 vctuxs
+  01110001100 vspltisw
+  01111001010 vctsxs
+  01111001110 vupklpx
+  10000000000 vsububm
+  10000000010 vavgub
+  10000000100 vand
+  10000001010 vmaxfp
+  10000001100 vslo
+  10001000000 vsubuhm
+  10001000010 vavguh
+  10001000100 vandc
+  10001001010 vminfp
+  10001001100 vsro
+  10010000000 vsubuwm
+  10010000010 vavguw
+  10010000100 vor
+  10011000100 vxor
+  10100000010 vavgsb
+  10100000100 vnor
+  10101000010 vavgsh
+  10110000000 vsubcuw
+  10110000010 vavgsw
+  11000000000 vsububs
+  11000000100 mfvscr
+  11000001000 vsum4ubs
+  11001000000 vsubuhs
+  11001000100 mtvscr
+  11001001000 vsum4shs
+  11010000000 vsubuws
+  11010001000 vsum2sws
+  11100000000 vsubsbs
+  11100001000 vsum4sbs
+  11101000000 vsubshs
+  11110000000 vsubsws
+  11110001000 vsumsws
+switch 22:31:0
+  0000000110 vcmpequb
+  0001000110 vcmpequh
+  0010000110 vcmpequw
+  0011000110 vcmpeqfp
+  0111000110 vcmpgefp
+  1000000110 vcmpgtub
+  1001000110 vcmpgtuh
+  1010000110 vcmpgtuw
+  1011000110 vcmpgtfp
+  1100000110 vcmpgtsb
+  1101000110 vcmpgtsh
+  1110000110 vcmpgtsw
+  1111000110 vcmpbfp
+switch 26:31:0
+  100000 vmhaddshs
+  100001 vmhraddshs
+  100010 vmladduhm
+  100100 vmsumubm
+  100101 vmsummbm
+  100110 vmsumuhm
+  100111 vmsumuhs
+  101000 vmsumshm
+  101001 vmsumshs
+  101010 vsel
+  101011 vperm
+  101100 vsldoi
+  101110 vmaddfp
+  101111 vnmsubfp
+switch 27:27:0
+  1 vsldoi128
+primary 5
+switch 22:22:5,27:27:0
+  000000 vperm128
+switch 22:25:2,27:27:0
+  000001 vaddfp128
+  000101 vsubfp128
+  001001 vmulfp128
+  001101 vmaddfp128
+  010001 vmaddcfp128
+  010101 vnmsubfp128
+  011001 vmsum3fp128
+  011101 vmsum4fp128
+  100000 vpkshss128
+  100001 vand128
+  100100 vpkshus128
+  100101 vandc128
+  101000 vpkswss128
+  101001 vnor128
+  101100 vpkswus128
+  101101 vor128
+  110000 vpkuhum128
+  110001 vxor128
+  110100 vpkuhus128
+  110101 vsel128
+  111000 vpkuwum128
+  111001 vslo128
+  111100 vpkuwus128
+  111101 vsro128
+primary 6
+switch 21:22:5,26:27:0
+  0100001 vpermwi128
+switch 21:23:4,26:27:0
+  1100001 vpkd3d128
+  1110001 vrlimi128
+switch 21:27:0
+  0100011 vcfpsxws128
+  0100111 vcfpuxws128
+  0101011 vcsxwfp128
+  0101111 vcuxwfp128
+  0110011 vrfim128
+  0110111 vrfin128
+  0111011 vrfip128
+  0111111 vrfiz128
+  1100011 vrefp128
+  1100111 vrsqrtefp128
+  1101011 vexptefp128
+  1101111 vlogefp128
+  1110011 vspltw128
+  1110111 vspltisw128
+  1111111 vupkd3d128
+switch 22:24:3,27:27:0
+  000000 vcmpeqfp128
+  001000 vcmpgefp128
+  010000 vcmpgtfp128
+  011000 vcmpbfp128
+  100000 vcmpequw128
+switch 22:25:2,27:27:0
+  000101 vrlw128
+  001101 vslw128
+  010101 vsraw128
+  011101 vsrw128
+  101000 vmaxfp128
+  101100 vminfp128
+  110000 vmrghw128
+  110100 vmrglw128
+  111000 vupkhsb128
+  111100 vupklsb128
+primary 7
+hit mulli
+primary 8
+hit subficx
+primary 10
+hit cmpli
+primary 11
+hit cmpi
+primary 12
+hit addic
+primary 13
+hit addicx
+primary 14
+hit addi
+primary 15
+hit addis
+primary 16
+hit bcx
+primary 17
+hit sc
+primary 18
+hit bx
+primary 19
+switch 21:30:0
+  0000000000 mcrf
+  0000010000 bclrx
+  0000100001 crnor
+  0010000001 crandc
+  0010010110 isync
+  0011000001 crxor
+  0011100001 crnand
+  0100000001 crand
+  0100100001 creqv
+  0110100001 crorc
+  0111000001 cror
+  1000010000 bcctrx
+primary 20
+hit rlwimix
+primary 21
+hit rlwinmx
+primary 23
+hit rlwnmx
+primary 24
+hit ori
+primary 25
+hit oris
+primary 26
+hit xori
+primary 27
+hit xoris
+primary 28
+hit andix
+primary 29
+hit andisx
+primary 30
+switch 27:29:0
+  000 rldiclx
+  001 rldicrx
+  010 rldicx
+  011 rldimix
+switch 27:30:0
+  1000 rldclx
+  1001 rldcrx
+primary 31
+switch 21:29:0
+  110011101 sradix
+switch 21:30:0
+  0000000000 cmp
+  0000000100 tw
+  0000000110 lvsl
+  0000000111 lvebx
+  0000010011 mfcr
+  0000010100 lwarx
+  0000010101 ldx
+  0000010111 lwzx
+  0000011000 slwx
+  0000011010 cntlzwx
+  0000011011 sldx
+  0000011100 andx
+  0000100000 cmpl
+  0000100110 lvsr
+  0000100111 lvehx
+  0000110101 ldux
+  0000110110 dcbst
+  0000110111 lwzux
+  0000111010 cntlzdx
+  0000111100 andcx
+  0001000100 td
+  0001000111 lvewx
+  0001010011 mfmsr
+  0001010100 ldarx
+  0001010110 dcbf
+  0001010111 lbzx
+  0001100111 lvx
+  0001110111 lbzux
+  0001111100 norx
+  0010000111 stvebx
+  0010010000 mtcrf
+  0010010010 mtmsr
+  0010010101 stdx
+  0010010110 stwcx
+  0010010111 stwx
+  0010100111 stvehx
+  0010110010 mtmsrd
+  0010110101 stdux
+  0010110111 stwux
+  0011000111 stvewx
+  0011010110 stdcx
+  0011010111 stbx
+  0011100111 stvx
+  0011110110 dcbtst
+  0011110111 stbux
+  0100010110 dcbt
+  0100010111 lhzx
+  0100011100 eqvx
+  0100110111 lhzux
+  0100111100 xorx
+  0101010011 mfspr
+  0101010101 lwax
+  0101010111 lhax
+  0101100111 lvxl
+  0101110011 mftb
+  0101110101 lwaux
+  0101110111 lhaux
+  0110010111 sthx
+  0110011100 orcx
+  0110110111 sthux
+  0110111100 orx
+  0111010011 mtspr
+  0111010110 dcbi
+  0111011100 nandx
+  0111100111 stvxl
+  1000000000 mcrxr
+  1000000111 lvlx
+  1000010100 ldbrx
+  1000010101 lswx
+  1000010110 lwbrx
+  1000010111 lfsx
+  1000011000 srwx
+  1000011011 srdx
+  1000100111 lvrx
+  1000110111 lfsux
+  1001010101 lswi
+  1001010110 sync
+  1001010111 lfdx
+  1001110111 lfdux
+  1010000111 stvlx
+  1010010100 stdbrx
+  1010010101 stswx
+  1010010110 stwbrx
+  1010010111 stfsx
+  1010100111 stvrx
+  1010110111 stfsux
+  1011010101 stswi
+  1011010111 stfdx
+  1011110111 stfdux
+  1100000111 lvlxl
+  1100010110 lhbrx
+  1100011000 srawx
+  1100011010 sradx
+  1100100111 lvrxl
+  1100111000 srawix
+  1101010110 eieio
+  1110000111 stvlxl
+  1110010110 sthbrx
+  1110011010 extshx
+  1110100111 stvrxl
+  1110111010 extsbx
+  1111010110 icbi
+  1111010111 stfiwx
+  1111011010 extswx
+switch 22:30:0
+  000001000 subfcx
+  000001001 mulhdux
+  000001010 addcx
+  000001011 mulhwux
+  000101000 subfx
+  001001001 mulhdx
+  001001011 mulhwx
+  001101000 negx
+  010001000 subfex
+  010001010 addex
+  011001000 subfzex
+  011001010 addzex
+  011101000 subfmex
+  011101001 mulldx
+  011101010 addmex
+  011101011 mullwx
+  100001010 addx
+  111001001 divdux
+  111001011 divwux
+  111101001 divdx
+  111101011 divwx
+switch 6:10:20,21:30:0
+  0000000000000001111110110 dcbz
+  0000100000000001111110110 dcbz128
+primary 32
+hit lwz
+primary 33
+hit lwzu
+primary 34
+hit lbz
+primary 35
+hit lbzu
+primary 36
+hit stw
+primary 37
+hit stwu
+primary 38
+hit stb
+primary 39
+hit stbu
+primary 40
+hit lhz
+primary 41
+hit lhzu
+primary 42
+hit lha
+primary 43
+hit lhau
+primary 44
+hit sth
+primary 45
+hit sthu
+primary 46
+hit lmw
+primary 47
+hit stmw
+primary 48
+hit lfs
+primary 49
+hit lfsu
+primary 50
+hit lfd
+primary 51
+hit lfdu
+primary 52
+hit stfs
+primary 53
+hit stfsu
+primary 54
+hit stfd
+primary 55
+hit stfdu
+primary 58
+switch 30:31:0
+  00 ld
+  01 ldu
+  10 lwa
+primary 59
+switch 26:30:0
+  10010 fdivsx
+  10100 fsubsx
+  10101 faddsx
+  10110 fsqrtsx
+  11000 fresx
+  11001 fmulsx
+  11100 fmsubsx
+  11101 fmaddsx
+  11110 fnmsubsx
+  11111 fnmaddsx
+primary 62
+switch 30:31:0
+  00 std
+  01 stdu
+primary 63
+switch 21:30:0
+  0000000000 fcmpu
+  0000001100 frspx
+  0000001110 fctiwx
+  0000001111 fctiwzx
+  0000100000 fcmpo
+  0000100110 mtfsb1x
+  0000101000 fnegx
+  0001000000 mcrfs
+  0001000110 mtfsb0x
+  0001001000 fmrx
+  0010000110 mtfsfix
+  0010001000 fnabsx
+  0100001000 fabsx
+  1001000111 mffsx
+  1011000111 mtfsfx
+  1100101110 fctidx
+  1100101111 fctidzx
+  1101001110 fcfidx
+switch 26:30:0
+  10010 fdivx
+  10100 fsubx
+  10101 faddx
+  10110 fsqrtx
+  10111 fselx
+  11001 fmulx
+  11010 frsqrtex
+  11100 fmsubx
+  11101 fmaddx
+  11110 fnmsubx
+  11111 fnmaddx
