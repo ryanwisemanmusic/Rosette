@@ -1,0 +1,1438 @@
+4d 11 ca|adc|adc %r9, %r10
+45 11 ca|adc|adc %r9d, %r10d
+66 45 11 ca|adc|adc %r9w, %r10w
+45 10 ca|adc|adc %r9b, %r10b
+48 11 c8|adc|adc %rcx, %rax
+11 c8|adc|adc %ecx, %eax
+66 11 c8|adc|adc %cx, %ax
+10 c8|adc|adc %cl, %al
+4f 13 54 6c 08|adc|adc 8(%r12,%r13,2), %r10
+47 13 54 6c 08|adc|adc 8(%r12,%r13,2), %r10d
+66 47 13 54 6c 08|adc|adc 8(%r12,%r13,2), %r10w
+47 12 54 6c 08|adc|adc 8(%r12,%r13,2), %r10b
+4f 11 54 6c 08|adc|adc %r10, 8(%r12,%r13,2)
+47 11 54 6c 08|adc|adc %r10d, 8(%r12,%r13,2)
+66 47 11 54 6c 08|adc|adc %r10w, 8(%r12,%r13,2)
+47 10 54 6c 08|adc|adc %r10b, 8(%r12,%r13,2)
+49 83 d2 05|adc|adc $5, %r10
+49 81 d2 45 23 01 00|adc|adc $0x12345, %r10
+41 83 d2 05|adc|adc $5, %r10d
+41 81 d2 45 23 01 00|adc|adc $0x12345, %r10d
+66 41 83 d2 05|adc|adc $5, %r10w
+66 41 81 d2 34 12|adc|adc $0x1234, %r10w
+41 80 d2 05|adc|adc $5, %r10b
+14 05|adc|adc $5, %al
+15 45 23 01 00|adc|adc $0x12345, %eax
+4b 83 54 6c 08 05|adc|adcq $5, 8(%r12,%r13,2)
+43 81 54 6c 08 45 23 01 00|adc|adcl $0x12345, 8(%r12,%r13,2)
+66 43 83 54 6c 08 05|adc|adcw $5, 8(%r12,%r13,2)
+43 80 54 6c 08 05|adc|adcb $5, 8(%r12,%r13,2)
+41 10 ca|adc|adc %cl, %r10b
+4d 01 ca|add|add %r9, %r10
+45 01 ca|add|add %r9d, %r10d
+66 45 01 ca|add|add %r9w, %r10w
+45 00 ca|add|add %r9b, %r10b
+48 01 c8|add|add %rcx, %rax
+01 c8|add|add %ecx, %eax
+66 01 c8|add|add %cx, %ax
+00 c8|add|add %cl, %al
+4f 03 54 6c 08|add|add 8(%r12,%r13,2), %r10
+47 03 54 6c 08|add|add 8(%r12,%r13,2), %r10d
+66 47 03 54 6c 08|add|add 8(%r12,%r13,2), %r10w
+47 02 54 6c 08|add|add 8(%r12,%r13,2), %r10b
+4f 01 54 6c 08|add|add %r10, 8(%r12,%r13,2)
+47 01 54 6c 08|add|add %r10d, 8(%r12,%r13,2)
+66 47 01 54 6c 08|add|add %r10w, 8(%r12,%r13,2)
+47 00 54 6c 08|add|add %r10b, 8(%r12,%r13,2)
+49 83 c2 05|add|add $5, %r10
+49 81 c2 45 23 01 00|add|add $0x12345, %r10
+41 83 c2 05|add|add $5, %r10d
+41 81 c2 45 23 01 00|add|add $0x12345, %r10d
+66 41 83 c2 05|add|add $5, %r10w
+66 41 81 c2 34 12|add|add $0x1234, %r10w
+41 80 c2 05|add|add $5, %r10b
+04 05|add|add $5, %al
+05 45 23 01 00|add|add $0x12345, %eax
+4b 83 44 6c 08 05|add|addq $5, 8(%r12,%r13,2)
+43 81 44 6c 08 45 23 01 00|add|addl $0x12345, 8(%r12,%r13,2)
+66 43 83 44 6c 08 05|add|addw $5, 8(%r12,%r13,2)
+43 80 44 6c 08 05|add|addb $5, 8(%r12,%r13,2)
+41 00 ca|add|add %cl, %r10b
+4d 21 ca|and_|and %r9, %r10
+45 21 ca|and_|and %r9d, %r10d
+66 45 21 ca|and_|and %r9w, %r10w
+45 20 ca|and_|and %r9b, %r10b
+48 21 c8|and_|and %rcx, %rax
+21 c8|and_|and %ecx, %eax
+66 21 c8|and_|and %cx, %ax
+20 c8|and_|and %cl, %al
+4f 23 54 6c 08|and_|and 8(%r12,%r13,2), %r10
+47 23 54 6c 08|and_|and 8(%r12,%r13,2), %r10d
+66 47 23 54 6c 08|and_|and 8(%r12,%r13,2), %r10w
+47 22 54 6c 08|and_|and 8(%r12,%r13,2), %r10b
+4f 21 54 6c 08|and_|and %r10, 8(%r12,%r13,2)
+47 21 54 6c 08|and_|and %r10d, 8(%r12,%r13,2)
+66 47 21 54 6c 08|and_|and %r10w, 8(%r12,%r13,2)
+47 20 54 6c 08|and_|and %r10b, 8(%r12,%r13,2)
+49 83 e2 05|and_|and $5, %r10
+49 81 e2 45 23 01 00|and_|and $0x12345, %r10
+41 83 e2 05|and_|and $5, %r10d
+41 81 e2 45 23 01 00|and_|and $0x12345, %r10d
+66 41 83 e2 05|and_|and $5, %r10w
+66 41 81 e2 34 12|and_|and $0x1234, %r10w
+41 80 e2 05|and_|and $5, %r10b
+24 05|and_|and $5, %al
+25 45 23 01 00|and_|and $0x12345, %eax
+4b 83 64 6c 08 05|and_|andq $5, 8(%r12,%r13,2)
+43 81 64 6c 08 45 23 01 00|and_|andl $0x12345, 8(%r12,%r13,2)
+66 43 83 64 6c 08 05|and_|andw $5, 8(%r12,%r13,2)
+43 80 64 6c 08 05|and_|andb $5, 8(%r12,%r13,2)
+41 20 ca|and_|and %cl, %r10b
+4d 0f bd d1|bsr|bsr %r9, %r10
+45 0f bd d1|bsr|bsr %r9d, %r10d
+66 45 0f bd d1|bsr|bsr %r9w, %r10w
+48 0f bd c1|bsr|bsr %rcx, %rax
+0f bd c1|bsr|bsr %ecx, %eax
+66 0f bd c1|bsr|bsr %cx, %ax
+4f 0f bd 54 6c 08|bsr|bsr 8(%r12,%r13,2), %r10
+47 0f bd 54 6c 08|bsr|bsr 8(%r12,%r13,2), %r10d
+66 47 0f bd 54 6c 08|bsr|bsr 8(%r12,%r13,2), %r10w
+49 0f ca|bswap|bswap %r10
+41 0f ca|bswap|bswap %r10d
+0f c8|bswap|bswap %eax
+48 0f c8|bswap|bswap %rax
+4d 0f a3 ca|bt|bt %r9, %r10
+45 0f a3 ca|bt|bt %r9d, %r10d
+66 45 0f a3 ca|bt|bt %r9w, %r10w
+48 0f a3 c8|bt|bt %rcx, %rax
+0f a3 c8|bt|bt %ecx, %eax
+66 0f a3 c8|bt|bt %cx, %ax
+4f 0f a3 54 6c 08|bt|bt %r10, 8(%r12,%r13,2)
+47 0f a3 54 6c 08|bt|bt %r10d, 8(%r12,%r13,2)
+66 47 0f a3 54 6c 08|bt|bt %r10w, 8(%r12,%r13,2)
+49 0f ba e2 05|bt|bt $5, %r10
+41 0f ba e2 05|bt|bt $5, %r10d
+66 41 0f ba e2 05|bt|bt $5, %r10w
+4b 0f ba 64 6c 08 05|bt|btq $5, 8(%r12,%r13,2)
+66 43 0f ba 64 6c 08 05|bt|btw $5, 8(%r12,%r13,2)
+4d 0f b3 ca|btr|btr %r9, %r10
+45 0f b3 ca|btr|btr %r9d, %r10d
+66 45 0f b3 ca|btr|btr %r9w, %r10w
+48 0f b3 c8|btr|btr %rcx, %rax
+0f b3 c8|btr|btr %ecx, %eax
+66 0f b3 c8|btr|btr %cx, %ax
+4f 0f b3 54 6c 08|btr|btr %r10, 8(%r12,%r13,2)
+47 0f b3 54 6c 08|btr|btr %r10d, 8(%r12,%r13,2)
+66 47 0f b3 54 6c 08|btr|btr %r10w, 8(%r12,%r13,2)
+49 0f ba f2 05|btr|btr $5, %r10
+41 0f ba f2 05|btr|btr $5, %r10d
+66 41 0f ba f2 05|btr|btr $5, %r10w
+4b 0f ba 74 6c 08 05|btr|btrq $5, 8(%r12,%r13,2)
+66 43 0f ba 74 6c 08 05|btr|btrw $5, 8(%r12,%r13,2)
+4d 0f ab ca|bts|bts %r9, %r10
+45 0f ab ca|bts|bts %r9d, %r10d
+66 45 0f ab ca|bts|bts %r9w, %r10w
+48 0f ab c8|bts|bts %rcx, %rax
+0f ab c8|bts|bts %ecx, %eax
+66 0f ab c8|bts|bts %cx, %ax
+4f 0f ab 54 6c 08|bts|bts %r10, 8(%r12,%r13,2)
+47 0f ab 54 6c 08|bts|bts %r10d, 8(%r12,%r13,2)
+66 47 0f ab 54 6c 08|bts|bts %r10w, 8(%r12,%r13,2)
+49 0f ba ea 05|bts|bts $5, %r10
+41 0f ba ea 05|bts|bts $5, %r10d
+66 41 0f ba ea 05|bts|bts $5, %r10w
+4b 0f ba 6c 6c 08 05|bts|btsq $5, 8(%r12,%r13,2)
+66 43 0f ba 6c 6c 08 05|bts|btsw $5, 8(%r12,%r13,2)
+99|cdq|cltd
+f8|clc|clc
+43 0f ae 7c 6c 08|clflush|clflush 8(%r12,%r13,2)
+4d 0f 42 d1|cmovc|cmovc %r9, %r10
+45 0f 42 d1|cmovc|cmovc %r9d, %r10d
+66 45 0f 42 d1|cmovc|cmovc %r9w, %r10w
+48 0f 42 c1|cmovc|cmovc %rcx, %rax
+0f 42 c1|cmovc|cmovc %ecx, %eax
+66 0f 42 c1|cmovc|cmovc %cx, %ax
+4f 0f 42 54 6c 08|cmovc|cmovc 8(%r12,%r13,2), %r10
+47 0f 42 54 6c 08|cmovc|cmovc 8(%r12,%r13,2), %r10d
+66 47 0f 42 54 6c 08|cmovc|cmovc 8(%r12,%r13,2), %r10w
+4d 0f 44 d1|cmove|cmove %r9, %r10
+45 0f 44 d1|cmove|cmove %r9d, %r10d
+66 45 0f 44 d1|cmove|cmove %r9w, %r10w
+48 0f 44 c1|cmove|cmove %rcx, %rax
+0f 44 c1|cmove|cmove %ecx, %eax
+66 0f 44 c1|cmove|cmove %cx, %ax
+4f 0f 44 54 6c 08|cmove|cmove 8(%r12,%r13,2), %r10
+47 0f 44 54 6c 08|cmove|cmove 8(%r12,%r13,2), %r10d
+66 47 0f 44 54 6c 08|cmove|cmove 8(%r12,%r13,2), %r10w
+4d 0f 4f d1|cmovg|cmovg %r9, %r10
+45 0f 4f d1|cmovg|cmovg %r9d, %r10d
+66 45 0f 4f d1|cmovg|cmovg %r9w, %r10w
+48 0f 4f c1|cmovg|cmovg %rcx, %rax
+0f 4f c1|cmovg|cmovg %ecx, %eax
+66 0f 4f c1|cmovg|cmovg %cx, %ax
+4f 0f 4f 54 6c 08|cmovg|cmovg 8(%r12,%r13,2), %r10
+47 0f 4f 54 6c 08|cmovg|cmovg 8(%r12,%r13,2), %r10d
+66 47 0f 4f 54 6c 08|cmovg|cmovg 8(%r12,%r13,2), %r10w
+4d 0f 45 d1|cmovnz|cmovnz %r9, %r10
+45 0f 45 d1|cmovnz|cmovnz %r9d, %r10d
+66 45 0f 45 d1|cmovnz|cmovnz %r9w, %r10w
+48 0f 45 c1|cmovnz|cmovnz %rcx, %rax
+0f 45 c1|cmovnz|cmovnz %ecx, %eax
+66 0f 45 c1|cmovnz|cmovnz %cx, %ax
+4f 0f 45 54 6c 08|cmovnz|cmovnz 8(%r12,%r13,2), %r10
+47 0f 45 54 6c 08|cmovnz|cmovnz 8(%r12,%r13,2), %r10d
+66 47 0f 45 54 6c 08|cmovnz|cmovnz 8(%r12,%r13,2), %r10w
+4d 39 ca|cmp|cmp %r9, %r10
+45 39 ca|cmp|cmp %r9d, %r10d
+66 45 39 ca|cmp|cmp %r9w, %r10w
+45 38 ca|cmp|cmp %r9b, %r10b
+48 39 c8|cmp|cmp %rcx, %rax
+39 c8|cmp|cmp %ecx, %eax
+66 39 c8|cmp|cmp %cx, %ax
+38 c8|cmp|cmp %cl, %al
+4f 3b 54 6c 08|cmp|cmp 8(%r12,%r13,2), %r10
+47 3b 54 6c 08|cmp|cmp 8(%r12,%r13,2), %r10d
+66 47 3b 54 6c 08|cmp|cmp 8(%r12,%r13,2), %r10w
+47 3a 54 6c 08|cmp|cmp 8(%r12,%r13,2), %r10b
+4f 39 54 6c 08|cmp|cmp %r10, 8(%r12,%r13,2)
+47 39 54 6c 08|cmp|cmp %r10d, 8(%r12,%r13,2)
+66 47 39 54 6c 08|cmp|cmp %r10w, 8(%r12,%r13,2)
+47 38 54 6c 08|cmp|cmp %r10b, 8(%r12,%r13,2)
+49 83 fa 05|cmp|cmp $5, %r10
+49 81 fa 45 23 01 00|cmp|cmp $0x12345, %r10
+41 83 fa 05|cmp|cmp $5, %r10d
+41 81 fa 45 23 01 00|cmp|cmp $0x12345, %r10d
+66 41 83 fa 05|cmp|cmp $5, %r10w
+66 41 81 fa 34 12|cmp|cmp $0x1234, %r10w
+41 80 fa 05|cmp|cmp $5, %r10b
+3c 05|cmp|cmp $5, %al
+3d 45 23 01 00|cmp|cmp $0x12345, %eax
+4b 83 7c 6c 08 05|cmp|cmpq $5, 8(%r12,%r13,2)
+43 81 7c 6c 08 45 23 01 00|cmp|cmpl $0x12345, 8(%r12,%r13,2)
+66 43 83 7c 6c 08 05|cmp|cmpw $5, 8(%r12,%r13,2)
+43 80 7c 6c 08 05|cmp|cmpb $5, 8(%r12,%r13,2)
+41 38 ca|cmp|cmp %cl, %r10b
+4d 0f b1 ca|cmpxchg|cmpxchg %r9, %r10
+45 0f b1 ca|cmpxchg|cmpxchg %r9d, %r10d
+66 45 0f b1 ca|cmpxchg|cmpxchg %r9w, %r10w
+45 0f b0 ca|cmpxchg|cmpxchg %r9b, %r10b
+48 0f b1 c8|cmpxchg|cmpxchg %rcx, %rax
+0f b1 c8|cmpxchg|cmpxchg %ecx, %eax
+66 0f b1 c8|cmpxchg|cmpxchg %cx, %ax
+0f b0 c8|cmpxchg|cmpxchg %cl, %al
+4f 0f b1 54 6c 08|cmpxchg|cmpxchg %r10, 8(%r12,%r13,2)
+47 0f b1 54 6c 08|cmpxchg|cmpxchg %r10d, 8(%r12,%r13,2)
+66 47 0f b1 54 6c 08|cmpxchg|cmpxchg %r10w, 8(%r12,%r13,2)
+47 0f b0 54 6c 08|cmpxchg|cmpxchg %r10b, 8(%r12,%r13,2)
+41 0f b0 ca|cmpxchg|cmpxchg %cl, %r10b
+48 99|cqo|cqto
+49 ff ca|dec|dec %r10
+41 ff ca|dec|dec %r10d
+66 41 ff ca|dec|dec %r10w
+41 fe ca|dec|dec %r10b
+48 ff c8|dec|dec %rax
+ff c8|dec|dec %eax
+66 ff c8|dec|dec %ax
+fe c8|dec|dec %al
+4b ff 4c 6c 08|dec|decq 8(%r12,%r13,2)
+43 ff 4c 6c 08|dec|decl 8(%r12,%r13,2)
+66 43 ff 4c 6c 08|dec|decw 8(%r12,%r13,2)
+43 fe 4c 6c 08|dec|decb 8(%r12,%r13,2)
+49 f7 f2|div|div %r10
+41 f7 f2|div|div %r10d
+66 41 f7 f2|div|div %r10w
+41 f6 f2|div|div %r10b
+48 f7 f0|div|div %rax
+f7 f0|div|div %eax
+66 f7 f0|div|div %ax
+f6 f0|div|div %al
+4b f7 74 6c 08|div|divq 8(%r12,%r13,2)
+43 f7 74 6c 08|div|divl 8(%r12,%r13,2)
+66 43 f7 74 6c 08|div|divw 8(%r12,%r13,2)
+43 f6 74 6c 08|div|divb 8(%r12,%r13,2)
+48 f7 f1|div|div %rcx, %rax
+f7 f1|div|div %ecx, %eax
+66 f7 f1|div|div %cx, %ax
+f6 f1|div|div %cl, %al
+49 f7 fa|idiv|idiv %r10
+41 f7 fa|idiv|idiv %r10d
+66 41 f7 fa|idiv|idiv %r10w
+41 f6 fa|idiv|idiv %r10b
+48 f7 f8|idiv|idiv %rax
+f7 f8|idiv|idiv %eax
+66 f7 f8|idiv|idiv %ax
+f6 f8|idiv|idiv %al
+4b f7 7c 6c 08|idiv|idivq 8(%r12,%r13,2)
+43 f7 7c 6c 08|idiv|idivl 8(%r12,%r13,2)
+66 43 f7 7c 6c 08|idiv|idivw 8(%r12,%r13,2)
+43 f6 7c 6c 08|idiv|idivb 8(%r12,%r13,2)
+48 f7 f9|idiv|idiv %rcx, %rax
+f7 f9|idiv|idiv %ecx, %eax
+66 f7 f9|idiv|idiv %cx, %ax
+f6 f9|idiv|idiv %cl, %al
+49 f7 ea|imul|imul %r10
+41 f7 ea|imul|imul %r10d
+66 41 f7 ea|imul|imul %r10w
+41 f6 ea|imul|imul %r10b
+48 f7 e8|imul|imul %rax
+f7 e8|imul|imul %eax
+66 f7 e8|imul|imul %ax
+f6 e8|imul|imul %al
+4b f7 6c 6c 08|imul|imulq 8(%r12,%r13,2)
+43 f7 6c 6c 08|imul|imull 8(%r12,%r13,2)
+66 43 f7 6c 6c 08|imul|imulw 8(%r12,%r13,2)
+43 f6 6c 6c 08|imul|imulb 8(%r12,%r13,2)
+4d 0f af d1|imul|imul %r9, %r10
+45 0f af d1|imul|imul %r9d, %r10d
+66 45 0f af d1|imul|imul %r9w, %r10w
+48 0f af c1|imul|imul %rcx, %rax
+0f af c1|imul|imul %ecx, %eax
+66 0f af c1|imul|imul %cx, %ax
+4f 0f af 54 6c 08|imul|imul 8(%r12,%r13,2), %r10
+47 0f af 54 6c 08|imul|imul 8(%r12,%r13,2), %r10d
+66 47 0f af 54 6c 08|imul|imul 8(%r12,%r13,2), %r10w
+4d 6b d2 05|imul|imul $5, %r10
+4d 69 d2 45 23 01 00|imul|imul $0x12345, %r10
+45 6b d2 05|imul|imul $5, %r10d
+45 69 d2 45 23 01 00|imul|imul $0x12345, %r10d
+66 45 6b d2 05|imul|imul $5, %r10w
+66 45 69 d2 34 12|imul|imul $0x1234, %r10w
+69 c0 45 23 01 00|imul|imul $0x12345, %eax
+4d 6b d1 03|imul|imul $3, %r9, %r10
+45 6b d1 03|imul|imul $3, %r9d, %r10d
+4f 69 54 6c 08 34 12 00 00|imul|imul $0x1234, 8(%r12,%r13,2), %r10
+49 ff c2|inc|inc %r10
+41 ff c2|inc|inc %r10d
+66 41 ff c2|inc|inc %r10w
+41 fe c2|inc|inc %r10b
+48 ff c0|inc|inc %rax
+ff c0|inc|inc %eax
+66 ff c0|inc|inc %ax
+fe c0|inc|inc %al
+4b ff 44 6c 08|inc|incq 8(%r12,%r13,2)
+43 ff 44 6c 08|inc|incl 8(%r12,%r13,2)
+66 43 ff 44 6c 08|inc|incw 8(%r12,%r13,2)
+43 fe 44 6c 08|inc|incb 8(%r12,%r13,2)
+77 3e|ja|ja .+0x40
+0f 87 fa 3f 00 00|ja|ja .+0x4000
+73 3e|jae|jae .+0x40
+0f 83 fa 3f 00 00|jae|jae .+0x4000
+72 3e|jb|jb .+0x40
+0f 82 fa 3f 00 00|jb|jb .+0x4000
+76 3e|jbe|jbe .+0x40
+0f 86 fa 3f 00 00|jbe|jbe .+0x4000
+74 3e|je|je .+0x40
+0f 84 fa 3f 00 00|je|je .+0x4000
+7f 3e|jg|jg .+0x40
+0f 8f fa 3f 00 00|jg|jg .+0x4000
+7d 3e|jge|jge .+0x40
+0f 8d fa 3f 00 00|jge|jge .+0x4000
+7c 3e|jl|jl .+0x40
+0f 8c fa 3f 00 00|jl|jl .+0x4000
+7e 3e|jle|jle .+0x40
+0f 8e fa 3f 00 00|jle|jle .+0x4000
+75 3e|jne|jne .+0x40
+0f 85 fa 3f 00 00|jne|jne .+0x4000
+70 3e|jo|jo .+0x40
+0f 80 fa 3f 00 00|jo|jo .+0x4000
+e3 3e|jrcxz|jrcxz .+0x40
+4f 8d 54 6c 08|lea|lea 8(%r12,%r13,2), %r10
+47 8d 54 6c 08|lea|lea 8(%r12,%r13,2), %r10d
+66 47 8d 54 6c 08|lea|lea 8(%r12,%r13,2), %r10w
+f3 4d 0f bd d1|lzcnt|lzcnt %r9, %r10
+f3 45 0f bd d1|lzcnt|lzcnt %r9d, %r10d
+66 f3 45 0f bd d1|lzcnt|lzcnt %r9w, %r10w
+f3 48 0f bd c1|lzcnt|lzcnt %rcx, %rax
+f3 0f bd c1|lzcnt|lzcnt %ecx, %eax
+66 f3 0f bd c1|lzcnt|lzcnt %cx, %ax
+f3 4f 0f bd 54 6c 08|lzcnt|lzcnt 8(%r12,%r13,2), %r10
+f3 47 0f bd 54 6c 08|lzcnt|lzcnt 8(%r12,%r13,2), %r10d
+66 f3 47 0f bd 54 6c 08|lzcnt|lzcnt 8(%r12,%r13,2), %r10w
+0f ae f0|mfence|mfence
+49 ba bc 9a 78 56 34 12 00 00|mov|movabsq $0x123456789abc, %r10
+48 b8 bc 9a 78 56 34 12 00 00|mov|movabsq $0x123456789abc, %rax
+4d 89 ca|mov|mov %r9, %r10
+45 89 ca|mov|mov %r9d, %r10d
+66 45 89 ca|mov|mov %r9w, %r10w
+45 88 ca|mov|mov %r9b, %r10b
+48 89 c8|mov|mov %rcx, %rax
+89 c8|mov|mov %ecx, %eax
+66 89 c8|mov|mov %cx, %ax
+88 c8|mov|mov %cl, %al
+4f 8b 54 6c 08|mov|mov 8(%r12,%r13,2), %r10
+47 8b 54 6c 08|mov|mov 8(%r12,%r13,2), %r10d
+66 47 8b 54 6c 08|mov|mov 8(%r12,%r13,2), %r10w
+47 8a 54 6c 08|mov|mov 8(%r12,%r13,2), %r10b
+4f 89 54 6c 08|mov|mov %r10, 8(%r12,%r13,2)
+47 89 54 6c 08|mov|mov %r10d, 8(%r12,%r13,2)
+66 47 89 54 6c 08|mov|mov %r10w, 8(%r12,%r13,2)
+47 88 54 6c 08|mov|mov %r10b, 8(%r12,%r13,2)
+49 c7 c2 05 00 00 00|mov|mov $5, %r10
+49 c7 c2 45 23 01 00|mov|mov $0x12345, %r10
+41 ba 05 00 00 00|mov|mov $5, %r10d
+41 ba 45 23 01 00|mov|mov $0x12345, %r10d
+66 41 ba 05 00|mov|mov $5, %r10w
+66 41 ba 34 12|mov|mov $0x1234, %r10w
+41 b2 05|mov|mov $5, %r10b
+b0 05|mov|mov $5, %al
+b8 45 23 01 00|mov|mov $0x12345, %eax
+4b c7 44 6c 08 05 00 00 00|mov|movq $5, 8(%r12,%r13,2)
+43 c7 44 6c 08 45 23 01 00|mov|movl $0x12345, 8(%r12,%r13,2)
+66 43 c7 44 6c 08 05 00|mov|movw $5, 8(%r12,%r13,2)
+43 c6 44 6c 08 05|mov|movb $5, 8(%r12,%r13,2)
+41 88 ca|mov|mov %cl, %r10b
+4f 0f 38 f0 54 6c 08|movbe|movbe 8(%r12,%r13,2), %r10
+47 0f 38 f0 54 6c 08|movbe|movbe 8(%r12,%r13,2), %r10d
+66 47 0f 38 f0 54 6c 08|movbe|movbe 8(%r12,%r13,2), %r10w
+4f 0f 38 f1 54 6c 08|movbe|movbe %r10, 8(%r12,%r13,2)
+47 0f 38 f1 54 6c 08|movbe|movbe %r10d, 8(%r12,%r13,2)
+66 47 0f 38 f1 54 6c 08|movbe|movbe %r10w, 8(%r12,%r13,2)
+66 4d 0f 6e ca|movq|movq %r10, %xmm9
+66 4d 0f 7e ca|movq|movq %xmm9, %r10
+f3 45 0f 7e d1|movq|movq %xmm9, %xmm10
+f3 47 0f 7e 4c 6c 08|movq|movq 8(%r12,%r13,2), %xmm9
+66 47 0f d6 4c 6c 08|movq|movq %xmm9, 8(%r12,%r13,2)
+f3 0f 7e ca|movq|movq %xmm2, %xmm1
+f3 47 0f 7e 54 6c 08|movq|movq 8(%r12,%r13,2), %xmm10
+f3 0f 7e 08|movq|movq (%rax), %xmm1
+66 47 0f d6 54 6c 08|movq|movq %xmm10, 8(%r12,%r13,2)
+66 0f d6 08|movq|movq %xmm1, (%rax)
+66 48 0f 6e c8|movq|movq %rax, %xmm1
+66 48 0f 7e c8|movq|movq %xmm1, %rax
+45 0f be d1|movsx|movsbl %r9b, %r10d
+45 0f bf d1|movsx|movswl %r9w, %r10d
+4d 0f be d1|movsx|movsbq %r9b, %r10
+4d 0f bf d1|movsx|movswq %r9w, %r10
+4f 0f be 54 6c 08|movsx|movsbq 8(%r12,%r13,2), %r10
+4f 0f bf 54 6c 08|movsx|movswq 8(%r12,%r13,2), %r10
+66 45 0f be d1|movsx|movsbw %r9b, %r10w
+66 47 0f be 54 6c 08|movsx|movsx 8(%r12,%r13,2), %r10w
+4c 0f be d1|movsx|movsx %cl, %r10
+44 0f be d1|movsx|movsx %cl, %r10d
+66 44 0f be d1|movsx|movsx %cl, %r10w
+4d 63 d1|movsxd|movslq %r9d, %r10
+4f 63 54 6c 08|movsxd|movslq 8(%r12,%r13,2), %r10
+48 63 c0|movsxd|movslq %eax, %rax
+45 0f b6 d1|movzx|movzbl %r9b, %r10d
+45 0f b7 d1|movzx|movzwl %r9w, %r10d
+4d 0f b6 d1|movzx|movzbq %r9b, %r10
+4d 0f b7 d1|movzx|movzwq %r9w, %r10
+47 0f b6 54 6c 08|movzx|movzbl 8(%r12,%r13,2), %r10d
+47 0f b7 54 6c 08|movzx|movzwl 8(%r12,%r13,2), %r10d
+0f b6 c0|movzx|movzbl %al, %eax
+0f b7 c0|movzx|movzwl %ax, %eax
+66 47 0f b6 54 6c 08|movzx|movzx 8(%r12,%r13,2), %r10w
+4c 0f b6 d1|movzx|movzx %cl, %r10
+44 0f b6 d1|movzx|movzx %cl, %r10d
+66 44 0f b6 d1|movzx|movzx %cl, %r10w
+49 f7 e2|mul|mul %r10
+41 f7 e2|mul|mul %r10d
+66 41 f7 e2|mul|mul %r10w
+41 f6 e2|mul|mul %r10b
+48 f7 e0|mul|mul %rax
+f7 e0|mul|mul %eax
+66 f7 e0|mul|mul %ax
+f6 e0|mul|mul %al
+4b f7 64 6c 08|mul|mulq 8(%r12,%r13,2)
+43 f7 64 6c 08|mul|mull 8(%r12,%r13,2)
+66 43 f7 64 6c 08|mul|mulw 8(%r12,%r13,2)
+43 f6 64 6c 08|mul|mulb 8(%r12,%r13,2)
+49 f7 da|neg|neg %r10
+41 f7 da|neg|neg %r10d
+66 41 f7 da|neg|neg %r10w
+41 f6 da|neg|neg %r10b
+48 f7 d8|neg|neg %rax
+f7 d8|neg|neg %eax
+66 f7 d8|neg|neg %ax
+f6 d8|neg|neg %al
+4b f7 5c 6c 08|neg|negq 8(%r12,%r13,2)
+43 f7 5c 6c 08|neg|negl 8(%r12,%r13,2)
+66 43 f7 5c 6c 08|neg|negw 8(%r12,%r13,2)
+43 f6 5c 6c 08|neg|negb 8(%r12,%r13,2)
+90|nop|nop
+49 0f 1f c2|nop|nop %r10
+41 0f 1f c2|nop|nop %r10d
+66 41 0f 1f c2|nop|nop %r10w
+48 0f 1f c0|nop|nop %rax
+0f 1f c0|nop|nop %eax
+66 0f 1f c0|nop|nop %ax
+4b 0f 1f 44 6c 08|nop|nopq 8(%r12,%r13,2)
+43 0f 1f 44 6c 08|nop|nopl 8(%r12,%r13,2)
+66 43 0f 1f 44 6c 08|nop|nopw 8(%r12,%r13,2)
+49 f7 d2|not_|not %r10
+41 f7 d2|not_|not %r10d
+66 41 f7 d2|not_|not %r10w
+41 f6 d2|not_|not %r10b
+48 f7 d0|not_|not %rax
+f7 d0|not_|not %eax
+66 f7 d0|not_|not %ax
+f6 d0|not_|not %al
+4b f7 54 6c 08|not_|notq 8(%r12,%r13,2)
+43 f7 54 6c 08|not_|notl 8(%r12,%r13,2)
+66 43 f7 54 6c 08|not_|notw 8(%r12,%r13,2)
+43 f6 54 6c 08|not_|notb 8(%r12,%r13,2)
+4d 09 ca|or_|or %r9, %r10
+45 09 ca|or_|or %r9d, %r10d
+66 45 09 ca|or_|or %r9w, %r10w
+45 08 ca|or_|or %r9b, %r10b
+48 09 c8|or_|or %rcx, %rax
+09 c8|or_|or %ecx, %eax
+66 09 c8|or_|or %cx, %ax
+08 c8|or_|or %cl, %al
+4f 0b 54 6c 08|or_|or 8(%r12,%r13,2), %r10
+47 0b 54 6c 08|or_|or 8(%r12,%r13,2), %r10d
+66 47 0b 54 6c 08|or_|or 8(%r12,%r13,2), %r10w
+47 0a 54 6c 08|or_|or 8(%r12,%r13,2), %r10b
+4f 09 54 6c 08|or_|or %r10, 8(%r12,%r13,2)
+47 09 54 6c 08|or_|or %r10d, 8(%r12,%r13,2)
+66 47 09 54 6c 08|or_|or %r10w, 8(%r12,%r13,2)
+47 08 54 6c 08|or_|or %r10b, 8(%r12,%r13,2)
+49 83 ca 05|or_|or $5, %r10
+49 81 ca 45 23 01 00|or_|or $0x12345, %r10
+41 83 ca 05|or_|or $5, %r10d
+41 81 ca 45 23 01 00|or_|or $0x12345, %r10d
+66 41 83 ca 05|or_|or $5, %r10w
+66 41 81 ca 34 12|or_|or $0x1234, %r10w
+41 80 ca 05|or_|or $5, %r10b
+0c 05|or_|or $5, %al
+0d 45 23 01 00|or_|or $0x12345, %eax
+4b 83 4c 6c 08 05|or_|orq $5, 8(%r12,%r13,2)
+43 81 4c 6c 08 45 23 01 00|or_|orl $0x12345, 8(%r12,%r13,2)
+66 43 83 4c 6c 08 05|or_|orw $5, 8(%r12,%r13,2)
+43 80 4c 6c 08 05|or_|orb $5, 8(%r12,%r13,2)
+41 08 ca|or_|or %cl, %r10b
+f3 90|pause|pause
+43 0f 18 4c 6c 08|prefetcht0|prefetcht0 8(%r12,%r13,2)
+43 0f 0d 4c 6c 08|prefetchw|prefetchw 8(%r12,%r13,2)
+41 52|push|push %r10
+66 41 52|push|push %r10w
+50|push|push %rax
+66 50|push|push %ax
+43 ff 74 6c 08|push|pushq 8(%r12,%r13,2)
+66 43 ff 74 6c 08|push|pushw 8(%r12,%r13,2)
+66 45 0f ef d1|pxor|pxor %xmm9, %xmm10
+66 0f ef ca|pxor|pxor %xmm2, %xmm1
+66 47 0f ef 54 6c 08|pxor|pxor 8(%r12,%r13,2), %xmm10
+66 0f ef 08|pxor|pxor (%rax), %xmm1
+66 47 0f ef 4c 6c 08|pxor|pxor 8(%r12,%r13,2), %xmm9
+0f 31|rdtsc|rdtsc
+49 d1 c2|rol|rol %r10
+41 d1 c2|rol|rol %r10d
+66 41 d1 c2|rol|rol %r10w
+41 d0 c2|rol|rol %r10b
+48 d1 c0|rol|rol %rax
+d1 c0|rol|rol %eax
+66 d1 c0|rol|rol %ax
+d0 c0|rol|rol %al
+4b d1 44 6c 08|rol|rolq 8(%r12,%r13,2)
+43 d1 44 6c 08|rol|roll 8(%r12,%r13,2)
+66 43 d1 44 6c 08|rol|rolw 8(%r12,%r13,2)
+43 d0 44 6c 08|rol|rolb 8(%r12,%r13,2)
+d2 c0|rol|rol %cl, %al
+49 c1 c2 05|rol|rol $5, %r10
+41 c1 c2 05|rol|rol $5, %r10d
+66 41 c1 c2 05|rol|rol $5, %r10w
+41 c0 c2 05|rol|rol $5, %r10b
+c0 c0 05|rol|rol $5, %al
+4b c1 44 6c 08 05|rol|rolq $5, 8(%r12,%r13,2)
+66 43 c1 44 6c 08 05|rol|rolw $5, 8(%r12,%r13,2)
+43 c0 44 6c 08 05|rol|rolb $5, 8(%r12,%r13,2)
+49 d3 c2|rol|rol %cl, %r10
+41 d3 c2|rol|rol %cl, %r10d
+66 41 d3 c2|rol|rol %cl, %r10w
+41 d2 c2|rol|rol %cl, %r10b
+49 d1 ca|ror|ror %r10
+41 d1 ca|ror|ror %r10d
+66 41 d1 ca|ror|ror %r10w
+41 d0 ca|ror|ror %r10b
+48 d1 c8|ror|ror %rax
+d1 c8|ror|ror %eax
+66 d1 c8|ror|ror %ax
+d0 c8|ror|ror %al
+4b d1 4c 6c 08|ror|rorq 8(%r12,%r13,2)
+43 d1 4c 6c 08|ror|rorl 8(%r12,%r13,2)
+66 43 d1 4c 6c 08|ror|rorw 8(%r12,%r13,2)
+43 d0 4c 6c 08|ror|rorb 8(%r12,%r13,2)
+d2 c8|ror|ror %cl, %al
+49 c1 ca 05|ror|ror $5, %r10
+41 c1 ca 05|ror|ror $5, %r10d
+66 41 c1 ca 05|ror|ror $5, %r10w
+41 c0 ca 05|ror|ror $5, %r10b
+c0 c8 05|ror|ror $5, %al
+4b c1 4c 6c 08 05|ror|rorq $5, 8(%r12,%r13,2)
+66 43 c1 4c 6c 08 05|ror|rorw $5, 8(%r12,%r13,2)
+43 c0 4c 6c 08 05|ror|rorb $5, 8(%r12,%r13,2)
+49 d3 ca|ror|ror %cl, %r10
+41 d3 ca|ror|ror %cl, %r10d
+66 41 d3 ca|ror|ror %cl, %r10w
+41 d2 ca|ror|ror %cl, %r10b
+49 d1 fa|sar|sar %r10
+41 d1 fa|sar|sar %r10d
+66 41 d1 fa|sar|sar %r10w
+41 d0 fa|sar|sar %r10b
+48 d1 f8|sar|sar %rax
+d1 f8|sar|sar %eax
+66 d1 f8|sar|sar %ax
+d0 f8|sar|sar %al
+4b d1 7c 6c 08|sar|sarq 8(%r12,%r13,2)
+43 d1 7c 6c 08|sar|sarl 8(%r12,%r13,2)
+66 43 d1 7c 6c 08|sar|sarw 8(%r12,%r13,2)
+43 d0 7c 6c 08|sar|sarb 8(%r12,%r13,2)
+d2 f8|sar|sar %cl, %al
+49 c1 fa 05|sar|sar $5, %r10
+41 c1 fa 05|sar|sar $5, %r10d
+66 41 c1 fa 05|sar|sar $5, %r10w
+41 c0 fa 05|sar|sar $5, %r10b
+c0 f8 05|sar|sar $5, %al
+4b c1 7c 6c 08 05|sar|sarq $5, 8(%r12,%r13,2)
+66 43 c1 7c 6c 08 05|sar|sarw $5, 8(%r12,%r13,2)
+43 c0 7c 6c 08 05|sar|sarb $5, 8(%r12,%r13,2)
+49 d3 fa|sar|sar %cl, %r10
+41 d3 fa|sar|sar %cl, %r10d
+66 41 d3 fa|sar|sar %cl, %r10w
+41 d2 fa|sar|sar %cl, %r10b
+41 0f 94 c2|sete|sete %r10b
+0f 94 c0|sete|sete %al
+43 0f 94 44 6c 08|sete|seteb 8(%r12,%r13,2)
+41 0f 95 c2|setne|setne %r10b
+0f 95 c0|setne|setne %al
+43 0f 95 44 6c 08|setne|setneb 8(%r12,%r13,2)
+41 0f 90 c2|seto|seto %r10b
+0f 90 c0|seto|seto %al
+43 0f 90 44 6c 08|seto|setob 8(%r12,%r13,2)
+41 0f 9a c2|setp|setp %r10b
+0f 9a c0|setp|setp %al
+43 0f 9a 44 6c 08|setp|setpb 8(%r12,%r13,2)
+49 d1 e2|shl|shl %r10
+41 d1 e2|shl|shl %r10d
+66 41 d1 e2|shl|shl %r10w
+41 d0 e2|shl|shl %r10b
+48 d1 e0|shl|shl %rax
+d1 e0|shl|shl %eax
+66 d1 e0|shl|shl %ax
+d0 e0|shl|shl %al
+4b d1 64 6c 08|shl|shlq 8(%r12,%r13,2)
+43 d1 64 6c 08|shl|shll 8(%r12,%r13,2)
+66 43 d1 64 6c 08|shl|shlw 8(%r12,%r13,2)
+43 d0 64 6c 08|shl|shlb 8(%r12,%r13,2)
+d2 e0|shl|shl %cl, %al
+49 c1 e2 05|shl|shl $5, %r10
+41 c1 e2 05|shl|shl $5, %r10d
+66 41 c1 e2 05|shl|shl $5, %r10w
+41 c0 e2 05|shl|shl $5, %r10b
+c0 e0 05|shl|shl $5, %al
+4b c1 64 6c 08 05|shl|shlq $5, 8(%r12,%r13,2)
+66 43 c1 64 6c 08 05|shl|shlw $5, 8(%r12,%r13,2)
+43 c0 64 6c 08 05|shl|shlb $5, 8(%r12,%r13,2)
+49 d3 e2|shl|shl %cl, %r10
+41 d3 e2|shl|shl %cl, %r10d
+66 41 d3 e2|shl|shl %cl, %r10w
+41 d2 e2|shl|shl %cl, %r10b
+49 d1 ea|shr|shr %r10
+41 d1 ea|shr|shr %r10d
+66 41 d1 ea|shr|shr %r10w
+41 d0 ea|shr|shr %r10b
+48 d1 e8|shr|shr %rax
+d1 e8|shr|shr %eax
+66 d1 e8|shr|shr %ax
+d0 e8|shr|shr %al
+4b d1 6c 6c 08|shr|shrq 8(%r12,%r13,2)
+43 d1 6c 6c 08|shr|shrl 8(%r12,%r13,2)
+66 43 d1 6c 6c 08|shr|shrw 8(%r12,%r13,2)
+43 d0 6c 6c 08|shr|shrb 8(%r12,%r13,2)
+d2 e8|shr|shr %cl, %al
+49 c1 ea 05|shr|shr $5, %r10
+41 c1 ea 05|shr|shr $5, %r10d
+66 41 c1 ea 05|shr|shr $5, %r10w
+41 c0 ea 05|shr|shr $5, %r10b
+c0 e8 05|shr|shr $5, %al
+4b c1 6c 6c 08 05|shr|shrq $5, 8(%r12,%r13,2)
+66 43 c1 6c 6c 08 05|shr|shrw $5, 8(%r12,%r13,2)
+43 c0 6c 6c 08 05|shr|shrb $5, 8(%r12,%r13,2)
+49 d3 ea|shr|shr %cl, %r10
+41 d3 ea|shr|shr %cl, %r10d
+66 41 d3 ea|shr|shr %cl, %r10w
+41 d2 ea|shr|shr %cl, %r10b
+f9|stc|stc
+4d 29 ca|sub|sub %r9, %r10
+45 29 ca|sub|sub %r9d, %r10d
+66 45 29 ca|sub|sub %r9w, %r10w
+45 28 ca|sub|sub %r9b, %r10b
+48 29 c8|sub|sub %rcx, %rax
+29 c8|sub|sub %ecx, %eax
+66 29 c8|sub|sub %cx, %ax
+28 c8|sub|sub %cl, %al
+4f 2b 54 6c 08|sub|sub 8(%r12,%r13,2), %r10
+47 2b 54 6c 08|sub|sub 8(%r12,%r13,2), %r10d
+66 47 2b 54 6c 08|sub|sub 8(%r12,%r13,2), %r10w
+47 2a 54 6c 08|sub|sub 8(%r12,%r13,2), %r10b
+4f 29 54 6c 08|sub|sub %r10, 8(%r12,%r13,2)
+47 29 54 6c 08|sub|sub %r10d, 8(%r12,%r13,2)
+66 47 29 54 6c 08|sub|sub %r10w, 8(%r12,%r13,2)
+47 28 54 6c 08|sub|sub %r10b, 8(%r12,%r13,2)
+49 83 ea 05|sub|sub $5, %r10
+49 81 ea 45 23 01 00|sub|sub $0x12345, %r10
+41 83 ea 05|sub|sub $5, %r10d
+41 81 ea 45 23 01 00|sub|sub $0x12345, %r10d
+66 41 83 ea 05|sub|sub $5, %r10w
+66 41 81 ea 34 12|sub|sub $0x1234, %r10w
+41 80 ea 05|sub|sub $5, %r10b
+2c 05|sub|sub $5, %al
+2d 45 23 01 00|sub|sub $0x12345, %eax
+4b 83 6c 6c 08 05|sub|subq $5, 8(%r12,%r13,2)
+43 81 6c 6c 08 45 23 01 00|sub|subl $0x12345, 8(%r12,%r13,2)
+66 43 83 6c 6c 08 05|sub|subw $5, 8(%r12,%r13,2)
+43 80 6c 6c 08 05|sub|subb $5, 8(%r12,%r13,2)
+41 28 ca|sub|sub %cl, %r10b
+4d 85 ca|test|test %r9, %r10
+45 85 ca|test|test %r9d, %r10d
+66 45 85 ca|test|test %r9w, %r10w
+45 84 ca|test|test %r9b, %r10b
+48 85 c8|test|test %rcx, %rax
+85 c8|test|test %ecx, %eax
+66 85 c8|test|test %cx, %ax
+84 c8|test|test %cl, %al
+4f 85 54 6c 08|test|test 8(%r12,%r13,2), %r10
+47 85 54 6c 08|test|test 8(%r12,%r13,2), %r10d
+66 47 85 54 6c 08|test|test 8(%r12,%r13,2), %r10w
+47 84 54 6c 08|test|test 8(%r12,%r13,2), %r10b
+49 f7 c2 05 00 00 00|test|test $5, %r10
+49 f7 c2 45 23 01 00|test|test $0x12345, %r10
+41 f7 c2 05 00 00 00|test|test $5, %r10d
+41 f7 c2 45 23 01 00|test|test $0x12345, %r10d
+66 41 f7 c2 05 00|test|test $5, %r10w
+66 41 f7 c2 34 12|test|test $0x1234, %r10w
+41 f6 c2 05|test|test $5, %r10b
+a8 05|test|test $5, %al
+a9 45 23 01 00|test|test $0x12345, %eax
+4b f7 44 6c 08 05 00 00 00|test|testq $5, 8(%r12,%r13,2)
+43 f7 44 6c 08 45 23 01 00|test|testl $0x12345, 8(%r12,%r13,2)
+66 43 f7 44 6c 08 05 00|test|testw $5, 8(%r12,%r13,2)
+43 f6 44 6c 08 05|test|testb $5, 8(%r12,%r13,2)
+41 84 ca|test|test %cl, %r10b
+c4 41 31 58 d3|vaddpd|vaddpd %xmm11, %xmm9, %xmm10
+c5 e9 58 cb|vaddpd|vaddpd %xmm3, %xmm2, %xmm1
+c4 01 31 58 54 6c 08|vaddpd|vaddpd 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 58 08|vaddpd|vaddpd (%rax), %xmm2, %xmm1
+c4 41 35 58 d3|vaddpd|vaddpd %ymm11, %ymm9, %ymm10
+c5 ed 58 cb|vaddpd|vaddpd %ymm3, %ymm2, %ymm1
+c4 01 35 58 54 6c 08|vaddpd|vaddpd 8(%r12,%r13,2), %ymm9, %ymm10
+c4 41 30 58 d3|vaddps|vaddps %xmm11, %xmm9, %xmm10
+c5 e8 58 cb|vaddps|vaddps %xmm3, %xmm2, %xmm1
+c4 01 30 58 54 6c 08|vaddps|vaddps 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e8 58 08|vaddps|vaddps (%rax), %xmm2, %xmm1
+c4 41 34 58 d3|vaddps|vaddps %ymm11, %ymm9, %ymm10
+c5 ec 58 cb|vaddps|vaddps %ymm3, %ymm2, %ymm1
+c4 01 34 58 54 6c 08|vaddps|vaddps 8(%r12,%r13,2), %ymm9, %ymm10
+c4 41 33 58 d3|vaddsd|vaddsd %xmm11, %xmm9, %xmm10
+c5 eb 58 cb|vaddsd|vaddsd %xmm3, %xmm2, %xmm1
+c4 01 33 58 54 6c 08|vaddsd|vaddsd 8(%r12,%r13,2), %xmm9, %xmm10
+c5 eb 58 08|vaddsd|vaddsd (%rax), %xmm2, %xmm1
+c4 41 32 58 d3|vaddss|vaddss %xmm11, %xmm9, %xmm10
+c5 ea 58 cb|vaddss|vaddss %xmm3, %xmm2, %xmm1
+c4 01 32 58 54 6c 08|vaddss|vaddss 8(%r12,%r13,2), %xmm9, %xmm10
+c5 ea 58 08|vaddss|vaddss (%rax), %xmm2, %xmm1
+c4 41 30 55 d3|vandnps|vandnps %xmm11, %xmm9, %xmm10
+c5 e8 55 cb|vandnps|vandnps %xmm3, %xmm2, %xmm1
+c4 01 30 55 54 6c 08|vandnps|vandnps 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e8 55 08|vandnps|vandnps (%rax), %xmm2, %xmm1
+c4 41 34 55 d3|vandnps|vandnps %ymm11, %ymm9, %ymm10
+c5 ec 55 cb|vandnps|vandnps %ymm3, %ymm2, %ymm1
+c4 01 34 55 54 6c 08|vandnps|vandnps 8(%r12,%r13,2), %ymm9, %ymm10
+c4 41 31 54 d3|vandpd|vandpd %xmm11, %xmm9, %xmm10
+c5 e9 54 cb|vandpd|vandpd %xmm3, %xmm2, %xmm1
+c4 01 31 54 54 6c 08|vandpd|vandpd 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 54 08|vandpd|vandpd (%rax), %xmm2, %xmm1
+c4 41 35 54 d3|vandpd|vandpd %ymm11, %ymm9, %ymm10
+c5 ed 54 cb|vandpd|vandpd %ymm3, %ymm2, %ymm1
+c4 01 35 54 54 6c 08|vandpd|vandpd 8(%r12,%r13,2), %ymm9, %ymm10
+c4 41 30 54 d3|vandps|vandps %xmm11, %xmm9, %xmm10
+c5 e8 54 cb|vandps|vandps %xmm3, %xmm2, %xmm1
+c4 01 30 54 54 6c 08|vandps|vandps 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e8 54 08|vandps|vandps (%rax), %xmm2, %xmm1
+c4 41 34 54 d3|vandps|vandps %ymm11, %ymm9, %ymm10
+c5 ec 54 cb|vandps|vandps %ymm3, %ymm2, %ymm1
+c4 01 34 54 54 6c 08|vandps|vandps 8(%r12,%r13,2), %ymm9, %ymm10
+c4 43 31 4a d3 c0|vblendvps|vblendvps %xmm12, %xmm11, %xmm9, %xmm10
+c4 e3 69 4a cb 40|vblendvps|vblendvps %xmm4, %xmm3, %xmm2, %xmm1
+c4 03 31 4a 54 6c 08 c0|vblendvps|vblendvps %xmm12, 8(%r12,%r13,2), %xmm9, %xmm10
+c4 43 35 4a d3 c0|vblendvps|vblendvps %ymm12, %ymm11, %ymm9, %ymm10
+c4 42 79 18 d1|vbroadcastss|vbroadcastss %xmm9, %xmm10
+c4 e2 79 18 ca|vbroadcastss|vbroadcastss %xmm2, %xmm1
+c4 02 79 18 54 6c 08|vbroadcastss|vbroadcastss 8(%r12,%r13,2), %xmm10
+c4 e2 79 18 08|vbroadcastss|vbroadcastss (%rax), %xmm1
+c4 02 7d 18 54 6c 08|vbroadcastss|vbroadcastss 8(%r12,%r13,2), %ymm10
+c4 42 7d 18 d1|vbroadcastss|vbroadcastss %xmm9, %ymm10
+c4 e2 7d 18 ca|vbroadcastss|vbroadcastss %xmm2, %ymm1
+c4 02 79 18 4c 6c 08|vbroadcastss|vbroadcastss 8(%r12,%r13,2), %xmm9
+c4 41 30 c2 d3 00|vcmpeqps|vcmpeqps %xmm11, %xmm9, %xmm10
+c5 e8 c2 cb 00|vcmpeqps|vcmpeqps %xmm3, %xmm2, %xmm1
+c4 01 30 c2 54 6c 08 00|vcmpeqps|vcmpeqps 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e8 c2 08 00|vcmpeqps|vcmpeqps (%rax), %xmm2, %xmm1
+c4 41 34 c2 d3 00|vcmpeqps|vcmpeqps %ymm11, %ymm9, %ymm10
+c5 ec c2 cb 00|vcmpeqps|vcmpeqps %ymm3, %ymm2, %ymm1
+c4 01 34 c2 54 6c 08 00|vcmpeqps|vcmpeqps 8(%r12,%r13,2), %ymm9, %ymm10
+c4 41 30 c2 d3 0d|vcmpgeps|vcmpgeps %xmm11, %xmm9, %xmm10
+c5 e8 c2 cb 0d|vcmpgeps|vcmpgeps %xmm3, %xmm2, %xmm1
+c4 01 30 c2 54 6c 08 0d|vcmpgeps|vcmpgeps 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e8 c2 08 0d|vcmpgeps|vcmpgeps (%rax), %xmm2, %xmm1
+c4 41 34 c2 d3 0d|vcmpgeps|vcmpgeps %ymm11, %ymm9, %ymm10
+c5 ec c2 cb 0d|vcmpgeps|vcmpgeps %ymm3, %ymm2, %ymm1
+c4 01 34 c2 54 6c 08 0d|vcmpgeps|vcmpgeps 8(%r12,%r13,2), %ymm9, %ymm10
+c4 41 30 c2 d3 0e|vcmpgtps|vcmpgtps %xmm11, %xmm9, %xmm10
+c5 e8 c2 cb 0e|vcmpgtps|vcmpgtps %xmm3, %xmm2, %xmm1
+c4 01 30 c2 54 6c 08 0e|vcmpgtps|vcmpgtps 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e8 c2 08 0e|vcmpgtps|vcmpgtps (%rax), %xmm2, %xmm1
+c4 41 34 c2 d3 0e|vcmpgtps|vcmpgtps %ymm11, %ymm9, %ymm10
+c5 ec c2 cb 0e|vcmpgtps|vcmpgtps %ymm3, %ymm2, %ymm1
+c4 01 34 c2 54 6c 08 0e|vcmpgtps|vcmpgtps 8(%r12,%r13,2), %ymm9, %ymm10
+c4 41 30 c2 d3 04|vcmpneqps|vcmpneqps %xmm11, %xmm9, %xmm10
+c5 e8 c2 cb 04|vcmpneqps|vcmpneqps %xmm3, %xmm2, %xmm1
+c4 01 30 c2 54 6c 08 04|vcmpneqps|vcmpneqps 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e8 c2 08 04|vcmpneqps|vcmpneqps (%rax), %xmm2, %xmm1
+c4 41 34 c2 d3 04|vcmpneqps|vcmpneqps %ymm11, %ymm9, %ymm10
+c5 ec c2 cb 04|vcmpneqps|vcmpneqps %ymm3, %ymm2, %ymm1
+c4 01 34 c2 54 6c 08 04|vcmpneqps|vcmpneqps 8(%r12,%r13,2), %ymm9, %ymm10
+c4 41 30 c2 d3 03|vcmpps|vcmpps $3, %xmm11, %xmm9, %xmm10
+c5 e8 c2 cb 03|vcmpps|vcmpps $3, %xmm3, %xmm2, %xmm1
+c4 01 30 c2 54 6c 08 03|vcmpps|vcmpps $3, 8(%r12,%r13,2), %xmm9, %xmm10
+c4 41 34 c2 d3 03|vcmpps|vcmpps $3, %ymm11, %ymm9, %ymm10
+c4 01 34 c2 54 6c 08 01|vcmpps|vcmpps $1, 8(%r12,%r13,2), %ymm9, %ymm10
+c4 01 30 c2 54 6c 08 01|vcmpps|vcmpps $1, 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e8 c2 08 03|vcmpunordps|vcmpunordps (%rax), %xmm2, %xmm1
+c5 ec c2 cb 03|vcmpunordps|vcmpunordps %ymm3, %ymm2, %ymm1
+c4 01 34 c2 54 6c 08 03|vcmpunordps|vcmpunordps 8(%r12,%r13,2), %ymm9, %ymm10
+c4 41 79 2f d1|vcomisd|vcomisd %xmm9, %xmm10
+c5 f9 2f ca|vcomisd|vcomisd %xmm2, %xmm1
+c4 01 79 2f 54 6c 08|vcomisd|vcomisd 8(%r12,%r13,2), %xmm10
+c5 f9 2f 08|vcomisd|vcomisd (%rax), %xmm1
+c4 01 79 2f 4c 6c 08|vcomisd|vcomisd 8(%r12,%r13,2), %xmm9
+c4 41 78 2f d1|vcomiss|vcomiss %xmm9, %xmm10
+c5 f8 2f ca|vcomiss|vcomiss %xmm2, %xmm1
+c4 01 78 2f 54 6c 08|vcomiss|vcomiss 8(%r12,%r13,2), %xmm10
+c5 f8 2f 08|vcomiss|vcomiss (%rax), %xmm1
+c4 01 78 2f 4c 6c 08|vcomiss|vcomiss 8(%r12,%r13,2), %xmm9
+c4 41 78 5b d1|vcvtdq2ps|vcvtdq2ps %xmm9, %xmm10
+c5 f8 5b ca|vcvtdq2ps|vcvtdq2ps %xmm2, %xmm1
+c4 01 78 5b 54 6c 08|vcvtdq2ps|vcvtdq2ps 8(%r12,%r13,2), %xmm10
+c5 f8 5b 08|vcvtdq2ps|vcvtdq2ps (%rax), %xmm1
+c4 41 7c 5b d1|vcvtdq2ps|vcvtdq2ps %ymm9, %ymm10
+c5 fc 5b ca|vcvtdq2ps|vcvtdq2ps %ymm2, %ymm1
+c4 01 7c 5b 54 6c 08|vcvtdq2ps|vcvtdq2ps 8(%r12,%r13,2), %ymm10
+c4 01 78 5b 4c 6c 08|vcvtdq2ps|vcvtdq2ps 8(%r12,%r13,2), %xmm9
+c4 41 78 5a d1|vcvtps2pd|vcvtps2pd %xmm9, %xmm10
+c5 f8 5a ca|vcvtps2pd|vcvtps2pd %xmm2, %xmm1
+c4 01 78 5a 54 6c 08|vcvtps2pd|vcvtps2pd 8(%r12,%r13,2), %xmm10
+c5 f8 5a 08|vcvtps2pd|vcvtps2pd (%rax), %xmm1
+c4 01 7c 5a 54 6c 08|vcvtps2pd|vcvtps2pd 8(%r12,%r13,2), %ymm10
+c4 41 7c 5a d1|vcvtps2pd|vcvtps2pd %xmm9, %ymm10
+c5 fc 5a ca|vcvtps2pd|vcvtps2pd %xmm2, %ymm1
+c4 01 78 5a 4c 6c 08|vcvtps2pd|vcvtps2pd 8(%r12,%r13,2), %xmm9
+c4 41 fb 2d d1|vcvtsd2si|vcvtsd2si %xmm9, %r10
+c4 41 7b 2d d1|vcvtsd2si|vcvtsd2si %xmm9, %r10d
+c4 e1 fb 2d c1|vcvtsd2si|vcvtsd2si %xmm1, %rax
+c5 fb 2d c1|vcvtsd2si|vcvtsd2si %xmm1, %eax
+c4 01 fb 2d 54 6c 08|vcvtsd2si|vcvtsd2si 8(%r12,%r13,2), %r10
+c4 01 7b 2d 54 6c 08|vcvtsd2si|vcvtsd2si 8(%r12,%r13,2), %r10d
+c4 41 33 5a d3|vcvtsd2ss|vcvtsd2ss %xmm11, %xmm9, %xmm10
+c5 eb 5a cb|vcvtsd2ss|vcvtsd2ss %xmm3, %xmm2, %xmm1
+c4 01 33 5a 54 6c 08|vcvtsd2ss|vcvtsd2ss 8(%r12,%r13,2), %xmm9, %xmm10
+c5 eb 5a 08|vcvtsd2ss|vcvtsd2ss (%rax), %xmm2, %xmm1
+c4 01 33 2a 54 6c 08|vcvtsi2sd|vcvtsi2sd 8(%r12,%r13,2), %xmm9, %xmm10
+c5 eb 2a 08|vcvtsi2sd|vcvtsi2sd (%rax), %xmm2, %xmm1
+c4 41 b3 2a d2|vcvtsi2sd|vcvtsi2sdq %r10, %xmm9, %xmm10
+c4 41 33 2a d2|vcvtsi2sd|vcvtsi2sdl %r10d, %xmm9, %xmm10
+c4 01 b3 2a 54 6c 08|vcvtsi2sd|vcvtsi2sdq 8(%r12,%r13,2), %xmm9, %xmm10
+c4 e1 eb 2a c8|vcvtsi2sd|vcvtsi2sdq %rax, %xmm2, %xmm1
+c5 eb 2a c8|vcvtsi2sd|vcvtsi2sdl %eax, %xmm2, %xmm1
+c4 41 32 5a d3|vcvtss2sd|vcvtss2sd %xmm11, %xmm9, %xmm10
+c5 ea 5a cb|vcvtss2sd|vcvtss2sd %xmm3, %xmm2, %xmm1
+c4 01 32 5a 54 6c 08|vcvtss2sd|vcvtss2sd 8(%r12,%r13,2), %xmm9, %xmm10
+c5 ea 5a 08|vcvtss2sd|vcvtss2sd (%rax), %xmm2, %xmm1
+c4 41 fa 2d d1|vcvtss2si|vcvtss2si %xmm9, %r10
+c4 41 7a 2d d1|vcvtss2si|vcvtss2si %xmm9, %r10d
+c4 e1 fa 2d c1|vcvtss2si|vcvtss2si %xmm1, %rax
+c5 fa 2d c1|vcvtss2si|vcvtss2si %xmm1, %eax
+c4 01 fa 2d 54 6c 08|vcvtss2si|vcvtss2si 8(%r12,%r13,2), %r10
+c4 01 7a 2d 54 6c 08|vcvtss2si|vcvtss2si 8(%r12,%r13,2), %r10d
+c4 41 7a 5b d1|vcvttps2dq|vcvttps2dq %xmm9, %xmm10
+c5 fa 5b ca|vcvttps2dq|vcvttps2dq %xmm2, %xmm1
+c4 01 7a 5b 54 6c 08|vcvttps2dq|vcvttps2dq 8(%r12,%r13,2), %xmm10
+c5 fa 5b 08|vcvttps2dq|vcvttps2dq (%rax), %xmm1
+c4 41 7e 5b d1|vcvttps2dq|vcvttps2dq %ymm9, %ymm10
+c5 fe 5b ca|vcvttps2dq|vcvttps2dq %ymm2, %ymm1
+c4 01 7e 5b 54 6c 08|vcvttps2dq|vcvttps2dq 8(%r12,%r13,2), %ymm10
+c4 01 7a 5b 4c 6c 08|vcvttps2dq|vcvttps2dq 8(%r12,%r13,2), %xmm9
+c4 41 fb 2c d1|vcvttsd2si|vcvttsd2si %xmm9, %r10
+c4 41 7b 2c d1|vcvttsd2si|vcvttsd2si %xmm9, %r10d
+c4 e1 fb 2c c1|vcvttsd2si|vcvttsd2si %xmm1, %rax
+c5 fb 2c c1|vcvttsd2si|vcvttsd2si %xmm1, %eax
+c4 01 fb 2c 54 6c 08|vcvttsd2si|vcvttsd2si 8(%r12,%r13,2), %r10
+c4 01 7b 2c 54 6c 08|vcvttsd2si|vcvttsd2si 8(%r12,%r13,2), %r10d
+c4 41 fa 2c d1|vcvttss2si|vcvttss2si %xmm9, %r10
+c4 41 7a 2c d1|vcvttss2si|vcvttss2si %xmm9, %r10d
+c4 e1 fa 2c c1|vcvttss2si|vcvttss2si %xmm1, %rax
+c5 fa 2c c1|vcvttss2si|vcvttss2si %xmm1, %eax
+c4 01 fa 2c 54 6c 08|vcvttss2si|vcvttss2si 8(%r12,%r13,2), %r10
+c4 01 7a 2c 54 6c 08|vcvttss2si|vcvttss2si 8(%r12,%r13,2), %r10d
+c4 41 30 5e d3|vdivps|vdivps %xmm11, %xmm9, %xmm10
+c5 e8 5e cb|vdivps|vdivps %xmm3, %xmm2, %xmm1
+c4 01 30 5e 54 6c 08|vdivps|vdivps 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e8 5e 08|vdivps|vdivps (%rax), %xmm2, %xmm1
+c4 41 34 5e d3|vdivps|vdivps %ymm11, %ymm9, %ymm10
+c5 ec 5e cb|vdivps|vdivps %ymm3, %ymm2, %ymm1
+c4 01 34 5e 54 6c 08|vdivps|vdivps 8(%r12,%r13,2), %ymm9, %ymm10
+c4 41 33 5e d3|vdivsd|vdivsd %xmm11, %xmm9, %xmm10
+c5 eb 5e cb|vdivsd|vdivsd %xmm3, %xmm2, %xmm1
+c4 01 33 5e 54 6c 08|vdivsd|vdivsd 8(%r12,%r13,2), %xmm9, %xmm10
+c5 eb 5e 08|vdivsd|vdivsd (%rax), %xmm2, %xmm1
+c4 41 32 5e d3|vdivss|vdivss %xmm11, %xmm9, %xmm10
+c5 ea 5e cb|vdivss|vdivss %xmm3, %xmm2, %xmm1
+c4 01 32 5e 54 6c 08|vdivss|vdivss 8(%r12,%r13,2), %xmm9, %xmm10
+c5 ea 5e 08|vdivss|vdivss (%rax), %xmm2, %xmm1
+c4 43 7d 19 ca 01|vextractf128|vextractf128 $1, %ymm9, %xmm10
+c4 03 7d 19 4c 6c 08 01|vextractf128|vextractf128 $1, %ymm9, 8(%r12,%r13,2)
+c4 81 78 ae 54 6c 08|vldmxcsr|vldmxcsr 8(%r12,%r13,2)
+c4 41 30 5f d3|vmaxps|vmaxps %xmm11, %xmm9, %xmm10
+c5 e8 5f cb|vmaxps|vmaxps %xmm3, %xmm2, %xmm1
+c4 01 30 5f 54 6c 08|vmaxps|vmaxps 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e8 5f 08|vmaxps|vmaxps (%rax), %xmm2, %xmm1
+c4 41 34 5f d3|vmaxps|vmaxps %ymm11, %ymm9, %ymm10
+c5 ec 5f cb|vmaxps|vmaxps %ymm3, %ymm2, %ymm1
+c4 01 34 5f 54 6c 08|vmaxps|vmaxps 8(%r12,%r13,2), %ymm9, %ymm10
+c4 41 33 5f d3|vmaxsd|vmaxsd %xmm11, %xmm9, %xmm10
+c5 eb 5f cb|vmaxsd|vmaxsd %xmm3, %xmm2, %xmm1
+c4 01 33 5f 54 6c 08|vmaxsd|vmaxsd 8(%r12,%r13,2), %xmm9, %xmm10
+c5 eb 5f 08|vmaxsd|vmaxsd (%rax), %xmm2, %xmm1
+c4 41 30 5d d3|vminps|vminps %xmm11, %xmm9, %xmm10
+c5 e8 5d cb|vminps|vminps %xmm3, %xmm2, %xmm1
+c4 01 30 5d 54 6c 08|vminps|vminps 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e8 5d 08|vminps|vminps (%rax), %xmm2, %xmm1
+c4 41 34 5d d3|vminps|vminps %ymm11, %ymm9, %ymm10
+c5 ec 5d cb|vminps|vminps %ymm3, %ymm2, %ymm1
+c4 01 34 5d 54 6c 08|vminps|vminps 8(%r12,%r13,2), %ymm9, %ymm10
+c4 41 33 5d d3|vminsd|vminsd %xmm11, %xmm9, %xmm10
+c5 eb 5d cb|vminsd|vminsd %xmm3, %xmm2, %xmm1
+c4 01 33 5d 54 6c 08|vminsd|vminsd 8(%r12,%r13,2), %xmm9, %xmm10
+c5 eb 5d 08|vminsd|vminsd (%rax), %xmm2, %xmm1
+c4 41 79 28 d1|vmovapd|vmovapd %xmm9, %xmm10
+c5 f9 28 ca|vmovapd|vmovapd %xmm2, %xmm1
+c4 01 79 28 54 6c 08|vmovapd|vmovapd 8(%r12,%r13,2), %xmm10
+c5 f9 28 08|vmovapd|vmovapd (%rax), %xmm1
+c4 01 79 29 54 6c 08|vmovapd|vmovapd %xmm10, 8(%r12,%r13,2)
+c5 f9 29 08|vmovapd|vmovapd %xmm1, (%rax)
+c4 41 7d 28 d1|vmovapd|vmovapd %ymm9, %ymm10
+c5 fd 28 ca|vmovapd|vmovapd %ymm2, %ymm1
+c4 01 7d 28 54 6c 08|vmovapd|vmovapd 8(%r12,%r13,2), %ymm10
+c4 01 7d 29 54 6c 08|vmovapd|vmovapd %ymm10, 8(%r12,%r13,2)
+c4 01 79 28 4c 6c 08|vmovapd|vmovapd 8(%r12,%r13,2), %xmm9
+c4 01 79 29 4c 6c 08|vmovapd|vmovapd %xmm9, 8(%r12,%r13,2)
+c4 41 78 28 d1|vmovaps|vmovaps %xmm9, %xmm10
+c5 f8 28 ca|vmovaps|vmovaps %xmm2, %xmm1
+c4 01 78 28 54 6c 08|vmovaps|vmovaps 8(%r12,%r13,2), %xmm10
+c5 f8 28 08|vmovaps|vmovaps (%rax), %xmm1
+c4 01 78 29 54 6c 08|vmovaps|vmovaps %xmm10, 8(%r12,%r13,2)
+c5 f8 29 08|vmovaps|vmovaps %xmm1, (%rax)
+c4 41 7c 28 d1|vmovaps|vmovaps %ymm9, %ymm10
+c5 fc 28 ca|vmovaps|vmovaps %ymm2, %ymm1
+c4 01 7c 28 54 6c 08|vmovaps|vmovaps 8(%r12,%r13,2), %ymm10
+c4 01 7c 29 54 6c 08|vmovaps|vmovaps %ymm10, 8(%r12,%r13,2)
+c4 01 78 28 4c 6c 08|vmovaps|vmovaps 8(%r12,%r13,2), %xmm9
+c4 01 78 29 4c 6c 08|vmovaps|vmovaps %xmm9, 8(%r12,%r13,2)
+c4 01 79 6e 54 6c 08|vmovd|vmovd 8(%r12,%r13,2), %xmm10
+c5 f9 6e 08|vmovd|vmovd (%rax), %xmm1
+c4 01 79 7e 54 6c 08|vmovd|vmovd %xmm10, 8(%r12,%r13,2)
+c5 f9 7e 08|vmovd|vmovd %xmm1, (%rax)
+c4 41 f9 6e ca|vmovd|vmovd %r10, %xmm9
+c4 41 f9 7e ca|vmovd|vmovd %xmm9, %r10
+c4 41 79 6e ca|vmovd|vmovd %r10d, %xmm9
+c4 41 79 7e ca|vmovd|vmovd %xmm9, %r10d
+c4 e1 f9 6e c8|vmovd|vmovd %rax, %xmm1
+c4 e1 f9 7e c8|vmovd|vmovd %xmm1, %rax
+c5 f9 6e c8|vmovd|vmovd %eax, %xmm1
+c5 f9 7e c8|vmovd|vmovd %xmm1, %eax
+c4 01 79 6e 4c 6c 08|vmovd|vmovd 8(%r12,%r13,2), %xmm9
+c4 01 79 7e 4c 6c 08|vmovd|vmovd %xmm9, 8(%r12,%r13,2)
+c4 41 79 6f d1|vmovdqa|vmovdqa %xmm9, %xmm10
+c5 f9 6f ca|vmovdqa|vmovdqa %xmm2, %xmm1
+c4 01 79 6f 54 6c 08|vmovdqa|vmovdqa 8(%r12,%r13,2), %xmm10
+c5 f9 6f 08|vmovdqa|vmovdqa (%rax), %xmm1
+c4 01 79 7f 54 6c 08|vmovdqa|vmovdqa %xmm10, 8(%r12,%r13,2)
+c5 f9 7f 08|vmovdqa|vmovdqa %xmm1, (%rax)
+c4 41 7d 6f d1|vmovdqa|vmovdqa %ymm9, %ymm10
+c5 fd 6f ca|vmovdqa|vmovdqa %ymm2, %ymm1
+c4 01 7d 6f 54 6c 08|vmovdqa|vmovdqa 8(%r12,%r13,2), %ymm10
+c4 01 7d 7f 54 6c 08|vmovdqa|vmovdqa %ymm10, 8(%r12,%r13,2)
+c4 01 79 6f 4c 6c 08|vmovdqa|vmovdqa 8(%r12,%r13,2), %xmm9
+c4 01 79 7f 4c 6c 08|vmovdqa|vmovdqa %xmm9, 8(%r12,%r13,2)
+c4 41 7a 7e d1|vmovq|vmovq %xmm9, %xmm10
+c5 fa 7e ca|vmovq|vmovq %xmm2, %xmm1
+c4 01 7a 7e 54 6c 08|vmovq|vmovq 8(%r12,%r13,2), %xmm10
+c5 fa 7e 08|vmovq|vmovq (%rax), %xmm1
+c4 01 79 d6 54 6c 08|vmovq|vmovq %xmm10, 8(%r12,%r13,2)
+c5 f9 d6 08|vmovq|vmovq %xmm1, (%rax)
+c4 01 7a 7e 4c 6c 08|vmovq|vmovq 8(%r12,%r13,2), %xmm9
+c4 01 79 d6 4c 6c 08|vmovq|vmovq %xmm9, 8(%r12,%r13,2)
+c4 41 33 10 d3|vmovsd|vmovsd %xmm11, %xmm9, %xmm10
+c5 eb 10 cb|vmovsd|vmovsd %xmm3, %xmm2, %xmm1
+c4 01 7b 10 54 6c 08|vmovsd|vmovsd 8(%r12,%r13,2), %xmm10
+c5 fb 10 08|vmovsd|vmovsd (%rax), %xmm1
+c4 01 7b 11 54 6c 08|vmovsd|vmovsd %xmm10, 8(%r12,%r13,2)
+c5 fb 11 08|vmovsd|vmovsd %xmm1, (%rax)
+c4 01 7b 10 4c 6c 08|vmovsd|vmovsd 8(%r12,%r13,2), %xmm9
+c4 01 7b 11 4c 6c 08|vmovsd|vmovsd %xmm9, 8(%r12,%r13,2)
+c4 41 32 10 d3|vmovss|vmovss %xmm11, %xmm9, %xmm10
+c5 ea 10 cb|vmovss|vmovss %xmm3, %xmm2, %xmm1
+c4 01 7a 10 54 6c 08|vmovss|vmovss 8(%r12,%r13,2), %xmm10
+c5 fa 10 08|vmovss|vmovss (%rax), %xmm1
+c4 01 7a 11 54 6c 08|vmovss|vmovss %xmm10, 8(%r12,%r13,2)
+c5 fa 11 08|vmovss|vmovss %xmm1, (%rax)
+c4 01 7a 10 4c 6c 08|vmovss|vmovss 8(%r12,%r13,2), %xmm9
+c4 01 7a 11 4c 6c 08|vmovss|vmovss %xmm9, 8(%r12,%r13,2)
+c4 41 31 59 d3|vmulpd|vmulpd %xmm11, %xmm9, %xmm10
+c5 e9 59 cb|vmulpd|vmulpd %xmm3, %xmm2, %xmm1
+c4 01 31 59 54 6c 08|vmulpd|vmulpd 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 59 08|vmulpd|vmulpd (%rax), %xmm2, %xmm1
+c4 41 35 59 d3|vmulpd|vmulpd %ymm11, %ymm9, %ymm10
+c5 ed 59 cb|vmulpd|vmulpd %ymm3, %ymm2, %ymm1
+c4 01 35 59 54 6c 08|vmulpd|vmulpd 8(%r12,%r13,2), %ymm9, %ymm10
+c4 41 30 59 d3|vmulps|vmulps %xmm11, %xmm9, %xmm10
+c5 e8 59 cb|vmulps|vmulps %xmm3, %xmm2, %xmm1
+c4 01 30 59 54 6c 08|vmulps|vmulps 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e8 59 08|vmulps|vmulps (%rax), %xmm2, %xmm1
+c4 41 34 59 d3|vmulps|vmulps %ymm11, %ymm9, %ymm10
+c5 ec 59 cb|vmulps|vmulps %ymm3, %ymm2, %ymm1
+c4 01 34 59 54 6c 08|vmulps|vmulps 8(%r12,%r13,2), %ymm9, %ymm10
+c4 41 33 59 d3|vmulsd|vmulsd %xmm11, %xmm9, %xmm10
+c5 eb 59 cb|vmulsd|vmulsd %xmm3, %xmm2, %xmm1
+c4 01 33 59 54 6c 08|vmulsd|vmulsd 8(%r12,%r13,2), %xmm9, %xmm10
+c5 eb 59 08|vmulsd|vmulsd (%rax), %xmm2, %xmm1
+c4 41 32 59 d3|vmulss|vmulss %xmm11, %xmm9, %xmm10
+c5 ea 59 cb|vmulss|vmulss %xmm3, %xmm2, %xmm1
+c4 01 32 59 54 6c 08|vmulss|vmulss 8(%r12,%r13,2), %xmm9, %xmm10
+c5 ea 59 08|vmulss|vmulss (%rax), %xmm2, %xmm1
+c4 41 30 56 d3|vorps|vorps %xmm11, %xmm9, %xmm10
+c5 e8 56 cb|vorps|vorps %xmm3, %xmm2, %xmm1
+c4 01 30 56 54 6c 08|vorps|vorps 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e8 56 08|vorps|vorps (%rax), %xmm2, %xmm1
+c4 41 34 56 d3|vorps|vorps %ymm11, %ymm9, %ymm10
+c5 ec 56 cb|vorps|vorps %ymm3, %ymm2, %ymm1
+c4 01 34 56 54 6c 08|vorps|vorps 8(%r12,%r13,2), %ymm9, %ymm10
+c4 41 31 6b d3|vpackssdw|vpackssdw %xmm11, %xmm9, %xmm10
+c5 e9 6b cb|vpackssdw|vpackssdw %xmm3, %xmm2, %xmm1
+c4 01 31 6b 54 6c 08|vpackssdw|vpackssdw 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 6b 08|vpackssdw|vpackssdw (%rax), %xmm2, %xmm1
+c4 41 31 63 d3|vpacksswb|vpacksswb %xmm11, %xmm9, %xmm10
+c5 e9 63 cb|vpacksswb|vpacksswb %xmm3, %xmm2, %xmm1
+c4 01 31 63 54 6c 08|vpacksswb|vpacksswb 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 63 08|vpacksswb|vpacksswb (%rax), %xmm2, %xmm1
+c4 42 31 2b d3|vpackusdw|vpackusdw %xmm11, %xmm9, %xmm10
+c4 e2 69 2b cb|vpackusdw|vpackusdw %xmm3, %xmm2, %xmm1
+c4 02 31 2b 54 6c 08|vpackusdw|vpackusdw 8(%r12,%r13,2), %xmm9, %xmm10
+c4 e2 69 2b 08|vpackusdw|vpackusdw (%rax), %xmm2, %xmm1
+c4 41 31 67 d3|vpackuswb|vpackuswb %xmm11, %xmm9, %xmm10
+c5 e9 67 cb|vpackuswb|vpackuswb %xmm3, %xmm2, %xmm1
+c4 01 31 67 54 6c 08|vpackuswb|vpackuswb 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 67 08|vpackuswb|vpackuswb (%rax), %xmm2, %xmm1
+c4 41 31 fc d3|vpaddb|vpaddb %xmm11, %xmm9, %xmm10
+c5 e9 fc cb|vpaddb|vpaddb %xmm3, %xmm2, %xmm1
+c4 01 31 fc 54 6c 08|vpaddb|vpaddb 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 fc 08|vpaddb|vpaddb (%rax), %xmm2, %xmm1
+c4 41 31 fe d3|vpaddd|vpaddd %xmm11, %xmm9, %xmm10
+c5 e9 fe cb|vpaddd|vpaddd %xmm3, %xmm2, %xmm1
+c4 01 31 fe 54 6c 08|vpaddd|vpaddd 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 fe 08|vpaddd|vpaddd (%rax), %xmm2, %xmm1
+c4 41 31 ec d3|vpaddsb|vpaddsb %xmm11, %xmm9, %xmm10
+c5 e9 ec cb|vpaddsb|vpaddsb %xmm3, %xmm2, %xmm1
+c4 01 31 ec 54 6c 08|vpaddsb|vpaddsb 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 ec 08|vpaddsb|vpaddsb (%rax), %xmm2, %xmm1
+c4 41 31 ed d3|vpaddsw|vpaddsw %xmm11, %xmm9, %xmm10
+c5 e9 ed cb|vpaddsw|vpaddsw %xmm3, %xmm2, %xmm1
+c4 01 31 ed 54 6c 08|vpaddsw|vpaddsw 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 ed 08|vpaddsw|vpaddsw (%rax), %xmm2, %xmm1
+c4 41 31 dc d3|vpaddusb|vpaddusb %xmm11, %xmm9, %xmm10
+c5 e9 dc cb|vpaddusb|vpaddusb %xmm3, %xmm2, %xmm1
+c4 01 31 dc 54 6c 08|vpaddusb|vpaddusb 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 dc 08|vpaddusb|vpaddusb (%rax), %xmm2, %xmm1
+c4 41 31 dd d3|vpaddusw|vpaddusw %xmm11, %xmm9, %xmm10
+c5 e9 dd cb|vpaddusw|vpaddusw %xmm3, %xmm2, %xmm1
+c4 01 31 dd 54 6c 08|vpaddusw|vpaddusw 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 dd 08|vpaddusw|vpaddusw (%rax), %xmm2, %xmm1
+c4 41 31 fd d3|vpaddw|vpaddw %xmm11, %xmm9, %xmm10
+c5 e9 fd cb|vpaddw|vpaddw %xmm3, %xmm2, %xmm1
+c4 01 31 fd 54 6c 08|vpaddw|vpaddw 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 fd 08|vpaddw|vpaddw (%rax), %xmm2, %xmm1
+c4 41 31 db d3|vpand|vpand %xmm11, %xmm9, %xmm10
+c5 e9 db cb|vpand|vpand %xmm3, %xmm2, %xmm1
+c4 01 31 db 54 6c 08|vpand|vpand 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 db 08|vpand|vpand (%rax), %xmm2, %xmm1
+c4 41 31 df d3|vpandn|vpandn %xmm11, %xmm9, %xmm10
+c5 e9 df cb|vpandn|vpandn %xmm3, %xmm2, %xmm1
+c4 01 31 df 54 6c 08|vpandn|vpandn 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 df 08|vpandn|vpandn (%rax), %xmm2, %xmm1
+c4 41 31 e0 d3|vpavgb|vpavgb %xmm11, %xmm9, %xmm10
+c5 e9 e0 cb|vpavgb|vpavgb %xmm3, %xmm2, %xmm1
+c4 01 31 e0 54 6c 08|vpavgb|vpavgb 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 e0 08|vpavgb|vpavgb (%rax), %xmm2, %xmm1
+c4 41 31 e3 d3|vpavgw|vpavgw %xmm11, %xmm9, %xmm10
+c5 e9 e3 cb|vpavgw|vpavgw %xmm3, %xmm2, %xmm1
+c4 01 31 e3 54 6c 08|vpavgw|vpavgw 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 e3 08|vpavgw|vpavgw (%rax), %xmm2, %xmm1
+c4 43 31 4c d3 c0|vpblendvb|vpblendvb %xmm12, %xmm11, %xmm9, %xmm10
+c4 e3 69 4c cb 40|vpblendvb|vpblendvb %xmm4, %xmm3, %xmm2, %xmm1
+c4 03 31 4c 54 6c 08 c0|vpblendvb|vpblendvb %xmm12, 8(%r12,%r13,2), %xmm9, %xmm10
+c4 43 31 0e d3 03|vpblendw|vpblendw $3, %xmm11, %xmm9, %xmm10
+c4 e3 69 0e cb 03|vpblendw|vpblendw $3, %xmm3, %xmm2, %xmm1
+c4 03 31 0e 54 6c 08 03|vpblendw|vpblendw $3, 8(%r12,%r13,2), %xmm9, %xmm10
+c4 03 31 0e 54 6c 08 01|vpblendw|vpblendw $1, 8(%r12,%r13,2), %xmm9, %xmm10
+c4 41 31 74 d3|vpcmpeqb|vpcmpeqb %xmm11, %xmm9, %xmm10
+c5 e9 74 cb|vpcmpeqb|vpcmpeqb %xmm3, %xmm2, %xmm1
+c4 01 31 74 54 6c 08|vpcmpeqb|vpcmpeqb 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 74 08|vpcmpeqb|vpcmpeqb (%rax), %xmm2, %xmm1
+c4 41 31 76 d3|vpcmpeqd|vpcmpeqd %xmm11, %xmm9, %xmm10
+c5 e9 76 cb|vpcmpeqd|vpcmpeqd %xmm3, %xmm2, %xmm1
+c4 01 31 76 54 6c 08|vpcmpeqd|vpcmpeqd 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 76 08|vpcmpeqd|vpcmpeqd (%rax), %xmm2, %xmm1
+c4 42 31 29 d3|vpcmpeqq|vpcmpeqq %xmm11, %xmm9, %xmm10
+c4 e2 69 29 cb|vpcmpeqq|vpcmpeqq %xmm3, %xmm2, %xmm1
+c4 02 31 29 54 6c 08|vpcmpeqq|vpcmpeqq 8(%r12,%r13,2), %xmm9, %xmm10
+c4 e2 69 29 08|vpcmpeqq|vpcmpeqq (%rax), %xmm2, %xmm1
+c4 41 31 75 d3|vpcmpeqw|vpcmpeqw %xmm11, %xmm9, %xmm10
+c5 e9 75 cb|vpcmpeqw|vpcmpeqw %xmm3, %xmm2, %xmm1
+c4 01 31 75 54 6c 08|vpcmpeqw|vpcmpeqw 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 75 08|vpcmpeqw|vpcmpeqw (%rax), %xmm2, %xmm1
+c4 41 31 64 d3|vpcmpgtb|vpcmpgtb %xmm11, %xmm9, %xmm10
+c5 e9 64 cb|vpcmpgtb|vpcmpgtb %xmm3, %xmm2, %xmm1
+c4 01 31 64 54 6c 08|vpcmpgtb|vpcmpgtb 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 64 08|vpcmpgtb|vpcmpgtb (%rax), %xmm2, %xmm1
+c4 41 31 66 d3|vpcmpgtd|vpcmpgtd %xmm11, %xmm9, %xmm10
+c5 e9 66 cb|vpcmpgtd|vpcmpgtd %xmm3, %xmm2, %xmm1
+c4 01 31 66 54 6c 08|vpcmpgtd|vpcmpgtd 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 66 08|vpcmpgtd|vpcmpgtd (%rax), %xmm2, %xmm1
+c4 41 31 65 d3|vpcmpgtw|vpcmpgtw %xmm11, %xmm9, %xmm10
+c5 e9 65 cb|vpcmpgtw|vpcmpgtw %xmm3, %xmm2, %xmm1
+c4 01 31 65 54 6c 08|vpcmpgtw|vpcmpgtw 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 65 08|vpcmpgtw|vpcmpgtw (%rax), %xmm2, %xmm1
+c4 43 79 14 ca 01|vpextrb|vpextrb $1, %xmm9, %r10d
+c4 03 79 14 4c 6c 08 01|vpextrb|vpextrb $1, %xmm9, 8(%r12,%r13,2)
+c4 e3 79 14 c8 01|vpextrb|vpextrb $1, %xmm1, %eax
+c4 43 79 16 ca 01|vpextrd|vpextrd $1, %xmm9, %r10d
+c4 e3 79 16 c8 01|vpextrd|vpextrd $1, %xmm1, %eax
+c4 03 79 16 4c 6c 08 01|vpextrd|vpextrd $1, %xmm9, 8(%r12,%r13,2)
+c4 43 f9 16 ca 01|vpextrq|vpextrq $1, %xmm9, %r10
+c4 e3 f9 16 c8 01|vpextrq|vpextrq $1, %xmm1, %rax
+c4 03 f9 16 4c 6c 08 01|vpextrq|vpextrq $1, %xmm9, 8(%r12,%r13,2)
+c4 41 79 c5 d1 01|vpextrw|vpextrw $1, %xmm9, %r10d
+c4 03 79 15 4c 6c 08 01|vpextrw|vpextrw $1, %xmm9, 8(%r12,%r13,2)
+c5 f9 c5 c1 01|vpextrw|vpextrw $1, %xmm1, %eax
+c4 43 31 20 d2 01|vpinsrb|vpinsrb $1, %r10d, %xmm9, %xmm10
+c4 03 31 20 54 6c 08 01|vpinsrb|vpinsrb $1, 8(%r12,%r13,2), %xmm9, %xmm10
+c4 03 31 20 54 6c 08 03|vpinsrb|vpinsrb $3, 8(%r12,%r13,2), %xmm9, %xmm10
+c4 e3 69 20 c8 01|vpinsrb|vpinsrb $1, %eax, %xmm2, %xmm1
+c4 03 31 22 54 6c 08 03|vpinsrd|vpinsrd $3, 8(%r12,%r13,2), %xmm9, %xmm10
+c4 43 31 22 d2 01|vpinsrd|vpinsrd $1, %r10d, %xmm9, %xmm10
+c4 e3 69 22 c8 01|vpinsrd|vpinsrd $1, %eax, %xmm2, %xmm1
+c4 03 31 22 54 6c 08 01|vpinsrd|vpinsrd $1, 8(%r12,%r13,2), %xmm9, %xmm10
+c4 41 31 c4 d2 01|vpinsrw|vpinsrw $1, %r10d, %xmm9, %xmm10
+c4 01 31 c4 54 6c 08 01|vpinsrw|vpinsrw $1, 8(%r12,%r13,2), %xmm9, %xmm10
+c4 01 31 c4 54 6c 08 03|vpinsrw|vpinsrw $3, 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 c4 c8 01|vpinsrw|vpinsrw $1, %eax, %xmm2, %xmm1
+c4 42 31 3c d3|vpmaxsb|vpmaxsb %xmm11, %xmm9, %xmm10
+c4 e2 69 3c cb|vpmaxsb|vpmaxsb %xmm3, %xmm2, %xmm1
+c4 02 31 3c 54 6c 08|vpmaxsb|vpmaxsb 8(%r12,%r13,2), %xmm9, %xmm10
+c4 e2 69 3c 08|vpmaxsb|vpmaxsb (%rax), %xmm2, %xmm1
+c4 42 31 3d d3|vpmaxsd|vpmaxsd %xmm11, %xmm9, %xmm10
+c4 e2 69 3d cb|vpmaxsd|vpmaxsd %xmm3, %xmm2, %xmm1
+c4 02 31 3d 54 6c 08|vpmaxsd|vpmaxsd 8(%r12,%r13,2), %xmm9, %xmm10
+c4 e2 69 3d 08|vpmaxsd|vpmaxsd (%rax), %xmm2, %xmm1
+c4 41 31 ee d3|vpmaxsw|vpmaxsw %xmm11, %xmm9, %xmm10
+c5 e9 ee cb|vpmaxsw|vpmaxsw %xmm3, %xmm2, %xmm1
+c4 01 31 ee 54 6c 08|vpmaxsw|vpmaxsw 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 ee 08|vpmaxsw|vpmaxsw (%rax), %xmm2, %xmm1
+c4 41 31 de d3|vpmaxub|vpmaxub %xmm11, %xmm9, %xmm10
+c5 e9 de cb|vpmaxub|vpmaxub %xmm3, %xmm2, %xmm1
+c4 01 31 de 54 6c 08|vpmaxub|vpmaxub 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 de 08|vpmaxub|vpmaxub (%rax), %xmm2, %xmm1
+c4 42 31 3f d3|vpmaxud|vpmaxud %xmm11, %xmm9, %xmm10
+c4 e2 69 3f cb|vpmaxud|vpmaxud %xmm3, %xmm2, %xmm1
+c4 02 31 3f 54 6c 08|vpmaxud|vpmaxud 8(%r12,%r13,2), %xmm9, %xmm10
+c4 e2 69 3f 08|vpmaxud|vpmaxud (%rax), %xmm2, %xmm1
+c4 42 31 3e d3|vpmaxuw|vpmaxuw %xmm11, %xmm9, %xmm10
+c4 e2 69 3e cb|vpmaxuw|vpmaxuw %xmm3, %xmm2, %xmm1
+c4 02 31 3e 54 6c 08|vpmaxuw|vpmaxuw 8(%r12,%r13,2), %xmm9, %xmm10
+c4 e2 69 3e 08|vpmaxuw|vpmaxuw (%rax), %xmm2, %xmm1
+c4 42 31 38 d3|vpminsb|vpminsb %xmm11, %xmm9, %xmm10
+c4 e2 69 38 cb|vpminsb|vpminsb %xmm3, %xmm2, %xmm1
+c4 02 31 38 54 6c 08|vpminsb|vpminsb 8(%r12,%r13,2), %xmm9, %xmm10
+c4 e2 69 38 08|vpminsb|vpminsb (%rax), %xmm2, %xmm1
+c4 42 31 39 d3|vpminsd|vpminsd %xmm11, %xmm9, %xmm10
+c4 e2 69 39 cb|vpminsd|vpminsd %xmm3, %xmm2, %xmm1
+c4 02 31 39 54 6c 08|vpminsd|vpminsd 8(%r12,%r13,2), %xmm9, %xmm10
+c4 e2 69 39 08|vpminsd|vpminsd (%rax), %xmm2, %xmm1
+c4 41 31 ea d3|vpminsw|vpminsw %xmm11, %xmm9, %xmm10
+c5 e9 ea cb|vpminsw|vpminsw %xmm3, %xmm2, %xmm1
+c4 01 31 ea 54 6c 08|vpminsw|vpminsw 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 ea 08|vpminsw|vpminsw (%rax), %xmm2, %xmm1
+c4 41 31 da d3|vpminub|vpminub %xmm11, %xmm9, %xmm10
+c5 e9 da cb|vpminub|vpminub %xmm3, %xmm2, %xmm1
+c4 01 31 da 54 6c 08|vpminub|vpminub 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 da 08|vpminub|vpminub (%rax), %xmm2, %xmm1
+c4 42 31 3b d3|vpminud|vpminud %xmm11, %xmm9, %xmm10
+c4 e2 69 3b cb|vpminud|vpminud %xmm3, %xmm2, %xmm1
+c4 02 31 3b 54 6c 08|vpminud|vpminud 8(%r12,%r13,2), %xmm9, %xmm10
+c4 e2 69 3b 08|vpminud|vpminud (%rax), %xmm2, %xmm1
+c4 42 31 3a d3|vpminuw|vpminuw %xmm11, %xmm9, %xmm10
+c4 e2 69 3a cb|vpminuw|vpminuw %xmm3, %xmm2, %xmm1
+c4 02 31 3a 54 6c 08|vpminuw|vpminuw 8(%r12,%r13,2), %xmm9, %xmm10
+c4 e2 69 3a 08|vpminuw|vpminuw (%rax), %xmm2, %xmm1
+c4 42 79 20 d1|vpmovsxbw|vpmovsxbw %xmm9, %xmm10
+c4 e2 79 20 ca|vpmovsxbw|vpmovsxbw %xmm2, %xmm1
+c4 02 79 20 54 6c 08|vpmovsxbw|vpmovsxbw 8(%r12,%r13,2), %xmm10
+c4 e2 79 20 08|vpmovsxbw|vpmovsxbw (%rax), %xmm1
+c4 02 79 20 4c 6c 08|vpmovsxbw|vpmovsxbw 8(%r12,%r13,2), %xmm9
+c4 42 79 23 d1|vpmovsxwd|vpmovsxwd %xmm9, %xmm10
+c4 e2 79 23 ca|vpmovsxwd|vpmovsxwd %xmm2, %xmm1
+c4 02 79 23 54 6c 08|vpmovsxwd|vpmovsxwd 8(%r12,%r13,2), %xmm10
+c4 e2 79 23 08|vpmovsxwd|vpmovsxwd (%rax), %xmm1
+c4 02 79 23 4c 6c 08|vpmovsxwd|vpmovsxwd 8(%r12,%r13,2), %xmm9
+c4 42 79 31 d1|vpmovzxbd|vpmovzxbd %xmm9, %xmm10
+c4 e2 79 31 ca|vpmovzxbd|vpmovzxbd %xmm2, %xmm1
+c4 02 79 31 54 6c 08|vpmovzxbd|vpmovzxbd 8(%r12,%r13,2), %xmm10
+c4 e2 79 31 08|vpmovzxbd|vpmovzxbd (%rax), %xmm1
+c4 02 79 31 4c 6c 08|vpmovzxbd|vpmovzxbd 8(%r12,%r13,2), %xmm9
+c4 42 79 30 d1|vpmovzxbw|vpmovzxbw %xmm9, %xmm10
+c4 e2 79 30 ca|vpmovzxbw|vpmovzxbw %xmm2, %xmm1
+c4 02 79 30 54 6c 08|vpmovzxbw|vpmovzxbw 8(%r12,%r13,2), %xmm10
+c4 e2 79 30 08|vpmovzxbw|vpmovzxbw (%rax), %xmm1
+c4 02 79 30 4c 6c 08|vpmovzxbw|vpmovzxbw 8(%r12,%r13,2), %xmm9
+c4 41 31 eb d3|vpor|vpor %xmm11, %xmm9, %xmm10
+c5 e9 eb cb|vpor|vpor %xmm3, %xmm2, %xmm1
+c4 01 31 eb 54 6c 08|vpor|vpor 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 eb 08|vpor|vpor (%rax), %xmm2, %xmm1
+c4 42 31 00 d3|vpshufb|vpshufb %xmm11, %xmm9, %xmm10
+c4 e2 69 00 cb|vpshufb|vpshufb %xmm3, %xmm2, %xmm1
+c4 02 31 00 54 6c 08|vpshufb|vpshufb 8(%r12,%r13,2), %xmm9, %xmm10
+c4 e2 69 00 08|vpshufb|vpshufb (%rax), %xmm2, %xmm1
+c4 41 79 70 d1 03|vpshufd|vpshufd $3, %xmm9, %xmm10
+c5 f9 70 ca 03|vpshufd|vpshufd $3, %xmm2, %xmm1
+c4 01 79 70 54 6c 08 03|vpshufd|vpshufd $3, 8(%r12,%r13,2), %xmm10
+c4 41 7a 70 d1 03|vpshufhw|vpshufhw $3, %xmm9, %xmm10
+c5 fa 70 ca 03|vpshufhw|vpshufhw $3, %xmm2, %xmm1
+c4 01 7a 70 54 6c 08 03|vpshufhw|vpshufhw $3, 8(%r12,%r13,2), %xmm10
+c4 41 7b 70 d1 03|vpshuflw|vpshuflw $3, %xmm9, %xmm10
+c5 fb 70 ca 03|vpshuflw|vpshuflw $3, %xmm2, %xmm1
+c4 01 7b 70 54 6c 08 03|vpshuflw|vpshuflw $3, 8(%r12,%r13,2), %xmm10
+c4 42 31 08 d3|vpsignb|vpsignb %xmm11, %xmm9, %xmm10
+c4 e2 69 08 cb|vpsignb|vpsignb %xmm3, %xmm2, %xmm1
+c4 02 31 08 54 6c 08|vpsignb|vpsignb 8(%r12,%r13,2), %xmm9, %xmm10
+c4 e2 69 08 08|vpsignb|vpsignb (%rax), %xmm2, %xmm1
+c4 42 31 0a d3|vpsignd|vpsignd %xmm11, %xmm9, %xmm10
+c4 e2 69 0a cb|vpsignd|vpsignd %xmm3, %xmm2, %xmm1
+c4 02 31 0a 54 6c 08|vpsignd|vpsignd 8(%r12,%r13,2), %xmm9, %xmm10
+c4 e2 69 0a 08|vpsignd|vpsignd (%rax), %xmm2, %xmm1
+c4 42 31 09 d3|vpsignw|vpsignw %xmm11, %xmm9, %xmm10
+c4 e2 69 09 cb|vpsignw|vpsignw %xmm3, %xmm2, %xmm1
+c4 02 31 09 54 6c 08|vpsignw|vpsignw 8(%r12,%r13,2), %xmm9, %xmm10
+c4 e2 69 09 08|vpsignw|vpsignw (%rax), %xmm2, %xmm1
+c4 41 31 f2 d3|vpslld|vpslld %xmm11, %xmm9, %xmm10
+c5 e9 f2 cb|vpslld|vpslld %xmm3, %xmm2, %xmm1
+c4 01 31 f2 54 6c 08|vpslld|vpslld 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 f2 08|vpslld|vpslld (%rax), %xmm2, %xmm1
+c4 c1 29 72 f1 03|vpslld|vpslld $3, %xmm9, %xmm10
+c5 f1 72 f2 03|vpslld|vpslld $3, %xmm2, %xmm1
+c4 41 31 f1 d3|vpsllw|vpsllw %xmm11, %xmm9, %xmm10
+c5 e9 f1 cb|vpsllw|vpsllw %xmm3, %xmm2, %xmm1
+c4 01 31 f1 54 6c 08|vpsllw|vpsllw 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 f1 08|vpsllw|vpsllw (%rax), %xmm2, %xmm1
+c4 c1 29 71 f1 03|vpsllw|vpsllw $3, %xmm9, %xmm10
+c5 f1 71 f2 03|vpsllw|vpsllw $3, %xmm2, %xmm1
+c4 41 31 e2 d3|vpsrad|vpsrad %xmm11, %xmm9, %xmm10
+c5 e9 e2 cb|vpsrad|vpsrad %xmm3, %xmm2, %xmm1
+c4 01 31 e2 54 6c 08|vpsrad|vpsrad 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 e2 08|vpsrad|vpsrad (%rax), %xmm2, %xmm1
+c4 c1 29 72 e1 03|vpsrad|vpsrad $3, %xmm9, %xmm10
+c5 f1 72 e2 03|vpsrad|vpsrad $3, %xmm2, %xmm1
+c4 41 31 e1 d3|vpsraw|vpsraw %xmm11, %xmm9, %xmm10
+c5 e9 e1 cb|vpsraw|vpsraw %xmm3, %xmm2, %xmm1
+c4 01 31 e1 54 6c 08|vpsraw|vpsraw 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 e1 08|vpsraw|vpsraw (%rax), %xmm2, %xmm1
+c4 c1 29 71 e1 03|vpsraw|vpsraw $3, %xmm9, %xmm10
+c5 f1 71 e2 03|vpsraw|vpsraw $3, %xmm2, %xmm1
+c4 41 31 d2 d3|vpsrld|vpsrld %xmm11, %xmm9, %xmm10
+c5 e9 d2 cb|vpsrld|vpsrld %xmm3, %xmm2, %xmm1
+c4 01 31 d2 54 6c 08|vpsrld|vpsrld 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 d2 08|vpsrld|vpsrld (%rax), %xmm2, %xmm1
+c4 c1 29 72 d1 03|vpsrld|vpsrld $3, %xmm9, %xmm10
+c5 f1 72 d2 03|vpsrld|vpsrld $3, %xmm2, %xmm1
+c4 41 31 d1 d3|vpsrlw|vpsrlw %xmm11, %xmm9, %xmm10
+c5 e9 d1 cb|vpsrlw|vpsrlw %xmm3, %xmm2, %xmm1
+c4 01 31 d1 54 6c 08|vpsrlw|vpsrlw 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 d1 08|vpsrlw|vpsrlw (%rax), %xmm2, %xmm1
+c4 c1 29 71 d1 03|vpsrlw|vpsrlw $3, %xmm9, %xmm10
+c5 f1 71 d2 03|vpsrlw|vpsrlw $3, %xmm2, %xmm1
+c4 41 31 f8 d3|vpsubb|vpsubb %xmm11, %xmm9, %xmm10
+c5 e9 f8 cb|vpsubb|vpsubb %xmm3, %xmm2, %xmm1
+c4 01 31 f8 54 6c 08|vpsubb|vpsubb 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 f8 08|vpsubb|vpsubb (%rax), %xmm2, %xmm1
+c4 41 31 fa d3|vpsubd|vpsubd %xmm11, %xmm9, %xmm10
+c5 e9 fa cb|vpsubd|vpsubd %xmm3, %xmm2, %xmm1
+c4 01 31 fa 54 6c 08|vpsubd|vpsubd 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 fa 08|vpsubd|vpsubd (%rax), %xmm2, %xmm1
+c4 41 31 e8 d3|vpsubsb|vpsubsb %xmm11, %xmm9, %xmm10
+c5 e9 e8 cb|vpsubsb|vpsubsb %xmm3, %xmm2, %xmm1
+c4 01 31 e8 54 6c 08|vpsubsb|vpsubsb 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 e8 08|vpsubsb|vpsubsb (%rax), %xmm2, %xmm1
+c4 41 31 e9 d3|vpsubsw|vpsubsw %xmm11, %xmm9, %xmm10
+c5 e9 e9 cb|vpsubsw|vpsubsw %xmm3, %xmm2, %xmm1
+c4 01 31 e9 54 6c 08|vpsubsw|vpsubsw 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 e9 08|vpsubsw|vpsubsw (%rax), %xmm2, %xmm1
+c4 41 31 d8 d3|vpsubusb|vpsubusb %xmm11, %xmm9, %xmm10
+c5 e9 d8 cb|vpsubusb|vpsubusb %xmm3, %xmm2, %xmm1
+c4 01 31 d8 54 6c 08|vpsubusb|vpsubusb 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 d8 08|vpsubusb|vpsubusb (%rax), %xmm2, %xmm1
+c4 41 31 d9 d3|vpsubusw|vpsubusw %xmm11, %xmm9, %xmm10
+c5 e9 d9 cb|vpsubusw|vpsubusw %xmm3, %xmm2, %xmm1
+c4 01 31 d9 54 6c 08|vpsubusw|vpsubusw 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 d9 08|vpsubusw|vpsubusw (%rax), %xmm2, %xmm1
+c4 41 31 f9 d3|vpsubw|vpsubw %xmm11, %xmm9, %xmm10
+c5 e9 f9 cb|vpsubw|vpsubw %xmm3, %xmm2, %xmm1
+c4 01 31 f9 54 6c 08|vpsubw|vpsubw 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 f9 08|vpsubw|vpsubw (%rax), %xmm2, %xmm1
+c4 42 79 17 d1|vptest|vptest %xmm9, %xmm10
+c4 e2 79 17 ca|vptest|vptest %xmm2, %xmm1
+c4 02 79 17 54 6c 08|vptest|vptest 8(%r12,%r13,2), %xmm10
+c4 e2 79 17 08|vptest|vptest (%rax), %xmm1
+c4 02 79 17 4c 6c 08|vptest|vptest 8(%r12,%r13,2), %xmm9
+c4 41 31 68 d3|vpunpckhbw|vpunpckhbw %xmm11, %xmm9, %xmm10
+c5 e9 68 cb|vpunpckhbw|vpunpckhbw %xmm3, %xmm2, %xmm1
+c4 01 31 68 54 6c 08|vpunpckhbw|vpunpckhbw 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 68 08|vpunpckhbw|vpunpckhbw (%rax), %xmm2, %xmm1
+c4 41 31 6d d3|vpunpckhqdq|vpunpckhqdq %xmm11, %xmm9, %xmm10
+c5 e9 6d cb|vpunpckhqdq|vpunpckhqdq %xmm3, %xmm2, %xmm1
+c4 01 31 6d 54 6c 08|vpunpckhqdq|vpunpckhqdq 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 6d 08|vpunpckhqdq|vpunpckhqdq (%rax), %xmm2, %xmm1
+c4 41 31 69 d3|vpunpckhwd|vpunpckhwd %xmm11, %xmm9, %xmm10
+c5 e9 69 cb|vpunpckhwd|vpunpckhwd %xmm3, %xmm2, %xmm1
+c4 01 31 69 54 6c 08|vpunpckhwd|vpunpckhwd 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 69 08|vpunpckhwd|vpunpckhwd (%rax), %xmm2, %xmm1
+c4 41 31 60 d3|vpunpcklbw|vpunpcklbw %xmm11, %xmm9, %xmm10
+c5 e9 60 cb|vpunpcklbw|vpunpcklbw %xmm3, %xmm2, %xmm1
+c4 01 31 60 54 6c 08|vpunpcklbw|vpunpcklbw 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 60 08|vpunpcklbw|vpunpcklbw (%rax), %xmm2, %xmm1
+c4 41 31 62 d3|vpunpckldq|vpunpckldq %xmm11, %xmm9, %xmm10
+c5 e9 62 cb|vpunpckldq|vpunpckldq %xmm3, %xmm2, %xmm1
+c4 01 31 62 54 6c 08|vpunpckldq|vpunpckldq 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 62 08|vpunpckldq|vpunpckldq (%rax), %xmm2, %xmm1
+c4 41 31 6c d3|vpunpcklqdq|vpunpcklqdq %xmm11, %xmm9, %xmm10
+c5 e9 6c cb|vpunpcklqdq|vpunpcklqdq %xmm3, %xmm2, %xmm1
+c4 01 31 6c 54 6c 08|vpunpcklqdq|vpunpcklqdq 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 6c 08|vpunpcklqdq|vpunpcklqdq (%rax), %xmm2, %xmm1
+c4 41 31 61 d3|vpunpcklwd|vpunpcklwd %xmm11, %xmm9, %xmm10
+c5 e9 61 cb|vpunpcklwd|vpunpcklwd %xmm3, %xmm2, %xmm1
+c4 01 31 61 54 6c 08|vpunpcklwd|vpunpcklwd 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 61 08|vpunpcklwd|vpunpcklwd (%rax), %xmm2, %xmm1
+c4 41 31 ef d3|vpxor|vpxor %xmm11, %xmm9, %xmm10
+c5 e9 ef cb|vpxor|vpxor %xmm3, %xmm2, %xmm1
+c4 01 31 ef 54 6c 08|vpxor|vpxor 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 ef 08|vpxor|vpxor (%rax), %xmm2, %xmm1
+c4 43 79 08 d1 03|vroundps|vroundps $3, %xmm9, %xmm10
+c4 e3 79 08 ca 03|vroundps|vroundps $3, %xmm2, %xmm1
+c4 03 79 08 54 6c 08 03|vroundps|vroundps $3, 8(%r12,%r13,2), %xmm10
+c4 43 7d 08 d1 03|vroundps|vroundps $3, %ymm9, %ymm10
+c4 43 31 0b d3 03|vroundsd|vroundsd $3, %xmm11, %xmm9, %xmm10
+c4 e3 69 0b cb 03|vroundsd|vroundsd $3, %xmm3, %xmm2, %xmm1
+c4 03 31 0b 54 6c 08 03|vroundsd|vroundsd $3, 8(%r12,%r13,2), %xmm9, %xmm10
+c4 03 31 0b 54 6c 08 01|vroundsd|vroundsd $1, 8(%r12,%r13,2), %xmm9, %xmm10
+c4 41 30 c6 d3 03|vshufps|vshufps $3, %xmm11, %xmm9, %xmm10
+c5 e8 c6 cb 03|vshufps|vshufps $3, %xmm3, %xmm2, %xmm1
+c4 01 30 c6 54 6c 08 03|vshufps|vshufps $3, 8(%r12,%r13,2), %xmm9, %xmm10
+c4 41 34 c6 d3 03|vshufps|vshufps $3, %ymm11, %ymm9, %ymm10
+c4 01 34 c6 54 6c 08 01|vshufps|vshufps $1, 8(%r12,%r13,2), %ymm9, %ymm10
+c4 01 30 c6 54 6c 08 01|vshufps|vshufps $1, 8(%r12,%r13,2), %xmm9, %xmm10
+c4 41 78 51 d1|vsqrtps|vsqrtps %xmm9, %xmm10
+c5 f8 51 ca|vsqrtps|vsqrtps %xmm2, %xmm1
+c4 01 78 51 54 6c 08|vsqrtps|vsqrtps 8(%r12,%r13,2), %xmm10
+c5 f8 51 08|vsqrtps|vsqrtps (%rax), %xmm1
+c4 41 7c 51 d1|vsqrtps|vsqrtps %ymm9, %ymm10
+c5 fc 51 ca|vsqrtps|vsqrtps %ymm2, %ymm1
+c4 01 7c 51 54 6c 08|vsqrtps|vsqrtps 8(%r12,%r13,2), %ymm10
+c4 01 78 51 4c 6c 08|vsqrtps|vsqrtps 8(%r12,%r13,2), %xmm9
+c4 41 33 51 d3|vsqrtsd|vsqrtsd %xmm11, %xmm9, %xmm10
+c5 eb 51 cb|vsqrtsd|vsqrtsd %xmm3, %xmm2, %xmm1
+c4 01 33 51 54 6c 08|vsqrtsd|vsqrtsd 8(%r12,%r13,2), %xmm9, %xmm10
+c5 eb 51 08|vsqrtsd|vsqrtsd (%rax), %xmm2, %xmm1
+c4 41 32 51 d3|vsqrtss|vsqrtss %xmm11, %xmm9, %xmm10
+c5 ea 51 cb|vsqrtss|vsqrtss %xmm3, %xmm2, %xmm1
+c4 01 32 51 54 6c 08|vsqrtss|vsqrtss 8(%r12,%r13,2), %xmm9, %xmm10
+c5 ea 51 08|vsqrtss|vsqrtss (%rax), %xmm2, %xmm1
+c4 41 30 5c d3|vsubps|vsubps %xmm11, %xmm9, %xmm10
+c5 e8 5c cb|vsubps|vsubps %xmm3, %xmm2, %xmm1
+c4 01 30 5c 54 6c 08|vsubps|vsubps 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e8 5c 08|vsubps|vsubps (%rax), %xmm2, %xmm1
+c4 41 34 5c d3|vsubps|vsubps %ymm11, %ymm9, %ymm10
+c5 ec 5c cb|vsubps|vsubps %ymm3, %ymm2, %ymm1
+c4 01 34 5c 54 6c 08|vsubps|vsubps 8(%r12,%r13,2), %ymm9, %ymm10
+c4 41 33 5c d3|vsubsd|vsubsd %xmm11, %xmm9, %xmm10
+c5 eb 5c cb|vsubsd|vsubsd %xmm3, %xmm2, %xmm1
+c4 01 33 5c 54 6c 08|vsubsd|vsubsd 8(%r12,%r13,2), %xmm9, %xmm10
+c5 eb 5c 08|vsubsd|vsubsd (%rax), %xmm2, %xmm1
+c4 41 32 5c d3|vsubss|vsubss %xmm11, %xmm9, %xmm10
+c5 ea 5c cb|vsubss|vsubss %xmm3, %xmm2, %xmm1
+c4 01 32 5c 54 6c 08|vsubss|vsubss 8(%r12,%r13,2), %xmm9, %xmm10
+c5 ea 5c 08|vsubss|vsubss (%rax), %xmm2, %xmm1
+c4 41 79 2e d1|vucomisd|vucomisd %xmm9, %xmm10
+c5 f9 2e ca|vucomisd|vucomisd %xmm2, %xmm1
+c4 01 79 2e 54 6c 08|vucomisd|vucomisd 8(%r12,%r13,2), %xmm10
+c5 f9 2e 08|vucomisd|vucomisd (%rax), %xmm1
+c4 01 79 2e 4c 6c 08|vucomisd|vucomisd 8(%r12,%r13,2), %xmm9
+c4 41 31 15 d3|vunpckhpd|vunpckhpd %xmm11, %xmm9, %xmm10
+c5 e9 15 cb|vunpckhpd|vunpckhpd %xmm3, %xmm2, %xmm1
+c4 01 31 15 54 6c 08|vunpckhpd|vunpckhpd 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 15 08|vunpckhpd|vunpckhpd (%rax), %xmm2, %xmm1
+c4 41 35 15 d3|vunpckhpd|vunpckhpd %ymm11, %ymm9, %ymm10
+c5 ed 15 cb|vunpckhpd|vunpckhpd %ymm3, %ymm2, %ymm1
+c4 01 35 15 54 6c 08|vunpckhpd|vunpckhpd 8(%r12,%r13,2), %ymm9, %ymm10
+c4 41 31 57 d3|vxorpd|vxorpd %xmm11, %xmm9, %xmm10
+c5 e9 57 cb|vxorpd|vxorpd %xmm3, %xmm2, %xmm1
+c4 01 31 57 54 6c 08|vxorpd|vxorpd 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e9 57 08|vxorpd|vxorpd (%rax), %xmm2, %xmm1
+c4 41 35 57 d3|vxorpd|vxorpd %ymm11, %ymm9, %ymm10
+c5 ed 57 cb|vxorpd|vxorpd %ymm3, %ymm2, %ymm1
+c4 01 35 57 54 6c 08|vxorpd|vxorpd 8(%r12,%r13,2), %ymm9, %ymm10
+c4 41 30 57 d3|vxorps|vxorps %xmm11, %xmm9, %xmm10
+c5 e8 57 cb|vxorps|vxorps %xmm3, %xmm2, %xmm1
+c4 01 30 57 54 6c 08|vxorps|vxorps 8(%r12,%r13,2), %xmm9, %xmm10
+c5 e8 57 08|vxorps|vxorps (%rax), %xmm2, %xmm1
+c4 41 34 57 d3|vxorps|vxorps %ymm11, %ymm9, %ymm10
+c5 ec 57 cb|vxorps|vxorps %ymm3, %ymm2, %ymm1
+c4 01 34 57 54 6c 08|vxorps|vxorps 8(%r12,%r13,2), %ymm9, %ymm10
+4d 31 ca|xor_|xor %r9, %r10
+45 31 ca|xor_|xor %r9d, %r10d
+66 45 31 ca|xor_|xor %r9w, %r10w
+45 30 ca|xor_|xor %r9b, %r10b
+48 31 c8|xor_|xor %rcx, %rax
+31 c8|xor_|xor %ecx, %eax
+66 31 c8|xor_|xor %cx, %ax
+30 c8|xor_|xor %cl, %al
+4f 33 54 6c 08|xor_|xor 8(%r12,%r13,2), %r10
+47 33 54 6c 08|xor_|xor 8(%r12,%r13,2), %r10d
+66 47 33 54 6c 08|xor_|xor 8(%r12,%r13,2), %r10w
+47 32 54 6c 08|xor_|xor 8(%r12,%r13,2), %r10b
+4f 31 54 6c 08|xor_|xor %r10, 8(%r12,%r13,2)
+47 31 54 6c 08|xor_|xor %r10d, 8(%r12,%r13,2)
+66 47 31 54 6c 08|xor_|xor %r10w, 8(%r12,%r13,2)
+47 30 54 6c 08|xor_|xor %r10b, 8(%r12,%r13,2)
+49 83 f2 05|xor_|xor $5, %r10
+49 81 f2 45 23 01 00|xor_|xor $0x12345, %r10
+41 83 f2 05|xor_|xor $5, %r10d
+41 81 f2 45 23 01 00|xor_|xor $0x12345, %r10d
+66 41 83 f2 05|xor_|xor $5, %r10w
+66 41 81 f2 34 12|xor_|xor $0x1234, %r10w
+41 80 f2 05|xor_|xor $5, %r10b
+34 05|xor_|xor $5, %al
+35 45 23 01 00|xor_|xor $0x12345, %eax
+4b 83 74 6c 08 05|xor_|xorq $5, 8(%r12,%r13,2)
+43 81 74 6c 08 45 23 01 00|xor_|xorl $0x12345, 8(%r12,%r13,2)
+66 43 83 74 6c 08 05|xor_|xorw $5, 8(%r12,%r13,2)
+43 80 74 6c 08 05|xor_|xorb $5, 8(%r12,%r13,2)
+41 30 ca|xor_|xor %cl, %r10b
