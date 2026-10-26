@@ -1071,6 +1071,7 @@ pub fn build(b: *std.Build) void {
         \\  bat_processor
         \\  include
         \\  ps1_processor
+        \\  pkg/registry
         \\  scripts
         \\  src
         \\  test
@@ -1089,6 +1090,11 @@ pub fn build(b: *std.Build) void {
         \\  src/compat/rosetta2
         \\permanent blacklist:
         \\  .rosette
+        \\  __pycache__
+        \\  .pytest_cache
+        \\  .DS_Store
+        \\  *.pyc
+        \\  *.pyo
         \\  app_testing
         \\  assets/exe_examples
         \\  include/assets/exe_examples
