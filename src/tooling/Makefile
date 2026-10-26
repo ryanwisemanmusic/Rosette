@@ -1,7 +1,24 @@
 # Targets owned by src/tooling/. Keep recipes local to this folder.
 
 
-.PHONY: c-fix c-fix-build link-audit-build iso-build iso-run run-iso xbox360-media-self-test
+.PHONY: c-fix c-fix-build link-audit-build iso-build iso-run run-iso xbox360-media-self-test pe-offline-audit
+
+# Read-only PE / Visual C++ project compatibility audit. This parses headers,
+# sections, static imports and project settings; it never loads or launches an
+# input image. An optional llvm-objdump pass writes disassembly text outside
+# the input project:
+#   make pe-offline-audit AUDIT_PATH="/path/to/project"
+#   make pe-offline-audit AUDIT_PATH="/path/to/project" PE_AUDIT_DISASSEMBLY_DIR="/tmp/maze-disassembly"
+pe-offline-audit:
+	@if [ -z "$(AUDIT_PATH)" ]; then \
+		echo 'Usage: make pe-offline-audit AUDIT_PATH="/path/to/PE-or-project-directory"'; \
+		exit 2; \
+	fi
+	@if [ -n "$(PE_AUDIT_DISASSEMBLY_DIR)" ]; then \
+		python3 "$(ROOT_DIR)/tools/pe_offline_audit.py" --disassemble "$(PE_AUDIT_DISASSEMBLY_DIR)" "$(AUDIT_PATH)"; \
+	else \
+		python3 "$(ROOT_DIR)/tools/pe_offline_audit.py" "$(AUDIT_PATH)"; \
+	fi
 
 # ---------------------------------------------------------------------------
 # C transpiler for fixing implicit narrowing conversions
