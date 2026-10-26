@@ -27,6 +27,10 @@ app-wrapper: mscoree-native shell-helper-build
 		"$(ROSETTE_APP_BUNDLE)/Contents/Resources/rosette-runtime/assets/exe_examples" \
 		"$(ROSETTE_APP_BUNDLE)/Contents/Resources/rosette-runtime/include/assets/exe_examples" \
 		"$(ROSETTE_APP_BUNDLE)/Contents/Resources/rosette-runtime/tools/test_prodder"
+	@# Source resource trees can contain local test traces and interpreter caches.
+	@# They are neither runtime inputs nor release assets; remove them before copying/signing.
+	@find "$(ROSETTE_APP_BUNDLE)" -type d \( -name .rosette -o -name __pycache__ -o -name .pytest_cache \) -prune -exec rm -rf {} +
+	@find "$(ROSETTE_APP_BUNDLE)" -type f \( -name .DS_Store -o -name '*.pyc' -o -name '*.pyo' \) -exec rm -f {} +
 	@if find "$(ROSETTE_APP_BUNDLE)" \( -type d -name app_testing -o -type d -path '*/assets/exe_examples' \) -print -quit | grep -q .; then \
 		echo "error: app_testing or bundled example payload entered Rosette.app"; \
 		exit 1; \
@@ -38,9 +42,15 @@ app-wrapper: mscoree-native shell-helper-build
 		"$(ROSETTE_APP_OUTPUT)/Contents/Resources/rosette-runtime/assets/exe_examples" \
 		"$(ROSETTE_APP_OUTPUT)/Contents/Resources/rosette-runtime/include/assets/exe_examples" \
 		"$(ROSETTE_APP_OUTPUT)/Contents/Resources/rosette-runtime/tools/test_prodder"
+	@find "$(ROSETTE_APP_OUTPUT)" -type d \( -name .rosette -o -name __pycache__ -o -name .pytest_cache \) -prune -exec rm -rf {} +
+	@find "$(ROSETTE_APP_OUTPUT)" -type f \( -name .DS_Store -o -name '*.pyc' -o -name '*.pyo' \) -exec rm -f {} +
 	@if find "$(ROSETTE_APP_OUTPUT)" \( -type d -name app_testing -o -type d -path '*/assets/exe_examples' \) -print -quit | grep -q .; then \
 		 echo "error: app_testing or bundled example payload entered the distributable Rosette.app"; \
 		 exit 1; \
+	fi
+	@if find "$(ROSETTE_APP_OUTPUT)" \( -type d \( -name .rosette -o -name __pycache__ -o -name .pytest_cache \) -o -type f \( -name .DS_Store -o -name '*.pyc' -o -name '*.pyo' \) \) -print -quit | grep -q .; then \
+		echo "error: local traces or generated cache files entered the distributable Rosette.app"; \
+		exit 1; \
 	fi
 	@if [ -e "$(ROSETTE_APP_OUTPUT)/Contents/Resources/rosette-runtime/tools/test_prodder" ]; then \
 		echo "error: development test helper entered the distributable Rosette.app"; \
@@ -76,8 +86,14 @@ installer: app-wrapper
 	@mkdir -p "$(ZIG_GLOBAL_CACHE_DIR)"
 	@rm -rf "$(ROSETTE_INSTALLER_BUNDLE)"
 	@$(ZIG_BUILD_ENV) zig build bundle --build-file $(APP_BP)app/dmg/installer/build.zig -Dpayload-app="$(ROOT_DIR)/program/app/Rosette.app" 2>&1
+	@find "$(ROSETTE_INSTALLER_BUNDLE)" -type d \( -name .rosette -o -name __pycache__ -o -name .pytest_cache \) -prune -exec rm -rf {} +
+	@find "$(ROSETTE_INSTALLER_BUNDLE)" -type f \( -name .DS_Store -o -name '*.pyc' -o -name '*.pyo' \) -exec rm -f {} +
 	@if find "$(ROSETTE_INSTALLER_BUNDLE)" \( -type d -name app_testing -o -type d -path '*/assets/exe_examples' \) -print -quit | grep -q .; then \
 		echo "error: app_testing or bundled example payload entered Rosette Installer.app"; \
+		exit 1; \
+	fi
+	@if find "$(ROSETTE_INSTALLER_BUNDLE)" \( -type d \( -name .rosette -o -name __pycache__ -o -name .pytest_cache \) -o -type f \( -name .DS_Store -o -name '*.pyc' -o -name '*.pyo' \) \) -print -quit | grep -q .; then \
+		echo "error: local traces or generated cache files entered Rosette Installer.app"; \
 		exit 1; \
 	fi
 	@if [ -e "$(ROSETTE_INSTALLER_BUNDLE)/Contents/Resources/Rosette.app/Contents/Resources/rosette-runtime/tools/test_prodder" ]; then \
@@ -124,6 +140,12 @@ uninstaller:
 	@echo "Building Rosette Uninstaller.app..."
 	@mkdir -p "$(ZIG_GLOBAL_CACHE_DIR)"
 	@$(ZIG_BUILD_ENV) zig build bundle --build-file $(APP_BP)app/dmg/uninstaller/build.zig 2>&1
+	@find "$(ROSETTE_UNINSTALLER_BUNDLE)" -type d \( -name .rosette -o -name __pycache__ -o -name .pytest_cache \) -prune -exec rm -rf {} +
+	@find "$(ROSETTE_UNINSTALLER_BUNDLE)" -type f \( -name .DS_Store -o -name '*.pyc' -o -name '*.pyo' \) -exec rm -f {} +
+	@if find "$(ROSETTE_UNINSTALLER_BUNDLE)" \( -type d \( -name .rosette -o -name __pycache__ -o -name .pytest_cache \) -o -type f \( -name .DS_Store -o -name '*.pyc' -o -name '*.pyo' \) \) -print -quit | grep -q .; then \
+		echo "error: local traces or generated cache files entered Rosette Uninstaller.app"; \
+		exit 1; \
+	fi
 	@echo "Signing Rosette Uninstaller.app..."
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "$(ROSETTE_UNINSTALLER_BUNDLE)/Contents/MacOS/rosette-uninstall-helper"
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "$(ROSETTE_UNINSTALLER_BUNDLE)/Contents/MacOS/rosette-uninstaller"
