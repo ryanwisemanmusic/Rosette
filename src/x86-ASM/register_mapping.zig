@@ -130,6 +130,10 @@ pub const FpuState = struct {
     status: u16 = 0,
     tag: u16 = 0xFFFF,
     x87_top: u8 = 0,
+    /// Physical x87 data registers, indexed by the tag word and selected
+    /// through x87_top. The raw PE interpreter currently models their values
+    /// as f64 while preserving the architectural eight-entry stack/tag shape.
+    x87_stack: [8]f64 = [_]f64{0.0} ** 8,
     mxcsr: u32 = 0x1F80,
     lazy: bool = false,
 };

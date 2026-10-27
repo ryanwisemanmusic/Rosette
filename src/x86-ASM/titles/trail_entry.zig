@@ -1,5 +1,5 @@
 const title_runtime = @import("../title_runtime.zig");
-const win32_thunks = @import("../win32_thunks.zig");
+const win32_thunks = @import("../win32/root.zig");
 const program = @import("trail_program.zig");
 const thunks = @import("trail_thunks.zig");
 

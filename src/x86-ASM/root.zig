@@ -5,4 +5,4 @@ pub const instruction_operations = @import("instruction_operations.zig");
 pub const instruction_set = @import("instruction_set.zig");
 pub const mscoree_thunks = @import("mscoree_thunks.zig");
 pub const raw_decoder = @import("raw_decoder.zig");
-pub const win32_thunks = @import("win32_thunks.zig");
+pub const win32_thunks = @import("win32/root.zig");
