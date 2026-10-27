@@ -115,9 +115,24 @@ pub fn free(scope: []const u8, heap_handle: u32, flags: u32, address: u32) bool 
     return true;
 }
 
+/// Return the original aligned size of an allocation owned by the synthetic
+/// process heap. Win32 HeapSize reports SIZE_T(-1) for invalid blocks.
+pub fn querySize(scope: []const u8, heap_handle: u32, flags: u32, address: u32) u32 {
+    const map = ensureState();
+    if (heap_handle != process_heap_handle or flags != 0) return std.math.maxInt(u32);
+    const allocation_size = map.get(address) orelse return std.math.maxInt(u32);
+    runtime_abi.common.writeLine(
+        "[heap-trace][x86][size] scope={s} seq={d} heap=0x{x} addr=0x{x} size=0x{x} flags=0x{x}\n",
+        .{ scope, reg_trace.currentSequence(), heap_handle, address, allocation_size, flags },
+    );
+    return allocation_size;
+}
+
 test "x86 heap runtime alloc/free roundtrip" {
     const heap_handle = getProcessHeap("heap-test");
     const addr = alloc("heap-test", heap_handle, 0, 32);
     try std.testing.expect(addr != 0);
+    try std.testing.expectEqual(@as(u32, 32), querySize("heap-test", heap_handle, 0, addr));
+    try std.testing.expectEqual(std.math.maxInt(u32), querySize("heap-test", heap_handle, 0, addr + 1));
     try std.testing.expect(free("heap-test", heap_handle, 0, addr));
 }
