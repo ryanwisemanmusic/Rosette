@@ -288,7 +288,7 @@ def read_project(path: pathlib.Path) -> tuple[str, str, list[str], list[ProjectC
 def registered_x86_thunks(repo_root: pathlib.Path) -> set[str]:
     """Extract the actual PE32 runner registrations instead of duplicating an API list."""
     names: set[str] = set()
-    for relative in ("src/x86-ASM/win32_thunks.zig", "src/x86-ASM/mscoree_thunks.zig"):
+    for relative in ("src/x86-ASM/win32/root.zig", "src/x86-ASM/mscoree_thunks.zig"):
         source = repo_root / relative
         try:
             text = source.read_text(encoding="utf-8")
