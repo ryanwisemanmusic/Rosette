@@ -54,6 +54,9 @@ pub const Subsystem = enum {
     component_object,
     /// Direct3D, DXGI and the desktop compositor.
     graphics_stack,
+    /// Legacy OpenGL 1.x and the GLU utility library. These names are known,
+    /// but Rosette does not currently provide a legacy GL context or GLU.
+    legacy_graphics,
     /// Sockets.
     networking,
     /// Audio, timers and the multimedia surface.
@@ -85,6 +88,7 @@ pub const Subsystem = enum {
             .security => "security and services",
             .component_object => "COM/OLE/WinRT",
             .graphics_stack => "Direct3D/DXGI",
+            .legacy_graphics => "legacy OpenGL/GLU",
             .networking => "sockets",
             .multimedia => "audio and timers",
             .game_input => "game controllers",
@@ -111,6 +115,7 @@ pub const Subsystem = enum {
             .security,
             .component_object,
             .graphics_stack,
+            .legacy_graphics,
             .networking,
             .multimedia,
             .game_input,
@@ -161,7 +166,8 @@ const libraries = [_]LibraryEntry{
     .{ .stem = "d3d12", .subsystem = .graphics_stack },
     .{ .stem = "d3dcompiler_47", .subsystem = .graphics_stack },
     .{ .stem = "dwmapi", .subsystem = .graphics_stack },
-    .{ .stem = "opengl32", .subsystem = .graphics_stack },
+    .{ .stem = "opengl32", .subsystem = .legacy_graphics },
+    .{ .stem = "glu32", .subsystem = .legacy_graphics },
     // Rosetta virtualizes the Vulkan loader itself: a guest that loads this
     // library reaches Rosetta's typed forwarder, not a host DLL. Refusing it
     // would end the graphics path at its first call.
@@ -296,17 +302,17 @@ pub const ModuleAvailability = enum {
 
 /// Libraries Rosetta deliberately will not load.
 ///
-/// Two kinds live here. Direct3D is named and contracted but has no device
-/// behind it. A graphics debugger's injected DLL is different: it is only
-/// ever present when a human attached the debugger, and reporting it absent
-/// is the *correct* answer on every machine where nobody did. Neither is a
-/// gap, and a run that reports them as gaps buries the library that is one.
+/// Direct3D and legacy OpenGL/GLU are known names without runtime backends.
+/// A graphics debugger's injected DLL is different: it is only ever present
+/// when a human attached the debugger, and reporting it absent is the
+/// *correct* answer on every machine where nobody did.
 const no_backend_libraries = [_][]const u8{
     "d3d11",
     "d3d12",
     "dxgi",
     "d3dcompiler_47",
     "opengl32",
+    "glu32",
     // Injected by RenderDoc when a capture session is attached. Xenia probes
     // for it with `GetModuleHandleW` and proceeds without it, which is what
     // happens on any machine that is not running a capture.
@@ -344,10 +350,12 @@ pub fn moduleFallback(dll_name: []const u8) []const u8 {
     if (matchesStem(dll_name, "d3d11") or
         matchesStem(dll_name, "d3d12") or
         matchesStem(dll_name, "dxgi") or
-        matchesStem(dll_name, "d3dcompiler_47") or
-        matchesStem(dll_name, "opengl32"))
+        matchesStem(dll_name, "d3dcompiler_47"))
     {
         return "vulkan-graphics-path";
+    }
+    if (matchesStem(dll_name, "opengl32") or matchesStem(dll_name, "glu32")) {
+        return "none-no-legacy-opengl-backend";
     }
     if (matchesStem(dll_name, "dsound")) return "winmm-coreaudio-path";
     if (matchesStem(dll_name, "renderdoc")) return "no-capture-session";
@@ -412,6 +420,12 @@ test "the libraries a guest loads dynamically to reach graphics and input are on
     // `LoadLibraryW(L"vulkan-1.dll")` and gives up immediately if it fails.
     try std.testing.expect(isWindowsSurface("vulkan-1.dll"));
     try std.testing.expectEqual(Subsystem.graphics_stack, subsystemFor("vulkan-1.dll"));
+    // Fixed-function OpenGL is not a Vulkan-forwarder alias. Keep its
+    // capability and deliberate no-backend decision distinct.
+    try std.testing.expect(isWindowsSurface("opengl32.dll"));
+    try std.testing.expect(isWindowsSurface("glu32.dll"));
+    try std.testing.expectEqual(Subsystem.legacy_graphics, subsystemFor("opengl32.dll"));
+    try std.testing.expectEqual(Subsystem.legacy_graphics, subsystemFor("GLU32.dll"));
     // XInput: the controller stack tries each spelling in turn, and the
     // driver returns X_STATUS_DLL_NOT_FOUND when the first one is absent.
     try std.testing.expect(isWindowsSurface("xinput1_4.dll"));
@@ -426,6 +440,10 @@ test "a deliberate refusal and a missing package are different findings" {
     try std.testing.expectEqual(ModuleAvailability.no_backend, moduleAvailability("D3D12.dll"));
     try std.testing.expectEqual(ModuleAvailability.no_backend, moduleAvailability("dxgi.dll"));
     try std.testing.expect(!moduleAvailability("D3D12.dll").isGap());
+    try std.testing.expectEqual(ModuleAvailability.no_backend, moduleAvailability("opengl32.dll"));
+    try std.testing.expectEqual(ModuleAvailability.no_backend, moduleAvailability("glu32.dll"));
+    try std.testing.expectEqualStrings("none-no-legacy-opengl-backend", moduleFallback("opengl32.dll"));
+    try std.testing.expectEqualStrings("none-no-legacy-opengl-backend", moduleFallback("glu32.dll"));
     // A debugger's injected DLL is absent on every machine without the
     // debugger attached, so reporting it absent is the right answer, not a
     // missing package.
