@@ -556,6 +556,73 @@ pub fn build(b: *std.Build) void {
     pe64_runtime_test_module.addImport("cleo_routing", cleo_module);
     pe64_runtime_test_module.addImport("x86_vector_helpers", pe_x86_vector_helpers_module);
 
+    // The PE32 raw bridge owns its instruction tests in the decoder and
+    // executor files. Keep a small target for these regressions so a guest
+    // instruction stop can be fixed and checked without launching the guest
+    // application or running the full application test graph.
+    const pe32_raw_decoder_test_module = b.createModule(.{
+        .root_source_file = b.path("../../src/x86-ASM/raw_decoder.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pe32_raw_decoder_test_module.addImport("runtime_abi_handshake", runtime_abi_module);
+    pe32_raw_decoder_test_module.addImport("isa_registry", isa_module);
+    pe32_raw_decoder_test_module.addImport("isa_highway", isa_highway_module);
+    pe32_raw_decoder_test_module.addImport("bridge_memory", bridge_memory_module);
+    pe32_raw_decoder_test_module.addImport("bridge_stack", bridge_stack_module);
+    pe32_raw_decoder_test_module.addImport("bridge_register_tracing", bridge_register_trace_module);
+    pe32_raw_decoder_test_module.addImport("cleo", cleo_module);
+    pe32_raw_decoder_test_module.link_libc = true;
+    pe32_raw_decoder_test_module.addObjectFile(compileCObject(
+        b,
+        target,
+        optimize,
+        b.path("../../test/host_stubs.c"),
+        "exe_runner_decoder_test_host_stubs.o",
+        &[_][]const u8{},
+    ));
+    const pe32_raw_decoder_test = b.addTest(.{
+        .root_module = pe32_raw_decoder_test_module,
+        .filters = &.{ "F6 Group3 decodes", "F6 TEST byte-immediate" },
+    });
+
+    const pe32_execution_test_module = b.createModule(.{
+        .root_source_file = b.path("../../src/x86-ASM/execution_engine.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pe32_execution_test_module.addImport("runtime_abi_handshake", runtime_abi_module);
+    pe32_execution_test_module.addImport("isa_registry", isa_module);
+    pe32_execution_test_module.addImport("isa_highway", isa_highway_module);
+    pe32_execution_test_module.addImport("entrypoint_code_text_segment", entrypoint_code_text_segment_module);
+    pe32_execution_test_module.addImport("bridge_register_tracing", bridge_register_trace_module);
+    pe32_execution_test_module.addImport("bridge_flags", bridge_flags_module);
+    pe32_execution_test_module.addImport("bridge_string_ops", bridge_string_ops_module);
+    pe32_execution_test_module.addImport("bridge_exceptions", bridge_exceptions_module);
+    pe32_execution_test_module.addImport("bridge_stack", bridge_stack_module);
+    pe32_execution_test_module.addImport("bridge_instruction_decoding", bridge_instruction_decoding_module);
+    pe32_execution_test_module.addImport("bridge_memory", bridge_memory_module);
+    pe32_execution_test_module.addImport("cleo", cleo_module);
+    pe32_execution_test_module.link_libc = true;
+    pe32_execution_test_module.addObjectFile(compileCObject(
+        b,
+        target,
+        optimize,
+        b.path("../../test/host_stubs.c"),
+        "exe_runner_execution_test_host_stubs.o",
+        &[_][]const u8{},
+    ));
+    const pe32_execution_test = b.addTest(.{
+        .root_module = pe32_execution_test_module,
+        .filters = &.{ "raw PE F6 NEG and NOT", "raw PE F6 TEST byte-immediate" },
+    });
+    const pe32_instruction_check_step = b.step(
+        "exe-runner-instruction-check",
+        "Run focused PE32 raw decoder and execution tests without launching a guest",
+    );
+    pe32_instruction_check_step.dependOn(&b.addRunArtifact(pe32_raw_decoder_test).step);
+    pe32_instruction_check_step.dependOn(&b.addRunArtifact(pe32_execution_test).step);
+
     runtime_abi_module.addImport("abort_trap_taxonomy", abort_trap_taxonomy_module);
     runtime_abi_module.addImport("entrypoint_code_text_segment", entrypoint_code_text_segment_module);
 
@@ -857,6 +924,14 @@ pub fn build(b: *std.Build) void {
             b,
             target,
             optimize,
+            b.path("../../lib/Mach-O/native_legacy_gl_dispatch.m"),
+            "standalone_windows_route_native_legacy_gl_dispatch.o",
+            &[_][]const u8{ "-Wall", "-Wextra" },
+        ));
+        exe_runner_mod.addObjectFile(compileCObject(
+            b,
+            target,
+            optimize,
             b.path("../../lib/Mach-O/input_controller_bridge.m"),
             "standalone_windows_route_input_controller_bridge.o",
             &[_][]const u8{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
@@ -870,6 +945,7 @@ pub fn build(b: *std.Build) void {
             &[_][]const u8{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
         ));
         exe_runner_mod.linkFramework("AppKit", .{});
+        exe_runner_mod.linkFramework("OpenGL", .{});
         exe_runner_mod.linkFramework("QuartzCore", .{});
         exe_runner_mod.linkFramework("Metal", .{});
         exe_runner_mod.linkFramework("GameController", .{});
