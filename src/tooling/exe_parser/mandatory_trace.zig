@@ -15,3 +15,7 @@ pub fn logText(text: []const u8) void {
 pub fn isEnabled() bool {
     return logger.isEnabled();
 }
+
+pub fn instructionTracingEnabled() bool {
+    return logger.instructionTracingEnabled();
+}

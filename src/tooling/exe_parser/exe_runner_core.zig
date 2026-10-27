@@ -18,8 +18,10 @@ const pe64_runtime = @import("pe64_runtime.zig");
 const elf_processor_state = @import("elf_processor_state");
 const native_windows_graphics = @import("native_windows_graphics");
 const native_windows_audio = @import("native_windows_audio");
-
-const image_scn_mem_execute: u32 = 0x2000_0000;
+const windows_command_line = @import("windows_command_line.zig");
+const pe32_image_loader = @import("pe32_image_loader.zig");
+const pe32_process_runtime = @import("pe32_process_runtime.zig");
+const pe32_interactive_session = @import("pe32_interactive_session.zig");
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn system(command: [*:0]const u8) c_int;
@@ -28,11 +30,38 @@ extern fn rosette_macho_native_application_ensure() c_int;
 extern fn rosette_macho_native_window_ensure(width: u32, height: u32, title: [*:0]const u8) c_int;
 extern fn rosette_macho_native_window_show() c_int;
 extern fn rosette_macho_native_window_pump_events() u32;
+extern fn rosette_macho_native_window_user_closed() c_int;
+extern fn rosette_macho_native_window_is_key() c_int;
+extern fn rosette_macho_native_window_async_key_state(virtual_key: u32) c_int;
 extern fn rosette_macho_native_service_main_queue() u32;
 extern fn rosette_macho_native_set_main_thread_request_hook(hook: ?*const fn (c_int) callconv(.c) void) void;
 extern fn rosette_macho_native_window_read_controller_state(out: *elf_processor_state.WindowsInputState) c_int;
 extern fn rosette_macho_native_window_set_drawable_owner(owned_by_swapchain: c_int) c_int;
 extern fn rosette_macho_native_window_prepare_drawable_size(width: u32, height: u32) c_int;
+extern fn rosette_macho_legacy_gl_context_create(width: u32, height: u32) c_int;
+extern fn rosette_macho_legacy_gl_make_current() c_int;
+extern fn rosette_macho_legacy_gl_clear_current() c_int;
+extern fn rosette_macho_legacy_gl_context_delete() c_int;
+extern fn rosette_macho_legacy_gl_swap() c_int;
+extern fn rosette_macho_legacy_gl_dispatch(
+    name: [*:0]const u8,
+    args: [*]const u64,
+    memory: [*]u8,
+    memory_size: usize,
+    guest_base: u32,
+) u64;
+
+/// The standalone PE32 child runner is exploratory and must remain bounded.
+/// Allow a larger diagnostic window without turning a GUI message loop into an
+/// unbounded interpreter run. Invalid/zero values retain the conservative cap.
+fn pe32ChildMaximumSteps() usize {
+    const default_steps: u64 = 100_000;
+    const maximum_steps: u64 = 50_000_000;
+    const value_ptr = std.c.getenv("ROSETTE_PE32_CHILD_MAX_STEPS") orelse return @intCast(default_steps);
+    const requested = std.fmt.parseInt(u64, std.mem.sliceTo(value_ptr, 0), 10) catch return @intCast(default_steps);
+    if (requested == 0) return @intCast(default_steps);
+    return @intCast(@min(requested, maximum_steps));
+}
 
 fn nativeEnsureApplication(_: ?*anyopaque) callconv(.c) c_int {
     if (comptime builtin.target.os.tag != .macos) return 0;
@@ -52,6 +81,58 @@ fn nativeShowWindow(_: ?*anyopaque) callconv(.c) c_int {
 fn nativePumpEvents(_: ?*anyopaque) callconv(.c) u32 {
     if (comptime builtin.target.os.tag != .macos) return 0;
     return rosette_macho_native_window_pump_events();
+}
+
+fn nativePe32WindowOpen(_: ?*anyopaque) callconv(.c) c_int {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    return if (rosette_macho_native_window_user_closed() == 0) 1 else 0;
+}
+
+fn nativePe32WindowIsKey(_: ?*anyopaque) callconv(.c) c_int {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    return rosette_macho_native_window_is_key();
+}
+
+fn nativePe32AsyncKeyState(_: ?*anyopaque, virtual_key: u32) callconv(.c) c_int {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    return rosette_macho_native_window_async_key_state(virtual_key);
+}
+
+fn nativeLegacyGlCreate(_: ?*anyopaque, width: u32, height: u32) callconv(.c) c_int {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    return rosette_macho_legacy_gl_context_create(width, height);
+}
+
+fn nativeLegacyGlMakeCurrent(_: ?*anyopaque) callconv(.c) c_int {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    return rosette_macho_legacy_gl_make_current();
+}
+
+fn nativeLegacyGlClearCurrent(_: ?*anyopaque) callconv(.c) c_int {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    return rosette_macho_legacy_gl_clear_current();
+}
+
+fn nativeLegacyGlDelete(_: ?*anyopaque) callconv(.c) c_int {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    return rosette_macho_legacy_gl_context_delete();
+}
+
+fn nativeLegacyGlSwap(_: ?*anyopaque) callconv(.c) c_int {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    return rosette_macho_legacy_gl_swap();
+}
+
+fn nativeLegacyGlDispatch(
+    _: ?*anyopaque,
+    name: [*:0]const u8,
+    args: [*]const u64,
+    memory: [*]u8,
+    memory_size: usize,
+    guest_base: u32,
+) callconv(.c) u64 {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    return rosette_macho_legacy_gl_dispatch(name, args, memory, memory_size, guest_base);
 }
 
 /// The main thread's park service: drain AppKit requests other threads
@@ -458,22 +539,6 @@ fn sectionName(section: *const parser.Section) []const u8 {
     return if (raw_name.len == 0) "<unnamed>" else raw_name;
 }
 
-fn installCodeTextSegments(exec: anytype, image: *const parser.Image) void {
-    const image_base_u32: u32 = @as(u32, @truncate(image.image_base));
-    exec.setLoadedImageSize(image.size_of_image);
-    exec.clearCodeTextSegments();
-    for (image.sections) |section| {
-        const section_size = if (section.virtual_size != 0) section.virtual_size else section.raw_size;
-        if (section_size == 0) continue;
-        exec.addCodeTextSegment(code_text.Segment.init(
-            image_base_u32 +% section.virtual_address,
-            section_size,
-            (section.characteristics & image_scn_mem_execute) != 0,
-            sectionName(&section),
-        ));
-    }
-}
-
 fn logInstructionPointerTrap(exec: anytype, guard: code_text.Guard, check: code_text.CheckResult) void {
     if (check.isValid()) return;
     const eip = exec.regs.eip;
@@ -581,6 +646,8 @@ fn logHaltContext(exec: anytype) void {
 }
 
 fn logRawStep(exec: anytype) void {
+    if (!trace.instructionTracingEnabled()) return;
+
     const base = exec.mem.base;
     const eip = exec.regs.eip;
     if (eip < base) return;
@@ -1060,6 +1127,24 @@ pub fn runWithArguments(
         const win32 = x86_asm.win32_thunks;
         const mscoree = x86_asm.mscoree_thunks;
         const Executor = x86_asm.instruction_operations.Executor;
+        var process_runtime = pe32_process_runtime.Runtime.init(allocator, init.io, profile.executable_path);
+        if (comptime builtin.target.os.tag == .macos) {
+            process_runtime.window_host = .{
+                .ensure_window = nativeEnsureWindow,
+                .show_window = nativeShowWindow,
+                .pump_events = nativePumpEvents,
+                .window_open = nativePe32WindowOpen,
+                .window_is_key = nativePe32WindowIsKey,
+                .async_key_state = nativePe32AsyncKeyState,
+                .legacy_gl_create = nativeLegacyGlCreate,
+                .legacy_gl_make_current = nativeLegacyGlMakeCurrent,
+                .legacy_gl_clear_current = nativeLegacyGlClearCurrent,
+                .legacy_gl_delete = nativeLegacyGlDelete,
+                .legacy_gl_swap = nativeLegacyGlSwap,
+                .legacy_gl_dispatch = nativeLegacyGlDispatch,
+            };
+        }
+        defer process_runtime.deinit();
 
         bootLog("8_abi_x86_init: initializing ABI handshake");
         runtime_abi.x86.init();
@@ -1068,39 +1153,71 @@ pub fn runWithArguments(
         trace.logText("execution = true\n");
 
         bootLog("9_create_executor: allocating emulator memory");
-        const stack_size: u32 = 1024 * 1024;
-        const mem_size = image.size_of_image + stack_size;
+        // Reserve the first page after the PE image for the PE32 TEB used by
+        // FS-relative SEH/runtime accesses; the guest stack begins after it.
+        const teb_size: u32 = 0x1000;
+        const stack_size: u32 = 1024 * 1024 + teb_size;
+        const image_base_u32: u32 = @truncate(image.image_base);
+        const image_and_stack_size = image.size_of_image + stack_size;
+        // The PE32 heap shim returns guest addresses beginning at 0x02000000.
+        // Back that range with guest memory so ordinary heap writes stay in the
+        // emulated address space instead of escaping into host memory.
+        const heap_guest_end: u32 = 0x0300_0000;
+        const heap_backing_size = if (image_base_u32 < heap_guest_end)
+            heap_guest_end - image_base_u32
+        else
+            0;
+        const mem_size = @max(image_and_stack_size, heap_backing_size);
         var exec = Executor.init(allocator, mem_size);
         defer exec.deinit();
+        defer if (exec.pe32_gl_context_created) {
+            if (exec.pe32_window_host.legacy_gl_delete) |delete_context| {
+                _ = delete_context(exec.pe32_window_host.context);
+            }
+        };
         exec.setRawX86PeMode();
+        exec.pe32_image_path = profile.executable_path;
+        exec.pe32_main_module_base = @truncate(image.image_base);
+        exec.pe32_command_line = try windows_command_line.build(allocator, profile.executable_path, windows_args);
 
         bootLog("10_code_text_segments: registering executable memory regions");
         exec.mem.base = @as(u32, @truncate(image.image_base));
-        installCodeTextSegments(&exec, &image);
-
         bootLog("11_copy_sections: writing section data to emulated memory");
-        for (image.sections) |section| {
-            const raw = pkg.rawSectionBytes(exe_bytes, &section);
-            const dest = section.virtual_address;
-            const copy_len = @min(@as(usize, section.raw_size), raw.len);
-            if (dest + copy_len <= exec.mem.data.len) {
-                @memcpy(exec.mem.data[dest .. dest + copy_len], raw[0..copy_len]);
-            }
-        }
+        const mapped_image = try pe32_image_loader.mapPreferredBase(&exec, exe_bytes, &image, image_base_u32);
 
         bootLog("12_set_registers: initializing x86 CPU state (EIP, ESP, segment regs)");
-        const image_base_u32: u32 = @as(u32, @truncate(image.image_base));
-        exec.regs.eip = image_base_u32 + image.entry_rva;
+        exec.regs.eip = mapped_image.entry;
         exec.regs.esp = image_base_u32 + image.size_of_image + stack_size - 16;
         exec.regs.ebp = exec.regs.esp;
         exec.mem.stack_hint = exec.regs.esp;
         exec.regs.cs = 0x23;
         exec.regs.ds = 0x2B;
         exec.regs.ss = 0x2B;
+        exec.regs.fs = 0x3B;
+        const teb_base = image_base_u32 + image.size_of_image;
+        const stack_base = teb_base + stack_size;
+        exec.regs.fs_desc.base = teb_base;
+        exec.regs.fs_desc.limit = teb_size - 1;
+        exec.mem.write32(teb_base, std.math.maxInt(u32)); // NT_TIB.ExceptionList: no active SEH frame.
+        exec.mem.write32(teb_base + 4, stack_base);
+        exec.mem.write32(teb_base + 8, teb_base + teb_size);
+        exec.mem.write32(teb_base + 0x18, teb_base); // NT_TIB.Self
+        exec.mem.write32(teb_base + 0x20, @intCast(std.c.getpid()));
+        exec.mem.write32(teb_base + 0x24, @truncate(std.Thread.getCurrentId()));
+        var teb_buf: [96]u8 = undefined;
+        const teb_line = std.fmt.bufPrint(&teb_buf, "pe32_tib = fs_base=0x{X:0>8}; exception_list=0xFFFFFFFF; stack_limit=0x{X:0>8}; stack_base=0x{X:0>8}\n", .{
+            teb_base,
+            teb_base + teb_size,
+            stack_base,
+        }) catch "";
+        trace.logText(teb_line);
 
         bootLog("13_register_thunks: installing Win32 & mscoree thunks");
         win32.register_win32_console_thunks(&exec);
         mscoree.register_mscoree_thunks(&exec);
+        exec.process_api_context = &process_runtime;
+        exec.process_api_handler = pe32_process_runtime.Runtime.processApi;
+        exec.pe32_window_host = process_runtime.window_host;
 
         bootLog("14_parse_imports: parsing PE import directory table");
         var import_dir = imports_mod.parseImportDirectory(allocator, exe_bytes, &image) catch |err| blk: {
@@ -1178,6 +1295,7 @@ pub fn runWithArguments(
         bootLog("15a_iat_setup: populating import address table");
         {
             exec_engine.clearIatEntries();
+            win32.register_dynamic_iat_targets(&exec);
             if (import_dir) |*dir| {
                 var imp_buf: [256]u8 = undefined;
                 const imp_line = std.fmt.bufPrint(&imp_buf, "imports = {d} entries parsed\n", .{dir.descriptors.len}) catch "";
@@ -1192,7 +1310,7 @@ pub fn runWithArguments(
 
                 for (dir.descriptors) |desc| {
                     const iat_addr = image_base_u32 + desc.iat_rva;
-                    exec_engine.addIatEntry(iat_addr, desc.function_name);
+                    exec_engine.addIatEntryForExecutor(&exec, iat_addr, desc.function_name);
                 }
             }
         }
@@ -1271,6 +1389,45 @@ pub fn runWithArguments(
                     std.debug.print("CLR runtime execution failed: {s}\n", .{@errorName(err)});
                 };
             }
+        }
+
+        const child_maximum_steps = pe32ChildMaximumSteps();
+        const child_summary = pe32_interactive_session.run(&process_runtime, child_maximum_steps);
+        if (child_summary.child_created) {
+            var child_buf: [1200]u8 = undefined;
+            const child_line = std.fmt.bufPrint(&child_buf, "pe32_child_process = created={}; resumed={}; dll_loaded={}; dll_attach={}; dll_attach_steps={d}; child_steps={d}; step_limit={d}; terminated={}; exit=0x{X:0>8}; stop=0x{X:0>8}; eip=0x{X:0>8}; eax=0x{X:0>8}; ebx=0x{X:0>8}; ecx=0x{X:0>8}; edx=0x{X:0>8}; esi=0x{X:0>8}; edi=0x{X:0>8}; ebp=0x{X:0>8}; esp=0x{X:0>8}; eflags=0x{X:0>8}; exception=0x{X:0>8}; active_msg=0x{X:0>8}; active_hwnd=0x{X:0>8}; active_lparam=0x{X:0>8}; ecx_p50=0x{X:0>8}; ecx_p54=0x{X:0>8}; stack0=0x{X:0>8}; stack4=0x{X:0>8}; stack8=0x{X:0>8}; stack12=0x{X:0>8}\n", .{
+                child_summary.child_created,
+                child_summary.child_resumed,
+                child_summary.dll_loaded,
+                child_summary.dll_attach_succeeded,
+                child_summary.dll_attach_steps,
+                child_summary.child_steps,
+                child_maximum_steps,
+                child_summary.child_terminated,
+                child_summary.child_exit_code,
+                child_summary.stopped_at,
+                child_summary.current_eip,
+                child_summary.eax,
+                child_summary.ebx,
+                child_summary.ecx,
+                child_summary.edx,
+                child_summary.esi,
+                child_summary.edi,
+                child_summary.ebp,
+                child_summary.esp,
+                child_summary.eflags,
+                child_summary.pending_exception,
+                child_summary.active_window_message,
+                child_summary.active_window_handle,
+                child_summary.active_window_lparam,
+                child_summary.ecx_0x50,
+                child_summary.ecx_0x54,
+                child_summary.stack_0,
+                child_summary.stack_4,
+                child_summary.stack_8,
+                child_summary.stack_12,
+            }) catch "";
+            trace.logText(child_line);
         }
 
         exec_engine.clearIatEntries();

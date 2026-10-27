@@ -54,7 +54,11 @@ pub export fn rosette_debug_log_path() [*:0]const u8 {
 }
 
 pub export fn rosette_runtime_abi_fail_fast_enabled() c_int {
-    return 1;
+    // Keep fail-fast as the default for normal runner use, but allow bounded
+    // PE32 compatibility investigations to report an unsupported guest
+    // instruction in the child summary instead of aborting the host process.
+    const override = std.c.getenv("ROSETTE_RUNTIME_ABI_FAIL_FAST") orelse return 1;
+    return if (override[0] == 0 or override[0] == '0') 0 else 1;
 }
 
 fn usage(exe_name: []const u8) void {
