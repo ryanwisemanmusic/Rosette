@@ -104,6 +104,7 @@ fn controlKindForRaw(kind: raw_decode.ControlKind) bridge.ControlTransferKind {
     return switch (kind) {
         .none => .none,
         .near_jump => .near_jump,
+        .conditional_jump => .near_jump,
         .near_call => .near_call,
         .near_return => .near_return,
     };
@@ -116,7 +117,6 @@ fn reportShadow(source: anytype) void {
 }
 
 pub fn validateRawInstructionWindow(scope: []const u8, start_eip: u32, bytes: []const u8, decoded: raw_decode.DecodedInstruction) void {
-    _ = start_eip;
     var event = bridge.makeDecodeEvent(.x86, reg_trace.currentSequence(), scope);
     const visible = @min(bytes.len, @min(@as(usize, decoded.len), @as(usize, 15)));
     event.decoded_len = @intCast(visible);
@@ -148,6 +148,26 @@ pub fn validateRawInstructionWindow(scope: []const u8, start_eip: u32, bytes: []
         runtime_abi.common.violation("x86-decode", "invalid_opcode", "scope={s} opcode byte 0x{x} is invalid/undefined", .{ scope, decoded.opcode });
     }
     if (event.undefined_opcode) {
+        // This bridge deliberately fail-fasts on instructions it cannot
+        // execute. Preserve the exact guest bytes and address before that
+        // abort so an offline PE run can distinguish a true unsupported
+        // encoding from self-modifying/generated code or a bad decode.
+        const digits = "0123456789ABCDEF";
+        var byte_text: [15 * 3]u8 = undefined;
+        var byte_text_len: usize = 0;
+        for (bytes[0..visible], 0..) |byte, index| {
+            if (index != 0) {
+                byte_text[byte_text_len] = ' ';
+                byte_text_len += 1;
+            }
+            byte_text[byte_text_len] = digits[byte >> 4];
+            byte_text[byte_text_len + 1] = digits[byte & 0x0F];
+            byte_text_len += 2;
+        }
+        runtime_abi.common.writeLine(
+            "[x86-raw-bytes] scope={s} eip=0x{x} bytes={s}\n",
+            .{ scope, start_eip, byte_text[0..byte_text_len] },
+        );
         runtime_abi.common.violation("x86-decode", "raw_unimplemented", "scope={s} instruction={s} isa={s} reason={s}", .{ scope, decoded.textSlice(), decoded.isa_path, decoded.unsupported_reason });
     }
 

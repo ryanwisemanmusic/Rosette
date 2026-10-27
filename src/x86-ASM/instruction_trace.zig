@@ -8,6 +8,13 @@ extern "C" fn rosette_debug_log_path() [*:0]const u8;
 
 var trace_file: ?*std.c.FILE = null;
 var trace_enabled: bool = false;
+var instruction_trace_enabled: bool = true;
+
+fn instructionsEnabledFromEnvironment() bool {
+    const value_ptr = std.c.getenv("ROSETTE_TRACE_INSTRUCTIONS") orelse return true;
+    const value = std.mem.sliceTo(value_ptr, 0);
+    return !std.mem.eql(u8, value, "0") and !std.ascii.eqlIgnoreCase(value, "false");
+}
 
 fn decodeRegister(encoded: i32) Register {
     return @enumFromInt(@as(u4, @truncate(@as(u32, @bitCast(encoded)))));
@@ -103,6 +110,7 @@ fn formatArm64Shadow(buf: []u8, inst: isa.InstructionDef) ![]const u8 {
 }
 
 pub fn initFromHostConfig() void {
+    instruction_trace_enabled = instructionsEnabledFromEnvironment();
     if (rosette_debug_x86_disasm_enabled() == 0) return;
 
     const path_z = rosette_debug_log_path();
@@ -119,6 +127,7 @@ pub fn initFromHostConfig() void {
 }
 
 pub fn initMandatory(log_path_z: [*:0]const u8) void {
+    instruction_trace_enabled = instructionsEnabledFromEnvironment();
     const path = std.mem.span(log_path_z);
     if (path.len == 0) return;
 
@@ -141,6 +150,7 @@ pub fn deinit() void {
     }
     trace_file = null;
     trace_enabled = false;
+    instruction_trace_enabled = true;
 }
 
 pub fn isEnabled() bool {
@@ -148,7 +158,7 @@ pub fn isEnabled() bool {
 }
 
 pub fn logInstruction(eip: u32, inst: isa.InstructionDef, ex: *const Executor) void {
-    if (!trace_enabled) return;
+    if (!trace_enabled or !instruction_trace_enabled) return;
 
     var inst_buf: [128]u8 = undefined;
     const inst_text = formatInstruction(&inst_buf, inst) catch return;

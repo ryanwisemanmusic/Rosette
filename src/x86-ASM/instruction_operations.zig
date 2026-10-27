@@ -66,6 +66,112 @@ pub const ExecutionMode = enum {
 
 /// Operations executor — holds the machine state and runs instructions.
 pub const Executor = struct {
+    pub const Pe32WindowHost = struct {
+        context: ?*anyopaque = null,
+        ensure_window: ?*const fn (?*anyopaque, u32, u32, [*:0]const u8) callconv(.c) c_int = null,
+        show_window: ?*const fn (?*anyopaque) callconv(.c) c_int = null,
+        pump_events: ?*const fn (?*anyopaque) callconv(.c) u32 = null,
+        window_open: ?*const fn (?*anyopaque) callconv(.c) c_int = null,
+        window_is_key: ?*const fn (?*anyopaque) callconv(.c) c_int = null,
+        async_key_state: ?*const fn (?*anyopaque, u32) callconv(.c) c_int = null,
+        legacy_gl_create: ?*const fn (?*anyopaque, u32, u32) callconv(.c) c_int = null,
+        legacy_gl_make_current: ?*const fn (?*anyopaque) callconv(.c) c_int = null,
+        legacy_gl_clear_current: ?*const fn (?*anyopaque) callconv(.c) c_int = null,
+        legacy_gl_delete: ?*const fn (?*anyopaque) callconv(.c) c_int = null,
+        legacy_gl_swap: ?*const fn (?*anyopaque) callconv(.c) c_int = null,
+        legacy_gl_dispatch: ?*const fn (
+            ?*anyopaque,
+            [*:0]const u8,
+            [*]const u64,
+            [*]u8,
+            usize,
+            u32,
+        ) callconv(.c) u64 = null,
+    };
+
+    pub const Pe32WindowTimer = struct {
+        active: bool = false,
+        window: u32 = 0,
+        id: u32 = 0,
+        interval_ns: u64 = 0,
+        next_due_ns: u64 = 0,
+        message_queued: bool = false,
+    };
+
+    /// A PE32 USER32 class registered by the guest. The class metadata is kept
+    /// in guest-address form so later CreateWindowEx calls can resolve the
+    /// original window procedure without copying pointers into host memory.
+    pub const Pe32WindowClass = struct {
+        atom: u16 = 0,
+        instance: u32 = 0,
+        procedure: u32 = 0,
+        name_address: u32 = 0,
+    };
+
+    /// A guest HWND and its WNDPROC are distinct from the single AppKit host
+    /// window. Keeping this small USER32-side table lets a PE create a top
+    /// level frame and a separate child render surface without overwriting
+    /// the callback target for both handles.
+    pub const Pe32WindowRecord = struct {
+        active: bool = false,
+        handle: u32 = 0,
+        procedure: u32 = 0,
+        parent: u32 = 0,
+        x: i32 = 0,
+        y: i32 = 0,
+        width: u32 = 0,
+        height: u32 = 0,
+        visible: bool = false,
+        paint_queued: bool = false,
+        paint_active: bool = false,
+        create_fields: [12]u32 = [_]u32{0} ** 12,
+    };
+
+    /// The PE32 USER32 MSG fields consumed by the loader's basic message loop.
+    pub const Pe32WindowMessage = struct {
+        window: u32 = 0,
+        message: u32 = 0,
+        wparam: u32 = 0,
+        lparam: u32 = 0,
+        dispatch_callback: bool = false,
+        /// Creation callbacks receive a pointer to a guest CREATESTRUCTW,
+        /// whose first field is the caller-provided lpParam object.
+        create_struct: bool = false,
+    };
+
+    /// A bounded PE32 bitmap object backed by guest-addressable storage. DIB
+    /// bits stay in the emulated address space so the guest can populate them
+    /// and pass them directly to OpenGL texture upload calls.
+    pub const Pe32GdiBitmap = struct {
+        active: bool = false,
+        handle: u32 = 0,
+        bits: u32 = 0,
+        width: u32 = 0,
+        height: i32 = 0,
+        bit_count: u16 = 0,
+        compression: u32 = 0,
+        row_stride: u32 = 0,
+        byte_size: u32 = 0,
+    };
+
+    /// APIs that operate across Win32 process/address-space boundaries are
+    /// delegated to the PE runner's process manager. The instruction engine
+    /// stays independent of PE file loading and host OS process semantics.
+    pub const ProcessApi = enum {
+        create_process_a,
+        virtual_alloc,
+        virtual_free,
+        virtual_alloc_ex,
+        write_process_memory,
+        create_remote_thread,
+        wait_for_single_object,
+        get_exit_code_thread,
+        resume_thread,
+        close_handle,
+        virtual_protect,
+    };
+    pub const ProcessApiHandler = *const fn (context: *anyopaque, executor: *Executor, api: ProcessApi) u32;
+
     regs: RegisterFile = .{},
     mem: Memory,
     execution_mode: ExecutionMode = .scripted,
@@ -73,9 +179,72 @@ pub const Executor = struct {
     labels: std.StringHashMap(u32),
     // Import handler table — maps external symbol name to handler
     import_table: std.StringHashMap(*const fn (ctx: *Executor) void),
+    /// PE32 runner TLS is scoped to its single emulated guest thread.
+    tls_values: [64]u32 = [_]u32{0} ** 64,
+    tls_allocated_mask: u64 = 0,
     // Interrupt vector table (256 vectors, for future x86 interrupt dispatch)
     interrupt_vector: [256]?*const fn (*Executor) void = [_]?*const fn (*Executor) void{null} ** 256,
     loaded_image_size: u32 = 0,
+    /// Host-side path for the PE32 module currently represented by this guest.
+    pe32_image_path: []const u8 = "",
+    /// Preferred base of the primary PE32 module, which may differ from the
+    /// lower base of a reserved flat guest address range.
+    pe32_main_module_base: u32 = 0,
+    /// Host-owned source bytes copied to guest memory on the first Win32 query.
+    pe32_command_line: []const u8 = "",
+    /// Guest address of the stable ANSI command line exposed to PE32 imports.
+    pe32_command_line_address: u32 = 0,
+    /// Guest address of the stable UTF-16 command line exposed to PE32 imports.
+    pe32_command_line_w_address: u32 = 0,
+    /// Small, bounded USER32 class table used by the PE32 GUI bootstrap path.
+    pe32_window_classes: [16]Pe32WindowClass = [_]Pe32WindowClass{.{}} ** 16,
+    pe32_window_class_count: usize = 0,
+    pe32_windows: [16]Pe32WindowRecord = [_]Pe32WindowRecord{.{}} ** 16,
+    pe32_window_next_handle: u32 = 0xF400_0001,
+    pe32_window_host: Pe32WindowHost = .{},
+    pe32_window_handle: u32 = 0,
+    pe32_window_procedure: u32 = 0,
+    pe32_window_x: i32 = 0,
+    pe32_window_y: i32 = 0,
+    pe32_window_width: u32 = 0,
+    pe32_window_height: u32 = 0,
+    pe32_window_visible: bool = false,
+    pe32_window_focused: bool = false,
+    pe32_window_paint_queued: bool = false,
+    pe32_window_paint_active: bool = false,
+    pe32_window_cursor_x: i32 = 0,
+    pe32_window_cursor_y: i32 = 0,
+    pe32_window_cursor_handle: u32 = 0,
+    /// Win32 CREATESTRUCTW fields, in their 32-bit ABI order.
+    pe32_window_create_fields: [12]u32 = [_]u32{0} ** 12,
+    pe32_window_messages: [16]Pe32WindowMessage = undefined,
+    pe32_window_message_head: usize = 0,
+    pe32_window_message_count: usize = 0,
+    pe32_window_timers: [8]Pe32WindowTimer = [_]Pe32WindowTimer{.{}} ** 8,
+    pe32_window_next_timer_id: u32 = 1,
+    pe32_window_callback: ?Pe32WindowMessage = null,
+    pe32_window_callback_followup: ?Pe32WindowMessage = null,
+    /// PE32 WGL state is process-local and remains distinct from the Xenia
+    /// Metal/Vulkan surface. The native host callback must create and own the
+    /// actual compatibility context before these flags become true.
+    pe32_gl_pixel_format_set: bool = false,
+    pe32_gl_context_created: bool = false,
+    pe32_gl_context_current: bool = false,
+    pe32_gdi_bitmaps: [16]Pe32GdiBitmap = [_]Pe32GdiBitmap{.{}} ** 16,
+    pe32_gdi_next_bitmap_handle: u32 = 0xF200_0001,
+    pe32_gdi_selected_bitmaps: [2]u32 = .{ 0, 0 },
+    pe32_gdi_selected_objects: [2]u32 = .{ 0, 0 },
+    pe32_priority_class: u32 = 0x0000_0020,
+    /// Guest pointers for the temporary environment blocks returned by Win32.
+    pe32_environment_a_address: u32 = 0,
+    pe32_environment_w_address: u32 = 0,
+    win32_last_error: u32 = 0,
+    win32_unhandled_exception_filter: u32 = 0,
+    process_api_context: ?*anyopaque = null,
+    process_api_handler: ?ProcessApiHandler = null,
+    /// Optional synthetic PE call-return boundary accepted by the raw decoder
+    /// for routines such as DllMain that are invoked without a guest caller.
+    raw_stop_eip: u32 = 0,
     code_text_segments: [code_text.max_segments]code_text.Segment = [_]code_text.Segment{code_text.Segment.init(0, 0, false, "")} ** code_text.max_segments,
     code_text_count: usize = 0,
     terminated: bool = false,
@@ -91,6 +260,42 @@ pub const Executor = struct {
 
     pub fn setRawX86PeMode(self: *Executor) void {
         self.execution_mode = .raw_x86_pe;
+    }
+
+    pub fn tlsAlloc(self: *Executor) u32 {
+        for (0..self.tls_values.len) |index| {
+            const bit = @as(u64, 1) << @as(u6, @intCast(index));
+            if ((self.tls_allocated_mask & bit) == 0) {
+                self.tls_allocated_mask |= bit;
+                self.tls_values[index] = 0;
+                return @intCast(index);
+            }
+        }
+        return std.math.maxInt(u32);
+    }
+
+    pub fn tlsFree(self: *Executor, index: u32) bool {
+        if (index >= self.tls_values.len) return false;
+        const bit = @as(u64, 1) << @as(u6, @intCast(index));
+        if ((self.tls_allocated_mask & bit) == 0) return false;
+        self.tls_allocated_mask &= ~bit;
+        self.tls_values[index] = 0;
+        return true;
+    }
+
+    pub fn tlsGetValue(self: *const Executor, index: u32) ?u32 {
+        if (index >= self.tls_values.len) return null;
+        const bit = @as(u64, 1) << @as(u6, @intCast(index));
+        if ((self.tls_allocated_mask & bit) == 0) return null;
+        return self.tls_values[index];
+    }
+
+    pub fn tlsSetValue(self: *Executor, index: u32, value: u32) bool {
+        if (index >= self.tls_values.len) return false;
+        const bit = @as(u64, 1) << @as(u6, @intCast(index));
+        if ((self.tls_allocated_mask & bit) == 0) return false;
+        self.tls_values[index] = value;
+        return true;
     }
 
     pub fn setLoadedImageSize(self: *Executor, image_size: u32) void {
@@ -583,6 +788,54 @@ pub const Executor = struct {
         if (self.import_table.get(name)) |handler| {
             handler(self);
         }
+    }
+
+    pub fn queuePe32WindowMessage(self: *Executor, message: Pe32WindowMessage) bool {
+        if (self.pe32_window_message_count == self.pe32_window_messages.len) return false;
+        const index = (self.pe32_window_message_head + self.pe32_window_message_count) % self.pe32_window_messages.len;
+        self.pe32_window_messages[index] = message;
+        self.pe32_window_message_count += 1;
+        return true;
+    }
+
+    pub fn findPe32Window(self: *Executor, handle: u32) ?*Pe32WindowRecord {
+        if (handle == 0) return null;
+        for (&self.pe32_windows) |*window| {
+            if (window.active and window.handle == handle) return window;
+        }
+        return null;
+    }
+
+    pub fn findPe32WindowConst(self: *const Executor, handle: u32) ?*const Pe32WindowRecord {
+        if (handle == 0) return null;
+        for (&self.pe32_windows) |*window| {
+            if (window.active and window.handle == handle) return window;
+        }
+        return null;
+    }
+
+    pub fn topLevelPe32Window(self: *const Executor) ?*const Pe32WindowRecord {
+        for (&self.pe32_windows) |*window| {
+            if (window.active and (window.parent == 0 or window.parent == 0xF400_0000)) return window;
+        }
+        return null;
+    }
+
+    pub fn focusPe32Window(self: *const Executor) ?*const Pe32WindowRecord {
+        const top = self.topLevelPe32Window() orelse return null;
+        var child: ?*const Pe32WindowRecord = null;
+        for (&self.pe32_windows) |*window| {
+            if (window.active and window.parent == top.handle) child = window;
+        }
+        return child orelse top;
+    }
+
+    pub fn popPe32WindowMessage(self: *Executor) ?Pe32WindowMessage {
+        if (self.pe32_window_message_count == 0) return null;
+        const message = self.pe32_window_messages[self.pe32_window_message_head];
+        self.pe32_window_message_head = (self.pe32_window_message_head + 1) % self.pe32_window_messages.len;
+        self.pe32_window_message_count -= 1;
+        return message;
     }
 
     // ---- Interrupt dispatch ----
