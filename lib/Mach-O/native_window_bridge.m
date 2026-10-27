@@ -19,8 +19,12 @@
 static void RosetteMachOUpdateMetalDrawable(void);
 static void RosetteMachOActivateWindowForInput(void);
 static void RosetteMachOUpdateFPSHUDTextOnMainThread(void);
+static _Atomic BOOL g_native_window_user_closed = ATOMIC_VAR_INIT(false);
 
 @interface RosetteMachOMetalView : NSView <CALayerDelegate>
+@end
+
+@interface RosetteMachOFPSOverlayView : NSView
 @end
 
 // AppKit's plain NSWindow may refuse key status for a window created by a
@@ -47,6 +51,12 @@ static void RosetteMachOApplyKeyboardEvent(NSEvent *event, BOOL down);
 
 - (BOOL)canBecomeMainWindow {
   return YES;
+}
+
+- (void)close {
+  [super close];
+  atomic_store_explicit(&g_native_window_user_closed, true,
+                        memory_order_release);
 }
 
 - (void)sendEvent:(NSEvent *)event {
@@ -104,6 +114,15 @@ static NSApplication *g_application;
 static NSWindow *g_window;
 static RosetteMachOMetalView *g_view;
 static CAMetalLayer *g_metal_layer;
+// Legacy PE32/OpenGL guests may temporarily present through a compatibility
+// context. Keep this view separate from the Metal view so WGL can opt into it
+// without changing the Xenia/MoltenVK surface or drawable ownership.
+static NSOpenGLView *g_legacy_gl_view;
+static NSOpenGLContext *g_legacy_gl_context;
+static NSView *g_legacy_gl_container;
+static RosetteMachOFPSOverlayView *g_legacy_gl_fps_overlay;
+static NSString *g_legacy_gl_previous_title;
+static BOOL g_legacy_gl_attached;
 static CATextLayer *g_fps_hud_layer;
 static _Atomic(uintptr_t) g_native_metal_layer_pointer = ATOMIC_VAR_INIT(0);
 static id<MTLDevice> g_metal_device;
@@ -168,6 +187,12 @@ static uint32_t g_keyboard_last_key_code;
 static BOOL g_reported_keyboard_mapping;
 static _Atomic uint64_t g_presented_fps_milli = ATOMIC_VAR_INIT(0);
 static _Atomic BOOL g_presented_fps_valid = ATOMIC_VAR_INIT(false);
+// The PE32 compatibility path has no Vulkan WSI callback, so count successful
+// NSOpenGLContext swaps directly. The GL context is current on only one thread
+// at a time; these sample fields are owned by that thread.
+static uint64_t g_legacy_gl_frame_count;
+static uint64_t g_legacy_gl_sample_start_ns;
+static uint64_t g_legacy_gl_sample_start_frame;
 
 // A quick tap that begins and ends between guest polls needs one snapshot to
 // be observed. It must not persist across presented frames, or a slow guest
@@ -182,6 +207,50 @@ static uint64_t g_keyboard_press_ns[128];
 static uint16_t g_keyboard_reported_buttons;
 static uint8_t g_keyboard_reported_triggers[2];
 static int16_t g_keyboard_reported_axes[4];
+
+static NSString *RosetteMachOFPSHUDString(void) {
+  pthread_mutex_lock(&g_keyboard_lock);
+  const BOOL focused = g_keyboard_focused;
+  pthread_mutex_unlock(&g_keyboard_lock);
+
+  if (!focused) return @"CLICK TO FOCUS";
+  if (!atomic_load_explicit(&g_presented_fps_valid, memory_order_acquire)) {
+    return @"FPS --.-";
+  }
+  const double fps = (double)atomic_load_explicit(
+                         &g_presented_fps_milli, memory_order_relaxed) /
+                     1000.0;
+  return [NSString stringWithFormat:@"FPS %.1f", fps];
+}
+
+@implementation RosetteMachOFPSOverlayView
+
+- (BOOL)isOpaque {
+  return NO;
+}
+
+- (NSView *)hitTest:(NSPoint)point {
+  (void)point;
+  // Leave mouse and keyboard interaction with the GL view underneath.
+  return nil;
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+  (void)dirtyRect;
+  const NSRect box = NSMakeRect(NSMaxX(self.bounds) - 144.0, 12.0, 132.0, 22.0);
+  [[NSColor colorWithCalibratedWhite:0.0 alpha:0.58] setFill];
+  [[NSBezierPath bezierPathWithRoundedRect:box xRadius:4.0 yRadius:4.0] fill];
+  const NSDictionary<NSAttributedStringKey, id> *attributes = @{
+    NSFontAttributeName :
+        [NSFont monospacedDigitSystemFontOfSize:12.0
+                                         weight:NSFontWeightMedium],
+    NSForegroundColorAttributeName : NSColor.whiteColor,
+  };
+  [RosetteMachOFPSHUDString() drawInRect:NSInsetRect(box, 5.0, 2.0)
+                          withAttributes:attributes];
+}
+
+@end
 
 static void RosetteMachOClearKeyboardStateLocked(void) {
   memset(g_keyboard_keys, 0, sizeof(g_keyboard_keys));
@@ -569,29 +638,18 @@ static void RosetteMachOConfigureOrdinaryWindowPolicy(void) {
 }
 
 static void RosetteMachOUpdateFPSHUDTextOnMainThread(void) {
-  if (!g_fps_hud_layer) return;
+  if (!g_fps_hud_layer && !g_legacy_gl_fps_overlay) return;
+  NSString *text = RosetteMachOFPSHUDString();
 
-  pthread_mutex_lock(&g_keyboard_lock);
-  const BOOL focused = g_keyboard_focused;
-  pthread_mutex_unlock(&g_keyboard_lock);
-
-  NSString *text = nil;
-  if (!focused) {
-    text = @"CLICK TO FOCUS";
-  } else if (atomic_load_explicit(&g_presented_fps_valid,
-                                  memory_order_acquire)) {
-    const double fps = (double)atomic_load_explicit(
-                           &g_presented_fps_milli, memory_order_relaxed) /
-                       1000.0;
-    text = [NSString stringWithFormat:@"FPS %.1f", fps];
-  } else {
-    text = @"FPS --.-";
+  if (g_fps_hud_layer) {
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    g_fps_hud_layer.string = text;
+    [CATransaction commit];
   }
-
-  [CATransaction begin];
-  [CATransaction setDisableActions:YES];
-  g_fps_hud_layer.string = text;
-  [CATransaction commit];
+  if (g_legacy_gl_fps_overlay) {
+    [g_legacy_gl_fps_overlay setNeedsDisplay:YES];
+  }
 }
 
 static void RosetteMachOShowWindowOnMainThread(const char *reason) {
@@ -990,6 +1048,8 @@ static BOOL RosetteMachOEnsureWindowOnMainThread(uint32_t width,
   if (!g_window) {
     return NO;
   }
+  atomic_store_explicit(&g_native_window_user_closed, false,
+                        memory_order_release);
   g_window.releasedWhenClosed = NO;
   g_window.title = title.length ? title : @"Xenia Canary (Rosette)";
   g_window.acceptsMouseMovedEvents = YES;
@@ -1209,6 +1269,58 @@ int rosette_macho_native_window_show(void) {
     });
   }
   return result ? 1 : 0;
+}
+
+// The PE32 child runner uses this to implement GetMessage's wait contract.
+// Closing the host window is the explicit user request that ends its message
+// loop; an empty guest queue is never treated as WM_QUIT.
+int rosette_macho_native_window_user_closed(void) {
+  return atomic_load_explicit(&g_native_window_user_closed,
+                              memory_order_acquire) ? 1 : 0;
+}
+
+// PE32 USER32 focus messages follow AppKit's real key-window state. The input
+// focus snapshot is updated while pumping AppKit events, and the mutex keeps
+// the query safe when the emulated guest thread is not AppKit's main thread.
+int rosette_macho_native_window_is_key(void) {
+  pthread_mutex_lock(&g_keyboard_lock);
+  const BOOL focused = g_keyboard_window_available && g_keyboard_focused;
+  pthread_mutex_unlock(&g_keyboard_lock);
+  return focused ? 1 : 0;
+}
+
+// Map the maze's Win32 controls onto the physical keys captured for the
+// native guest window. This is deliberately separate from XInput translation:
+// the injected PE32 DLL patches GetAsyncKeyState rather than polling XInput.
+int rosette_macho_native_window_async_key_state(uint32_t virtual_key) {
+  uint16_t key_code;
+  switch (virtual_key) {
+  case 0x09: // VK_TAB
+    key_code = 48u;
+    break;
+  case 0x1b: // VK_ESCAPE
+    key_code = 53u;
+    break;
+  case 0x25: // VK_LEFT
+    key_code = 123u;
+    break;
+  case 0x26: // VK_UP
+    key_code = 126u;
+    break;
+  case 0x27: // VK_RIGHT
+    key_code = 124u;
+    break;
+  case 0x28: // VK_DOWN
+    key_code = 125u;
+    break;
+  default:
+    return 0;
+  }
+
+  pthread_mutex_lock(&g_keyboard_lock);
+  const BOOL down = key_code < 128u && g_keyboard_keys[key_code];
+  pthread_mutex_unlock(&g_keyboard_lock);
+  return down ? 1 : 0;
 }
 
 int rosette_macho_native_window_hide(void) {
@@ -1702,6 +1814,191 @@ RosetteMachONativeWindowStatus rosette_macho_native_window_status(void) {
     });
   }
   return status;
+}
+
+// Create a legacy compatibility context for PE32 WGL callers. The view only
+// replaces the content view while this explicit context is alive. In
+// particular, a live Vulkan drawable contract always wins and is never
+// replaced by the legacy path.
+int rosette_macho_legacy_gl_context_create(uint32_t width, uint32_t height) {
+  (void)width;
+  (void)height;
+  __block int created = 0;
+  @autoreleasepool {
+    RosetteMachORunOnMainThreadSync(^{
+      if (g_drawable_contract_active) {
+        fprintf(stderr,
+                "pe32-opengl: refused WGL context while Vulkan owns the "
+                "native drawable\n");
+        return;
+      }
+      if (!RosetteMachOEnsureWindowOnMainThread(
+              kRosetteLockedWindowWidth, kRosetteLockedWindowHeight,
+              nil)) {
+        return;
+      }
+      if (g_legacy_gl_context != nil) {
+        created = 1;
+        return;
+      }
+
+      const NSOpenGLPixelFormatAttribute attributes[] = {
+          NSOpenGLPFAOpenGLProfile,
+          NSOpenGLProfileVersionLegacy,
+          NSOpenGLPFADoubleBuffer,
+          NSOpenGLPFAColorSize,
+          24,
+          NSOpenGLPFAAlphaSize,
+          8,
+          NSOpenGLPFADepthSize,
+          24,
+          NSOpenGLPFAStencilSize,
+          8,
+          0};
+      NSOpenGLPixelFormat *pixel_format =
+          [[NSOpenGLPixelFormat alloc] initWithAttributes:attributes];
+      if (pixel_format == nil) {
+        fprintf(stderr, "pe32-opengl: no legacy OpenGL pixel format\n");
+        return;
+      }
+
+      NSView *content = g_window.contentView;
+      g_legacy_gl_container = [[NSView alloc] initWithFrame:content.bounds];
+      if (g_legacy_gl_container == nil) {
+        fprintf(stderr, "pe32-opengl: failed to create GL content container\n");
+        return;
+      }
+      g_legacy_gl_container.autoresizingMask =
+          NSViewWidthSizable | NSViewHeightSizable;
+      g_legacy_gl_view = [[NSOpenGLView alloc]
+          initWithFrame:g_legacy_gl_container.bounds
+            pixelFormat:pixel_format];
+      if (g_legacy_gl_view == nil || g_legacy_gl_view.openGLContext == nil) {
+        g_legacy_gl_view = nil;
+        g_legacy_gl_container = nil;
+        fprintf(stderr, "pe32-opengl: failed to create NSOpenGLView\n");
+        return;
+      }
+      g_legacy_gl_view.autoresizingMask =
+          NSViewWidthSizable | NSViewHeightSizable;
+      g_legacy_gl_view.wantsBestResolutionOpenGLSurface = NO;
+      g_legacy_gl_context = g_legacy_gl_view.openGLContext;
+      [g_legacy_gl_context setView:g_legacy_gl_view];
+      GLint swap_interval = 1;
+      [g_legacy_gl_context setValues:&swap_interval
+                        forParameter:NSOpenGLCPSwapInterval];
+      g_legacy_gl_fps_overlay = [[RosetteMachOFPSOverlayView alloc]
+          initWithFrame:g_legacy_gl_container.bounds];
+      if (g_legacy_gl_fps_overlay == nil) {
+        g_legacy_gl_view = nil;
+        g_legacy_gl_context = nil;
+        g_legacy_gl_container = nil;
+        fprintf(stderr, "pe32-opengl: failed to create FPS overlay\n");
+        return;
+      }
+      g_legacy_gl_fps_overlay.autoresizingMask =
+          NSViewWidthSizable | NSViewHeightSizable;
+      [g_legacy_gl_container addSubview:g_legacy_gl_view];
+      [g_legacy_gl_container addSubview:g_legacy_gl_fps_overlay
+                          positioned:NSWindowAbove
+                          relativeTo:g_legacy_gl_view];
+      g_legacy_gl_previous_title = [g_window.title copy];
+      g_window.title = @"Playable 3D Maze";
+      g_window.contentView = g_legacy_gl_container;
+      g_window.initialFirstResponder = g_legacy_gl_view;
+      [g_window makeFirstResponder:g_legacy_gl_view];
+      g_legacy_gl_attached = YES;
+      g_legacy_gl_frame_count = 0;
+      g_legacy_gl_sample_start_ns = 0;
+      g_legacy_gl_sample_start_frame = 0;
+      atomic_store_explicit(&g_presented_fps_milli, 0, memory_order_relaxed);
+      atomic_store_explicit(&g_presented_fps_valid, false, memory_order_release);
+      RosetteMachOUpdateFPSHUDTextOnMainThread();
+      created = 1;
+      fprintf(stderr,
+              "pe32-opengl: compatibility context created window=%ux%u "
+              "fps_hud=legacy_gl_overlay\n",
+              (unsigned)g_window.contentView.bounds.size.width,
+              (unsigned)g_window.contentView.bounds.size.height);
+    });
+  }
+  return created;
+}
+
+int rosette_macho_legacy_gl_make_current(void) {
+  NSOpenGLContext *context = g_legacy_gl_context;
+  if (context == nil) return 0;
+  [context makeCurrentContext];
+  [context update];
+  return [NSOpenGLContext currentContext] == context ? 1 : 0;
+}
+
+int rosette_macho_legacy_gl_clear_current(void) {
+  [NSOpenGLContext clearCurrentContext];
+  return 1;
+}
+
+int rosette_macho_legacy_gl_swap(void) {
+  NSOpenGLContext *context = g_legacy_gl_context;
+  if (context == nil || [NSOpenGLContext currentContext] != context) return 0;
+  [context flushBuffer];
+  ++g_legacy_gl_frame_count;
+  const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  if (g_legacy_gl_sample_start_ns == 0u) {
+    g_legacy_gl_sample_start_ns = now;
+    g_legacy_gl_sample_start_frame = g_legacy_gl_frame_count;
+  } else {
+    const uint64_t elapsed = now - g_legacy_gl_sample_start_ns;
+    if (elapsed >= 500000000ull) {
+      const uint64_t frames =
+          g_legacy_gl_frame_count - g_legacy_gl_sample_start_frame;
+      const uint64_t fps_milli =
+          elapsed == 0u ? 0u : (frames * 1000000000000ull) / elapsed;
+      atomic_store_explicit(&g_presented_fps_milli, fps_milli,
+                            memory_order_relaxed);
+      atomic_store_explicit(&g_presented_fps_valid, frames != 0u,
+                            memory_order_release);
+      g_legacy_gl_sample_start_ns = now;
+      g_legacy_gl_sample_start_frame = g_legacy_gl_frame_count;
+      dispatch_async(dispatch_get_main_queue(), ^{
+        if (g_legacy_gl_attached) {
+          RosetteMachOUpdateFPSHUDTextOnMainThread();
+        }
+      });
+    }
+  }
+  return 1;
+}
+
+int rosette_macho_legacy_gl_context_delete(void) {
+  NSOpenGLContext *context = g_legacy_gl_context;
+  if (context == nil) return 0;
+  if ([NSOpenGLContext currentContext] == context) {
+    [NSOpenGLContext clearCurrentContext];
+  }
+  __block int deleted = 0;
+  @autoreleasepool {
+    RosetteMachORunOnMainThreadSync(^{
+      if (g_legacy_gl_attached && g_window != nil && g_view != nil) {
+        g_window.contentView = g_view;
+        g_window.initialFirstResponder = g_view;
+        [g_window makeFirstResponder:g_view];
+        if (g_legacy_gl_previous_title != nil) {
+          g_window.title = g_legacy_gl_previous_title;
+        }
+      }
+      g_legacy_gl_attached = NO;
+      g_legacy_gl_previous_title = nil;
+      g_legacy_gl_fps_overlay = nil;
+      g_legacy_gl_container = nil;
+      g_legacy_gl_view = nil;
+      g_legacy_gl_context = nil;
+      atomic_store_explicit(&g_presented_fps_valid, false, memory_order_release);
+      RosetteMachOUpdateFPSHUDTextOnMainThread();
+      deleted = 1;
+    });
+  }
+  return deleted;
 }
 
 int rosette_macho_native_window_describe(
