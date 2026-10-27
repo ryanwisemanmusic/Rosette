@@ -61,6 +61,9 @@ pub fn validateTitleSpec(memory_size: u32, stack_top: u32, grid_offset: u32, gri
 }
 
 pub fn validateExecutorState(phase: []const u8, mem_base: u32, mem_len: usize, eip: u32, esp: u32, ebp: u32, flags_raw: u32) void {
+    // EBP is a general-purpose x86 register. Frame-pointer conventions do not
+    // constrain its value, and optimized code commonly uses it as a counter.
+    _ = ebp;
     common.noteValidation();
     if (mem_len == 0) {
         common.violation("x86", "empty_memory", "{s}: executor memory is empty", .{phase});
@@ -71,13 +74,11 @@ pub fn validateExecutorState(phase: []const u8, mem_base: u32, mem_len: usize, e
         common.trapViolation(.BadInstructionPointer, "x86", "eip_range", "{s}: EIP 0x{x} outside [0x{x}, 0x{x}]", .{ phase, eip, mem_base, mem_end });
     if (@as(u64, esp) < mem_base or @as(u64, esp) > mem_end)
         common.trapViolation(.StackMismatch, "x86", "esp_range", "{s}: ESP 0x{x} outside [0x{x}, 0x{x}]", .{ phase, esp, mem_base, mem_end });
-    if (@as(u64, ebp) < mem_base or @as(u64, ebp) > mem_end)
-        common.trapViolation(.StackMismatch, "x86", "ebp_range", "{s}: EBP 0x{x} outside [0x{x}, 0x{x}]", .{ phase, ebp, mem_base, mem_end });
     if ((flags_raw & 0x2) == 0)
         common.trapViolation(.FlagMismatch, "x86", "eflags_reserved1", "{s}: EFLAGS bit1 cleared (raw=0x{x})", .{ phase, flags_raw });
 }
 
-fn validateSegmentState(phase: []const u8, name: []const u8, seg: SegmentState, mem_base: u32, mem_len: usize) void {
+fn validateSegmentState(phase: []const u8, name: []const u8, seg: SegmentState) void {
     if (seg.privilege > 3)
         common.violation("x86", "segment_privilege", "{s}: {s} privilege {d} invalid", .{ phase, name, seg.privilege });
     if (!(seg.operand_bits == 16 or seg.operand_bits == 32))
@@ -87,14 +88,19 @@ fn validateSegmentState(phase: []const u8, name: []const u8, seg: SegmentState, 
     const seg_end = @as(u64, seg.base) + @as(u64, seg.limit);
     if (seg_end < seg.base)
         common.violation("x86", "segment_overflow", "{s}: {s} base 0x{x} + limit 0x{x} overflowed", .{ phase, name, seg.base, seg.limit });
-    if (mem_len > 0 and name.len > 0 and (name[0] == 'C' or name[0] == 'S' or name[0] == 'D' or name[0] == 'E')) {
-        const mem_end = @as(u64, mem_base) + mem_len;
-        if (@as(u64, seg.base) < mem_base or (seg.limit != 0xFFFFFFFF and seg_end > mem_end))
-            common.violation("x86", "segment_range", "{s}: {s} [0x{x}..0x{x}] outside memory [0x{x}..0x{x}]", .{ phase, name, seg.base, seg_end, mem_base, mem_end });
-    }
+    // A segment descriptor is not an allocation reservation. In flat 32-bit
+    // PE processes, CS/DS/SS commonly have base 0 and limit 0xFFFFFFFF even
+    // though the guest image and stack are mapped at nonzero addresses. FS may
+    // also name a TEB outside the image allocation. Check the *current* CS:EIP
+    // and SS:ESP below, and validate each actual memory access at its
+    // execution site; comparing the whole descriptor range with this one
+    // backing allocation rejects valid flat-segment state before guest code
+    // runs (and does not prove that the mapping is safe).
 }
 
 pub fn validateExtendedState(phase: []const u8, mem_base: u32, mem_len: usize, eip: u32, esp: u32, ebp: u32, state: ExtendedState) void {
+    // EBP is not inherently a frame pointer; actual memory accesses are checked
+    // at their execution sites.
     common.noteValidation();
     validateExecutorState(phase, mem_base, mem_len, eip, esp, ebp, state.flags_raw);
 
@@ -105,20 +111,17 @@ pub fn validateExtendedState(phase: []const u8, mem_base: u32, mem_len: usize, e
     if (state.iopl != @as(u2, @truncate((state.flags_raw >> 12) & 0x3)))
         common.trapViolation(.FlagMismatch, "x86", "iopl_mismatch", "{s}: IOPL field {d} does not match EFLAGS raw 0x{x}", .{ phase, state.iopl, state.flags_raw });
 
-    validateSegmentState(phase, "CS", state.cs, mem_base, mem_len);
-    validateSegmentState(phase, "DS", state.ds, mem_base, mem_len);
-    validateSegmentState(phase, "ES", state.es, mem_base, mem_len);
-    validateSegmentState(phase, "FS", state.fs, mem_base, mem_len);
-    validateSegmentState(phase, "GS", state.gs, mem_base, mem_len);
-    validateSegmentState(phase, "SS", state.ss, mem_base, mem_len);
+    validateSegmentState(phase, "CS", state.cs);
+    validateSegmentState(phase, "DS", state.ds);
+    validateSegmentState(phase, "ES", state.es);
+    validateSegmentState(phase, "FS", state.fs);
+    validateSegmentState(phase, "GS", state.gs);
+    validateSegmentState(phase, "SS", state.ss);
 
     if (@as(u64, eip) < state.cs.base or @as(u64, eip) > @as(u64, state.cs.base) + state.cs.limit)
         common.trapViolation(.BadInstructionPointer, "x86", "cs_eip_range", "{s}: EIP 0x{x} outside CS range [0x{x}..0x{x}]", .{ phase, eip, state.cs.base, @as(u64, state.cs.base) + state.cs.limit });
     if (@as(u64, esp) < state.ss.base or @as(u64, esp) > @as(u64, state.ss.base) + state.ss.limit)
         common.trapViolation(.StackMismatch, "x86", "ss_esp_range", "{s}: ESP 0x{x} outside SS range [0x{x}..0x{x}]", .{ phase, esp, state.ss.base, @as(u64, state.ss.base) + state.ss.limit });
-    if (@as(u64, ebp) < state.ss.base or @as(u64, ebp) > @as(u64, state.ss.base) + state.ss.limit)
-        common.trapViolation(.StackMismatch, "x86", "ss_ebp_range", "{s}: EBP 0x{x} outside SS range [0x{x}..0x{x}]", .{ phase, ebp, state.ss.base, @as(u64, state.ss.base) + state.ss.limit });
-
     if ((state.mxcsr & 0xFFBF_0000) != 0)
         common.violation("x86", "mxcsr_reserved", "{s}: MXCSR reserved bits set: 0x{x}", .{ phase, state.mxcsr });
     if ((state.fpu_control & 0xE080) != 0)
@@ -186,8 +189,11 @@ pub fn validateMemorySemantics(kind: AccessKind, addr: u32, width: usize, permis
         common.violation("x86", "null_page", "{s} at 0x{x} touched null page", .{ @tagName(kind), addr });
     if (guard_page)
         common.violation("x86", "guard_page", "{s} at 0x{x} touched guard page", .{ @tagName(kind), addr });
-    if (!aligned)
-        common.violation("x86", "unaligned_access", "{s} at 0x{x} width {d} unaligned", .{ @tagName(kind), addr, width });
+    // Scalar x86 loads and stores are valid at unaligned addresses unless
+    // CR0.AM and EFLAGS.AC jointly request #AC. This flat PE model does not
+    // enable alignment checking, so ordinary unaligned accesses are expected
+    // guest behavior rather than an ABI violation.
+    _ = aligned;
     const need_bit: u8 = switch (kind) {
         .read => 1 << 0,
         .write => 1 << 1,

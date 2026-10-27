@@ -14,6 +14,12 @@ var initialized = false;
 var log_file: ?*std.c.FILE = null;
 var violation_count: usize = 0;
 var validation_count: usize = 0;
+var trace_enabled = true;
+
+fn traceFileEnabled() bool {
+    const value = std.c.getenv("ROSETTE_RUNTIME_ABI_TRACE") orelse return true;
+    return value[0] != '0';
+}
 
 fn pathZToSlice(path_z: [*:0]const u8) []const u8 {
     return std.mem.span(path_z);
@@ -42,10 +48,13 @@ pub fn acquire() void {
     retain_count += 1;
     if (initialized) return;
     initialized = true;
+    trace_enabled = traceFileEnabled();
 
-    var path_buf: [max_log_path]u8 = undefined;
-    const log_path = buildRuntimeLogPath(&path_buf);
-    log_file = std.c.fopen(log_path.ptr, "w");
+    if (trace_enabled) {
+        var path_buf: [max_log_path]u8 = undefined;
+        const log_path = buildRuntimeLogPath(&path_buf);
+        log_file = std.c.fopen(log_path.ptr, "w");
+    }
     writeLine("# Rosette runtime ABI handshake log\n", .{});
     writeLine("# debug_enabled={d}\n", .{rosette_debug_enabled()});
 }
@@ -76,7 +85,7 @@ pub fn validationCount() usize {
 }
 
 pub fn writeLine(comptime fmt: []const u8, args: anytype) void {
-    if (log_file == null) return;
+    if (log_file == null or !trace_enabled) return;
     var line_buf: [2048]u8 = undefined;
     const line = std.fmt.bufPrint(&line_buf, fmt, args) catch return;
     if (log_file) |file| {
