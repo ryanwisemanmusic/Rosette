@@ -1,7 +1,7 @@
 # Targets owned by app/bundling/. Keep recipes local to this folder.
 
 
-.PHONY: exe-list mscoree-native exe-runner-build gate-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-parse app-exe-run
+.PHONY: exe-list mscoree-native exe-runner-build exe-runner-instruction-check gate-runner-build exe-runner-cleanup exe-run exe-run-interactive exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-parse app-exe-run
 
 exe-list:
 	@find "$(EXE_EXAMPLES_DIR)" -maxdepth 1 -type f \( -name '*.exe' -o -name '*.EXE' \) | sort
@@ -63,6 +63,12 @@ exe-runner-build: mscoree-native
 	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build exe-runner --build-file app/bundling/build.zig $(APP_BUNDLE_RELEASE_FLAG) 2>&1
 	@cp "$(ROOT_DIR)/app/bundling/zig-out/bin/rosette_exe_runner" "$(EXE_RUNNER_BIN)"
 
+# Fast, offline PE32 decoder/executor regressions. Does not build, launch, or
+# modify the runner binary and does not execute a guest application.
+exe-runner-instruction-check:
+	@mkdir -p "$(ZIG_CACHE_DIR)/global"
+	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build exe-runner-instruction-check --build-file app/bundling/build.zig $(APP_BUNDLE_RELEASE_FLAG) 2>&1
+
 gate-runner-build: exe-runner-build
 
 exe-runner-cleanup:
@@ -82,6 +88,36 @@ exe-run: exe-runner-build
 	fi
 	@$(MAKE) --no-print-directory exe-runner-cleanup
 	@$(call RUN_ROSETTE_EXE,$(EXE),)
+
+# Interactive PE32 GUI sessions are opt-in: unlike exe-run's bounded analysis
+# run, this keeps resuming a hosted child until it exits or its native window
+# closes. Use this for programs such as Playable3DMaze that need an event loop.
+# The full ABI trace can grow by gigabytes in long-lived guests, so interactive
+# runs disable it by default. Set ROSETTE_INTERACTIVE_ABI_TRACE=1 to opt in.
+ROSETTE_INTERACTIVE_ABI_TRACE ?= 0
+# Per-instruction disassembly is useful for bounded diagnosis but can dominate
+# a long-running guest. Set ROSETTE_INTERACTIVE_INSTRUCTION_TRACE=1 to opt in.
+ROSETTE_INTERACTIVE_INSTRUCTION_TRACE ?= 0
+# Interactive PE32 window callbacks may reach an instruction the emulator does
+# not implement. Keep that guest failure from aborting the Rosette host; the
+# callback stops and emits one PE32_EXEC_STOP record so the missing operation
+# can be identified. Bounded exe-run keeps its strict fail-fast default.
+ROSETTE_INTERACTIVE_FAIL_FAST ?= 0
+# This diagnostic is failure-only (not a per-instruction trace); it prints the
+# guest EIP, decoded operation, reason and registers when an instruction stops.
+ROSETTE_INTERACTIVE_EXEC_TRACE ?= 1
+exe-run-interactive: exe-runner-build
+	@if [ ! -f "$(EXE)" ]; then \
+		echo "EXE not found: $(EXE)"; \
+		exit 1; \
+	fi
+	@$(MAKE) --no-print-directory exe-runner-cleanup
+	@export ROSETTE_PE32_INTERACTIVE=1; \
+	 export ROSETTE_RUNTIME_ABI_TRACE="$(ROSETTE_INTERACTIVE_ABI_TRACE)"; \
+	 export ROSETTE_TRACE_INSTRUCTIONS="$(ROSETTE_INTERACTIVE_INSTRUCTION_TRACE)"; \
+	 export ROSETTE_RUNTIME_ABI_FAIL_FAST="$(ROSETTE_INTERACTIVE_FAIL_FAST)"; \
+	 export ROSETTE_PE32_EXEC_TRACE="$(ROSETTE_INTERACTIVE_EXEC_TRACE)"; \
+	 $(call RUN_ROSETTE_EXE,$(EXE),)
 
 exe-export: exe-runner-build
 	@src="$(SRC_EXE)"; \
