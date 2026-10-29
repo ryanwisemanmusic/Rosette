@@ -85,6 +85,45 @@ pub fn tryLog10(comptime host: type, state: anytype, name: []const u8, direct_re
 /// its chain.
 pub fn tryFunction(comptime host: type, state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
     if (tryExp2(host, state, name, direct_return_rip) or tryLog10(host, state, name, direct_return_rip)) return true;
+
+    // The supplied OpenTyrian PE imports both CRT precisions. Keep float
+    // results in XMM0's low lane and preserve the same Microsoft x64 ABI path
+    // as the existing double implementations.
+    if (std.mem.eql(u8, name, "atanf") or std.mem.eql(u8, name, "cosf") or
+        std.mem.eql(u8, name, "roundf") or std.mem.eql(u8, name, "sinf") or
+        std.mem.eql(u8, name, "sqrtf"))
+    {
+        const value = guestFloat(state, 0);
+        const result: f32 = if (std.mem.eql(u8, name, "atanf"))
+            std.math.atan(value)
+        else if (std.mem.eql(u8, name, "cosf"))
+            std.math.cos(value)
+        else if (std.mem.eql(u8, name, "roundf"))
+            std.math.round(value)
+        else if (std.mem.eql(u8, name, "sinf"))
+            std.math.sin(value)
+        else
+            @sqrt(value);
+        returnGuestFloat(state, result);
+        host.completeCall(state, direct_return_rip);
+        return true;
+    }
+
+    if (std.mem.eql(u8, name, "sin")) {
+        returnGuestDouble(state, std.math.sin(guestDouble(state, 0)));
+        host.completeCall(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "pow")) {
+        returnGuestDouble(state, std.math.pow(f64, guestDouble(state, 0), guestDouble(state, 1)));
+        host.completeCall(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "powf")) {
+        returnGuestFloat(state, std.math.pow(f32, guestFloat(state, 0), guestFloat(state, 1)));
+        host.completeCall(state, direct_return_rip);
+        return true;
+    }
     const Unary = struct { name: []const u8, apply: *const fn (f64) f64 };
     const unary = [_]Unary{
         .{ .name = "acos", .apply = struct {

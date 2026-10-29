@@ -32,12 +32,19 @@ const io_integrity = @import("windows_runtime/io_integrity.zig");
 const fast_imports = @import("windows_runtime/fast_imports.zig");
 const fast_math = @import("windows_runtime/fast_math.zig");
 const core_imports = @import("windows_runtime/core_imports.zig");
+const sdl2_imports = @import("windows_runtime/sdl2_imports.zig");
+const crt_string_mutation = @import("windows_runtime/crt_string_mutation.zig");
+const stdio_format = @import("windows_runtime/stdio_format.zig");
+const sdl2_format = @import("windows_runtime/sdl2_format.zig");
+const windows_import_catalog = @import("windows_runtime/import_catalog.zig");
 pub const SYNTHETIC_BSEARCH_RETURN = @import("windows_bsearch").SYNTHETIC_BSEARCH_RETURN;
 const log = std.log.scoped(.windows_runtime);
 
 const _core_import_api = struct {
     pub const _std = std;
     pub const _stdio_flush = stdio_flush;
+    pub const _stdio_format = stdio_format;
+    pub const _formatWindowsV = sdl2_format.formatWindowsV;
     pub const _import_contract = import_contract;
     pub const _log = log;
     pub const _ModuleAvailability = ModuleAvailability;
@@ -61,6 +68,10 @@ const _core_import_api = struct {
     pub const _fillGuest = fillGuest;
     pub const _guestRangeAvailable = guestRangeAvailable;
     pub const _copyGuestBytes = copyGuestBytes;
+    pub const _crtCStringOrNull = crtCStringOrNull;
+    pub const _crtCStringSnapshotBytes = crtCStringSnapshotBytes;
+    pub const _deinitCrtCStringSnapshot = deinitCrtCStringSnapshot;
+    pub const _noteCrtMemoryUnreadable = noteCrtMemoryUnreadable;
     pub const _writeWindowsGuestHandle = writeWindowsGuestHandle;
     pub const _handleDxgiFactory = handleDxgiFactory;
     pub const _windows_get_message_idle_rounds = windows_get_message_idle_rounds;
@@ -113,6 +124,7 @@ const _core_import_api = struct {
     pub const _noteWindowsUnreadableModuleName = noteWindowsUnreadableModuleName;
     pub const _guestStdString = guestStdString;
     pub const _guestWideUnit = guestWideUnit;
+    pub const _guestWideCStringLength = guestWideCStringLength;
     pub const _copyGuestWideString = copyGuestWideString;
     pub const _publishGuestPathWrites = publishGuestPathWrites;
     pub const _guestSystemAffinityMask = guestSystemAffinityMask;
@@ -173,6 +185,7 @@ const _core_import_api = struct {
     pub const _beginWindowsFind = beginWindowsFind;
     pub const _advanceWindowsFindCall = advanceWindowsFindCall;
     pub const _handleStringAndMemory = handleStringAndMemory;
+    pub const _beginWindowsSdlAudioCallback = beginWindowsSdlAudioCallback;
     pub const _handleWindowsRegistry = handleWindowsRegistry;
     pub const _handleWindowsSockets = handleWindowsSockets;
     pub const _handleWindowsSecurity = handleWindowsSecurity;
@@ -405,13 +418,16 @@ pub const ImportClass = enum {
 
 pub fn classifyImport(dll_name: []const u8, function_name: []const u8) ImportClass {
     if (isGraphicsImport(dll_name, function_name)) return .graphics;
-    if (isKnownCoreImport(function_name)) return .core;
+    if (windows_import_catalog.isKnownCoreImport(function_name)) return .core;
     if (isKnownContractImport(dll_name, function_name)) return .contract;
+    if (sdl2_imports.classify(dll_name, function_name)) |support| {
+        return if (support == .implemented) .contract else .degraded;
+    }
     return .unsupported;
 }
 
 /// The three inventory answers for one (module, name) pair.
-const ImportTraits = struct { graphics: bool, core: bool, contract: bool };
+const ImportTraits = struct { graphics: bool, core: bool, contract: bool, degraded: bool };
 
 /// `classifyImport`'s inputs, remembered by value. Every import call used to
 /// classify its name afresh - about five hundred string comparisons in
@@ -426,7 +442,7 @@ const ImportTraitsMemo = struct {
     name: [80]u8 = undefined,
     name_len: u8 = 0,
     valid: bool = false,
-    traits: ImportTraits = .{ .graphics = false, .core = false, .contract = false },
+    traits: ImportTraits = .{ .graphics = false, .core = false, .contract = false, .degraded = false },
 };
 var import_traits_memo: [512]ImportTraitsMemo = @splat(.{});
 var import_traits_memo_mutex = ImportTraitsMutex{};
@@ -449,8 +465,9 @@ fn importTraits(dll_name: []const u8, function_name: []const u8) ImportTraits {
     }
     const traits: ImportTraits = .{
         .graphics = isGraphicsImport(dll_name, function_name),
-        .core = isKnownCoreImport(function_name),
+        .core = windows_import_catalog.isKnownCoreImport(function_name),
         .contract = isKnownContractImport(dll_name, function_name),
+        .degraded = sdl2_imports.classify(dll_name, function_name) == .deferred,
     };
     if (slot) |entry| {
         @memcpy(entry.dll[0..dll_name.len], dll_name);
@@ -469,6 +486,7 @@ fn classifyImportCached(dll_name: []const u8, function_name: []const u8) ImportC
     if (traits.graphics) return .graphics;
     if (traits.core) return .core;
     if (traits.contract) return .contract;
+    if (traits.degraded) return .degraded;
     return .unsupported;
 }
 
@@ -1487,495 +1505,6 @@ fn handleDxgiFactory(state: anytype, name: []const u8, direct_return_rip: ?u64) 
     return true;
 }
 
-fn isKnownCoreImport(name: []const u8) bool {
-    if (name.len == 0) return false;
-    // The PE loader and the MSVC runtime use a large family of prefixed
-    // helpers. These prefixes are deliberately limited to ABI/runtime names;
-    // arbitrary C++ imports still remain visible as unsupported.
-    if (std.mem.startsWith(u8, name, "Rtl") or
-        std.mem.startsWith(u8, name, "Nt") or
-        std.mem.startsWith(u8, name, "Zw") or
-        std.mem.startsWith(u8, name, "__stdio_common_") or
-        std.mem.startsWith(u8, name, "__p_")) return true;
-
-    const known_names = [_][]const u8{
-        // Process, module, error, and environment state.
-        "GetLastError",
-        "SetLastError",
-        "GetHandleInformation",
-        "GetCurrentProcess",
-        "GetCurrentThread",
-        "GetCurrentProcessId",
-        "GetCurrentThreadId",
-        "GetProcessHeap",
-        "GetModuleHandleA",
-        "GetModuleHandleW",
-        "ExitProcess",
-        "TerminateProcess",
-        "exit",
-        "_exit",
-        "_Exit",
-        "quick_exit",
-        "_cexit",
-        "_c_exit",
-        "LoadLibraryA",
-        "LoadLibraryW",
-        "LoadLibraryExA",
-        "LoadLibraryExW",
-        "FreeLibrary",
-        "GetProcAddress",
-        "GetModuleFileNameA",
-        "GetModuleFileNameW",
-        "GetModuleInformation",
-        "SetUnhandledExceptionFilter",
-        "GetThreadDescription",
-        "SetThreadDescription",
-        "IsDebuggerPresent",
-        "GetEnvironmentVariableA",
-        "GetEnvironmentVariableW",
-        "SetEnvironmentVariableA",
-        "SetEnvironmentVariableW",
-        "GetCommandLineA",
-        "GetCommandLineW",
-        "GetSystemDirectoryA",
-        "GetSystemDirectoryW",
-        "GetWindowsDirectoryA",
-        "GetWindowsDirectoryW",
-        "GetTempPathA",
-        "GetTempPathW",
-        "GetCurrentDirectoryA",
-        "GetCurrentDirectoryW",
-        "GetVersionExA",
-        "GetVersionExW",
-
-        // dbghelp's symbol service is used by Xenia's Windows stack walker
-        // during processor startup.  The PE runner cannot expose host stack
-        // addresses as guest pointers, but it can preserve the option and
-        // initialization contracts so diagnostics do not abort startup.
-        "SymGetOptions",
-        "SymSetOptions",
-        "SymInitialize",
-        "SymCleanup",
-        "StackWalk64",
-        "SymFunctionTableAccess64",
-        "SymGetModuleBase64",
-        "SymGetSymFromAddr64",
-        "SymFromAddr",
-        "SymGetLineFromAddr64",
-        "SymGetModuleInfo64",
-        "SymRefreshModuleList",
-
-        // Virtual memory and heap entry points.
-        "VirtualAlloc",
-        "VirtualAllocEx",
-        "VirtualFree",
-        "VirtualFreeEx",
-        "VirtualProtect",
-        "VirtualProtectEx",
-        "VirtualQuery",
-        "VirtualQueryEx",
-        "HeapAlloc",
-        "HeapReAlloc",
-        "HeapFree",
-        "HeapSize",
-        "HeapCreate",
-        "HeapDestroy",
-        "RtlAllocateHeap",
-        "RtlReAllocateHeap",
-        "RtlFreeHeap",
-        "RtlSizeHeap",
-        "LocalAlloc",
-        "LocalReAlloc",
-        "LocalFree",
-        "GlobalAlloc",
-        "GlobalReAlloc",
-        "GlobalFree",
-        "CoTaskMemAlloc",
-        "CoTaskMemRealloc",
-        "CoTaskMemFree",
-
-        // Synchronization and thread lifecycle. The cooperative executor
-        // cannot safely block the host here, so these are non-blocking guest
-        // operations with explicit deterministic results.
-        "InitializeCriticalSection",
-        "InitializeCriticalSectionEx",
-        "InitializeCriticalSectionAndSpinCount",
-        "DeleteCriticalSection",
-        "EnterCriticalSection",
-        "LeaveCriticalSection",
-        "TryEnterCriticalSection",
-        "CreateEventA",
-        "CreateEventW",
-        "CreateMutexA",
-        "CreateMutexW",
-        "CreateSemaphoreA",
-        "CreateSemaphoreW",
-        "pthread_once",
-        "SetEvent",
-        "ResetEvent",
-        "PulseEvent",
-        "ReleaseMutex",
-        "ReleaseSemaphore",
-        "CloseHandle",
-        "WaitForSingleObject",
-        "WaitForSingleObjectEx",
-        "WaitForMultipleObjects",
-        "WaitForMultipleObjectsEx",
-        "Sleep",
-        "SleepEx",
-        "SwitchToThread",
-        "CreateThread",
-        "CreateRemoteThread",
-        "ExitThread",
-        "TlsAlloc",
-        "TlsGetValue",
-        "TlsSetValue",
-        "TlsFree",
-        "FlsAlloc",
-        "FlsGetValue",
-        "FlsSetValue",
-        "FlsFree",
-        "GetQueuedCompletionStatus",
-        "PostQueuedCompletionStatus",
-        "SetThreadContext",
-
-        // File and path APIs. The model reports absence until a real Rosetta
-        // filesystem binding is installed; it never fabricates file contents.
-        "CreateFileA",
-        "CreateFileW",
-        "CreateFileMappingA",
-        "CreateFileMappingW",
-        "MapViewOfFile",
-        "MapViewOfFileEx",
-        "UnmapViewOfFile",
-        "ReadFile",
-        "WriteFile",
-        "FlushFileBuffers",
-        "GetFileSize",
-        "GetFileSizeEx",
-        "SetFilePointer",
-        "SetFilePointerEx",
-        "SetEndOfFile",
-        "FlushFileBuffers",
-        "GetFileAttributesA",
-        "GetFileAttributesW",
-        "GetFileAttributesExA",
-        "GetFileAttributesExW",
-        "FindFirstFileA",
-        "FindFirstFileW",
-        "FindFirstFileExA",
-        "FindFirstFileExW",
-        "FindNextFileA",
-        "FindNextFileW",
-        "FindClose",
-        "DeleteFileA",
-        "DeleteFileW",
-        "MoveFileA",
-        "MoveFileW",
-        "GetFullPathNameA",
-        "GetFullPathNameW",
-
-        // UCRT/MSVC stdio calls used by Xenia's Windows filesystem facade.
-        // These are backed by the same confined handle table as CreateFile,
-        // so FILE* values never contain host pointers.
-        "__acrt_iob_func",
-        "fopen",
-        "fopen64",
-        "_wfopen",
-        "_wfsopen",
-        "fdopen",
-        "_fdopen",
-        "fgetwc",
-        "fclose",
-        "fflush",
-        "fread",
-        "fwrite",
-        "fseek",
-        "ftell",
-        "_fseeki64",
-        "_ftelli64",
-        "lseek64",
-        "_lseeki64",
-        "read",
-        "_read",
-        "write",
-        "_write",
-        "close",
-        "_close",
-        "setvbuf",
-        "ferror",
-        "feof",
-        "fgetc",
-        "fputc",
-        "fputs",
-        "fgets",
-        "putc",
-        "puts",
-        "putchar",
-        "_filelengthi64",
-        "_chsize_s",
-        "_fileno",
-        "_stat64",
-        "_wstat64",
-        "__stat64",
-        "_fstat64",
-        "fstat64",
-
-        // Win32 window/message entry points used by Xenia's UI shell.
-        "RegisterClassA",
-        "RegisterClassW",
-        "RegisterClassExA",
-        "RegisterClassExW",
-        "UnregisterClassA",
-        "UnregisterClassW",
-        "CreateWindowExA",
-        "CreateWindowExW",
-        "DestroyWindow",
-        "ShowWindow",
-        "UpdateWindow",
-        "SetWindowPos",
-        "SetWindowLongA",
-        "SetWindowLongW",
-        "SetWindowLongPtrA",
-        "SetWindowLongPtrW",
-        "GetWindowLongA",
-        "GetWindowLongW",
-        "GetWindowLongPtrA",
-        "GetWindowLongPtrW",
-        "GetClassLongPtrW",
-        "GetClientRect",
-        "GetWindowRect",
-        "GetWindowPlacement",
-        "SetWindowPlacement",
-        "GetDC",
-        "ReleaseDC",
-        "GetDeviceCaps",
-        "BeginPaint",
-        "EndPaint",
-        "PeekMessageA",
-        "PeekMessageW",
-        "GetMessageA",
-        "GetMessageW",
-        "TranslateMessage",
-        "DispatchMessageA",
-        "DispatchMessageW",
-        "DefWindowProcA",
-        "DefWindowProcW",
-        "PostQuitMessage",
-        "PostMessageA",
-        "PostMessageW",
-        "GetSystemMetrics",
-        "GetDpiForWindow",
-        "AdjustWindowRectEx",
-        "AdjustWindowRectExForDpi",
-        "EnableNonClientDpiScaling",
-        "GetDpiForSystem",
-        "GetMonitorInfoA",
-        "GetMonitorInfoW",
-        "MonitorFromWindow",
-        "SetCursor",
-        "LoadCursorA",
-        "LoadCursorW",
-        "LoadIconA",
-        "LoadIconW",
-        "GetStockObject",
-        "CreateIconFromResourceEx",
-        "DestroyIcon",
-        "SetWindowTextA",
-        "SetWindowTextW",
-        "SetPropA",
-        "SetPropW",
-        "GetPropA",
-        "GetPropW",
-        "RemovePropA",
-        "RemovePropW",
-        "RegisterDeviceNotificationA",
-        "RegisterDeviceNotificationW",
-        "UnregisterDeviceNotification",
-        "CreateTimerQueueTimer",
-        "DeleteTimerQueueTimer",
-        "SetMenu",
-        "CreateMenu",
-        "CreatePopupMenu",
-        "DestroyMenu",
-        "AppendMenuA",
-        "AppendMenuW",
-        "EnableMenuItem",
-        "DrawMenuBar",
-        "SetMenuInfo",
-        "GetMenuInfo",
-        "MessageBoxA",
-        "MessageBoxW",
-        "SetFocus",
-        "GetFocus",
-        "GetCapture",
-        "SetCapture",
-        "ReleaseCapture",
-        "GetCursorPos",
-        "WindowFromPoint",
-        "ScreenToClient",
-        "ClientToScreen",
-        "GetKeyState",
-        "VkKeyScanW",
-        "InvalidateRect",
-        "InvalidateRgn",
-        "RedrawWindow",
-        "ValidateRect",
-        "ValidateRgn",
-        "GetUpdateRect",
-        "SendMessageA",
-        "SendMessageW",
-        "AttachConsole",
-        "DragAcceptFiles",
-        "DragFinish",
-        "DragQueryFileW",
-        "GlobalAddAtomW",
-        "GlobalDeleteAtom",
-        "PostMessageA",
-        "PostMessageW",
-        "PostQuitMessage",
-
-        // Time, performance counters, and processor-yield helpers.
-        "QueryPerformanceCounter",
-        "QueryPerformanceFrequency",
-        "GetTickCount",
-        "GetTickCount64",
-        "GetSystemTimeAsFileTime",
-        "GetSystemTimePreciseAsFileTime",
-        "GetLocalTime",
-        "GetSystemTime",
-        "_localtime64",
-        "asctime",
-        "_lock_file",
-        "_unlock_file",
-        "YieldProcessor",
-        "PauseProcessor",
-        "GetNativeSystemInfo",
-        "GetSystemInfo",
-        "GetCurrentProcessorNumber",
-
-        // Process startup and COM helpers used by Xenia's Windows shell.
-        "CommandLineToArgvW",
-        "WideCharToMultiByte",
-        "MultiByteToWideChar",
-        "CoInitializeEx",
-        "CoUninitialize",
-        "CoInitializeSecurity",
-        "FormatMessageA",
-        "FormatMessageW",
-        "LocalFree",
-        "DwmSetWindowAttribute",
-        "DwmEnableMMCSS",
-        "NtQueryTimerResolution",
-        "NtSetTimerResolution",
-
-        // Optional platform libraries linked by the Windows Xenia target.
-        // These are kept in the ABI inventory so their absence is reported at
-        // the call site rather than as an unrelated unresolved import.
-        "XInputGetState",
-        "XInputGetStateEx",
-        "XInputSetState",
-        "XInputGetCapabilities",
-        "XInputEnable",
-        "XInputGetBatteryInformation",
-        "XInputGetKeystroke",
-        "WSAStartup",
-        "WSACleanup",
-        "socket",
-        "closesocket",
-        "ioctlsocket",
-        "setsockopt",
-        "getsockopt",
-        "connect",
-        "send",
-        "recv",
-        "select",
-        "getaddrinfo",
-        "freeaddrinfo",
-        "htons",
-        "ntohs",
-        "BCryptOpenAlgorithmProvider",
-        "BCryptCloseAlgorithmProvider",
-        "BCryptGetProperty",
-        "BCryptCreateHash",
-        "BCryptHashData",
-        "BCryptFinishHash",
-        "BCryptDestroyHash",
-        "BCryptGenRandom",
-
-        // MSVC/UCRT and compiler support. The ordinary allocation/string
-        // cases are implemented below; the remaining helpers are safe ABI
-        // no-ops whose lack of semantic work is logged by the runtime policy.
-        "memcpy",
-        "memmove",
-        "memset",
-        "memcmp",
-        "strlen",
-        "strnlen",
-        "strcmp",
-        "strncmp",
-        "strcpy",
-        "strncpy",
-        "strcat",
-        "strchr",
-        "strrchr",
-        "qsort",
-        "tolower",
-        "toupper",
-        "wcslen",
-        "wmemcpy",
-        "wmemmove",
-        "wmemset",
-        "malloc",
-        "calloc",
-        "realloc",
-        "free",
-        "_malloc_base",
-        "_free_base",
-        "_recalloc",
-        "_aligned_malloc",
-        "_aligned_free",
-        "_ultoa",
-        "_setjmp",
-        "longjmp",
-        "_beginthread",
-        "_beginthreadex",
-        "_endthread",
-        "_endthreadex",
-        "_initterm",
-        "_initterm_e",
-        "__security_init_cookie",
-        "__chkstk",
-        "__chkstk_ms",
-        "__C_specific_handler",
-        "__CxxFrameHandler3",
-        "__CxxFrameHandler4",
-        "_except_handler4_common",
-        "_purecall",
-        "terminate",
-        "__std_terminate",
-        "set_new_handler",
-
-        // Interlocked operations appear in the Xenia scheduler and resource
-        // caches. They use the first Microsoft ABI argument as the address.
-        "InterlockedIncrement",
-        "InterlockedIncrement64",
-        "InterlockedDecrement",
-        "InterlockedDecrement64",
-        "InterlockedExchange",
-        "InterlockedExchange64",
-        "InterlockedCompareExchange",
-        "InterlockedCompareExchange64",
-        "InterlockedOr",
-        "InterlockedAnd",
-        "InterlockedXor",
-    };
-    for (known_names) |known| {
-        if (std.mem.eql(u8, name, known)) return true;
-    }
-    return false;
-}
-
 // These are the remaining imports emitted by the untouched Windows Xenia
 // build after the GNU C++ runtime is linked into the PE. They are genuine
 // names from the Win32/UCRT/MinGW ABI surface. Each name is owned by a
@@ -2381,6 +1910,28 @@ fn dispatchWindowsWaveOutCallback(state: anytype, device: anytype, header: u64, 
     guestStateField(state, "regs").*.r9 = header;
     guestStateField(state, "regs").*.rip = device.callback;
     state.windows_audio_callback_dispatches +|= 1;
+    return true;
+}
+
+/// SDL's callback API runs guest code on the event-pumping executor, then
+/// submits the filled guest buffer to the same native audio bridge used by
+/// WinMM. The callback continuation retains SDL_PollEvent's return value.
+fn beginWindowsSdlAudioCallback(
+    state: anytype,
+    return_rip: u64,
+    return_is_direct: bool,
+    stream_address: u64,
+    stream_size: u32,
+    return_rax: u64,
+) bool {
+    if (!state.beginWindowsAudioCallback(return_rip, return_is_direct)) return false;
+    const frame_count = guestStateField(state, "windows_audio_callback_frame_count").*;
+    if (frame_count == 0) return false;
+    const frame = &guestStateField(state, "windows_audio_callback_frames").*[frame_count - 1];
+    frame.kind = .sdl;
+    frame.return_rax = return_rax;
+    frame.stream_address = stream_address;
+    frame.stream_size = stream_size;
     return true;
 }
 
@@ -3319,6 +2870,14 @@ fn crtCStringOrNull(state: anytype, address: u64) ?GuestCStringSnapshot {
     return null;
 }
 
+fn deinitCrtCStringSnapshot(snapshot: GuestCStringSnapshot) void {
+    snapshot.deinit();
+}
+
+fn crtCStringSnapshotBytes(snapshot: GuestCStringSnapshot) []const u8 {
+    return snapshot.bytes();
+}
+
 /// `strnlen`: at most `maximum` bytes, and an unterminated buffer that long
 /// is an answer rather than a fault.
 fn crtBoundedLength(state: anytype, address: u64, maximum: usize) u64 {
@@ -3428,6 +2987,7 @@ pub fn windowsModuleUnavailableOnHost(path: []const u8) bool {
 pub fn isRecognizedDynamicImport(dll_name: []const u8, function_name: []const u8) bool {
     if (function_name.len == 0) return false;
     if (std.mem.eql(u8, dll_name, "dxgi-com") and std.mem.startsWith(u8, function_name, "IDXGI")) return true;
+    if (sdl2_imports.classify(dll_name, function_name) != null) return true;
     // The graphics surface is the load-bearing case for this predicate.
     // Xenia reaches its whole Vulkan path through
     // `GetProcAddress(vulkan-1.dll, "vkGetInstanceProcAddr")` and then through
@@ -3435,7 +2995,7 @@ pub fn isRecognizedDynamicImport(dll_name: []const u8, function_name: []const u8
     // inventory, and answering NULL for them would end the run at
     // "Failed to get Vulkan loader function pointers".
     if (isGraphicsImport(dll_name, function_name)) return true;
-    if (isKnownCoreImport(function_name)) return true;
+    if (windows_import_catalog.isKnownCoreImport(function_name)) return true;
     if (isKnownContractImport(dll_name, function_name)) return true;
     // The catalogue keeps a name-only bucket for dynamic lookups whose module
     // Rosetta could not attribute; consult it when the handle was not one
@@ -4488,23 +4048,80 @@ fn hostOpenFile(state: anytype, path: []const u8, mode: std.Io.Dir.OpenFileOptio
         log.info("Windows host open: path={s} mode={s}", .{ path, @tagName(mode) });
     }
     if (std.fs.path.isAbsolute(path)) {
-        return std.Io.Dir.openFileAbsolute(io, path, options) catch |err| {
+        if (std.Io.Dir.openFileAbsolute(io, path, options)) |file| {
+            return file;
+        } else |primary_error| {
+            // Many Windows SDL games ship immutable assets under a sibling
+            // `data/` directory while opening them by basename from their
+            // executable directory. Keep the normal path first, then try that
+            // one confined package layout only for read-only, basename-only
+            // misses. The guest cannot use this to escape the configured root
+            // or redirect writes.
+            if (mode == .read_only) {
+                var fallback_buffer: [std.fs.max_path_bytes]u8 = undefined;
+                if (hostDataSubdirectoryPath(state, path, &fallback_buffer)) |fallback| {
+                    if (std.Io.Dir.openFileAbsolute(io, fallback, options)) |file| {
+                        if (state.diagnose_abi) {
+                            log.info("Windows host open: path={s} mode={s} source=data_subdirectory_fallback", .{ fallback, @tagName(mode) });
+                        }
+                        return file;
+                    } else |_| {}
+                }
+
+                if (is_media and state.windows_media_io_trace_events < 16) {
+                    state.windows_media_io_trace_events += 1;
+                    log.info("Windows media host open failed: path={s} error={s}", .{ path, @errorName(primary_error) });
+                }
+                if (state.diagnose_abi) log.info("Windows host open failed: path={s} error={s}", .{ path, @errorName(primary_error) });
+                return null;
+            }
+
             if (is_media and state.windows_media_io_trace_events < 16) {
                 state.windows_media_io_trace_events += 1;
-                log.info("Windows media host open failed: path={s} error={s}", .{ path, @errorName(err) });
+                log.info("Windows media host open failed: path={s} error={s}", .{ path, @errorName(primary_error) });
             }
-            if (state.diagnose_abi) log.info("Windows host open failed: path={s} error={s}", .{ path, @errorName(err) });
+            if (state.diagnose_abi) log.info("Windows host open failed: path={s} error={s}", .{ path, @errorName(primary_error) });
             return null;
-        };
+        }
     }
-    return std.Io.Dir.cwd().openFile(io, path, options) catch |err| {
+    if (std.Io.Dir.cwd().openFile(io, path, options)) |file| {
+        return file;
+    } else |err| {
         if (is_media and state.windows_media_io_trace_events < 16) {
             state.windows_media_io_trace_events += 1;
             log.info("Windows media host open failed: path={s} error={s}", .{ path, @errorName(err) });
         }
         if (state.diagnose_abi) log.info("Windows host open failed: path={s} error={s}", .{ path, @errorName(err) });
         return null;
+    }
+}
+
+fn hostDataSubdirectoryPath(state: anytype, path: []const u8, destination: []u8) ?[]const u8 {
+    const configured_root = state.windows_host_working_directory orelse return null;
+    var root = configured_root;
+    while (root.len > 1 and root[root.len - 1] == '/') root = root[0 .. root.len - 1];
+
+    const relative = if (std.mem.eql(u8, root, "/")) blk: {
+        if (path.len <= 1 or path[0] != '/') return null;
+        break :blk path[1..];
+    } else blk: {
+        if (path.len <= root.len or !std.mem.startsWith(u8, path, root) or path[root.len] != '/') return null;
+        break :blk path[root.len + 1 ..];
     };
+    if (relative.len == 0 or std.mem.indexOfScalar(u8, relative, '/') != null or
+        std.mem.eql(u8, relative, ".") or std.mem.eql(u8, relative, "..")) return null;
+
+    const prefix = if (std.mem.eql(u8, root, "/")) "/data/" else null;
+    const prefix_len = if (prefix) |value| value.len else root.len + "/data/".len;
+    if (prefix_len > destination.len or relative.len > destination.len - prefix_len) return null;
+    if (prefix) |value| {
+        @memcpy(destination[0..value.len], value);
+    } else {
+        @memcpy(destination[0..root.len], root);
+        @memcpy(destination[root.len..][0.."/data/".len], "/data/");
+    }
+    @memcpy(destination[prefix_len..][0..relative.len], relative);
+    return destination[0 .. prefix_len + relative.len];
 }
 
 fn hostCreateFile(state: anytype, path: []const u8, read: bool, truncate: bool, exclusive: bool) ?std.Io.File {
@@ -6261,6 +5878,7 @@ fn convertUnsignedLongToGuestString(state: anytype, direct_return_rip: ?u64) boo
 }
 
 fn handleStringAndMemory(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    if (crt_string_mutation.handle(_core_import_api, state, name, direct_return_rip)) return true;
     if (std.mem.eql(u8, name, "_strrev")) {
         const address = arg(state, 0, direct_return_rip);
         const source = guestCString(state, address) orelse {
@@ -7511,6 +7129,16 @@ fn handleWindowsCompleteness(
     name: []const u8,
     direct_return_rip: ?u64,
 ) bool {
+    if (std.mem.eql(u8, name, "rand")) {
+        // Microsoft CRT's default seed and LCG are specified by the runtime;
+        // this keeps rand() deterministic until a seed-setting import is
+        // present, while keeping its state separate from rand_s entropy.
+        state.windows_crt_rand_state = state.windows_crt_rand_state *% 214013 +% 2531011;
+        guestStateField(state, "regs").*.rax = (state.windows_crt_rand_state >> 16) & 0x7fff;
+        guestStateField(state, "windows_last_error").* = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
     if (std.mem.eql(u8, name, "_get_errno")) {
         const output = arg(state, 0, direct_return_rip);
         if (output == 0 or state.guestMemory(output, 4) == null) {
@@ -8464,6 +8092,38 @@ fn tryImm32(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
 
 /// Small Win32 entry points with an exact answer Rosette can give.
 fn trySmallWin32(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
+    if (std.mem.eql(u8, name, "IsDBCSLeadByte")) {
+        // The PE runner's initial Windows ANSI locale is the single-byte
+        // C/Western code page. It has no DBCS lead-byte range.
+        guestStateField(state, "regs").*.rax = 0;
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "IsProcessorFeaturePresent")) {
+        // An x64 guest has SSE and SSE2 architecturally available, and those
+        // are the only processor-specific feature bits currently advertised
+        // by this PE execution route. Unknown bits take the documented FALSE
+        // path so the guest can choose its scalar fallback.
+        const feature: u32 = @truncate(arg(state, 0, direct_return_rip));
+        guestStateField(state, "regs").*.rax = @intFromBool(feature == 6 or feature == 10);
+        finish(state, direct_return_rip);
+        return true;
+    }
+    if (std.mem.eql(u8, name, "_configthreadlocale")) {
+        const requested: i32 = @bitCast(@as(u32, @truncate(arg(state, 0, direct_return_rip))));
+        const previous = state.windows_crt_thread_locale_mode;
+        if (requested == -1) {
+            guestStateField(state, "regs").*.rax = previous;
+        } else if (requested == 0 or requested == 1) {
+            state.windows_crt_thread_locale_mode = @intCast(requested);
+            guestStateField(state, "regs").*.rax = previous;
+        } else {
+            guestStateField(state, "regs").*.rax = @bitCast(@as(i64, -1));
+            guestErrnoStorage(state).* = 22; // EINVAL
+        }
+        finish(state, direct_return_rip);
+        return true;
+    }
     if (std.mem.eql(u8, name, "lstrlenW")) {
         guestStateField(state, "regs").*.rax = guestWideCStringLength(state, arg(state, 0, direct_return_rip), 0x100000) orelse 0;
         finish(state, direct_return_rip);
@@ -9122,6 +8782,11 @@ fn tryFunctionImpl(state: anytype, dll_name: []const u8, function_name: []const 
 
 fn dispatchFunction(state: anytype, dll_name: []const u8, function_name: []const u8, direct_return_rip: ?u64) bool {
     if (std.mem.eql(u8, dll_name, "dxgi-com")) return handleDxgiCom(state, function_name, direct_return_rip);
+    if (sdl2_imports.classify(dll_name, function_name) != null and
+        sdl2_imports.handle(_core_import_api, state, dll_name, function_name, direct_return_rip))
+    {
+        return true;
+    }
     switch (classifyImportCached(dll_name, function_name)) {
         .graphics => {
             const State = @TypeOf(state.*);

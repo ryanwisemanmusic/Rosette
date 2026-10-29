@@ -1,6 +1,8 @@
 //! Core Windows import dispatch. Helper references arrive through a
 //! compile-time API table, so the moved handler retains direct calls and does
 //! not add runtime indirection.
+const startup_info = @import("startup_info.zig");
+
 pub fn handleCore(comptime api: type, state: anytype, dll_name: []const u8, name: []const u8, direct_return_rip: ?u64) bool {
     const std = api._std;
     const import_contract = api._import_contract;
@@ -23,7 +25,6 @@ pub fn handleCore(comptime api: type, state: anytype, dll_name: []const u8, name
     const importTraits = api._importTraits;
     const guestStateField = api._guestStateField;
     const guestErrnoStorage = api._guestErrnoStorage;
-    const fillGuest = api._fillGuest;
     const guestRangeAvailable = api._guestRangeAvailable;
     const copyGuestBytes = api._copyGuestBytes;
     const writeWindowsGuestHandle = api._writeWindowsGuestHandle;
@@ -144,6 +145,8 @@ pub fn handleCore(comptime api: type, state: anytype, dll_name: []const u8, name
     const handleWindowsCompleteness = api._handleWindowsCompleteness;
     const handleWindowsSrwLock = api._handleWindowsSrwLock;
     const completeWithImportFallback = api._completeWithImportFallback;
+    if (api._stdio_format.handle(api, state, name, direct_return_rip)) return true;
+    if (startup_info.handle(api, state, name, direct_return_rip)) return true;
     // SRW lock imports are a frequent Xenia synchronization boundary. Keep
     // these four names ahead of the registry/socket/security/string handler
     // chain; the helper retains their ownership, TSO fences, waiter handoff,
@@ -567,10 +570,11 @@ pub fn handleCore(comptime api: type, state: anytype, dll_name: []const u8, name
         return true;
     }
 
-    if (std.mem.eql(u8, name, "_wmkdir")) {
+    if (std.mem.eql(u8, name, "_wmkdir") or std.mem.eql(u8, name, "_mkdir")) {
+        const wide = std.mem.eql(u8, name, "_wmkdir");
         const path_argument = arg(state, 0, direct_return_rip);
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const path = guestPathToHost(state, path_argument, true, &path_buffer) orelse {
+        const path = guestPathToHost(state, path_argument, wide, &path_buffer) orelse {
             guestStateField(state, "windows_last_error").* = 3; // ERROR_PATH_NOT_FOUND
             guestStateField(state, "regs").*.rax = @bitCast(@as(i64, -1));
             finish(state, direct_return_rip);
@@ -1162,6 +1166,12 @@ pub fn handleCore(comptime api: type, state: anytype, dll_name: []const u8, name
         finish(state, direct_return_rip);
         return true;
     }
+    if (std.mem.eql(u8, name, "__p__acmdln")) {
+        const command_line = cachedGuestCommandLine(state, &state.windows_command_line_a, false);
+        guestStateField(state, "regs").*.rax = cachedGuestPointer(state, &state.windows_acmdln_storage, command_line);
+        finish(state, direct_return_rip);
+        return true;
+    }
     if (std.mem.eql(u8, name, "_initialize_narrow_environment") or
         std.mem.eql(u8, name, "_initialize_wide_environment") or
         std.mem.eql(u8, name, "_configure_narrow_argv") or
@@ -1249,20 +1259,6 @@ pub fn handleCore(comptime api: type, state: anytype, dll_name: []const u8, name
         }
         guestStateField(state, "windows_last_error").* = if (removed) 0 else 87;
         guestStateField(state, "regs").*.rax = @intFromBool(removed);
-        finish(state, direct_return_rip);
-        return true;
-    }
-    if (std.mem.eql(u8, name, "GetStartupInfoW")) {
-        const startup_info = arg(state, 0, direct_return_rip);
-        if (startup_info == 0 or state.guestMemory(startup_info, 104) == null) {
-            guestStateField(state, "windows_last_error").* = 87; // ERROR_INVALID_PARAMETER
-        } else {
-            _ = fillGuest(state, startup_info, 104, 0);
-            state.write32(startup_info, 104);
-            guestStateField(state, "windows_last_error").* = 0;
-        }
-        // GetStartupInfoW is void; the return register is intentionally not
-        // used as a success signal.
         finish(state, direct_return_rip);
         return true;
     }
