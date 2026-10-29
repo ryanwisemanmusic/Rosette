@@ -38,6 +38,10 @@ fi
 
 export ROSETTE_ASYNC_LOG="${ROSETTE_ASYNC_LOG:-1}"
 export ROSETTE_INPUT_HASH_STALL_SECONDS="${ROSETTE_INPUT_HASH_STALL_SECONDS:-0}"
+# Arm a one-frame GFXReconstruct capture before Xenia creates its Vulkan
+# instance. Nothing is written until F10 is pressed; set ROSETTE_VULKAN_GFXR=off
+# for a run that should not load the capture layer.
+export ROSETTE_VULKAN_GFXR="${ROSETTE_VULKAN_GFXR:-1}"
 # The build-async entry point is the long-lived bring-up path. Keep fatal
 # findings in the evidence log so decode/cache and other diagnostics cannot
 # terminate the process before the first Cocoa present. A caller that owns a
