@@ -596,13 +596,24 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
             .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
         });
         guest_abi_test_mod.addCSourceFile(.{
+            .file = b.path("lib/Mach-O/native_window_toolbar.m"),
+            .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
+        });
+        guest_abi_test_mod.addCSourceFile(.{
             .file = b.path("lib/Mach-O/input_controller_bridge.m"),
             .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
         });
         guest_abi_test_mod.linkFramework("AppKit", .{});
+        guest_abi_test_mod.linkFramework("CoreGraphics", .{});
+        guest_abi_test_mod.linkFramework("CoreVideo", .{});
         guest_abi_test_mod.linkFramework("QuartzCore", .{});
         guest_abi_test_mod.linkFramework("Metal", .{});
         guest_abi_test_mod.linkFramework("GameController", .{});
+        guest_abi_test_mod.linkFramework("AudioToolbox", .{});
+        guest_abi_test_mod.linkFramework("AVFoundation", .{});
+        guest_abi_test_mod.linkFramework("CoreMedia", .{});
+        guest_abi_test_mod.linkFramework("ScreenCaptureKit", .{});
+        guest_abi_test_mod.linkFramework("UniformTypeIdentifiers", .{});
     }
     const guest_abi_test = b.addTest(.{ .root_module = guest_abi_test_mod });
     check_step.dependOn(&b.addRunArtifact(guest_abi_test).step);
@@ -936,6 +947,10 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
             .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
         });
         macho_processor_mod.addCSourceFile(.{
+            .file = b.path("lib/Mach-O/native_window_toolbar.m"),
+            .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
+        });
+        macho_processor_mod.addCSourceFile(.{
             .file = b.path("lib/Mach-O/input_controller_bridge.m"),
             .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
         });
@@ -960,9 +975,16 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
             .flags = &.{ "-Wall", "-Wextra" },
         });
         macho_processor_mod.linkFramework("AppKit", .{});
+        macho_processor_mod.linkFramework("CoreGraphics", .{});
+        macho_processor_mod.linkFramework("CoreVideo", .{});
         macho_processor_mod.linkFramework("QuartzCore", .{});
         macho_processor_mod.linkFramework("Metal", .{});
         macho_processor_mod.linkFramework("GameController", .{});
+        macho_processor_mod.linkFramework("AudioToolbox", .{});
+        macho_processor_mod.linkFramework("AVFoundation", .{});
+        macho_processor_mod.linkFramework("CoreMedia", .{});
+        macho_processor_mod.linkFramework("ScreenCaptureKit", .{});
+        macho_processor_mod.linkFramework("UniformTypeIdentifiers", .{});
     }
     // The Mach-O runtime carries the full MachOState struct (hundreds of
     // diagnostics/ledger fields) as a stack local inside MachOState.init and
@@ -1052,13 +1074,24 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
             .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
         });
         macho_processor_test_mod.addCSourceFile(.{
+            .file = b.path("lib/Mach-O/native_window_toolbar.m"),
+            .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
+        });
+        macho_processor_test_mod.addCSourceFile(.{
             .file = b.path("lib/Mach-O/input_controller_bridge.m"),
             .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
         });
         macho_processor_test_mod.linkFramework("AppKit", .{});
+        macho_processor_test_mod.linkFramework("CoreGraphics", .{});
+        macho_processor_test_mod.linkFramework("CoreVideo", .{});
         macho_processor_test_mod.linkFramework("QuartzCore", .{});
         macho_processor_test_mod.linkFramework("Metal", .{});
         macho_processor_test_mod.linkFramework("GameController", .{});
+        macho_processor_test_mod.linkFramework("AudioToolbox", .{});
+        macho_processor_test_mod.linkFramework("AVFoundation", .{});
+        macho_processor_test_mod.linkFramework("CoreMedia", .{});
+        macho_processor_test_mod.linkFramework("ScreenCaptureKit", .{});
+        macho_processor_test_mod.linkFramework("UniformTypeIdentifiers", .{});
     }
     const macho_processor_test = b.addTest(.{ .root_module = macho_processor_test_mod });
     const macho_processor_check = b.step(

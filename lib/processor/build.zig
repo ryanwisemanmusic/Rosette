@@ -263,6 +263,12 @@ pub fn register0(b: *std.Build, ctx: anytype) void {
         .filters = &.{"SSE oracle"},
     });
     sse_oracle_check.dependOn(&b.addRunArtifact(sse_oracle_test).step);
+    const legacy_simd_check = b.step("legacy-simd-check", "Check legacy SSE/SSE2 decoding and XMM/YMM state preservation");
+    const legacy_simd_test = b.addTest(.{
+        .root_module = elf_processor_test_mod,
+        .filters = &.{ "legacy PINSRW inserts register and memory words", "legacy PSUBW subtracts packed words", "legacy PADDW adds packed words", "legacy PMAXSW selects signed", "legacy PSADBW sums unsigned byte distances", "legacy MOVDDUP decodes m64", "legacy UNPCKLPD interleaves XMM", "legacy PCMPEQB memory form from OpenTyrian", "legacy PMULLW register form from OpenTyrian" },
+    });
+    legacy_simd_check.dependOn(&b.addRunArtifact(legacy_simd_test).step);
     const reference_count_check = b.step("reference-count-check", "Run grouped LOCK decoding and concurrent Xenia object lifetime regressions");
     const reference_count_test = b.addTest(.{
         .root_module = elf_processor_test_mod,
