@@ -1,6 +1,7 @@
 const std = @import("std");
 const x64_decoder = @import("x64_decoder");
 const evex = @import("evex_runtime");
+const packed_compare = @import("packed_compare.zig");
 const cleo_routing = @import("cleo_routing");
 const exit_diagnostics = @import("exit_diagnostics");
 const macho_log = @import("dyld").event_log;
@@ -2622,19 +2623,14 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 const source_high = self.ymm_hi[d.xmm_src];
                 const mask_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
                 self.ymm_hi[d.xmm_dst] = shuffleBytes(source_high, mask_high);
-            } else {
+            } else if (!d.legacy_sse) {
+                // Legacy two-operand SSE leaves the upper YMM half alone;
+                // VEX.128 clears it after executing the low XMM lane.
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }
         },
         .vpcmpeqb, .vpcmpeqw, .vpcmpeqd, .vpcmpeqq, .vpcmpgtb, .vpcmpgtw, .vpcmpgtd, .vpcmpgtq => {
-            const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
-            self.xmm[d.xmm_dst] = applyVexCompare(self.xmm[d.xmm_src], rhs_low, d.op);
-            if (d.vector_256) {
-                const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
-                self.ymm_hi[d.xmm_dst] = applyVexCompare(self.ymm_hi[d.xmm_src], rhs_high, d.op);
-            } else {
-                @memset(&self.ymm_hi[d.xmm_dst], 0);
-            }
+            packed_compare.execute(self, d);
         },
         .vptest, .vtestps, .vtestpd => {
             const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
@@ -2788,7 +2784,8 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             }
             if (!d.legacy_sse) @memset(&self.ymm_hi[d.xmm_dst], 0);
         },
-        .vmovshdup, .vmovsldup, .vmovddup => {
+        .vmovddup => packed_compare.executeMovddup(self, d),
+        .vmovshdup, .vmovsldup => {
             const source_low = if (d.is_reg_form) self.xmm[d.xmm_src] else self.readMem128(d.addr);
             self.xmm[d.xmm_dst] = duplicateVectorElements(d.op, source_low);
             if (d.vector_256) {
@@ -3083,7 +3080,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             // Insert the element
             if (d.is_reg_form) {
                 // From GPR register (low dword/qword/word)
-                const gpr_val = self.regVal(@as(RegId, @enumFromInt(d.xmm_src2)), switch (d.op) {
+                const gpr_val = self.regVal(d.src_reg, switch (d.op) {
                     .vpinsrd => .bits32,
                     .vpinsrq => .bits64,
                     .vpinsrw => .bits16,
@@ -3114,7 +3111,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 }
             }
 
-            if (d.vector_256) {
+            if (d.vector_256 or !d.legacy_sse) {
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }
         },
@@ -3170,7 +3167,8 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 } else {
                     self.ymm_hi[d.xmm_dst] = shiftPackedElements(source_high, packedShiftLaneBits(d.op), count, left);
                 }
-            } else {
+            } else if (!d.legacy_sse) {
+                // VEX.128 clears YMM's upper half; legacy SSE preserves it.
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }
         },
@@ -3181,7 +3179,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             if (d.vector_256) {
                 const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
                 self.ymm_hi[d.xmm_dst] = packedMinMax(self.ymm_hi[d.xmm_src], rhs_high, kind);
-            } else {
+            } else if (!d.legacy_sse) {
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }
         },
@@ -3201,7 +3199,8 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                     packedIntegerLaneBits(d.op),
                     packedIntegerOperation(d.op),
                 );
-            } else {
+            } else if (!d.legacy_sse) {
+                // Legacy SSE preserves YMM's upper half; VEX.128 clears it.
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }
         },
