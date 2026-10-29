@@ -463,7 +463,7 @@ pub fn executeVexConvertPacked(
     if (d.vector_256) {
         const source_high = if (d.is_reg_form) contextField(self, "ymm_hi")[d.xmm_src2] else self.readMem128(d.addr + 16);
         contextField(self, "ymm_hi")[d.xmm_dst] = convert(source_high);
-    } else {
+    } else if (!d.legacy_sse) {
         @memset(&contextField(self, "ymm_hi")[d.xmm_dst], 0);
     }
 }
@@ -535,7 +535,7 @@ pub fn executeVexReciprocalPacked(self: anytype, d: DecodedInsn, comptime square
     if (d.vector_256) {
         const source_high = if (d.is_reg_form) contextField(self, "ymm_hi")[d.xmm_src2] else self.readMem128(d.addr + 16);
         contextField(self, "ymm_hi")[d.xmm_dst] = decoder.reciprocalVexPackedF32(source_high, square_root);
-    } else {
+    } else if (!d.legacy_sse) {
         @memset(&contextField(self, "ymm_hi")[d.xmm_dst], 0);
     }
 }
@@ -588,7 +588,7 @@ pub fn executeVexRoundPackedF32(self: anytype, d: DecodedInsn) void {
     if (d.vector_256) {
         const source_high = if (d.is_reg_form) contextField(self, "ymm_hi")[d.xmm_src2] else self.readMem128(d.addr + 16);
         contextField(self, "ymm_hi")[d.xmm_dst] = decoder.roundVexPackedF32(source_high, @truncate(d.imm));
-    } else {
+    } else if (!d.legacy_sse) {
         @memset(&contextField(self, "ymm_hi")[d.xmm_dst], 0);
     }
 }
@@ -599,7 +599,7 @@ pub fn executeVexRoundPackedF64(self: anytype, d: DecodedInsn) void {
     if (d.vector_256) {
         const source_high = if (d.is_reg_form) contextField(self, "ymm_hi")[d.xmm_src2] else self.readMem128(d.addr + 16);
         contextField(self, "ymm_hi")[d.xmm_dst] = decoder.roundVexPackedF64(source_high, @truncate(d.imm));
-    } else {
+    } else if (!d.legacy_sse) {
         @memset(&contextField(self, "ymm_hi")[d.xmm_dst], 0);
     }
 }
@@ -667,6 +667,27 @@ fn vexSource128(self: anytype, d: DecodedInsn, source_index: u8, memory: bool, h
     return if (high) contextField(self, "ymm_hi")[source_index] else contextField(self, "xmm")[source_index];
 }
 
+/// Execute packed integer comparisons shared by the Mach-O and PE64 CPUs.
+/// Legacy SSE decodes use the destination as their first source and preserve
+/// its paired YMM upper half; VEX.128 clears that half after the same compare.
+pub fn executeVexPackedCompare(self: anytype, d: DecodedInsn) void {
+    const right_is_memory = !d.is_reg_form;
+    contextField(self, "xmm")[d.xmm_dst] = decoder.applyVexCompare(
+        vexSource128(self, d, d.xmm_src, false, false),
+        vexSource128(self, d, d.xmm_src2, right_is_memory, false),
+        d.op,
+    );
+    if (d.vector_256) {
+        contextField(self, "ymm_hi")[d.xmm_dst] = decoder.applyVexCompare(
+            vexSource128(self, d, d.xmm_src, false, true),
+            vexSource128(self, d, d.xmm_src2, right_is_memory, true),
+            d.op,
+        );
+    } else if (!d.legacy_sse) {
+        @memset(&contextField(self, "ymm_hi")[d.xmm_dst], 0);
+    }
+}
+
 pub fn executeVexPackedInteger(self: anytype, d: DecodedInsn, lane_bits: u8, operation: PackedIntegerOperation) void {
     const right_is_memory = !d.is_reg_form;
     contextField(self, "xmm")[d.xmm_dst] = packed_ops.packedIntegerBinary(
@@ -682,7 +703,7 @@ pub fn executeVexPackedInteger(self: anytype, d: DecodedInsn, lane_bits: u8, ope
             lane_bits,
             operation,
         );
-    } else {
+    } else if (!d.legacy_sse) {
         @memset(&contextField(self, "ymm_hi")[d.xmm_dst], 0);
     }
 }
@@ -718,7 +739,7 @@ pub fn executeVexPackedMinMax(self: anytype, d: DecodedInsn, kind: MinMaxKind) v
             vexSource128(self, d, d.xmm_src2, right_is_memory, true),
             kind,
         );
-    } else {
+    } else if (!d.legacy_sse) {
         @memset(&contextField(self, "ymm_hi")[d.xmm_dst], 0);
     }
 }
@@ -752,7 +773,7 @@ pub fn executeVexMultiplyUnsignedEvenDwords(self: anytype, d: DecodedInsn) void 
             vexSource128(self, d, d.xmm_src, false, true),
             vexSource128(self, d, d.xmm_src2, right_is_memory, true),
         );
-    } else {
+    } else if (!d.legacy_sse) {
         @memset(&contextField(self, "ymm_hi")[d.xmm_dst], 0);
     }
 }
@@ -823,7 +844,7 @@ pub fn executeVexPackedShift(self: anytype, d: DecodedInsn, lane_bits: u8, left:
             packed_ops.arithmeticShiftPackedElements(source_high, lane_bits, count)
         else
             packed_ops.shiftPackedElements(source_high, lane_bits, count, left);
-    } else {
+    } else if (!d.legacy_sse) {
         @memset(&contextField(self, "ymm_hi")[d.xmm_dst], 0);
     }
 }
