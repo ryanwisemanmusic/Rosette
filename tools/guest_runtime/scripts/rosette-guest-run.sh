@@ -55,10 +55,9 @@ Environment:
   ROSETTE_VULKAN_REPORT_INTERVAL_MS (default: 5000; compact progress cadence),
   ROSETTE_FSI_EVIDENCE (default: 1; save bounded guest/native shader modules
     and all FSI pipeline identities beside run logs; 0 disables the archive),
-  ROSETTE_VULKAN_GFXR (default: off; 1 = press F10 in game to record one frame
-    of the native Vulkan stream with GFXReconstruct beside the run log, then
-    analyse it with tools/vulkan/capture_replay.py; frames:N captures fixed
-    present frames instead),
+  ROSETTE_VULKAN_GFXR (default: 1; GFXReconstruct is armed before Vulkan
+    starts, then press F10 in game to record one frame beside the run log;
+    set 0/off to disable, or use frames:N for fixed present frames),
   ROSETTE_ELF_TRACE_WINDOWS_MEMORY, ROSETTE_XENIA_FATAL_POINT_TERMINATE,
   ROSETTE_ELF_TRACE_WINDOWS_AUDIO,
   ROSETTE_PE64_NATIVE_PTHREAD_COND, ROSETTE_PE64_GUEST_WAIT_COMPAT,
@@ -237,10 +236,10 @@ export ROSETTE_ASYNC_LOG="${ROSETTE_ASYNC_LOG:-1}"
 # Set either to 1 to bring back the independent Cocoa preview or the captures;
 # the main window's title carries the frame count either way.
 export ROSETTE_VULKAN_CAPTURE="${ROSETTE_VULKAN_CAPTURE:-0}"
-# GFXReconstruct is separate from Rosette's PNG probe. Keep the default
-# explicit in the run manifest/log so a disabled pass capture cannot be
-# mistaken for completed fog/exposure attribution.
-export ROSETTE_VULKAN_GFXR="${ROSETTE_VULKAN_GFXR:-off}"
+# GFXReconstruct is armed before Vulkan creates its instance. It writes no
+# capture until F10 is pressed, so ordinary runs do not produce a large dump.
+# Set 0/off to disable it; the explicit value is recorded in the run manifest.
+export ROSETTE_VULKAN_GFXR="${ROSETTE_VULKAN_GFXR:-1}"
 # Shader bytes are saved once at creation, with a 256 MiB run ceiling. This
 # supplies post-fault evidence without instrumenting live Metal shaders.
 export ROSETTE_FSI_EVIDENCE="${ROSETTE_FSI_EVIDENCE:-1}"
