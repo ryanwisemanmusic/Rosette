@@ -7,6 +7,7 @@ const process_impl_guest_diagnostics = @import("guest_diagnostics.zig");
 const process_impl_guest_memory = @import("guest_memory.zig");
 const process_impl_instruction_decode = @import("instruction_decode.zig");
 const process_impl_kernel_services = @import("kernel_services.zig");
+const process_impl_legacy_vector_ops = @import("legacy_vector_ops.zig");
 const process_impl_lifecycle = @import("lifecycle.zig");
 const process_impl_run_reporting = @import("run_reporting.zig");
 const process_impl_syscalls = @import("syscalls.zig");
@@ -2435,32 +2436,6 @@ pub fn executeVphminposuw(self: *ElfState, d: __process_DecodedInsn) void {
     @memset(&process_impl_lifecycle.guestContextField(self, "ymm_hi").*[d.xmm_dst], 0);
 }
 
-pub fn executeVexInsertElement(self: *ElfState, d: __process_DecodedInsn) void {
-    const element_bytes: usize = switch (d.op) {
-        .vpinsrb_xmm_xmm_reg32, .vpinsrb_xmm_xmm_mem8 => 1,
-        .vpinsrw => 2,
-        .vpinsrd => 4,
-        .vpinsrq => 8,
-        else => unreachable,
-    };
-    const destination_lane = @as(usize, @intCast(d.imm)) & ((16 / element_bytes) - 1);
-    const source_size: __process_Size = if (d.op == .vpinsrq) .bits64 else .bits32;
-    const scalar = if (d.is_reg_form)
-        regVal(self, d.src_reg, source_size)
-    else
-        readMemVal(self, d.addr, d.size);
-    var result = process_impl_lifecycle.guestContextField(self, "xmm").*[d.xmm_src];
-    switch (element_bytes) {
-        1 => result[destination_lane] = @truncate(scalar),
-        2 => __process_std.mem.writeInt(u16, result[destination_lane * 2 ..][0..2], @truncate(scalar), .little),
-        4 => __process_std.mem.writeInt(u32, result[destination_lane * 4 ..][0..4], @truncate(scalar), .little),
-        8 => __process_std.mem.writeInt(u64, result[destination_lane * 8 ..][0..8], scalar, .little),
-        else => unreachable,
-    }
-    process_impl_lifecycle.guestContextField(self, "xmm").*[d.xmm_dst] = result;
-    @memset(&process_impl_lifecycle.guestContextField(self, "ymm_hi").*[d.xmm_dst], 0);
-}
-
 pub fn executeVexExtractElement(self: *ElfState, d: __process_DecodedInsn) void {
     const element_bytes: usize = switch (d.op) {
         .vpextrb => 1,
@@ -2504,12 +2479,13 @@ pub fn executeVinsertps(self: *ElfState, d: __process_DecodedInsn) void {
 }
 
 pub fn executeVectorSpecial(self: *ElfState, d: __process_DecodedInsn) bool {
+    if (process_impl_legacy_vector_ops.executePackedCompare(self, d)) return true;
     switch (d.op) {
         .vptest, .vtestps, .vtestpd => executeVectorTest(self, d),
         .vextractf128, .vinsertf128, .vinserti128 => executeVexLane128(self, d),
         .vperm2f128 => executeVexPermute2x128(self, d),
         .vphminposuw => executeVphminposuw(self, d),
-        .vpinsrb_xmm_xmm_reg32, .vpinsrb_xmm_xmm_mem8, .vpinsrd, .vpinsrq, .vpinsrw => executeVexInsertElement(self, d),
+        .vpinsrb_xmm_xmm_reg32, .vpinsrb_xmm_xmm_mem8, .vpinsrd, .vpinsrq, .vpinsrw => process_impl_legacy_vector_ops.executeInsertElement(self, d, regVal, readMemVal),
         .vpextrb, .vpextrw, .vpextrd, .vpextrq => executeVexExtractElement(self, d),
         .vinsertps => executeVinsertps(self, d),
         else => return false,
@@ -2995,6 +2971,10 @@ pub fn executeCleoVectorMove(self: *ElfState, d: __process_DecodedInsn) bool {
                 process_impl_lifecycle.guestContextField(self, "xmm").*[d.xmm_dst] = result;
             }
             if (!d.legacy_sse) @memset(&process_impl_lifecycle.guestContextField(self, "ymm_hi").*[d.xmm_dst], 0);
+            return true;
+        },
+        .vmovddup => {
+            process_impl_legacy_vector_ops.executeMovddup(self, d, readMemVal);
             return true;
         },
         else => {},

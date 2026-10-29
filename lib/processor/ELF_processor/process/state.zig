@@ -250,7 +250,7 @@ const envFlag = __ProcessInternals._envFlag;
 const envPresentAndFalse = __ProcessInternals._envPresentAndFalse;
 const envText = __ProcessInternals._envText;
 const envU64 = __ProcessInternals._envU64;
-
+const windows_sdl_state = @import("windows_sdl_state.zig");
 pub const ElfState = struct {
     allocator: std.mem.Allocator,
     mem: []u8,
@@ -863,6 +863,7 @@ pub const ElfState = struct {
     windows_condition_hook_events: u64 = 0,
     windows_guest_compatibility_events: u64 = 0,
     windows_last_error: u32 = 0,
+    windows_sdl: windows_sdl_state.WindowsSdlState = .{},
     windows_unhandled_exception_filter: u64 = 0,
     windows_symbol_options: u32 = 0,
     windows_symbol_services_initialized: bool = false,
@@ -1051,6 +1052,7 @@ pub const ElfState = struct {
     windows_commode_storage: u64 = 0,
     windows_acrt_iob_storage: [3]u64 = [_]u64{0} ** 3,
     windows_new_mode: u32 = 0,
+    windows_crt_thread_locale_mode: u32 = 0,
     windows_invalid_parameter_handler: u64 = 0,
     windows_signal_handlers: [32]u64 = [_]u64{0} ** 32,
     windows_com_mta_cookie: u64 = 0,
@@ -1179,6 +1181,7 @@ pub const ElfState = struct {
     /// because a fixed sequence is exactly what a caller of `rand_s` is
     /// trying to avoid.
     windows_random_state: u64 = 0x9E3779B97F4A7C15,
+    windows_crt_rand_state: u32 = 1,
     /// The process error mode `SetErrorMode` reports back. Remembered
     /// because the API returns the previous value, and a caller that saves
     /// and restores it corrupts its own state if the save reads a constant.
@@ -1359,6 +1362,7 @@ pub const ElfState = struct {
     windows_environ_w: u64 = 0,
     windows_environ_a_storage: u64 = 0,
     windows_environ_w_storage: u64 = 0,
+    windows_acmdln_storage: u64 = 0,
     windows_wcmdln_storage: u64 = 0,
     windows_entry_point: u64 = 0,
     windows_window_handle: u64 = 0,

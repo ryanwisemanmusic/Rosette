@@ -5,7 +5,11 @@ const testing = std.testing;
 const frame_content_contract = @import("frame_content_contract");
 const WindowsGraphicsHooks = @import("../windows_guest/host_interfaces.zig").WindowsGraphicsHooks;
 const monotonicNanoseconds = @import("../diagnostics/monotonic_clock.zig").monotonicNanoseconds;
-pub const WINDOWS_EVENT_PUMP_STRIDE: u64 = 1000;
+/// Guest-step ceiling paired with a host-time deadline so busy loops cannot
+/// synchronously dispatch AppKit thousands of times per second.
+pub const WINDOWS_EVENT_PUMP_STRIDE: u64 = 100_000_000;
+pub const WINDOWS_EVENT_PUMP_INTERVAL_NS: u64 = 8 * std.time.ns_per_ms;
+const GUEST_FRAME_RATE_SAMPLE_NS: u64 = 250 * std.time.ns_per_ms;
 
 pub const WindowsGraphicsPhase = enum(u8) {
     cold,
@@ -179,6 +183,11 @@ pub const WindowsGraphicsState = struct {
     /// visible rather than an invisible change in behaviour.
     event_pump_skips: u64 = 0,
     next_event_pump_step: u64 = 0,
+    next_event_pump_nanos: u64 = 0,
+    guest_frame_count: u64 = 0,
+    guest_frame_rate_sample_count: u64 = 0,
+    guest_frame_rate_sample_ns: u64 = 0,
+    guest_frame_rate_started: bool = false,
     vulkan_calls: u64 = 0,
     proc_queries: u64 = 0,
     instance_creations: u64 = 0,
@@ -306,26 +315,66 @@ pub const WindowsGraphicsState = struct {
         return true;
     }
 
-    /// Drain the host event queue, but not once per guest instruction.
+    /// Drain the host event queue at a bounded guest-step and host-time rate.
     ///
     /// Xenia's `RunMainMessageLoop` calls `GetMessage` in a tight loop, and
     /// Rosette pumped AppKit on every one of them: 12.7 million dispatches to
     /// the main thread in the 2026-09-12 run, one per ~18 guest instructions.
-    /// A window's event queue does not have events at that rate. The stride
-    /// keeps the pump at a few hundred hertz, which is faster than any window
-    /// event a person can generate, and returns the rest of the boundary to
-    /// the interpreter.
+    /// A window's event queue does not have events at that rate. The dual
+    /// cadence prevents a fast guest from flooding AppKit and also keeps
+    /// input responsive when a guest is running slowly.
     ///
     /// `force` is for the callers that must not be throttled - a paint is
     /// pending, or the guest is about to block - where a missed pump is a
     /// missed frame rather than a missed millisecond.
     pub fn pumpEventsAtStep(self: *WindowsGraphicsState, step: u64, force: bool) u32 {
-        if (!force and step < self.next_event_pump_step) {
+        return self.pumpEventsAtStepAtTime(step, force, monotonicNanoseconds());
+    }
+
+    fn pumpEventsAtStepAtTime(self: *WindowsGraphicsState, step: u64, force: bool, now_ns: u64) u32 {
+        const step_deadline_reached = step >= self.next_event_pump_step;
+        const time_deadline_reached = self.next_event_pump_nanos == 0 or now_ns >= self.next_event_pump_nanos;
+        if (!force and !step_deadline_reached and !time_deadline_reached) {
             self.event_pump_skips +|= 1;
             return 0;
         }
         self.next_event_pump_step = step +| WINDOWS_EVENT_PUMP_STRIDE;
+        self.next_event_pump_nanos = now_ns +| WINDOWS_EVENT_PUMP_INTERVAL_NS;
         return self.pumpEvents();
+    }
+
+    /// Count completed non-Vulkan guest frames and publish their recent rate
+    /// to the native HUD. Vulkan applications update the same HUD in their
+    /// forwarder; SDL-rendered PE games use this boundary instead.
+    pub fn noteGuestFramePresented(self: *WindowsGraphicsState) void {
+        self.noteGuestFramePresentedAt(monotonicNanoseconds());
+    }
+
+    fn noteGuestFramePresentedAt(self: *WindowsGraphicsState, now_ns: u64) void {
+        self.guest_frame_count +|= 1;
+        if (!self.guest_frame_rate_started) {
+            self.guest_frame_rate_started = true;
+            self.guest_frame_rate_sample_count = self.guest_frame_count;
+            self.guest_frame_rate_sample_ns = now_ns;
+            return;
+        }
+        if (now_ns < self.guest_frame_rate_sample_ns or
+            now_ns - self.guest_frame_rate_sample_ns < GUEST_FRAME_RATE_SAMPLE_NS) return;
+
+        const elapsed_ns = now_ns - self.guest_frame_rate_sample_ns;
+        const completed_frames = self.guest_frame_count -| self.guest_frame_rate_sample_count;
+        const fps_milli: u64 = if (completed_frames == 0 or elapsed_ns == 0)
+            0
+        else
+            @intCast(@min(
+                @as(u128, completed_frames) * 1_000_000_000_000 / elapsed_ns,
+                std.math.maxInt(u64),
+            ));
+        self.guest_frame_rate_sample_count = self.guest_frame_count;
+        self.guest_frame_rate_sample_ns = now_ns;
+        if (self.hooks.set_frame_counter) |callback| {
+            callback(self.hooks.native_context, self.guest_frame_count, fps_milli);
+        }
     }
 
     pub fn pumpEvents(self: *WindowsGraphicsState) u32 {
@@ -678,11 +727,28 @@ const NativeGraphicsTestHarness = struct {
     starts: u64 = 0,
     stage: u32 = 10,
     frames: u64 = 0,
+    event_pumps: u64 = 0,
+    frame_counter_updates: u64 = 0,
+    last_frame: u64 = 0,
+    last_fps_milli: u64 = 0,
     present_chain_reports: u64 = 0,
     present_chain_full_reports: u64 = 0,
     application_ensures: u64 = 0,
     window_ensures: u64 = 0,
 };
+
+fn testPumpEvents(context: ?*anyopaque) callconv(.c) u32 {
+    const harness: *NativeGraphicsTestHarness = @ptrCast(@alignCast(context.?));
+    harness.event_pumps +|= 1;
+    return 0;
+}
+
+fn testSetFrameCounter(context: ?*anyopaque, frame: u64, fps_milli: u64) callconv(.c) void {
+    const harness: *NativeGraphicsTestHarness = @ptrCast(@alignCast(context.?));
+    harness.frame_counter_updates +|= 1;
+    harness.last_frame = frame;
+    harness.last_fps_milli = fps_milli;
+}
 
 fn testNativeWindowEnsureApplication(context: ?*anyopaque) callconv(.c) c_int {
     const harness: *NativeGraphicsTestHarness = @ptrCast(@alignCast(context.?));
@@ -821,6 +887,46 @@ test "Windows graphics ledger keeps native diagnostics separate from guest outpu
     try testing.expectEqual(@as(u64, 2), snapshot.native_diagnostic_frames);
     try testing.expectEqual(@as(u64, 0), snapshot.native_diagnostic_failures);
     try testing.expect(!snapshot.native_vulkan_forwarding);
+}
+
+test "host event pump obeys guest-step and host-time deadlines" {
+    var harness = NativeGraphicsTestHarness{};
+    var graphics = WindowsGraphicsState{
+        .hooks = .{ .context = &harness, .pump_events = testPumpEvents },
+    };
+
+    _ = graphics.pumpEventsAtStepAtTime(0, false, 0);
+    try testing.expectEqual(@as(u64, 1), harness.event_pumps);
+
+    _ = graphics.pumpEventsAtStepAtTime(1, false, 1);
+    try testing.expectEqual(@as(u64, 1), harness.event_pumps);
+    try testing.expectEqual(@as(u64, 1), graphics.event_pump_skips);
+
+    _ = graphics.pumpEventsAtStepAtTime(1, false, WINDOWS_EVENT_PUMP_INTERVAL_NS);
+    try testing.expectEqual(@as(u64, 2), harness.event_pumps);
+
+    // At extremely high guest throughput the instruction ceiling is an
+    // additional guard, and explicit pending-paint requests still bypass it.
+    _ = graphics.pumpEventsAtStepAtTime(WINDOWS_EVENT_PUMP_STRIDE + 1, false, WINDOWS_EVENT_PUMP_INTERVAL_NS + 1);
+    _ = graphics.pumpEventsAtStepAtTime(WINDOWS_EVENT_PUMP_STRIDE + 2, true, WINDOWS_EVENT_PUMP_INTERVAL_NS + 2);
+    try testing.expectEqual(@as(u64, 4), harness.event_pumps);
+}
+
+test "completed SDL guest frames publish sampled FPS to the native HUD" {
+    var harness = NativeGraphicsTestHarness{};
+    var graphics = WindowsGraphicsState{
+        .hooks = .{ .native_context = &harness, .set_frame_counter = testSetFrameCounter },
+    };
+
+    graphics.noteGuestFramePresentedAt(0);
+    graphics.noteGuestFramePresentedAt(100 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(u64, 0), harness.frame_counter_updates);
+    graphics.noteGuestFramePresentedAt(250 * std.time.ns_per_ms);
+
+    try testing.expectEqual(@as(u64, 3), graphics.guest_frame_count);
+    try testing.expectEqual(@as(u64, 1), harness.frame_counter_updates);
+    try testing.expectEqual(@as(u64, 3), harness.last_frame);
+    try testing.expectEqual(@as(u64, 8_000), harness.last_fps_milli);
 }
 
 test "native guest forwarding does not start a duplicate diagnostic presenter" {

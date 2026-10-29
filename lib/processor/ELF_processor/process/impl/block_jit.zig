@@ -234,8 +234,8 @@ pub fn publishBlockJitHookFilter(self: *ElfState) void {
 pub fn blockJitRequestAbort(self: *ElfState) void {
     const scratch = process_impl_lifecycle.guestContextField(self, "block_jit_scratch");
     scratch.abort = 1;
-    // The native chain checks only `chain_break` between blocks.
-    scratch.chain_break = 1;
+    // The native chain checks only `chain_count` between blocks.
+    scratch.requestBreak();
     if (currentBlockJit(self)) |jit| jit.aborts +|= 1;
 }
 
@@ -1693,10 +1693,9 @@ pub fn accountBlockJitIn(self: *ElfState, ctx: __process_GuestContextRef, jit: *
     return retired;
 }
 
-pub fn accountBlockJitRun(self: *ElfState, ctx: __process_GuestContextRef, jit: *__process_BlockJitState, first: *__process_block_jit.Block, last: *__process_block_jit.Block, completed: u32, record: *const __process_block_jit.Scratch) u32 {
-    const count = record.chain_count;
-    const blocks = count & __process_block_jit.chain_count_blocks_mask;
-    const retired_total: u64 = count >> __process_block_jit.chain_count_shift;
+pub fn accountBlockJitRun(self: *ElfState, ctx: __process_GuestContextRef, jit: *__process_BlockJitState, first: *__process_block_jit.Block, last: *__process_block_jit.Block, completed: u32, record: *const __process_block_jit.Scratch, run: __process_block_jit.chain_budget.Run) u32 {
+    const blocks = run.blocks;
+    const retired_total: u64 = run.instructions;
     const image = @min(record.chain_retired_image, retired_total);
     const other_mapped = @min(record.chain_retired_other_mapped, retired_total - image);
     jit.executions +|= blocks;
@@ -1885,11 +1884,10 @@ pub fn executeBlockJit(self: *ElfState, jit: *__process_BlockJitState, first: *_
         const scratch_record = ctx.field("block_jit_scratch");
         scratch_record.abort = 0;
         scratch_record.chain_break = 0;
-        scratch_record.chain_count = 0;
         // The chain runs until the step's instruction budget is spent,
         // as this loop does.
         const budget_instructions: u64 = chain_instruction_limit -| total_retired;
-        scratch_record.chain_budget = budget_instructions << __process_block_jit.chain_count_shift;
+        scratch_record.chain_count = __process_block_jit.chain_budget.start(budget_instructions);
         scratch_record.chain_retired_image = 0;
         scratch_record.chain_retired_other_mapped = 0;
         scratch_record.chain_previous = null;
@@ -1916,8 +1914,9 @@ pub fn executeBlockJit(self: *ElfState, jit: *__process_BlockJitState, first: *_
         // back here once. Account all of them exactly as if each had
         // returned: `last_instruction_rip`, the totals and the title's
         // code-fetch ledger all read the same afterwards.
-        const blocks_run = record.chain_count & __process_block_jit.chain_count_blocks_mask;
-        if ((record.chain_count >> __process_block_jit.chain_count_shift) >= budget_instructions) {
+        const run = __process_block_jit.chain_budget.decode(record.chain_count, budget_instructions, record.chain_break != 0);
+        const blocks_run = run.blocks;
+        if (run.instructions >= budget_instructions) {
             jit.chain_exits_budget +|= 1;
         } else if (record.chain_break != 0) {
             jit.chain_exits_break +|= 1;
@@ -1927,7 +1926,7 @@ pub fn executeBlockJit(self: *ElfState, jit: *__process_BlockJitState, first: *_
         if (blocks_run == 0) {
             total_retired +|= accountBlockJitIn(self, ctx, jit, block, completed);
         } else {
-            total_retired +|= accountBlockJitRun(self, ctx, jit, block, last, completed, record);
+            total_retired +|= accountBlockJitRun(self, ctx, jit, block, last, completed, record, run);
             block = last;
             const hops: u64 = blocks_run - 1;
             jit.chained +|= hops;
@@ -2013,7 +2012,7 @@ pub fn verifyBlockJit(self: *ElfState, jit: *__process_BlockJitState, block: *__
     // block's instructions. Letting it chain would run its successor
     // too and report a mismatch against work the interpreter side never
     // did, dropping a block that was in fact correct.
-    process_impl_lifecycle.guestContextField(self, "block_jit_scratch").*.chain_break = 1;
+    process_impl_lifecycle.guestContextField(self, "block_jit_scratch").requestBreak();
     const scratch = bindBlockJitRegisterFile(self);
     const tso_entry = __process_tso_memory.enterTranslatedCode(.jit_entry, block.start_rip);
     if (tso_entry.first) logTranslatedEntryViolation(self, block, tso_entry.pending, "verification");
@@ -2189,7 +2188,7 @@ pub fn verifyMemoryBlockJit(self: *ElfState, jit: *__process_BlockJitState, bloc
     restore.apply(self, before, xmm_before, ymm_before, zmm_before, k_before);
     process_impl_lifecycle.guestContextField(self, "block_jit_scratch").* = .{ .block = block };
     process_impl_guest_diagnostics.refreshBlockJitGuards(self, process_impl_lifecycle.guestContextField(self, "block_jit_scratch"));
-    process_impl_lifecycle.guestContextField(self, "block_jit_scratch").*.chain_break = 1;
+    process_impl_lifecycle.guestContextField(self, "block_jit_scratch").requestBreak();
     const scratch = bindBlockJitRegisterFile(self);
     const tso_entry = __process_tso_memory.enterTranslatedCode(.jit_entry, block.start_rip);
     if (tso_entry.first) logTranslatedEntryViolation(self, block, tso_entry.pending, "verification");

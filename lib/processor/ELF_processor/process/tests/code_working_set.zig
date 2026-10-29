@@ -218,6 +218,13 @@ pub fn runOrdered(count: usize, repeat: usize, passes: u64, parallel: bool, regi
     @memset(state.mem[guest..][0..0x100], 0);
     state.block_jit_enabled = true;
     state.block_jit_hot_threshold = 1;
+    // `ROSETTE_CODE_WORKING_SET_FASTMEM_BOUND=1`: the offline upper bound of a
+    // fixed host offset for guest memory (`block_jit/fastmem_bound.zig`).
+    const has_bound = @hasDecl(I._block_jit, "fastmem_bound");
+    if (has_bound) I._block_jit.fastmem_bound.delta = if (std.c.getenv("ROSETTE_CODE_WORKING_SET_FASTMEM_BOUND") != null) @intFromPtr(state.mem.ptr) -% MEM_BASE else null;
+    defer if (has_bound) {
+        I._block_jit.fastmem_bound.delta = null;
+    };
     if (std.c.getenv("ROSETTE_CODE_WORKING_SET_WINDOW")) |raw| {
         const jit = state.blockJitActive() orelse return error.NoJit;
         if (@hasField(@TypeOf(jit.memory), "window_bytes")) jit.memory.window_bytes = std.fmt.parseInt(usize, std.mem.sliceTo(raw, 0), 0) catch jit.memory.window_bytes;

@@ -3248,10 +3248,19 @@ const WindowsMessageDispatchFrame = struct {
     wndproc: u64 = 0,
 };
 
+const WindowsAudioCallbackKind = enum(u8) {
+    winmm,
+    sdl,
+};
+
 const WindowsAudioCallbackFrame = struct {
     return_rip: u64 = 0,
     return_rsp: u64 = 0,
     return_is_direct: bool = false,
+    kind: WindowsAudioCallbackKind = .winmm,
+    return_rax: u64 = 0,
+    stream_address: u64 = 0,
+    stream_size: u32 = 0,
 };
 
 /// The PE Xenia build reaches audio through SDL's WinMM backend.  Rosetta
@@ -3577,6 +3586,7 @@ const host_interfaces = @import("windows_guest/host_interfaces.zig");
 pub const WindowsGraphicsHooks = host_interfaces.WindowsGraphicsHooks;
 pub const WindowsInputState = host_interfaces.WindowsInputState;
 pub const WindowsInputHooks = host_interfaces.WindowsInputHooks;
+pub const WindowsHostKeyboardEvent = host_interfaces.WindowsHostKeyboardEvent;
 pub const WindowsAudioHooks = host_interfaces.WindowsAudioHooks;
 
 const graphics_state = @import("windows_ui/graphics_state.zig");
@@ -4897,7 +4907,7 @@ fn blockJitInterpret(state_ptr: *anyopaque, block: *const block_jit.Block, index
         self.guestContextField("windows_guest_handoff_requested").* or
         self.blockJitTargetHooked(self.guestContextField("regs").*.rip))
     {
-        self.guestContextField("block_jit_scratch").*.chain_break = 1;
+        self.guestContextField("block_jit_scratch").requestBreak();
     }
     if (self.isTerminated() or self.guestContextField("guest_access_violation_pending").* or parked) return 1;
     if (self.guestContextField("regs").*.rip != insn.rip +% insn.len) return 1;
@@ -5129,6 +5139,7 @@ pub const __ProcessInternals = struct {
     pub const _WindowsImportStub = WindowsImportStub;
     pub const _WindowsImportStubInterior = WindowsImportStubInterior;
     pub const _WindowsInputState = WindowsInputState;
+    pub const _WindowsHostKeyboardEvent = WindowsHostKeyboardEvent;
     pub const _WindowsMappedCodeSlice = WindowsMappedCodeSlice;
     pub const _WindowsMessage = WindowsMessage;
     pub const _WindowsMultiWaitResult = WindowsMultiWaitResult;

@@ -1108,6 +1108,10 @@ test "legacy PSHUFD, PCMPEQD and PSUBQ execute instead of decoding as NOP or not
     try testing.expectEqual([4]u64{ 56, 56, 0, 0 }, testGetLanes(&state, 4));
 }
 
+test {
+    _ = @import("opentyrian_legacy_sse.zig");
+}
+
 test "a waitable timer signals at its due tick, re-arms when periodic, and a synchronization timer is consumed" {
     var state = ElfState.init(testing.allocator);
     defer state.deinit();

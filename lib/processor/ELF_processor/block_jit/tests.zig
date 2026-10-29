@@ -77,7 +77,6 @@ const scratch_flag_b_offset = core._test_api._scratch_flag_b_offset;
 const scratch_flag_r_offset = core._test_api._scratch_flag_r_offset;
 const scratch_chain_break_offset = core._test_api._scratch_chain_break_offset;
 const scratch_chain_count_offset = core._test_api._scratch_chain_count_offset;
-const scratch_chain_budget_offset = core._test_api._scratch_chain_budget_offset;
 const scratch_chain_retired_image_offset = core._test_api._scratch_chain_retired_image_offset;
 const scratch_chain_retired_other_mapped_offset = core._test_api._scratch_chain_retired_other_mapped_offset;
 const scratch_chain_previous_offset = core._test_api._scratch_chain_previous_offset;
@@ -297,7 +296,7 @@ pub const TestState = struct {
         state.last_helper_index = state.scratch.index;
         if (state.abort_on_access) {
             state.scratch.abort = 1;
-            state.scratch.chain_break = 1;
+            state.scratch.requestBreak();
         }
         const width: usize = @as(usize, 1) << @intCast(size);
         if (address +| width > state.memory.len) return 0;
@@ -312,7 +311,7 @@ pub const TestState = struct {
         state.last_helper_index = state.scratch.index;
         if (state.abort_on_access) {
             state.scratch.abort = 1;
-            state.scratch.chain_break = 1;
+            state.scratch.requestBreak();
         }
         const width: usize = @as(usize, 1) << @intCast(size);
         if (address +| width > state.memory.len) return;
@@ -325,7 +324,7 @@ pub const TestState = struct {
         state.last_helper_index = state.scratch.index;
         if (state.abort_on_access) {
             state.scratch.abort = 1;
-            state.scratch.chain_break = 1;
+            state.scratch.requestBreak();
         }
         out.* = @splat(0);
         if (address +| 16 > state.memory.len) return;
@@ -338,7 +337,7 @@ pub const TestState = struct {
         state.last_helper_index = state.scratch.index;
         if (state.abort_on_access) {
             state.scratch.abort = 1;
-            state.scratch.chain_break = 1;
+            state.scratch.requestBreak();
         }
         if (address +| 16 > state.memory.len) return;
         @memcpy(state.memory[@intCast(address)..][0..16], value);
@@ -350,7 +349,7 @@ pub const TestState = struct {
         state.last_helper_index = state.scratch.index;
         if (state.abort_on_access) {
             state.scratch.abort = 1;
-            state.scratch.chain_break = 1;
+            state.scratch.requestBreak();
         }
         if (address +| 16 > state.memory.len) return;
         @memcpy(state.memory[@intCast(address)..][0..16], value);

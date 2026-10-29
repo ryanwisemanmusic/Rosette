@@ -810,6 +810,9 @@ pub fn finishWindowsAudioCallback(self: *ElfState) bool {
     const frame_index = process_impl_lifecycle.guestContextField(self, "windows_audio_callback_frame_count").* - 1;
     const frame = process_impl_lifecycle.guestContextField(self, "windows_audio_callback_frames").*[frame_index];
     process_impl_lifecycle.guestContextField(self, "windows_audio_callback_frame_count").* = frame_index;
+    if (frame.kind == .sdl and frame.stream_size != 0) {
+        self.submitWindowsHostAudio(frame.stream_address, frame.stream_size);
+    }
     const expected_callback_rsp = (frame.return_rsp -| 48) + 8;
     if ((self.trace_windows_audio or self.diagnose_abi) and !frame.return_is_direct and process_impl_lifecycle.guestContextField(self, "regs").*.rsp != expected_callback_rsp) {
         __process_log.warn("Windows audio callback changed stack unexpectedly callback_rsp=0x{x} expected_after_ret=0x{x} return_rsp=0x{x}", .{
@@ -820,8 +823,9 @@ pub fn finishWindowsAudioCallback(self: *ElfState) bool {
     }
     process_impl_lifecycle.guestContextField(self, "regs").*.rsp = if (frame.return_is_direct) frame.return_rsp else frame.return_rsp +| 8;
     process_impl_lifecycle.guestContextField(self, "regs").*.rip = frame.return_rip;
-    // waveOutWrite's return value is independent of the callback's
-    // internal semaphore operation.
-    process_impl_lifecycle.guestContextField(self, "regs").*.rax = 0;
+    // WinMM's callback return value is unrelated to WOM_DONE. SDL calls a
+    // callback synchronously from its event pump, so its import's result must
+    // survive the callback excursion.
+    process_impl_lifecycle.guestContextField(self, "regs").*.rax = if (frame.kind == .sdl) frame.return_rax else 0;
     return true;
 }

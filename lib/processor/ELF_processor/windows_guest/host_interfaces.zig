@@ -43,6 +43,14 @@ pub const WindowsGraphicsHooks = struct {
     /// prevents a guest address or a host Vulkan object from crossing the ABI
     /// boundary accidentally.
     native_present_guest_frontbuffer: ?*const fn (?*anyopaque, *anyopaque, u64, u32, u32, c_int, u32, u32, c_int) callconv(.c) c_int = null,
+    /// Present a bounded guest-owned packed pixel buffer through the native
+    /// window layer. The guest address is translated by the PE state before
+    /// any host pointer reaches the Cocoa/Metal bridge.
+    native_present_guest_pixels: ?*const fn (?*anyopaque, *anyopaque, u64, u32, u32, u64) callconv(.c) c_int = null,
+    /// Publish completed non-Vulkan guest frames to the native FPS HUD. The
+    /// rate is supplied in milli-frames per second so the callback stays
+    /// integer-only across the C ABI.
+    set_frame_counter: ?*const fn (?*anyopaque, u64, u64) callconv(.c) void = null,
     /// Optional real Vulkan dispatch supplied by the host-side Windows route.
     /// The callback receives the PE state as an opaque pointer and a bounded
     /// function-name slice. It may adapt the Microsoft x64 call into a native
@@ -95,7 +103,24 @@ pub const WindowsInputState = extern struct {
 pub const WindowsInputHooks = struct {
     context: ?*anyopaque = null,
     read_controller_state: ?*const fn (?*anyopaque, *WindowsInputState) callconv(.c) c_int = null,
+    poll_keyboard_event: ?*const fn (?*anyopaque, *WindowsHostKeyboardEvent) callconv(.c) c_int = null,
 };
+
+/// One host key transition for SDL's event queue. `virtual_key_code` is the
+/// platform-neutral slot supplied by the native window backend (macOS virtual
+/// key code on this host); the SDL compatibility layer translates it to the
+/// guest's SDL scancode/keycode representation.
+pub const WindowsHostKeyboardEvent = extern struct {
+    virtual_key_code: u16 = 0,
+    down: u8 = 0,
+    repeat: u8 = 0,
+    modifiers: u16 = 0,
+    reserved: u16 = 0,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(WindowsHostKeyboardEvent) == 8);
+}
 
 comptime {
     std.debug.assert(@sizeOf(WindowsInputState) == 160);

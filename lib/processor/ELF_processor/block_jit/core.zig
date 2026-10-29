@@ -80,6 +80,7 @@ const indirect_links = @import("indirect_links.zig");
 const fastmem_bound = @import("fastmem_bound.zig");
 const lean_memory = @import("lean_memory.zig");
 const exit_flags = @import("exit_flags.zig");
+const chain_budget = @import("chain_budget.zig");
 const exit_flag_offsets: exit_flags.Offsets = .{ .kind = scratch_flag_kind_offset, .a = scratch_flag_a_offset, .r = scratch_flag_r_offset, .helper = helper_flags_offset, .scratch = r_scratch, .helpers = r_helpers, .state = r_state };
 const chain_layout = @import("chain_layout.zig");
 const register_cache = @import("register_cache.zig");
@@ -253,21 +254,19 @@ pub const Scratch = extern struct {
     transfer_target: u64 = 0,
     /// Set by a helper that has made continuing in translated code wrong:
     /// the run ended, a fault is pending, a thread switched, or a shim asked
-    /// for the scheduler. A helper that sets `abort` sets this too, so the
-    /// native chain reads only this word before every hop.
+    /// for the scheduler. Set through `requestBreak`, which also makes
+    /// `chain_count` negative: the chain reads only that word at an exit.
     chain_break: u32 = 0,
     chain_reserved: u32 = 0,
-    /// What every block that left through `exit_path` since the glue's entry
-    /// retired, `instructions << chain_count_shift | blocks`: one add of
-    /// `x0 << shift` and one of 1 per block. The glue accounts a whole chain
-    /// from this, the two ledgers below and the last block - which is what
-    /// let the chain stop being bounded by a 64-entry log. The log forced a
-    /// return to the glue every 64 blocks; Halo 3's main thread made 83.8
-    /// million such round trips on 2026-10-01.
+    /// The step's remaining instructions above `chain_count_shift`, counted
+    /// down by every block that left through `exit_path`, and those blocks
+    /// below it (`chain_budget.zig`): negative once the budget is spent or a
+    /// break was requested. The glue accounts a whole chain from this, the
+    /// two ledgers below and the last block - which is what let the chain
+    /// stop being bounded by a 64-entry log. The log forced a return to the
+    /// glue every 64 blocks; Halo 3's main thread made 83.8 million such
+    /// round trips on 2026-10-01.
     chain_count: u64 = 0,
-    /// The chain leaves once `chain_count` reaches this: the glue's remaining
-    /// instruction budget, shifted the same way.
-    chain_budget: u64 = 0,
     /// The instructions in `chain_count` that image blocks retired, and
     /// those mapped blocks outside the code cache retired. The rest ran in
     /// the code cache, which is where nearly every hop is, so the common
@@ -296,6 +295,10 @@ pub const Scratch = extern struct {
     /// changes them (M2 Max, 2026-10-11): Xenia reloads MXCSR around every
     /// switch between PowerPC FPU and VMX code and after every host call.
     fpcr_writes: u64 = 0,
+
+    pub fn requestBreak(self: *Scratch) void {
+        chain_budget.requestBreak(self);
+    }
 };
 
 /// `Scratch.chain_count` keeps blocks below this bit and instructions above.
@@ -691,7 +694,6 @@ const scratch_flag_b_offset: u32 = @offsetOf(Scratch, "flag_b");
 const scratch_flag_r_offset: u32 = @offsetOf(Scratch, "flag_r");
 const scratch_chain_break_offset: u32 = @offsetOf(Scratch, "chain_break");
 const scratch_chain_count_offset: u32 = @offsetOf(Scratch, "chain_count");
-const scratch_chain_budget_offset: u32 = @offsetOf(Scratch, "chain_budget");
 const scratch_chain_retired_image_offset: u32 = @offsetOf(Scratch, "chain_retired_image");
 const scratch_chain_retired_other_mapped_offset: u32 = @offsetOf(Scratch, "chain_retired_other_mapped");
 const scratch_chain_previous_offset: u32 = @offsetOf(Scratch, "chain_previous");
@@ -2625,12 +2627,9 @@ const Compiler = struct {
         if (self.resident_loop == null) try self.emitCacheWriteBack();
         const leave = self.epilogue_path;
         // Account this block, whether or not the chain goes on: one more
-        // block, x0 more instructions. x0 stays as it is, since it is also
-        // what the glue receives when this is the last block.
-        try self.emitChecked(a64.ldrImm(.doubleword, t1, r_scratch, scratch_chain_count_offset));
-        try self.emit(a64.addSubShifted(.x64, .add, false, t1, t1, 0, chain_count_shift));
-        try self.emitChecked(a64.addImm(.x64, t1, t1, 1));
-        try self.emitChecked(a64.strImm(.doubleword, t1, r_scratch, scratch_chain_count_offset));
+        // block, x0 fewer instructions left. x0 stays as it is, since it is
+        // also what the glue receives when this is the last block.
+        try chain_budget.emitCount(self, t1, r_scratch);
         switch (self.ledger) {
             .code_cache => {},
             .image, .other_mapped => {
@@ -2640,14 +2639,10 @@ const Compiler = struct {
                 try self.emitChecked(a64.strImm(.doubleword, t3, r_scratch, offset));
             },
         }
-        // A helper has asked for the scheduler, the run has ended, or a
-        // fault is pending (a helper that sets `abort` sets this too); or
-        // the glue's instruction budget for this step is spent.
-        try self.emitChecked(a64.ldrImm(.word, t0, r_scratch, scratch_chain_break_offset));
-        try self.a.branchIfNonZero(.w32, t0, leave);
-        try self.emitChecked(a64.ldrImm(.doubleword, t3, r_scratch, scratch_chain_budget_offset));
-        try self.emit(a64.cmp(.x64, t1, t3));
-        try self.a.branchCond(.hs, leave);
+        // The glue's instruction budget for this step is spent, or a helper
+        // has asked for the scheduler, the run has ended or a fault is
+        // pending: either made the count negative. The ledger keeps NZCV.
+        try self.a.branchCond(.mi, leave);
     }
 
     fn emitDispatch(self: *Compiler) Error!void {
@@ -8050,7 +8045,6 @@ pub const _test_api = struct {
     pub const _scratch_flag_r_offset = scratch_flag_r_offset;
     pub const _scratch_chain_break_offset = scratch_chain_break_offset;
     pub const _scratch_chain_count_offset = scratch_chain_count_offset;
-    pub const _scratch_chain_budget_offset = scratch_chain_budget_offset;
     pub const _scratch_chain_retired_image_offset = scratch_chain_retired_image_offset;
     pub const _scratch_chain_retired_other_mapped_offset = scratch_chain_retired_other_mapped_offset;
     pub const _scratch_chain_previous_offset = scratch_chain_previous_offset;

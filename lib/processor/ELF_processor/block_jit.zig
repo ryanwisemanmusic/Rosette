@@ -43,6 +43,7 @@ pub const indirect_links = @import("block_jit/indirect_links.zig");
 pub const fastmem_bound = @import("block_jit/fastmem_bound.zig");
 pub const lean_memory = @import("block_jit/lean_memory.zig");
 pub const exit_flags = @import("block_jit/exit_flags.zig");
+pub const chain_budget = @import("block_jit/chain_budget.zig");
 pub const Hop = core.Hop;
 pub const chain_never_word = core.chain_never_word;
 pub const isNative = core.isNative;
@@ -71,6 +72,7 @@ pub const compileWith = core.compileWith;
 
 test {
     _ = @import("block_jit/tests.zig");
+    _ = @import("block_jit/chain_budget.zig");
     _ = @import("block_jit/register_flow_tests.zig");
     _ = @import("block_jit/ordered_lane_tests.zig");
     _ = @import("block_jit/vector_expansion_tests.zig");

@@ -1,5 +1,6 @@
 const std = @import("std");
 const core = @import("core.zig");
+const chain_budget = @import("chain_budget.zig");
 const f = @import("tests.zig");
 const ids = [_]core.RegId{
     .bl_bx_ebx_rbx,      .dh_si_esi_rsi,      .bh_di_edi_rdi,      .al_ax_eax_rax,
@@ -92,12 +93,13 @@ const Graph = struct {
         s.scratch.ymm_hi_file = @intFromPtr(&s.ymm_hi);
         s.scratch.zmm_hi_file = @intFromPtr(&s.zmm_hi);
         s.scratch.tlb_file = @intFromPtr(&s.tlb);
-        s.scratch.chain_count = 0;
+        // As the glue does at every entry.
+        s.scratch.chain_break = 0;
+        s.scratch.chain_count = chain_budget.start(instructions);
         s.scratch.chain_retired_image = 0;
         s.scratch.chain_retired_other_mapped = 0;
-        s.scratch.chain_budget = instructions << core.chain_count_shift;
         _ = g.h[0].block.entry()(s, &g.h[0].block.helpers, &s.scratch);
-        return s.scratch.chain_count >> core.chain_count_shift;
+        return chain_budget.decode(s.scratch.chain_count, instructions, s.scratch.chain_break != 0).instructions;
     }
 };
 fn allocate() !*f.TestState {

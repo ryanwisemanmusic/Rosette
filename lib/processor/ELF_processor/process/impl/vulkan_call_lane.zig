@@ -71,7 +71,7 @@ pub fn transfer(self: *ElfState, target: u64, return_rip: u64) u32 {
     _ = completed.fetchAdd(1, .monotonic);
     if (lifecycle.isTerminated(self)) {
         _ = terminated.fetchAdd(1, .monotonic);
-        lifecycle.guestContextField(self, "block_jit_scratch").chain_break = 1;
+        lifecycle.guestContextField(self, "block_jit_scratch").requestBreak();
     }
     return 2;
 }

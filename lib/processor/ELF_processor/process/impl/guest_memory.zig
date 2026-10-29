@@ -2900,6 +2900,11 @@ pub fn beginWindowsInitTerm(
         .returns_error = returns_error,
     };
     process_impl_lifecycle.guestContextField(self, "windows_initterm_frame_count").* += 1;
+    // `_initterm_e` reports the first nonzero initializer result. With an
+    // empty table there is no callback to overwrite RAX, so initialize the
+    // status here instead of interpreting a previous import's return value
+    // (often a pointer) as an initializer failure.
+    process_impl_lifecycle.guestContextField(self, "regs").*.rax = 0;
     continueWindowsInitTerm(self);
     return true;
 }

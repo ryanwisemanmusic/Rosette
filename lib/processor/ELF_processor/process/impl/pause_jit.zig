@@ -61,7 +61,7 @@ pub fn execute(self: *ElfState, block: *const I._block_jit.Block, index: u32) u3
     if (ctx.field("windows_guest_slice_yield_requested").* or ctx.field("windows_guest_handoff_requested").* or
         capturing or life.isTerminated(self) or ctx.field("guest_access_violation_pending").*)
     {
-        ctx.field("block_jit_scratch").chain_break = 1;
+        ctx.field("block_jit_scratch").requestBreak();
         return 1;
     }
     return 0;

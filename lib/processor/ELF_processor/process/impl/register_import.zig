@@ -78,6 +78,6 @@ pub fn tryExecute(self: *process.ElfState, insn: *const I._block_jit.Insn) bool 
         const count = @atomicLoad(u64, &active.register_import_tail_calls, .monotonic);
         @atomicStore(u64, &active.register_import_tail_calls, count +| 1, .monotonic);
     }
-    ctx.field("block_jit_scratch").chain_break = 1;
+    ctx.field("block_jit_scratch").requestBreak();
     return true;
 }
