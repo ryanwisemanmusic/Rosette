@@ -55,6 +55,14 @@ pub fn build(b: *std.Build) void {
             b,
             target,
             optimize,
+            b.path("../../lib/Mach-O/native_window_toolbar.m"),
+            "windows_route_native_window_toolbar.o",
+            &[_][]const u8{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
+        ));
+        helper_mod.addObjectFile(compileCObject(
+            b,
+            target,
+            optimize,
             b.path("../../lib/Mach-O/input_controller_bridge.m"),
             "windows_route_input_controller_bridge.o",
             &[_][]const u8{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
@@ -68,10 +76,16 @@ pub fn build(b: *std.Build) void {
             &[_][]const u8{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
         ));
         helper_mod.linkFramework("AppKit", .{});
+        helper_mod.linkFramework("CoreGraphics", .{});
+        helper_mod.linkFramework("CoreVideo", .{});
         helper_mod.linkFramework("QuartzCore", .{});
         helper_mod.linkFramework("Metal", .{});
         helper_mod.linkFramework("GameController", .{});
         helper_mod.linkFramework("AudioToolbox", .{});
+        helper_mod.linkFramework("AVFoundation", .{});
+        helper_mod.linkFramework("CoreMedia", .{});
+        helper_mod.linkFramework("ScreenCaptureKit", .{});
+        helper_mod.linkFramework("UniformTypeIdentifiers", .{});
     }
     const app_bundle_parser_mod = b.createModule(.{
         .root_source_file = b.path("../../src/tooling/app_parser/bundle_parser.zig"),
@@ -924,6 +938,14 @@ pub fn build(b: *std.Build) void {
             b,
             target,
             optimize,
+            b.path("../../lib/Mach-O/native_window_toolbar.m"),
+            "standalone_windows_route_native_window_toolbar.o",
+            &[_][]const u8{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
+        ));
+        exe_runner_mod.addObjectFile(compileCObject(
+            b,
+            target,
+            optimize,
             b.path("../../lib/Mach-O/native_legacy_gl_dispatch.m"),
             "standalone_windows_route_native_legacy_gl_dispatch.o",
             &[_][]const u8{ "-Wall", "-Wextra" },
@@ -945,11 +967,17 @@ pub fn build(b: *std.Build) void {
             &[_][]const u8{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
         ));
         exe_runner_mod.linkFramework("AppKit", .{});
+        exe_runner_mod.linkFramework("CoreGraphics", .{});
+        exe_runner_mod.linkFramework("CoreVideo", .{});
         exe_runner_mod.linkFramework("OpenGL", .{});
         exe_runner_mod.linkFramework("QuartzCore", .{});
         exe_runner_mod.linkFramework("Metal", .{});
         exe_runner_mod.linkFramework("GameController", .{});
         exe_runner_mod.linkFramework("AudioToolbox", .{});
+        exe_runner_mod.linkFramework("AVFoundation", .{});
+        exe_runner_mod.linkFramework("CoreMedia", .{});
+        exe_runner_mod.linkFramework("ScreenCaptureKit", .{});
+        exe_runner_mod.linkFramework("UniformTypeIdentifiers", .{});
     }
 
     const standalone_runner = b.addExecutable(.{
