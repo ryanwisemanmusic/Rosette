@@ -1109,6 +1109,18 @@ test "shared legacy decoder recognizes SSE2 PUNPCK XMM forms" {
     }
 }
 
+test "shared legacy decoder recognizes memory PCMPEQB XMM form" {
+    const decoded = decodeLegacyInstruction(&[_]u8{ 0x66, 0x0F, 0x74, 0x40, 0xF0 }, .long64);
+    try std.testing.expectEqual(Op.vpcmpeqb, decoded.op);
+    try std.testing.expect(decoded.legacy_sse);
+    try std.testing.expect(!decoded.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 0), decoded.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), decoded.xmm_src);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, decoded.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -16))), decoded.addr);
+    try std.testing.expectEqual(@as(u8, 5), decoded.len);
+}
+
 test "shared legacy decoder recognizes extended-register PADDQ" {
     const decoded = decodeLegacyInstruction(
         &[_]u8{ 0x66, 0x45, 0x0F, 0xD4, 0xD3 },
@@ -1136,6 +1148,128 @@ test "shared legacy decoder recognizes extended-register PADDQ" {
     const unprefixed = decodeLegacyInstruction(&[_]u8{ 0x0F, 0xD4, 0xC1 }, .long64);
     try std.testing.expectEqual(Op.invalid, unprefixed.op);
     try std.testing.expectEqual(@as(u8, 0), unprefixed.len);
+}
+
+test "shared legacy decoder recognizes two-operand XMM PADDB only with 66 prefix" {
+    const reg = decodeLegacyInstruction(&[_]u8{ 0x66, 0x0F, 0xFC, 0xD1 }, .long64);
+    try std.testing.expectEqual(Op.vpaddb, reg.op);
+    try std.testing.expect(reg.legacy_sse);
+    try std.testing.expect(reg.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 2), reg.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 2), reg.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), reg.xmm_src2);
+    try std.testing.expectEqual(@as(u8, 4), reg.len);
+
+    const memory = decodeLegacyInstruction(&[_]u8{ 0x66, 0x0F, 0xFC, 0x05, 0x10, 0x00, 0x00, 0x00 }, .long64);
+    try std.testing.expectEqual(Op.vpaddb, memory.op);
+    try std.testing.expect(memory.legacy_sse);
+    try std.testing.expect(!memory.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 0), memory.xmm_dst);
+    try std.testing.expectEqual(@as(u64, 0x10), memory.addr);
+    try std.testing.expectEqual(@as(u8, 8), memory.len);
+
+    const unprefixed = decodeLegacyInstruction(&[_]u8{ 0x0F, 0xFC, 0xC1 }, .long64);
+    try std.testing.expectEqual(Op.invalid, unprefixed.op);
+    try std.testing.expectEqual(@as(u8, 0), unprefixed.len);
+}
+
+test "shared legacy decoder recognizes XMM PSADBW only with 66 prefix" {
+    const reg = decodeLegacyInstruction(&[_]u8{ 0x66, 0x0F, 0xF6, 0xC1 }, .long64);
+    try std.testing.expectEqual(Op.vpsadbw, reg.op);
+    try std.testing.expect(reg.legacy_sse);
+    try std.testing.expect(reg.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 0), reg.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), reg.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), reg.xmm_src2);
+    try std.testing.expectEqual(@as(u8, 4), reg.len);
+
+    const memory = decodeLegacyInstruction(&[_]u8{ 0x66, 0x0F, 0xF6, 0x05, 0x10, 0x00, 0x00, 0x00 }, .long64);
+    try std.testing.expectEqual(Op.vpsadbw, memory.op);
+    try std.testing.expect(memory.legacy_sse);
+    try std.testing.expect(!memory.is_reg_form);
+    try std.testing.expectEqual(@as(u64, 0x10), memory.addr);
+    try std.testing.expectEqual(@as(u8, 8), memory.len);
+
+    const unprefixed = decodeLegacyInstruction(&[_]u8{ 0x0F, 0xF6, 0xC1 }, .long64);
+    try std.testing.expectEqual(Op.invalid, unprefixed.op);
+    try std.testing.expectEqual(@as(u8, 0), unprefixed.len);
+}
+
+test "shared legacy decoder recognizes two-operand XMM PSUBW only with 66 prefix" {
+    const reg = decodeLegacyInstruction(&[_]u8{ 0x66, 0x0F, 0xF9, 0xC1 }, .long64);
+    try std.testing.expectEqual(Op.vpsubw, reg.op);
+    try std.testing.expect(reg.legacy_sse);
+    try std.testing.expect(reg.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 0), reg.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), reg.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), reg.xmm_src2);
+    try std.testing.expectEqual(@as(u8, 4), reg.len);
+
+    const memory = decodeLegacyInstruction(&[_]u8{ 0x66, 0x0F, 0xF9, 0x05, 0x10, 0x00, 0x00, 0x00 }, .long64);
+    try std.testing.expectEqual(Op.vpsubw, memory.op);
+    try std.testing.expect(memory.legacy_sse);
+    try std.testing.expect(!memory.is_reg_form);
+    try std.testing.expectEqual(@as(u64, 0x10), memory.addr);
+    try std.testing.expectEqual(@as(u8, 8), memory.len);
+
+    const unprefixed = decodeLegacyInstruction(&[_]u8{ 0x0F, 0xF9, 0xC1 }, .long64);
+    try std.testing.expectEqual(Op.invalid, unprefixed.op);
+    try std.testing.expectEqual(@as(u8, 0), unprefixed.len);
+}
+
+test "shared legacy decoder recognizes two-operand XMM PSUBB with extended registers" {
+    // OpenTyrian's map loader uses `psubb xmm8, xmm6` while expanding a level.
+    const reg = decodeLegacyInstruction(&[_]u8{ 0x66, 0x44, 0x0F, 0xF8, 0xC6 }, .long64);
+    try std.testing.expectEqual(Op.vpsubb, reg.op);
+    try std.testing.expect(reg.legacy_sse);
+    try std.testing.expect(reg.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 8), reg.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 8), reg.xmm_src);
+    try std.testing.expectEqual(@as(u8, 6), reg.xmm_src2);
+    try std.testing.expectEqual(@as(u8, 5), reg.len);
+
+    const memory = decodeLegacyInstruction(&[_]u8{ 0x66, 0x0F, 0xF8, 0x05, 0x10, 0x00, 0x00, 0x00 }, .long64);
+    try std.testing.expectEqual(Op.vpsubb, memory.op);
+    try std.testing.expect(memory.legacy_sse);
+    try std.testing.expect(!memory.is_reg_form);
+    try std.testing.expectEqual(@as(u64, 0x10), memory.addr);
+    try std.testing.expectEqual(@as(u8, 8), memory.len);
+
+    const unprefixed = decodeLegacyInstruction(&[_]u8{ 0x0F, 0xF8, 0xC6 }, .long64);
+    try std.testing.expectEqual(Op.invalid, unprefixed.op);
+    try std.testing.expectEqual(@as(u8, 0), unprefixed.len);
+}
+
+test "shared legacy decoder recognizes immediate XMM packed shifts" {
+    const decoded = decodeLegacyInstruction(&[_]u8{ 0x66, 0x0F, 0x71, 0xD1, 0x04 }, .long64);
+    try std.testing.expectEqual(Op.vpsrlw, decoded.op);
+    try std.testing.expect(decoded.legacy_sse);
+    try std.testing.expect(decoded.uses_imm);
+    try std.testing.expect(decoded.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 1), decoded.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 1), decoded.xmm_src);
+    try std.testing.expectEqual(@as(u64, 4), decoded.imm);
+    try std.testing.expectEqual(@as(u8, 5), decoded.len);
+
+    const memory = decodeLegacyInstruction(&[_]u8{ 0x66, 0x0F, 0x71, 0x10, 0x04 }, .long64);
+    try std.testing.expectEqual(Op.invalid, memory.op);
+    try std.testing.expectEqual(@as(u8, 0), memory.len);
+}
+
+test "shared legacy decoder recognizes register-only PEXTRW" {
+    const decoded = decodeLegacyInstruction(&[_]u8{ 0x66, 0x0F, 0xC5, 0xD2, 0x03 }, .long64);
+    try std.testing.expectEqual(Op.vpextrw, decoded.op);
+    try std.testing.expect(decoded.legacy_sse);
+    try std.testing.expect(decoded.uses_imm);
+    try std.testing.expect(decoded.is_reg_form);
+    try std.testing.expectEqual(RegId.dl_dx_edx_rdx, decoded.dst_reg);
+    try std.testing.expectEqual(@as(u8, 2), decoded.xmm_src);
+    try std.testing.expectEqual(@as(u64, 3), decoded.imm);
+    try std.testing.expectEqual(@as(u8, 5), decoded.len);
+
+    const memory = decodeLegacyInstruction(&[_]u8{ 0x66, 0x0F, 0xC5, 0x10, 0x03 }, .long64);
+    try std.testing.expectEqual(Op.invalid, memory.op);
+    try std.testing.expectEqual(@as(u8, 0), memory.len);
 }
 
 test "shared legacy decoder recognizes SHUFPS and SHUFPD immediate forms" {
@@ -1392,6 +1526,35 @@ test "shared legacy decoder recognizes scalar SSE conversions to integer" {
     const missing_precision_prefix = decodeLegacyInstruction(&[_]u8{ 0x0F, 0x2C, 0xC1 }, .long64);
     try std.testing.expectEqual(Op.invalid, missing_precision_prefix.op);
     try std.testing.expectEqual(@as(u8, 0), missing_precision_prefix.len);
+}
+
+test "shared legacy decoder recognizes PINSRW register and memory forms" {
+    const register = decodeLegacyInstruction(&.{ 0x66, 0x41, 0x0F, 0xC4, 0x0C, 0x82, 0x00 }, .long64);
+    try std.testing.expectEqual(Op.vpinsrw, register.op);
+    try std.testing.expect(register.legacy_sse);
+    try std.testing.expect(register.uses_imm);
+    try std.testing.expect(!register.is_reg_form);
+    try std.testing.expectEqual(Size.bits16, register.size);
+    try std.testing.expectEqual(@as(u8, 1), register.xmm_dst);
+    try std.testing.expectEqual(register.xmm_dst, register.xmm_src);
+    try std.testing.expectEqual(@as(u64, 0), register.imm);
+    try std.testing.expectEqual(@as(u8, 7), register.len);
+
+    const gpr = decodeLegacyInstruction(&.{ 0x66, 0x45, 0x0F, 0xC4, 0xC8, 0x05 }, .long64);
+    try std.testing.expectEqual(Op.vpinsrw, gpr.op);
+    try std.testing.expect(gpr.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 9), gpr.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 9), gpr.xmm_src);
+    try std.testing.expectEqual(RegId.r8b_r8w_r8d_r8, gpr.src_reg);
+    try std.testing.expectEqual(@as(u64, 5), gpr.imm);
+    try std.testing.expectEqual(@as(u8, 6), gpr.len);
+
+    const missing_immediate = decodeLegacyInstruction(&.{ 0x66, 0x0F, 0xC4, 0xC8 }, .long64);
+    try std.testing.expectEqual(Op.invalid, missing_immediate.op);
+    try std.testing.expectEqual(@as(u8, 0), missing_immediate.len);
+
+    const unsupported_mmx = decodeLegacyInstruction(&.{ 0x0F, 0xC4, 0xC8, 0x05 }, .long64);
+    try std.testing.expectEqual(Op.invalid, unsupported_mmx.op);
 }
 
 pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedInsn {

@@ -475,6 +475,29 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         return decoded;
     }
 
+    if (opcode2 == 0x14 or opcode2 == 0x15) {
+        // UNPCKLPS/UNPCKHPS and their 66-prefixed SSE2 double-precision
+        // forms interleave two packed vectors. The legacy destination is
+        // also source 1, and its YMM upper half is architecturally preserved.
+        if (has_f2 or has_f3 or pos.* >= bytes.len) return .{};
+        var decoded = DecodedInsn{ .legacy_sse = true, .size = if (has_66) .bits64 else .bits32 };
+        const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, decoded.size);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = decoded.xmm_dst;
+        if (decoded.is_reg_form) {
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
+        } else {
+            decoded.addr = rm.addr;
+        }
+        decoded.op = switch (opcode2) {
+            0x14 => if (has_66) .vunpcklpd else .vunpcklps,
+            0x15 => if (has_66) .vunpckhpd else .vunpckhps,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos.*);
+        return decoded;
+    }
+
     if (opcode2 == 0x12 or opcode2 == 0x13 or opcode2 == 0x16 or opcode2 == 0x17) {
         return decodeLegacySseHalfMove(bytes, &pos.*, rex_r, rex_x, rex_b, has_66, has_f2, has_f3, opcode2);
     }
@@ -694,11 +717,34 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         return decodeLegacySseBinary(bytes, &pos.*, rex_r, rex_x, rex_b, has_66, has_f2, has_f3, opcode2);
     }
 
+    if (opcode2 == 0xEE) {
+        // PMAXSW is an SSE2 XMM operation only with the mandatory 66 prefix;
+        // the unprefixed form targets the currently unsupported MMX file.
+        if (!has_66 or has_f2 or has_f3) return .{};
+        return decodeLegacySseBinary(bytes, &pos.*, rex_r, rex_x, rex_b, has_66, has_f2, has_f3, opcode2);
+    }
+
     if (opcode2 == 0xDB or opcode2 == 0xDF or opcode2 == 0xEB) {
         // PAND (DB), PANDN (DF), and POR (EB) are the integer packed-XMM
         // counterparts to the AND/ANDN/OR floating-point encodings.  All
         // three require 66 in the legacy SSE2 form; the unprefixed bytes are
         // MMX instructions and must not enter the XMM executor.
+        if (!has_66 or has_f2 or has_f3) return .{};
+        return decodeLegacySseBinary(bytes, &pos.*, rex_r, rex_x, rex_b, has_66, has_f2, has_f3, opcode2);
+    }
+
+    if (opcode2 == 0xFC) {
+        // PADD B has an XMM form only with the mandatory 66 prefix. The
+        // unprefixed encoding targets MMX state, which this executor does not
+        // model, so keep it outside the XMM path.
+        if (!has_66 or has_f2 or has_f3) return .{};
+        return decodeLegacySseBinary(bytes, &pos.*, rex_r, rex_x, rex_b, has_66, has_f2, has_f3, opcode2);
+    }
+
+    if (opcode2 == 0xF6) {
+        // PSADBW has an XMM form only with the mandatory 66 prefix. The
+        // unprefixed encoding targets MMX state, which this runtime does not
+        // model; don't reinterpret it as a vector-register operation.
         if (!has_66 or has_f2 or has_f3) return .{};
         return decodeLegacySseBinary(bytes, &pos.*, rex_r, rex_x, rex_b, has_66, has_f2, has_f3, opcode2);
     }
@@ -761,14 +807,20 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         return decoded;
     }
 
-    if (opcode2 == 0x76 or opcode2 == 0xFB) {
-        // PCMPEQD (66 0F 76) and PSUBQ (66 0F FB): legacy two-operand forms
-        // of operations the vector executor already runs, laid out like
-        // PADDQ below. libstdc++'s basic_stringbuf __xfer_bufptrs uses both.
+    if (opcode2 == 0x64 or opcode2 == 0x65 or opcode2 == 0x66 or opcode2 == 0x74) {
+        // PCMPGTB/W/D and PCMPEQB have SSE2 XMM encodings only with 66. The
+        // legacy destination is also the first source; their unprefixed MMX
+        // forms remain outside the XMM executor.
         if (!has_66 or has_f2 or has_f3 or pos.* >= bytes.len) return .{};
         var decoded = DecodedInsn{ .legacy_sse = true, .size = .bits64 };
         const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, .bits64);
-        decoded.op = if (opcode2 == 0x76) .vpcmpeqd else .vpsubq;
+        decoded.op = switch (opcode2) {
+            0x64 => .vpcmpgtb,
+            0x65 => .vpcmpgtw,
+            0x66 => .vpcmpgtd,
+            0x74 => .vpcmpeqb,
+            else => unreachable,
+        };
         decoded.xmm_dst = @intFromEnum(rm.reg);
         decoded.xmm_src = decoded.xmm_dst;
         if (decoded.is_reg_form) {
@@ -780,19 +832,48 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         return decoded;
     }
 
-    if (opcode2 == 0xD4) {
-        // 66 0F D4 /r is the legacy SSE2 PADDQ form.  The shared vector
-        // executor already implements the operation as VPADDQ, but the
-        // legacy encoding is a two-operand instruction: ModRM.reg is both
-        // the destination and the first source, while ModRM.r/m is the
-        // second source.  Keep the legacy marker so the destination's upper
-        // YMM half remains untouched, as required by a legacy SSE operation.
-        // The unprefixed form is the MMX PADDQ encoding and is not decoded by
-        // this XMM path; F2/F3 are reserved for this opcode.
+    if (opcode2 == 0x76 or opcode2 == 0xF8 or opcode2 == 0xF9 or opcode2 == 0xFA or opcode2 == 0xFB or opcode2 == 0xFD or opcode2 == 0xFE) {
+        // PCMPEQD (66 0F 76), PSUBB (66 0F F8), PSUBW (66 0F F9),
+        // PSUBD (66 0F FA), PSUBQ (66 0F FB), PADDW (66 0F FD), and
+        // PADDD (66 0F FE):
+        // legacy two-operand forms of operations the vector executor already
+        // runs, laid out like PADDQ below. The OpenTyrian palette scaler uses
+        // PSUBW in its fade path.
         if (!has_66 or has_f2 or has_f3 or pos.* >= bytes.len) return .{};
         var decoded = DecodedInsn{ .legacy_sse = true, .size = .bits64 };
         const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, .bits64);
-        decoded.op = .vpaddq;
+        decoded.op = switch (opcode2) {
+            0x76 => .vpcmpeqd,
+            0xF8 => .vpsubb,
+            0xF9 => .vpsubw,
+            0xFA => .vpsubd,
+            0xFB => .vpsubq,
+            0xFD => .vpaddw,
+            0xFE => .vpaddd,
+            else => unreachable,
+        };
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = decoded.xmm_dst;
+        if (decoded.is_reg_form) {
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
+        } else {
+            decoded.addr = rm.addr;
+        }
+        decoded.len = @intCast(pos.*);
+        return decoded;
+    }
+
+    if (opcode2 == 0xD4 or opcode2 == 0xD5) {
+        // 66 0F D4 /r (PADDQ) and 66 0F D5 /r (PMULLW) are legacy SSE2
+        // two-operand forms already supported by the shared vector executor.
+        // ModRM.reg is both the destination and the first source, while
+        // ModRM.r/m is the second source. Keep the legacy marker so the
+        // destination's upper YMM half remains untouched. The unprefixed
+        // forms are MMX encodings and stay outside this XMM path.
+        if (!has_66 or has_f2 or has_f3 or pos.* >= bytes.len) return .{};
+        var decoded = DecodedInsn{ .legacy_sse = true, .size = .bits64 };
+        const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.op = if (opcode2 == 0xD4) .vpaddq else .vpmullw;
         decoded.xmm_dst = @intFromEnum(rm.reg);
         decoded.xmm_src = decoded.xmm_dst;
         if (decoded.is_reg_form) {
@@ -821,6 +902,88 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
             decoded.addr = rm.addr;
         }
         if (pos.* >= bytes.len) return .{};
+        decoded.imm = bytes[pos.*];
+        decoded.uses_imm = true;
+        pos.* += 1;
+        decoded.len = @intCast(pos.*);
+        return decoded;
+    }
+
+    if (opcode2 == 0x71 or opcode2 == 0x72 or opcode2 == 0x73) {
+        // Legacy SSE2 immediate packed shifts are group opcodes: ModRM.reg
+        // selects the shift, while ModRM.r/m is the read/write XMM operand.
+        // Their unprefixed counterparts operate on MMX registers, which are
+        // not modeled by this XMM executor. Memory r/m encodings are reserved.
+        if (!has_66 or has_f2 or has_f3 or pos.* >= bytes.len) return .{};
+        var decoded = DecodedInsn{ .legacy_sse = true };
+        const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, .bits64);
+        if (!decoded.is_reg_form) return .{};
+        const group = @intFromEnum(rm.reg) & 0x07;
+        if (group != 2 and group != 3 and group != 4 and group != 6 and group != 7) return .{};
+        if (group == 4 and opcode2 == 0x73) return .{};
+        decoded.xmm_dst = addressing.rmVectorIndex(rm.addr);
+        decoded.xmm_src = decoded.xmm_dst;
+        decoded.op = switch (opcode2) {
+            0x71 => switch (group) {
+                2 => .vpsrlw,
+                4 => .vpsraw,
+                else => .vpsllw,
+            },
+            0x72 => switch (group) {
+                2 => .vpsrld,
+                4 => .vpsrad,
+                else => .vpslld,
+            },
+            0x73 => switch (group) {
+                2 => .vpsrlq,
+                3 => .vpsrldq,
+                6 => .vpsllq,
+                7 => .vpslldq,
+                else => unreachable,
+            },
+            else => unreachable,
+        };
+        if (pos.* >= bytes.len) return .{};
+        decoded.imm = bytes[pos.*];
+        decoded.uses_imm = true;
+        pos.* += 1;
+        decoded.len = @intCast(pos.*);
+        return decoded;
+    }
+
+    if (opcode2 == 0xC4) {
+        // PINSRW (66 0F C4 /r ib) inserts the low word from a GPR or memory
+        // into the XMM destination selected by ModRM.reg. Normalize the
+        // destructive legacy form to VPINSRW with the destination also used
+        // as its merge source; legacy_sse preserves the architectural YMM
+        // upper half in the shared executor.
+        if (!has_66 or has_f2 or has_f3 or pos.* >= bytes.len) return .{};
+        var decoded = DecodedInsn{ .op = .vpinsrw, .legacy_sse = true, .size = .bits16 };
+        const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, .bits32);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = decoded.xmm_dst;
+        if (decoded.is_reg_form) {
+            decoded.src_reg = addressing.rmRegister(rm.addr);
+        } else {
+            decoded.addr = rm.addr;
+        }
+        if (pos.* >= bytes.len) return .{};
+        decoded.imm = bytes[pos.*];
+        decoded.uses_imm = true;
+        pos.* += 1;
+        decoded.len = @intCast(pos.*);
+        return decoded;
+    }
+
+    if (opcode2 == 0xC5) {
+        // PEXTRW (66 0F C5 /r ib) extracts from ModRM.r/m XMM to the GPR in
+        // ModRM.reg. The memory form is reserved; 0F C5 without 66 is MMX.
+        if (!has_66 or has_f2 or has_f3 or pos.* >= bytes.len) return .{};
+        var decoded = DecodedInsn{ .op = .vpextrw, .legacy_sse = true, .size = .bits16 };
+        const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, .bits32);
+        if (!decoded.is_reg_form or pos.* >= bytes.len) return .{};
+        decoded.dst_reg = rm.reg;
+        decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
         decoded.imm = bytes[pos.*];
         decoded.uses_imm = true;
         pos.* += 1;
@@ -858,6 +1021,27 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         d.op = .nop;
         d.len = @as(u8, @intCast(pos.* + 2));
         return d;
+    }
+
+    if (opcode2 == 0xF4 and has_66 and !has_f2 and !has_f3) {
+        // 66 0F F4 /r is the SSE2 XMM form of PMULUDQ. The legacy form is
+        // destructive: ModRM.reg supplies both the destination and source 1,
+        // while r/m supplies source 2. Decode the complete ModRM address so
+        // an immediately following instruction prefix cannot be consumed as
+        // part of this instruction (the previous generic NOP length skipped
+        // one byte for register operands and desynchronized guest execution).
+        if (pos.* >= bytes.len) return .{};
+        var decoded = DecodedInsn{ .op = .vpmuludq, .legacy_sse = true };
+        const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = decoded.xmm_dst;
+        if (decoded.is_reg_form) {
+            decoded.xmm_src2 = addressing.rmVectorIndex(rm.addr);
+        } else {
+            decoded.addr = rm.addr;
+        }
+        decoded.len = @intCast(pos.*);
+        return decoded;
     }
 
     if (opcode2 == 0xF1 or opcode2 == 0xF2 or opcode2 == 0xF3 or opcode2 == 0xF4 or opcode2 == 0xF5) {
@@ -1086,6 +1270,9 @@ fn decodeLegacySseBinary(
         0xDF => .vandnpd,
         0xEB => .vorpd,
         0xEF => .vpxor,
+        0xFC => .vpaddb,
+        0xEE => .vpmaxsw,
+        0xF6 => .vpsadbw,
         else => return .{},
     };
     if (decoded.is_reg_form) {
@@ -1108,6 +1295,24 @@ fn decodeLegacySseHalfMove(
     has_f3: bool,
     opcode: u8,
 ) DecodedInsn {
+    // SSE3 MOVDDUP (F2 0F 12 /r) duplicates the source's low doubleword
+    // into both halves of the destination XMM register. Its memory operand
+    // is only eight bytes; representing it as a normal half-move would make
+    // the executor read beyond the architectural operand.
+    if (opcode == 0x12 and has_f2 and !has_f3 and !has_66 and pos.* < bytes.len) {
+        var decoded = DecodedInsn{ .legacy_sse = true, .size = .bits64 };
+        const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        if (decoded.is_reg_form) {
+            decoded.xmm_src = addressing.rmVectorIndex(rm.addr);
+        } else {
+            decoded.addr = rm.addr;
+        }
+        decoded.op = .vmovddup;
+        decoded.len = @intCast(pos.*);
+        return decoded;
+    }
+
     // F2/F3 select MOVDDUP/MOVSLDUP/MOVSHDUP, which are separate broadcast
     // operations. Do not reinterpret those encodings as a half move.
     if (has_f2 or has_f3 or pos.* >= bytes.len) return .{};
