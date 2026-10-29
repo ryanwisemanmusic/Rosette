@@ -117,6 +117,19 @@ typedef struct RosetteMachOKeyboardControllerState {
 _Static_assert(sizeof(RosetteMachOKeyboardControllerState) == 160,
                "keyboard/gamepad controller state must match the Zig input hook");
 
+// A queued physical key transition consumed by SDL_PollEvent. The virtual key
+// code remains host-native here; the guest SDL adapter applies SDL's scancode
+// and keycode conventions before writing SDL_Event.
+typedef struct RosetteMachOHostKeyboardEvent {
+  uint16_t virtual_key_code;
+  uint8_t down;
+  uint8_t repeat;
+  uint16_t modifiers;
+  uint16_t reserved;
+} RosetteMachOHostKeyboardEvent;
+_Static_assert(sizeof(RosetteMachOHostKeyboardEvent) == 8,
+               "host keyboard event must match the Zig SDL input hook");
+
 // The Zig mirror in lib/gpu/window_geometry.zig is filled by writing through
 // a pointer to this type, so the two layouts have to be the same object. A
 // field added on one side and not the other has no compiler that can see
@@ -131,6 +144,8 @@ _Static_assert(sizeof(RosetteMachONativeWindowGeometry) == 232,
 int rosette_macho_native_window_describe(RosetteMachONativeWindowGeometry *out);
 int rosette_macho_native_window_read_controller_state(
     RosetteMachOKeyboardControllerState *out);
+int rosette_macho_native_window_poll_keyboard_event(
+    RosetteMachOHostKeyboardEvent *out);
 
 int rosette_macho_native_application_ensure(void);
 int rosette_macho_native_window_ensure(uint32_t width, uint32_t height,
@@ -139,6 +154,10 @@ int rosette_macho_native_window_ensure(uint32_t width, uint32_t height,
 // WSI cadence for a passive, low-frequency on-window HUD.
 void rosette_macho_native_window_set_frame_counter(uint64_t raw_frame,
                                                    uint64_t presented_fps_milli);
+// Cocoa toolbar controls. The default state is FPS visible and brightness
+// lift zero. Brightness is a post-composition display lift in [0, 0.35].
+int rosette_macho_native_window_set_fps_visible(int visible);
+int rosette_macho_native_window_set_post_brightness(float lift);
 int rosette_macho_native_window_set_title(const char *title);
 int rosette_macho_native_window_set_size(uint32_t width, uint32_t height);
 int rosette_macho_native_window_show(void);

@@ -1,5 +1,6 @@
 #import "native_window_bridge.h"
 #import "input_controller_bridge.h"
+#import "native_window_toolbar.h"
 
 #import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
@@ -121,6 +122,9 @@ static NSOpenGLView *g_legacy_gl_view;
 static NSOpenGLContext *g_legacy_gl_context;
 static NSView *g_legacy_gl_container;
 static RosetteMachOFPSOverlayView *g_legacy_gl_fps_overlay;
+static CALayer *g_post_brightness_layer;
+static BOOL g_fps_hud_visible = YES;
+static CGFloat g_post_brightness_lift;
 static NSString *g_legacy_gl_previous_title;
 static BOOL g_legacy_gl_attached;
 static CATextLayer *g_fps_hud_layer;
@@ -174,6 +178,11 @@ static uint64_t g_readback_saved;
 // mutations, while XInput/Xam polls may arrive from a guest worker thread.
 static pthread_mutex_t g_keyboard_lock = PTHREAD_MUTEX_INITIALIZER;
 static BOOL g_keyboard_keys[128];
+static const size_t kRosetteKeyboardEventQueueCapacity = 256u;
+static RosetteMachOHostKeyboardEvent
+    g_keyboard_event_queue[256];
+static size_t g_keyboard_event_head;
+static size_t g_keyboard_event_count;
 static BOOL g_keyboard_window_available;
 static BOOL g_keyboard_focused;
 static uint32_t g_keyboard_packet;
@@ -207,6 +216,38 @@ static uint64_t g_keyboard_press_ns[128];
 static uint16_t g_keyboard_reported_buttons;
 static uint8_t g_keyboard_reported_triggers[2];
 static int16_t g_keyboard_reported_axes[4];
+
+// Keep SDL's transition events separate from the existing XInput snapshot.
+// SDL guests need key-down and key-up edges; the virtual controller consumes
+// held state. Both are populated by the same AppKit event, without translating
+// one input model into the other.
+static void RosetteMachOQueueKeyboardEventLocked(NSUInteger key_code,
+                                                 BOOL down, BOOL repeat,
+                                                 uint16_t modifiers) {
+  if (g_keyboard_event_count == kRosetteKeyboardEventQueueCapacity) {
+    g_keyboard_event_head =
+        (g_keyboard_event_head + 1u) % kRosetteKeyboardEventQueueCapacity;
+    --g_keyboard_event_count;
+  }
+  const size_t tail = (g_keyboard_event_head + g_keyboard_event_count) %
+                      kRosetteKeyboardEventQueueCapacity;
+  g_keyboard_event_queue[tail] = (RosetteMachOHostKeyboardEvent){
+      .virtual_key_code = (uint16_t)key_code,
+      .down = down ? 1u : 0u,
+      .repeat = repeat ? 1u : 0u,
+      .modifiers = modifiers,
+      .reserved = 0u,
+  };
+  ++g_keyboard_event_count;
+}
+
+static void RosetteMachOQueueKeyboardReleasesLocked(void) {
+  for (NSUInteger key_code = 0; key_code < 128u; ++key_code) {
+    if (g_keyboard_keys[key_code]) {
+      RosetteMachOQueueKeyboardEventLocked(key_code, NO, NO, 0u);
+    }
+  }
+}
 
 static NSString *RosetteMachOFPSHUDString(void) {
   pthread_mutex_lock(&g_keyboard_lock);
@@ -264,6 +305,7 @@ static void RosetteMachOUpdateKeyboardFocusOnMainThread(void) {
     if (g_keyboard_focused) {
       ++g_keyboard_focus_loss_events;
       ++g_keyboard_packet;
+      RosetteMachOQueueKeyboardReleasesLocked();
     }
     g_keyboard_window_available = NO;
     g_keyboard_focused = NO;
@@ -284,6 +326,7 @@ static void RosetteMachOUpdateKeyboardFocusOnMainThread(void) {
     // not leak a stuck virtual button into the next foreground interval.
     ++g_keyboard_focus_loss_events;
     ++g_keyboard_packet;
+    RosetteMachOQueueKeyboardReleasesLocked();
     RosetteMachOClearKeyboardStateLocked();
   }
   g_keyboard_window_available = YES;
@@ -322,6 +365,13 @@ static void RosetteMachOApplyKeyboardEvent(NSEvent *event, BOOL down) {
   pthread_mutex_lock(&g_keyboard_lock);
   g_keyboard_last_key_code = (uint32_t)key_code;
   const BOOL was_down = g_keyboard_keys[key_code];
+  const NSEventModifierFlags flags = event.modifierFlags;
+  uint16_t modifiers = 0u;
+  if ((flags & NSEventModifierFlagShift) != 0) modifiers |= 0x0001u; // KMOD_LSHIFT
+  if ((flags & NSEventModifierFlagControl) != 0) modifiers |= 0x0040u; // KMOD_LCTRL
+  if ((flags & NSEventModifierFlagOption) != 0) modifiers |= 0x0100u; // KMOD_LALT
+  if ((flags & NSEventModifierFlagCommand) != 0) modifiers |= 0x0400u; // KMOD_LGUI
+  if ((flags & NSEventModifierFlagCapsLock) != 0) modifiers |= 0x2000u; // KMOD_CAPS
   if (down) {
     // Holding a key produces AppKit repeat events; a controller packet should
     // change on the transition, not on every repeat notification.
@@ -332,6 +382,9 @@ static void RosetteMachOApplyKeyboardEvent(NSEvent *event, BOOL down) {
       g_keyboard_press_ns[key_code] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
       ++g_keyboard_packet;
       ++g_keyboard_key_down_events;
+      RosetteMachOQueueKeyboardEventLocked(key_code, YES, NO, modifiers);
+    } else if (event.isARepeat) {
+      RosetteMachOQueueKeyboardEventLocked(key_code, YES, YES, modifiers);
     }
   } else if (was_down) {
     g_keyboard_keys[key_code] = NO;
@@ -341,6 +394,7 @@ static void RosetteMachOApplyKeyboardEvent(NSEvent *event, BOOL down) {
     g_keyboard_press_observed[key_code] = NO;
     ++g_keyboard_packet;
     ++g_keyboard_key_up_events;
+    RosetteMachOQueueKeyboardEventLocked(key_code, NO, NO, modifiers);
   }
   pthread_mutex_unlock(&g_keyboard_lock);
 }
@@ -868,6 +922,18 @@ static void RosetteMachOEnsureFPSHUDOnMainThread(void) {
   if (!g_metal_layer) {
     return;
   }
+  if (!g_post_brightness_layer) {
+    g_post_brightness_layer = [CALayer layer];
+    g_post_brightness_layer.name = @"Rosette Post Brightness";
+    g_post_brightness_layer.backgroundColor = NSColor.whiteColor.CGColor;
+    g_post_brightness_layer.anchorPoint = CGPointMake(0.0, 0.0);
+    g_post_brightness_layer.zPosition = 900.0;
+    g_post_brightness_layer.opaque = NO;
+    [g_metal_layer addSublayer:g_post_brightness_layer];
+  }
+  g_post_brightness_layer.frame = g_metal_layer.bounds;
+  g_post_brightness_layer.opacity = (float)g_post_brightness_lift;
+  g_post_brightness_layer.hidden = g_post_brightness_lift <= 0.0;
   if (!g_fps_hud_layer) {
     g_fps_hud_layer = [CATextLayer layer];
     g_fps_hud_layer.name = @"Rosette FPS";
@@ -888,11 +954,35 @@ static void RosetteMachOEnsureFPSHUDOnMainThread(void) {
   }
   [CATransaction begin];
   [CATransaction setDisableActions:YES];
+  g_fps_hud_layer.hidden = !g_fps_hud_visible;
   g_fps_hud_layer.contentsScale = MAX(g_metal_layer.contentsScale, 1.0);
   g_fps_hud_layer.position = CGPointMake(
       CGRectGetMaxX(g_metal_layer.bounds) - 12.0, 12.0);
   [CATransaction commit];
   RosetteMachOUpdateFPSHUDTextOnMainThread();
+}
+
+int rosette_macho_native_window_set_fps_visible(int visible) {
+  @autoreleasepool {
+    RosetteMachORunOnMainThreadSync(^{
+      g_fps_hud_visible = visible != 0;
+      if (g_fps_hud_layer) g_fps_hud_layer.hidden = !g_fps_hud_visible;
+      if (g_legacy_gl_fps_overlay) g_legacy_gl_fps_overlay.hidden = !g_fps_hud_visible;
+    });
+  }
+  return 1;
+}
+
+int rosette_macho_native_window_set_post_brightness(float lift) {
+  if (!isfinite((double)lift)) return 0;
+  const CGFloat bounded = RosetteMachOClamp((CGFloat)lift, 0.0, 0.35);
+  @autoreleasepool {
+    RosetteMachORunOnMainThreadSync(^{
+      g_post_brightness_lift = bounded;
+      if (g_metal_layer) RosetteMachOEnsureFPSHUDOnMainThread();
+    });
+  }
+  return 1;
 }
 
 int rosette_macho_native_window_set_drawable_owner(int owned_by_swapchain) {
@@ -1012,6 +1102,7 @@ static BOOL RosetteMachOEnsureWindowOnMainThread(uint32_t width,
   if (g_window && g_view && g_metal_layer && g_metal_device) {
     RosetteMachOConfigureWindowPlacementPolicyOnMainThread();
     RosetteMachOEnsureFPSHUDOnMainThread();
+    rosette_macho_native_toolbar_install(g_window);
     if (title.length) {
       g_window.title = title;
     }
@@ -1121,6 +1212,7 @@ static BOOL RosetteMachOEnsureWindowOnMainThread(uint32_t width,
   RosetteMachOPlaceWindowSafely();
   RosetteMachOUpdateMetalDrawable();
   RosetteMachOEnsureFPSHUDOnMainThread();
+  rosette_macho_native_toolbar_install(g_window);
   RosetteMachOShowWindowOnMainThread("created");
   return YES;
 }
@@ -1757,6 +1849,23 @@ int rosette_macho_native_window_read_controller_state(
     g_reported_keyboard_mapping = YES;
   }
   return available ? 1 : 0;
+}
+
+int rosette_macho_native_window_poll_keyboard_event(
+    RosetteMachOHostKeyboardEvent *out) {
+  if (!out) return 0;
+  memset(out, 0, sizeof(*out));
+  pthread_mutex_lock(&g_keyboard_lock);
+  if (g_keyboard_event_count == 0u) {
+    pthread_mutex_unlock(&g_keyboard_lock);
+    return 0;
+  }
+  *out = g_keyboard_event_queue[g_keyboard_event_head];
+  g_keyboard_event_head =
+      (g_keyboard_event_head + 1u) % kRosetteKeyboardEventQueueCapacity;
+  --g_keyboard_event_count;
+  pthread_mutex_unlock(&g_keyboard_lock);
+  return 1;
 }
 
 uint32_t rosette_macho_native_window_pump_events(void) {
