@@ -62,3 +62,13 @@ test "texture slot diagnosis keeps vertex records distinct from bad texture data
     texture[0] = @intFromEnum(FetchConstantType.invalid_vertex);
     try std.testing.expectEqual(.invalid_vertex_in_texture_slot, diagnoseTextureSlot(texture));
 }
+
+test "Halo 3 invalid-texture log descriptors remain classified as vertex records" {
+    const logged = [_][6]u32{
+        .{ 0x051D_C85B, 0x1000_001A, 0, 0, 0, 0 },
+        .{ 0x052C_909B, 0x1000_001A, 0, 0, 0, 0 },
+    };
+    for (logged) |raw| {
+        try std.testing.expectEqual(.vertex_in_texture_slot, diagnoseTextureSlot(raw));
+    }
+}
