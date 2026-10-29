@@ -36,8 +36,21 @@ extern fn rosette_macho_native_window_async_key_state(virtual_key: u32) c_int;
 extern fn rosette_macho_native_service_main_queue() u32;
 extern fn rosette_macho_native_set_main_thread_request_hook(hook: ?*const fn (c_int) callconv(.c) void) void;
 extern fn rosette_macho_native_window_read_controller_state(out: *elf_processor_state.WindowsInputState) c_int;
+extern fn rosette_macho_native_window_poll_keyboard_event(out: *elf_processor_state.WindowsHostKeyboardEvent) c_int;
 extern fn rosette_macho_native_window_set_drawable_owner(owned_by_swapchain: c_int) c_int;
 extern fn rosette_macho_native_window_prepare_drawable_size(width: u32, height: u32) c_int;
+extern fn rosette_macho_native_window_present_frame(
+    serial: u64,
+    pixels: [*]const u8,
+    source_length: u64,
+    source_width: u32,
+    source_height: u32,
+    row_pitch: u64,
+    format: u32,
+    orientation: u8,
+    fit: u8,
+) u64;
+extern fn rosette_macho_native_window_set_frame_counter(frame: u64, presented_fps_milli: u64) void;
 extern fn rosette_macho_legacy_gl_context_create(width: u32, height: u32) c_int;
 extern fn rosette_macho_legacy_gl_make_current() c_int;
 extern fn rosette_macho_legacy_gl_clear_current() c_int;
@@ -147,6 +160,11 @@ fn nativeReadControllerState(_: ?*anyopaque, out: *elf_processor_state.WindowsIn
     return rosette_macho_native_window_read_controller_state(out);
 }
 
+fn nativePollKeyboardEvent(_: ?*anyopaque, out: *elf_processor_state.WindowsHostKeyboardEvent) callconv(.c) c_int {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    return rosette_macho_native_window_poll_keyboard_event(out);
+}
+
 fn nativeGraphics(context: ?*anyopaque) ?*native_windows_graphics.NativeWindowsGraphics {
     const value = context orelse return null;
     return @ptrCast(@alignCast(value));
@@ -199,6 +217,40 @@ fn nativePresentGuestFrontBuffer(
         format_raw,
         guest_swap_observed != 0,
     )) 1 else 0;
+}
+
+fn nativePresentGuestPixels(
+    context: ?*anyopaque,
+    state_pointer: *anyopaque,
+    source: u64,
+    width: u32,
+    height: u32,
+    row_pitch: u64,
+) callconv(.c) c_int {
+    if (comptime builtin.target.os.tag != .macos) return 0;
+    const bridge = nativeGraphics(context) orelse return 0;
+    _ = bridge;
+    const state: *elf_processor_state.ElfState = @ptrCast(@alignCast(state_pointer));
+    const source_length = std.math.mul(u64, row_pitch, height) catch return 0;
+    const pixels = state.guestMemoryConst(source, source_length) orelse return 0;
+    const serial = @max(state.windows_sdl.present_count, 1);
+    return if (rosette_macho_native_window_present_frame(
+        serial,
+        pixels.ptr,
+        source_length,
+        width,
+        height,
+        row_pitch,
+        37, // VK_FORMAT_R8G8B8A8_UNORM: tightly packed RGBA guest bytes.
+        0,
+        1, // Preserve aspect ratio in the native drawable.
+    ) != 0) 1 else 0;
+}
+
+fn nativeSetFrameCounter(context: ?*anyopaque, frame: u64, fps_milli: u64) callconv(.c) void {
+    _ = context;
+    if (comptime builtin.target.os.tag != .macos) return;
+    rosette_macho_native_window_set_frame_counter(frame, fps_milli);
 }
 
 fn nativeMetalLayerHostPointer(context: ?*anyopaque) callconv(.c) usize {
@@ -341,6 +393,8 @@ fn windowsGraphicsHooks(native_context: ?*anyopaque) pe64_runtime.GraphicsHooks 
         .native_presenter_is_ready = nativePresenterIsReady,
         .native_presenter_present_diagnostic = nativePresenterDiagnostic,
         .native_present_guest_frontbuffer = nativePresentGuestFrontBuffer,
+        .native_present_guest_pixels = nativePresentGuestPixels,
+        .set_frame_counter = nativeSetFrameCounter,
         .native_vulkan_dispatch = nativeVulkanDispatch,
         .native_metal_layer_host_pointer = nativeMetalLayerHostPointer,
         .native_metal_drawable_owner = nativeMetalDrawableOwner,
@@ -353,7 +407,10 @@ fn windowsGraphicsHooks(native_context: ?*anyopaque) pe64_runtime.GraphicsHooks 
 
 fn windowsInputHooks() elf_processor_state.WindowsInputHooks {
     if (comptime builtin.target.os.tag != .macos) return .{};
-    return .{ .read_controller_state = nativeReadControllerState };
+    return .{
+        .read_controller_state = nativeReadControllerState,
+        .poll_keyboard_event = nativePollKeyboardEvent,
+    };
 }
 
 fn machineName(machine: u16) []const u8 {

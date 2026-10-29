@@ -621,6 +621,7 @@ fn isDirectlyHandledVector(op: x64_decoder.Op) bool {
         .vpmovmskb,
         .vpmovmskb_ymm,
         .pmovmskb,
+        .vpsadbw,
         .vmovmskps,
         .vmovmskpd,
         .vcvtsi2ss_xmm_reg,
